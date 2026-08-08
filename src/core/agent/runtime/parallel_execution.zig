@@ -24,6 +24,7 @@ pub fn isReadOnlyCall(registry: tool_dispatch.Registry, call: ToolCall) bool {
         .semantic_search,
         .grep_files,
         .file_info,
+        .skill,
         .web_fetch,
         .web_search,
         => tool.activity_kind == .read,
@@ -519,6 +520,20 @@ test "parallel classifier admits approval-bearing web fetch read groups" {
     };
 
     try std.testing.expectEqual(@as(usize, 2), parallelReadOnlyPrefixLen(registry, &calls));
+}
+
+test "parallel classifier admits installed skill reads" {
+    const builtin_tools = @import("../../../builtins/tools.zig");
+    const tools = [_]tool_dispatch.Tool{builtin_tools.skill};
+    const registry = tool_dispatch.Registry{ .tools = &tools };
+    const calls = [_]ToolCall{toolCall(
+        "skill_1",
+        "skill",
+        "{\"name\":\"demo\",\"location\":\"/tmp/demo\",\"resource\":\"SKILL.md\"}",
+    )};
+
+    try std.testing.expectEqual(@as(usize, 1), parallelReadOnlyPrefixLen(registry, &calls));
+    try std.testing.expect(isReadOnlyCall(registry, calls[0]));
 }
 
 test "parallel classifier rejects prompts approvals dynamic tools and mutations" {
