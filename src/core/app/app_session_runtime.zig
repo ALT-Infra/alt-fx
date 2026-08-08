@@ -3564,7 +3564,7 @@ pub fn Runtime(comptime App: type) type {
                     action_arena.allocator(),
                     call,
                     null,
-                    types.deferred_tool_result_output,
+                    types.context_deferred_tool_status_label,
                     &.{},
                 )
             else if (result.status == .success or process_ran)
@@ -3586,7 +3586,7 @@ pub fn Runtime(comptime App: type) type {
             defer app.alloc.free(action);
 
             const outcome: types.ToolOutcomeKind = if (deferred)
-                .denied
+                .deferred
             else if (result.status == .success or process_ran)
                 .completed
             else
@@ -6544,19 +6544,19 @@ test "execution replay preserves paired deferred tools without command output" {
             .tool_call_id = @constCast("call_read"),
             .tool_name = @constCast("read_file"),
             .status = .failure,
-            .output = @constCast("Not executed"),
-            .output_bytes = 12,
-            .stored_output_bytes = 12,
+            .output = @constCast(types.context_deferred_tool_result_output),
+            .output_bytes = types.context_deferred_tool_result_output.len,
+            .stored_output_bytes = types.context_deferred_tool_result_output.len,
         },
         .{
             .tool_call_id = @constCast("call_command"),
             .tool_name = @constCast("run_command"),
             .status = .failure,
-            .output = @constCast("Not executed"),
+            .output = @constCast(types.context_deferred_tool_result_output),
             .output_handle = @constCast("should-not-be-read.txt"),
             .preview = @constCast("should not be rendered"),
-            .output_bytes = 12,
-            .stored_output_bytes = 12,
+            .output_bytes = types.context_deferred_tool_result_output.len,
+            .stored_output_bytes = types.context_deferred_tool_result_output.len,
             .truncated = true,
             .command_output_replay = .unavailable,
             .command_process_presentation = .{ .exit_code = 7 },
@@ -6571,12 +6571,12 @@ test "execution replay preserves paired deferred tools without command output" {
 
     try std.testing.expectEqualSlices(
         types.ToolOutcomeKind,
-        &.{ .denied, .denied },
+        &.{ .deferred, .deferred },
         app.completed_tool_outcomes.items,
     );
     try std.testing.expectEqual(@as(usize, 2), app.completed_tool_statuses.items.len);
-    try std.testing.expectEqualStrings("● Not executed read_file\n", app.completed_tool_statuses.items[0]);
-    try std.testing.expectEqualStrings("● Not executed run_command\n", app.completed_tool_statuses.items[1]);
+    try std.testing.expectEqualStrings("● Context updated read_file\n", app.completed_tool_statuses.items[0]);
+    try std.testing.expectEqualStrings("● Context updated run_command\n", app.completed_tool_statuses.items[1]);
     try std.testing.expectEqual(@as(usize, 2), app.historical_tool_detail_entry_ids.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.command_output_writes.items.len);

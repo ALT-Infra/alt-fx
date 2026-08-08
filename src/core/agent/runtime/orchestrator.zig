@@ -421,6 +421,49 @@ fn appendNotExecutedToolResult(
     );
 }
 
+fn appendContextDeferredToolResult(
+    deps: *const AgentRuntimeDeps,
+    provisional_statuses: *runtime_tool_presentation.ProvisionalToolStatuses,
+    provisional_alloc: Allocator,
+    arena: Allocator,
+    turn_id: u64,
+    call: ToolCall,
+    advertised_dynamic_tool_names: []const []const u8,
+    step_ctx: TraceContext,
+    within_turn_suffix: *std.ArrayList(ChatMessage),
+    completed_tool_names: *std.ArrayList([]u8),
+    batch: *runtime_tool_batch.StepBatchState,
+) !void {
+    _ = try provisional_statuses.settleDeferredCall(
+        deps,
+        provisional_alloc,
+        arena,
+        turn_id,
+        call,
+        advertised_dynamic_tool_names,
+    );
+    debug_trace.eventf(
+        "tool",
+        "execution_result",
+        step_ctx,
+        "call_id={s} name={s} result_kind=context_deferred model_output_bytes={d}",
+        .{ call.id, call.name, types.context_deferred_tool_result_output.len },
+    );
+    try runtime_tool_batch.appendToolResultContent(
+        arena,
+        within_turn_suffix,
+        completed_tool_names,
+        batch,
+        call,
+        types.context_deferred_tool_result_output,
+        null,
+        .{
+            .increment_total = false,
+            .status = .failure,
+        },
+    );
+}
+
 fn providerExecutedResult(call: ToolCall) ?ToolExecutionResult {
     if (call.provenance != .provider_executed) return null;
     const provider_result = call.provider_result orelse return null;
@@ -4816,10 +4859,12 @@ fn processQueuedPromptLoop(
                 );
                 continue;
             }
-            if (context_delta) {
+            if (context_delta and
+                !runtime_parallel_execution.isReadOnlyCall(deps.tool_registry, tool_call))
+            {
                 if (preparation_batch.preparations[tool_call_index]) |preparation| {
                     if (preparation == .candidate) {
-                        try appendNotExecutedToolResult(
+                        try appendContextDeferredToolResult(
                             deps,
                             &stream_ctx.provisional_statuses,
                             stream_ctx.alloc,
@@ -4831,7 +4876,6 @@ fn processQueuedPromptLoop(
                             &within_turn_suffix,
                             &completed_tool_names,
                             &step_batch,
-                            "context_deferred",
                         );
                         continue;
                     }

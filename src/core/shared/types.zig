@@ -132,6 +132,7 @@ pub const ToolOutcomeKind = enum {
     denied,
     cancelled,
     failed,
+    deferred,
 };
 
 pub const ToolOutcome = struct {
@@ -753,10 +754,13 @@ pub const CommandProcessPresentation = union(enum) {
 };
 
 pub const deferred_tool_result_output = "Not executed";
+pub const context_deferred_tool_result_output = "Scoped project instructions were added before execution. Review them and reissue this tool call if it is still appropriate.";
+pub const context_deferred_tool_status_label = "Context updated";
 
 pub fn isDeferredToolResult(result: PersistedToolResult) bool {
     return result.status == .failure and
-        std.mem.eql(u8, result.output, deferred_tool_result_output);
+        (std.mem.eql(u8, result.output, deferred_tool_result_output) or
+            std.mem.eql(u8, result.output, context_deferred_tool_result_output));
 }
 
 test "persisted deferred tool result classifier is exact" {
@@ -783,6 +787,9 @@ test "persisted deferred tool result classifier is exact" {
 
     result.output = @constCast("tool failed");
     try std.testing.expect(!isDeferredToolResult(result));
+
+    result.output = @constCast(context_deferred_tool_result_output);
+    try std.testing.expect(isDeferredToolResult(result));
 }
 
 pub const ToolResultMemory = struct {
