@@ -333,6 +333,30 @@ fn commitSelectedContext(
     }
 }
 
+fn candidateHasApplicableContextDelta(
+    arena: Allocator,
+    context_registry: context_contract.Registry,
+    config: Config,
+    context_delivery_state: *const context_contract.DeliveryState,
+    candidate: tool_preparation.Candidate,
+) !bool {
+    switch (candidate.kind) {
+        .advertised_dynamic, .deferred_dynamic, .legacy_target_resolution => return true,
+        .registered => if (candidate.applicable_targets.len == 0) return false,
+    }
+
+    var selected = try context_registry.selectDefaultApplicableContext(arena, .{
+        .workspace_root = config.workspace_root,
+        .access_scope = config.access_scope,
+        .targets = candidate.applicable_targets,
+        .delivered_sources = context_delivery_state.delivered_sources.items,
+        .evaluated_endpoints = context_delivery_state.evaluated_endpoints.items,
+        .context_limits = config.context_limits,
+    });
+    defer selected.deinit(arena);
+    return selected.content != null;
+}
+
 const ParentTurnDeliveryState = struct {
     acknowledgements: []const runtime_deps.ParentTurnDeliveryAck = &.{},
     acknowledged: bool = false,
@@ -4200,6 +4224,18 @@ fn processQueuedPromptLoop(
             }
         }
 
+        const context_deferred_calls = arena.alloc(bool, prepared_tool_calls.len) catch |err| {
+            return settleFailedContextGate(
+                deps,
+                &stream_ctx.provisional_statuses,
+                stream_ctx.alloc,
+                turn_id,
+                effective_tool_calls,
+                advertised_dynamic_tool_names,
+                err,
+            );
+        };
+        @memset(context_deferred_calls, false);
         var context_delta = false;
         if (deps.context_enabled and preparation_batch.applicable_targets.items.len > 0) {
             const context_registry = deps.context_registry orelse
@@ -4224,6 +4260,51 @@ fn processQueuedPromptLoop(
             };
             defer selected.deinit(arena);
             for (selected.notices) |notice| try deps.pushContextNotice(notice);
+
+            context_delta = selected.content != null;
+            if (context_delta) {
+                if (prepared_tool_calls.len == 1) {
+                    if (!runtime_parallel_execution.isReadOnlyCall(
+                        deps.tool_registry,
+                        effective_tool_calls[0],
+                    )) {
+                        if (preparation_batch.preparations[0]) |preparation| {
+                            context_deferred_calls[0] = preparation == .candidate;
+                        }
+                    }
+                } else if (!config.cancel_flag.load(.seq_cst)) context_probes: {
+                    for (preparation_batch.preparations, effective_tool_calls, 0..) |maybe_preparation, tool_call, index| {
+                        if (runtime_parallel_execution.isReadOnlyCall(
+                            deps.tool_registry,
+                            tool_call,
+                        )) continue;
+                        const preparation = maybe_preparation orelse continue;
+                        const candidate = switch (preparation) {
+                            .terminal => continue,
+                            .candidate => |candidate| candidate,
+                        };
+                        context_deferred_calls[index] = candidateHasApplicableContextDelta(
+                            arena,
+                            context_registry,
+                            config,
+                            &context_delivery_state,
+                            candidate,
+                        ) catch |err| {
+                            if (config.cancel_flag.load(.seq_cst)) break :context_probes;
+                            return settleFailedContextGate(
+                                deps,
+                                &stream_ctx.provisional_statuses,
+                                stream_ctx.alloc,
+                                turn_id,
+                                effective_tool_calls,
+                                advertised_dynamic_tool_names,
+                                err,
+                            );
+                        };
+                        if (config.cancel_flag.load(.seq_cst)) break :context_probes;
+                    }
+                }
+            }
 
             if (config.cancel_flag.load(.seq_cst)) {
                 var cancelled_call: ?ToolCall = null;
@@ -4268,7 +4349,6 @@ fn processQueuedPromptLoop(
                 return;
             }
 
-            context_delta = selected.content != null;
             commitSelectedContext(
                 arena,
                 &stable_prefix,
@@ -4859,9 +4939,7 @@ fn processQueuedPromptLoop(
                 );
                 continue;
             }
-            if (context_delta and
-                !runtime_parallel_execution.isReadOnlyCall(deps.tool_registry, tool_call))
-            {
+            if (context_deferred_calls[tool_call_index]) {
                 if (preparation_batch.preparations[tool_call_index]) |preparation| {
                     if (preparation == .candidate) {
                         try appendContextDeferredToolResult(

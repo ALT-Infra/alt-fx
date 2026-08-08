@@ -3413,6 +3413,85 @@ test "modern context delta defers effectful call exactly once" {
     try std.testing.expectEqualStrings("Context updated write_file", terminal.outcome.summary);
 }
 
+test "modern context delta does not defer unrelated effectful call" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace/nested");
+    {
+        var rules = try tmp.dir.createFile(
+            std.testing.io,
+            "workspace/nested/AGENTS.md",
+            .{},
+        );
+        defer rules.close(std.testing.io);
+        try rules.writeStreamingAll(
+            std.testing.io,
+            "UNRELATED_NESTED_SCOPE_RULE",
+        );
+        var input = try tmp.dir.createFile(
+            std.testing.io,
+            "workspace/nested/input.txt",
+            .{},
+        );
+        defer input.close(std.testing.io);
+        try input.writeStreamingAll(std.testing.io, "unchanged");
+    }
+    const workspace = try io_mod.dirRealpathAlloc(
+        alloc,
+        tmp.dir,
+        "workspace",
+    );
+    defer alloc.free(workspace);
+
+    const calls = [_]ToolCall{
+        toolCall(
+            "nested_read",
+            "read_file",
+            "{\"path\":\"nested/input.txt\"}",
+        ),
+        toolCall(
+            "root_create",
+            "create_folder",
+            "{\"path\":\"root-output\"}",
+        ),
+    };
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.context_enabled = true;
+    hooks.context_registry = .{ .default_provider = builtin_context.provider };
+    hooks.exec_plans = &.{
+        .{ .result = .{ .model_output = "nested input" } },
+        .{ .result = .{ .model_output = "root folder created" } },
+    };
+    var fixture = PromptFixture{ .workspace_root = workspace };
+    var job = fixture.job();
+    job.permission_mode = .auto;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try expectBodyContains(&gateway, 1, "UNRELATED_NESTED_SCOPE_RULE");
+    try expectBodyNotContains(
+        &gateway,
+        1,
+        types.context_deferred_tool_result_output,
+    );
+    const expected_ids = [_][]const u8{ "nested_read", "root_create" };
+    try std.testing.expectEqual(expected_ids.len, hooks.permission_call_ids.items.len);
+    try std.testing.expectEqual(expected_ids.len, hooks.executed_call_ids.items.len);
+    for (expected_ids, hooks.permission_call_ids.items, hooks.executed_call_ids.items) |expected, permission_id, execution_id| {
+        try std.testing.expectEqualStrings(expected, permission_id);
+        try std.testing.expectEqualStrings(expected, execution_id);
+    }
+}
+
 test "modern later selector errors escape atomically and settle changed provisional identity" {
     const alloc = std.testing.allocator;
     defer FailingApplicableContext.reset(.out_of_memory, "");
