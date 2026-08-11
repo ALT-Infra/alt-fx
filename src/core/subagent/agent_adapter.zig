@@ -1,0 +1,575 @@
+const std = @import("std");
+const agent_runtime = @import("../agent/agent_runtime.zig");
+const worker_runtime = @import("../agent/worker_runtime.zig");
+const auto_classifier = @import("../permissions/auto_classifier.zig");
+const command_admission = @import("../permissions/command_admission.zig");
+const command_output_content = @import("../tooling/command_output_content.zig");
+const file_mutation = @import("../tooling/file_mutation.zig");
+const tool_admission = @import("../tooling/tool_admission.zig");
+const tool_presentation = @import("../tooling/tool_presentation.zig");
+const tool_result_errors = @import("../tooling/tool_result_errors.zig");
+const tool_runtime = @import("../tooling/tool_runtime.zig");
+const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
+const mcp_access = @import("../mcp/access_policy.zig");
+const context_contract = @import("../workspace/context_contract.zig");
+const hooks = @import("../hooks/hooks.zig");
+const execution_memory = @import("../agent/execution_memory.zig");
+const gateway_error_format = @import("../shared/gateway_error_format.zig");
+const io_mod = @import("../shared/io.zig");
+const session_codec = @import("../session/session_codec.zig");
+const types = @import("../shared/types.zig");
+const diff_mod = @import("../output/diff.zig");
+const domain = @import("domain.zig");
+const execution = @import("execution.zig");
+const parent_delivery_projector = @import("parent_delivery_projector.zig");
+const tool_host = @import("tool_host.zig");
+
+const Allocator = std.mem.Allocator;
+
+pub const Config = struct {
+    host: *tool_host.Runtime,
+    tool_context: tool_runtime.Context,
+    system_prompt: []const u8,
+    model_prompt_overlay: ?[]const u8 = null,
+    skills_prompt_section: []const u8 = "",
+    explicit_skills_prompt_section: []const u8 = "",
+    gateway_tools_json: []const u8,
+    custom_tool_guidance: []const u8 = "",
+    context_registry: context_contract.Registry,
+    context_enabled: bool,
+    project_context: []const u8 = "",
+    lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
+};
+
+const Context = struct {
+    config: Config,
+    turn: *execution.TurnContext,
+    admission: domain.AdmissionSnapshot,
+    cancel: *std.atomic.Value(bool),
+    input_tokens: u64 = 0,
+    output_tokens: u64 = 0,
+    turn_outcome: ?types.TurnPresentationOutcome = null,
+
+    fn toolContext(self: *Context) tool_runtime.Context {
+        var result = self.config.tool_context;
+        result.worker = self.turn.workerRuntime();
+        result.session = self.turn.sessionRuntime();
+        result.cancel_flag = self.cancel;
+        result.permission_mode = self.admission.permission_mode;
+        result.permission_grants = self.admission.grants;
+        result.session_grants = self.admission.grants;
+        result.permission_rules = self.admission.rules;
+        result.sandbox_backend = self.admission.sandbox_backend;
+        result.advertised_dynamic_tool_names = self.admission.integration_names;
+        result.mcp_access = if (self.admission.mcp_view) |*view|
+            .{ .scoped = .{
+                .captured = view,
+                .admission_authority_generation = self.admission.authority_generation,
+                .live = .{ .context = self, .resolve_fn = resolveLiveMcpView },
+            } }
+        else
+            .disabled;
+        result.subagent_host = self.config.host;
+        result.subagent_caller_id = self.turn.child_id;
+        result.session_child_capability = self.turn.childCapability() catch null;
+        result.interactive = false;
+        result.output_chunk_ctx = self;
+        result.on_output_chunk = pushLiveOutputChunk;
+        result.background_url_ctx = self;
+        result.on_background_url_ready = discardBackgroundUrl;
+        result.web_search_progress_ctx = null;
+        result.on_web_search_progress = null;
+        result.web_fetch_progress_ctx = null;
+        result.on_web_fetch_progress = null;
+        result.model_capability_resolver = null;
+        result.lifecycle_view = self.config.lifecycle_view;
+        result.lifecycle_scope = .{
+            .kind = .subagent,
+            .workspace_root = result.workspace_root,
+            .session_id = self.turn.child_id,
+        };
+        return result;
+    }
+
+    fn resolveLiveMcpView(
+        raw: *anyopaque,
+        alloc: Allocator,
+    ) !tool_mcp_runtime.ResolvedLiveView {
+        const self: *Context = @ptrCast(@alignCast(raw));
+        var authority = try self.turn.resolveLiveAuthority(alloc);
+        defer authority.deinit(alloc);
+        const view = authority.mcp_view orelse return error.McpRuntimeUnavailable;
+        authority.mcp_view = null;
+        return .{
+            .authority_generation = mcp_access.authorityGeneration(view),
+            .action_authority_generation = authority.generation,
+            .view = view,
+        };
+    }
+};
+
+pub fn run(
+    config: Config,
+    turn: *execution.TurnContext,
+    message: domain.QueuedMessage,
+    admission: domain.AdmissionSnapshot,
+    cancel: *std.atomic.Value(bool),
+) execution.ServiceError!execution.RunOutcome {
+    var arena_state = std.heap.ArenaAllocator.init(turn.alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var context = Context{
+        .config = config,
+        .turn = turn,
+        .admission = admission,
+        .cancel = cancel,
+    };
+    const history = turn.sessionRuntime().snapshotHistory(arena) catch return error.OutOfMemory;
+    const recovery_checkpoint = turn.snapshotRecoveryCheckpoint(arena) catch
+        return error.OutOfMemory;
+    const prompt = worker_runtime.QueuedPrompt{
+        .turn_id = 1,
+        .prompt = arena.dupe(u8, message.content) catch return error.OutOfMemory,
+        .images = &.{},
+        .model = arena.dupe(u8, admission.model) catch return error.OutOfMemory,
+        .api_key = arena.dupe(u8, config.tool_context.api_key) catch return error.OutOfMemory,
+        .gateway_team = if (config.tool_context.gateway_team) |team|
+            arena.dupe(u8, team) catch return error.OutOfMemory
+        else
+            null,
+        .credential_source = config.tool_context.credential_source,
+        .permission_mode = admission.permission_mode,
+        .sandbox_backend = admission.sandbox_backend,
+        .history = history,
+        .root_user_intent_context = if (message.root_user_intent_context.len > 0)
+            arena.dupe(u8, message.root_user_intent_context) catch return error.OutOfMemory
+        else
+            &.{},
+        .grants = types.dupePermissionGrantSlice(arena, admission.grants) catch return error.OutOfMemory,
+        .agent_settings = .{
+            .max_tool_result_bytes = config.tool_context.max_tool_result_bytes,
+            .first_call_tool_choice = config.tool_context.first_call_tool_choice,
+            .fast_mode = config.tool_context.fast_mode,
+            .effort = admission.effort,
+        },
+        .recovery_checkpoint = recovery_checkpoint,
+        .recovery_source_already_presented = recovery_checkpoint != null,
+    };
+    const deps = runtimeDeps(&context);
+    execution.runNormalAgentTurn(
+        &deps,
+        null,
+        .{
+            .view = config.lifecycle_view,
+            .scope = .{
+                .kind = .subagent,
+                .workspace_root = config.tool_context.workspace_root,
+                .session_id = turn.child_id,
+            },
+            .outcome_allocator = turn.alloc,
+        },
+        .{
+            .system_prompt = config.system_prompt,
+            .model_prompt_overlay = config.model_prompt_overlay,
+            .skills_prompt_section = config.skills_prompt_section,
+            .explicit_skills_prompt_section = config.explicit_skills_prompt_section,
+            .gateway_retry_count = config.tool_context.gateway_retry_count,
+            .gateway_chat_url = config.tool_context.gateway_chat_url,
+            .gateway_tools_json = config.gateway_tools_json,
+            .custom_tool_guidance = config.custom_tool_guidance,
+            .agent_step_limit = config.tool_context.agent_step_limit,
+            .max_tool_result_bytes = config.tool_context.max_tool_result_bytes,
+            .cancel_flag = cancel,
+            .fast_mode = config.tool_context.fast_mode,
+            .effort = admission.effort,
+            .first_call_tool_choice = config.tool_context.first_call_tool_choice,
+            .workspace_root = config.tool_context.workspace_root,
+            .access_scope = config.tool_context.access_scope,
+            .origin = .subagent,
+            .root_user_intent_context = message.root_user_intent_context,
+            .session_child_capability = turn.childCapability() catch null,
+            .context_limits = config.tool_context.context_limits,
+        },
+        prompt,
+    ) catch |err| {
+        const mapped: execution.ServiceError = switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Cancelled => error.Cancelled,
+            else => error.ProviderFailed,
+        };
+        if (mapped != error.OutOfMemory) {
+            turn.setFailureDiagnostic("agent_turn_failed", @errorName(err)) catch
+                return error.OutOfMemory;
+        }
+        return mapped;
+    };
+    return if (context.turn_outcome == .paused) .paused else .completed;
+}
+
+fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
+    return .{
+        .ctx = context,
+        .agent_stream_provider = context.config.tool_context.agent_stream_provider,
+        .tool_registry = context.config.tool_context.tool_registry,
+        .context_registry = context.config.context_registry,
+        .context_enabled = context.config.context_enabled,
+        .finalize_turn = finalizeTurn,
+        .live_tool_authority = context.turn.liveToolAuthorityProvider(),
+        .tool_activity_recorder = context.turn.toolActivityRecorder(),
+        .prepare_parent_turn_context = prepareParentTurnContext,
+        .acknowledge_parent_turn_context = acknowledgeParentTurnContext,
+        .append_runtime_context = appendRuntimeContext,
+        .append_static_context = appendStaticContext,
+        .validate_tool_call = validateToolCall,
+        .check_tool_availability = checkToolAvailability,
+        .request_tool_permission = requestToolPermission,
+        .request_prepared_file_mutation_permission = requestPreparedFileMutationPermission,
+        .request_sandbox_widening = requestSandboxWidening,
+        .describe_tool_action = describeToolAction,
+        .describe_tool_action_completed = describeToolAction,
+        .describe_tool_action_denied = describeToolActionDenied,
+        .permission_target_for_call = permissionTargetForCall,
+        .execute_tool_call = executeToolCall,
+        .publish_committed_file_handoff = publishCommittedFileHandoff,
+        .propagate_history_turn = propagateHistoryTurn,
+        .recovery_checkpoint = .{
+            .set = setRecoveryCheckpoint,
+        },
+        .propagate_grant = discardGrant,
+        .push_event = pushLiveEvent,
+        .push_text = pushLiveText,
+        .push_tool_lifecycle = pushLiveToolLifecycle,
+        .push_diff_block = pushLiveDiff,
+        .push_system_notice = pushLiveNotice,
+        .push_route_recovery_status = pushLiveRouteRecoveryStatus,
+        .push_command_output_complete = pushLiveCommandOutputComplete,
+        .push_http_error = captureHttpError,
+        .format_tool_execution_error = formatToolExecutionError,
+        .report_usage = reportUsage,
+        .usage = &context.turn.sessionRuntime().usage,
+        .usage_allocator = context.turn.alloc,
+    };
+}
+
+fn finalizeTurn(
+    raw: *anyopaque,
+    _: u64,
+    outcome: types.TurnPresentationOutcome,
+    _: ?types.ProviderCompletionDisposition,
+) !void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    context.turn_outcome = outcome;
+}
+
+fn prepareParentTurnContext(
+    raw: *anyopaque,
+    arena: Allocator,
+) !?agent_runtime.PreparedParentTurnContext {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    const child_id = context.turn.child_id orelse return null;
+    return parent_delivery_projector.prepare(
+        arena,
+        context.config.host.sessions,
+        child_id,
+        context.config.host.manager.options.child_store,
+    );
+}
+
+fn acknowledgeParentTurnContext(
+    raw: *anyopaque,
+    arena: Allocator,
+    acknowledgements: []const agent_runtime.ParentTurnDeliveryAck,
+) void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    parent_delivery_projector.acknowledge(
+        arena,
+        context.config.host.sessions,
+        context.config.host.manager.options.child_store,
+        acknowledgements,
+    );
+}
+
+fn appendRuntimeContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayList(types.ChatMessage)) !void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    const tool_ctx = context.toolContext();
+    try context.config.context_registry.appendDefaultTransient(.{
+        .workspace_root = tool_ctx.workspace_root,
+        .access_scope = tool_ctx.access_scope,
+        .interactive = false,
+        .permission_mode = context.admission.permission_mode,
+        .sandbox_backend = context.admission.sandbox_backend,
+        .tracker = null,
+        .background = tool_ctx.background,
+        .session = context.turn.sessionRuntime(),
+    }, arena, messages);
+}
+
+fn appendStaticContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayList(types.ChatMessage)) !void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    try context.config.context_registry.appendDefaultStatic(.{
+        .project_context = context.config.project_context,
+    }, arena, messages);
+}
+
+fn validateToolCall(raw: *anyopaque, arena: Allocator, call: types.ToolCall) !agent_runtime.ToolCallValidationResult {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    return tool_runtime.validateToolCall(context.toolContext(), arena, call);
+}
+
+fn checkToolAvailability(raw: *anyopaque, arena: Allocator, call: types.ToolCall) !?[]const u8 {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    return tool_runtime.checkToolAvailability(context.toolContext(), arena, call);
+}
+
+fn admissionContext(
+    context: *Context,
+    dynamic_names: []const []const u8,
+    review: ?auto_classifier.ReviewTurnContext,
+) tool_runtime.Context {
+    var tool_ctx = tool_runtime.withAdvertisedDynamicToolNames(context.toolContext(), dynamic_names);
+    tool_ctx.permission_review_turn = review;
+    tool_ctx.permission_prompter = context.turn.permissionPrompter();
+    return tool_ctx;
+}
+
+fn requestToolPermission(
+    raw: *anyopaque,
+    arena: Allocator,
+    call: types.ToolCall,
+    review: auto_classifier.ReviewTurnContext,
+    mode: types.PermissionMode,
+    grants: []const types.PermissionGrant,
+    live: ?agent_runtime.LiveToolAuthority,
+    revalidation: ?agent_runtime.LivePermissionRevalidation,
+    dynamic_names: []const []const u8,
+) !command_admission.PermissionOutcome {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    const tool_ctx = admissionContext(context, dynamic_names, review);
+    if (revalidation) |request| return switch (request) {
+        .action => |action| tool_admission.revalidateLiveActionPermissionOutcome(
+            tool_ctx.admissionInputWithLiveAuthority(live),
+            arena,
+            call,
+            mode,
+            grants,
+            action.authority,
+            action.human_approval,
+        ),
+        .sandbox_widening => |widening| tool_admission.revalidateLiveSandboxWideningOutcome(
+            tool_ctx.admissionInputWithLiveAuthority(live),
+            arena,
+            call,
+            mode,
+            grants,
+            widening.authority,
+            widening.required.wideningInput(),
+            widening.human_approval,
+        ),
+    };
+    return tool_admission.requestPermissionOutcome(
+        tool_ctx.admissionInputWithLiveAuthority(live),
+        arena,
+        call,
+        mode,
+        grants,
+    );
+}
+
+fn requestPreparedFileMutationPermission(
+    raw: *anyopaque,
+    arena: Allocator,
+    call: types.ToolCall,
+    prepared: *tool_admission.PreparedFileMutationCall,
+    review: auto_classifier.ReviewTurnContext,
+    mode: types.PermissionMode,
+    grants: []const types.PermissionGrant,
+    live: ?agent_runtime.LiveToolAuthority,
+    dynamic_names: []const []const u8,
+) !command_admission.PermissionOutcome {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    const tool_ctx = admissionContext(context, dynamic_names, review);
+    return tool_admission.requestPreparedFileMutationPermissionOutcome(
+        tool_ctx.admissionInputWithLiveAuthority(live),
+        arena,
+        call,
+        prepared,
+        mode,
+        grants,
+    );
+}
+
+fn requestSandboxWidening(
+    raw: *anyopaque,
+    arena: Allocator,
+    call: types.ToolCall,
+    review: auto_classifier.ReviewTurnContext,
+    mode: types.PermissionMode,
+    grants: []const types.PermissionGrant,
+    live: ?agent_runtime.LiveToolAuthority,
+    dynamic_names: []const []const u8,
+    required: agent_runtime.SandboxScopeRequired,
+) !command_admission.PermissionOutcome {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    const tool_ctx = admissionContext(context, dynamic_names, review);
+    return tool_admission.requestSandboxWideningOutcome(
+        tool_ctx.admissionInputWithLiveAuthority(live),
+        arena,
+        call,
+        mode,
+        grants,
+        required.wideningInput(),
+    );
+}
+
+fn describeToolAction(raw: *anyopaque, arena: Allocator, call: types.ToolCall, file_path: ?[]const u8, _: []const []const u8) ![]const u8 {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    return tool_presentation.formatPlainAction(arena, .{
+        .tool_registry = context.config.tool_context.tool_registry,
+        .call = call,
+        .workspace_root = context.config.tool_context.workspace_root,
+        .file_display_path = file_path,
+    });
+}
+
+fn describeToolActionDenied(raw: *anyopaque, arena: Allocator, call: types.ToolCall, file_path: ?[]const u8, label: []const u8, dynamic_names: []const []const u8) ![]const u8 {
+    const action = try describeToolAction(raw, arena, call, file_path, dynamic_names);
+    return std.fmt.allocPrint(arena, "{s}: {s}", .{ label, action });
+}
+
+fn permissionTargetForCall(raw: *anyopaque, arena: Allocator, call: types.ToolCall, dynamic_names: []const []const u8) ![]const u8 {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    const tool_ctx = tool_runtime.withAdvertisedDynamicToolNames(context.toolContext(), dynamic_names);
+    return tool_admission.permissionTargetForLiveAuthority(
+        tool_ctx.admissionInput(),
+        arena,
+        call,
+    );
+}
+
+fn executeToolCall(raw: *anyopaque, request: agent_runtime.ToolExecutionRequest) !agent_runtime.ToolExecutionResult {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    var tool_ctx = context.toolContext();
+    tool_ctx.root_user_intent_context = request.root_user_intent_context;
+    return tool_runtime.executeToolCallAuthorized(tool_ctx, request);
+}
+
+fn propagateHistoryTurn(raw: *anyopaque, turn: types.HistoryTurn) !void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    try context.turn.commit(
+        context.turn.active_work_id orelse return error.StaleWork,
+        turn,
+        context.input_tokens,
+        context.output_tokens,
+        io_mod.milliTimestamp(),
+    );
+}
+
+fn setRecoveryCheckpoint(
+    raw: *anyopaque,
+    checkpoint: session_codec.RecoveryCheckpoint,
+) !void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    try context.turn.setRecoveryCheckpoint(checkpoint, io_mod.milliTimestamp());
+}
+
+fn reportUsage(raw: *anyopaque, usage: types.Usage) void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    if (usage.input_tokens) |value| context.input_tokens = value;
+    if (usage.output_tokens) |value| context.output_tokens = value;
+}
+
+fn publishCommittedFileHandoff(_: *anyopaque, _: file_mutation.CommittedFileHandoff) agent_runtime.SecondaryPublicationReport {
+    return .{ .diff = .skipped, .tracker = .skipped };
+}
+
+fn formatToolExecutionError(_: *anyopaque, arena: Allocator, tool_name: []const u8, err: anyerror) ![]const u8 {
+    return tool_result_errors.formatToolExecutionErrorJson(arena, tool_name, err);
+}
+
+fn discardGrant(_: *anyopaque, _: []const u8, _: []const u8) !void {}
+fn pushLiveText(raw: *anyopaque, emission: agent_runtime.TextEmission) !void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    switch (emission) {
+        .assistant_source => {},
+        .assistant_rendered => |text| context.turn.appendLiveText(text),
+        .operational => |text| context.turn.appendLiveText(text),
+    }
+}
+fn pushLiveNotice(raw: *anyopaque, text: []const u8) !void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    context.turn.appendLiveText(text);
+}
+
+fn pushLiveToolLifecycle(
+    raw: *anyopaque,
+    event: types.ToolLifecycleEvent,
+) !void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    context.turn.appendLiveEvent(.{ .tool_lifecycle = event });
+}
+
+fn pushLiveDiff(
+    raw: *anyopaque,
+    payload: agent_runtime.DiffEntryPayload,
+) !void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    defer diff_mod.freeDiffEntryPayload(std.heap.c_allocator, payload);
+    context.turn.appendLiveEvent(.{ .diff_block = payload });
+}
+
+fn pushLiveCommandOutputComplete(
+    raw: *anyopaque,
+    lifecycle_id: ?types.ToolLifecycleId,
+) !void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    context.turn.appendLiveEvent(.{
+        .command_output_complete = lifecycle_id,
+    });
+}
+
+fn pushLiveRouteRecoveryStatus(
+    raw: *anyopaque,
+    status: types.RouteRecoveryStatus,
+) !void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    context.turn.appendLiveEvent(.{ .route_recovery_status = status });
+}
+
+fn captureHttpError(
+    raw: *anyopaque,
+    status: std.http.Status,
+    detail: []const u8,
+    _: ?types.CredentialSource,
+) !void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    const formatted = try gateway_error_format.formatHttpErrorMessage(
+        context.turn.alloc,
+        status,
+        detail,
+    );
+    defer context.turn.alloc.free(formatted);
+    const redacted = try execution_memory.redactText(context.turn.alloc, formatted);
+    defer context.turn.alloc.free(redacted);
+    try context.turn.setFailureDiagnostic("provider_http_error", redacted);
+}
+
+fn pushLiveEvent(raw: *anyopaque, event: worker_runtime.WorkerEvent) !void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    context.turn.appendLiveEvent(event);
+    worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
+}
+
+fn pushLiveOutputChunk(
+    raw: *anyopaque,
+    lifecycle_id: ?types.ToolLifecycleId,
+    stream: command_output_content.Stream,
+    text: []const u8,
+) anyerror!void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    context.turn.appendLiveEvent(.{ .command_output = .{
+        .lifecycle_id = lifecycle_id,
+        .stream = stream,
+        .text = @constCast(text),
+    } });
+}
+fn discardBackgroundUrl(_: *anyopaque, _: u64, _: []const u8) void {}

@@ -1,0 +1,52 @@
+# Single-task Terminal-Bench smoke eval for fx.
+# FxAgent uploads evals/images/fx into each registered task container.
+jobs_dir: evals/jobs-out
+n_attempts: 1
+timeout_multiplier: 1.0
+n_concurrent_trials: 1
+quiet: false
+
+environment:
+  type: docker
+  force_build: true
+  delete: true
+
+agents:
+  - name: fx
+    import_path: evals.agents.fx_agent:FxAgent
+    model_name: anthropic/claude-sonnet-4.6
+
+datasets:
+  - name: terminal-bench/terminal-bench-2
+    task_names:
+      - terminal-bench/break-filter-js-from-html
+    download_dir: evals/.build/harbor-datasets
+
+metrics:
+  - type: uv-script
+    kwargs:
+      script_path: evals/metrics/fx_metrics.py
+
+artifacts:
+  - source: /logs/agent
+    destination: agent
+  - source: /logs/verifier
+    destination: verifier
+  - source: /logs/artifacts
+    destination: fx-run
+  - source: /tmp/fx-home/.fx
+    destination: fx-home
+  - source: /app
+    destination: workspace
+    exclude:
+      - node_modules
+      - .git
+      - .cache
+      - __pycache__
+      - .pytest_cache
+      - dist
+      - build
+      - coverage
+      - target
+      - .venv
+      - venv

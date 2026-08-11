@@ -1,0 +1,33 @@
+# Optional qualitative RewardKit judge example.
+# This is not part of normal fx release signoff.
+
+[judge]
+judge = "anthropic/claude-sonnet-4-6"
+files = ["/app/evals/runs/latest.md", "/logs/artifacts/fx-result.json"]
+timeout = 120
+reasoning_effort = "medium"
+weight = 1.0
+
+[[criterion]]
+name = "release_risk_signal"
+description = "Does the review identify behavior-changing release risks and avoid treating style-only notes as blockers?"
+type = "likert"
+points = 5
+weight = 2.0
+
+[[criterion]]
+name = "evidence_quality"
+description = "Does the review cite concrete files, commands, or artifacts instead of relying on unsupported impressions?"
+type = "likert"
+points = 5
+weight = 1.0
+
+[[criterion]]
+name = "deterministic_gate_respected"
+description = "Does the review keep deterministic release verifiers as the required release signal?"
+type = "binary"
+weight = 2.0
+
+[scoring]
+aggregation = "threshold"
+threshold = 0.8

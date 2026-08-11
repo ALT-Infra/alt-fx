@@ -1,0 +1,476 @@
+const std = @import("std");
+const command_classification = @import("../shell_command/command_classification.zig");
+
+const RiskKind = enum {
+    discard_version_control_state,
+    forceful_file_removal,
+};
+
+/// Returns a short policy note for command text with a high-risk shape.
+pub fn command_risk_note_for(command: []const u8) ?[]const u8 {
+    const analysis = command_classification.analysis_command_tail(command);
+    const risk = risk_kind_in_analysis(analysis) orelse return null;
+    return risk_note_for(risk);
+}
+
+/// Returns a narrow alternative when the command text makes a safer path obvious.
+pub fn command_safer_alternative_for(command: []const u8) ?[]const u8 {
+    const analysis = command_classification.analysis_command_tail(command);
+    if (risk_kind_in_analysis(analysis)) |risk| {
+        return safer_alternative_for_risk(risk);
+    }
+
+    if (has_shell_boundary(command)) return null;
+    const base = command_classification.base_command_token(analysis) orelse return null;
+    if (std.mem.eql(u8, base, "cat") or std.mem.eql(u8, base, "less") or std.mem.eql(u8, base, "more")) {
+        return "safer: use read_file for file inspection";
+    }
+    if (std.mem.eql(u8, base, "ls")) {
+        return "safer: use list_files or glob_files for discovery";
+    }
+    if (is_pattern_matcher(base)) {
+        return "safer: use grep_files for exact local search";
+    }
+    if (std.mem.eql(u8, base, "find")) {
+        return "safer: use glob_files or list_files for discovery";
+    }
+    return null;
+}
+
+fn risk_note_for(risk: RiskKind) []const u8 {
+    return switch (risk) {
+        .discard_version_control_state => "note: command may discard version-control state",
+        .forceful_file_removal => "note: command may remove files forcefully",
+    };
+}
+
+fn safer_alternative_for_risk(risk: RiskKind) []const u8 {
+    return switch (risk) {
+        .discard_version_control_state => "safer: inspect git status first and revert only the intended files",
+        .forceful_file_removal => "safer: inspect targets first or use delete_file for explicit files",
+    };
+}
+
+/// Returns an informational annotation for non-error non-zero exit codes.
+pub fn semantic_exit_annotation(command_text: []const u8, exit_code: i64, stderr_text: []const u8) ?[]const u8 {
+    if (exit_code == 0) return null;
+
+    const analysis = command_classification.analysis_command_tail(command_text);
+    const terminal = command_classification.terminal_exit_segment(analysis) orelse return null;
+    const base = command_classification.base_command_token(terminal) orelse return null;
+
+    if (is_pattern_matcher(base)) {
+        return if (exit_code == 1) "note: no matches found" else null;
+    }
+    if (std.mem.eql(u8, base, "find")) {
+        if (exit_code != 1 or !looks_like_find_access_issue(stderr_text)) return null;
+        return "note: some paths could not be read";
+    }
+    if (std.mem.eql(u8, base, "diff") or std.mem.eql(u8, base, "cmp")) {
+        return if (exit_code == 1) "note: compared files differ" else null;
+    }
+    if (std.mem.eql(u8, base, "test") or std.mem.eql(u8, base, "[")) {
+        return if (exit_code == 1) "note: condition evaluated false" else null;
+    }
+    return null;
+}
+
+fn risk_kind_in_analysis(command: []const u8) ?RiskKind {
+    if (warning_at_command_position(command)) |risk| return risk;
+
+    var in_single = false;
+    var in_double = false;
+    var escaped = false;
+    var i: usize = 0;
+    while (i < command.len) : (i += 1) {
+        const ch = command[i];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (ch == '\\' and !in_single) {
+            escaped = true;
+            continue;
+        }
+        if (ch == '\'' and !in_double) {
+            in_single = !in_single;
+            continue;
+        }
+        if (ch == '"' and !in_single) {
+            in_double = !in_double;
+            continue;
+        }
+        if (in_single or in_double) continue;
+
+        const boundary_end = switch (ch) {
+            ';', '\n', '&' => blk: {
+                if (ch == '&' and i + 1 < command.len and command[i + 1] == '&') {
+                    i += 1;
+                    break :blk i + 1;
+                }
+                break :blk i + 1;
+            },
+            '|' => blk: {
+                if (i + 1 < command.len and command[i + 1] == '|') {
+                    i += 1;
+                    break :blk i + 1;
+                }
+                break :blk i + 1;
+            },
+            else => continue,
+        };
+        if (warning_at_command_position(command[boundary_end..])) |risk| return risk;
+    }
+    return null;
+}
+
+fn warning_at_command_position(command: []const u8) ?RiskKind {
+    var cursor = command_classification.skip_whitespace(command, 0);
+    while (command_classification.next_token(command, cursor)) |token| {
+        if (!command_classification.is_env_assignment(token.text)) break;
+        cursor = token.end;
+    }
+    const first = command_classification.next_token(command, cursor) orelse return null;
+
+    if (privileged_command_tail(command, first)) |tail| {
+        if (warning_at_command_position(tail)) |risk| return risk;
+    }
+
+    const rest = command[first.end..];
+    if (git_hard_reset(first.text, rest)) |risk| return risk;
+    if (forceful_file_removal(first.text, rest)) |risk| return risk;
+    return null;
+}
+
+fn privileged_command_tail(command: []const u8, first: command_classification.Token) ?[]const u8 {
+    if (std.mem.eql(u8, first.text, "sudo") or std.mem.eql(u8, first.text, "doas")) {
+        return sudo_like_command_tail(command, first.end);
+    }
+    if (std.mem.eql(u8, first.text, "su")) {
+        return su_command_tail(command, first.end);
+    }
+    return null;
+}
+
+fn sudo_like_command_tail(command: []const u8, start: usize) ?[]const u8 {
+    var cursor = start;
+    while (command_classification.next_token(command, cursor)) |token| {
+        if (std.mem.eql(u8, token.text, "--")) {
+            const next = command_classification.next_token(command, token.end) orelse return null;
+            return command[next.start..];
+        }
+        if (command_classification.is_env_assignment(token.text)) {
+            cursor = token.end;
+            continue;
+        }
+        if (std.mem.startsWith(u8, token.text, "-")) {
+            if (privilege_option_takes_value(token.text)) {
+                const value = command_classification.next_token(command, token.end) orelse return null;
+                cursor = value.end;
+            } else {
+                cursor = token.end;
+            }
+            continue;
+        }
+        return command[token.start..];
+    }
+    return null;
+}
+
+fn privilege_option_takes_value(option: []const u8) bool {
+    return std.mem.eql(u8, option, "-u") or
+        std.mem.eql(u8, option, "-g") or
+        std.mem.eql(u8, option, "-h") or
+        std.mem.eql(u8, option, "-p") or
+        std.mem.eql(u8, option, "-C") or
+        std.mem.eql(u8, option, "-T") or
+        std.mem.eql(u8, option, "-U") or
+        std.mem.eql(u8, option, "--user") or
+        std.mem.eql(u8, option, "--group") or
+        std.mem.eql(u8, option, "--host") or
+        std.mem.eql(u8, option, "--prompt") or
+        std.mem.eql(u8, option, "--close-from") or
+        std.mem.eql(u8, option, "--command-timeout") or
+        std.mem.eql(u8, option, "--other-user");
+}
+
+fn su_command_tail(command: []const u8, start: usize) ?[]const u8 {
+    var cursor = start;
+    while (command_classification.next_token(command, cursor)) |token| {
+        if (std.mem.eql(u8, token.text, "-c")) {
+            return parse_su_command_argument(command, token.end);
+        }
+        cursor = token.end;
+    }
+    return null;
+}
+
+fn parse_su_command_argument(command: []const u8, start: usize) ?[]const u8 {
+    const cursor = command_classification.skip_whitespace(command, start);
+    if (cursor >= command.len) return null;
+
+    const quote = command[cursor];
+    if (quote == '\'' or quote == '"') {
+        const payload_start = cursor + 1;
+        var escaped = false;
+        var i = payload_start;
+        while (i < command.len) : (i += 1) {
+            const ch = command[i];
+            if (escaped) {
+                escaped = false;
+                continue;
+            }
+            if (quote == '"' and ch == '\\') {
+                escaped = true;
+                continue;
+            }
+            if (ch == quote) return command[payload_start..i];
+        }
+        return null;
+    }
+
+    const token = command_classification.next_token(command, cursor) orelse return null;
+    return token.text;
+}
+
+fn git_hard_reset(command_name: []const u8, rest: []const u8) ?RiskKind {
+    if (!std.mem.eql(u8, command_name, "git")) return null;
+
+    const sub = command_classification.next_token(rest, 0) orelse return null;
+    const args = rest[sub.end..];
+
+    if (std.mem.eql(u8, sub.text, "reset") and has_token(args, "--hard")) {
+        return .discard_version_control_state;
+    }
+    return null;
+}
+
+fn forceful_file_removal(command_name: []const u8, rest: []const u8) ?RiskKind {
+    if (!std.mem.eql(u8, command_name, "rm")) return null;
+
+    var has_recursive = false;
+    var has_force = false;
+    var cursor: usize = 0;
+    while (command_classification.next_token(rest, cursor)) |token| {
+        cursor = token.end;
+        if (!std.mem.startsWith(u8, token.text, "-")) continue;
+        if (std.mem.eql(u8, token.text, "--recursive") or std.mem.eql(u8, token.text, "-r") or std.mem.eql(u8, token.text, "-R")) has_recursive = true;
+        if (std.mem.eql(u8, token.text, "--force") or std.mem.eql(u8, token.text, "-f")) has_force = true;
+        if (token.text.len > 1 and token.text[1] != '-') {
+            for (token.text[1..]) |ch| {
+                if (ch == 'r' or ch == 'R') has_recursive = true;
+                if (ch == 'f') has_force = true;
+            }
+        }
+    }
+    return if (has_recursive or has_force) .forceful_file_removal else null;
+}
+
+fn is_pattern_matcher(command: []const u8) bool {
+    return std.mem.eql(u8, command, "grep") or
+        std.mem.eql(u8, command, "egrep") or
+        std.mem.eql(u8, command, "fgrep") or
+        std.mem.eql(u8, command, "rg") or
+        std.mem.eql(u8, command, "ag");
+}
+
+fn looks_like_find_access_issue(stderr_text: []const u8) bool {
+    return contains_ascii_ignore_case(stderr_text, "permission denied") or
+        contains_ascii_ignore_case(stderr_text, "operation not permitted");
+}
+
+fn has_token(rest: []const u8, needle: []const u8) bool {
+    var cursor: usize = 0;
+    while (command_classification.next_token(rest, cursor)) |token| {
+        cursor = token.end;
+        if (std.mem.eql(u8, token.text, needle)) return true;
+    }
+    return false;
+}
+
+fn contains_ascii_ignore_case(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (haystack.len < needle.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (ascii_eql_ignore_case(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+fn ascii_eql_ignore_case(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (std.ascii.toLower(left) != std.ascii.toLower(right)) return false;
+    }
+    return true;
+}
+
+fn has_shell_boundary(command: []const u8) bool {
+    return std.mem.findScalar(u8, command, ';') != null or
+        std.mem.findScalar(u8, command, '&') != null or
+        std.mem.findScalar(u8, command, '|') != null or
+        std.mem.findScalar(u8, command, '<') != null or
+        std.mem.findScalar(u8, command, '>') != null or
+        std.mem.findScalar(u8, command, '$') != null or
+        std.mem.findScalar(u8, command, '`') != null or
+        std.mem.findScalar(u8, command, '\n') != null;
+}
+
+test "command risk note detects git hard reset" {
+    try std.testing.expectEqualStrings("note: command may discard version-control state", command_risk_note_for("git reset --hard").?);
+}
+
+test "command safer alternative explains risky commands" {
+    try std.testing.expectEqualStrings("safer: inspect git status first and revert only the intended files", command_safer_alternative_for("git reset --hard").?);
+    try std.testing.expectEqualStrings("safer: inspect targets first or use delete_file for explicit files", command_safer_alternative_for("rm -rf /tmp/x").?);
+}
+
+test "command safer alternative maps shell inspection to dedicated tools" {
+    try std.testing.expectEqualStrings("safer: use read_file for file inspection", command_safer_alternative_for("cat src/main.zig").?);
+    try std.testing.expectEqualStrings("safer: use list_files or glob_files for discovery", command_safer_alternative_for("ls src").?);
+    try std.testing.expectEqualStrings("safer: use grep_files for exact local search", command_safer_alternative_for("rg needle src").?);
+    try std.testing.expectEqualStrings("safer: use glob_files or list_files for discovery", command_safer_alternative_for("find src -name '*.zig'").?);
+}
+
+test "command safer alternative stays conservative for compound commands" {
+    try std.testing.expect(command_safer_alternative_for("cat src/main.zig | wc -l") == null);
+    try std.testing.expect(command_safer_alternative_for("git status") == null);
+}
+
+test "command risk note stays narrow for ordinary git operations" {
+    try std.testing.expect(command_risk_note_for("git status") == null);
+    try std.testing.expect(command_risk_note_for("git log --oneline") == null);
+    try std.testing.expect(command_risk_note_for("git commit --no-verify -m ok") == null);
+}
+
+test "command risk note detects forceful removal" {
+    try std.testing.expectEqualStrings("note: command may remove files forcefully", command_risk_note_for("rm -rf /tmp/x").?);
+}
+
+test "command risk note detects privilege-wrapped removal" {
+    try std.testing.expectEqualStrings("note: command may remove files forcefully", command_risk_note_for("sudo rm -rf /tmp").?);
+    try std.testing.expectEqualStrings("note: command may remove files forcefully", command_risk_note_for("doas rm -rf /tmp").?);
+}
+
+test "command risk note detects privilege-wrapped git reset" {
+    try std.testing.expectEqualStrings("note: command may discard version-control state", command_risk_note_for("sudo git reset --hard").?);
+}
+
+test "command risk note detects quoted su command payload" {
+    try std.testing.expectEqualStrings("note: command may remove files forcefully", command_risk_note_for("su -c 'rm -rf /tmp'").?);
+    try std.testing.expectEqualStrings("note: command may discard version-control state", command_risk_note_for("su -c \"git reset --hard\"").?);
+    try std.testing.expectEqualStrings("note: command may remove files forcefully", command_risk_note_for("su root -c 'rm -rf /tmp'").?);
+}
+
+test "command risk note fails closed for malformed su command payload" {
+    try std.testing.expect(command_risk_note_for("su -c 'rm -rf /tmp") == null);
+    try std.testing.expect(command_risk_note_for("su -c \"git reset --hard") == null);
+}
+
+test "command risk note detects process-control wrapped removal" {
+    try std.testing.expect(command_risk_note_for("nice rm -rf /tmp") != null);
+}
+
+test "command risk note detects timeout wrapped git reset" {
+    try std.testing.expect(command_risk_note_for("timeout 5 git reset --hard") != null);
+}
+
+test "command risk note detects safe env wrapped git reset" {
+    try std.testing.expect(command_risk_note_for("env NODE_ENV=prod git reset --hard") != null);
+}
+
+test "command risk note sees removal after unknown env prefix" {
+    try std.testing.expectEqualStrings("note: command may remove files forcefully", command_risk_note_for("MY_SECRET=x rm -rf /tmp").?);
+}
+
+test "command risk note ignores quoted command text" {
+    try std.testing.expect(command_risk_note_for("echo 'rm -rf /tmp'") == null);
+}
+
+test "command risk note ignores command text in argument string" {
+    try std.testing.expect(command_risk_note_for("git commit -m \"rm -rf /tmp\"") == null);
+}
+
+test "command risk note detects command after sequence boundary" {
+    try std.testing.expect(command_risk_note_for("echo ok; rm -f scratch") != null);
+}
+
+test "semantic annotation explains grep exit one" {
+    try std.testing.expectEqualStrings("note: no matches found", semantic_exit_annotation("grep foo bar", 1, "").?);
+}
+
+test "semantic annotation leaves grep real errors alone" {
+    try std.testing.expect(semantic_exit_annotation("grep foo bar", 2, "") == null);
+}
+
+test "semantic annotation leaves zero exits alone" {
+    try std.testing.expect(semantic_exit_annotation("grep foo bar", 0, "") == null);
+}
+
+test "semantic annotation explains find partial access" {
+    try std.testing.expectEqualStrings("note: some paths could not be read", semantic_exit_annotation("find /tmp -name foo", 1, "find: /tmp/private: Permission denied").?);
+    try std.testing.expectEqualStrings("note: some paths could not be read", semantic_exit_annotation("find /tmp -name foo", 1, "find: /tmp/private: Operation not permitted").?);
+}
+
+test "semantic annotation leaves find usage errors alone" {
+    try std.testing.expect(semantic_exit_annotation("find /tmp -bad", 1, "find: -bad: unknown primary or operator") == null);
+    try std.testing.expect(semantic_exit_annotation("find /tmp -name", 1, "find: -name: requires additional arguments") == null);
+}
+
+test "semantic annotation explains diff differences" {
+    try std.testing.expectEqualStrings("note: compared files differ", semantic_exit_annotation("diff a b", 1, "").?);
+}
+
+test "semantic annotation explains test false" {
+    try std.testing.expectEqualStrings("note: condition evaluated false", semantic_exit_annotation("test -f foo", 1, "").?);
+}
+
+test "semantic annotation explains bracket alias false" {
+    try std.testing.expectEqualStrings("note: condition evaluated false", semantic_exit_annotation("[ -f foo ]", 1, "").?);
+}
+
+test "semantic annotation handles wrapped grep" {
+    try std.testing.expectEqualStrings("note: no matches found", semantic_exit_annotation("timeout 5 grep foo bar.txt", 1, "").?);
+}
+
+test "semantic annotation uses last pipe segment" {
+    try std.testing.expectEqualStrings("note: no matches found", semantic_exit_annotation("diff a b | grep changed", 1, "").?);
+}
+
+test "semantic annotation uses last sequence segment" {
+    try std.testing.expectEqualStrings("note: no matches found", semantic_exit_annotation("ls -la; grep foo bar.txt", 1, "").?);
+}
+
+test "semantic annotation uses last newline segment" {
+    try std.testing.expectEqualStrings("note: no matches found", semantic_exit_annotation("ls -la\ngrep foo bar.txt", 1, "").?);
+}
+
+test "semantic annotation ignores default last pipe segment" {
+    try std.testing.expect(semantic_exit_annotation("grep foo bar | wc -l", 1, "") == null);
+}
+
+test "semantic annotation declines short circuit commands" {
+    try std.testing.expect(semantic_exit_annotation("grep foo bar && echo done", 1, "") == null);
+}
+
+test "semantic annotation declines background commands" {
+    try std.testing.expect(semantic_exit_annotation("true & grep foo bar", 1, "") == null);
+}
+
+test "semantic annotation ignores quoted pipe" {
+    try std.testing.expectEqualStrings("note: no matches found", semantic_exit_annotation("grep 'foo|bar' baz", 1, "").?);
+}
+
+test "semantic annotation ignores unknown base command" {
+    try std.testing.expect(semantic_exit_annotation("python3 myscript.py", 1, "") == null);
+}
+
+test "semantic annotation ignores default nonzero command" {
+    try std.testing.expect(semantic_exit_annotation("ls -z", 1, "") == null);
+}
+
+test "semantic annotation handles empty and malformed input" {
+    try std.testing.expect(semantic_exit_annotation("", 1, "") == null);
+    try std.testing.expect(semantic_exit_annotation("grep 'unterminated", 1, "") == null);
+}

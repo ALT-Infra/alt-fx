@@ -1,0 +1,44 @@
+schema_version = "1.1"
+multi_step_reward_strategy = "final"
+
+[task]
+name = "vercel-labs-fx/stateful-report"
+description = "Build a tiny status report across sequential Harbor steps."
+keywords = ["fx", "multi-step", "state"]
+
+[metadata]
+category = "coding"
+difficulty = "easy"
+
+[environment]
+build_timeout_sec = 600.0
+os = "linux"
+cpus = 1
+memory_mb = 2048
+storage_mb = 10240
+allow_internet = true
+
+[[steps]]
+name = "seed-report"
+min_reward = 1.0
+artifacts = ["/app/tasks.json", "/app/report.py"]
+
+[steps.agent]
+timeout_sec = 180.0
+user = "agent"
+
+[steps.verifier]
+timeout_sec = 45.0
+user = "root"
+
+[[steps]]
+name = "extend-report"
+artifacts = ["/app/tasks.json", "/app/report.py", "/app/report.txt"]
+
+[steps.agent]
+timeout_sec = 180.0
+user = "agent"
+
+[steps.verifier]
+timeout_sec = 45.0
+user = "root"

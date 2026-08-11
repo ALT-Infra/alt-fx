@@ -1,0 +1,66 @@
+# Manual local comparison eval.
+# Comparison models:
+# fx: anthropic/claude-opus-4.7 with high effort through Vercel AI Gateway
+# codex: openai/gpt-5.5 with high reasoning effort through Vercel AI Gateway
+# claude-code: anthropic/claude-opus-4.7 with high effort through Vercel AI Gateway
+# opencode: anthropic/claude-sonnet-4.6 through Vercel AI Gateway's OpenAI-compatible API
+jobs_dir: evals/jobs-out
+n_attempts: 1
+timeout_multiplier: 1.0
+n_concurrent_trials: 1
+quiet: false
+
+environment:
+  type: docker
+  force_build: true
+  delete: true
+
+agents:
+  - name: fx
+    import_path: evals.agents.fx_agent:FxAgent
+    model_name: anthropic/claude-opus-4.7
+    kwargs:
+      effort: high
+  - name: codex-gateway
+    import_path: evals.agents.codex_gateway:CodexGatewayAgent
+    model_name: openai/gpt-5.5
+    kwargs:
+      reasoning_effort: high
+  - name: claude-code-gateway
+    import_path: evals.agents.claude_gateway:ClaudeCodeGatewayAgent
+    model_name: anthropic/claude-opus-4.7
+    kwargs:
+      reasoning_effort: high
+  - name: opencode-gateway
+    import_path: evals.agents.opencode_gateway:OpenCodeGatewayAgent
+    model_name: openai/anthropic/claude-sonnet-4.6
+
+datasets:
+  - path: evals/datasets/fx-release
+
+metrics:
+  - type: uv-script
+    kwargs:
+      script_path: evals/metrics/fx_metrics.py
+
+artifacts:
+  - source: /logs/agent
+    destination: agent
+  - source: /logs/verifier
+    destination: verifier
+  - source: /logs/artifacts
+    destination: fx-run
+  - source: /app
+    destination: workspace
+    exclude:
+      - node_modules
+      - .git
+      - .cache
+      - __pycache__
+      - .pytest_cache
+      - dist
+      - build
+      - coverage
+      - target
+      - .venv
+      - venv

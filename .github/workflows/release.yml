@@ -1,0 +1,151 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      needed: ${{ steps.check.outputs.needed }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check if release needed
+        id: check
+        run: |
+          VERSION=$(grep 'pub const version' src/main.zig | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          TAG="v${VERSION}"
+          echo "version=${TAG}" >> "$GITHUB_OUTPUT"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "Tag ${TAG} exists, no release needed"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+            echo "Tag ${TAG} missing, release needed"
+          fi
+
+  build:
+    needs: check-version
+    if: needs.check-version.outputs.needed == 'true'
+    name: Build ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            target: x86_64-linux
+          - name: linux-aarch64
+            target: aarch64-linux
+          - name: macos-x86_64
+            target: x86_64-macos
+          - name: macos-aarch64
+            target: aarch64-macos
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
+
+      - name: Package
+        # sha256sum is available on all ubuntu runners used in this workflow
+        run: |
+          tar -czf fx-${{ matrix.name }}.tar.gz -C zig-out/bin fx
+          sha256sum fx-${{ matrix.name }}.tar.gz > fx-${{ matrix.name }}.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fx-${{ matrix.name }}
+          path: |
+            fx-${{ matrix.name }}.tar.gz
+            fx-${{ matrix.name }}.tar.gz.sha256
+
+  release:
+    needs: [check-version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create git tag
+        run: |
+          git tag ${{ needs.check-version.outputs.version }}
+          git push origin ${{ needs.check-version.outputs.version }}
+
+      - name: Extract changelog entry
+        run: |
+          awk '/<!-- release:start -->/{found=1; next} /<!-- release:end -->/{found=0} found{print}' CHANGELOG.md > /tmp/release-notes.md
+          LINES=$(wc -l < /tmp/release-notes.md | tr -d ' ')
+          if [ "$LINES" -lt 2 ]; then
+            echo "Error: No release notes found between <!-- release:start --> and <!-- release:end --> markers in CHANGELOG.md"
+            exit 1
+          fi
+          echo "Extracted release notes ($LINES lines)"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check-version.outputs.version }}
+          body_path: /tmp/release-notes.md
+          files: |
+            fx-*.tar.gz
+            fx-*.tar.gz.sha256
+
+      - name: Publish to CDN
+        env:
+          BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.check-version.outputs.version }}"
+          CDN_BASE="cli"
+
+          for FILE in fx-*.tar.gz fx-*.tar.gz.sha256; do
+            [ -f "$FILE" ] || continue
+            CONTENT_TYPE="application/octet-stream"
+            [[ "$FILE" == *.sha256 ]] && CONTENT_TYPE="text/plain"
+            [[ "$FILE" == *.tar.gz ]] && [[ "$FILE" != *.sha256 ]] && CONTENT_TYPE="application/gzip"
+
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+              -X PUT "https://blob.vercel-storage.com/${CDN_BASE}/${VERSION}/${FILE}" \
+              -H "Authorization: Bearer ${BLOB_READ_WRITE_TOKEN}" \
+              -H "x-api-version: 7" \
+              -H "x-content-type: ${CONTENT_TYPE}" \
+              -H "x-add-random-suffix: 0" \
+              -H "x-cache-control-max-age: 31536000" \
+              --data-binary "@${FILE}")
+            echo "Uploaded ${FILE} -> ${CDN_BASE}/${VERSION}/${FILE} ($HTTP_CODE)"
+            if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+              echo "::error::Failed to upload ${FILE} to CDN ($HTTP_CODE)"
+              exit 1
+            fi
+          done
+
+          echo -n "$VERSION" > /tmp/latest.txt
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X PUT "https://blob.vercel-storage.com/${CDN_BASE}/latest.txt" \
+            -H "Authorization: Bearer ${BLOB_READ_WRITE_TOKEN}" \
+            -H "x-api-version: 7" \
+            -H "x-content-type: text/plain" \
+            -H "x-add-random-suffix: 0" \
+            -H "x-cache-control-max-age: 60" \
+            --data-binary "@/tmp/latest.txt")
+          echo "Updated latest.txt to $VERSION ($HTTP_CODE)"

@@ -1,0 +1,268 @@
+const std = @import("std");
+
+pub const description_max_bytes: usize = 1024;
+pub const truncation_marker = "... [truncated]";
+
+pub const JsonType = enum {
+    string,
+    integer,
+    boolean,
+    object,
+    array,
+};
+
+pub const Property = struct {
+    name: []const u8,
+    json_type: JsonType,
+    description: []const u8 = "",
+    enum_values: []const []const u8 = &.{},
+    min_length: ?usize = null,
+    max_length: ?usize = null,
+    minimum: ?usize = null,
+    maximum: ?usize = null,
+    min_items: ?usize = null,
+    max_items: ?usize = null,
+    item_json_type: ?JsonType = null,
+    item_enum_values: []const []const u8 = &.{},
+    items: ?*const ObjectSchema = null,
+    object_schema: ?*const ObjectSchema = null,
+};
+
+pub const ObjectSchema = struct {
+    properties: []const Property = &.{},
+    required: []const []const u8 = &.{},
+    additional_properties: ?bool = null,
+    min_properties: ?usize = null,
+    max_properties: ?usize = null,
+};
+
+pub const FunctionSchema = struct {
+    name: []const u8,
+    description: []const u8,
+    input_schema: ObjectSchema = .{},
+};
+
+fn cappedDescriptionAlloc(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
+    if (text.len <= description_max_bytes) return alloc.dupe(u8, text);
+
+    const prefix_len = description_max_bytes - truncation_marker.len;
+    var out = try alloc.alloc(u8, description_max_bytes);
+    @memcpy(out[0..prefix_len], text[0..prefix_len]);
+    @memcpy(out[prefix_len..], truncation_marker);
+    return out;
+}
+
+fn writeCappedDescriptionJsonString(
+    alloc: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    text: []const u8,
+) !void {
+    const capped_description = try cappedDescriptionAlloc(alloc, text);
+    defer alloc.free(capped_description);
+    try std.json.Stringify.value(capped_description, .{}, writer);
+}
+
+/// Opens the gateway's flattened function-tool envelope, up to the
+/// "inputSchema" value. The caller writes the schema and the closing brace.
+fn writeFunctionSchemaOpen(
+    writer: *std.Io.Writer,
+    name: []const u8,
+    description: []const u8,
+) !void {
+    try writer.writeAll("{\"type\":\"function\",\"name\":");
+    try std.json.Stringify.value(name, .{}, writer);
+    try writer.writeAll(",\"description\":");
+    try std.json.Stringify.value(description, .{}, writer);
+    try writer.writeAll(",\"inputSchema\":");
+}
+
+pub fn writeBuiltinFunctionSchema(
+    alloc: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    schema: FunctionSchema,
+) !void {
+    const description = try cappedDescriptionAlloc(alloc, schema.description);
+    defer alloc.free(description);
+    try writeFunctionSchemaOpen(writer, schema.name, description);
+    try writeObjectSchema(alloc, writer, schema.input_schema);
+    try writer.writeByte('}');
+}
+
+pub fn builtinFunctionSchemaJsonAlloc(alloc: std.mem.Allocator, schema: FunctionSchema) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeBuiltinFunctionSchema(alloc, &out.writer, schema);
+    return try out.toOwnedSlice();
+}
+
+/// Envelope for a dynamic (MCP) tool whose input schema is already rendered
+/// JSON. Caller owns the returned slice.
+pub fn dynamicFunctionSchemaJsonAlloc(
+    alloc: std.mem.Allocator,
+    name: []const u8,
+    description: []const u8,
+    input_schema_json: []const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeFunctionSchemaOpen(&out.writer, name, description);
+    try out.writer.writeAll(input_schema_json);
+    try out.writer.writeByte('}');
+    return try out.toOwnedSlice();
+}
+
+fn writeObjectSchema(
+    alloc: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    schema: ObjectSchema,
+) anyerror!void {
+    try writer.writeAll("{\"type\":\"object\",\"properties\":{");
+    for (schema.properties, 0..) |property, index| {
+        if (index > 0) try writer.writeByte(',');
+        try std.json.Stringify.value(property.name, .{}, writer);
+        try writer.writeByte(':');
+        try writePropertySchema(alloc, writer, property);
+    }
+    try writer.writeByte('}');
+    if (schema.additional_properties) |value| {
+        try writer.writeAll(",\"additionalProperties\":");
+        try writer.writeAll(if (value) "true" else "false");
+    }
+    if (schema.min_properties) |value| try writer.print(",\"minProperties\":{d}", .{value});
+    if (schema.max_properties) |value| try writer.print(",\"maxProperties\":{d}", .{value});
+    if (schema.required.len > 0) {
+        try writer.writeAll(",\"required\":[");
+        for (schema.required, 0..) |name, index| {
+            if (index > 0) try writer.writeByte(',');
+            try std.json.Stringify.value(name, .{}, writer);
+        }
+        try writer.writeByte(']');
+    }
+    try writer.writeByte('}');
+}
+
+fn writePropertySchema(
+    alloc: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    property: Property,
+) anyerror!void {
+    if (property.object_schema) |object_schema| {
+        try writeObjectSchema(alloc, writer, object_schema.*);
+        return;
+    }
+    try writer.writeAll("{\"type\":");
+    try std.json.Stringify.value(@tagName(property.json_type), .{}, writer);
+    if (property.enum_values.len > 0) {
+        try writer.writeAll(",\"enum\":[");
+        for (property.enum_values, 0..) |value, index| {
+            if (index > 0) try writer.writeByte(',');
+            try std.json.Stringify.value(value, .{}, writer);
+        }
+        try writer.writeByte(']');
+    }
+    if (property.min_length) |value| try writer.print(",\"minLength\":{d}", .{value});
+    if (property.max_length) |value| try writer.print(",\"maxLength\":{d}", .{value});
+    if (property.minimum) |value| try writer.print(",\"minimum\":{d}", .{value});
+    if (property.maximum) |value| try writer.print(",\"maximum\":{d}", .{value});
+    if (property.description.len > 0) {
+        try writer.writeAll(",\"description\":");
+        try writeCappedDescriptionJsonString(alloc, writer, property.description);
+    }
+    if (property.min_items) |value| try writer.print(",\"minItems\":{d}", .{value});
+    if (property.max_items) |value| try writer.print(",\"maxItems\":{d}", .{value});
+    if (property.item_json_type) |item_json_type| {
+        try writer.writeAll(",\"items\":{\"type\":");
+        try std.json.Stringify.value(@tagName(item_json_type), .{}, writer);
+        if (property.item_enum_values.len > 0) {
+            try writer.writeAll(",\"enum\":[");
+            for (property.item_enum_values, 0..) |value, index| {
+                if (index > 0) try writer.writeByte(',');
+                try std.json.Stringify.value(value, .{}, writer);
+            }
+            try writer.writeByte(']');
+        }
+        try writer.writeByte('}');
+    } else if (property.items) |items| {
+        try writer.writeAll(",\"items\":");
+        try writeObjectSchema(alloc, writer, items.*);
+    }
+    try writer.writeByte('}');
+}
+
+test "nested object schema serializes exact property bounds" {
+    const alloc = std.testing.allocator;
+    const nested = ObjectSchema{
+        .properties = &.{.{ .name = "create", .json_type = .object, .object_schema = &.{
+            .properties = &.{.{ .name = "name", .json_type = .string }},
+            .required = &.{"name"},
+            .additional_properties = false,
+        } }},
+        .additional_properties = false,
+        .min_properties = 1,
+        .max_properties = 1,
+    };
+    const schema = FunctionSchema{
+        .name = "nested",
+        .description = "nested",
+        .input_schema = nested,
+    };
+
+    const json = try builtinFunctionSchemaJsonAlloc(alloc, schema);
+    defer alloc.free(json);
+
+    try std.testing.expect(std.mem.find(u8, json, "\"minProperties\":1") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"maxProperties\":1") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"create\":{\"type\":\"object\",\"properties\":{") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"additionalProperties\":false") != null);
+}
+
+test "cappedDescriptionAlloc appends explicit truncation marker" {
+    const alloc = std.testing.allocator;
+    const oversized = "x" ** (description_max_bytes + 20);
+
+    const capped = try cappedDescriptionAlloc(alloc, oversized);
+    defer alloc.free(capped);
+
+    try std.testing.expectEqual(description_max_bytes, capped.len);
+    try std.testing.expect(std.mem.endsWith(u8, capped, truncation_marker));
+}
+
+test "builtinFunctionSchemaJsonAlloc serializes strings and object schema" {
+    const alloc = std.testing.allocator;
+    const schema = FunctionSchema{
+        .name = "read_file",
+        .description = "Read \"quoted\" paths. When to use: test escaping. When NOT to use: unescaped JSON.",
+        .input_schema = .{
+            .properties = &.{
+                .{ .name = "path", .json_type = .string, .description = "File path \"with quotes\"." },
+            },
+            .required = &.{"path"},
+        },
+    };
+
+    const json = try builtinFunctionSchemaJsonAlloc(alloc, schema);
+    defer alloc.free(json);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("read_file", parsed.value.object.get("name").?.string);
+    try std.testing.expect(std.mem.find(u8, json, "\\\"quoted\\\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\\\"with quotes\\\"") != null);
+}
+
+test "dynamicFunctionSchemaJsonAlloc wraps rendered input schema in the flattened envelope" {
+    const alloc = std.testing.allocator;
+    const description = ("d" ** (description_max_bytes + 1)) ++ "tail";
+    const json = try dynamicFunctionSchemaJsonAlloc(alloc, "mcp_fs_read", description, "{\"type\":\"object\",\"properties\":{}}");
+    defer alloc.free(json);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("function", parsed.value.object.get("type").?.string);
+    try std.testing.expectEqualStrings("mcp_fs_read", parsed.value.object.get("name").?.string);
+    try std.testing.expectEqualStrings(description, parsed.value.object.get("description").?.string);
+    try std.testing.expect(parsed.value.object.get("inputSchema").?.object.get("properties") != null);
+    try std.testing.expect(parsed.value.object.get("function") == null);
+}

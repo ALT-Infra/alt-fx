@@ -1,0 +1,122 @@
+#!/usr/bin/env node
+import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { createFxTerminal, supportsJspi } from "../fx-sdk.js";
+
+const scriptDir = fileURLToPath(new URL(".", import.meta.url));
+const defaultWasm = resolve(scriptDir, "../../zig-out/bin/fx-term.wasm");
+const wasmPath = resolve(process.argv[2] || defaultWasm);
+
+if (!supportsJspi()) {
+  console.error("Node JSPI is disabled. Run with: node --experimental-wasm-jspi sdk/scripts/test-term.mjs");
+  process.exit(2);
+}
+
+const output = [];
+let firstTokenAt;
+const startedAt = performance.now();
+const streamedDecoder = new TextDecoder();
+let streamedText = "";
+const dataListeners = new Set();
+const resizeListeners = new Set();
+let drainCalls = 0;
+let drainCompleted = false;
+const terminal = {
+  cols: 80,
+  rows: 24,
+  write(bytes) {
+    const chunk = bytes instanceof Uint8Array ? bytes : new TextEncoder().encode(bytes);
+    output.push(chunk);
+    streamedText += streamedDecoder.decode(chunk, { stream: true });
+    if (firstTokenAt === undefined && streamedText.includes("hello")) firstTokenAt = performance.now();
+    process.stdout.write(chunk);
+  },
+  async drain() {
+    drainCalls += 1;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    drainCompleted = true;
+  },
+  onData(callback) {
+    dataListeners.add(callback);
+    return () => dataListeners.delete(callback);
+  },
+  onResize(callback) {
+    resizeListeners.add(callback);
+    return () => resizeListeners.delete(callback);
+  },
+};
+
+const persistedConfig = new Map([
+  ["model", "sdk/term-model"],
+  ["mode", "plan"],
+]);
+const events = [];
+const encoded = new TextEncoder();
+let requestedModel;
+let secondTokenSentAt;
+let outputBytesAtFirstChunk;
+let outputBytesBeforeSecondChunk;
+const outputByteLength = () => output.reduce((total, chunk) => total + chunk.byteLength, 0);
+const mockFetch = async (_url, init) => {
+  requestedModel = new Headers(init.headers).get("ai-language-model-id");
+  return new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"hello"}\n'));
+      outputBytesAtFirstChunk = outputByteLength();
+      setTimeout(() => {
+        outputBytesBeforeSecondChunk = outputByteLength();
+        secondTokenSentAt = performance.now();
+        controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":" world"}\n'));
+        controller.enqueue(encoded.encode('data: {"type":"finish","finishReason":{"unified":"stop"},"usage":{"inputTokens":{"total":1},"outputTokens":{"total":2}}}\n'));
+        controller.enqueue(encoded.encode("data: [DONE]\n"));
+        controller.close();
+      }, 250);
+    },
+  }), { status: 200, headers: { "content-type": "text/event-stream" } });
+};
+const runtime = await createFxTerminal({
+  wasm: await readFile(wasmPath),
+  terminal,
+  env: { AI_GATEWAY_API_KEY: "term-test-key" },
+  fetch: mockFetch,
+  configStore: {
+    get(configId) { return persistedConfig.get(configId) ?? null; },
+    set(configId, value) { persistedConfig.set(configId, value); },
+  },
+  onEvent(event) { events.push(event); },
+  traceWasi: process.env.FX_WASI_TRACE === "1",
+  stderr(bytes) { process.stderr.write(bytes); },
+});
+await Promise.race([
+  runtime.interactive,
+  new Promise((_, reject) => setTimeout(() => reject(new Error("timed out waiting for fx-term to become interactive")), 5000)),
+]);
+if (!streamedText.includes("Run /help for commands")) throw new Error("interactive resolved before startup output was written");
+if (drainCalls !== 1 || !drainCompleted) throw new Error("interactive resolved before the terminal adapter drained");
+runtime.write("hello");
+runtime.write("\x1b[D");
+runtime.write("!");
+runtime.write("\x7f");
+runtime.write("\r");
+const deadline = performance.now() + 5000;
+while (secondTokenSentAt === undefined) {
+  if (performance.now() >= deadline) throw new Error("timed out waiting for streamed fx-term response");
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+await new Promise((resolve) => setTimeout(resolve, 100));
+runtime.write("/exit\r");
+const exitCode = await Promise.race([
+  runtime.exited,
+  new Promise((_, reject) => setTimeout(() => reject(new Error("timed out waiting for fx-term exit")), 5000)),
+]);
+const text = new TextDecoder().decode(Buffer.concat(output.map((chunk) => Buffer.from(chunk))));
+
+if (exitCode !== 0) throw new Error(`fx-term exited with code ${exitCode}`);
+if (!text.includes("𝒇x")) throw new Error("shared Fx welcome frame was not observed");
+if (!text.includes("Run /help for commands")) throw new Error("shared Fx welcome guidance was not observed");
+if (requestedModel !== "sdk/term-model") throw new Error(`terminal prompt did not use the host-restored model: ${requestedModel}`);
+if (!(outputBytesBeforeSecondChunk > outputBytesAtFirstChunk)) throw new Error("terminal did not render output before the delayed second token arrived");
+if (!events.some((event) => event.type === "config.restore" && event.configId === "model")) throw new Error("terminal model restore event was not emitted");
+if (!events.some((event) => event.type === "config.restore" && event.configId === "mode")) throw new Error("terminal mode restore event was not emitted");
+console.error(`term SDK smoke passed: exit=${exitCode}, bytes=${Buffer.byteLength(text)}`);

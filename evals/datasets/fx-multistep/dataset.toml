@@ -1,0 +1,7 @@
+schema_version = "1.0"
+
+[dataset]
+name = "vercel-labs-fx/fx-multistep"
+description = "Manual Harbor multi-step evals for fx."
+authors = [{ name = "Vercel" }]
+keywords = ["fx", "multi-step", "agent", "evals"]

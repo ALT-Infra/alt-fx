@@ -1,0 +1,26 @@
+schema_version = "1.1"
+
+[task]
+name = "vercel-labs-fx/grep-files"
+description = "Search files and identify the file containing a target string."
+keywords = ["grep", "search"]
+
+[metadata]
+category = "search"
+difficulty = "easy"
+
+[verifier]
+timeout_sec = 30.0
+user = "root"
+
+[agent]
+timeout_sec = 120.0
+user = "agent"
+
+[environment]
+build_timeout_sec = 600.0
+os = "linux"
+cpus = 1
+memory_mb = 2048
+storage_mb = 10240
+allow_internet = true
