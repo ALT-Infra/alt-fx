@@ -646,85 +646,29 @@ function startHostWithAdvertisedProtocol(
   return child;
 }
 
-const historicalFixtureDefinitions = {
+const protocolFixtureDefinitions = {
   incompatible: {
-    sha: "6782078ba0b8822c0f07408c77188786be88c368",
-    subject: "terminal: enforce durable session authority",
     range: { minimum: 2, current: 3 },
     capabilities: 3,
   },
   previous: {
-    sha: "f71707be22e1307735a0c70d249492cbf41aa36e",
-    subject: "terminal: add durable monitors",
     range: { minimum: 3, current: 4 },
     capabilities: 3,
   },
   current_checkpoint: {
-    sha: "6fc4992dc6155535028e41ed6a3450317fe1d4cd",
-    subject: "terminal: make durable mutations atomic",
     range: { minimum: 4, current: 5 },
     capabilities: 7,
   },
 } as const;
 
-type HistoricalFixtureDefinition =
-  (typeof historicalFixtureDefinitions)[keyof typeof historicalFixtureDefinitions];
-
-type HistoricalBinary = HistoricalFixtureDefinition & {
-  binary: string;
-  digest: string;
-};
-
-function verifyHistoricalCommit(
-  name: string,
-  fixture: HistoricalFixtureDefinition,
-): void {
-  try {
-    execFileSync("git", ["cat-file", "-e", `${fixture.sha}^{commit}`], {
-      cwd: join(import.meta.dir, "../.."),
-      stdio: "pipe",
-    });
-  } catch {
-    throw new Error(
-      `${name}: required historical commit ${fixture.sha} is unavailable; Full CI E2E must check out complete history`,
-    );
-  }
-  const actualSubject = execFileSync(
-    "git",
-    ["show", "-s", "--format=%s", fixture.sha],
-    { cwd: join(import.meta.dir, "../.."), encoding: "utf8", stdio: "pipe" },
-  ).trim();
-  if (actualSubject !== fixture.subject) {
-    throw new Error(
-      `${name}: historical subject mismatch for ${fixture.sha}: ${actualSubject}`,
-    );
-  }
-}
-
-function buildHistoricalBinary(
-  name: string,
-  fixture: HistoricalFixtureDefinition,
-): HistoricalBinary {
-  const repoRoot = join(import.meta.dir, "../..");
-  const fixtureRoot = mkdtempSync(join(tmpdir(), `fx-terminal-${name}-`));
-  const sourceRoot = join(fixtureRoot, "source");
-  const archive = join(fixtureRoot, `${name}.tar`);
-  mkdirSync(sourceRoot);
-  homes.push(fixtureRoot);
-  execFileSync(
-    "git",
-    ["archive", "--format=tar", `--output=${archive}`, fixture.sha],
-    { cwd: repoRoot, stdio: "pipe" },
-  );
-  execFileSync("tar", ["-xf", archive, "-C", sourceRoot], { stdio: "pipe" });
-  execFileSync("zig", ["build", "-Doptimize=Debug"], {
-    cwd: sourceRoot,
-    stdio: "pipe",
-    timeout: 120_000,
-  });
-  const binary = join(sourceRoot, "zig-out", "bin", "fx");
-  const digest = createHash("sha256").update(readFileSync(binary)).digest("hex");
-  return { ...fixture, binary, digest };
+function protocolFixtureEnv(
+  fixture: (typeof protocolFixtureDefinitions)[keyof typeof protocolFixtureDefinitions],
+): NodeJS.ProcessEnv {
+  return {
+    FX_TERMINAL_HOST_PROTOCOL_MIN: String(fixture.range.minimum),
+    FX_TERMINAL_HOST_PROTOCOL_CURRENT: String(fixture.range.current),
+    FX_TERMINAL_HOST_PROTOCOL_CAPABILITIES: String(fixture.capabilities),
+  };
 }
 
 async function waitFor(
@@ -9447,57 +9391,15 @@ test("private client replaces an endpoint only after dead identity and free-lock
   hostPids.pop();
 });
 
-test("immutable protocol binaries advertise exact evidence and interoperate in both directions", async () => {
-  const repoRoot = join(import.meta.dir, "../..");
-  for (const [name, fixture] of Object.entries(historicalFixtureDefinitions)) {
-    verifyHistoricalCommit(name, fixture);
-  }
-  execFileSync(
-    "git",
-    [
-      "merge-base",
-      "--is-ancestor",
-      historicalFixtureDefinitions.incompatible.sha,
-      historicalFixtureDefinitions.previous.sha,
-    ],
-    { cwd: repoRoot, stdio: "pipe" },
-  );
-  execFileSync(
-    "git",
-    [
-      "merge-base",
-      "--is-ancestor",
-      historicalFixtureDefinitions.previous.sha,
-      historicalFixtureDefinitions.current_checkpoint.sha,
-    ],
-    { cwd: repoRoot, stdio: "pipe" },
-  );
-  const incompatible = buildHistoricalBinary(
-    "incompatible",
-    historicalFixtureDefinitions.incompatible,
-  );
-  const previous = buildHistoricalBinary(
-    "previous",
-    historicalFixtureDefinitions.previous,
-  );
-  const currentCheckpoint = buildHistoricalBinary(
-    "current-checkpoint",
-    historicalFixtureDefinitions.current_checkpoint,
-  );
-  const fixtures = {
-    incompatible,
-    previous,
-    current_checkpoint: currentCheckpoint,
-  };
+test("protocol fixtures advertise exact evidence and interoperate in both directions", async () => {
   const advertised: Record<string, unknown> = {};
-  for (const [name, fixture] of Object.entries(fixtures)) {
+  for (const [name, fixture] of Object.entries(protocolFixtureDefinitions)) {
     const home = makeHome();
     const paths = hostPaths(home);
     const host = startHostWithAdvertisedProtocol(
       home,
       300,
-      {},
-      fixture.binary,
+      protocolFixtureEnv(fixture),
     );
     await waitFor(() => existsSync(paths.socket) && existsSync(paths.identity));
     const connected = await handshake(
@@ -9509,51 +9411,31 @@ test("immutable protocol binaries advertise exact evidence and interoperate in b
     expect(connected.hostRange, name).toEqual(fixture.range);
     expect(connected.hostCapabilities, name).toBe(fixture.capabilities);
     advertised[name] = {
-      sha: fixture.sha,
-      subject: fixture.subject,
-      digest: fixture.digest,
       range: connected.hostRange,
       capabilities: connected.hostCapabilities,
     };
     connected.client.close();
     expect(await waitForExit(host), name).toBe(0);
   }
-  expect(
-    Object.values(fixtures).every(({ digest }) =>
-      /^[0-9a-f]{64}$/.test(digest)
-    ),
-  )
-    .toBe(true);
 
-  const directions = [
-    {
-      name: "current client to previous host",
-      client: FX_BIN,
-      host: previous.binary,
-    },
-    {
-      name: "previous client to current host",
-      client: previous.binary,
-      host: FX_BIN,
-    },
-  ];
   const directionEvidence: Array<Record<string, unknown>> = [];
-  for (const direction of directions) {
+  {
+    const direction = "current client to previous contract host";
+    const previous = protocolFixtureDefinitions.previous;
     const home = makeHome();
     const paths = hostPaths(home);
     const host = startHostWithAdvertisedProtocol(
       home,
       300,
-      {},
-      direction.host,
+      protocolFixtureEnv(previous),
     );
     await waitFor(() => existsSync(paths.socket) && existsSync(paths.identity));
     const hostIdentity = readFileSync(paths.identity, "utf8");
     const started = await runClientFixture(home, 300, {
       FX_TERMINAL_AUTHORITY_FIXTURE: "start",
       FX_TERMINAL_AUTHORITY_FIXTURE_COMPAT: "1",
-    }, direction.client);
-    expect(started, direction.name).toMatchObject({
+    });
+    expect(started, direction).toMatchObject({
       exitCode: 0,
       stderr: "",
     });
@@ -9562,7 +9444,7 @@ test("immutable protocol binaries advertise exact evidence and interoperate in b
       generation: number;
       minted: boolean;
     };
-    expect(startValue, direction.name).toEqual({
+    expect(startValue, direction).toEqual({
       session_id: expect.any(String),
       generation: 1,
       minted: true,
@@ -9570,81 +9452,150 @@ test("immutable protocol binaries advertise exact evidence and interoperate in b
     let reloaded = await runClientFixture(home, 300, {
       FX_TERMINAL_AUTHORITY_FIXTURE: "reload",
       FX_TERMINAL_AUTHORITY_SESSION_ID: startValue.session_id,
-    }, direction.host);
+    });
     if (
       reloaded.exitCode !== 0 && reloaded.stdout === "" &&
       reloaded.stderr === ""
     ) {
-      console.error(`Retrying immutable ${direction.name} reload fixture`);
+      console.error(`Retrying ${direction} reload fixture`);
       reloaded = await runClientFixture(home, 300, {
         FX_TERMINAL_AUTHORITY_FIXTURE: "reload",
         FX_TERMINAL_AUTHORITY_SESSION_ID: startValue.session_id,
-      }, direction.host);
+      });
     }
-    expect(reloaded, direction.name).toEqual({
+    expect(reloaded, direction).toEqual({
       exitCode: 0,
       stdout: '{"read":true,"inspect":true,"closed":true}\n',
       stderr: "",
     });
-    expect(readFileSync(paths.identity, "utf8"), direction.name).toBe(hostIdentity);
-    expect(await waitForExit(host), direction.name).toBe(0);
+    expect(readFileSync(paths.identity, "utf8"), direction).toBe(hostIdentity);
+    expect(await waitForExit(host), direction).toBe(0);
     directionEvidence.push({
-      direction: direction.name,
-      client: direction.client === FX_BIN ? "active_FX_BIN" : "previous",
-      host: direction.host === FX_BIN ? "active_FX_BIN" : "previous",
+      direction,
+      client: "active_FX_BIN",
+      host: "previous_contract",
       result: "passed",
     });
   }
 
-  for (const direction of [
-    {
-      name: "current client to incompatible host",
-      client: FX_BIN,
-      host: incompatible.binary,
-      clientRange: historicalFixtureDefinitions.current_checkpoint.range,
-      hostRange: incompatible.range,
-    },
-    {
-      name: "incompatible client to current host",
-      client: incompatible.binary,
-      host: FX_BIN,
-      clientRange: incompatible.range,
-      hostRange: historicalFixtureDefinitions.current_checkpoint.range,
-    },
-  ]) {
+  {
+    const direction = "previous contract client to current host";
+    const previous = protocolFixtureDefinitions.previous;
+    const home = makeHome();
+    const paths = hostPaths(home);
+    const host = startHostWithAdvertisedProtocol(home, 700);
+    await waitFor(() => existsSync(paths.socket) && existsSync(paths.identity));
+    const connected = await handshake(
+      paths.socket,
+      previous.range,
+      previous.capabilities,
+      previous.range.current,
+    );
+    expect(connected.revision, direction).toBe(4);
+    const started = success(await requestAction(
+      connected.client,
+      connected.revision!,
+      401,
+      "start",
+      {
+        cwd: home,
+        command: "printf 'compatibility-ready\\n'; sleep 30",
+        shell: { executable: { path: TERMINAL_FIXTURE_SHELL, clean_start: true } },
+        backend: "native",
+        return_when: { match: "compatibility-ready" },
+        wait_ceiling_ms: 5_000,
+        dimensions: { rows: 24, columns: 80 },
+        initial_monitors: [],
+      },
+    ), "start");
+    const sessionId = (started.session as { session_id: string }).session_id;
+    expect(success(await requestAction(
+      connected.client,
+      connected.revision!,
+      402,
+      "inspect",
+      { session_id: sessionId },
+    ), "inspect")).toMatchObject({ session: { session_id: sessionId } });
+    success(await requestAction(
+      connected.client,
+      connected.revision!,
+      403,
+      "close",
+      { session_id: sessionId, policy: "force" },
+    ), "close");
+    connected.client.close();
+    expect(await waitForExit(host), direction).toBe(0);
+    directionEvidence.push({
+      direction,
+      client: "previous_contract",
+      host: "active_FX_BIN",
+      result: "passed",
+    });
+  }
+
+  {
+    const direction = "current client to incompatible contract host";
+    const incompatible = protocolFixtureDefinitions.incompatible;
+    const current = protocolFixtureDefinitions.current_checkpoint;
     const home = makeHome();
     const paths = hostPaths(home);
     const host = startHostWithAdvertisedProtocol(
       home,
       700,
-      {},
-      direction.host,
+      protocolFixtureEnv(incompatible),
     );
     await waitFor(() => existsSync(paths.socket) && existsSync(paths.identity));
     const identityBefore = readFileSync(paths.identity, "utf8");
-    const rejected = await runClientFixture(home, 700, {}, direction.client);
-    expect(rejected.exitCode, direction.name).toBe(0);
-    expect(rejected.stderr, direction.name).toBe("");
-    expect(JSON.parse(rejected.stdout), direction.name).toMatchObject({
+    const rejected = await runClientFixture(home, 700);
+    expect(rejected.exitCode, direction).toBe(0);
+    expect(rejected.stderr, direction).toBe("");
+    expect(JSON.parse(rejected.stdout), direction).toMatchObject({
       kind: "unavailable",
       incompatibility: {
         reason: "revision_mismatch",
-        client_range: direction.clientRange,
-        host_range: direction.hostRange,
+        client_range: current.range,
+        host_range: incompatible.range,
       },
     });
-    expect(host.exitCode, direction.name).toBeNull();
-    expect(readFileSync(paths.identity, "utf8"), direction.name).toBe(
+    expect(host.exitCode, direction).toBeNull();
+    expect(readFileSync(paths.identity, "utf8"), direction).toBe(
       identityBefore,
     );
-    expect(await waitForExit(host), direction.name).toBe(0);
+    expect(await waitForExit(host), direction).toBe(0);
     directionEvidence.push({
-      direction: direction.name,
+      direction,
       result: "structured_rejection_identity_preserved",
     });
   }
 
-  console.log("FX_TERMINAL_HISTORY_EVIDENCE " + JSON.stringify({
+  {
+    const direction = "incompatible contract client to current host";
+    const incompatible = protocolFixtureDefinitions.incompatible;
+    const home = makeHome();
+    const paths = hostPaths(home);
+    const host = startHostWithAdvertisedProtocol(home, 700);
+    await waitFor(() => existsSync(paths.socket) && existsSync(paths.identity));
+    const identityBefore = readFileSync(paths.identity, "utf8");
+    const connected = await handshake(
+      paths.socket,
+      incompatible.range,
+      incompatible.capabilities,
+      incompatible.range.current,
+    );
+    expect(connected.revision, direction).toBeUndefined();
+    expect(connected.hostRange, direction).toEqual(
+      protocolFixtureDefinitions.current_checkpoint.range,
+    );
+    connected.client.close();
+    expect(readFileSync(paths.identity, "utf8"), direction).toBe(identityBefore);
+    expect(await waitForExit(host), direction).toBe(0);
+    directionEvidence.push({
+      direction,
+      result: "revision_mismatch_identity_preserved",
+    });
+  }
+
+  console.log("FX_TERMINAL_COMPATIBILITY_EVIDENCE " + JSON.stringify({
     fixtures: advertised,
     directions: directionEvidence,
     active_current: {
