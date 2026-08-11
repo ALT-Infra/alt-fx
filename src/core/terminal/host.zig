@@ -176,6 +176,9 @@ pub const Config = struct {
         if (io_mod.getenv("FX_TERMINAL_HOST_PROTOCOL_CURRENT")) |value| {
             config.hello.range.current = try std.fmt.parseInt(u16, value, 10);
         }
+        if (io_mod.getenv("FX_TERMINAL_HOST_PROTOCOL_CAPABILITIES")) |value| {
+            config.hello.capabilities = try std.fmt.parseInt(u64, value, 10);
+        }
         if (io_mod.getenv("FX_TERMINAL_HOST_IDLE_MS")) |value| {
             config.idle_grace_ms = try std.fmt.parseInt(u64, value, 10);
         }
