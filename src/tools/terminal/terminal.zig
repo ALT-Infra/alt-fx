@@ -533,14 +533,18 @@ fn startRequest(
     definitions: []const contracts.MonitorDefinition,
     persistence: ?contracts.StartPersistence,
 ) !contracts.ActionRequest {
+    const command: ?[]const u8 = if (input.command) |value|
+        if (value.len == 0) null else value
+    else
+        null;
     return .{ .start = .{
         .cwd = cwd,
-        .command = input.command,
+        .command = command,
         .shell = try buildShell(input.shell),
         .backend = input.backend orelse .native,
         .return_when = if (input.return_when) |condition|
             try buildReturnCondition(condition)
-        else if (input.command != null)
+        else if (command != null)
             .started
         else
             null,
@@ -889,6 +893,112 @@ test "terminal start accepts native and tmux backend contracts" {
             },
         }
     }
+}
+
+test "terminal start canonicalizes interactive command representations" {
+    const ReturnTag = std.meta.Tag(contracts.ReturnCondition);
+    const cases = [_]struct {
+        input: Input,
+        expected_command: ?[]const u8,
+        expected_return_when: ?ReturnTag,
+    }{
+        .{
+            .input = .{ .action = .start },
+            .expected_command = null,
+            .expected_return_when = null,
+        },
+        .{
+            .input = .{ .action = .start, .command = "" },
+            .expected_command = null,
+            .expected_return_when = null,
+        },
+        .{
+            .input = .{ .action = .start, .command = "printf ready" },
+            .expected_command = "printf ready",
+            .expected_return_when = .started,
+        },
+        .{
+            .input = .{
+                .action = .start,
+                .command = "",
+                .return_when = .{ .kind = .exit },
+                .wait_ceiling_ms = 1000,
+            },
+            .expected_command = null,
+            .expected_return_when = .exit,
+        },
+        .{
+            .input = .{ .action = .start, .command = " " },
+            .expected_command = " ",
+            .expected_return_when = .started,
+        },
+    };
+
+    for (cases) |case| {
+        const request = try startRequest(&case.input, "/tmp", &.{}, null);
+        try request.validate();
+        switch (request) {
+            .start => |start| {
+                if (case.expected_command) |expected| {
+                    try std.testing.expectEqualStrings(expected, start.command.?);
+                } else {
+                    try std.testing.expect(start.command == null);
+                }
+                if (case.expected_return_when) |expected| {
+                    try std.testing.expectEqual(
+                        expected,
+                        std.meta.activeTag(start.return_when.?),
+                    );
+                } else {
+                    try std.testing.expect(start.return_when == null);
+                }
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+}
+
+test "registered terminal validation accepts an exact empty start command" {
+    const terminal_tool = tool_dispatch.Tool{
+        .name = "terminal",
+        .description = "Terminal test adapter.",
+        .gateway_schema = .{
+            .name = "terminal",
+            .description = "Terminal test adapter.",
+        },
+        .decode = decode,
+        .validate = validate,
+        .call = call,
+        .reads_only_fn = readsOnly,
+        .irreversible_fn = isIrreversible,
+    };
+    const registry = tool_dispatch.Registry{ .tools = &.{terminal_tool} };
+    const ctx: tool_dispatch.DispatchContext = .{
+        .allocator = std.testing.allocator,
+        .workspace_root = "/tmp",
+    };
+
+    const accepted = try tool_dispatch.validateRegisteredToolCall(ctx, registry, .{
+        .id = "terminal-empty-start",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"start\",\"command\":\"\"}",
+    });
+    defer switch (accepted) {
+        .failure => |reason| std.testing.allocator.free(reason),
+        else => {},
+    };
+    try std.testing.expectEqual(.valid, accepted);
+
+    const rejected = try tool_dispatch.validateRegisteredToolCall(ctx, registry, .{
+        .id = "terminal-invalid-resize",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"resize\"}",
+    });
+    defer switch (rejected) {
+        .failure => |reason| std.testing.allocator.free(reason),
+        else => {},
+    };
+    try std.testing.expect(rejected == .failure);
 }
 
 test "terminal public wait ceiling maps to action-specific Core requests" {

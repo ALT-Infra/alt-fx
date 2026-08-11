@@ -1082,6 +1082,65 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
+  "TUI starts an interactive terminal when the command is exact empty",
+  async () => {
+    const fixture = createFixture("fx-tui-terminal-empty-command-");
+    let terminalSessionId = "";
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("tui_terminal_empty_start", "terminal", {
+        action: "start",
+        command: "",
+      }),
+      (body) => {
+        const resultText = toolResultText(body, "tui_terminal_empty_start");
+        const result = JSON.parse(resultText) as {
+          success: { start: { session: { session_id: string } } };
+        };
+        terminalSessionId = result.success.start.session.session_id;
+        expect(terminalSessionId.length).toBeGreaterThan(0);
+        expect(resultText).toContain('"lifecycle":"running"');
+        return fakeGatewayToolCall("tui_terminal_empty_close", "terminal", {
+          action: "close",
+          session_id: terminalSessionId,
+          close_policy: "force",
+        });
+      },
+      (body) => {
+        const result = toolResultText(body, "tui_terminal_empty_close");
+        expect(result).toContain(`"session_id":"${terminalSessionId}"`);
+        expect(result).toContain('"lifecycle":"closed"');
+        return fakeGatewayFinalText("Interactive terminal started and closed");
+      },
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway);
+
+    await active.sendText("Start a terminal.");
+    const pane = await active.waitForText(
+      "Interactive terminal started and closed",
+      TIMEOUT,
+    );
+    expect(pane).toContain("Used terminal start");
+    expect(pane).toContain("Used terminal close");
+    expect(pane).not.toContain("InvalidCommand");
+    expect(pane).not.toContain("Failed start");
+    expect(gateway.requests).toHaveLength(3);
+
+    const record = await waitForTerminalRecord(
+      fixture.home,
+      (candidate) =>
+        candidate.session_id === terminalSessionId &&
+        candidate.lifecycle === "closed",
+    );
+    const terminalPid = Number(record.pid);
+    expect(Number.isSafeInteger(terminalPid) && terminalPid > 0).toBe(true);
+    await waitForOwnedProcessExit([terminalPid]);
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
   "TUI executes public native terminal start and owner-scoped list",
   async () => {
     const fixture = createFixture("fx-tui-terminal-public-");
