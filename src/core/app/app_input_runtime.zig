@@ -37,6 +37,7 @@ const skill_runtime = @import("../skills/skill_runtime.zig");
 const file_index = @import("../workspace/file_index.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const types = @import("../shared/types.zig");
+const subagent_input = @import("../subagent/input_action.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const auto_upgrade = @import("../upgrade/auto_upgrade.zig");
 const upgrade_helpers = @import("../upgrade/upgrade_helpers.zig");
@@ -624,6 +625,7 @@ pub fn Runtime(comptime App: type) type {
                             decoded.composer_shortcut,
                             decoded.approval_focused_edit,
                             decoded.question_action,
+                            decoded.subagent_action,
                             decoded.cancel_pending,
                             input_limits.composer_bytes,
                         )) {
@@ -926,6 +928,7 @@ pub fn Runtime(comptime App: type) type {
             composer_shortcut: ?input_action.ShortcutAction,
             approval_focused_edit: ?approval_decision.DraftAction,
             question_action: ?question_prompt.Action,
+            subagent_action: ?subagent_input.Action,
             was_cancel_pending: bool,
             max_input_len: usize,
         ) !ResolvedEscapeRoute {
@@ -994,7 +997,12 @@ pub fn Runtime(comptime App: type) type {
                             approval_focused_edit,
                         );
                     } else {
-                        try subagent_rt.routeSubagentEscapeAction(app, resolved);
+                        try subagent_rt.routeSubagentEscapeAction(
+                            app,
+                            resolved,
+                            composer_shortcut,
+                            subagent_action,
+                        );
                     }
                     return .done;
                 }
@@ -1287,7 +1295,7 @@ pub fn Runtime(comptime App: type) type {
             }
             if (comptime runtime_profile.allows(App, .subagents)) {
                 if (app.subagents.isViewActive()) {
-                    try subagent_rt.handleSubagentViewByte(app, byte);
+                    try subagent_rt.handleSubagentRawInput(app, raw);
                     return true;
                 }
             }
@@ -2418,7 +2426,12 @@ pub fn Runtime(comptime App: type) type {
                         }
                         return;
                     }
-                    try subagent_rt.routeSubagentEscapeAction(app, .escape);
+                    try subagent_rt.routeSubagentEscapeAction(
+                        app,
+                        .escape,
+                        null,
+                        .escape,
+                    );
                     return;
                 }
             }
@@ -2479,7 +2492,12 @@ pub fn Runtime(comptime App: type) type {
             if (comptime runtime_profile.allows(App, .subagents)) {
                 if (app.subagents.isViewActive()) {
                     _ = disarmEscapeClear(app);
-                    try subagent_rt.routeSubagentEscapeAction(app, .escape);
+                    try subagent_rt.routeSubagentEscapeAction(
+                        app,
+                        .escape,
+                        null,
+                        .escape,
+                    );
                     return;
                 }
             }
@@ -2808,6 +2826,8 @@ const RoutingSubagents = struct {
     active: bool = false,
     main_approval_presented: bool = false,
     handled_keys: usize = 0,
+    handled_raw_keys: usize = 0,
+    handled_actions: usize = 0,
     last_handled_key: ?u8 = null,
     last_main_approval_id: ?u64 = null,
     toggle_view_calls: usize = 0,
@@ -2837,14 +2857,16 @@ const RoutingSubagents = struct {
         return alloc.dupe(u8, "");
     }
 
-    pub fn handleKey(self: *RoutingSubagents, _: std.mem.Allocator, byte: u8) !@import("../../ui/subagent/controller.zig").KeyAction {
+    pub fn handleKey(self: *RoutingSubagents, _: std.mem.Allocator, byte: u8) !subagent_input.Command {
         self.handled_keys += 1;
+        self.handled_raw_keys += 1;
         self.last_handled_key = byte;
         return .none;
     }
 
-    pub fn handleAction(self: *RoutingSubagents, _: std.mem.Allocator, action: @import("../../ui/subagent/controller.zig").InputAction) !@import("../../ui/subagent/controller.zig").KeyAction {
+    pub fn handleAction(self: *RoutingSubagents, _: std.mem.Allocator, action: subagent_input.Action) !subagent_input.Command {
         self.handled_keys += 1;
+        self.handled_actions += 1;
         self.last_handled_key = switch (action) {
             .escape => 0x1b,
             .up, .left => 25,
@@ -2854,12 +2876,12 @@ const RoutingSubagents = struct {
         return .none;
     }
 
-    pub fn handleKeyWithMainApproval(self: *RoutingSubagents, alloc: std.mem.Allocator, byte: u8, main_approval_id: ?u64) !@import("../../ui/subagent/controller.zig").KeyAction {
+    pub fn handleKeyWithMainApproval(self: *RoutingSubagents, alloc: std.mem.Allocator, byte: u8, main_approval_id: ?u64) !subagent_input.Command {
         self.last_main_approval_id = main_approval_id;
         return self.handleKey(alloc, byte);
     }
 
-    pub fn handleActionWithMainApproval(self: *RoutingSubagents, alloc: std.mem.Allocator, action: @import("../../ui/subagent/controller.zig").InputAction, main_approval_id: ?u64) !@import("../../ui/subagent/controller.zig").KeyAction {
+    pub fn handleActionWithMainApproval(self: *RoutingSubagents, alloc: std.mem.Allocator, action: subagent_input.Action, main_approval_id: ?u64) !subagent_input.Command {
         self.last_main_approval_id = main_approval_id;
         return self.handleAction(alloc, action);
     }
@@ -4906,6 +4928,7 @@ test "app_input_runtime ctrl-l preserves an active inline picker" {
         &app,
         .{ .composer_shortcut = .redraw },
         .redraw,
+        null,
         null,
         null,
         false,
@@ -8071,6 +8094,7 @@ test "app_input_runtime active multiline history moves vertically before advanci
         null,
         null,
         null,
+        null,
         false,
         4096,
     );
@@ -9030,9 +9054,13 @@ test "app_input_runtime routes keys to subagent view when no modal is active" {
 
     try feedRoutingBytes(&app, "\x1b[A");
     try std.testing.expectEqual(@as(usize, 1), app.subagents.handled_keys);
+    try std.testing.expectEqual(@as(usize, 1), app.subagents.handled_actions);
+    try std.testing.expectEqual(@as(usize, 0), app.subagents.handled_raw_keys);
 
     try Runtime(RoutingFakeApp).handleByte(&app, 'x', 4096, 100);
     try std.testing.expectEqual(@as(usize, 2), app.subagents.handled_keys);
+    try std.testing.expectEqual(@as(usize, 1), app.subagents.handled_actions);
+    try std.testing.expectEqual(@as(usize, 1), app.subagents.handled_raw_keys);
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
 }
 
@@ -11062,6 +11090,7 @@ test "composer shortcut line delete handles decoded and raw mutations" {
             .delete_to_line_start,
             null,
             null,
+            null,
             false,
             4096,
         );
@@ -11141,6 +11170,7 @@ test "composer shortcut line delete preserves no-op picker redraw and metadata s
         .delete_to_line_start,
         null,
         null,
+        null,
         false,
         4096,
     );
@@ -11154,6 +11184,7 @@ test "composer shortcut line delete preserves no-op picker redraw and metadata s
         &app,
         .delete_to_line_end,
         .delete_to_line_end,
+        null,
         null,
         null,
         false,

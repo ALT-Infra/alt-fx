@@ -14,6 +14,7 @@ const projection = @import("../../core/subagent/ui_projection.zig");
 const terminal_projection = @import("../../core/terminal/ui_projection.zig");
 const skill_contract = @import("../../core/skills/skill_contract.zig");
 const input_action = @import("../../core/input/input_action.zig");
+const subagent_input = @import("../../core/subagent/input_action.zig");
 const horizontal_navigation = @import("../../core/input/horizontal_navigation.zig");
 const paste_framing = @import("../../core/input/paste_framing.zig");
 const ui_input = @import("../input/runtime.zig");
@@ -106,54 +107,11 @@ pub const Route = union(enum) {
     }
 };
 
-pub const Command = enum {
-    none,
-    redraw,
-    page_changed,
-    exit_app,
-    close_manager,
-    acknowledge,
-    child_changed,
-    load_older_history,
-    refresh_newest_history,
-    submit_child_message,
-    load_attach_candidates,
-    load_more_attach_candidates,
-    submit_manager_mutation,
-    resolve_child_approval,
-    open_terminal,
-};
+pub const Command = subagent_input.Command;
 
 const RootSelection = enum { child, terminal };
 
-pub const Action = enum {
-    up,
-    down,
-    left,
-    right,
-    page_up,
-    page_down,
-    enter,
-    activity,
-    notifications,
-    archived,
-    next_page,
-    previous_page,
-    escape,
-    toggle,
-    ctrl_c,
-    home,
-    end,
-    word_left,
-    word_right,
-    delete_next,
-    delete_word_left,
-    delete_word_right,
-    delete_to_line_start,
-    delete_to_line_end,
-    clear_line,
-    insert_newline,
-};
+pub const Action = subagent_input.Action;
 
 pub const SubmissionFailure = struct {
     code: manager_mod.FailureCode,
@@ -2763,6 +2721,8 @@ pub const Runtime = struct {
             .end,
             .word_left,
             .word_right,
+            .focus_next,
+            .delete_backward,
             .delete_next,
             .delete_word_left,
             .delete_word_right,
@@ -2775,6 +2735,19 @@ pub const Runtime = struct {
     }
 
     fn handleChildAction(self: *Runtime, alloc: Allocator, action: Action) !Command {
+        if (action == .focus_next) {
+            const messageable = if (self.child.chat) |chat|
+                chat.messageable()
+            else
+                false;
+            self.focus = if (self.focus == .child_composer)
+                .child_detail
+            else if (messageable)
+                .child_composer
+            else
+                .child_detail;
+            return .redraw;
+        }
         const messageable = if (self.child.chat) |chat|
             chat.messageable()
         else
@@ -2858,6 +2831,11 @@ pub const Runtime = struct {
                 &self.child.editor.entities,
                 &self.child.editor.vertical_navigation,
             ),
+            .delete_backward => edited = self.child.editor.deletionState(null).delete(
+                alloc,
+                .character_left,
+                .clear,
+            ),
             .delete_next => edited = self.child.editor.deletionState(null).delete(
                 alloc,
                 .character_right,
@@ -2896,6 +2874,7 @@ pub const Runtime = struct {
             .toggle,
             .escape,
             => return .none,
+            .focus_next => unreachable,
             .up,
             .down,
             .page_up,
@@ -2961,6 +2940,13 @@ pub const Runtime = struct {
                     &value.vertical_navigation,
                 );
             },
+            .delete_backward => if (editor) |value| {
+                edited = value.deletionState(null).delete(
+                    alloc,
+                    .character_left,
+                    .clear,
+                );
+            },
             .delete_next => if (editor) |value| {
                 edited = value.deletionState(null).delete(
                     alloc,
@@ -2999,6 +2985,7 @@ pub const Runtime = struct {
                     edited = true;
                 }
             },
+            .focus_next => self.moveFormField(1),
             .enter => return .submit_manager_mutation,
             else => return .none,
         }
@@ -7316,6 +7303,49 @@ test "child and form editors keep Home End and control aliases on the current li
     try std.testing.expectEqual(second_line_start, form_runtime.form.editors[2].edit_state.cursor);
     try std.testing.expectEqual(Command.redraw, try form_runtime.handleByte(alloc, 5, null));
     try std.testing.expectEqual(multiline.len, form_runtime.form.editors[2].edit_state.cursor);
+}
+
+test "typed terminal controls preserve child and form edit behavior" {
+    const alloc = std.testing.allocator;
+
+    var child_runtime = Runtime{};
+    defer child_runtime.deinit(alloc);
+    try std.testing.expect(try child_runtime.replaceSnapshot(
+        alloc,
+        try testSnapshot(alloc, 1, &.{"child"}),
+    ));
+    try std.testing.expectEqual(Command.child_changed, try child_runtime.handle(alloc, .enter));
+    try child_runtime.installChildChat(
+        alloc,
+        try testChildChat(alloc, child_runtime.routedNode().?),
+        false,
+        true,
+    );
+    try child_runtime.child.editor.insertionState().insertSlice(alloc, "ab", .preserve);
+
+    try std.testing.expect(child_runtime.childComposerFocused());
+    try std.testing.expectEqual(Command.redraw, try child_runtime.handle(alloc, .focus_next));
+    try std.testing.expect(!child_runtime.childComposerFocused());
+    try std.testing.expectEqual(Command.redraw, try child_runtime.handle(alloc, .focus_next));
+    try std.testing.expect(child_runtime.childComposerFocused());
+    try std.testing.expectEqual(Command.redraw, try child_runtime.handle(alloc, .delete_backward));
+    try std.testing.expectEqualStrings("a", child_runtime.child.editor.edit_state.input.items);
+
+    var form_runtime = Runtime{};
+    defer form_runtime.deinit(alloc);
+    try form_runtime.setDefaults(alloc, "test/model", types.ReasoningEffort.literal("high"));
+    try std.testing.expect(try form_runtime.replaceSnapshot(
+        alloc,
+        try testSnapshot(alloc, 1, &.{}),
+    ));
+    try std.testing.expectEqual(Command.redraw, try form_runtime.handleByte(alloc, 'c', null));
+    form_runtime.form.field_index = 2;
+    try form_runtime.form.replaceEditor(alloc, .initial_message, "ab");
+
+    try std.testing.expectEqual(Command.redraw, try form_runtime.handle(alloc, .delete_backward));
+    try std.testing.expectEqualStrings("a", form_runtime.form.editors[2].edit_state.input.items);
+    try std.testing.expectEqual(Command.redraw, try form_runtime.handle(alloc, .focus_next));
+    try std.testing.expectEqual(@as(usize, 3), form_runtime.form.field_index);
 }
 
 test "unchanged live child snapshots do not mutate the viewport or request repaint" {
