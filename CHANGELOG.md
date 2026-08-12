@@ -1,8 +1,19 @@
 # fx
 
-## 0.3.73
+## 0.4.0
 
 <!-- release:start -->
+
+### Improvements
+
+- **Interactive terminal startup:** Start an interactive shell when the `terminal` tool receives an empty command (#3)
+
+### Contributors
+
+- @fazxes
+<!-- release:end -->
+
+## 0.3.73
 
 ### New Features
 
@@ -38,7 +49,6 @@
 - @suarezesteban
 - @rauchg
 - @shaper
-<!-- release:end -->
 
 ## 0.3.72
 
