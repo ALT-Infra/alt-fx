@@ -271,7 +271,7 @@ jobs:
                 input: {
                   branch: {
                     repositoryNameWithOwner: $repository,
-                    refName: $ref
+                    branchName: $ref
                   },
                   expectedHeadOid: $expected_head,
                   message: {headline: $headline},
