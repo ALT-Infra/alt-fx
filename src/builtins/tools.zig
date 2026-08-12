@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin_gateway = @import("gateway.zig");
+const terminal_contracts = @import("../core/terminal/contracts.zig");
 const terminal_monitor = @import("../core/terminal/monitor.zig");
 const gateway_schema = @import("../core/tooling/gateway_schema.zig");
 const subagent_domain = @import("../core/subagent/domain.zig");
@@ -1463,6 +1464,25 @@ test "terminal tool schema exposes one exact object branch per action" {
         "Required for polling conditions tcp_ready, http_ready, path_exists, path_changed, path_size, and custom_probe. Event-driven conditions process_exit, exit_code, signal, output_contains, output_matches, output_quiet, and screen_matches omit it; materialized values are ignored.",
         check_interval.description,
     );
+}
+
+test "terminal advertisement and admission agree on every action field" {
+    const branches = terminal.gateway_schema.input_schema.one_of;
+    try std.testing.expectEqual(std.meta.tags(terminal_contracts.Action).len, branches.len);
+
+    for (branches) |branch| {
+        const action_property = schemaProperty(branch, "action").?;
+        try std.testing.expectEqual(@as(usize, 1), action_property.enum_values.len);
+        const action = std.meta.stringToEnum(
+            terminal_contracts.Action,
+            action_property.enum_values[0],
+        ) orelse return error.TestUnexpectedResult;
+        const admitted_fields = terminal_impl.actionFieldNames(action);
+        try std.testing.expectEqual(branch.properties.len, admitted_fields.len);
+        for (branch.properties, admitted_fields) |property, admitted_field| {
+            try std.testing.expectEqualStrings(property.name, admitted_field);
+        }
+    }
 }
 
 test "terminal gateway advertisement projects action-specific alternatives" {

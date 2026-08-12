@@ -136,7 +136,7 @@ pub const Input = struct {
     close_policy: ?contracts.ClosePolicy = null,
 };
 
-fn actionFieldNames(action: contracts.Action) []const []const u8 {
+pub fn actionFieldNames(action: contracts.Action) []const []const u8 {
     return switch (action) {
         .start => &.{ "action", "cwd", "command", "shell", "backend", "return_when", "wait_ceiling_ms", "dimensions", "initial_monitors" },
         .read => &.{ "action", "session_id", "cursor_segment", "cursor_offset" },
