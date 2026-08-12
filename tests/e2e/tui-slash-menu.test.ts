@@ -156,7 +156,7 @@ async function waitForAppearanceMenu(
     latest = await session.capturePaneGrid();
     const pane = latest.join("\n");
     if (
-      pane.includes("Appearance · Choose one") &&
+      pane.includes("Appearance") &&
       (expectedSelection === undefined || pane.includes(expectedSelection))
     ) return latest;
     await Bun.sleep(100);
@@ -174,8 +174,9 @@ async function waitForStatuslineMenu(
     latest = await session.capturePaneGrid();
     const pane = latest.join("\n");
     if (
-      pane.includes("Status line:") &&
-      pane.includes("Enter Toggle") &&
+      pane.includes("Status line") &&
+      !pane.includes("↑↓ Navigate") &&
+      !pane.includes("←→ Change") &&
       (expectedSelection === undefined || pane.includes(expectedSelection))
     ) return latest;
     await Bun.sleep(100);
@@ -189,7 +190,7 @@ async function waitForSandboxMenu(session: TmuxSession): Promise<string[]> {
   while (Date.now() < deadline) {
     latest = await session.capturePaneGrid();
     const pane = latest.join("\n");
-    if (pane.includes("Sandbox:") && pane.includes("Enter Apply")) return latest;
+    if (pane.includes("Sandbox") && pane.includes("←→ Change")) return latest;
     await Bun.sleep(100);
   }
   throw new Error(`Timed out waiting for sandbox menu.\nPane:\n${latest.join("\n")}`);
@@ -1270,26 +1271,27 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       let grid = await waitForAppearanceMenu(session);
       let pane = grid.join("\n");
       expect(pane).toContain("𝒇x");
-      expect(pane).toContain("INPUT STYLE");
-      expect(pane).toContain("PRESENTATION");
-      expect(pane).toContain("❯ Lines");
-      expect(pane).toContain("Tint ✓");
-      expect(pane).toContain("Minimal ✓");
+      expect(pane).toContain("Input appearance");
+      expect(pane).toContain("Maxxing mode");
+      expect(pane).toContain("lines  tint");
+      expect(pane).toContain("minimal  legacy");
+      expect(pane).not.toContain("❯");
+      expect(pane).not.toContain("✓");
       expect(pane).toContain("Tab Section");
-      expect(pane).toContain("Enter Apply");
+      expect(pane).toContain("←→ Change");
 
-      await session.sendKeys("Enter");
-      grid = await waitForAppearanceMenu(session, "Lines ✓");
+      await session.sendKeys("Right");
+      grid = await waitForAppearanceMenu(session, "lines  tint");
       pane = grid.join("\n");
-      expect(pane).toContain("Lines ✓");
+      expect(pane).not.toContain("✓");
       expect(JSON.parse(readFileSync(settingsPath, "utf8")).input_appearance).toBe("lines");
 
       await session.sendKeys("Tab");
-      await session.waitForText("❯ Normal", 5_000);
-      await session.sendKeys("Enter");
-      grid = await waitForAppearanceMenu(session, "Normal ✓");
+      await session.waitForText("minimal  legacy", 5_000);
+      await session.sendKeys("Right");
+      grid = await waitForAppearanceMenu(session, "minimal  legacy");
       pane = grid.join("\n");
-      expect(pane).toContain("Normal ✓");
+      expect(pane).not.toContain("✓");
       expect(JSON.parse(readFileSync(settingsPath, "utf8")).maxxing_mode).toBe("legacy");
 
       await session.sendKeys("Escape");
@@ -1358,17 +1360,15 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.resizeWindow(60, 12, 500);
       await session.sendText("/appearance");
-      pane = await session.waitForText("Appearance · Choose one", 5_000);
-      expect(pane).toContain("Lines");
-      expect(pane).toContain("Tint");
-      expect(pane).toContain("Normal");
-      expect(pane).toContain("Minimal");
+      pane = await session.waitForText("Appearance", 5_000);
+      expect(pane).toContain("Input appearance");
+      expect(pane).toContain("lines  tint");
+      expect(pane).toContain("Maxxing mode");
+      expect(pane).toContain("minimal  legacy");
 
       await session.sendKeys("Escape");
       await session.waitForPane(
-        (current) =>
-          hasEmptyComposer(current) &&
-          !current.includes("Appearance · Choose one"),
+        (current) => hasEmptyComposer(current) && !current.includes("←→ Change"),
         5_000,
       );
       await session.sendText("/quit");
@@ -1411,22 +1411,26 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendText("/statusline");
       let grid = await waitForStatuslineMenu(session);
       let pane = grid.join("\n");
-      expect(pane).toContain("❯ Sandbox");
+      expect(pane).toContain("Sandbox");
       expect(pane).toContain("Context");
+      expect(pane).toContain("off  on");
+      expect(pane).not.toContain("❯");
       expect(pane).not.toContain("Choose what appears");
-      expect(pane).toContain("Enter Toggle");
+      expect(pane).not.toContain("↑↓ Navigate");
+      expect(pane).not.toContain("←→ Change");
 
-      await session.sendKeys("Enter");
-      grid = await waitForStatuslineMenu(session, "Sandbox ✓");
+      await session.sendKeys("Right");
+      grid = await waitForStatuslineMenu(session, "off  on");
       pane = grid.join("\n");
-      expect(pane).toContain("Sandbox ✓");
+      expect(JSON.parse(readFileSync(settingsPath, "utf8")).statusLine.sandbox).toBe(true);
       expect(JSON.parse(readFileSync(settingsPath, "utf8")).statusLine.sandbox).toBe(true);
 
       await session.sendKeys("Down");
-      await session.sendKeys("Enter");
-      grid = await waitForStatuslineMenu(session, "Context ✓");
+      await session.sendKeys("Right");
+      grid = await waitForStatuslineMenu(session, "Context");
       pane = grid.join("\n");
-      expect(pane).toContain("Context ✓");
+      expect(pane).not.toContain("saved to user settings");
+      expect(pane).not.toContain("● Statusline:");
       expect(JSON.parse(readFileSync(settingsPath, "utf8")).statusLine.context).toBe(true);
 
       await session.sendKeys("Escape");
@@ -1434,7 +1438,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         (current) =>
           hasEmptyComposer(current) &&
           current.includes("𝒇x") &&
-          !current.includes("Enter Toggle"),
+          !current.includes("←→ Change"),
         5_000,
       );
       expect(session.isAlive()).toBe(true);
@@ -1474,16 +1478,22 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendText("/sandbox");
       let grid = await waitForSandboxMenu(session);
       let pane = grid.join("\n");
-      expect(pane).toContain("❯ OS sandbox");
-      expect(pane).toContain("None ✓");
+      expect(pane).toContain("Command sandbox");
+      expect(pane).toContain("Choose command process isolation");
+      expect(pane).toContain("os  none");
+      expect(pane).not.toContain("✓");
+      expect(pane).not.toContain("❯");
       expect(pane).not.toContain("Choose one");
-      expect(pane).toContain("Enter Apply");
+      expect(pane).toContain("←→ Change");
 
       await session.sendKeys("Down");
-      await session.sendKeys("Enter");
+      await session.sendKeys("Right");
       grid = await waitForSandboxMenu(session);
       pane = grid.join("\n");
-      expect(pane).toContain("❯ None ✓");
+      expect(pane).toContain("Command sandbox");
+      expect(pane).toContain("os  none");
+      expect(pane).not.toContain("✓");
+      expect(pane).not.toContain("❯");
       expect(JSON.parse(readFileSync(settingsPath, "utf8")).sandbox).toBe("none");
 
       await session.sendKeys("Escape");
@@ -1491,7 +1501,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         (current) =>
           hasEmptyComposer(current) &&
           current.includes("𝒇x") &&
-          !current.includes("Enter Apply"),
+          !current.includes("←→ Change"),
         5_000,
       );
       expect(session.isAlive()).toBe(true);
@@ -2400,7 +2410,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).toContain("[All]");
       expect(pane).toContain(currentModel);
       expect(pane).toContain("1M context · 32K output · Fast");
-      expect(pane).toContain("Authenticated model catalog loaded.");
+      expect(pane).not.toContain("Authenticated model catalog loaded.");
       expect(pane).not.toContain("Current");
       expect(pane).not.toContain("Reasoning");
       expect(pane).toContain("↑↓ Navigate");

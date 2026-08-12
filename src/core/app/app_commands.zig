@@ -3027,6 +3027,108 @@ pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
     return snapshot;
 }
 
+pub fn applySettingsCatalogMenuChange(app: anytype, change: settings_catalog.Change) !void {
+    switch (change.setting) {
+        .input_appearance => {
+            const next = input_appearance.InputAppearance.parse(change.value) orelse
+                return error.InvalidSettingsCatalogValue;
+            const runtime_changed = next != app.input_runtime.input_appearance;
+            if (runtime_changed) app.input_runtime.input_appearance = next;
+            try persistUserPreferencesSilently(
+                app,
+                "input",
+                .{ .input_appearance = next.label() },
+                runtime_changed,
+            );
+        },
+        .maxxing_mode => {
+            const next = presentation_mode.MaxxingMode.parse(change.value) orelse
+                return error.InvalidSettingsCatalogValue;
+            const runtime_changed = next != app.shell.maxxing_mode;
+            if (runtime_changed) {
+                app.shell.maxxing_mode = next;
+                app.shell.render_requests.request(.transcript);
+            }
+            try persistUserPreferencesSilently(
+                app,
+                "maxxing",
+                .{ .maxxing_mode = next.label() },
+                runtime_changed,
+            );
+        },
+        .statusline_sandbox, .statusline_context, .statusline_session => {
+            const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
+            const runtime_changed = switch (change.setting) {
+                .statusline_sandbox => blk: {
+                    const changed = enabled != app.statusline_sandbox;
+                    app.statusline_sandbox = enabled;
+                    break :blk changed;
+                },
+                .statusline_context => blk: {
+                    const changed = enabled != app.statusline_context;
+                    app.statusline_context = enabled;
+                    break :blk changed;
+                },
+                .statusline_session => blk: {
+                    const changed = enabled != app.statusline_session;
+                    app.statusline_session = enabled;
+                    break :blk changed;
+                },
+                else => unreachable,
+            };
+            const item: config_runtime.UserSettingsPatch = switch (change.setting) {
+                .statusline_sandbox => .{ .statusline_item = .{ .item = .sandbox, .enabled = enabled } },
+                .statusline_context => .{ .statusline_item = .{ .item = .context, .enabled = enabled } },
+                .statusline_session => .{ .statusline_item = .{ .item = .session, .enabled = enabled } },
+                else => unreachable,
+            };
+            try persistUserPreferencesSilently(app, "statusline", item, runtime_changed);
+        },
+        .sandbox => {
+            const mode = sandbox.PublicMode.parse(change.value) orelse return error.InvalidSettingsCatalogValue;
+            if (mode == .os and !sandbox.osSandboxAvailable()) {
+                try app.writeDomainNotice(.{
+                    .topic = "sandbox",
+                    .tone = .warning,
+                    .body = sandbox.unsupported_os_sandbox_message,
+                }, true);
+                return;
+            }
+            _ = app_permission_runtime.Runtime(@TypeOf(app.*)).setSandboxBackend(
+                app,
+                sandbox.backendForPublicMode(mode),
+            );
+            var outcome = config_runtime.setSandbox(app.alloc, app.workspace_root, mode.label()) catch |err| {
+                try writeSandboxPersistenceFailure(app, err);
+                return;
+            };
+            outcome.deinit(app.alloc);
+        },
+        else => try applySettingsCatalogChange(app, change),
+    }
+    app.shell.render_requests.request(.footer);
+}
+
+fn persistUserPreferencesSilently(
+    app: anytype,
+    label: []const u8,
+    patch: config_runtime.UserSettingsPatch,
+    runtime_changed: bool,
+) !void {
+    var attempt = config_runtime.attemptUserPreferences(app.alloc, patch);
+    defer attempt.deinit(app.alloc);
+    switch (attempt) {
+        .failure => |failure| try session_commands.reportUserSettingsFailure(
+            app,
+            label,
+            failure.err,
+            failure.cleanup,
+            runtime_changed,
+        ),
+        .outcome => {},
+    }
+}
+
 pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change) !void {
     switch (change.setting) {
         .model => unreachable,
