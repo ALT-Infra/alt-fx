@@ -2705,10 +2705,10 @@ test "semantic notice renders every tone and resets before following content" {
 
 test "semantic notice keeps an OSC 8 target hidden and clickable" {
     const alloc = std.testing.allocator;
-    const url = "https://github.com/vercel-labs/fx/issues/new?template=fx-report.yml&diagnostics=version%3A%200.4.0";
+    const url = "https://fx.sh/feedback";
     const body = try std.fmt.allocPrint(
         alloc,
-        "\x1b]8;;{s}\x1b\\Report issue\x1b]8;;\x1b\\ on GitHub.",
+        "\x1b]8;;{s}\x1b\\Open feedback form\x1b]8;;\x1b\\.",
         .{url},
     );
     defer alloc.free(body);
@@ -2725,13 +2725,13 @@ test "semantic notice keeps an OSC 8 target hidden and clickable" {
     var row: std.ArrayList(u8) = .empty;
     defer row.deinit(alloc);
     try grid.rowTextTrimmed(1, &row);
-    try std.testing.expectEqualStrings("● Feedback: Report issue on GitHub.", row.items);
+    try std.testing.expectEqualStrings("● Feedback: Open feedback form.", row.items);
 
     const link_cell = grid.cellAt(1, 13).?;
-    try std.testing.expectEqual(@as(u21, 'R'), link_cell.codepoint);
+    try std.testing.expectEqual(@as(u21, 'O'), link_cell.codepoint);
     try std.testing.expect(link_cell.style.hyperlink_id != 0);
     try std.testing.expectEqualStrings(url, grid.hyperlinkUrl(link_cell.style.hyperlink_id).?);
-    try std.testing.expectEqual(@as(u32, 0), grid.cellAt(1, 25).?.style.hyperlink_id);
+    try std.testing.expectEqual(@as(u32, 0), grid.cellAt(1, 31).?.style.hyperlink_id);
 
     var narrow_grid = try vt_emulator.Grid.init(alloc, 9, 16);
     defer narrow_grid.deinit();
@@ -2754,7 +2754,7 @@ test "semantic notice keeps an OSC 8 target hidden and clickable" {
             try linked_text.append(alloc, @intCast(cell.codepoint));
         }
     }
-    try std.testing.expectEqualStrings("Reportissue", linked_text.items);
+    try std.testing.expectEqualStrings("Openfeedback form", linked_text.items);
     try std.testing.expectEqual(@as(u32, 0), narrow_grid.current_style.hyperlink_id);
 }
 

@@ -47,9 +47,9 @@ else
     struct {};
 const TranscriptEntry = transcript_runtime.TranscriptEntry;
 
-fn finish_feedback_notice(app: anytype, entry_id: u32, tone: types.NoticeTone, body: []const u8) !void {
+fn finish_trace_notice(app: anytype, entry_id: u32, tone: types.NoticeTone, body: []const u8) !void {
     const notice: types.SemanticNotice = .{
-        .topic = "",
+        .topic = "trace",
         .tone = tone,
         .body = body,
     };
@@ -59,32 +59,26 @@ fn finish_feedback_notice(app: anytype, entry_id: u32, tone: types.NoticeTone, b
     app.shell.render_requests.request(.transcript);
 }
 
-const FeedbackIssueReportDisposition = union(enum) {
+const TraceReportDisposition = union(enum) {
     copied_file: []const u8,
     copy_failed: []const u8,
     saved: []const u8,
     unavailable,
 };
 
-/// Returns an OSC 8 terminal hyperlink whose owned bytes belong to the caller.
-fn format_feedback_issue_notice(
+/// Returns an owned trace notice whose bytes belong to the caller.
+fn format_trace_notice(
     alloc: std.mem.Allocator,
-    url: []const u8,
-    disposition: FeedbackIssueReportDisposition,
+    disposition: TraceReportDisposition,
 ) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
     switch (disposition) {
-        .copied_file => try out.writer.writeAll("Feedback copied to clipboard. "),
-        .copy_failed => |path| try out.writer.print("Clipboard copy failed. Redact {s}, then ", .{path}),
-        .saved => |path| try out.writer.print("Feedback saved at {s}. Redact it, then ", .{path}),
-        .unavailable => try out.writer.writeAll("Could not create feedback report. "),
-    }
-    try out.writer.print("\x1b]8;;{s}\x1b\\\x1b[4mReport issue\x1b[24m\x1b]8;;\x1b\\.", .{url});
-    switch (disposition) {
-        .copied_file => try out.writer.writeAll(" Please ensure its redaction before sharing."),
-        else => {},
+        .copied_file => try out.writer.writeAll("Trace copied to clipboard. Review and redact it before sharing."),
+        .copy_failed => |path| try out.writer.print("Clipboard copy failed. Trace saved at {s}. Review and redact it before sharing.", .{path}),
+        .saved => |path| try out.writer.print("Trace saved at {s}. Review and redact it before sharing.", .{path}),
+        .unavailable => try out.writer.writeAll("Could not create trace."),
     }
     return out.toOwnedSlice();
 }
@@ -302,6 +296,7 @@ pub fn Handlers(comptime App: type) type {
                 .handle_skills = commandHandleSkills,
                 .copy_last = commandCopyLast,
                 .submit_feedback = commandSubmitFeedback,
+                .create_trace = commandCreateTrace,
                 .compact_history = commandCompactHistory,
                 .handle_settings = commandHandleSettings,
                 .handle_alias = commandHandleAlias,
@@ -319,38 +314,46 @@ pub fn Handlers(comptime App: type) type {
             };
         }
 
-        fn handleFeedbackReport(app: *App) !void {
-            const progress_entry_id = try app.appendDomainNotice(.{
+        fn handleFeedback(app: *App) !void {
+            try app.flushBeforeBlockingExternalWork();
+            const opened = if (comptime @hasDecl(App, "urlOpener"))
+                app.urlOpener().open(app.alloc, feedback_runtime.url) catch false
+            else
+                false;
+            if (opened) {
+                try app.writeDomainNotice(.{
+                    .topic = "feedback",
+                    .tone = .neutral,
+                    .body = "Opened https://fx.sh/feedback.",
+                }, true);
+                return;
+            }
+            try app.writeDomainNotice(.{
                 .topic = "feedback",
+                .tone = .@"error",
+                .body = "Could not open https://fx.sh/feedback. Open it manually.",
+            }, true);
+        }
+
+        fn handleTraceReport(app: *App) !void {
+            const progress_entry_id = try app.appendDomainNotice(.{
+                .topic = "trace",
                 .tone = .neutral,
-                .body = "Preparing feedback report...",
+                .body = "Preparing trace...",
             });
             app.shell.render_requests.request(.transcript);
             try app.flushBeforeBlockingExternalWork();
 
-            const report = buildFeedbackReport(app) catch {
-                try finish_feedback_notice(app, progress_entry_id, .@"error", "Failed to build feedback report.");
+            const report = buildTraceReport(app) catch {
+                try finish_trace_notice(app, progress_entry_id, .@"error", "Failed to build trace.");
                 return;
             };
             defer app.alloc.free(report);
 
             const builtin = @import("builtin");
-            const build_options = @import("build_options");
-            const url = feedback_runtime.buildGitHubIssueUrl(app.alloc, .{
-                .version = App.app_version,
-                .git_commit = build_options.git_commit,
-                .os_family = @tagName(builtin.os.tag),
-                .arch = @tagName(builtin.cpu.arch),
-                .build_mode = @tagName(builtin.mode),
-            }) catch {
-                try finish_feedback_notice(app, progress_entry_id, .@"error", "Failed to create the GitHub issue link.");
-                return;
-            };
-            defer app.alloc.free(url);
-
-            const report_path: ?[]u8 = writeFeedbackReportFile(app.alloc, report) catch null;
+            const report_path: ?[]u8 = writeTraceReportFile(app.alloc, report) catch null;
             defer if (report_path) |path| app.alloc.free(path);
-            const disposition: FeedbackIssueReportDisposition = if (report_path) |path| blk: {
+            const disposition: TraceReportDisposition = if (report_path) |path| blk: {
                 const copied = if (comptime @hasDecl(App, "clipboard"))
                     app.clipboard().copy_file(app.alloc, path) catch false
                 else
@@ -361,13 +364,13 @@ pub fn Handlers(comptime App: type) type {
             } else blk: {
                 break :blk .unavailable;
             };
-            const body = try format_feedback_issue_notice(app.alloc, url, disposition);
+            const body = try format_trace_notice(app.alloc, disposition);
             defer app.alloc.free(body);
             const tone: types.NoticeTone = switch (disposition) {
                 .copied_file, .saved => .neutral,
                 .copy_failed, .unavailable => .@"error",
             };
-            try finish_feedback_notice(app, progress_entry_id, tone, body);
+            try finish_trace_notice(app, progress_entry_id, tone, body);
         }
 
         fn commandQuit(ctx: *anyopaque) !void {
@@ -1220,7 +1223,12 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandSubmitFeedback(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            try handleFeedbackReport(app);
+            try handleFeedback(app);
+        }
+
+        fn commandCreateTrace(ctx: *anyopaque) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try handleTraceReport(app);
         }
 
         fn commandCompactHistory(ctx: *anyopaque) !void {
@@ -1410,9 +1418,9 @@ pub fn Handlers(comptime App: type) type {
     };
 }
 
-const feedback_transcript_max_line_bytes: usize = 300;
+const trace_transcript_max_line_bytes: usize = 300;
 
-fn feedbackFilePermissions() std.Io.File.Permissions {
+fn traceFilePermissions() std.Io.File.Permissions {
     const builtin = @import("builtin");
     return switch (builtin.os.tag) {
         .windows => .default_file,
@@ -1420,7 +1428,7 @@ fn feedbackFilePermissions() std.Io.File.Permissions {
     };
 }
 
-fn writeFeedbackReportFile(alloc: std.mem.Allocator, contents: []const u8) ![]u8 {
+fn writeTraceReportFile(alloc: std.mem.Allocator, contents: []const u8) ![]u8 {
     const tmp_dir = io_mod.getenv("TMPDIR") orelse "/tmp";
     const trimmed = std.mem.trimEnd(u8, tmp_dir, "/");
     const now_ms = io_mod.milliTimestamp();
@@ -1434,7 +1442,7 @@ fn writeFeedbackReportFile(alloc: std.mem.Allocator, contents: []const u8) ![]u8
         var random_bytes: [6]u8 = undefined;
         io_mod.getIo().random(&random_bytes);
         const random_hex = std.fmt.bytesToHex(random_bytes, .lower);
-        const path = try std.fmt.allocPrint(alloc, "{s}/fx-feedback-{d}-{d:0>2}-{d:0>2}-{d:0>2}{d:0>2}{d:0>2}-{s}.md", .{
+        const path = try std.fmt.allocPrint(alloc, "{s}/fx-trace-{d}-{d:0>2}-{d:0>2}-{d:0>2}{d:0>2}{d:0>2}-{s}.md", .{
             trimmed,
             year_day.year,
             month_day.month.numeric(),
@@ -1449,7 +1457,7 @@ fn writeFeedbackReportFile(alloc: std.mem.Allocator, contents: []const u8) ![]u8
         var file = std.Io.Dir.createFileAbsolute(io_mod.getIo(), path, .{
             .truncate = false,
             .exclusive = true,
-            .permissions = feedbackFilePermissions(),
+            .permissions = traceFilePermissions(),
         }) catch |err| switch (err) {
             error.PathAlreadyExists => {
                 alloc.free(path);
@@ -1466,14 +1474,14 @@ fn writeFeedbackReportFile(alloc: std.mem.Allocator, contents: []const u8) ![]u8
     return error.PathAlreadyExists;
 }
 
-fn buildFeedbackReport(app: anytype) ![]u8 {
+fn buildTraceReport(app: anytype) ![]u8 {
     const App = @TypeOf(app.*);
     const builtin = @import("builtin");
 
     var out: std.Io.Writer.Allocating = .init(app.alloc);
     defer out.deinit();
 
-    try out.writer.writeAll("# fx feedback report\n\n");
+    try out.writer.writeAll("# fx trace\n\n");
     try out.writer.writeAll("Private diagnostic report. It may include prompts, file paths, command output, and file snippets.\n\n");
 
     try out.writer.writeAll("## Summary\n");
@@ -1958,14 +1966,14 @@ fn lastInterruptedTurn(items: []const types.HistoryTurn) ?types.InterruptedHisto
     };
 }
 
-const feedback_tool_args_max_bytes: usize = 1200;
+const trace_tool_args_max_bytes: usize = 1200;
 
 fn networkCallIsError(call: diagnostics.NetworkCall) bool {
     return call.errorName().len > 0 or (call.status != 0 and call.status >= 400);
 }
 
 fn writeNetworkCallCompact(writer: *std.Io.Writer, call: diagnostics.NetworkCall) !void {
-    try writeFeedbackTimestampUtc(writer, call.started_at_ms);
+    try writeTraceTimestampUtc(writer, call.started_at_ms);
     try writer.print(" model={s}", .{call.model()});
     if (call.kind != .gateway) try writer.print(" kind={s}", .{@tagName(call.kind)});
     if (call.subagent_id != 0) try writer.print(" source=subagent#{d}", .{call.subagent_id}) else try writer.writeAll(" source=parent");
@@ -2044,7 +2052,7 @@ fn writeSubagentsSummary(writer: *std.Io.Writer, alloc: std.mem.Allocator, contr
 }
 
 fn writeToolCallCompact(writer: *std.Io.Writer, call: diagnostics.ToolCallMetric) !void {
-    try writeFeedbackTimestampUtc(writer, call.started_at_ms);
+    try writeTraceTimestampUtc(writer, call.started_at_ms);
     try writer.print(" name={s} status={s} duration={d}ms", .{ call.name(), if (call.ok) "ok" else "err", call.duration_ms });
     if (call.subagent_id != 0) try writer.print(" source=subagent#{d}", .{call.subagent_id}) else try writer.writeAll(" source=parent");
     try writer.writeByte('\n');
@@ -2155,10 +2163,10 @@ fn writeLastInterruptedDetail(writer: *std.Io.Writer, items: []const types.Histo
                 try writer.print("  in_flight_tool: {s}\n", .{call.name});
                 if (call.arguments_json.len > 0) {
                     try writer.writeAll("  in_flight_args:\n");
-                    if (call.arguments_json.len > feedback_tool_args_max_bytes) {
+                    if (call.arguments_json.len > trace_tool_args_max_bytes) {
                         try writer.writeAll("    ");
-                        try writeMaskedInline(writer, alloc, call.arguments_json[0..feedback_tool_args_max_bytes]);
-                        try writer.print("\n    ... (truncated, {d} more bytes)\n", .{call.arguments_json.len - feedback_tool_args_max_bytes});
+                        try writeMaskedInline(writer, alloc, call.arguments_json[0..trace_tool_args_max_bytes]);
+                        try writer.print("\n    ... (truncated, {d} more bytes)\n", .{call.arguments_json.len - trace_tool_args_max_bytes});
                     } else {
                         try writer.writeAll("    ");
                         try writeMaskedInline(writer, alloc, call.arguments_json);
@@ -2176,8 +2184,8 @@ fn writeLastInterruptedDetail(writer: *std.Io.Writer, items: []const types.Histo
     }
 }
 
-const feedback_trace_tail_bytes: usize = 6 * 1024;
-const feedback_trace_max_lines: usize = 80;
+const trace_tail_bytes: usize = 6 * 1024;
+const trace_max_lines: usize = 80;
 
 fn writeTraceLogTail(writer: *std.Io.Writer, alloc: std.mem.Allocator, path: []const u8) !void {
     var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch return;
@@ -2188,7 +2196,7 @@ fn writeTraceLogTail(writer: *std.Io.Writer, alloc: std.mem.Allocator, path: []c
     const total_size: usize = @intCast(stat_buf.size);
     if (total_size == 0) return;
 
-    const read_size = @min(total_size, feedback_trace_tail_bytes);
+    const read_size = @min(total_size, trace_tail_bytes);
     const offset: u64 = total_size - read_size;
 
     const buf = alloc.alloc(u8, read_size) catch return;
@@ -2209,16 +2217,16 @@ fn writeTraceLogTail(writer: *std.Io.Writer, alloc: std.mem.Allocator, path: []c
         try lines.append(alloc, trimmed);
     }
 
-    const start = if (lines.items.len > feedback_trace_max_lines)
-        lines.items.len - feedback_trace_max_lines
+    const start = if (lines.items.len > trace_max_lines)
+        lines.items.len - trace_max_lines
     else
         0;
 
     for (lines.items[start..]) |line| {
         const masked = try text_utils.maskSecrets(alloc, line);
         defer if (masked.ptr != line.ptr) alloc.free(masked);
-        if (masked.len > feedback_transcript_max_line_bytes) {
-            try writer.writeAll(masked[0..feedback_transcript_max_line_bytes]);
+        if (masked.len > trace_transcript_max_line_bytes) {
+            try writer.writeAll(masked[0..trace_transcript_max_line_bytes]);
             try writer.writeAll(" ...\n");
         } else {
             try writer.writeAll(masked);
@@ -2227,7 +2235,7 @@ fn writeTraceLogTail(writer: *std.Io.Writer, alloc: std.mem.Allocator, path: []c
     }
 }
 
-fn writeFeedbackTimestampUtc(writer: *std.Io.Writer, ms: i64) !void {
+fn writeTraceTimestampUtc(writer: *std.Io.Writer, ms: i64) !void {
     if (ms <= 0) {
         try writer.writeAll("[----------T--:--:--Z]");
         return;
@@ -2315,7 +2323,7 @@ noinline fn writeTranscriptTimeline(writer: *std.Io.Writer, alloc: std.mem.Alloc
         if (body.len == 0) continue;
 
         if (emitted_any) try writer.writeByte('\n');
-        try writeFeedbackTimestampUtc(writer, ts);
+        try writeTraceTimestampUtc(writer, ts);
         try writer.print(" {s}\n", .{kind});
         try writer.writeAll(body);
         emitted_any = true;
@@ -2492,7 +2500,7 @@ test "workspace list reports refresh rejection without replacing access" {
     try std.testing.expectEqual(@as(usize, 0), app.access.entries.len);
 }
 
-test "feedback timeline retains semantic table contents" {
+test "trace timeline retains semantic table contents" {
     const alloc = std.testing.allocator;
     var entries: std.ArrayList(TranscriptEntry) = .empty;
     defer {
@@ -2516,7 +2524,7 @@ test "feedback timeline retains semantic table contents" {
     try std.testing.expect(std.mem.find(u8, out.written(), "[structured table]") == null);
 }
 
-test "feedback timeline retains semantic code block contents" {
+test "trace timeline retains semantic code block contents" {
     const alloc = std.testing.allocator;
     var entries: std.ArrayList(TranscriptEntry) = .empty;
     defer {
@@ -2538,7 +2546,7 @@ test "feedback timeline retains semantic code block contents" {
     try std.testing.expect(std.mem.find(u8, out.written(), "const value = 1;") != null);
 }
 
-test "feedback timeline retains the semantic thematic rule adapter" {
+test "trace timeline retains the semantic thematic rule adapter" {
     const alloc = std.testing.allocator;
     var entries: std.ArrayList(TranscriptEntry) = .empty;
     defer {
@@ -3624,60 +3632,46 @@ fn expectNoHiddenSandboxLabels(text: []const u8) !void {
     try std.testing.expect(std.mem.find(u8, text, "just-bash") == null);
 }
 
-test "feedback issue notice emits a balanced OSC 8 hyperlink" {
-    const url = "https://github.com/vercel-labs/fx/issues/new?template=fx-report.yml";
-    const body = try format_feedback_issue_notice(std.testing.allocator, url, .{ .copied_file = "/tmp/report.md" });
-    defer std.testing.allocator.free(body);
-
-    try std.testing.expectEqualStrings(
-        "Feedback copied to clipboard. " ++
-            "\x1b]8;;https://github.com/vercel-labs/fx/issues/new?template=fx-report.yml\x1b\\" ++
-            "\x1b[4mReport issue\x1b[24m\x1b]8;;\x1b\\. " ++
-            "Please ensure its redaction before sharing.",
-        body,
-    );
-}
-
-test "feedback issue notice distinguishes Markdown file outcomes" {
-    const url = "https://github.com/vercel-labs/fx/issues/new?template=fx-report.yml";
-    const report_path = "/tmp/report.md";
+test "trace notice distinguishes Markdown file outcomes without a feedback CTA" {
+    const report_path = "/tmp/trace.md";
     const cases = [_]struct {
-        disposition: FeedbackIssueReportDisposition,
+        disposition: TraceReportDisposition,
         expected: []const u8,
     }{
         .{
             .disposition = .{ .copied_file = report_path },
-            .expected = "Feedback copied to clipboard. ",
+            .expected = "Trace copied to clipboard. Review and redact it before sharing.",
         },
         .{
             .disposition = .{ .copy_failed = report_path },
-            .expected = "Clipboard copy failed. Redact /tmp/report.md, then ",
+            .expected = "Clipboard copy failed. Trace saved at /tmp/trace.md. Review and redact it before sharing.",
         },
         .{
             .disposition = .{ .saved = report_path },
-            .expected = "Feedback saved at /tmp/report.md. Redact it, then ",
+            .expected = "Trace saved at /tmp/trace.md. Review and redact it before sharing.",
         },
         .{
             .disposition = .unavailable,
-            .expected = "Could not create feedback report. ",
+            .expected = "Could not create trace.",
         },
     };
 
     for (cases) |case| {
-        const body = try format_feedback_issue_notice(std.testing.allocator, url, case.disposition);
+        const body = try format_trace_notice(std.testing.allocator, case.disposition);
         defer std.testing.allocator.free(body);
-        try std.testing.expect(std.mem.startsWith(u8, body, case.expected));
-        try std.testing.expect(std.mem.find(u8, body, "Report issue") != null);
+        try std.testing.expectEqualStrings(case.expected, body);
+        try std.testing.expect(std.mem.find(u8, body, "feedback") == null);
+        try std.testing.expect(std.mem.find(u8, body, "Report issue") == null);
     }
 }
 
-test "feedback report file uses private randomized markdown path" {
+test "trace report file uses private randomized markdown path" {
     const alloc = std.testing.allocator;
-    const path = try writeFeedbackReportFile(alloc, "hello\n");
+    const path = try writeTraceReportFile(alloc, "hello\n");
     defer alloc.free(path);
     defer std.Io.Dir.deleteFileAbsolute(std.testing.io, path) catch {};
 
-    try std.testing.expect(std.mem.find(u8, path, "fx-feedback-") != null);
+    try std.testing.expect(std.mem.find(u8, path, "fx-trace-") != null);
     try std.testing.expect(std.mem.endsWith(u8, path, ".md"));
 
     var file = try std.Io.Dir.openFileAbsolute(std.testing.io, path, .{});
@@ -3689,7 +3683,7 @@ test "feedback report file uses private randomized markdown path" {
     }
 }
 
-test "feedback auth summary preserves missing and loaded status text" {
+test "trace auth summary preserves missing and loaded status text" {
     const alloc = std.testing.allocator;
     var app = struct { auth: auth_runtime.Runtime = .{} }{};
     defer app.auth.deinit(alloc);
@@ -3717,7 +3711,7 @@ test "feedback auth summary preserves missing and loaded status text" {
     );
 }
 
-test "feedback tool calls print errors first and mask obvious secrets" {
+test "trace tool calls print errors first and mask obvious secrets" {
     const alloc = std.testing.allocator;
     diagnostics.resetForTest();
     defer diagnostics.resetForTest();
@@ -3748,7 +3742,7 @@ test "feedback tool calls print errors first and mask obvious secrets" {
     try std.testing.expect(std.mem.find(u8, text, "PASSWORD=[redacted]") != null);
 }
 
-test "feedback successful tool calls use compact result previews" {
+test "trace successful tool calls use compact result previews" {
     const alloc = std.testing.allocator;
     diagnostics.resetForTest();
     defer diagnostics.resetForTest();
@@ -3770,7 +3764,7 @@ test "feedback successful tool calls use compact result previews" {
     try std.testing.expect(std.mem.find(u8, text, "long body line") == null);
 }
 
-test "feedback omits web_fetch URL and result bodies from tool-call diagnostics" {
+test "trace omits web_fetch URL and result bodies from tool-call diagnostics" {
     const alloc = std.testing.allocator;
     diagnostics.resetForTest();
     defer diagnostics.resetForTest();
@@ -3795,7 +3789,7 @@ test "feedback omits web_fetch URL and result bodies from tool-call diagnostics"
     try std.testing.expect(std.mem.find(u8, text, "result_preview:") == null);
 }
 
-test "feedback renders web search request count without content" {
+test "trace renders web search request count without content" {
     const alloc = std.testing.allocator;
     diagnostics.resetForTest();
     defer diagnostics.resetForTest();
@@ -3824,7 +3818,7 @@ test "feedback renders web search request count without content" {
     try std.testing.expect(std.mem.find(u8, text, "raw result content") == null);
 }
 
-test "feedback renders gateway schema diagnostics without raw payload content" {
+test "trace renders gateway schema diagnostics without raw payload content" {
     const alloc = std.testing.allocator;
     diagnostics.resetForTest();
     defer diagnostics.resetForTest();

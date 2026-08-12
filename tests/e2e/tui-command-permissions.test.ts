@@ -209,9 +209,9 @@ function sessionIdFromHome(root: IsolatedRoot): string {
   return ids[0]!;
 }
 
-function latestFeedbackReportPath(root: IsolatedRoot): string {
+function latestTraceReportPath(root: IsolatedRoot): string {
   const reports = readdirSync(root.root)
-    .filter((entry) => entry.startsWith("fx-feedback-") && entry.endsWith(".md"))
+    .filter((entry) => entry.startsWith("fx-trace-") && entry.endsWith(".md"))
     .map((entry) => {
       const path = join(root.root, entry);
       return { path, mtimeMs: statSync(path).mtimeMs };
@@ -872,6 +872,14 @@ function hostilePath(root: IsolatedRoot) {
 
 function installClipboardFixture(root: IsolatedRoot, script: string) {
   for (const command of ["pbcopy", "xclip", "osascript"]) {
+    const path = join(root.hostileBin, command);
+    writeFileSync(path, script);
+    chmodSync(path, 0o755);
+  }
+}
+
+function installUrlOpenerFixture(root: IsolatedRoot, script: string) {
+  for (const command of ["open", "xdg-open"]) {
     const path = join(root.hostileBin, command);
     writeFileSync(path, script);
     chmodSync(path, 0o755);
@@ -1853,7 +1861,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "TUI writes Gateway schema diagnostics to feedback after Gateway 400",
+    "TUI writes Gateway schema diagnostics to a trace after Gateway 400",
     async () => {
       const root = createIsolatedRoot();
       const gateway = startFakeGateway([
@@ -1886,14 +1894,14 @@ describe("effect-aware command permissions", () => {
       await activeSession.sendText("Trigger the gateway schema diagnostic.");
       await activeSession.waitForText("HTTP 400", TIMEOUT);
 
-      await activeSession.sendText("/feedback");
+      await activeSession.sendText("/trace");
       await activeSession.waitForText(
         process.platform === "darwin"
           ? "Clipboard copy failed"
-          : "Feedback saved at",
+          : "Trace saved at",
         TIMEOUT,
       );
-      const reportPath = latestFeedbackReportPath(root);
+      const reportPath = latestTraceReportPath(root);
       const report = readFileSync(reportPath, "utf8");
 
       expect(gateway.requests).toHaveLength(1);
@@ -1917,15 +1925,15 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "TUI creates a Markdown feedback file and renders a prefilled GitHub issue link",
+    "TUI creates a private Markdown trace without a feedback CTA",
     async () => {
       const root = createIsolatedRoot();
       const gateway = startFakeGateway([]);
-      const stderrPath = join(root.root, "feedback-report-stderr.log");
-      const clipboardPath = join(root.root, "feedback-clipboard-path.txt");
+      const stderrPath = join(root.root, "trace-report-stderr.log");
+      const clipboardPath = join(root.root, "trace-clipboard-path.txt");
       installClipboardFixture(
         root,
-        '#!/bin/sh\nfor arg in "$@"; do last="$arg"; done\nprintf "%s" "$last" > "$FX_FEEDBACK_CLIPBOARD_OUTPUT"\n',
+        '#!/bin/sh\nfor arg in "$@"; do last="$arg"; done\nprintf "%s" "$last" > "$FX_TRACE_CLIPBOARD_OUTPUT"\n',
       );
       writeFileSync(stderrPath, "");
 
@@ -1935,37 +1943,28 @@ describe("effect-aware command permissions", () => {
         env: gatewayEnv(root, gateway, {
           PATH: hostilePath(root),
           TMPDIR: root.root,
-          FX_FEEDBACK_CLIPBOARD_OUTPUT: clipboardPath,
+          FX_TRACE_CLIPBOARD_OUTPUT: clipboardPath,
         }),
         stderrPath,
         width: 120,
         height: 40,
       });
       await activeSession.waitForComposer(TIMEOUT);
-      await activeSession.sendText("/feedback");
-      await activeSession.waitForText("Report issue", TIMEOUT);
+      await activeSession.sendText("/trace");
       await activeSession.waitForText(
         process.platform === "darwin"
-          ? "Feedback copied to clipboard"
-          : "Feedback saved at",
+          ? "Trace copied to clipboard"
+          : "Trace saved at",
         TIMEOUT,
       );
-      if (process.platform === "darwin") {
-        await activeSession.waitForText(
-          "Please ensure its redaction before sharing.",
-          TIMEOUT,
-        );
-      }
 
       const escapes = await activeSession.capturePaneEscapes();
-      expect(escapes).toContain("Report issue");
-      expect(escapes).toContain("https://github.com/vercel-labs/fx/issues/new?template=fx-report.yml&diagnostics=");
-      expect(escapes).toContain("source%3A%20%2Ffeedback");
-      expect(escapes).not.toContain("workspace%3A");
-      expect(escapes).not.toContain("prompt%3A");
-      const reportPath = latestFeedbackReportPath(root);
+      expect(escapes).not.toContain("Report issue");
+      expect(escapes).not.toContain("fx.sh/feedback");
+      expect(escapes).not.toContain("github.com");
+      const reportPath = latestTraceReportPath(root);
       const report = readFileSync(reportPath, "utf8");
-      expect(report).toContain("# fx feedback report");
+      expect(report).toContain("# fx trace");
       expect(report).toContain("## Summary");
       expect(report).toContain(root.workspace);
       expect(statSync(reportPath).mode & 0o077).toBe(0);
@@ -1974,6 +1973,58 @@ describe("effect-aware command permissions", () => {
       } else {
         expect(existsSync(clipboardPath)).toBe(false);
       }
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI feedback opens fx.sh without creating a trace or touching the clipboard",
+    async () => {
+      const root = createIsolatedRoot();
+      const gateway = startFakeGateway([]);
+      const stderrPath = join(root.root, "feedback-stderr.log");
+      const openerPath = join(root.root, "feedback-opened-url.txt");
+      const clipboardMarker = join(root.root, "feedback-clipboard-used.txt");
+      installUrlOpenerFixture(
+        root,
+        '#!/bin/sh\nprintf "%s" "$1" > "$FX_FEEDBACK_OPEN_OUTPUT"\n',
+      );
+      installClipboardFixture(
+        root,
+        '#!/bin/sh\nprintf used > "$FX_FEEDBACK_CLIPBOARD_MARKER"\n',
+      );
+      writeFileSync(stderrPath, "");
+
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, {
+          PATH: hostilePath(root),
+          TMPDIR: root.root,
+          FX_FEEDBACK_OPEN_OUTPUT: openerPath,
+          FX_FEEDBACK_CLIPBOARD_MARKER: clipboardMarker,
+        }),
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText("/feedback");
+      await activeSession.waitForText("Opened https://fx.sh/feedback.", TIMEOUT);
+
+      expect(readFileSync(openerPath, "utf8")).toBe("https://fx.sh/feedback");
+      expect(existsSync(clipboardMarker)).toBe(false);
+      expect(
+        readdirSync(root.root).filter((entry) => entry.startsWith("fx-trace-")),
+      ).toHaveLength(0);
+      const escapes = await activeSession.capturePaneEscapes();
+      expect(escapes).not.toContain("github.com");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       await activeSession.sendText("/quit");

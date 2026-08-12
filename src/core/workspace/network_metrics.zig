@@ -1,4 +1,4 @@
-// In-memory ring buffer of recent gateway HTTP calls. Used by /feedback
+// In-memory ring buffer of recent gateway HTTP calls. Used by /trace
 // to surface latency / error patterns without forcing a persistent trace
 // log. Process-wide and lock-protected: callers do not need to plumb the
 // buffer through their context.
