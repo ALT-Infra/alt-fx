@@ -105,6 +105,7 @@ pub const Runtime = struct {
     pub fn pushText(self: *Runtime, text: []const u8) !void {
         try self.checkPendingError();
         errdefer |err| self.rememberFailure(err);
+        self.shell.setAssistantTailWritable(true);
         _ = try self.shell.streamAssistantChunk(self.alloc, &self.metrics, text);
         try self.render();
     }
@@ -113,6 +114,10 @@ pub const Runtime = struct {
         try self.checkPendingError();
         errdefer |err| self.rememberFailure(err);
         _ = try self.shell.applyToolLifecycle(self.alloc, event);
+        switch (event) {
+            .turn_finished => self.shell.setAssistantTailWritable(false),
+            else => {},
+        }
         try self.render();
         switch (event) {
             .turn_finished => try self.shell.finishLifecycleBatch(self.alloc),

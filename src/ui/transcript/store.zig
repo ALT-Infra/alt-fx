@@ -1070,6 +1070,7 @@ fn appendSemanticNoticeEntry(
     self: anytype,
     alloc: Allocator,
     notice: types.SemanticNotice,
+    pending_replacement: bool,
 ) !u32 {
     std.debug.assert(notice.body.len > 0);
 
@@ -1083,6 +1084,7 @@ fn appendSemanticNoticeEntry(
         .tone = owned.tone,
         .body = owned.body,
         .visibility = owned.visibility,
+        .pending_replacement = pending_replacement,
     } });
     self.next_entry_id +%= 1;
     return entry_id;
@@ -1093,13 +1095,38 @@ pub fn appendSemanticNoticeAtomic(
     alloc: Allocator,
     notice: types.SemanticNotice,
 ) !u32 {
+    return appendSemanticNoticeAtomicPinned(self, alloc, notice, false);
+}
+
+/// Appends a semantic notice the producer intends to replace in place later.
+/// The entry carries a pending-replacement pin; replaceSemanticNoticeAtomic
+/// requires that pin, and the finished replacement clears it.
+pub fn appendReplaceableSemanticNoticeAtomic(
+    self: anytype,
+    alloc: Allocator,
+    notice: types.SemanticNotice,
+) !u32 {
+    return appendSemanticNoticeAtomicPinned(self, alloc, notice, true);
+}
+
+fn appendSemanticNoticeAtomicPinned(
+    self: anytype,
+    alloc: Allocator,
+    notice: types.SemanticNotice,
+    pending_replacement: bool,
+) !u32 {
     std.debug.assert(notice.body.len > 0);
     try self.assertCanMutateTranscript();
 
     var shadow = try cloneMutationState(self, alloc);
     defer shadow.deinit(alloc);
 
-    const entry_id = try appendSemanticNoticeEntry(&shadow, alloc, notice);
+    const entry_id = try appendSemanticNoticeEntry(
+        &shadow,
+        alloc,
+        notice,
+        pending_replacement,
+    );
     const retention_changed = try enforceStructuredRetentionAndReport(
         &shadow,
         alloc,
@@ -1143,6 +1170,12 @@ pub fn replaceSemanticNoticeAtomic(
     var shadow = try cloneMutationState(self, alloc);
     defer shadow.deinit(alloc);
     const entry_index = semanticNoticeIndex(&shadow, entry_id) orelse return false;
+    // In-place replacement requires the producer-owned pin, mirroring the
+    // raw-bytes lifecycle pin: an unpinned notice is immutable history and
+    // may already be released into terminal scrollback.
+    if (!shadow.entries.items[entry_index].semantic_notice.pending_replacement) {
+        return error.MissingNoticeReplacementPin;
+    }
     const created_at_ms = shadow.entries.items[entry_index].semantic_notice.created_at_ms;
     const owned = try types.dupeSemanticNotice(alloc, notice);
     var handed_off = false;
@@ -1958,6 +1991,7 @@ fn cloneEntry(alloc: Allocator, entry: TranscriptEntry) !TranscriptEntry {
                 .tone = owned.tone,
                 .body = owned.body,
                 .visibility = owned.visibility,
+                .pending_replacement = notice.pending_replacement,
             } };
         },
         .user_turn => |user| blk: {

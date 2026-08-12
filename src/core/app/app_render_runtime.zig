@@ -1577,6 +1577,12 @@ pub fn Runtime(comptime App: type) type {
                     try syncChildConversationProjection(app, view);
                 }
             }
+            // Frame-fresh producer fact for the finality floor: the trailing
+            // assistant entry stays non-final while the stream is open or
+            // the pacer still holds undelivered output.
+            app.shell.setAssistantTailWritable(
+                app.stream.active or app.pacer.hasPending(),
+            );
             const presentation_shell: *transcript_runtime.TranscriptRuntime =
                 if (child_view != null)
                     app.subagents.childConversationRuntime() orelse &app.shell

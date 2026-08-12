@@ -1955,6 +1955,10 @@ const App = struct {
         return self.shell.appendSemanticNotice(self.alloc, notice);
     }
 
+    pub fn appendReplaceableDomainNotice(self: *App, notice: types.SemanticNotice) !u32 {
+        return self.shell.appendReplaceableSemanticNotice(self.alloc, notice);
+    }
+
     pub fn replaceDomainNotice(self: *App, entry_id: u32, notice: types.SemanticNotice) !bool {
         return self.shell.replaceSemanticNotice(self.alloc, entry_id, notice);
     }

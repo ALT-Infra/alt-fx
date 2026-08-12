@@ -7246,3 +7246,629 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     TIMEOUT,
   );
 });
+
+describe.skipIf(!tmuxAvailable())("transcript scrollback release", () => {
+  const SB_TIMEOUT = 60_000;
+  let root: string | undefined;
+  let session: TmuxSession | undefined;
+  let gateway: { stop: () => void } | undefined;
+
+  afterEach(async () => {
+    await session?.kill();
+    session = undefined;
+    gateway?.stop();
+    gateway = undefined;
+    if (root) rmSync(root, { recursive: true, force: true });
+    root = undefined;
+  });
+
+  function sbSseEvent(event: object): string {
+    return `data: ${JSON.stringify(event)}\n\n`;
+  }
+
+  function sbTokenChunks(text: string, size: number): string[] {
+    const chunks: string[] = [];
+    for (let index = 0; index < text.length; index += size) {
+      chunks.push(text.slice(index, index + size));
+    }
+    return chunks;
+  }
+
+  function sbStreamedFinalText(lines: string[], delayMs: number) {
+    return () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          async start(controller) {
+            const encoder = new TextEncoder();
+            for (const line of lines) {
+              controller.enqueue(
+                encoder.encode(
+                  sbSseEvent({
+                    type: "text-delta",
+                    id: "answer_1",
+                    delta: `${line}\n`,
+                  }),
+                ),
+              );
+              await Bun.sleep(delayMs);
+            }
+            controller.enqueue(
+              encoder.encode(
+                sbSseEvent({
+                  type: "finish",
+                  finishReason: { unified: "stop", raw: "stop" },
+                  usage: {
+                    inputTokens: { total: 3 },
+                    outputTokens: { total: 5 },
+                  },
+                }),
+              ),
+            );
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+            controller.close();
+          },
+        }),
+        { headers: { "content-type": "text/event-stream" } },
+      );
+  }
+
+  // Models an ordinary model/network wait: the transcript sits byte-stable
+  // for several render ticks while this response is already pending. Release
+  // must not treat that quiet window as finality.
+  function sbHeldSerializedToolCall(
+    id: string,
+    name: string,
+    input: string,
+    holdMs: number,
+  ) {
+    return () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          async start(controller) {
+            const encoder = new TextEncoder();
+            await Bun.sleep(holdMs);
+            controller.enqueue(
+              encoder.encode(
+                sbSseEvent({
+                  type: "tool-call",
+                  toolCallId: id,
+                  toolName: name,
+                  input,
+                }),
+              ),
+            );
+            controller.enqueue(
+              encoder.encode(
+                sbSseEvent({
+                  type: "finish",
+                  finishReason: { unified: "tool-calls", raw: "tool-calls" },
+                }),
+              ),
+            );
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+            controller.close();
+          },
+        }),
+        { headers: { "content-type": "text/event-stream" } },
+      );
+  }
+
+  function sbToolCallBatch(
+    calls: Array<{ id: string; name: string; input: object }>,
+    assistantText?: string,
+    reasoning?: { chunks: string[]; delayMs: number; id: string },
+  ) {
+    const finishEvents = (): object[] => {
+      const events: object[] = [];
+      if (assistantText) {
+        events.push({
+          type: "text-delta",
+          id: "answer_1",
+          delta: assistantText,
+        });
+      }
+      for (const call of calls) {
+        events.push({
+          type: "tool-call",
+          toolCallId: call.id,
+          toolName: call.name,
+          input: call.input,
+        });
+      }
+      events.push({
+        type: "finish",
+        finishReason: { unified: "tool-calls", raw: "tool-calls" },
+      });
+      return events;
+    };
+    if (!reasoning) {
+      return new Response(
+        `${finishEvents()
+          .map((event) => sbSseEvent(event))
+          .join("")}data: [DONE]\n\n`,
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    }
+    return () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          async start(controller) {
+            const encoder = new TextEncoder();
+            controller.enqueue(
+              encoder.encode(
+                sbSseEvent({ type: "reasoning-start", id: reasoning.id }),
+              ),
+            );
+            for (const chunk of reasoning.chunks) {
+              controller.enqueue(
+                encoder.encode(
+                  sbSseEvent({
+                    type: "reasoning-delta",
+                    id: reasoning.id,
+                    delta: chunk,
+                  }),
+                ),
+              );
+              await Bun.sleep(reasoning.delayMs);
+            }
+            controller.enqueue(
+              encoder.encode(
+                sbSseEvent({ type: "reasoning-end", id: reasoning.id }),
+              ),
+            );
+            for (const event of finishEvents()) {
+              controller.enqueue(encoder.encode(sbSseEvent(event)));
+            }
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+            controller.close();
+          },
+        }),
+        { headers: { "content-type": "text/event-stream" } },
+      );
+  }
+
+  function sbReasoningThenStreamedFinalText(
+    reasoningChunks: string[],
+    chunks: string[],
+    delayMs: number,
+  ) {
+    return () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          async start(controller) {
+            const encoder = new TextEncoder();
+            controller.enqueue(
+              encoder.encode(
+                sbSseEvent({ type: "reasoning-start", id: "r-final" }),
+              ),
+            );
+            for (const chunk of reasoningChunks) {
+              controller.enqueue(
+                encoder.encode(
+                  sbSseEvent({
+                    type: "reasoning-delta",
+                    id: "r-final",
+                    delta: chunk,
+                  }),
+                ),
+              );
+              await Bun.sleep(delayMs);
+            }
+            controller.enqueue(
+              encoder.encode(
+                sbSseEvent({ type: "reasoning-end", id: "r-final" }),
+              ),
+            );
+            controller.enqueue(
+              encoder.encode(sbSseEvent({ type: "text-start", id: "answer_1" })),
+            );
+            for (const chunk of chunks) {
+              controller.enqueue(
+                encoder.encode(
+                  sbSseEvent({
+                    type: "text-delta",
+                    id: "answer_1",
+                    delta: chunk,
+                  }),
+                ),
+              );
+              await Bun.sleep(delayMs);
+            }
+            controller.enqueue(
+              encoder.encode(sbSseEvent({ type: "text-end", id: "answer_1" })),
+            );
+            controller.enqueue(
+              encoder.encode(
+                sbSseEvent({
+                  type: "finish",
+                  finishReason: { unified: "stop", raw: "stop" },
+                  usage: {
+                    inputTokens: { total: 3 },
+                    outputTokens: { total: 5 },
+                  },
+                }),
+              ),
+            );
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+            controller.close();
+          },
+        }),
+        { headers: { "content-type": "text/event-stream" } },
+      );
+  }
+
+  function sbSettings(): string {
+    return JSON.stringify({
+      sandbox: "none",
+      permission_mode: "yolo",
+      permission: {},
+      startup_scrollback: false,
+      input_appearance: "lines",
+      maxxing_mode: "minimal",
+      statusLine: { context: true },
+      yolo_acknowledged: true,
+    });
+  }
+
+  test(
+    "sequential tool group and streamed markdown keep native scrollback final",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-sb-release-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const tapePath = join(root, "sb-release.fxtape");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(workspace, "docs"), { recursive: true });
+      for (let index = 1; index <= 17; index += 1) {
+        writeFileSync(
+          join(workspace, "docs", `source-${String(index).padStart(2, "0")}.md`),
+          `source row ${index}\n`,
+        );
+      }
+      writeFileSync(join(home, ".fx", "settings.json"), sbSettings());
+      writeFileSync(stderrPath, "");
+
+      const codeALines = Array.from(
+        { length: 6 },
+        (_, index) => `CODE_A_LINE_${String(index + 1).padStart(2, "0")}();`,
+      );
+      const codeBLines = Array.from(
+        { length: 4 },
+        (_, index) => `CODE_B_LINE_${String(index + 1).padStart(2, "0")}();`,
+      );
+      const responseLines = [
+        "RESP_INTRO here is how the hook works today.",
+        "",
+        "1. RESP_ITEM_ONE the hook is mounted with:",
+        "",
+        "```ts",
+        ...codeALines,
+        "```",
+        "",
+        "2. RESP_ITEM_TWO its logical cache key is generated from only:",
+        "",
+        "```ts",
+        ...codeBLines,
+        "```",
+        "",
+        "RESP_TAIL that is the whole flow.",
+      ];
+
+      const readResponse = (index: number) => {
+        const input = JSON.stringify({
+          path: `docs/source-${String(index).padStart(2, "0")}.md`,
+        });
+        if (index === 15) {
+          return sbHeldSerializedToolCall(
+            `sb-read-${index}`,
+            "read_file",
+            input,
+            350,
+          );
+        }
+        return fakeGatewaySerializedToolCall(
+          `sb-read-${index}`,
+          "read_file",
+          input,
+        );
+      };
+      gateway = startFakeGateway([
+        fakeGatewaySerializedToolCall(
+          "sb-list",
+          "list_files",
+          JSON.stringify({ path: "docs" }),
+          "I'll inspect the SWR wiring end to end.",
+        ),
+        ...Array.from({ length: 17 }, (_, index) => readResponse(index + 1)),
+        sbStreamedFinalText(responseLines, 60),
+      ]);
+      const fakeGateway = gateway as ReturnType<typeof startFakeGateway>;
+
+      session = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: workspace,
+        width: 100,
+        height: 20,
+        minimumHistoryLines: 10_000,
+        stderrPath,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-sb-release-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_GATEWAY_BASE_URL: fakeGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: fakeGateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: fakeGateway.chatUrl,
+          FX_MODEL: MODEL,
+          FX_RECORD: tapePath,
+          FX_RECORD_INPUT: "1",
+        },
+      });
+
+      await session.waitForComposer(SB_TIMEOUT);
+      await session.sendText("Explain the SWR hook wiring.");
+      await session.waitForText("RESP_TAIL", SB_TIMEOUT);
+      await session.waitForPane(hasEmptyComposer, SB_TIMEOUT);
+      await Bun.sleep(250);
+
+      const scrollback = await session.captureFullScrollback();
+
+      // The group header must survive as its final text exactly once; a
+      // frozen intermediate count would add another "tool call" line.
+      expect(countOccurrences(scrollback, "tool call")).toBe(1);
+      expect(scrollback).toContain("18 tool calls");
+      for (let index = 1; index <= 17; index += 1) {
+        expect(
+          countOccurrences(
+            scrollback,
+            `Read docs/source-${String(index).padStart(2, "0")}.md`,
+          ),
+        ).toBe(1);
+      }
+
+      const orderedMarkers = [
+        "RESP_INTRO",
+        "RESP_ITEM_ONE",
+        ...codeALines.map((line) => line.slice(0, line.length - 3)),
+        "RESP_ITEM_TWO",
+        ...codeBLines.map((line) => line.slice(0, line.length - 3)),
+        "RESP_TAIL",
+      ];
+      let previousIndex = -1;
+      for (const marker of orderedMarkers) {
+        expect(countOccurrences(scrollback, marker)).toBe(1);
+        const index = scrollback.indexOf(marker);
+        expect(index).toBeGreaterThan(previousIndex);
+        previousIndex = index;
+      }
+      const introIndex = scrollback.indexOf("RESP_INTRO");
+      const tailIndex = scrollback.indexOf("RESP_TAIL");
+      const responseRegion = scrollback.slice(introIndex, tailIndex);
+      expect(responseRegion).not.toContain("Read docs/source-");
+      expect(responseRegion).not.toMatch(/(?:Thinking \(|\(↑\d)/);
+      expect(existsSync(tapePath)).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    SB_TIMEOUT + 30_000,
+  );
+
+  test(
+    "parallel tool batches and token-streamed markdown keep native scrollback final",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-sb-batch-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const tapePath = join(root, "sb-batch.fxtape");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(workspace, "docs"), { recursive: true });
+      for (let index = 1; index <= 20; index += 1) {
+        writeFileSync(
+          join(workspace, "docs", `source-${String(index).padStart(2, "0")}.md`),
+          `alpha scoped row ${index}\n`.repeat(3),
+        );
+      }
+      writeFileSync(join(home, ".fx", "settings.json"), sbSettings());
+      writeFileSync(stderrPath, "");
+
+      const fillerLines = Array.from(
+        { length: 45 },
+        (_, index) =>
+          `FILLER_ROW_${String(index + 1).padStart(2, "0")} history line.`,
+      );
+      let readCounter = 0;
+      const readCall = () => {
+        readCounter += 1;
+        return {
+          id: `sb-read-${readCounter}`,
+          name: "read_file",
+          input: {
+            path: `docs/source-${String(readCounter).padStart(2, "0")}.md`,
+          },
+        };
+      };
+      let grepCounter = 0;
+      const grepCall = (pattern: string) => {
+        grepCounter += 1;
+        return {
+          id: `sb-grep-${grepCounter}`,
+          name: "grep_files",
+          input: { pattern, path: "docs", include: "*.md", mode: "matches" },
+        };
+      };
+      const responseLines = [
+        "RESP_INTRO teamData is cached client-side, but not by scope.",
+        "The path is:",
+        "",
+        "1. RESP_ITEM_ONE the dropdown calls:",
+        "",
+        "```ts",
+        "CODE_A_LINE_01(['scoped', 'team'], {}, {",
+        "CODE_A_LINE_02: true,",
+        "CODE_A_LINE_03: true,",
+        "})",
+        "```",
+        "",
+        "2. RESP_ITEM_TWO its logical cache key is generated from only:",
+        "",
+        "```ts",
+        'CODE_B_LINE_01 // ["team", {}]',
+        "```",
+        "",
+        "3. RESP_ITEM_THREE scoped data is stored in a singleton atom:",
+        "",
+        "```ts",
+        "CODE_C_LINE_01: atom(ASSERT_SWR_DATA)",
+        "```",
+        "",
+        "4. RESP_ITEM_FOUR revalidateNever disables all refresh paths:",
+        "",
+        "```ts",
+        "CODE_D_LINE_01: false",
+        "CODE_D_LINE_02: false",
+        "CODE_D_LINE_03: false",
+        "CODE_D_LINE_04: false",
+        "```",
+        "",
+        "RESP_TAIL that is why the previous atom value remains indefinitely.",
+      ];
+
+      gateway = startFakeGateway([
+        sbStreamedFinalText(fillerLines, 10),
+        sbToolCallBatch(
+          [
+            readCall(),
+            readCall(),
+            grepCall("useServerQuerySWR"),
+            grepCall("revalidateNever"),
+          ],
+          "I'll trace how the cache keys are built end to end.",
+        ),
+        sbToolCallBatch([
+          {
+            id: "sb-glob",
+            name: "glob_files",
+            input: { pattern: "**/*.md", path: "docs", mode: "matches" },
+          },
+          readCall(),
+          readCall(),
+          grepCall("ScopedPromisesProvider"),
+        ]),
+        sbToolCallBatch([
+          readCall(),
+          readCall(),
+          readCall(),
+          grepCall("revalidateOnFocus"),
+        ]),
+        sbToolCallBatch([
+          readCall(),
+          readCall(),
+          readCall(),
+          grepCall("ContextSWRProvider"),
+        ]),
+        sbToolCallBatch([
+          readCall(),
+          grepCall("getWritableScopedAtoms"),
+          grepCall("AltProvidersProbe"),
+          grepCall("scope change"),
+        ]),
+        sbToolCallBatch([grepCall("router.")], undefined, {
+          chunks: Array.from(
+            { length: 10 },
+            (_, index) => `thinking hard step ${index} `,
+          ),
+          delayMs: 350,
+          id: "r-pause",
+        }),
+        sbToolCallBatch([readCall()]),
+        sbReasoningThenStreamedFinalText(
+          Array.from(
+            { length: 8 },
+            (_, index) => `assembling the final answer ${index} `,
+          ),
+          sbTokenChunks(responseLines.join("\n"), 10),
+          20,
+        ),
+      ]);
+      const fakeGateway = gateway as ReturnType<typeof startFakeGateway>;
+
+      session = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: workspace,
+        width: 149,
+        height: 51,
+        minimumHistoryLines: 10_000,
+        stderrPath,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-sb-batch-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_GATEWAY_BASE_URL: fakeGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: fakeGateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: fakeGateway.chatUrl,
+          FX_MODEL: MODEL,
+          FX_RECORD: tapePath,
+          FX_RECORD_INPUT: "1",
+        },
+      });
+
+      await session.waitForComposer(SB_TIMEOUT);
+      await session.sendText("Fill the history first.");
+      await session.waitForText("FILLER_ROW_45", SB_TIMEOUT);
+      await session.waitForPane(hasEmptyComposer, SB_TIMEOUT);
+      await session.sendText("How would client-side teamData go stale?");
+      await session.waitForText("RESP_TAIL", SB_TIMEOUT);
+      await session.waitForPane(hasEmptyComposer, SB_TIMEOUT);
+      await Bun.sleep(250);
+
+      const scrollback = await session.captureFullScrollback();
+
+      const childMarkers = [
+        ...Array.from(
+          { length: 12 },
+          (_, index) =>
+            `Read docs/source-${String(index + 1).padStart(2, "0")}.md`,
+        ),
+        "Searched useServerQuerySWR",
+        "Searched revalidateNever",
+        "Searched ScopedPromisesProvider",
+        "Searched revalidateOnFocus",
+        "Searched ContextSWRProvider",
+        "Searched getWritableScopedAtoms",
+        "Searched AltProvidersProbe",
+        "Searched scope change",
+        "Searched router.",
+        "Matched **/*.md",
+      ];
+      for (const marker of childMarkers) {
+        expect(countOccurrences(scrollback, marker)).toBe(1);
+      }
+      const orderedResponseMarkers = [
+        "RESP_INTRO",
+        "RESP_ITEM_ONE",
+        "CODE_A_LINE_01",
+        "CODE_A_LINE_02",
+        "CODE_A_LINE_03",
+        "RESP_ITEM_TWO",
+        "CODE_B_LINE_01",
+        "RESP_ITEM_THREE",
+        "CODE_C_LINE_01",
+        "RESP_ITEM_FOUR",
+        "CODE_D_LINE_01",
+        "CODE_D_LINE_04",
+        "RESP_TAIL",
+      ];
+      let previousIndex = -1;
+      for (const marker of orderedResponseMarkers) {
+        expect(countOccurrences(scrollback, marker)).toBe(1);
+        const index = scrollback.indexOf(marker);
+        expect(index).toBeGreaterThan(previousIndex);
+        previousIndex = index;
+      }
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    SB_TIMEOUT + 60_000,
+  );
+});

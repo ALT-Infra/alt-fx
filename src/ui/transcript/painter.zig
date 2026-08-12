@@ -1122,9 +1122,14 @@ pub const PreparedTranscriptSurfacePaint = struct {
     measured_history_origin: ?MeasuredHistoryOrigin = null,
     measured_history_origin_consumed: bool = false,
     measured_resize_target_provenance: MeasuredResizeTargetProvenance = .none,
+    // Owned copy of the source's finality boundary candidates; the scroll
+    // planner selects the release floor from these against frame-fresh
+    // producer facts. Empty candidates mean the whole flow is final.
+    finality_candidates: source_preparation.FinalityCandidates = .{},
     cursor: ViewportCursorResult = .{ .cursor_row = 1, .cursor_col = 1, .replaceable_row = 1 },
 
     pub fn deinit(self: *PreparedTranscriptSurfacePaint, alloc: Allocator) void {
+        self.finality_candidates.deinit(alloc);
         if (self.owns_bytes and self.bytes.len > 0) alloc.free(self.bytes);
         self.visible_lines.deinit(alloc);
         self.line_visual_rows.deinit(alloc);
@@ -1725,6 +1730,7 @@ fn prepareTranscriptSurfacePaintInternal(
         },
     };
     errdefer prepared.deinit(alloc);
+    prepared.finality_candidates = try source.finality.clone(alloc);
     const transcript_buf = TranscriptBuffer{ .bytes = prepared.bytes };
 
     debug_trace.logf("render", "viewport_enter layout={d}x{d} content_bottom={d} viewport_top={d} cursor={d},{d} replaceable={{last={s} row={d} start={d}}} transcript_bytes={d} entries={d}", .{ self.layout.cols, self.layout.rows, self.layout.content_bottom, self.viewport_top_row, self.cursor_row, self.cursor_col, if (effective_replaceable_last_line) "true" else "false", effective_replaceable_row, effective_replaceable_start, prepared.bytes.len, self.entries.items.len });

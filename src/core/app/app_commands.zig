@@ -336,7 +336,7 @@ pub fn Handlers(comptime App: type) type {
         }
 
         fn handleTraceReport(app: *App) !void {
-            const progress_entry_id = try app.appendDomainNotice(.{
+            const progress_entry_id = try app.appendReplaceableDomainNotice(.{
                 .topic = "",
                 .tone = .neutral,
                 .body = "Preparing trace...",

@@ -1812,13 +1812,14 @@ test "semantic notice append and replacement preserve ownership identity and tim
     defer runtime.deinit(alloc);
     runtime.setCommandOutputRenderPolicy(semanticNoticePaletteA());
 
-    const entry_id = try runtime.appendSemanticNotice(alloc, .{
+    const entry_id = try runtime.appendReplaceableSemanticNotice(alloc, .{
         .topic = "build",
         .tone = .warning,
         .body = "first body",
     });
     try std.testing.expectEqual(@as(usize, 1), runtime.entries.items.len);
     try std.testing.expect(runtime.entries.items[0] == .semantic_notice);
+    try std.testing.expect(runtime.entries.items[0].semantic_notice.pending_replacement);
     const created_at_ms = runtime.entries.items[0].createdAtMs();
     try std.testing.expectEqualStrings("build", runtime.entries.items[0].semantic_notice.topic);
     try std.testing.expectEqualStrings("first body", runtime.entries.items[0].semantic_notice.body);
@@ -1837,6 +1838,17 @@ test "semantic notice append and replacement preserve ownership identity and tim
     try std.testing.expectEqualStrings("replacement body with /tmp/output/path", runtime.entries.items[0].semantic_notice.body);
     try std.testing.expectEqual(types.NoticeVisibility.full_only, runtime.entries.items[0].semantic_notice.visibility);
     try std.testing.expectEqualStrings("", runtime.transcript.items);
+    // The finished replacement clears the pending-replacement pin, making
+    // the entry immutable history: a second in-place replacement is refused.
+    try std.testing.expect(!runtime.entries.items[0].semantic_notice.pending_replacement);
+    try std.testing.expectError(
+        error.MissingNoticeReplacementPin,
+        runtime.replaceSemanticNotice(alloc, entry_id, .{
+            .topic = "again",
+            .tone = .information,
+            .body = "must not apply",
+        }),
+    );
     try std.testing.expect(!(try runtime.replaceSemanticNotice(alloc, entry_id + 1, .{
         .topic = "missing",
         .tone = .information,
@@ -1870,7 +1882,7 @@ fn checkSemanticNoticeReplacementAllocationFailures(alloc: Allocator) !void {
     const base = std.testing.allocator;
     var runtime = TranscriptRuntime{ .layout = transcriptTestLayout(32, 16, 12) };
     defer runtime.deinit(base);
-    const entry_id = try runtime.appendSemanticNotice(base, .{
+    const entry_id = try runtime.appendReplaceableSemanticNotice(base, .{
         .topic = "before",
         .tone = .information,
         .body = "stable body",
@@ -8487,6 +8499,9 @@ test "command output consolidation preserves committed prompt scrollback anchor"
         const text = try std.fmt.bufPrint(&line, "assistant table row {d}\n", .{index + 1});
         try first_assistant.text.appendSlice(alloc, text);
     }
+    // The assistant content above is complete; report producer closure so
+    // the finality floor does not hold the tail.
+    runtime.setAssistantTailWritable(false);
 
     var live_source = try runtime.prepareTranscriptSource(alloc, null);
     defer live_source.deinit(alloc);
@@ -8558,7 +8573,29 @@ test "command output consolidation preserves committed prompt scrollback anchor"
     defer compact_prepared.deinit(alloc);
     const facts = runtime.planTranscriptScroll(&compact_prepared);
     try std.testing.expect(facts.target_visual_offset > facts.source_visual_offset);
-    try std.testing.expect(facts.planned_rows > 0);
+    // The consolidation changed committed rows in place, so this frame has
+    // no ability to materialize the held range: zero release, re-anchor on
+    // the rewritten flow, and mark the finality debt.
+    try std.testing.expect(!facts.source_compatible);
+    try std.testing.expect(facts.recovery_rebase);
+    try std.testing.expectEqual(@as(u32, 0), facts.semantic_rows);
+    try std.testing.expectEqual(@as(u16, 0), facts.planned_rows);
+    try std.testing.expect(facts.finality_hold);
+    try commitPreparedForTest(&runtime, alloc, &compact_source, &compact_prepared);
+
+    // The following compatible frame settles the debt with final bytes.
+    var settle_source = try runtime.prepareTranscriptSource(alloc, null);
+    defer settle_source.deinit(alloc);
+    var settle_prepared = try prepareTestSourceForCurrentArea(
+        &runtime,
+        alloc,
+        &settle_source,
+    );
+    defer settle_prepared.deinit(alloc);
+    const settle_facts = runtime.planTranscriptScroll(&settle_prepared);
+    try std.testing.expect(settle_facts.source_compatible);
+    try std.testing.expect(settle_facts.semantic_rows > 0);
+    try std.testing.expect(settle_facts.planned_rows > 0);
 }
 
 fn removeRawEntriesForTest(
@@ -15105,4 +15142,240 @@ test "lifecycle pins survive low cap until batch cleanup restores prune eligibil
         !transcriptContainsEntry(&runtime, first) or
             !transcriptContainsEntry(&runtime, second),
     );
+}
+
+test "finality floor holds unfenced tool turn across quiet ticks and settles after the fence" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(60, 10, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+
+    for (0..6) |index| {
+        var line: [32]u8 = undefined;
+        const text = try std.fmt.bufPrint(&line, "final context {d:0>2}\n", .{index});
+        _ = try runtime.appendRawTranscriptEntry(alloc, text);
+    }
+    var base_source = try runtime.prepareTranscriptSource(alloc, null);
+    defer base_source.deinit(alloc);
+    var base_prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &base_source);
+    defer base_prepared.deinit(alloc);
+    try commitPreparedForTest(&runtime, alloc, &base_source, &base_prepared);
+
+    var turn_call_ids: [8][12]u8 = undefined;
+    for (0..8) |index| {
+        const call_id = try std.fmt.bufPrint(&turn_call_ids[index], "t2-call-{d:0>2}", .{index});
+        const id = types.ToolLifecycleId{ .turn_id = 2, .call_id = call_id };
+        _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+            .id = id,
+            .presentation_group_id = .{ .turn_id = 2, .anchor_step_id = 1 },
+            .reconciles_provisional_call_id = null,
+            .tool_name = "read_file",
+            .activity_kind = .read,
+        } });
+        _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+            .id = id,
+            .outcome = .{ .kind = .completed, .summary = "Read one file" },
+        } });
+    }
+    try runtime.finishLifecycleBatch(alloc);
+    try std.testing.expectEqual(@as(u64, 0), runtime.finalizedToolTurnWatermark());
+
+    var live_source = try runtime.prepareTranscriptSource(alloc, null);
+    defer live_source.deinit(alloc);
+    var live_prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &live_source);
+    defer live_prepared.deinit(alloc);
+    try commitPreparedForTest(&runtime, alloc, &live_source, &live_prepared);
+
+    const held = runtime.transcript_commit_state.stable;
+    try std.testing.expect(held.visual_offset > held.history_visual_offset);
+
+    // Quiet ticks over the unchanged flow release nothing: byte stability
+    // is not finality while the turn is unfenced.
+    var quiet_source = try runtime.prepareTranscriptSource(alloc, null);
+    defer quiet_source.deinit(alloc);
+    var quiet_prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &quiet_source);
+    defer quiet_prepared.deinit(alloc);
+    const quiet_facts = runtime.planTranscriptScroll(&quiet_prepared);
+    try std.testing.expect(quiet_facts.source_compatible);
+    try std.testing.expectEqual(@as(u32, 0), quiet_facts.semantic_rows);
+    try std.testing.expect(quiet_facts.finality_hold);
+
+    // A later mutation of the same group still releases nothing.
+    const late_call = types.ToolLifecycleId{ .turn_id = 2, .call_id = "t2-late" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = late_call,
+        .presentation_group_id = .{ .turn_id = 2, .anchor_step_id = 1 },
+        .reconciles_provisional_call_id = null,
+        .tool_name = "read_file",
+        .activity_kind = .read,
+    } });
+    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = late_call,
+        .outcome = .{ .kind = .completed, .summary = "Read late file" },
+    } });
+    try runtime.finishLifecycleBatch(alloc);
+    var mutated_source = try runtime.prepareTranscriptSource(alloc, null);
+    defer mutated_source.deinit(alloc);
+    var mutated_prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &mutated_source);
+    defer mutated_prepared.deinit(alloc);
+    const mutated_facts = runtime.planTranscriptScroll(&mutated_prepared);
+    try std.testing.expectEqual(@as(u32, 0), mutated_facts.semantic_rows);
+    try std.testing.expectEqual(@as(u16, 0), mutated_facts.planned_rows);
+    try commitPreparedForTest(&runtime, alloc, &mutated_source, &mutated_prepared);
+
+    // The fence and the final mutation arrive in one batch: the first
+    // post-fence frame is byte-incompatible and must hold (zero release),
+    // re-anchoring on the final flow.
+    _ = try runtime.applyToolLifecycle(alloc, .{ .turn_finished = .{
+        .turn_id = 2,
+        .outcome = .completed,
+    } });
+    try runtime.finishLifecycleBatch(alloc);
+    try std.testing.expectEqual(@as(u64, 2), runtime.finalizedToolTurnWatermark());
+
+    // The debt settles on the first eligible frame after the fence: the
+    // same frame when the fence publication changed no bytes, or the frame
+    // after a byte-incompatible publication re-anchors (Phase A then B).
+    var released: u32 = 0;
+    for (0..2) |frame_index| {
+        var frame_source = try runtime.prepareTranscriptSource(alloc, null);
+        defer frame_source.deinit(alloc);
+        var frame_prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &frame_source);
+        defer frame_prepared.deinit(alloc);
+        const frame_facts = runtime.planTranscriptScroll(&frame_prepared);
+        if (!frame_facts.source_compatible) {
+            // Phase A: zero release while the anchor is stale.
+            try std.testing.expectEqual(@as(u32, 0), frame_facts.semantic_rows);
+            try std.testing.expectEqual(@as(u16, 0), frame_facts.planned_rows);
+            try std.testing.expect(frame_facts.finality_hold);
+            try std.testing.expectEqual(@as(usize, 0), frame_index);
+        }
+        released += frame_facts.semantic_rows;
+        try commitPreparedForTest(&runtime, alloc, &frame_source, &frame_prepared);
+    }
+    try std.testing.expect(released > 0);
+    const settled = runtime.transcript_commit_state.stable;
+    try std.testing.expectEqual(settled.visual_offset, settled.history_visual_offset);
+}
+
+test "pending replacement notice holds release until the finished replacement settles" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(24, 10, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+
+    for (0..4) |index| {
+        var line: [24]u8 = undefined;
+        const text = try std.fmt.bufPrint(&line, "history {d:0>2}\n", .{index});
+        _ = try runtime.appendRawTranscriptEntry(alloc, text);
+    }
+    var base_source = try runtime.prepareTranscriptSource(alloc, null);
+    defer base_source.deinit(alloc);
+    var base_prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &base_source);
+    defer base_prepared.deinit(alloc);
+    try commitPreparedForTest(&runtime, alloc, &base_source, &base_prepared);
+    const notice_id = try runtime.appendReplaceableSemanticNotice(alloc, .{
+        .topic = "feedback",
+        .tone = .neutral,
+        .body = "Preparing feedback report while external work is blocking",
+    });
+    for (0..6) |index| {
+        var line: [24]u8 = undefined;
+        const text = try std.fmt.bufPrint(&line, "later {d:0>2}\n", .{index});
+        _ = try runtime.appendRawTranscriptEntry(alloc, text);
+    }
+
+    var live_source = try runtime.prepareTranscriptSource(alloc, null);
+    defer live_source.deinit(alloc);
+    var live_prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &live_source);
+    defer live_prepared.deinit(alloc);
+    try commitPreparedForTest(&runtime, alloc, &live_source, &live_prepared);
+    const held = runtime.transcript_commit_state.stable;
+    try std.testing.expect(held.visual_offset > held.history_visual_offset);
+
+    // Quiet frames while the producer blocks release nothing.
+    var quiet_source = try runtime.prepareTranscriptSource(alloc, null);
+    defer quiet_source.deinit(alloc);
+    var quiet_prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &quiet_source);
+    defer quiet_prepared.deinit(alloc);
+    const quiet_facts = runtime.planTranscriptScroll(&quiet_prepared);
+    try std.testing.expect(quiet_facts.source_compatible);
+    try std.testing.expectEqual(@as(u32, 0), quiet_facts.semantic_rows);
+    try std.testing.expect(quiet_facts.finality_hold);
+
+    // The finished replacement clears the pin; the incompatible frame
+    // re-anchors with zero release and the next frame settles everything.
+    try std.testing.expect(try runtime.replaceSemanticNotice(alloc, notice_id, .{
+        .topic = "feedback",
+        .tone = .success,
+        .body = "Feedback report ready",
+    }));
+    var replaced_source = try runtime.prepareTranscriptSource(alloc, null);
+    defer replaced_source.deinit(alloc);
+    var replaced_prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &replaced_source);
+    defer replaced_prepared.deinit(alloc);
+    const replaced_facts = runtime.planTranscriptScroll(&replaced_prepared);
+    try std.testing.expect(!replaced_facts.source_compatible);
+    try std.testing.expectEqual(@as(u32, 0), replaced_facts.semantic_rows);
+    try std.testing.expectEqual(@as(u16, 0), replaced_facts.planned_rows);
+    try commitPreparedForTest(&runtime, alloc, &replaced_source, &replaced_prepared);
+
+    var settle_source = try runtime.prepareTranscriptSource(alloc, null);
+    defer settle_source.deinit(alloc);
+    try std.testing.expect(
+        std.mem.find(u8, settle_source.bytes, "report ready") != null,
+    );
+    var settle_prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &settle_source);
+    defer settle_prepared.deinit(alloc);
+    const settle_facts = runtime.planTranscriptScroll(&settle_prepared);
+    try std.testing.expect(settle_facts.source_compatible);
+    try std.testing.expect(settle_facts.semantic_rows > 0);
+    try commitPreparedForTest(&runtime, alloc, &settle_source, &settle_prepared);
+    const settled = runtime.transcript_commit_state.stable;
+    try std.testing.expectEqual(settled.visual_offset, settled.history_visual_offset);
+}
+
+test "finality candidates keep tool turn and replaceable tail offsets independent" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(60, 12, 8),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+
+    const id = types.ToolLifecycleId{ .turn_id = 5, .call_id = "boundary-call" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .presentation_group_id = .{ .turn_id = 5, .anchor_step_id = 1 },
+        .reconciles_provisional_call_id = null,
+        .tool_name = "read_file",
+        .activity_kind = .read,
+    } });
+    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = id,
+        .outcome = .{ .kind = .completed, .summary = "Read boundary file" },
+    } });
+    try runtime.finishLifecycleBatch(alloc);
+    _ = try runtime.appendRawTranscriptEntry(alloc, "settled context line\n");
+    _ = try transcript_store.appendReplaceableTranscriptLineSilent(
+        &runtime,
+        alloc,
+        "working status line",
+    );
+
+    var source = try runtime.prepareTranscriptSource(alloc, null);
+    defer source.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), source.finality.tool_turn_floors.len);
+    const group_floor = source.finality.tool_turn_floors[0];
+    try std.testing.expectEqual(@as(u64, 5), group_floor.turn_id);
+    try std.testing.expect(group_floor.start_byte < source.bytes.len);
+    // The replaceable-tail contract keeps its own offset; the finality
+    // boundary does not repurpose it.
+    try std.testing.expect(source.replaceable_last_line);
+    try std.testing.expect(source.replaceable_start > group_floor.start_byte);
+    try std.testing.expect(source.replaceable_start < source.bytes.len);
 }

@@ -3156,6 +3156,9 @@ test "structured command-output rewrite materializes committed transcript scroll
         const text = try std.fmt.bufPrint(&line, "assistant table row {d}\n", .{index + 1});
         try first_assistant.text.appendSlice(h.alloc, text);
     }
+    // Assistant content is complete before each frame; report producer
+    // closure so the finality floor does not hold the tail.
+    h.shell.setAssistantTailWritable(false);
 
     try h.renderTranscriptFrame();
     try h.flush();
@@ -3185,6 +3188,14 @@ test "structured command-output rewrite materializes committed transcript scroll
         try second_assistant.text.appendSlice(h.alloc, text);
     }
 
+    try h.renderTranscriptFrame();
+    try h.flush();
+    // The structured rewrite is byte-incompatible with the committed
+    // anchor: this frame re-anchors in place with zero release.
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.planned_scroll_rows);
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
+
+    // The following compatible frame settles the held rows with final bytes.
     try h.renderTranscriptFrame();
     try h.flush();
     try std.testing.expect(h.last_frame.planned_scroll_rows > 0);
@@ -5921,8 +5932,6 @@ test "inline approval footer reflow preserves concurrent transcript progress" {
         @as(?u16, footer_history_rows),
         h.last_frame.document_append_clear_rows,
     );
-    const expected_append_rows: u16 = 2;
-
     _ = try h.shell.streamAssistantChunk(
         alloc,
         &h.metrics,
@@ -5932,11 +5941,12 @@ test "inline approval footer reflow preserves concurrent transcript progress" {
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    try std.testing.expectEqual(expected_append_rows, h.last_frame.planned_scroll_rows);
-    try std.testing.expectEqual(expected_append_rows, h.last_frame.committed_scroll_rows);
+    // The assistant producer is still open, so the streamed rows are not
+    // final: the viewport follows them through an in-place repaint and no
+    // transcript row is released into scrollback.
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.planned_scroll_rows);
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.committed_scroll_rows);
     try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
-    try std.testing.expect(h.last_frame.document_append_bytes > 0);
-    try std.testing.expectEqual(@as(?u16, null), h.last_frame.document_append_clear_rows);
     try std.testing.expectEqual(
         @as(usize, 1),
         std.mem.count(u8, h.shell.transcript.items, append_one),
@@ -5945,6 +5955,25 @@ test "inline approval footer reflow preserves concurrent transcript progress" {
         @as(usize, 1),
         std.mem.count(u8, h.shell.transcript.items, append_two),
     );
+    try std.testing.expectEqual(@as(usize, 1), try countGridOccurrences(&h, append_one));
+    try std.testing.expectEqual(@as(usize, 1), try countGridOccurrences(&h, append_two));
+
+    // Closing the producer finalizes the tail; the held rows settle through
+    // the catch-up replay, possibly across frames.
+    h.shell.setAssistantTailWritable(false);
+    var settle_frames: usize = 0;
+    var settled_scroll_rows: u32 = 0;
+    while (settle_frames < 8) : (settle_frames += 1) {
+        h.frame_redraw = true;
+        try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+        try h.flush();
+        try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
+        if (h.last_frame.planned_scroll_rows == 0) break;
+        settled_scroll_rows += h.last_frame.planned_scroll_rows;
+    }
+    try std.testing.expect(settled_scroll_rows > 0);
+    try std.testing.expectEqual(@as(usize, 1), try countGridOccurrences(&h, append_one));
+    try std.testing.expectEqual(@as(usize, 1), try countGridOccurrences(&h, append_two));
 
     approval.clear(alloc);
     h.frame_redraw = true;
