@@ -25,12 +25,17 @@ let fetchCalls = 0;
 let responseStatus = null;
 let firstResponseBodyChunkAt = null;
 let responseBodyChunks = 0;
+let requestedSessionId = null;
+let requestedSessionAffinity = null;
 const responsePreviewChunks = [];
 let responsePreviewBytes = 0;
 
 const tracedFetch = async (url, init) => {
   if (init.method === "GET" && String(url).endsWith("/v1/models")) return fetch(url, init);
   fetchCalls++;
+  const headers = new Headers(init.headers);
+  requestedSessionId = headers.get("x-session-id");
+  requestedSessionAffinity = headers.get("x-session-affinity");
   const response = await fetch(url, init);
   responseStatus = response.status;
   if (!response.body) return response;
@@ -95,6 +100,8 @@ try {
 
   if (responseStatus !== 200) throw new Error(`live gateway returned HTTP ${responseStatus}`);
   if (fetchCalls !== 1) throw new Error(`expected one live gateway fetch, got ${fetchCalls}`);
+  if (requestedSessionId !== session.id) throw new Error(`live gateway request used unexpected session id: ${requestedSessionId}`);
+  if (requestedSessionAffinity !== session.id) throw new Error(`live gateway request used unexpected session affinity: ${requestedSessionAffinity}`);
   if (!text.includes(nonce)) {
     const responsePreview = new TextDecoder().decode(Buffer.concat(responsePreviewChunks.map((chunk) => Buffer.from(chunk))));
     throw new Error(`live model response did not include the per-run nonce; ACP text=${JSON.stringify(text.slice(0, 500))}; SSE preview=${JSON.stringify(responsePreview.slice(0, 1000))}`);

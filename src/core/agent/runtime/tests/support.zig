@@ -65,6 +65,7 @@ pub const vision_agent_test_tools = [_]tool_dispatch.Tool{builtin_tools.vision};
 pub const VisionAgentToolRuntime = struct {
     alloc: Allocator,
     workspace_root: []const u8 = "/tmp/workspace",
+    session_id: ?[]const u8 = null,
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
     result_allocator_override: ?Allocator = null,
     execution_count: usize = 0,
@@ -135,6 +136,11 @@ pub const VisionAgentToolRuntime = struct {
                 .source = .command_line,
             } },
             .context_registry = .{ .default_provider = builtin_context.provider },
+            .lifecycle_scope = .{
+                .kind = .interactive,
+                .workspace_root = self.workspace_root,
+                .session_id = self.session_id,
+            },
             .output_chunk_ctx = undefined,
             .on_output_chunk = discardVisionToolOutput,
             .background_url_ctx = undefined,
@@ -234,6 +240,7 @@ pub const FakeGateway = struct {
     request_bodies: std.ArrayList([]u8) = .empty,
     request_models: std.ArrayList([]u8) = .empty,
     request_api_keys: std.ArrayList([]u8) = .empty,
+    request_session_ids: std.ArrayList(?[]u8) = .empty,
     recovery_pause_flag: ?*std.atomic.Value(bool) = null,
 
     pub fn init(alloc: Allocator, completions: []const FakeCompletion) FakeGateway {
@@ -247,6 +254,10 @@ pub const FakeGateway = struct {
         self.request_models.deinit(self.alloc);
         for (self.request_api_keys.items) |api_key| self.alloc.free(api_key);
         self.request_api_keys.deinit(self.alloc);
+        for (self.request_session_ids.items) |session_id| {
+            if (session_id) |id| self.alloc.free(id);
+        }
+        self.request_session_ids.deinit(self.alloc);
     }
 
     pub fn provider(self: *FakeGateway) agent_stream_provider.Provider {
@@ -264,6 +275,9 @@ pub const FakeGateway = struct {
         try self.request_bodies.append(self.alloc, try self.alloc.dupe(u8, request.payload));
         try self.request_models.append(self.alloc, try self.alloc.dupe(u8, request.model));
         try self.request_api_keys.append(self.alloc, try self.alloc.dupe(u8, request.api_key));
+        const session_id = if (request.session_id) |id| try self.alloc.dupe(u8, id) else null;
+        errdefer if (session_id) |id| self.alloc.free(id);
+        try self.request_session_ids.append(self.alloc, session_id);
         if (self.index >= self.completions.len) return error.TestUnexpectedGatewayRequest;
         const completion = self.completions[self.index];
         self.index += 1;
