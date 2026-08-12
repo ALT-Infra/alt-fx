@@ -613,6 +613,7 @@ pub const FakeAgentRuntimeDeps = struct {
     enable_recovery_checkpoint: bool = false,
     recovery_checkpoints: std.ArrayList(session_codec.RecoveryCheckpoint) = .empty,
     recovery_checkpoint_error: ?anyerror = null,
+    cancel_on_recovery_reservation: ?*std.atomic.Value(bool) = null,
     pause_on_auto_retry_status: bool = false,
     recovery_pause_flag: ?*std.atomic.Value(bool) = null,
 
@@ -739,6 +740,11 @@ pub const FakeAgentRuntimeDeps = struct {
             self.alloc,
             try checkpoint.dupe(self.alloc),
         );
+        if (checkpoint.outstanding_reservation) {
+            if (self.cancel_on_recovery_reservation) |cancel_flag| {
+                cancel_flag.store(true, .seq_cst);
+            }
+        }
     }
 
     fn resolveModelCapabilities(raw: *anyopaque, _: Allocator, model: []const u8) !model_capabilities.Capabilities {

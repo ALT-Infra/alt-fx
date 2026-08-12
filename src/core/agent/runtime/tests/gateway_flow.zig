@@ -4081,6 +4081,30 @@ test "processQueuedPrompt reserves and settles durable attempts before history c
     try std.testing.expectEqual(@as(usize, 1), hooks.history_propagation_count);
 }
 
+test "processQueuedPrompt does not consume cancellation before provider admission" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .content = "must not send" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.enable_recovery_checkpoint = true;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    hooks.cancel_on_recovery_reservation = &fixture.cancel_flag;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 0), gateway.request_models.items.len);
+    try std.testing.expectEqual(@as(usize, 2), hooks.recovery_checkpoints.items.len);
+    const reserved = hooks.recovery_checkpoints.items[0];
+    try std.testing.expect(reserved.outstanding_reservation);
+    try std.testing.expectEqual(@as(usize, 0), reserved.consumed_provider_attempts);
+    const settled = hooks.recovery_checkpoints.items[1];
+    try std.testing.expect(!settled.outstanding_reservation);
+    try std.testing.expectEqual(@as(usize, 0), settled.consumed_provider_attempts);
+    try std.testing.expectEqual(@as(usize, 1), hooks.interrupted_history_count);
+}
+
 test "processQueuedPrompt carries one durable budget across transport recovery" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{

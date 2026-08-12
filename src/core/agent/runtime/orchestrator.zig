@@ -2541,7 +2541,8 @@ fn processQueuedPromptLoop(
                     debug_trace.logf("agent", "token progress publication failed source=gateway_error err={s}", .{@errorName(progress_err)});
                 };
                 const cancel_requested = config.cancel_flag.load(.seq_cst);
-                const consumed_attempts = semantic_attempt + 1;
+                const consumed_attempts = semantic_attempt +
+                    @as(usize, @intFromBool(gateway_attempt_evidence.provider_admitted));
                 const network_failure = gateway_attempt_evidence.network_failure;
                 const failure_cause: model_response_recovery.FailureCause = if (network_failure) |evidence|
                     switch (evidence.cause) {

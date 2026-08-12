@@ -58,6 +58,7 @@ pub const NetworkFailureEvidence = struct {
 };
 
 pub const AttemptEvidence = struct {
+    provider_admitted: bool = false,
     network_failure: ?NetworkFailureEvidence = null,
 };
 

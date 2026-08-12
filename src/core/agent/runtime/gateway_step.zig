@@ -51,6 +51,7 @@ pub fn streamGatewayCompletion(
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     const started_at_ms = io_mod.milliTimestamp();
     const usage_observation = try session_usage.GatewayObservation.begin(usage);
+    attempt_evidence.provider_admitted = true;
     var result = provider.stream(alloc, .{
         .api_key = api_key,
         .team = team,
