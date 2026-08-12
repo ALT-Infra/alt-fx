@@ -45,7 +45,7 @@ Standard PR CI labels Debug and ReleaseSafe Build & Test and deterministic E2E r
 
 ## Pull Requests
 
-Assign exactly one label that describes the PR's primary intent:
+Every PR must carry exactly one label that describes its primary intent:
 
 * `type: bug`: fixes incorrect behavior
 
@@ -61,7 +61,7 @@ Assign exactly one label that describes the PR's primary intent:
 
 * `type: security`: fixes or hardens a security boundary
 
-For a mixed PR, choose the label that best describes why the PR exists. Keep the title as a clean imperative sentence and do not add bracketed type prefixes such as `[bug]` or `[improvement]`.
+If you cannot manage labels, a maintainer or repository agent will apply the label before review. For a mixed PR, choose the label that best describes why the PR exists. Keep the title as a clean imperative sentence and do not add bracketed type prefixes such as `[bug]` or `[improvement]`.
 
 ## Repo Shape
 
