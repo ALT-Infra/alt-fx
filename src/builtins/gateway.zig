@@ -365,7 +365,7 @@ fn streamAgentCompletion(
     alloc: Allocator,
     request: agent_stream_provider_contract.Request,
 ) anyerror!agent_stream_provider_contract.Result {
-    const result = try gateway_client.streamGatewayCompletion(
+    const result = gateway_client.streamGatewayCompletion(
         alloc,
         .{
             .api_key = request.api_key,
@@ -379,7 +379,6 @@ fn streamAgentCompletion(
             .delivery = request.delivery,
             .on_reasoning_chunk = request.on_reasoning_chunk,
             .on_tool_input_chunk = request.on_tool_input_chunk,
-            .connection_status = request.connection_status,
             .provider_attempt_owner = switch (request.provider_attempt_owner) {
                 .transport => .transport,
                 .agent => .agent,
@@ -389,7 +388,13 @@ fn streamAgentCompletion(
         request.on_content_chunk,
         request.on_tool_start,
         request.cancel_flag,
-    );
+    ) catch |err| {
+        request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(
+            err,
+            request.delivery.load(),
+        );
+        return err;
+    };
     const diagnostics = if (result.status == .ok)
         gateway_failure_diagnostics.FailureDiagnostics{}
     else

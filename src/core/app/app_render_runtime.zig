@@ -956,15 +956,6 @@ pub fn Runtime(comptime App: type) type {
                         runtime.render_requests.request(.footer);
                     }
                 },
-                .gateway_connection_status => |status| switch (status) {
-                    .clear => if (runtime.worker_status_state().clear_gateway_connection()) {
-                        runtime.render_requests.request(.footer);
-                    },
-                    .connecting, .retrying, .recovered => {
-                        _ = runtime.worker_status_state().set_gateway_connection(status, io_mod.milliTimestamp());
-                        runtime.render_requests.request(.footer);
-                    },
-                },
                 .api_status_text => |text| {
                     runtime.worker_status_state().set_api(text, .danger);
                     runtime.render_requests.request(.footer);

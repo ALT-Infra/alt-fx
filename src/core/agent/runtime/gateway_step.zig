@@ -15,6 +15,7 @@ const TraceContext = debug_trace.TraceContext;
 const ToolExecutionResult = runtime_tool_contracts.ToolExecutionResult;
 
 pub const DeliveryCertainty = agent_stream_provider.DeliveryCertainty;
+pub const AttemptEvidence = agent_stream_provider.AttemptEvidence;
 
 pub const StreamResult = struct {
     status: std.http.Status,
@@ -32,9 +33,9 @@ pub fn streamGatewayCompletion(
     retry_count: usize,
     chat_url: []const u8,
     payload: []const u8,
-    connection_status: ?agent_stream_provider.ConnectionStatusSink,
     cooperative_pulse: ?agent_stream_provider.CooperativePulse,
     delivery: *DeliveryCertainty,
+    attempt_evidence: *AttemptEvidence,
     callback_ctx: *anyopaque,
     on_content_chunk: agent_stream_provider.StreamCallback,
     on_tool_start: ?agent_stream_provider.ToolStartCallback,
@@ -60,9 +61,9 @@ pub fn streamGatewayCompletion(
         .trace_ctx = trace_ctx,
         .content_capture_limit = content_capture_limit,
         .delivery = delivery,
+        .attempt_evidence = attempt_evidence,
         .on_reasoning_chunk = on_reasoning_chunk,
         .on_tool_input_chunk = on_tool_input_chunk,
-        .connection_status = connection_status,
         .cooperative_pulse = cooperative_pulse,
         .provider_attempt_owner = provider_attempt_owner,
         .callback_ctx = callback_ctx,
@@ -334,6 +335,7 @@ test "pre-send gateway failure settles usage as unbilled" {
     defer usage.deinit(alloc);
     var cancel_flag = std.atomic.Value(bool).init(false);
     var delivery = DeliveryCertainty.init();
+    var attempt_evidence: agent_stream_provider.AttemptEvidence = .{};
     var callback_ctx: u8 = 0;
     const result = streamGatewayCompletion(
         agent_stream_provider.unavailable_provider,
@@ -345,8 +347,8 @@ test "pre-send gateway failure settles usage as unbilled" {
         "not a valid URL",
         "{}",
         null,
-        null,
         &delivery,
+        &attempt_evidence,
         &callback_ctx,
         Callbacks.content,
         null,
@@ -388,6 +390,7 @@ test "possibly sent gateway failure marks billing incomplete" {
     defer usage.deinit(alloc);
     var cancel_flag = std.atomic.Value(bool).init(false);
     var delivery = DeliveryCertainty.init();
+    var attempt_evidence: agent_stream_provider.AttemptEvidence = .{};
     var callback_ctx: u8 = 0;
 
     const result = streamGatewayCompletion(
@@ -400,8 +403,8 @@ test "possibly sent gateway failure marks billing incomplete" {
         "https://example.test/chat",
         "{}",
         null,
-        null,
         &delivery,
+        &attempt_evidence,
         &callback_ctx,
         Callbacks.content,
         null,

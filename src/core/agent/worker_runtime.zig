@@ -460,7 +460,6 @@ pub const WorkerEvent = union(enum) {
     semantic_notice: types.SemanticNotice,
     route_recovery_status: types.RouteRecoveryStatus,
     clear_route_recovery_status,
-    gateway_connection_status: types.GatewayConnectionStatus,
     api_status_text: []u8,
     command_output: CommandOutputChunk,
     command_output_complete: ?types.ToolLifecycleId,
@@ -2454,7 +2453,6 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
         .semantic_notice => |notice| .{ .semantic_notice = try types.dupeSemanticNotice(alloc, notice) },
         .route_recovery_status => |status| .{ .route_recovery_status = status },
         .clear_route_recovery_status => .clear_route_recovery_status,
-        .gateway_connection_status => |status| .{ .gateway_connection_status = status },
         .api_status_text => |text| .{ .api_status_text = try alloc.dupe(u8, text) },
         .command_output => |chunk| .{ .command_output = .{
             .lifecycle_id = if (chunk.lifecycle_id) |id| .{
@@ -2528,7 +2526,6 @@ pub fn freeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) void {
         .semantic_notice => |notice| types.freeSemanticNotice(alloc, notice),
         .route_recovery_status => {},
         .clear_route_recovery_status => {},
-        .gateway_connection_status => {},
         .api_status_text => |text| alloc.free(text),
         .command_output => |chunk| {
             if (chunk.lifecycle_id) |id| alloc.free(@constCast(id.call_id));
@@ -4222,9 +4219,6 @@ test "clear queued prompts preserves events and discard frees event payloads" {
     } }));
     freeWorkerEvent(alloc, .{ .route_recovery_status = .{ .kind = .auto_retry, .failed_attempt = 1, .attempt_limit = 3 } });
     freeWorkerEvent(alloc, .clear_route_recovery_status);
-    freeWorkerEvent(alloc, try dupeWorkerEvent(alloc, .{ .gateway_connection_status = .{
-        .retrying = .{ .number = 1, .limit = 3 },
-    } }));
     freeWorkerEvent(alloc, .{ .command_output = .{ .stream = .stdout, .text = try alloc.dupe(u8, "out") } });
     freeWorkerEvent(alloc, .{ .command_output_complete = null });
     freeWorkerEvent(alloc, .{ .command_output_complete = .{ .turn_id = 1, .call_id = try alloc.dupe(u8, "1") } });

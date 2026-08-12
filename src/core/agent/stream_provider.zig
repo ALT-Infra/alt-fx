@@ -45,13 +45,20 @@ pub const ProviderAttemptOwner = enum {
     agent,
 };
 
-pub const ConnectionStatusSink = struct {
-    ctx: *anyopaque,
-    push: *const fn (ctx: *anyopaque, status: types.GatewayConnectionStatus) anyerror!void,
+pub const NetworkFailureCause = enum {
+    transport_interrupted,
+    system_resumed,
+};
 
-    pub fn publish(self: ConnectionStatusSink, status: types.GatewayConnectionStatus) anyerror!void {
-        try self.push(self.ctx, status);
-    }
+/// Stable native transport evidence consumed by model recovery policy.
+/// Providers that cannot distinguish failure stages leave this unset.
+pub const NetworkFailureEvidence = struct {
+    cause: NetworkFailureCause,
+    delivery: DeliveryCertainty.State,
+};
+
+pub const AttemptEvidence = struct {
+    network_failure: ?NetworkFailureEvidence = null,
 };
 
 /// Gives a cooperative single-threaded host a chance to publish UI and runtime
@@ -105,9 +112,9 @@ pub const Request = struct {
     payload: []const u8,
     trace_ctx: debug_trace.TraceContext,
     content_capture_limit: ?usize,
-    connection_status: ?ConnectionStatusSink,
     cooperative_pulse: ?CooperativePulse = null,
     delivery: *DeliveryCertainty,
+    attempt_evidence: *AttemptEvidence,
     callback_ctx: *anyopaque,
     on_content_chunk: StreamCallback,
     on_tool_start: ?ToolStartCallback,
@@ -226,6 +233,7 @@ test "stream provider dispatches request and preserves ordered callbacks" {
     var capture: Capture = .{};
     defer capture.chunks.deinit(std.testing.allocator);
     var delivery = DeliveryCertainty.init();
+    var attempt_evidence: AttemptEvidence = .{};
     var cancelled = std.atomic.Value(bool).init(false);
     var result = try (Provider{
         .context = &fake,
@@ -239,8 +247,8 @@ test "stream provider dispatches request and preserves ordered callbacks" {
         .payload = "{}",
         .trace_ctx = .{},
         .content_capture_limit = null,
-        .connection_status = null,
         .delivery = &delivery,
+        .attempt_evidence = &attempt_evidence,
         .callback_ctx = &capture,
         .on_content_chunk = Capture.append,
         .on_tool_start = null,

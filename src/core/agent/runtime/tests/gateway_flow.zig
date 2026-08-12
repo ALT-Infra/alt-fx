@@ -135,39 +135,6 @@ fn expectRouteStatus(
     try std.testing.expectEqualStrings(expected_label, status.label(&label_buf));
 }
 
-test "processQueuedPrompt maps gateway connection lifecycle to model recovery" {
-    const alloc = std.testing.allocator;
-    const statuses = [_]types.GatewayConnectionStatus{
-        .connecting,
-        .{ .retrying = .{ .number = 1, .limit = 3 } },
-        .{ .recovered = .{ .number = 2, .limit = 3 } },
-        .clear,
-    };
-    const chunks = [_][]const u8{"ok"};
-    const completions = [_]FakeCompletion{.{
-        .connection_statuses = &statuses,
-        .chunks = &chunks,
-        .content = "ok",
-    }};
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer hooks.deinit();
-    var fixture = PromptFixture{};
-
-    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
-
-    try std.testing.expectEqual(@as(usize, 2), hooks.route_recovery_statuses.items.len);
-    for (hooks.route_recovery_statuses.items) |status| {
-        try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.auto_retry, status.kind);
-        try std.testing.expectEqual(types.ModelRecoveryCause.network_interrupted, status.cause.?);
-        try std.testing.expectEqual(types.ModelRecoveryAction.waiting_for_connectivity, status.action.?);
-        try std.testing.expectEqual(@as(usize, 1), status.failed_attempt);
-        try std.testing.expectEqual(@as(usize, 10), status.attempt_limit);
-    }
-    try std.testing.expectEqual(@as(usize, 2), hooks.route_recovery_clear_count);
-}
-
 fn makeOwnedProviderPrompt(alloc: Allocator, text: []const u8, model: []const u8) !QueuedPrompt {
     const prompt = try alloc.dupe(u8, text);
     errdefer alloc.free(prompt);
@@ -3273,7 +3240,7 @@ test "processQueuedPrompt leaves parent delivery pending after pre-dispatch canc
 
 test "processQueuedPrompt leaves parent delivery pending after pre-send failure" {
     const alloc = std.testing.allocator;
-    const first_completions = [_]FakeCompletion{.{ .pre_send_error = error.UnknownHostName }};
+    const first_completions = [_]FakeCompletion{.{ .pre_send_error = error.TestTransportFailure }};
     var first_gateway = FakeGateway.init(alloc, &first_completions);
     defer first_gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
@@ -3283,7 +3250,7 @@ test "processQueuedPrompt leaves parent delivery pending after pre-send failure"
     var fixture = PromptFixture{};
 
     try std.testing.expectError(
-        error.UnknownHostName,
+        error.TestTransportFailure,
         runFakePrompt(&first_gateway, &hooks, fixture.config(), fixture.job()),
     );
 
@@ -3312,7 +3279,7 @@ test "processQueuedPrompt leaves parent delivery pending after pre-send failure"
 
 test "processQueuedPrompt acknowledges parent delivery after ambiguous send failure" {
     const alloc = std.testing.allocator;
-    const completions = [_]FakeCompletion{.{ .stream_error = error.UnknownHostName }};
+    const completions = [_]FakeCompletion{.{ .stream_error = error.TestTransportFailure }};
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
@@ -3321,7 +3288,7 @@ test "processQueuedPrompt acknowledges parent delivery after ambiguous send fail
     var fixture = PromptFixture{};
 
     try std.testing.expectError(
-        error.UnknownHostName,
+        error.TestTransportFailure,
         runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job()),
     );
 
@@ -3987,6 +3954,110 @@ test "processQueuedPrompt retries replay-safe ReadFailed before success" {
     try std.testing.expect(std.mem.find(u8, trace, "retry=true") != null);
 }
 
+test "processQueuedPrompt counts and retries a definitely unsent native setup failure" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .pre_send_error = error.TlsInitializationFailed },
+        .{ .content = "Recovered after setup" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.enable_recovery_checkpoint = true;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.max_provider_attempts = 2;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
+    try std.testing.expectEqual(@as(usize, 4), hooks.recovery_checkpoints.items.len);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        hooks.recovery_checkpoints.items[1].consumed_provider_attempts,
+    );
+    try std.testing.expect(!hooks.recovery_checkpoints.items[1].outstanding_reservation);
+    try expectRouteStatus(
+        &hooks,
+        0,
+        .auto_retry,
+        "▲ Network interrupted · retrying request · attempt 1/2",
+    );
+    try expectRouteStatus(
+        &hooks,
+        1,
+        .auto_recovered,
+        "✓ recovered · succeeded on attempt 2/2",
+    );
+}
+
+test "processQueuedPrompt routes native network failure classes through one heartbeat" {
+    const alloc = std.testing.allocator;
+    const Stage = enum { before_send, after_send };
+    const Case = struct {
+        err: anyerror,
+        stage: Stage,
+        cause: types.ModelRecoveryCause = .network_interrupted,
+    };
+    const cases = [_]Case{
+        .{ .err = error.TlsInitializationFailed, .stage = .before_send },
+        .{ .err = error.UnknownHostName, .stage = .before_send },
+        .{ .err = error.ConnectionRefused, .stage = .before_send },
+        .{ .err = error.WriteFailed, .stage = .after_send },
+        .{ .err = error.ReadFailed, .stage = .after_send },
+        .{ .err = error.ConnectionResetByPeer, .stage = .after_send },
+        .{ .err = error.SystemResumed, .stage = .after_send, .cause = .system_resumed },
+    };
+
+    for (cases) |case| {
+        var completions = [_]FakeCompletion{
+            .{},
+            .{ .content = "Recovered" },
+        };
+        switch (case.stage) {
+            .before_send => completions[0].pre_send_error = case.err,
+            .after_send => completions[0].stream_error = case.err,
+        }
+
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+        var config = fixture.config();
+        config.max_provider_attempts = 2;
+
+        try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+        try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
+        try std.testing.expectEqual(@as(usize, 2), hooks.route_recovery_statuses.items.len);
+        try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.auto_retry, hooks.route_recovery_statuses.items[0].kind);
+        try std.testing.expectEqual(case.cause, hooks.route_recovery_statuses.items[0].cause.?);
+        try std.testing.expectEqual(@as(usize, 1), hooks.route_recovery_statuses.items[0].failed_attempt);
+        try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.auto_recovered, hooks.route_recovery_statuses.items[1].kind);
+        try std.testing.expectEqual(@as(usize, 2), hooks.route_recovery_statuses.items[1].succeeded_attempt);
+    }
+}
+
+test "processQueuedPrompt does not retry opaque JS host stream failures" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .stream_error = error.JsHostStreamFailed }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try std.testing.expectError(
+        error.JsHostStreamFailed,
+        runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job()),
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.route_recovery_statuses.items.len);
+}
+
 test "processQueuedPrompt reserves and settles durable attempts before history commit cleanup" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{.{ .content = "Done" }};
@@ -4103,6 +4174,47 @@ test "processQueuedPrompt preserves fallback route and budget until selection ch
     }
 }
 
+test "processQueuedPrompt restores legacy connectivity checkpoints through evidence" {
+    const alloc = std.testing.allocator;
+    var fixture = PromptFixture{};
+    const checkpoint = session_codec.RecoveryCheckpoint{
+        .turn_id = 45,
+        .user = .{ .text = @constCast("user prompt") },
+        .assistant_source = @constCast("partial response"),
+        .cause = .system_resumed,
+        .action = .waiting_for_connectivity,
+        .route_model = @constCast("zai/glm-5.2"),
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 10,
+        .consumed_provider_attempts = 3,
+    };
+    const completions = [_]FakeCompletion{.{ .content = "continued response" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.enable_recovery_checkpoint = true;
+    defer hooks.deinit();
+    var job = fixture.job();
+    job.model = @constCast("zai/glm-5.2");
+    job.recovery_checkpoint = checkpoint;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
+    try std.testing.expect(std.mem.find(
+        u8,
+        gateway.request_bodies.items[0],
+        "<partial_assistant>\\npartial response\\n</partial_assistant>",
+    ) != null);
+    const reserved = hooks.recovery_checkpoints.items[0];
+    try std.testing.expectEqual(@as(usize, 3), reserved.consumed_provider_attempts);
+    try std.testing.expect(reserved.outstanding_reservation);
+    for (hooks.route_recovery_statuses.items) |status| {
+        try std.testing.expect(status.action != .waiting_for_connectivity);
+    }
+}
+
 test "processQueuedPrompt counts only failed provider attempts across tool followups" {
     const alloc = std.testing.allocator;
     const first_calls = [_]ToolCall{
@@ -4197,11 +4309,11 @@ test "processQueuedPrompt explicit checkpoint continuation starts a fresh exhaus
     try std.testing.expectEqual(@as(usize, 1), second_hooks.history_propagation_count);
 }
 
-test "processQueuedPrompt headless wake deadline pauses before another request" {
+test "processQueuedPrompt retries system resume through the heartbeat" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{
         .{ .stream_error = error.SystemResumed },
-        .{ .content = "must not send" },
+        .{ .content = "Recovered after resume" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
@@ -4210,16 +4322,22 @@ test "processQueuedPrompt headless wake deadline pauses before another request" 
     defer hooks.deinit();
     var fixture = PromptFixture{};
     var config = fixture.config();
-    config.connectivity_wait_timeout_ms = 0;
+    config.max_provider_attempts = 2;
 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
-    try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
-    try std.testing.expectEqual(types.TurnPresentationOutcome.paused, hooks.finalized_outcome.?);
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
     const checkpoint = hooks.recovery_checkpoints.items[hooks.recovery_checkpoints.items.len - 1];
     try std.testing.expectEqual(types.ModelRecoveryCause.system_resumed, checkpoint.cause);
-    try std.testing.expectEqual(@as(usize, 1), checkpoint.consumed_provider_attempts);
+    try std.testing.expectEqual(@as(usize, 2), checkpoint.consumed_provider_attempts);
     try std.testing.expect(!checkpoint.outstanding_reservation);
+    try expectRouteStatus(
+        &hooks,
+        0,
+        .auto_retry,
+        "▲ Mac woke from sleep · retrying request · attempt 1/2",
+    );
 }
 
 test "processQueuedPrompt interactive try later pauses instead of cancelling" {
@@ -4246,7 +4364,7 @@ test "processQueuedPrompt interactive try later pauses instead of cancelling" {
     try std.testing.expectEqual(types.ModelRecoveryAction.paused, checkpoint.action);
 }
 
-test "processQueuedPrompt try later interrupts connectivity backoff" {
+test "processQueuedPrompt try later interrupts heartbeat backoff" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{.{ .stream_error = error.SystemResumed }};
     var pause_flag = std.atomic.Value(bool).init(false);
@@ -4254,11 +4372,10 @@ test "processQueuedPrompt try later interrupts connectivity backoff" {
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     hooks.enable_recovery_checkpoint = true;
-    hooks.pause_on_connectivity_status = true;
+    hooks.pause_on_auto_retry_status = true;
     hooks.recovery_pause_flag = &pause_flag;
     defer hooks.deinit();
     var fixture = PromptFixture{};
-    hooks.recovery_pause_cancel_flag = &fixture.cancel_flag;
     var config = fixture.config();
     config.recovery_pause_flag = &pause_flag;
 

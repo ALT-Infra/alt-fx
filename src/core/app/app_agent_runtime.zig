@@ -1062,7 +1062,6 @@ pub fn Runtime(comptime App: type) type {
                 .skills_prompt_section = skills_section,
                 .explicit_skills_prompt_section = explicit_skills_section,
                 .gateway_retry_count = gateway_retry_count,
-                .connectivity_wait_timeout_ms = null,
                 .recovery_pause_flag = if (comptime @hasField(@TypeOf(app.worker), "worker_recovery_pause_requested"))
                     &app.worker.worker_recovery_pause_requested
                 else
@@ -2433,55 +2432,6 @@ test "app direct ask delivers semantic presentation through the runtime sink" {
         &.{ .table, .code_block, .thematic_rule },
         semantic_events[0..semantic_event_count],
     );
-}
-
-test "app maps gateway connection lifecycle to one root recovery status" {
-    const Gateway = struct {
-        fn stream(
-            _: ?*anyopaque,
-            _: Allocator,
-            request: agent_stream_provider.Request,
-        ) !agent_stream_provider.Result {
-            const sink = request.connection_status orelse return error.TestExpectedEqual;
-            try sink.publish(.connecting);
-            try sink.publish(.{ .recovered = .{ .number = 2, .limit = 3 } });
-            request.on_content_chunk(request.callback_ctx, "connected");
-            return .{ .status = .ok, .completion = .{ .content = "", .finish_reason = .stop } };
-        }
-    };
-
-    const alloc = std.testing.allocator;
-    var app = try FakeApp.init(alloc);
-    defer app.deinit();
-    const job = try makeQueuedPrompt(alloc);
-    defer worker_runtime.freeQueuedPrompt(alloc, job);
-
-    app.agent_stream_provider = testAgentStreamProvider(Gateway.stream);
-
-    try Runtime(FakeApp).processQueuedPrompt(&app, job, 3, test_gateway_chat_url);
-
-    var events = app.worker.takeEvents();
-    defer events.deinit(std.heap.c_allocator);
-    defer for (events.items) |event| worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
-
-    var statuses: [1]types.RouteRecoveryStatus = undefined;
-    var status_count: usize = 0;
-    var clear_count: usize = 0;
-    for (events.items) |event| switch (event) {
-        .route_recovery_status => |status| {
-            if (status_count >= statuses.len) return error.TestUnexpectedResult;
-            statuses[status_count] = status;
-            status_count += 1;
-        },
-        .clear_route_recovery_status => clear_count += 1,
-        else => {},
-    };
-
-    try std.testing.expectEqual(@as(usize, 1), status_count);
-    try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.auto_retry, statuses[0].kind);
-    try std.testing.expectEqual(types.ModelRecoveryCause.network_interrupted, statuses[0].cause.?);
-    try std.testing.expectEqual(types.ModelRecoveryAction.waiting_for_connectivity, statuses[0].action.?);
-    try std.testing.expectEqual(@as(usize, 1), clear_count);
 }
 
 test "app agent runtime clears active turn settings when queued prompt setup fails" {

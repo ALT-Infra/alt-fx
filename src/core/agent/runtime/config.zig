@@ -25,9 +25,6 @@ pub const Config = struct {
     explicit_skills_prompt_section: []const u8 = "",
     gateway_retry_count: usize,
     max_provider_attempts: usize = model_response_recovery.default_max_provider_attempts,
-    /// Null is the interactive, user-controlled wait. Headless hosts use the
-    /// five-minute awake-time bound and tests may inject a shorter value.
-    connectivity_wait_timeout_ms: ?i64 = 300_000,
     /// Interactive hosts may request a durable "try later" pause separately
     /// from cancellation. Headless hosts leave this null.
     recovery_pause_flag: ?*std.atomic.Value(bool) = null,

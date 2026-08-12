@@ -46,7 +46,6 @@ pub const Strategy = enum {
     regenerate_tool,
     continue_after_confirmed_tool,
     reconcile_tool,
-    wait_for_connectivity,
     pause,
     stop,
 };
@@ -102,19 +101,6 @@ pub noinline fn decide(evidence: Evidence) Decision {
         };
     }
 
-    if (evidence.cause == .system_resumed) {
-        return .{ .strategy = .wait_for_connectivity };
-    }
-
-    if (evidence.retry_after_seconds) |seconds| {
-        if (seconds > max_retry_after_seconds) {
-            return .{
-                .strategy = .pause,
-                .required_action = .continue_later,
-            };
-        }
-    }
-
     const strategy: Strategy = if (evidence.delivery == .definitely_unsent)
         .retry_request
     else switch (evidence.tool) {
@@ -126,10 +112,10 @@ pub noinline fn decide(evidence: Evidence) Decision {
         else
             .retry_request,
     };
-    const delay_ns = if (evidence.retry_after_seconds) |seconds|
-        std.math.mul(u64, seconds, std.time.ns_per_s) catch max_retry_after_seconds * std.time.ns_per_s
-    else
-        retryDelayNs(evidence.attempts.consumed);
+    const delay_ns = if (evidence.retry_after_seconds) |seconds| blk: {
+        const bounded_seconds: u64 = @min(seconds, max_retry_after_seconds);
+        break :blk bounded_seconds * std.time.ns_per_s;
+    } else retryDelayNs(evidence.attempts.consumed);
     return .{
         .strategy = strategy,
         .delay_ns = delay_ns,
@@ -304,9 +290,23 @@ test "retry after and cancellation override automatic recovery" {
 
     var over_cap = base;
     over_cap.retry_after_seconds = 31;
-    const paused = decide(over_cap);
-    try std.testing.expectEqual(Strategy.pause, paused.strategy);
-    try std.testing.expect(!paused.reserve_provider_attempt);
+    const capped = decide(over_cap);
+    try std.testing.expectEqual(Strategy.retry_request, capped.strategy);
+    try std.testing.expectEqual(
+        @as(u64, max_retry_after_seconds * std.time.ns_per_s),
+        capped.delay_ns,
+    );
+    try std.testing.expect(capped.reserve_provider_attempt);
+
+    var overflow = base;
+    overflow.retry_after_seconds = std.math.maxInt(u64);
+    const overflow_capped = decide(overflow);
+    try std.testing.expectEqual(Strategy.retry_request, overflow_capped.strategy);
+    try std.testing.expectEqual(
+        @as(u64, max_retry_after_seconds * std.time.ns_per_s),
+        overflow_capped.delay_ns,
+    );
+    try std.testing.expect(overflow_capped.reserve_provider_attempt);
 
     var cancelled = base;
     cancelled.cancelled = true;
@@ -315,7 +315,6 @@ test "retry after and cancellation override automatic recovery" {
 
 test "retry schedule uses the approved cap" {
     const expected = [_]u64{
-        0,
         250 * std.time.ns_per_ms,
         1 * std.time.ns_per_s,
         2 * std.time.ns_per_s,
@@ -324,20 +323,37 @@ test "retry schedule uses the approved cap" {
         16 * std.time.ns_per_s,
         30 * std.time.ns_per_s,
         30 * std.time.ns_per_s,
+        30 * std.time.ns_per_s,
     };
-    for (expected, 0..) |delay, consumed| {
+    var total: u64 = 0;
+    for (expected, 1..) |delay, consumed| {
         try std.testing.expectEqual(delay, retryDelayNs(consumed));
+        total += delay;
     }
+    try std.testing.expectEqual(
+        @as(u64, 121_250 * std.time.ns_per_ms),
+        total,
+    );
 }
 
-test "system resume is gateway evidence but agent policy owns connectivity action" {
-    const waiting = decide(.{
+test "system resume uses the same evidence sensitive recovery strategy" {
+    const retrying = decide(.{
         .cause = .system_resumed,
         .delivery = .definitely_unsent,
         .attempts = .{ .consumed = 4 },
     });
-    try std.testing.expectEqual(Strategy.wait_for_connectivity, waiting.strategy);
-    try std.testing.expect(!waiting.reserve_provider_attempt);
+    try std.testing.expectEqual(Strategy.retry_request, retrying.strategy);
+    try std.testing.expectEqual(@as(u64, 4 * std.time.ns_per_s), retrying.delay_ns);
+    try std.testing.expect(retrying.reserve_provider_attempt);
+
+    const continuing = decide(.{
+        .cause = .system_resumed,
+        .delivery = .possibly_sent,
+        .attempts = .{ .consumed = 4 },
+        .output = .partial,
+    });
+    try std.testing.expectEqual(Strategy.continue_response, continuing.strategy);
+    try std.testing.expect(continuing.reserve_provider_attempt);
 
     const exhausted = decide(.{
         .cause = .system_resumed,

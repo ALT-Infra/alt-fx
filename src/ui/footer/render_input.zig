@@ -908,38 +908,6 @@ test "frame-owned activity preserves route recovery status tone" {
     try std.testing.expect(frameOwnedActivityProjection(&active_buf, &shell, question_ctx, null) == .none);
 }
 
-test "frame-owned activity preserves neutral connection status text" {
-    var input = InputRuntime{};
-    defer input.deinit(std.testing.allocator);
-    var shell = TranscriptRuntime{};
-    defer shell.deinit(std.testing.allocator);
-    const ctx: RenderContext = .{
-        .stream = .{ .active = true },
-        .has_api_key = true,
-        .model = "gpt-5.1",
-        .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
-        .activity = .{ .turn_thinking = .{
-            .label = "Connecting...",
-            .tone = .neutral,
-        } },
-        .input = &input,
-    };
-
-    var active_buf: [256]u8 = undefined;
-    switch (frameOwnedActivityProjection(&active_buf, &shell, ctx, null)) {
-        .turn_thinking => |thinking| {
-            try std.testing.expectEqual(ActivityProjection.Tone.neutral, thinking.tone);
-            try std.testing.expectEqualStrings("Connecting...", thinking.label);
-        },
-        .none, .tool_slot => return error.TestUnexpectedResult,
-    }
-}
-
 test "frame-owned activity shows live streaming token progress" {
     var input = InputRuntime{};
     defer input.deinit(std.testing.allocator);
