@@ -4,13 +4,22 @@
 
 <!-- release:start -->
 
+### New Features
+
+- **WebAssembly terminal sessions:** The experimental terminal SDK can now sign in and restore persisted sessions across reloads
+- **Hosted workspace commands:** The WebAssembly terminal can run commands supplied by its host workspace
+
 ### Improvements
 
-- **Interactive terminal startup:** Start an interactive shell when the `terminal` tool receives an empty command (#3)
+- **WebAssembly terminal output:** Stream assistant Markdown and tables more smoothly in the terminal SDK
+- **Feedback reports:** `/feedback` now copies a diagnostic report and opens a prefilled GitHub issue form, with guidance to review and redact sensitive information before submitting
+- **Agents and processes:** The Ctrl+X manager now groups agents and background processes with clearer labels, actions, counts, and compact layouts
+- **Background terminals:** Background sessions remain available through Ctrl+X while the normal footer stays quieter, and terminal takeover now shows how to detach
 
-### Contributors
+### Bug Fixes
 
-- @fazxes
+- **Interactive terminal startup:** Start an interactive shell when the `terminal` tool receives an empty command
+- **Ctrl+X manager layout:** Keep the close action visible on narrow terminals and align status labels correctly for wide Unicode names
 <!-- release:end -->
 
 ## 0.3.73
