@@ -259,7 +259,7 @@ jobs:
 
           jq -n \
             --arg repository "$GITHUB_REPOSITORY" \
-            --arg ref "$REF" \
+            --arg branch "$BRANCH" \
             --arg expected_head "$GITHUB_SHA" \
             --arg headline "Prepare v${NEW} release" \
             --arg main_zig "$(base64 -w 0 src/main.zig)" \
@@ -271,7 +271,7 @@ jobs:
                 input: {
                   branch: {
                     repositoryNameWithOwner: $repository,
-                    branchName: $ref
+                    branchName: $branch
                   },
                   expectedHeadOid: $expected_head,
                   message: {headline: $headline},
