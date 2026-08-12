@@ -34,6 +34,7 @@ pub const ObjectSchema = struct {
     additional_properties: ?bool = null,
     min_properties: ?usize = null,
     max_properties: ?usize = null,
+    one_of: []const ObjectSchema = &.{},
 };
 
 pub const FunctionSchema = struct {
@@ -116,6 +117,24 @@ fn writeObjectSchema(
     writer: *std.Io.Writer,
     schema: ObjectSchema,
 ) anyerror!void {
+    if (schema.one_of.len > 0) {
+        if (schema.properties.len > 0 or
+            schema.required.len > 0 or
+            schema.additional_properties != null or
+            schema.min_properties != null or
+            schema.max_properties != null)
+        {
+            return error.InvalidObjectSchema;
+        }
+        try writer.writeAll("{\"oneOf\":[");
+        for (schema.one_of, 0..) |alternative, index| {
+            if (index > 0) try writer.writeByte(',');
+            try writeObjectSchema(alloc, writer, alternative);
+        }
+        try writer.writeAll("]}");
+        return;
+    }
+
     try writer.writeAll("{\"type\":\"object\",\"properties\":{");
     for (schema.properties, 0..) |property, index| {
         if (index > 0) try writer.writeByte(',');
@@ -214,6 +233,71 @@ test "nested object schema serializes exact property bounds" {
     try std.testing.expect(std.mem.find(u8, json, "\"maxProperties\":1") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"create\":{\"type\":\"object\",\"properties\":{") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"additionalProperties\":false") != null);
+}
+
+test "object alternatives serialize as exclusive object branches" {
+    const alloc = std.testing.allocator;
+    const alternatives = [_]ObjectSchema{
+        .{
+            .properties = &.{
+                .{ .name = "action", .json_type = .string, .enum_values = &.{"read"} },
+                .{ .name = "path", .json_type = .string },
+            },
+            .required = &.{ "action", "path" },
+            .additional_properties = false,
+        },
+        .{
+            .properties = &.{
+                .{ .name = "action", .json_type = .string, .enum_values = &.{"list"} },
+            },
+            .required = &.{"action"},
+            .additional_properties = false,
+        },
+    };
+    const schema = FunctionSchema{
+        .name = "alternative",
+        .description = "alternative",
+        .input_schema = .{ .one_of = &alternatives },
+    };
+
+    const json = try builtinFunctionSchemaJsonAlloc(alloc, schema);
+    defer alloc.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+
+    const input_schema = parsed.value.object.get("inputSchema").?.object;
+    try std.testing.expect(input_schema.get("type") == null);
+    try std.testing.expect(input_schema.get("properties") == null);
+    const one_of = input_schema.get("oneOf").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), one_of.len);
+    try std.testing.expectEqualStrings(
+        "read",
+        one_of[0].object.get("properties").?.object.get("action").?.object.get("enum").?.array.items[0].string,
+    );
+    try std.testing.expectEqualStrings(
+        "list",
+        one_of[1].object.get("properties").?.object.get("action").?.object.get("enum").?.array.items[0].string,
+    );
+    try std.testing.expectEqual(false, one_of[0].object.get("additionalProperties").?.bool);
+    try std.testing.expectEqual(false, one_of[1].object.get("additionalProperties").?.bool);
+}
+
+test "object alternatives reject contradictory ordinary object metadata" {
+    const schema = FunctionSchema{
+        .name = "invalid_alternative",
+        .description = "invalid alternative",
+        .input_schema = .{
+            .properties = &.{.{ .name = "value", .json_type = .string }},
+            .one_of = &.{.{
+                .properties = &.{.{ .name = "action", .json_type = .string }},
+            }},
+        },
+    };
+
+    try std.testing.expectError(
+        error.InvalidObjectSchema,
+        builtinFunctionSchemaJsonAlloc(std.testing.allocator, schema),
+    );
 }
 
 test "cappedDescriptionAlloc appends explicit truncation marker" {

@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin_gateway = @import("gateway.zig");
+const terminal_contracts = @import("../core/terminal/contracts.zig");
 const terminal_monitor = @import("../core/terminal/monitor.zig");
 const gateway_schema = @import("../core/tooling/gateway_schema.zig");
 const subagent_domain = @import("../core/subagent/domain.zig");
@@ -173,6 +174,153 @@ const terminal_write_schema = gateway_schema.ObjectSchema{
     },
     .required = &.{"kind"},
     .additional_properties = false,
+};
+
+const terminal_properties = [_]gateway_schema.Property{
+    .{ .name = "session_id", .json_type = .string, .description = "Required for session-targeted actions. Omit for start and list; owner-catalog authority is private." },
+    .{ .name = "cwd", .json_type = .string, .description = "Start working directory; defaults to the workspace." },
+    .{ .name = "command", .json_type = .string, .description = "Optional command for start; omit for an interactive shell." },
+    .{ .name = "shell", .json_type = .object, .object_schema = &terminal_shell_schema },
+    .{ .name = "backend", .json_type = .string, .enum_values = &.{ "native", "tmux" }, .description = "Start backend or optional list filter." },
+    .{ .name = "return_when", .json_type = .object, .object_schema = &terminal_return_schema },
+    .{ .name = "wait_ceiling_ms", .json_type = .integer, .minimum = 1, .description = "Required for wait; required for start when return_when is non-immediate; maximum blocking time in milliseconds." },
+    .{ .name = "dimensions", .json_type = .object, .object_schema = &terminal_dimensions_schema },
+    .{ .name = "initial_monitors", .json_type = .array, .max_items = 32, .items = &terminal_monitor_definition_schema },
+    .{ .name = "cursor_segment", .json_type = .integer, .minimum = 1 },
+    .{ .name = "cursor_offset", .json_type = .integer },
+    .{ .name = "after_event_id", .json_type = .integer },
+    .{ .name = "acknowledge_event_id", .json_type = .integer, .minimum = 1 },
+    .{ .name = "max_events", .json_type = .integer, .minimum = 1, .maximum = 256 },
+    .{ .name = "write", .json_type = .object, .object_schema = &terminal_write_schema },
+    .{ .name = "lease", .json_type = .string, .enum_values = &.{ "acquire", "use", "release", "revoke" } },
+    .{ .name = "monitor", .json_type = .object, .object_schema = &terminal_monitor_operation_schema },
+    .{ .name = "task_id", .json_type = .string },
+    .{ .name = "workspace_root", .json_type = .string },
+    .{ .name = "rows", .json_type = .integer, .minimum = 1, .maximum = 4096 },
+    .{ .name = "columns", .json_type = .integer, .minimum = 1, .maximum = 4096 },
+    .{ .name = "signal", .json_type = .string, .enum_values = &.{ "hangup", "interrupt", "quit", "terminate", "kill" } },
+    .{ .name = "close_policy", .json_type = .string, .enum_values = &.{ "graceful", "force" } },
+};
+
+fn terminalProperty(comptime name: []const u8) gateway_schema.Property {
+    inline for (terminal_properties) |property| {
+        if (std.mem.eql(u8, property.name, name)) return property;
+    }
+    @compileError("unknown terminal property: " ++ name);
+}
+
+const terminal_action_schemas = [_]gateway_schema.ObjectSchema{
+    .{
+        .properties = &.{
+            .{ .name = "action", .json_type = .string, .enum_values = &.{"start"} },
+            terminalProperty("cwd"),
+            terminalProperty("command"),
+            terminalProperty("shell"),
+            terminalProperty("backend"),
+            terminalProperty("return_when"),
+            terminalProperty("wait_ceiling_ms"),
+            terminalProperty("dimensions"),
+            terminalProperty("initial_monitors"),
+        },
+        .required = &.{"action"},
+        .additional_properties = false,
+    },
+    .{
+        .properties = &.{
+            .{ .name = "action", .json_type = .string, .enum_values = &.{"read"} },
+            terminalProperty("session_id"),
+            terminalProperty("cursor_segment"),
+            terminalProperty("cursor_offset"),
+        },
+        .required = &.{ "action", "session_id", "cursor_segment" },
+        .additional_properties = false,
+    },
+    .{
+        .properties = &.{
+            .{ .name = "action", .json_type = .string, .enum_values = &.{"screen"} },
+            terminalProperty("session_id"),
+        },
+        .required = &.{ "action", "session_id" },
+        .additional_properties = false,
+    },
+    .{
+        .properties = &.{
+            .{ .name = "action", .json_type = .string, .enum_values = &.{"write"} },
+            terminalProperty("session_id"),
+            terminalProperty("write"),
+            terminalProperty("lease"),
+        },
+        .required = &.{ "action", "session_id" },
+        .additional_properties = false,
+    },
+    .{
+        .properties = &.{
+            .{ .name = "action", .json_type = .string, .enum_values = &.{"wait"} },
+            terminalProperty("session_id"),
+            terminalProperty("return_when"),
+            terminalProperty("wait_ceiling_ms"),
+        },
+        .required = &.{ "action", "session_id", "return_when", "wait_ceiling_ms" },
+        .additional_properties = false,
+    },
+    .{
+        .properties = &.{
+            .{ .name = "action", .json_type = .string, .enum_values = &.{"monitor"} },
+            terminalProperty("session_id"),
+            terminalProperty("monitor"),
+        },
+        .required = &.{ "action", "session_id", "monitor" },
+        .additional_properties = false,
+    },
+    .{
+        .properties = &.{
+            .{ .name = "action", .json_type = .string, .enum_values = &.{"inspect"} },
+            terminalProperty("session_id"),
+            terminalProperty("after_event_id"),
+            terminalProperty("acknowledge_event_id"),
+            terminalProperty("max_events"),
+        },
+        .required = &.{ "action", "session_id" },
+        .additional_properties = false,
+    },
+    .{
+        .properties = &.{
+            .{ .name = "action", .json_type = .string, .enum_values = &.{"list"} },
+            terminalProperty("task_id"),
+            terminalProperty("workspace_root"),
+            terminalProperty("backend"),
+        },
+        .required = &.{"action"},
+        .additional_properties = false,
+    },
+    .{
+        .properties = &.{
+            .{ .name = "action", .json_type = .string, .enum_values = &.{"resize"} },
+            terminalProperty("session_id"),
+            terminalProperty("rows"),
+            terminalProperty("columns"),
+        },
+        .required = &.{ "action", "session_id", "rows", "columns" },
+        .additional_properties = false,
+    },
+    .{
+        .properties = &.{
+            .{ .name = "action", .json_type = .string, .enum_values = &.{"signal"} },
+            terminalProperty("session_id"),
+            terminalProperty("signal"),
+        },
+        .required = &.{ "action", "session_id", "signal" },
+        .additional_properties = false,
+    },
+    .{
+        .properties = &.{
+            .{ .name = "action", .json_type = .string, .enum_values = &.{"close"} },
+            terminalProperty("session_id"),
+            terminalProperty("close_policy"),
+        },
+        .required = &.{ "action", "session_id", "close_policy" },
+        .additional_properties = false,
+    },
 };
 const skill_description =
     "Read an installed skill or one of its relative text resources in bounded chunks. Pass the exact advertised location when one is listed, then use next_offset to continue. When to use: the user explicitly invokes a listed skill or the task clearly matches one. When NOT to use: generic exploration, ordinary file edits, guessing from vague words, or installing a missing skill.";
@@ -866,34 +1014,7 @@ pub const terminal = ToolSpec{
         .name = "terminal",
         .description = terminal_description,
         .input_schema = .{
-            .properties = &.{
-                .{ .name = "action", .json_type = .string, .enum_values = &.{ "start", "read", "screen", "write", "wait", "monitor", "inspect", "list", "resize", "signal", "close" } },
-                .{ .name = "session_id", .json_type = .string, .description = "Required for session-targeted actions. Omit for start and list; owner-catalog authority is private." },
-                .{ .name = "cwd", .json_type = .string, .description = "Start working directory; defaults to the workspace." },
-                .{ .name = "command", .json_type = .string, .description = "Optional command for start; omit for an interactive shell." },
-                .{ .name = "shell", .json_type = .object, .object_schema = &terminal_shell_schema },
-                .{ .name = "backend", .json_type = .string, .enum_values = &.{ "native", "tmux" }, .description = "Start backend or optional list filter." },
-                .{ .name = "return_when", .json_type = .object, .object_schema = &terminal_return_schema },
-                .{ .name = "wait_ceiling_ms", .json_type = .integer, .minimum = 1, .description = "Required for wait; required for start when return_when is non-immediate; maximum blocking time in milliseconds." },
-                .{ .name = "dimensions", .json_type = .object, .object_schema = &terminal_dimensions_schema },
-                .{ .name = "initial_monitors", .json_type = .array, .max_items = 32, .items = &terminal_monitor_definition_schema },
-                .{ .name = "cursor_segment", .json_type = .integer, .minimum = 1 },
-                .{ .name = "cursor_offset", .json_type = .integer },
-                .{ .name = "after_event_id", .json_type = .integer },
-                .{ .name = "acknowledge_event_id", .json_type = .integer, .minimum = 1 },
-                .{ .name = "max_events", .json_type = .integer, .minimum = 1, .maximum = 256 },
-                .{ .name = "write", .json_type = .object, .object_schema = &terminal_write_schema },
-                .{ .name = "lease", .json_type = .string, .enum_values = &.{ "acquire", "use", "release", "revoke" } },
-                .{ .name = "monitor", .json_type = .object, .object_schema = &terminal_monitor_operation_schema },
-                .{ .name = "task_id", .json_type = .string },
-                .{ .name = "workspace_root", .json_type = .string },
-                .{ .name = "rows", .json_type = .integer, .minimum = 1, .maximum = 4096 },
-                .{ .name = "columns", .json_type = .integer, .minimum = 1, .maximum = 4096 },
-                .{ .name = "signal", .json_type = .string, .enum_values = &.{ "hangup", "interrupt", "quit", "terminate", "kill" } },
-                .{ .name = "close_policy", .json_type = .string, .enum_values = &.{ "graceful", "force" } },
-            },
-            .required = &.{"action"},
-            .additional_properties = false,
+            .one_of = &terminal_action_schemas,
         },
     },
     .executor_kind = .terminal,
@@ -1258,95 +1379,137 @@ test "registry classifies every built-in progress label" {
     }
 }
 
-test "terminal tool schema exposes the complete action and backend surface" {
+fn schemaProperty(schema: gateway_schema.ObjectSchema, name: []const u8) ?gateway_schema.Property {
+    for (schema.properties) |property| {
+        if (std.mem.eql(u8, property.name, name)) return property;
+    }
+    return null;
+}
+
+test "terminal tool schema exposes one exact object branch per action" {
     try std.testing.expect(terminal.requires_approval);
     try std.testing.expectEqual(tool_dispatch.ExecutorKind.terminal, terminal.executor_kind);
     try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.none, terminal.permission_target_kind);
 
-    var action_values: ?[]const []const u8 = null;
-    var backend_values: ?[]const []const u8 = null;
-    var session_id_description: ?[]const u8 = null;
-    var wait_ceiling_description: ?[]const u8 = null;
-    var wait_ceiling_count: usize = 0;
-    var has_safety_ceiling = false;
-    var has_initial_monitors = false;
-    var has_return_when = false;
-    var has_lifecycle = false;
-    var output_quiet_duration: ?gateway_schema.Property = null;
-    var notification_interval: ?gateway_schema.Property = null;
-    var lifetime_duration: ?gateway_schema.Property = null;
-    var check_interval: ?gateway_schema.Property = null;
-    for (terminal.gateway_schema.input_schema.properties) |property| {
-        if (std.mem.eql(u8, property.name, "action")) action_values = property.enum_values;
-        if (std.mem.eql(u8, property.name, "backend")) backend_values = property.enum_values;
-        if (std.mem.eql(u8, property.name, "session_id")) session_id_description = property.description;
-        if (std.mem.eql(u8, property.name, "wait_ceiling_ms")) {
-            wait_ceiling_description = property.description;
-            wait_ceiling_count += 1;
+    const expected = [_]struct {
+        action: []const u8,
+        properties: []const []const u8,
+        required: []const []const u8,
+    }{
+        .{ .action = "start", .properties = &.{ "action", "cwd", "command", "shell", "backend", "return_when", "wait_ceiling_ms", "dimensions", "initial_monitors" }, .required = &.{"action"} },
+        .{ .action = "read", .properties = &.{ "action", "session_id", "cursor_segment", "cursor_offset" }, .required = &.{ "action", "session_id", "cursor_segment" } },
+        .{ .action = "screen", .properties = &.{ "action", "session_id" }, .required = &.{ "action", "session_id" } },
+        .{ .action = "write", .properties = &.{ "action", "session_id", "write", "lease" }, .required = &.{ "action", "session_id" } },
+        .{ .action = "wait", .properties = &.{ "action", "session_id", "return_when", "wait_ceiling_ms" }, .required = &.{ "action", "session_id", "return_when", "wait_ceiling_ms" } },
+        .{ .action = "monitor", .properties = &.{ "action", "session_id", "monitor" }, .required = &.{ "action", "session_id", "monitor" } },
+        .{ .action = "inspect", .properties = &.{ "action", "session_id", "after_event_id", "acknowledge_event_id", "max_events" }, .required = &.{ "action", "session_id" } },
+        .{ .action = "list", .properties = &.{ "action", "task_id", "workspace_root", "backend" }, .required = &.{"action"} },
+        .{ .action = "resize", .properties = &.{ "action", "session_id", "rows", "columns" }, .required = &.{ "action", "session_id", "rows", "columns" } },
+        .{ .action = "signal", .properties = &.{ "action", "session_id", "signal" }, .required = &.{ "action", "session_id", "signal" } },
+        .{ .action = "close", .properties = &.{ "action", "session_id", "close_policy" }, .required = &.{ "action", "session_id", "close_policy" } },
+    };
+
+    try std.testing.expectEqual(expected.len, terminal.gateway_schema.input_schema.one_of.len);
+    try std.testing.expectEqual(@as(usize, 0), terminal.gateway_schema.input_schema.properties.len);
+    for (expected, terminal.gateway_schema.input_schema.one_of) |want, branch| {
+        try std.testing.expectEqual(want.properties.len, branch.properties.len);
+        for (want.properties, branch.properties) |want_name, property| {
+            try std.testing.expectEqualStrings(want_name, property.name);
         }
-        if (std.mem.eql(u8, property.name, "safety_ceiling_ms")) has_safety_ceiling = true;
-        if (std.mem.eql(u8, property.name, "initial_monitors")) has_initial_monitors = true;
-        if (std.mem.eql(u8, property.name, "return_when")) has_return_when = true;
-        if (std.mem.eql(u8, property.name, "lifecycle")) has_lifecycle = true;
+        const action = schemaProperty(branch, "action").?;
+        try std.testing.expectEqual(@as(usize, 1), action.enum_values.len);
+        try std.testing.expectEqualStrings(want.action, action.enum_values[0]);
+        try std.testing.expectEqualSlices([]const u8, want.required, branch.required);
+        try std.testing.expectEqual(@as(?bool, false), branch.additional_properties);
     }
-    for (terminal_monitor_condition_schema.properties) |property| {
-        if (std.mem.eql(u8, property.name, "duration_ms")) output_quiet_duration = property;
-    }
-    for (terminal_monitor_notify_schema.properties) |property| {
-        if (std.mem.eql(u8, property.name, "interval_ms")) notification_interval = property;
-    }
-    for (terminal_monitor_lifetime_schema.properties) |property| {
-        if (std.mem.eql(u8, property.name, "duration_ms")) lifetime_duration = property;
-    }
-    for (terminal_monitor_definition_schema.properties) |property| {
-        if (std.mem.eql(u8, property.name, "check_interval_ms")) check_interval = property;
-    }
+
+    const start_branch = terminal.gateway_schema.input_schema.one_of[0];
+    const read_branch = terminal.gateway_schema.input_schema.one_of[1];
+    const list_branch = terminal.gateway_schema.input_schema.one_of[7];
     try std.testing.expectEqualSlices(
         []const u8,
-        &.{ "start", "read", "screen", "write", "wait", "monitor", "inspect", "list", "resize", "signal", "close" },
-        action_values.?,
+        &.{ "native", "tmux" },
+        schemaProperty(start_branch, "backend").?.enum_values,
     );
     try std.testing.expectEqualSlices(
         []const u8,
         &.{ "native", "tmux" },
-        backend_values.?,
+        schemaProperty(list_branch, "backend").?.enum_values,
     );
-    try std.testing.expectEqualSlices(
-        []const u8,
-        &.{"action"},
-        terminal.gateway_schema.input_schema.required,
-    );
-    try std.testing.expectEqual(
-        @as(?bool, false),
-        terminal.gateway_schema.input_schema.additional_properties,
-    );
-    try std.testing.expect(has_initial_monitors);
-    try std.testing.expect(has_return_when);
-    try std.testing.expect(!has_lifecycle);
-    try std.testing.expectEqual(@as(usize, 1), wait_ceiling_count);
-    try std.testing.expect(!has_safety_ceiling);
     try std.testing.expectEqualStrings(
         "Required for wait; required for start when return_when is non-immediate; maximum blocking time in milliseconds.",
-        wait_ceiling_description.?,
+        schemaProperty(start_branch, "wait_ceiling_ms").?.description,
     );
     try std.testing.expectEqualStrings(
         "Required for session-targeted actions. Omit for start and list; owner-catalog authority is private.",
-        session_id_description.?,
+        schemaProperty(read_branch, "session_id").?.description,
     );
+
+    const output_quiet_duration = schemaProperty(terminal_monitor_condition_schema, "duration_ms").?;
+    const notification_interval = schemaProperty(terminal_monitor_notify_schema, "interval_ms").?;
+    const lifetime_duration = schemaProperty(terminal_monitor_lifetime_schema, "duration_ms").?;
+    const check_interval = schemaProperty(terminal_monitor_definition_schema, "check_interval_ms").?;
     const minimum_schedule_ms: usize = @intCast(terminal_monitor.minimum_schedule_ms);
     const maximum_schedule_ms: usize = @intCast(terminal_monitor.maximum_schedule_ms);
     const maximum_lifetime_ms: usize = @intCast(terminal_monitor.maximum_lifetime_ms);
-    try std.testing.expectEqual(@as(?usize, minimum_schedule_ms), output_quiet_duration.?.minimum);
-    try std.testing.expectEqual(@as(?usize, maximum_schedule_ms), output_quiet_duration.?.maximum);
-    try std.testing.expectEqual(@as(?usize, minimum_schedule_ms), notification_interval.?.minimum);
-    try std.testing.expectEqual(@as(?usize, maximum_schedule_ms), notification_interval.?.maximum);
-    try std.testing.expectEqual(@as(?usize, 1), lifetime_duration.?.minimum);
-    try std.testing.expectEqual(@as(?usize, maximum_lifetime_ms), lifetime_duration.?.maximum);
-    try std.testing.expectEqual(@as(?usize, minimum_schedule_ms), check_interval.?.minimum);
-    try std.testing.expectEqual(@as(?usize, maximum_schedule_ms), check_interval.?.maximum);
+    try std.testing.expectEqual(@as(?usize, minimum_schedule_ms), output_quiet_duration.minimum);
+    try std.testing.expectEqual(@as(?usize, maximum_schedule_ms), output_quiet_duration.maximum);
+    try std.testing.expectEqual(@as(?usize, minimum_schedule_ms), notification_interval.minimum);
+    try std.testing.expectEqual(@as(?usize, maximum_schedule_ms), notification_interval.maximum);
+    try std.testing.expectEqual(@as(?usize, 1), lifetime_duration.minimum);
+    try std.testing.expectEqual(@as(?usize, maximum_lifetime_ms), lifetime_duration.maximum);
+    try std.testing.expectEqual(@as(?usize, minimum_schedule_ms), check_interval.minimum);
+    try std.testing.expectEqual(@as(?usize, maximum_schedule_ms), check_interval.maximum);
     try std.testing.expectEqualStrings(
         "Required for polling conditions tcp_ready, http_ready, path_exists, path_changed, path_size, and custom_probe. Event-driven conditions process_exit, exit_code, signal, output_contains, output_matches, output_quiet, and screen_matches omit it; materialized values are ignored.",
-        check_interval.?.description,
+        check_interval.description,
+    );
+}
+
+test "terminal advertisement and admission agree on every action field" {
+    const branches = terminal.gateway_schema.input_schema.one_of;
+    try std.testing.expectEqual(std.meta.tags(terminal_contracts.Action).len, branches.len);
+
+    for (branches) |branch| {
+        const action_property = schemaProperty(branch, "action").?;
+        try std.testing.expectEqual(@as(usize, 1), action_property.enum_values.len);
+        const action = std.meta.stringToEnum(
+            terminal_contracts.Action,
+            action_property.enum_values[0],
+        ) orelse return error.TestUnexpectedResult;
+        const admitted_fields = terminal_impl.actionFieldNames(action);
+        try std.testing.expectEqual(branch.properties.len, admitted_fields.len);
+        for (branch.properties, admitted_fields) |property, admitted_field| {
+            try std.testing.expectEqualStrings(property.name, admitted_field);
+        }
+    }
+}
+
+test "terminal gateway advertisement projects action-specific alternatives" {
+    const alloc = std.testing.allocator;
+    var projection = try tool_advertisement.buildGatewayToolProjectionForSet(
+        alloc,
+        advertisement_set,
+        .{ .terminal_available = true },
+    );
+    defer projection.deinit(alloc);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, projection.tools_json, .{});
+    defer parsed.deinit();
+
+    var terminal_schema: ?std.json.ObjectMap = null;
+    for (parsed.value.array.items) |tool_value| {
+        if (tool_value != .object) continue;
+        const name = tool_value.object.get("name") orelse continue;
+        if (name != .string or !std.mem.eql(u8, name.string, "terminal")) continue;
+        terminal_schema = tool_value.object.get("inputSchema").?.object;
+        break;
+    }
+
+    const input_schema = terminal_schema orelse return error.TestExpectedEqual;
+    try std.testing.expect(input_schema.get("properties") == null);
+    try std.testing.expectEqual(
+        @as(usize, 11),
+        input_schema.get("oneOf").?.array.items.len,
     );
 }
 

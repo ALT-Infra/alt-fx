@@ -136,6 +136,37 @@ pub const Input = struct {
     close_policy: ?contracts.ClosePolicy = null,
 };
 
+pub fn actionFieldNames(action: contracts.Action) []const []const u8 {
+    return switch (action) {
+        .start => &.{ "action", "cwd", "command", "shell", "backend", "return_when", "wait_ceiling_ms", "dimensions", "initial_monitors" },
+        .read => &.{ "action", "session_id", "cursor_segment", "cursor_offset" },
+        .screen => &.{ "action", "session_id" },
+        .write => &.{ "action", "session_id", "write", "lease" },
+        .wait => &.{ "action", "session_id", "return_when", "wait_ceiling_ms" },
+        .monitor => &.{ "action", "session_id", "monitor" },
+        .inspect => &.{ "action", "session_id", "after_event_id", "acknowledge_event_id", "max_events" },
+        .list => &.{ "action", "task_id", "workspace_root", "backend" },
+        .resize => &.{ "action", "session_id", "rows", "columns" },
+        .signal => &.{ "action", "session_id", "signal" },
+        .close => &.{ "action", "session_id", "close_policy" },
+    };
+}
+
+fn actionAllowsField(action: contracts.Action, field_name: []const u8) bool {
+    for (actionFieldNames(action)) |allowed_name| {
+        if (std.mem.eql(u8, allowed_name, field_name)) return true;
+    }
+    return false;
+}
+
+fn unexpectedActionField(action: contracts.Action, object: std.json.ObjectMap) ?[]const u8 {
+    var fields = object.iterator();
+    while (fields.next()) |entry| {
+        if (!actionAllowsField(action, entry.key_ptr.*)) return entry.key_ptr.*;
+    }
+    return null;
+}
+
 const OwnedInput = struct {
     parsed: std.json.Parsed(Input),
 
@@ -149,6 +180,50 @@ pub fn decode(
     ctx: tool_dispatch.DispatchContext,
     args_json: []const u8,
 ) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
+    var raw = std.json.parseFromSlice(
+        std.json.Value,
+        ctx.allocator,
+        args_json,
+        .{},
+    ) catch {
+        return .{ .failure = try ctx.allocator.dupe(
+            u8,
+            "terminal arguments must match the advertised action schema",
+        ) };
+    };
+    defer raw.deinit();
+    if (raw.value != .object) {
+        return .{ .failure = try ctx.allocator.dupe(
+            u8,
+            "terminal arguments must match the advertised action schema",
+        ) };
+    }
+    const raw_action = raw.value.object.get("action") orelse {
+        return .{ .failure = try ctx.allocator.dupe(
+            u8,
+            "terminal arguments must match the advertised action schema",
+        ) };
+    };
+    if (raw_action != .string) {
+        return .{ .failure = try ctx.allocator.dupe(
+            u8,
+            "terminal arguments must match the advertised action schema",
+        ) };
+    }
+    const action = std.meta.stringToEnum(contracts.Action, raw_action.string) orelse {
+        return .{ .failure = try ctx.allocator.dupe(
+            u8,
+            "terminal arguments must match the advertised action schema",
+        ) };
+    };
+    if (unexpectedActionField(action, raw.value.object)) |field_name| {
+        return .{ .failure = try std.fmt.allocPrint(
+            ctx.allocator,
+            "terminal {s} field \"{s}\" is not allowed",
+            .{ @tagName(action), field_name },
+        ) };
+    }
+
     const parsed = std.json.parseFromSlice(
         Input,
         ctx.allocator,
@@ -865,6 +940,77 @@ test "terminal decoder accepts every public action and owns its input" {
     }
 }
 
+test "terminal action field ownership is exact for every public action" {
+    const expected = [_]struct {
+        action: contracts.Action,
+        fields: []const []const u8,
+    }{
+        .{ .action = .start, .fields = &.{ "action", "cwd", "command", "shell", "backend", "return_when", "wait_ceiling_ms", "dimensions", "initial_monitors" } },
+        .{ .action = .read, .fields = &.{ "action", "session_id", "cursor_segment", "cursor_offset" } },
+        .{ .action = .screen, .fields = &.{ "action", "session_id" } },
+        .{ .action = .write, .fields = &.{ "action", "session_id", "write", "lease" } },
+        .{ .action = .wait, .fields = &.{ "action", "session_id", "return_when", "wait_ceiling_ms" } },
+        .{ .action = .monitor, .fields = &.{ "action", "session_id", "monitor" } },
+        .{ .action = .inspect, .fields = &.{ "action", "session_id", "after_event_id", "acknowledge_event_id", "max_events" } },
+        .{ .action = .list, .fields = &.{ "action", "task_id", "workspace_root", "backend" } },
+        .{ .action = .resize, .fields = &.{ "action", "session_id", "rows", "columns" } },
+        .{ .action = .signal, .fields = &.{ "action", "session_id", "signal" } },
+        .{ .action = .close, .fields = &.{ "action", "session_id", "close_policy" } },
+    };
+
+    try std.testing.expectEqual(std.meta.tags(contracts.Action).len, expected.len);
+    for (expected) |want| {
+        try std.testing.expectEqualSlices(
+            []const u8,
+            want.fields,
+            actionFieldNames(want.action),
+        );
+        inline for (@typeInfo(Input).@"struct".fields) |field| {
+            var want_allowed = false;
+            for (want.fields) |allowed_name| {
+                if (std.mem.eql(u8, allowed_name, field.name)) {
+                    want_allowed = true;
+                    break;
+                }
+            }
+            try std.testing.expectEqual(
+                want_allowed,
+                actionAllowsField(want.action, field.name),
+            );
+        }
+    }
+}
+
+test "terminal decoder rejects cross-action fields regardless of value" {
+    const alloc = std.testing.allocator;
+    inline for (&.{
+        .{
+            "{\"action\":\"start\",\"session_id\":\"\"}",
+            "terminal start field \"session_id\" is not allowed",
+        },
+        .{
+            "{\"action\":\"list\",\"cwd\":\"\",\"task_id\":\"\"}",
+            "terminal list field \"cwd\" is not allowed",
+        },
+        .{
+            "{\"action\":\"close\",\"close_policy\":\"force\",\"session_id\":\"terminal-a\",\"rows\":0}",
+            "terminal close field \"rows\" is not allowed",
+        },
+    }) |case| {
+        const decoded = try decode(.{ .allocator = alloc }, case[0]);
+        switch (decoded) {
+            .failure => |message| {
+                defer alloc.free(message);
+                try std.testing.expectEqualStrings(case[1], message);
+            },
+            .input => |input| {
+                input.deinit(alloc);
+                return error.TestUnexpectedResult;
+            },
+        }
+    }
+}
+
 test "terminal start accepts native and tmux backend contracts" {
     const alloc = std.testing.allocator;
     inline for (.{ "native", "tmux" }) |backend| {
@@ -958,7 +1104,7 @@ test "terminal start canonicalizes interactive command representations" {
     }
 }
 
-test "registered terminal validation accepts an exact empty start command" {
+test "registered terminal validation enforces action-specific input before execution" {
     const terminal_tool = tool_dispatch.Tool{
         .name = "terminal",
         .description = "Terminal test adapter.",
@@ -978,16 +1124,46 @@ test "registered terminal validation accepts an exact empty start command" {
         .workspace_root = "/tmp",
     };
 
-    const accepted = try tool_dispatch.validateRegisteredToolCall(ctx, registry, .{
-        .id = "terminal-empty-start",
+    inline for (&.{
+        "{\"action\":\"start\",\"command\":\"\"}",
+        "{\"action\":\"read\",\"session_id\":\"terminal-a\",\"cursor_segment\":1}",
+        "{\"action\":\"screen\",\"session_id\":\"terminal-a\"}",
+        "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"lease\":\"acquire\"}",
+        "{\"action\":\"wait\",\"session_id\":\"terminal-a\",\"return_when\":{\"kind\":\"exit\"},\"wait_ceiling_ms\":1000}",
+        "{\"action\":\"monitor\",\"session_id\":\"terminal-a\",\"monitor\":{\"kind\":\"remove\",\"monitor_id\":\"monitor-a\"}}",
+        "{\"action\":\"inspect\",\"session_id\":\"terminal-a\"}",
+        "{\"action\":\"list\",\"task_id\":\"\",\"workspace_root\":\"\"}",
+        "{\"action\":\"resize\",\"session_id\":\"terminal-a\",\"rows\":24,\"columns\":80}",
+        "{\"action\":\"signal\",\"session_id\":\"terminal-a\",\"signal\":\"interrupt\"}",
+        "{\"action\":\"close\",\"session_id\":\"terminal-a\",\"close_policy\":\"force\"}",
+    }) |arguments_json| {
+        const accepted = try tool_dispatch.validateRegisteredToolCall(ctx, registry, .{
+            .id = "terminal-valid",
+            .name = "terminal",
+            .arguments_json = arguments_json,
+        });
+        defer switch (accepted) {
+            .failure => |reason| std.testing.allocator.free(reason),
+            else => {},
+        };
+        try std.testing.expectEqual(.valid, accepted);
+    }
+
+    const mixed = try tool_dispatch.validateRegisteredToolCall(ctx, registry, .{
+        .id = "terminal-mixed-start",
         .name = "terminal",
-        .arguments_json = "{\"action\":\"start\",\"command\":\"\"}",
+        .arguments_json = "{\"action\":\"start\",\"command\":\"printf wrong\",\"session_id\":\"terminal-a\",\"write\":{\"kind\":\"text\",\"text\":\"wrong\"},\"rows\":24,\"columns\":80,\"signal\":\"terminate\",\"close_policy\":\"force\"}",
     });
-    defer switch (accepted) {
+    defer switch (mixed) {
         .failure => |reason| std.testing.allocator.free(reason),
         else => {},
     };
-    try std.testing.expectEqual(.valid, accepted);
+    switch (mixed) {
+        .failure => |reason| try std.testing.expect(
+            std.mem.find(u8, reason, "terminal start field \"session_id\" is not allowed") != null,
+        ),
+        else => return error.TestUnexpectedResult,
+    }
 
     const rejected = try tool_dispatch.validateRegisteredToolCall(ctx, registry, .{
         .id = "terminal-invalid-resize",
@@ -1248,7 +1424,7 @@ test "terminal public list rejects lifecycle and projects supported filters" {
 
     const empty_decoded = try decode(
         .{ .allocator = alloc },
-        "{\"action\":\"list\",\"session_id\":\"\",\"cwd\":\"\",\"task_id\":\"\",\"workspace_root\":\"\"}",
+        "{\"action\":\"list\",\"task_id\":\"\",\"workspace_root\":\"\"}",
     );
     switch (empty_decoded) {
         .failure => |message| {
