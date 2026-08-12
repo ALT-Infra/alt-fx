@@ -2469,16 +2469,15 @@ describe.skipIf(SKIP)("tui: resize", () => {
       label: "statusline",
       width: 72,
       height: 16,
-      surfaceMarker: "Status line:",
+      surfaceMarker: "Status line",
       editedInput: "x",
       async openSurface(active) {
         await active.sendText("/statusline");
-        await active.waitForText("Status line:", TIMEOUT);
-        await active.sendKeys("Enter");
-        await active.waitForText("sandbox: on", TIMEOUT);
+        await active.waitForText("Status line", TIMEOUT);
+        await active.sendKeys("Right");
+        await active.waitForText("sandbox:none", TIMEOUT);
         await active.sendKeys("Down");
-        await active.sendKeys("Enter");
-        await active.waitForText("context: on", TIMEOUT);
+        await active.sendKeys("Right");
       },
     },
     {
@@ -2486,13 +2485,13 @@ describe.skipIf(SKIP)("tui: resize", () => {
       label: "appearance",
       width: 72,
       height: 16,
-      surfaceMarker: "Appearance · Choose one",
+      surfaceMarker: "Appearance",
       editedInput: "x",
       async openSurface(active) {
         await active.sendText("/appearance");
-        await active.waitForText("Appearance · Choose one", TIMEOUT);
-        await active.sendKeys("Enter");
-        await active.waitForText("Input: switched to lines", TIMEOUT);
+        await active.waitForText("Input appearance", TIMEOUT);
+        await active.sendKeys("Right");
+        await active.waitForText("lines  tint", TIMEOUT);
       },
     },
     {
@@ -2513,11 +2512,11 @@ describe.skipIf(SKIP)("tui: resize", () => {
       label: "sandbox",
       width: 120,
       height: 36,
-      surfaceMarker: "Sandbox:",
+      surfaceMarker: "Command sandbox",
       editedInput: "x",
       async openSurface(active) {
         await active.sendText("/sandbox");
-        await active.waitForText("Sandbox:", TIMEOUT);
+        await active.waitForText("Command sandbox", TIMEOUT);
         await active.resizeWindow(60, 12, 500);
       },
     },

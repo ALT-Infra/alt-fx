@@ -1030,7 +1030,7 @@ pub fn Runtime(comptime App: type) type {
             }
 
             if (appearanceMenuActive(app)) {
-                routeAppearanceMenuEscapeAction(app, resolved);
+                try routeAppearanceMenuEscapeAction(app, resolved);
                 return .done;
             }
 
@@ -1973,7 +1973,7 @@ pub fn Runtime(comptime App: type) type {
         fn submitAppearanceMenuSelection(app: *App) !void {
             const change = app.input_runtime.appearance_menu.selectedChange() orelse return;
             if (comptime @hasDecl(App, "notificationPreferences")) {
-                try app_commands.applySettingsCatalogChange(app, change);
+                try app_commands.applySettingsCatalogMenuChange(app, change);
             }
             app.shell.render_requests.request(.footer);
         }
@@ -2001,7 +2001,7 @@ pub fn Runtime(comptime App: type) type {
                 .usage, .workspace => unreachable,
             } orelse return;
             if (comptime @hasDecl(App, "notificationPreferences")) {
-                try app_commands.applySettingsCatalogChange(app, change);
+                try app_commands.applySettingsCatalogMenuChange(app, change);
             }
             app.shell.render_requests.request(.footer);
         }
@@ -2073,6 +2073,21 @@ pub fn Runtime(comptime App: type) type {
                 }
                 return;
             }
+            if ((menu == .statusline or menu == .sandbox) and
+                (resolved == .cursor_left or resolved == .cursor_right))
+            {
+                const snapshot = app_commands.settingsCatalogSnapshot(app);
+                const delta: i32 = if (resolved == .cursor_left) -1 else 1;
+                const change = switch (menu) {
+                    .statusline => app.input_runtime.statusline_menu.changeSelectedOption(&snapshot, delta),
+                    .sandbox => app.input_runtime.sandbox_menu.changeSelectedOption(&snapshot, delta),
+                    .usage, .workspace => unreachable,
+                } orelse return;
+                if (comptime @hasDecl(App, "notificationPreferences")) {
+                    try app_commands.applySettingsCatalogMenuChange(app, change);
+                }
+                return;
+            }
             const delta: i32 = switch (resolved) {
                 .cursor_up => -1,
                 .cursor_down => 1,
@@ -2091,10 +2106,21 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        fn routeAppearanceMenuEscapeAction(app: *App, resolved: input_action.Action) void {
+        fn routeAppearanceMenuEscapeAction(app: *App, resolved: input_action.Action) !void {
             switch (resolved) {
-                .cursor_up => _ = app.input_runtime.appearance_menu.move(-1),
-                .cursor_down => _ = app.input_runtime.appearance_menu.move(1),
+                .cursor_up, .cursor_down => {
+                    _ = app.input_runtime.appearance_menu.cycleSection(1);
+                },
+                .cursor_left, .cursor_right => {
+                    const snapshot = app_commands.settingsCatalogSnapshot(app);
+                    const change = app.input_runtime.appearance_menu.changeSelectedOption(
+                        &snapshot,
+                        if (resolved == .cursor_left) -1 else 1,
+                    ) orelse return;
+                    if (comptime @hasDecl(App, "notificationPreferences")) {
+                        try app_commands.applySettingsCatalogMenuChange(app, change);
+                    }
+                },
                 .toggle_permission_mode => _ = app.input_runtime.appearance_menu.cycleSection(-1),
                 else => return,
             }

@@ -1589,8 +1589,9 @@ tmuxTest(
     await active.sendText("/input");
     await active.waitForPane(
       (pane) =>
-        pane.includes("Appearance · Choose one") &&
-        pane.includes("Tint ✓"),
+        pane.includes("Appearance") &&
+        pane.includes("Input appearance") &&
+        pane.includes("lines  tint"),
       READY_TIMEOUT,
     );
     await active.sendKeys("Escape");

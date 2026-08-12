@@ -490,11 +490,11 @@ pub fn composeSettingsMenuHintRow(
 
 pub fn composeAppearanceMenuHintRow(alloc: Allocator, width: u16) !std.ArrayList(u8) {
     const variants = [_][]const u8{
-        "↑↓ Navigate     Tab Section     Enter Apply     Esc Close",
-        "↑↓ Navigate  Tab Section  Enter Apply  Esc Close",
-        "↑↓ Move  Tab Section  Enter Apply  Esc",
-        "Enter Apply  Esc Close",
-        "Enter Esc",
+        "↑↓ Navigate     ←→ Change     Tab Section     Esc Close",
+        "↑↓ Navigate  ←→ Change  Tab Section  Esc Close",
+        "↑↓ Move  ←→ Change  Tab  Esc",
+        "←→ Change  Esc Close",
+        "←→ Esc",
     };
     var hint = variants[variants.len - 1];
     for (variants) |candidate| {
@@ -519,14 +519,14 @@ pub fn composeCompactCommandMenuHintRow(
 ) !std.ArrayList(u8) {
     const variants = switch (menu) {
         .statusline => [_][]const u8{
-            "↑↓ Navigate     Enter Toggle     Esc Close",
-            "↑↓ Move  Enter Toggle  Esc",
-            "Enter Esc",
+            "",
+            "",
+            "",
         },
         .sandbox => [_][]const u8{
-            "↑↓ Navigate     Enter Apply     Esc Close",
-            "↑↓ Move  Enter Apply  Esc",
-            "Enter Esc",
+            "↑↓ Navigate     ←→ Change     Esc Close",
+            "↑↓ Move  ←→ Change  Esc",
+            "←→ Esc",
         },
         .usage => [_][]const u8{
             "←→ Scope     ↑↓ Model     Enter Expand     R Refresh     Esc Close",
