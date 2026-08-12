@@ -1,6 +1,7 @@
 const std = @import("std");
 const question_prompt = @import("../../core/agent/question_prompt.zig");
 const approval_decision = @import("../../core/permissions/approval_decision.zig");
+const subagent_input = @import("../../core/subagent/input_action.zig");
 const command_specs = @import("../../core/slash_commands/command_specs.zig");
 const input_appearance = @import("../../core/config/input_appearance.zig");
 const settings_catalog = @import("../../core/config/settings_catalog.zig");
@@ -277,6 +278,179 @@ fn withQuestionInput(
         .paste_byte, .unrecognized_escape => event,
     };
     return typed;
+}
+
+fn subagentActionFromShortcut(
+    action: input_action.ShortcutAction,
+) ?subagent_input.Action {
+    return switch (action) {
+        .move => |intent| if (intent.extend_selection)
+            null
+        else switch (intent.kind) {
+            .character_left => .left,
+            .character_right => .right,
+            .word_left => .word_left,
+            .word_right => .word_right,
+            .line_start, .draft_start => .home,
+            .line_end, .draft_end => .end,
+            .visual_up => .up,
+            .visual_down => .down,
+            .page_up => .page_up,
+            .page_down => .page_down,
+            .paragraph_up, .paragraph_down => null,
+        },
+        .delete_backward => .delete_backward,
+        .delete_forward => .delete_next,
+        .delete_word_left => .delete_word_left,
+        .delete_word_right => .delete_word_right,
+        .delete_to_line_start => .delete_to_line_start,
+        .delete_to_line_end => .delete_to_line_end,
+        .insert_newline => .insert_newline,
+        .select_all,
+        .copy_selection,
+        .cut_selection,
+        .undo,
+        .redo,
+        .history_previous,
+        .history_next,
+        .delete_whitespace_word_left,
+        .yank,
+        .redraw,
+        => null,
+    };
+}
+
+fn subagentActionFromRawByte(byte: u8) ?subagent_input.Action {
+    return switch (byte) {
+        3 => .ctrl_c,
+        24 => .toggle,
+        '\r' => .enter,
+        '\t' => .focus_next,
+        1 => .home,
+        5 => .end,
+        0x7f, 8 => .delete_backward,
+        11 => .delete_to_line_end,
+        21 => .clear_line,
+        23 => .delete_word_left,
+        else => null,
+    };
+}
+
+fn subagentActionFromDecoded(action: input_action.Action) ?subagent_input.Action {
+    return switch (action) {
+        .escape => .escape,
+        .history_up, .cursor_up => .up,
+        .history_down, .cursor_down => .down,
+        .cursor_left => .left,
+        .cursor_right => .right,
+        .home => .home,
+        .end => .end,
+        .word_left => .word_left,
+        .word_right => .word_right,
+        .delete_next => .delete_next,
+        .delete_word_left => .delete_word_left,
+        .delete_word_right => .delete_word_right,
+        .delete_to_line_start => .delete_to_line_start,
+        .delete_to_line_end => .delete_to_line_end,
+        .clear_line => .clear_line,
+        .insert_newline => .insert_newline,
+        .page_up => .page_up,
+        .page_down => .page_down,
+        .composer_shortcut => |typed| subagentActionFromShortcut(typed),
+        .remapped_byte => |byte| subagentActionFromRawByte(byte),
+        .mouse_wheel,
+        .mouse_pointer,
+        .toggle_full_transcript,
+        .toggle_permission_mode,
+        .open_all_sessions,
+        .paste_start,
+        .paste_end,
+        .ignore,
+        => null,
+    };
+}
+
+fn withSubagentInput(
+    ingress: input_action.TerminalInputIngress,
+) input_action.TerminalInputIngress {
+    var typed = ingress;
+    const event = typed.event orelse return typed;
+    typed.event = switch (event) {
+        .raw => |raw| input_action.TerminalInputEvent{ .raw = .{
+            .byte = raw.byte,
+            .composer_shortcut = raw.composer_shortcut,
+            .approval_action = raw.approval_action,
+            .question_action = raw.question_action,
+            .subagent_action = subagentActionFromRawByte(raw.byte),
+        } },
+        .action => |decoded| input_action.TerminalInputEvent{ .action = .{
+            .action = decoded.action,
+            .composer_shortcut = decoded.composer_shortcut,
+            .approval_focused_edit = decoded.approval_focused_edit,
+            .question_action = decoded.question_action,
+            .subagent_action = subagentActionFromDecoded(decoded.action),
+            .cancel_pending = decoded.cancel_pending,
+        } },
+        .paste_byte, .unrecognized_escape => event,
+    };
+    return typed;
+}
+
+test "terminal input carries typed subagent controls and shortcuts" {
+    var runtime = InputRuntime{};
+    defer runtime.deinit(std.testing.allocator);
+    const context: input_action.TerminalDecodeContext = .{
+        .now_ms = 1,
+        .paste_active = false,
+        .cancel_pending = false,
+        .child_route_active = true,
+    };
+
+    const toggle = runtime.decodeTerminalByte(24, context);
+    try std.testing.expectEqual(
+        subagent_input.Action.toggle,
+        toggle.event.?.raw.subagent_action.?,
+    );
+
+    const line_start = runtime.decodeTerminalByte(1, context);
+    try std.testing.expectEqual(
+        subagent_input.Action.home,
+        line_start.event.?.raw.subagent_action.?,
+    );
+
+    const clear_line = runtime.decodeTerminalByte(21, context);
+    try std.testing.expectEqual(
+        subagent_input.Action.clear_line,
+        clear_line.event.?.raw.subagent_action.?,
+    );
+
+    const child_only_shortcut = runtime.decodeTerminalByte(2, context);
+    try std.testing.expect(child_only_shortcut.event.?.raw.subagent_action == null);
+    try std.testing.expectEqual(
+        input_action.ShortcutAction{ .move = .{ .kind = .character_left } },
+        child_only_shortcut.event.?.raw.composer_shortcut.?,
+    );
+
+    const text = runtime.decodeTerminalByte('j', context);
+    try std.testing.expect(text.event.?.raw.subagent_action == null);
+
+    var word_delete = input_action.TerminalInputIngress{};
+    for ("\x1bd") |byte| {
+        word_delete = runtime.decodeTerminalByte(byte, context);
+    }
+    try std.testing.expectEqual(
+        subagent_input.Action.delete_word_right,
+        word_delete.event.?.action.subagent_action.?,
+    );
+
+    var arrow = input_action.TerminalInputIngress{};
+    for ("\x1b[A") |byte| {
+        arrow = runtime.decodeTerminalByte(byte, context);
+    }
+    try std.testing.expectEqual(
+        subagent_input.Action.up,
+        arrow.event.?.action.subagent_action.?,
+    );
 }
 
 test "question bytes translate to typed prompt actions" {
@@ -747,10 +921,10 @@ pub const InputRuntime = struct {
         context: input_action.TerminalDecodeContext,
     ) input_action.TerminalInputIngress {
         if (context.paste_active) return terminal_action_decoder.pasteByteIngress(byte);
-        return withQuestionInput(
+        return withSubagentInput(withQuestionInput(
             withApprovalInput(self.terminal_action_decoder.feed(byte, context)),
             context.question_freeform_selected,
-        );
+        ));
     }
 
     pub fn flushTerminalAction(

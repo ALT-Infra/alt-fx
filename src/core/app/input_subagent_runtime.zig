@@ -1,5 +1,4 @@
 const std = @import("std");
-const ui_input = @import("../../ui/input/runtime.zig");
 const input_action = @import("../input/input_action.zig");
 const input_visual_layout = @import("../../ui/input/visual_layout.zig");
 const shell_runtime = @import("../../ui/shell_runtime.zig");
@@ -13,6 +12,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const types = @import("../shared/types.zig");
 const subagent_domain = @import("../subagent/domain.zig");
+const subagent_input = @import("../subagent/input_action.zig");
 const catalog_screen_layout = @import("../../ui/catalog_screen_layout.zig");
 const input_presentation = @import("../../ui/footer/input_presentation.zig");
 const model_menu_presentation = @import("../../ui/footer/model_menu_presentation.zig");
@@ -21,7 +21,12 @@ const render_input = @import("../../ui/footer/render_input.zig");
 
 pub fn SubagentRuntime(comptime App: type) type {
     return struct {
-        pub fn routeSubagentEscapeAction(app: *App, action: input_action.Action) !void {
+        pub fn routeSubagentEscapeAction(
+            app: *App,
+            action: input_action.Action,
+            shortcut: ?input_action.ShortcutAction,
+            typed_action: ?subagent_input.Action,
+        ) !void {
             if (comptime !@hasDecl(@TypeOf(app.subagents), "handleAction")) return;
             app.input_runtime.vertical_navigation.reset();
             if (comptime @hasField(App, "model_cache") and
@@ -79,33 +84,15 @@ pub fn SubagentRuntime(comptime App: type) type {
                     return;
                 }
             }
-            if (ui_input.shortcutFromEscapeAction(action)) |shortcut| {
-                if (try routeChildComposerShortcut(app, shortcut)) return;
+            if (shortcut) |composer_action| {
+                if (try routeChildComposerShortcut(app, composer_action)) return;
             }
-            switch (action) {
-                .escape => try handleSubagentAction(app, .escape),
-                .history_up, .cursor_up => try handleSubagentAction(app, .up),
-                .history_down, .cursor_down => try handleSubagentAction(app, .down),
-                .cursor_left => try handleSubagentAction(app, .left),
-                .cursor_right => try handleSubagentAction(app, .right),
-                .home => try handleSubagentAction(app, .home),
-                .end => try handleSubagentAction(app, .end),
-                .word_left => try handleSubagentAction(app, .word_left),
-                .word_right => try handleSubagentAction(app, .word_right),
-                .delete_next => try handleSubagentAction(app, .delete_next),
-                .delete_word_left => try handleSubagentAction(app, .delete_word_left),
-                .delete_word_right => try handleSubagentAction(app, .delete_word_right),
-                .delete_to_line_start => try handleSubagentAction(app, .delete_to_line_start),
-                .delete_to_line_end => try handleSubagentAction(app, .delete_to_line_end),
-                .clear_line => try handleSubagentAction(app, .clear_line),
-                .insert_newline => try handleSubagentAction(app, .insert_newline),
-                .page_up => try handleSubagentAction(app, .page_up),
-                .page_down => try handleSubagentAction(app, .page_down),
-                .mouse_pointer => |pointer| {
-                    _ = routeChildComposerPointerAction(app, pointer);
-                },
-                .remapped_byte => |b| try handleSubagentViewByte(app, b),
-                else => {},
+            if (typed_action) |resolved| {
+                try handleSubagentAction(app, resolved);
+                return;
+            }
+            if (action == .mouse_pointer) {
+                _ = routeChildComposerPointerAction(app, action.mouse_pointer);
             }
         }
 
@@ -282,7 +269,11 @@ pub fn SubagentRuntime(comptime App: type) type {
             );
         }
 
-        pub fn handleSubagentViewByte(app: *App, byte: u8) !void {
+        pub fn handleSubagentRawInput(
+            app: *App,
+            raw: input_action.RawTerminalInput,
+        ) !void {
+            const byte = raw.byte;
             if (comptime @hasField(App, "model_cache") and
                 @hasDecl(@TypeOf(app.subagents), "childRouteId") and
                 @hasDecl(@TypeOf(app.subagents), "childPresentationView"))
@@ -298,9 +289,14 @@ pub fn SubagentRuntime(comptime App: type) type {
                     return;
                 }
             }
-            if (ui_input.shortcutFromControlByte(byte)) |shortcut| {
+            if (raw.composer_shortcut) |shortcut| {
                 if (try routeChildComposerShortcut(app, shortcut)) return;
             }
+            if (raw.subagent_action) |action| {
+                try handleSubagentAction(app, action);
+                return;
+            }
+            if (raw.composer_shortcut != null) return;
             const failure_before = if (comptime @hasDecl(
                 @TypeOf(app.subagents),
                 "childPresentationView",
@@ -346,7 +342,7 @@ pub fn SubagentRuntime(comptime App: type) type {
             }
         }
 
-        fn handleSubagentAction(app: *App, action: @import("../../ui/subagent/controller.zig").InputAction) !void {
+        fn handleSubagentAction(app: *App, action: subagent_input.Action) !void {
             const result = if (comptime @hasDecl(@TypeOf(app.subagents), "handleActionWithMainApproval"))
                 try app.subagents.handleActionWithMainApproval(app.alloc, action, mainApprovalId(app))
             else
@@ -719,7 +715,7 @@ pub fn SubagentRuntime(comptime App: type) type {
             app: *App,
             action: input_action.Action,
         ) !void {
-            const mapped: @import("../../ui/subagent/controller.zig").InputAction =
+            const mapped: subagent_input.Action =
                 switch (action) {
                     .cursor_left => .left,
                     .cursor_right => .right,
@@ -747,7 +743,7 @@ pub fn SubagentRuntime(comptime App: type) type {
             app: *App,
             action: input_action.Action,
         ) !void {
-            const mapped: @import("../../ui/subagent/controller.zig").InputAction =
+            const mapped: subagent_input.Action =
                 switch (action) {
                     .cursor_left => .left,
                     .cursor_right => .right,
@@ -862,9 +858,17 @@ const TestSubagents = struct {
     pub fn handleKey(
         _: *TestSubagents,
         _: std.mem.Allocator,
-        byte: u8,
-    ) !@import("../../ui/subagent/controller.zig").KeyAction {
-        return if (byte == 3) .exit_app else .none;
+        _: u8,
+    ) !subagent_input.Command {
+        return .none;
+    }
+
+    pub fn handleAction(
+        _: *TestSubagents,
+        _: std.mem.Allocator,
+        action: subagent_input.Action,
+    ) !subagent_input.Command {
+        return if (action == .ctrl_c) .exit_app else .none;
     }
 
     pub fn isViewActive(_: *const TestSubagents) bool {
@@ -874,7 +878,7 @@ const TestSubagents = struct {
 
 const TestApp = struct {
     alloc: std.mem.Allocator = std.testing.allocator,
-    input_runtime: ui_input.InputRuntime = .{},
+    input_runtime: @import("../../ui/input/runtime.zig").InputRuntime = .{},
     subagents: TestSubagents = .{},
     session_persistence: app_session_runtime.Persistence = .{},
     shell: transcript_runtime.TranscriptRuntime = .{},
@@ -910,7 +914,7 @@ const CatalogTestState = struct {
 
 const CatalogTestApp = struct {
     alloc: std.mem.Allocator = std.testing.allocator,
-    input_runtime: ui_input.InputRuntime = .{},
+    input_runtime: @import("../../ui/input/runtime.zig").InputRuntime = .{},
     subagents: CatalogTestSubagents = .{},
     model_cache: CatalogTestState = .{},
     skills: CatalogTestState = .{},
@@ -931,7 +935,10 @@ test "subagent Ctrl-C requests resume handoff before exit" {
         app.shell.deinit(std.testing.allocator);
     }
 
-    try SubagentRuntime(TestApp).handleSubagentViewByte(&app, 3);
+    try SubagentRuntime(TestApp).handleSubagentRawInput(&app, .{
+        .byte = 3,
+        .subagent_action = .ctrl_c,
+    });
 
     try std.testing.expect(app.should_exit);
     try std.testing.expectEqual(
