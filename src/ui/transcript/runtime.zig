@@ -7208,8 +7208,12 @@ pub const TranscriptRuntime = struct {
         const semantic_rows: u32 = if (geometry_rebase)
             geometry_history_rows
         else if (!recovery_rebase)
-            if (anchor.normal_buffer_recovery_pending or
-                anchor.history_catchup_pending)
+            // Normal-buffer recovery restores rows the takeover already
+            // displaced into scrollback; that restore is display repair,
+            // not a content release, so the finality clamp does not apply.
+            if (anchor.normal_buffer_recovery_pending)
+                target_offset -| anchor.history_visual_offset
+            else if (anchor.history_catchup_pending)
                 releasable_advance
             else
                 // Rows leaving the screen top are [visual..visual+scroll);
@@ -7368,6 +7372,10 @@ pub const TranscriptRuntime = struct {
         history_catchup_pending: bool = false,
         staged_flow_end: ?usize = null,
         projection_staged: bool = false,
+        // The frame slides the viewport past withheld release with an
+        // in-place repaint; a document append would scroll the same rows
+        // physically without a matching plan.
+        hold_staged: bool = false,
 
         fn init(
             prepared: *const transcript_painter.PreparedTranscriptSurfacePaint,
@@ -7700,6 +7708,7 @@ pub const TranscriptRuntime = struct {
                         target_layout.transcript_area,
                         scroll_facts.target_visual_offset,
                     );
+                    target.hold_staged = true;
                     debug_trace.logf(
                         "scroll",
                         "transcript_transition_hold_release target_visual_offset={d} history_visual_offset={d} semantic_rows={d}",
@@ -8352,6 +8361,7 @@ pub const TranscriptRuntime = struct {
                 },
             );
         } else if (append_base != null and
+            !target.hold_staged and
             (!scroll_facts.recovery_rebase or append_is_history_replay) and
             !scroll_facts.recovery_projection_deferred and
             (if (append_is_history_replay)
@@ -8471,10 +8481,12 @@ pub const TranscriptRuntime = struct {
             .scroll_plan = scroll_plan,
             .document_append = document_append,
             .document_append_bytes = document_append_bytes,
-            .history_settle_pending = self.finalityReleasableOffset(
-                prepared,
-                scroll_facts.target_visual_offset,
-            ) > target.history_visual_offset,
+            .history_settle_pending = scroll_facts.recovery_rebase and
+                !self.fullTranscriptActive() and
+                self.finalityReleasableOffset(
+                    prepared,
+                    scroll_facts.target_visual_offset,
+                ) > target.history_visual_offset,
             .resize_reflow_rows = scroll_facts.resize_reflow_rows,
             .semantic_rows = scroll_facts.semantic_rows,
             .semantic_progress_rows = scroll_facts.semantic_progress_rows,
