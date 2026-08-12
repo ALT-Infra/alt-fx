@@ -11458,17 +11458,14 @@ test "app_input_runtime clears pending image placeholders after image command st
         try std.testing.expectEqual(@as(usize, 0), app.pending_images.items.len);
         try std.testing.expectEqual(@as(usize, 0), app.preflight_count);
         try std.testing.expectEqual(@as(usize, 0), app.queue_accept_count);
-        const expected_history_count: usize = if (fail_after_clear) 0 else 1;
         try std.testing.expectEqual(
-            expected_history_count,
+            @as(usize, 1),
             app.input_runtime.composer_history.count(),
         );
-        if (!fail_after_clear) {
-            try std.testing.expectEqualStrings(
-                "/images clear",
-                app.input_runtime.composer_history.entryText(0).?,
-            );
-        }
+        try std.testing.expectEqualStrings(
+            "/images clear",
+            app.input_runtime.composer_history.entryText(0).?,
+        );
         try std.testing.expect(app.last_prompt == null);
     }
 }

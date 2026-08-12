@@ -432,7 +432,7 @@ const specs = [_]Spec{
     .{ .id = .sound_level, .category = .notifications, .label = "Sound level", .description = "Choose off, on, or max interface sounds" },
     .{ .id = .sandbox, .category = .advanced, .label = "Command sandbox", .description = "Choose command process isolation for this workspace" },
     .{ .id = .startup_scrollback, .category = .advanced, .label = "Startup scrollback", .description = "Restore terminal output when Fx starts" },
-    .{ .id = .prompt_history, .category = .advanced, .label = "Prompt history", .description = "Save accepted prompts for composer history" },
+    .{ .id = .prompt_history, .category = .advanced, .label = "Prompt history", .description = "Save accepted prompts and slash commands for composer history" },
 };
 
 const on_off_options = [_][]const u8{ "off", "on" };

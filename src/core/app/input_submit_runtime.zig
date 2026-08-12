@@ -237,14 +237,14 @@ pub fn SubmitRuntime(comptime App: type) type {
             commitStableExtractedImageIds(app, extracted.images);
             commitRemappedImageIds(app, visual_text.next_image_id);
             if (visual_text.text.len > 0) {
-                recordAcceptedPromptHistory(
+                recordAcceptedPromptComposerHistory(
                     app,
                     max_prompt_history,
                     &accepted_draft,
                 );
             }
             if (!has_images_for_submit and visual_text.text.len > 0) {
-                recordAcceptedPrompt(app, visual_text.text);
+                recordAcceptedInput(app, visual_text.text);
             }
             discard_extracted = false;
             releasePendingImages(app);
@@ -396,12 +396,12 @@ pub fn SubmitRuntime(comptime App: type) type {
                 }
                 app.shell.render_requests.request(.footer);
             };
-            try App.handleCommand(app, command_copy);
             recordAcceptedSlashCommandHistory(
                 app,
                 max_prompt_history,
                 command_copy,
             );
+            try App.handleCommand(app, command_copy);
         }
 
         fn projectRetainedImageTokens(
@@ -691,7 +691,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             }
         }
 
-        fn recordAcceptedPrompt(app: *App, text: []const u8) void {
+        fn recordAcceptedInput(app: *App, text: []const u8) void {
             if (comptime !@hasField(App, "prompt_history")) return;
             const outcome = app.prompt_history.recordAccepted(
                 app.alloc,
@@ -704,7 +704,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                 error.PromptHistoryWriteFailed;
             const notice = std.fmt.allocPrint(
                 app.alloc,
-                "failed to save prompt history ({s}); prompt submission continued",
+                "failed to save input history ({s}); submission continued",
                 .{@errorName(err)},
             ) catch |notice_err| {
                 debug_trace.logf(
@@ -728,7 +728,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             };
         }
 
-        fn recordAcceptedPromptHistory(
+        fn recordAcceptedPromptComposerHistory(
             app: *App,
             max_prompt_history: usize,
             accepted: *const AcceptedDraftProjection,
@@ -758,7 +758,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                 &.{},
                 &.{},
             );
-            recordAcceptedPrompt(app, command);
+            recordAcceptedInput(app, command);
         }
 
         fn recordComposerHistory(
@@ -784,7 +784,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             ) catch |err| {
                 debug_trace.logf(
                     "input",
-                    "prompt history skipped after queue admission err={s}",
+                    "composer history record skipped err={s}",
                     .{@errorName(err)},
                 );
             };
