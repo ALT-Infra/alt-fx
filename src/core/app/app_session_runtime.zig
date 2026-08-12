@@ -13,6 +13,7 @@ const app_lifecycle = @import("app_lifecycle.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const input_queue_runtime = @import("input_queue_runtime.zig");
 const image_attachments = @import("../images/image_attachments.zig");
+const core_input_runtime = @import("../input/runtime.zig");
 const io_mod = @import("../shared/io.zig");
 const list_window = @import("../shared/list_window.zig");
 const session_runtime = @import("../session/session.zig");
@@ -1323,7 +1324,7 @@ pub fn Runtime(comptime App: type) type {
             app.shell.clearTranscript(app.alloc);
             app.session.reset(app.alloc);
             app.input_runtime.inputResetState().resetForSession(app.alloc);
-            app.input_runtime.resetEscapeDecoder();
+            app.terminal_input_runtime.resetEscapeDecoder();
             app.permission_engine.clear(app.alloc);
             app.clearPendingImages();
             app.change_tracker.clear(std.heap.c_allocator);
@@ -4659,7 +4660,8 @@ const TestApp = struct {
     session: session_runtime.SessionRuntime = .{ .max_history_turns = 8 },
     session_persistence: Persistence = .{},
     session_title: std.ArrayList(u8) = .empty,
-    input_runtime: ui_input.InputRuntime = .{},
+    input_runtime: core_input_runtime.Runtime = .{},
+    terminal_input_runtime: ui_input.Runtime = .{},
     shell: transcript_runtime.TranscriptRuntime = .{},
     metrics: types.Metrics = .{},
     pending_images: std.ArrayList(types.ImageAttachment) = .empty,
@@ -4745,6 +4747,7 @@ const TestApp = struct {
 
     fn deinit(self: *TestApp) void {
         self.input_runtime.deinit(self.alloc);
+        self.terminal_input_runtime.deinit(self.alloc);
         self.session_title.deinit(self.alloc);
         self.shell.deinit(self.alloc);
         self.pending_images.deinit(self.alloc);

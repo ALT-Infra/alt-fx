@@ -2,11 +2,8 @@ const std = @import("std");
 const question_prompt = @import("../../core/agent/question_prompt.zig");
 const approval_decision = @import("../../core/permissions/approval_decision.zig");
 const subagent_input = @import("../../core/subagent/input_action.zig");
-const command_specs = @import("../../core/slash_commands/command_specs.zig");
-const input_appearance = @import("../../core/config/input_appearance.zig");
-const settings_catalog = @import("../../core/config/settings_catalog.zig");
-const usage_menu = @import("../../core/session/usage_menu.zig");
 const paste_blocks = @import("../../core/input/pasted_blocks.zig");
+const core_input_runtime = @import("../../core/input/runtime.zig");
 const native_clear_probe_runtime = @import("native_clear_probe.zig");
 const image_attachments = @import("../../core/images/image_attachments.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
@@ -14,28 +11,12 @@ const io_mod = @import("../../core/shared/io.zig");
 const types = @import("../../core/shared/types.zig");
 const cursor_probe = @import("../terminal/cursor_probe.zig");
 const theme_monitor = @import("../terminal/theme_monitor.zig");
-const editor_state = @import("../../core/input/editor_state.zig");
-const edit_history = @import("../../core/input/edit_history.zig");
 const gesture_state = @import("../../core/input/gesture_state.zig");
 const horizontal_navigation = @import("../../core/input/horizontal_navigation.zig");
-const input_limit_rejection = @import("../../core/input/input_limit_rejection.zig");
-const input_reset = @import("../../core/input/input_reset.zig");
 const picker_state = @import("../../core/input/picker_state.zig");
-const paste_framing = @import("../../core/input/paste_framing.zig");
-const registered_entities = @import("../../core/input/registered_entities.zig");
-const text_scalar = @import("../../core/input/text_scalar.zig");
 const composer_history = @import("../../core/input/composer_history.zig");
-const composer_deletion = @import("../../core/input/composer_deletion.zig");
 const composer_insertion = @import("../../core/input/composer_insertion.zig");
-const composer_kill_ring = @import("../../core/input/composer_kill_ring.zig");
-const composer_line_continuation = @import("../../core/input/composer_line_continuation.zig");
-const composer_replacement = @import("../../core/input/composer_replacement.zig");
-const composer_selection = @import("../../core/input/composer_selection.zig");
-const composer_skill_binding = @import("../../core/input/composer_skill_binding.zig");
-const composer_text_replacement = @import("../../core/input/composer_text_replacement.zig");
-const composer_undo = @import("../../core/input/composer_undo.zig");
 const kill_ring = @import("../../core/input/kill_ring.zig");
-const workspace_menu = @import("../../core/workspace/workspace_menu.zig");
 const entity_spans = @import("../../core/shared/entity_spans.zig");
 const input_action = @import("../../core/input/input_action.zig");
 const vertical_navigation = @import("../../core/input/vertical_navigation.zig");
@@ -44,7 +25,9 @@ const escape_parser = @import("escape_parser.zig");
 const shortcuts = @import("shortcuts.zig");
 const terminal_action_decoder = @import("terminal_action_decoder.zig");
 
-pub const ImageBlocks = kill_ring.ImageBlocks;
+const ImageBlocks = kill_ring.ImageBlocks;
+const InputRuntime = core_input_runtime.Runtime;
+const InputAppearance = core_input_runtime.InputAppearance;
 
 const Allocator = std.mem.Allocator;
 const InsertResult = composer_insertion.InsertResult;
@@ -397,7 +380,7 @@ fn withSubagentInput(
 }
 
 test "terminal input carries typed subagent controls and shortcuts" {
-    var runtime = InputRuntime{};
+    var runtime = Runtime{};
     defer runtime.deinit(std.testing.allocator);
     const context: input_action.TerminalDecodeContext = .{
         .now_ms = 1,
@@ -484,7 +467,7 @@ test "question bytes translate to typed prompt actions" {
 }
 
 test "terminal input carries typed question decisions and focused edits" {
-    var runtime = InputRuntime{};
+    var runtime = Runtime{};
     defer runtime.deinit(std.testing.allocator);
 
     const choice_context: input_action.TerminalDecodeContext = .{
@@ -674,7 +657,7 @@ test "approval bytes translate to typed decision actions" {
 }
 
 test "terminal input carries typed approval decisions and focused edits" {
-    var runtime = InputRuntime{};
+    var runtime = Runtime{};
     defer runtime.deinit(std.testing.allocator);
     const context: input_action.TerminalDecodeContext = .{
         .now_ms = 1,
@@ -702,8 +685,6 @@ test "terminal input carries typed approval decisions and focused edits" {
         focused_escape.event.?.action.approval_focused_edit.?,
     );
 }
-
-pub const InputAppearance = input_appearance.InputAppearance;
 
 test "backspace and forward delete remove input selection first" {
     const alloc = std.testing.allocator;
@@ -861,62 +842,33 @@ test "text edits undo and redo without snapshotting structured state" {
     try std.testing.expectEqualStrings("ab", runtime.edit_state.input.items);
 }
 
-pub const InputRuntime = struct {
-    edit_state: editor_state.State = .{},
-    input_appearance: InputAppearance = .default,
-    slash_menu_categories: bool = true,
-    picker: picker_state.State = .{},
-    help_menu: command_specs.HelpMenu = .{},
-    settings_menu: settings_catalog.Menu = .{},
-    appearance_menu: settings_catalog.AppearanceMenu = .{},
-    statusline_menu: settings_catalog.StatuslineMenu = .{},
-    sandbox_menu: settings_catalog.SandboxMenu = .{},
-    usage_menu: usage_menu.State = .{},
-    workspace_menu: workspace_menu.State = .{},
-    composer_history: composer_history.State = .{},
-    paste: paste_framing.State = .{},
-    entities: registered_entities.State = .{},
-    text_scalar: text_scalar.State = .{},
-    gestures: gesture_state.State = .{},
-    input_limit_rejection: input_limit_rejection.State = .{},
-    kill_ring: kill_ring.State = .{},
-    edit_history: edit_history.State = .{},
-    vertical_navigation: vertical_navigation.State = .{},
+pub const Runtime = struct {
     terminal_cursor_probe: cursor_probe.Parser = .{},
     terminal_theme_monitor: theme_monitor.Monitor = .{},
     deferred_terminal_input_source: ?DeferredTerminalInputSource = null,
     native_clear_probe: native_clear_probe_runtime.Runtime = .{},
     terminal_action_decoder: terminal_action_decoder.Decoder = .{},
 
-    pub fn deinit(self: *InputRuntime, alloc: Allocator) void {
-        input_reset.resetPendingTextScalarWithTrace(&self.text_scalar, "shutdown");
-        self.paste.deinit(alloc);
-        self.usage_menu.close(alloc);
-        self.edit_state.deinit(alloc);
-        self.picker.deinit(alloc);
-        self.composer_history.deinit(alloc);
-        self.entities.deinit(alloc);
-        self.kill_ring.deinit(alloc);
-        self.edit_history.deinit(alloc);
+    pub fn deinit(self: *Runtime, alloc: Allocator) void {
         self.native_clear_probe.deinit(alloc);
     }
 
-    pub fn resetEscapeDecoder(self: *InputRuntime) void {
+    pub fn resetEscapeDecoder(self: *Runtime) void {
         self.terminal_action_decoder.reset();
     }
 
-    pub fn hasPendingTerminalAction(self: *const InputRuntime) bool {
+    pub fn hasPendingTerminalAction(self: *const Runtime) bool {
         return self.terminal_action_decoder.hasPending();
     }
 
-    pub fn hasPendingTerminalInput(self: *const InputRuntime) bool {
+    pub fn hasPendingTerminalInput(self: *const Runtime) bool {
         return self.hasPendingTerminalAction() or
             self.terminal_theme_monitor.hasPendingInput() or
             self.terminal_cursor_probe.hasPendingInput();
     }
 
     pub fn decodeTerminalByte(
-        self: *InputRuntime,
+        self: *Runtime,
         byte: u8,
         context: input_action.TerminalDecodeContext,
     ) input_action.TerminalInputIngress {
@@ -928,7 +880,7 @@ pub const InputRuntime = struct {
     }
 
     pub fn flushTerminalAction(
-        self: *InputRuntime,
+        self: *Runtime,
         now_ms: i64,
         timeout_ms: i64,
         paste_active: bool,
@@ -936,7 +888,7 @@ pub const InputRuntime = struct {
         return self.terminal_action_decoder.flush(now_ms, timeout_ms, paste_active);
     }
 
-    pub fn takeDeferredTerminalInputByte(self: *InputRuntime) ?u8 {
+    pub fn takeDeferredTerminalInputByte(self: *Runtime) ?u8 {
         if (self.takeDeferredThemeMonitorByte()) |byte| return byte;
         if (self.terminal_cursor_probe.takeDeferredByte()) |byte| {
             self.deferred_terminal_input_source = .cursor_probe;
@@ -945,7 +897,7 @@ pub const InputRuntime = struct {
         return null;
     }
 
-    pub fn takeDeferredThemeMonitorByte(self: *InputRuntime) ?u8 {
+    pub fn takeDeferredThemeMonitorByte(self: *Runtime) ?u8 {
         std.debug.assert(self.deferred_terminal_input_source == null);
         if (self.terminal_theme_monitor.takeDeferredByte()) |byte| {
             self.deferred_terminal_input_source = .theme_monitor;
@@ -954,7 +906,7 @@ pub const InputRuntime = struct {
         return null;
     }
 
-    pub fn consumeDeferredTerminalInputDispatch(self: *InputRuntime) ?DeferredTerminalInputSource {
+    pub fn consumeDeferredTerminalInputDispatch(self: *Runtime) ?DeferredTerminalInputSource {
         const source = self.deferred_terminal_input_source;
         self.deferred_terminal_input_source = null;
         return switch (source orelse return null) {
@@ -968,157 +920,42 @@ pub const InputRuntime = struct {
             },
         };
     }
-
-    pub fn inputResetState(self: *InputRuntime) input_reset.State {
-        return .{
-            .edit = &self.edit_state,
-            .picker = &self.picker,
-            .composer_history = &self.composer_history,
-            .paste = &self.paste,
-            .entities = &self.entities,
-            .text_scalar = &self.text_scalar,
-            .gestures = &self.gestures,
-            .input_limit_rejection = &self.input_limit_rejection,
-            .kill_ring = &self.kill_ring,
-            .edit_history = &self.edit_history,
-            .vertical_navigation = &self.vertical_navigation,
-        };
-    }
-
-    pub fn insertionState(self: *InputRuntime) composer_insertion.State {
-        return .{
-            .edit = &self.edit_state,
-            .history = &self.edit_history,
-            .picker = &self.picker,
-            .entities = &self.entities,
-            .vertical_navigation = &self.vertical_navigation,
-            .input_limit_rejection = &self.input_limit_rejection,
-        };
-    }
-
-    pub fn selectionState(self: *InputRuntime) composer_selection.State {
-        return .{ .insertion = self.insertionState() };
-    }
-
-    pub fn replacementState(
-        self: *InputRuntime,
-        images: ?*ImageBlocks,
-    ) composer_replacement.State {
-        return .{
-            .insertion = self.insertionState(),
-            .images = images,
-        };
-    }
-
-    pub fn deletionState(
-        self: *InputRuntime,
-        images: ?*ImageBlocks,
-    ) composer_deletion.State {
-        return .{ .replacement = self.replacementState(images) };
-    }
-
-    pub fn undoState(self: *InputRuntime) composer_undo.State {
-        return .{
-            .edit = &self.edit_state,
-            .history = &self.edit_history,
-            .picker = &self.picker,
-            .entities = &self.entities,
-            .vertical_navigation = &self.vertical_navigation,
-            .input_limit_rejection = &self.input_limit_rejection,
-        };
-    }
-
-    pub fn killRingState(
-        self: *InputRuntime,
-        images: ?*ImageBlocks,
-    ) composer_kill_ring.State {
-        return .{
-            .ring = &self.kill_ring,
-            .history = &self.edit_history,
-            .active = .{
-                .edit = &self.edit_state,
-                .entities = &self.entities,
-                .picker = &self.picker,
-                .vertical_navigation = &self.vertical_navigation,
-                .input_limit_rejection = &self.input_limit_rejection,
-                .images = images,
-            },
-        };
-    }
-
-    pub fn textReplacementState(self: *InputRuntime) composer_text_replacement.State {
-        return .{
-            .edit = &self.edit_state,
-            .history = &self.edit_history,
-            .picker = &self.picker,
-            .entities = &self.entities,
-            .vertical_navigation = &self.vertical_navigation,
-            .input_limit_rejection = &self.input_limit_rejection,
-        };
-    }
-
-    pub fn moveInputCursor(self: *InputRuntime, intent: input_action.MoveIntent) bool {
-        return horizontal_navigation.moveIntent(
-            intent,
-            &self.edit_state,
-            &self.entities,
-            &self.vertical_navigation,
-        );
-    }
-
-    pub fn historyBoundary(self: *InputRuntime, alloc: Allocator) void {
-        self.edit_history.reset(alloc);
-    }
-
-    pub fn lineContinuationState(self: *InputRuntime) composer_line_continuation.State {
-        return .{
-            .edit = &self.edit_state,
-            .history = &self.edit_history,
-            .picker = &self.picker,
-            .entities = &self.entities,
-            .vertical_navigation = &self.vertical_navigation,
-        };
-    }
-
-    pub fn skillBindingState(self: *InputRuntime) composer_skill_binding.State {
-        return .{ .insertion = self.insertionState() };
-    }
-
-    pub fn scanInputCursorVertical(
-        self: *const InputRuntime,
-        direction: visual_layout.Direction,
-        terminal_cols: u16,
-        pending_images: []const types.ImageAttachment,
-    ) visual_layout.VerticalScan {
-        return visual_layout.scanAdjacentRow(.{
-            .input = self.edit_state.input.items,
-            .cursor = self.edit_state.cursor,
-            .terminal_cols = terminal_cols,
-            .images = pending_images,
-            .pasted_blocks = self.entities.pasted_blocks.items,
-            .image_tokens = self.entities.image_tokens.items,
-            .skill_tokens = self.entities.skill_tokens.items,
-        }, direction, self.vertical_navigation.preferredColumn());
-    }
-
-    pub fn scanInputCursorRows(
-        self: *const InputRuntime,
-        direction: visual_layout.Direction,
-        row_count: usize,
-        terminal_cols: u16,
-        pending_images: []const types.ImageAttachment,
-    ) visual_layout.VerticalScan {
-        return visual_layout.scanRowDelta(.{
-            .input = self.edit_state.input.items,
-            .cursor = self.edit_state.cursor,
-            .terminal_cols = terminal_cols,
-            .images = pending_images,
-            .pasted_blocks = self.entities.pasted_blocks.items,
-            .image_tokens = self.entities.image_tokens.items,
-            .skill_tokens = self.entities.skill_tokens.items,
-        }, direction, row_count, self.vertical_navigation.preferredColumn());
-    }
 };
+
+pub fn scanInputCursorVertical(
+    input: *const InputRuntime,
+    direction: visual_layout.Direction,
+    terminal_cols: u16,
+    pending_images: []const types.ImageAttachment,
+) visual_layout.VerticalScan {
+    return visual_layout.scanAdjacentRow(.{
+        .input = input.edit_state.input.items,
+        .cursor = input.edit_state.cursor,
+        .terminal_cols = terminal_cols,
+        .images = pending_images,
+        .pasted_blocks = input.entities.pasted_blocks.items,
+        .image_tokens = input.entities.image_tokens.items,
+        .skill_tokens = input.entities.skill_tokens.items,
+    }, direction, input.vertical_navigation.preferredColumn());
+}
+
+pub fn scanInputCursorRows(
+    input: *const InputRuntime,
+    direction: visual_layout.Direction,
+    row_count: usize,
+    terminal_cols: u16,
+    pending_images: []const types.ImageAttachment,
+) visual_layout.VerticalScan {
+    return visual_layout.scanRowDelta(.{
+        .input = input.edit_state.input.items,
+        .cursor = input.edit_state.cursor,
+        .terminal_cols = terminal_cols,
+        .images = pending_images,
+        .pasted_blocks = input.entities.pasted_blocks.items,
+        .image_tokens = input.entities.image_tokens.items,
+        .skill_tokens = input.entities.skill_tokens.items,
+    }, direction, row_count, input.vertical_navigation.preferredColumn());
+}
 
 fn applyVerticalTargetForTest(
     runtime: *InputRuntime,
@@ -1140,7 +977,12 @@ fn moveVerticalForTest(
 ) bool {
     return applyVerticalTargetForTest(
         runtime,
-        runtime.scanInputCursorVertical(direction, terminal_cols, pending_images),
+        scanInputCursorVertical(
+            runtime,
+            direction,
+            terminal_cols,
+            pending_images,
+        ),
     );
 }
 
@@ -2561,7 +2403,7 @@ test "vertical movement scans soft wraps and boundary-owned rows" {
     try runtime.edit_state.input.appendSlice(alloc, "abcdefgh");
     runtime.edit_state.cursor = 4;
 
-    const scan = runtime.scanInputCursorVertical(.up, 6, &.{});
+    const scan = scanInputCursorVertical(&runtime, .up, 6, &.{});
     try std.testing.expect(scan.target != null);
     try std.testing.expectEqual(@as(usize, 2), scan.total_rows);
     try std.testing.expectEqual(@as(usize, 1), scan.cursor_row);
@@ -2620,7 +2462,7 @@ test "vertical movement never targets inside a registered paste" {
     try std.testing.expect(moveVerticalForTest(&runtime, .up, 80, &.{}));
     _ = moveHorizontalForTest(&runtime, .character_left);
     _ = moveHorizontalForTest(&runtime, .character_right);
-    const down = runtime.scanInputCursorVertical(.down, 80, &.{});
+    const down = scanInputCursorVertical(&runtime, .down, 80, &.{});
     try std.testing.expect(down.target != null);
     try std.testing.expectEqual(@as(usize, "x\n".len), down.target.?.raw_offset);
     try std.testing.expect(!runtime.entities.pasted_blocks.items[0].span.contains(
@@ -2651,7 +2493,7 @@ test "vertical scan reports null target facts at visual edges" {
     try runtime.edit_state.input.appendSlice(alloc, "abc");
     runtime.edit_state.cursor = 0;
 
-    const scan = runtime.scanInputCursorVertical(.up, 80, &.{});
+    const scan = scanInputCursorVertical(&runtime, .up, 80, &.{});
     try std.testing.expect(scan.target == null);
     try std.testing.expectEqual(@as(usize, 1), scan.total_rows);
     try std.testing.expectEqual(@as(usize, 0), scan.cursor_row);
@@ -2672,7 +2514,7 @@ test "vertical intent resets before nonvertical no-op cursor movement" {
     try std.testing.expect(top.vertical_navigation.preferredColumn() == null);
     _ = moveHorizontalForTest(&top, .draft_start);
     try std.testing.expect(top.vertical_navigation.preferredColumn() == null);
-    const down = top.scanInputCursorVertical(.down, 80, &.{});
+    const down = scanInputCursorVertical(&top, .down, 80, &.{});
     try std.testing.expectEqual(@as(usize, 0), down.preferred_column);
 
     var end = InputRuntime{};
@@ -2686,7 +2528,7 @@ test "vertical intent resets before nonvertical no-op cursor movement" {
     try std.testing.expect(end.vertical_navigation.preferredColumn() == null);
     _ = moveHorizontalForTest(&end, .draft_end);
     try std.testing.expect(end.vertical_navigation.preferredColumn() == null);
-    const up = end.scanInputCursorVertical(.up, 80, &.{});
+    const up = scanInputCursorVertical(&end, .up, 80, &.{});
     try std.testing.expectEqual(@as(usize, 0), up.preferred_column);
 }
 
@@ -2733,7 +2575,7 @@ fn moveEscape(kind: input_action.MoveKind, extend_selection: bool) InputEscapeAc
 }
 
 fn expectScanMatchesLayout(runtime: InputRuntime, direction: visual_layout.Direction, cols: u16, images: []const types.ImageAttachment) !void {
-    const actual = runtime.scanInputCursorVertical(direction, cols, images);
+    const actual = scanInputCursorVertical(&runtime, direction, cols, images);
     const expected = visual_layout.scanAdjacentRow(.{
         .input = runtime.edit_state.input.items,
         .cursor = runtime.edit_state.cursor,
@@ -5116,23 +4958,24 @@ test "input escape parser handles ctrl+arrow as word jump" {
 }
 
 test "resetEscapeDecoder zeroes only terminal decoder state" {
-    var runtime: InputRuntime = .{};
-    runtime.gestures = gesture_state.pressCtrlCExit(runtime.gestures, 123).next;
-    runtime.gestures = gesture_state.pressEscapeClear(runtime.gestures, 456).next;
+    var input: InputRuntime = .{};
+    input.gestures = gesture_state.pressCtrlCExit(input.gestures, 123).next;
+    input.gestures = gesture_state.pressEscapeClear(input.gestures, 456).next;
 
-    runtime.terminal_action_decoder.stage = 2;
-    runtime.terminal_action_decoder.param = 200;
-    runtime.terminal_action_decoder.param2 = 1;
-    runtime.terminal_action_decoder.started_ms = 99;
-    runtime.terminal_action_decoder.cancel_pending = true;
-    try std.testing.expect(runtime.hasPendingTerminalInput());
-    runtime.resetEscapeDecoder();
-    try std.testing.expectEqual(@as(u8, 0), runtime.terminal_action_decoder.stage);
-    try std.testing.expectEqual(@as(u16, 0), runtime.terminal_action_decoder.param);
-    try std.testing.expectEqual(@as(u16, 0), runtime.terminal_action_decoder.param2);
-    try std.testing.expectEqual(@as(i64, 0), runtime.terminal_action_decoder.started_ms);
-    try std.testing.expect(!runtime.terminal_action_decoder.cancel_pending);
-    try std.testing.expect(!runtime.hasPendingTerminalInput());
-    try std.testing.expect(runtime.gestures.ctrlCExitArmed());
-    try std.testing.expect(runtime.gestures.escapeClearArmed());
+    var terminal: Runtime = .{};
+    terminal.terminal_action_decoder.stage = 2;
+    terminal.terminal_action_decoder.param = 200;
+    terminal.terminal_action_decoder.param2 = 1;
+    terminal.terminal_action_decoder.started_ms = 99;
+    terminal.terminal_action_decoder.cancel_pending = true;
+    try std.testing.expect(terminal.hasPendingTerminalInput());
+    terminal.resetEscapeDecoder();
+    try std.testing.expectEqual(@as(u8, 0), terminal.terminal_action_decoder.stage);
+    try std.testing.expectEqual(@as(u16, 0), terminal.terminal_action_decoder.param);
+    try std.testing.expectEqual(@as(u16, 0), terminal.terminal_action_decoder.param2);
+    try std.testing.expectEqual(@as(i64, 0), terminal.terminal_action_decoder.started_ms);
+    try std.testing.expect(!terminal.terminal_action_decoder.cancel_pending);
+    try std.testing.expect(!terminal.hasPendingTerminalInput());
+    try std.testing.expect(input.gestures.ctrlCExitArmed());
+    try std.testing.expect(input.gestures.escapeClearArmed());
 }
