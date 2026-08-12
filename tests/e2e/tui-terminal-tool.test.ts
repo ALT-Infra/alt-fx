@@ -1082,6 +1082,141 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
+  "terminal action-specific schema rejects mixed input before starting a session",
+  async () => {
+    const fixture = createFixture("fx-tui-terminal-action-schema-");
+    const mixedMarker = join(fixture.workspace, "mixed-start-ran");
+    let terminalSessionId = "";
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("terminal_mixed_start", "terminal", {
+        action: "start",
+        cwd: fixture.workspace,
+        command: `printf SHOULD_NOT_RUN > ${JSON.stringify(mixedMarker)}`,
+        backend: "native",
+        session_id: "terminal-foreign",
+        cursor_segment: 1,
+        cursor_offset: 0,
+        after_event_id: 0,
+        acknowledge_event_id: 1,
+        max_events: 1,
+        write: { kind: "text", text: "wrong action" },
+        lease: "use",
+        monitor: { kind: "remove", monitor_id: "monitor-foreign" },
+        task_id: "task-foreign",
+        workspace_root: fixture.workspace,
+        rows: 24,
+        columns: 80,
+        signal: "terminate",
+        close_policy: "force",
+      }),
+      (body) => {
+        expect(toolResultText(body, "terminal_mixed_start")).toContain(
+          'terminal start field "session_id" is not allowed',
+        );
+        expect(terminalRecords(fixture.home)).toEqual([]);
+        expect(existsSync(mixedMarker)).toBe(false);
+        return fakeGatewayToolCall("terminal_valid_start", "terminal", {
+          action: "start",
+          cwd: fixture.workspace,
+          command: "printf ACTION_SCHEMA_OK",
+          shell: {
+            kind: "executable",
+            path: TERMINAL_FIXTURE_SHELL,
+            clean_start: true,
+          },
+          backend: "native",
+          return_when: { kind: "exit" },
+          wait_ceiling_ms: 20_000,
+        });
+      },
+      (body) => {
+        const resultText = toolResultText(body, "terminal_valid_start");
+        const result = JSON.parse(resultText) as {
+          success: { start: { session: { session_id: string } } };
+        };
+        terminalSessionId = result.success.start.session.session_id;
+        expect(terminalSessionId.length).toBeGreaterThan(0);
+        return fakeGatewayToolCall("terminal_valid_close", "terminal", {
+          action: "close",
+          session_id: terminalSessionId,
+          close_policy: "force",
+        });
+      },
+      (body) => {
+        const result = toolResultText(body, "terminal_valid_close");
+        expect(result).toContain(`"session_id":"${terminalSessionId}"`);
+        expect(result).toContain('"lifecycle":"closed"');
+        return fakeGatewayFinalText("Terminal action schema verified");
+      },
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway);
+
+    await active.sendText("Verify the terminal action schema.");
+    await active.waitForText("Terminal action schema verified", TIMEOUT);
+    expect(gateway.requests).toHaveLength(4);
+
+    const firstRequest = JSON.parse(gateway.requests[0]!.body) as {
+      tools: Array<{
+        name?: string;
+        inputSchema?: {
+          properties?: Record<string, unknown>;
+          oneOf?: Array<{
+            properties?: Record<string, { enum?: string[] }>;
+            required?: string[];
+            additionalProperties?: boolean;
+          }>;
+        };
+      }>;
+    };
+    const terminalSchema = firstRequest.tools.find(
+      (tool) => tool.name === "terminal",
+    )?.inputSchema;
+    expect(terminalSchema).toBeDefined();
+    expect(terminalSchema!.properties).toBeUndefined();
+    const branches = terminalSchema!.oneOf ?? [];
+    const expectedBranches = [
+      { action: "start", properties: ["action", "cwd", "command", "shell", "backend", "return_when", "wait_ceiling_ms", "dimensions", "initial_monitors"], required: ["action"] },
+      { action: "read", properties: ["action", "session_id", "cursor_segment", "cursor_offset"], required: ["action", "session_id", "cursor_segment"] },
+      { action: "screen", properties: ["action", "session_id"], required: ["action", "session_id"] },
+      { action: "write", properties: ["action", "session_id", "write", "lease"], required: ["action", "session_id"] },
+      { action: "wait", properties: ["action", "session_id", "return_when", "wait_ceiling_ms"], required: ["action", "session_id", "return_when", "wait_ceiling_ms"] },
+      { action: "monitor", properties: ["action", "session_id", "monitor"], required: ["action", "session_id", "monitor"] },
+      { action: "inspect", properties: ["action", "session_id", "after_event_id", "acknowledge_event_id", "max_events"], required: ["action", "session_id"] },
+      { action: "list", properties: ["action", "task_id", "workspace_root", "backend"], required: ["action"] },
+      { action: "resize", properties: ["action", "session_id", "rows", "columns"], required: ["action", "session_id", "rows", "columns"] },
+      { action: "signal", properties: ["action", "session_id", "signal"], required: ["action", "session_id", "signal"] },
+      { action: "close", properties: ["action", "session_id", "close_policy"], required: ["action", "session_id", "close_policy"] },
+    ];
+    expect(branches).toHaveLength(expectedBranches.length);
+    for (const expected of expectedBranches) {
+      const branch = branches.find((candidate) =>
+        candidate.properties?.action?.enum?.[0] === expected.action
+      );
+      expect(branch).toBeDefined();
+      expect(branch!.properties!.action!.enum).toEqual([expected.action]);
+      expect(Object.keys(branch!.properties!)).toEqual(expected.properties);
+      expect(branch!.required).toEqual(expected.required);
+      expect(branch!.additionalProperties).toBe(false);
+    }
+
+    const scrollback = await active.captureFullScrollback();
+    expect(countOccurrences(scrollback, "Used terminal start")).toBe(1);
+    expect(scrollback).toContain("Used terminal close");
+    expect(existsSync(mixedMarker)).toBe(false);
+    const records = terminalRecords(fixture.home);
+    expect(records).toHaveLength(1);
+    expect(records[0]!.session_id).toBe(terminalSessionId);
+    expect(records[0]!.lifecycle).toBe("closed");
+    const terminalPid = Number(records[0]!.pid);
+    expect(Number.isSafeInteger(terminalPid) && terminalPid > 0).toBe(true);
+    await waitForOwnedProcessExit([terminalPid]);
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
   "TUI starts an interactive terminal when the command is exact empty",
   async () => {
     const fixture = createFixture("fx-tui-terminal-empty-command-");
@@ -1300,14 +1435,27 @@ test.skipIf(!tmuxAvailable())(
     const request = JSON.parse(gateway.requests[0]!.body) as {
       tools: Array<{
         name?: string;
-        inputSchema?: { properties?: Record<string, unknown> };
+        inputSchema?: {
+          properties?: Record<string, unknown>;
+          oneOf?: Array<{
+            properties?: Record<string, {
+              enum?: string[];
+            }>;
+          }>;
+        };
       }>;
     };
     const terminalSchema = request.tools.find(
       (tool) => tool.name === "terminal",
     )?.inputSchema;
     expect(terminalSchema).toBeDefined();
-    const terminalProperties = Object.keys(terminalSchema!.properties ?? {});
+    expect(terminalSchema!.properties).toBeUndefined();
+    expect(terminalSchema!.oneOf).toHaveLength(11);
+    const waitBranch = terminalSchema!.oneOf!.find((branch) =>
+      branch.properties?.action?.enum?.[0] === "wait"
+    );
+    expect(waitBranch).toBeDefined();
+    const terminalProperties = Object.keys(waitBranch!.properties ?? {});
     expect(
       terminalProperties.filter((name) => name === "wait_ceiling_ms"),
     ).toHaveLength(1);
