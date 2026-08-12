@@ -1705,7 +1705,12 @@ test.skipIf(!tmuxAvailable())(
     for (const record of sessionRecords(fixture.home)) {
       expect(record.history_len).toBe(0);
     }
-    expect(existsSync(join(fixture.home, ".fx", "history.jsonl"))).toBe(false);
+    const promptHistory = readFileSync(
+      join(fixture.home, ".fx", "history.jsonl"),
+      "utf8",
+    );
+    expect(promptHistory).toContain("/image ");
+    expect(promptHistory).toContain("/images");
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
   45_000,
@@ -1762,7 +1767,9 @@ test.skipIf(!tmuxAvailable())(
     for (const record of sessionRecords(fixture.home)) {
       expect(record.history_len).toBe(0);
     }
-    expect(existsSync(join(fixture.home, ".fx", "history.jsonl"))).toBe(false);
+    expect(
+      readFileSync(join(fixture.home, ".fx", "history.jsonl"), "utf8"),
+    ).toContain("/quit");
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
 
     await waitForTerminalHostExit(fixture.home);
