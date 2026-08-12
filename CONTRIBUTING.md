@@ -47,19 +47,19 @@ Standard PR CI labels Debug and ReleaseSafe Build & Test and deterministic E2E r
 
 Assign exactly one label that describes the PR's primary intent:
 
-* `type: bug` — fixes incorrect behavior
+* `type: bug`: fixes incorrect behavior
 
-* `type: feature` — adds a new user-facing capability
+* `type: feature`: adds a new user-facing capability
 
-* `type: improvement` — improves existing user-facing behavior
+* `type: improvement`: improves existing user-facing behavior
 
-* `type: docs` — changes documentation only
+* `type: docs`: changes documentation only
 
-* `type: maintenance` — changes internal tooling, dependencies, CI, or implementation structure without a user-facing behavior change
+* `type: maintenance`: changes internal tooling, dependencies, CI, or implementation structure without a user-facing behavior change
 
-* `type: release` — prepares or repairs a release
+* `type: release`: prepares or repairs a release
 
-* `type: security` — fixes or hardens a security boundary
+* `type: security`: fixes or hardens a security boundary
 
 For a mixed PR, choose the label that best describes why the PR exists. Keep the title as a clean imperative sentence and do not add bracketed type prefixes such as `[bug]` or `[improvement]`.
 

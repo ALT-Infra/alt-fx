@@ -220,19 +220,19 @@ TUI tests use tmux to drive the interactive terminal. They require `tmux` to be 
 
 Every pull request must have exactly one `type:` label, chosen by its primary intent:
 
-* `type: bug` — fixes incorrect behavior
+* `type: bug`: fixes incorrect behavior
 
-* `type: feature` — adds a new user-facing capability
+* `type: feature`: adds a new user-facing capability
 
-* `type: improvement` — improves existing user-facing behavior
+* `type: improvement`: improves existing user-facing behavior
 
-* `type: docs` — changes documentation only
+* `type: docs`: changes documentation only
 
-* `type: maintenance` — changes internal tooling, dependencies, CI, or implementation structure without a user-facing behavior change
+* `type: maintenance`: changes internal tooling, dependencies, CI, or implementation structure without a user-facing behavior change
 
-* `type: release` — prepares or repairs a release
+* `type: release`: prepares or repairs a release
 
-* `type: security` — fixes or hardens a security boundary
+* `type: security`: fixes or hardens a security boundary
 
 Assign the label when the PR is opened and keep it accurate when the PR changes. For a mixed PR, choose the label that describes the primary reason the PR exists. If that is ambiguous, ask before applying or changing the label.
 
