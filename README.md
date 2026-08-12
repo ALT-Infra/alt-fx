@@ -48,7 +48,7 @@ fx
 
 The current directory becomes the primary workspace. Enter a prompt, or run `/help` to browse interactive commands.
 
-Run `/feedback` to copy a Markdown diagnostic and show a terminal link to a prefilled GitHub Issue Form. Paste the report into the form, then review and redact any sensitive data before submitting.
+Run `/feedback` to create a private Markdown diagnostic and show a terminal link to a prefilled GitHub Issue Form. On macOS, fx copies the `.md` file to the clipboard; on other platforms, it saves the file and prints its path. Review and redact the local file before attaching it to the form.
 
 Use `fx ask` for a single request:
 

@@ -871,7 +871,7 @@ function hostilePath(root: IsolatedRoot) {
 }
 
 function installClipboardFixture(root: IsolatedRoot, script: string) {
-  for (const command of ["pbcopy", "xclip"]) {
+  for (const command of ["pbcopy", "xclip", "osascript"]) {
     const path = join(root.hostileBin, command);
     writeFileSync(path, script);
     chmodSync(path, 0o755);
@@ -1888,7 +1888,9 @@ describe("effect-aware command permissions", () => {
 
       await activeSession.sendText("/feedback");
       await activeSession.waitForText(
-        "Clipboard copy failed. Feedback report saved at",
+        process.platform === "darwin"
+          ? "Clipboard copy failed"
+          : "Feedback saved at",
         TIMEOUT,
       );
       const reportPath = latestFeedbackReportPath(root);
@@ -1915,15 +1917,15 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "TUI renders a prefilled GitHub issue as a terminal hyperlink",
+    "TUI creates a Markdown feedback file and renders a prefilled GitHub issue link",
     async () => {
       const root = createIsolatedRoot();
       const gateway = startFakeGateway([]);
       const stderrPath = join(root.root, "feedback-report-stderr.log");
-      const clipboardPath = join(root.root, "feedback-clipboard.md");
+      const clipboardPath = join(root.root, "feedback-clipboard-path.txt");
       installClipboardFixture(
         root,
-        '#!/bin/sh\n/bin/cat > "$FX_FEEDBACK_CLIPBOARD_OUTPUT"\n',
+        '#!/bin/sh\nfor arg in "$@"; do last="$arg"; done\nprintf "%s" "$last" > "$FX_FEEDBACK_CLIPBOARD_OUTPUT"\n',
       );
       writeFileSync(stderrPath, "");
 
@@ -1941,7 +1943,13 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("/feedback");
-      await activeSession.waitForText("Open the prefilled GitHub form", TIMEOUT);
+      await activeSession.waitForText("Report issue", TIMEOUT);
+      await activeSession.waitForText(
+        process.platform === "darwin"
+          ? "Feedback copied as .md"
+          : "Feedback saved at",
+        TIMEOUT,
+      );
 
       const escapes = await activeSession.capturePaneEscapes();
       expect(escapes).toContain("Report issue");
@@ -1949,11 +1957,17 @@ describe("effect-aware command permissions", () => {
       expect(escapes).toContain("source%3A%20%2Ffeedback");
       expect(escapes).not.toContain("workspace%3A");
       expect(escapes).not.toContain("prompt%3A");
-      const report = readFileSync(clipboardPath, "utf8");
+      const reportPath = latestFeedbackReportPath(root);
+      const report = readFileSync(reportPath, "utf8");
       expect(report).toContain("# fx feedback report");
       expect(report).toContain("## Summary");
       expect(report).toContain(root.workspace);
-      expect(readdirSync(root.root).filter((entry) => entry.startsWith("fx-feedback-"))).toHaveLength(0);
+      expect(statSync(reportPath).mode & 0o077).toBe(0);
+      if (process.platform === "darwin") {
+        expect(readFileSync(clipboardPath, "utf8")).toBe(reportPath);
+      } else {
+        expect(existsSync(clipboardPath)).toBe(false);
+      }
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       await activeSession.sendText("/quit");
