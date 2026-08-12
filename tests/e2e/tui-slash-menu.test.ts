@@ -653,7 +653,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForPane(
         (pane) =>
           composerContains(pane, "/feedback") &&
-          !pane.includes("copy a diagnostic and show a GitHub issue link"),
+          !pane.includes("copy a Markdown report file and show a GitHub link"),
         5_000,
       );
       const afterDismiss = await capture("after-dismiss");
@@ -661,7 +661,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForPane(
         (pane) =>
           composerContains(pane, "/feedbackx") &&
-          !pane.includes("copy a diagnostic and show a GitHub issue link"),
+          !pane.includes("copy a Markdown report file and show a GitHub link"),
         5_000,
       );
       const afterDismissEdit = await capture("after-dismiss-edit");

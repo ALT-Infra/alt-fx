@@ -1283,7 +1283,7 @@ fn footerGeometryForRows(rows: FooterRows, activity: ActivityPlacement) footer_v
 
 const surface_test_slash_specs = [_]command_specs.SlashSpec{
     .{ .kind = .help, .command = "/help", .help_entry = "/help", .completion_description = "show available slash commands", .presentation_category = .general },
-    .{ .kind = .feedback, .command = "/feedback", .help_entry = "/feedback", .completion_description = "copy a diagnostic and show a GitHub issue link", .presentation_category = .product },
+    .{ .kind = .feedback, .command = "/feedback", .help_entry = "/feedback", .completion_description = "copy a Markdown report file and show a GitHub link", .presentation_category = .product },
 };
 const surface_test_slash_registry = command_specs.SlashRegistry{ .commands = surface_test_slash_specs[0..] };
 

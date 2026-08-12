@@ -153,12 +153,21 @@ fn copyUnavailable(_: ?*anyopaque, _: []const u8) ClipboardError!bool {
     return false;
 }
 
+fn copy_file_unavailable(_: ?*anyopaque, _: std.mem.Allocator, _: []const u8) ClipboardError!bool {
+    return false;
+}
+
 pub const Clipboard = struct {
     context: ?*anyopaque = null,
     copy_fn: *const fn (
         ?*anyopaque,
         []const u8,
     ) ClipboardError!bool,
+    copy_file_fn: *const fn (
+        ?*anyopaque,
+        std.mem.Allocator,
+        []const u8,
+    ) ClipboardError!bool = copy_file_unavailable,
 
     /// Borrows `text` for this call. The caller retains ownership. Returns
     /// `false` when the host has no clipboard implementation.
@@ -167,6 +176,16 @@ pub const Clipboard = struct {
         text: []const u8,
     ) ClipboardError!bool {
         return self.copy_fn(self.context, text);
+    }
+
+    /// Borrows `path` for this call. The caller retains ownership. Returns
+    /// `false` when the host cannot publish file references to its clipboard.
+    pub fn copy_file(
+        self: Clipboard,
+        alloc: std.mem.Allocator,
+        path: []const u8,
+    ) ClipboardError!bool {
+        return self.copy_file_fn(self.context, alloc, path);
     }
 };
 
@@ -288,6 +307,11 @@ test "unavailable secret store reports absence and refuses writes" {
         unavailable_secret_store.store(std.testing.allocator, "secret"),
     );
     try std.testing.expect(!try unavailable_secret_store.storeInteractive());
+}
+
+test "unavailable clipboard rejects text and file references" {
+    try std.testing.expect(!try unavailable_clipboard.copy("text"));
+    try std.testing.expect(!try unavailable_clipboard.copy_file(std.testing.allocator, "/tmp/report.md"));
 }
 
 test "current host describes its operating system" {

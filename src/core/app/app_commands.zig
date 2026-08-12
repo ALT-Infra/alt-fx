@@ -49,7 +49,7 @@ const TranscriptEntry = transcript_runtime.TranscriptEntry;
 
 fn finish_feedback_notice(app: anytype, entry_id: u32, tone: types.NoticeTone, body: []const u8) !void {
     const notice: types.SemanticNotice = .{
-        .topic = "feedback",
+        .topic = "",
         .tone = tone,
         .body = body,
     };
@@ -60,7 +60,8 @@ fn finish_feedback_notice(app: anytype, entry_id: u32, tone: types.NoticeTone, b
 }
 
 const FeedbackIssueReportDisposition = union(enum) {
-    copied,
+    copied_file: []const u8,
+    copy_failed: []const u8,
     saved: []const u8,
     unavailable,
 };
@@ -75,15 +76,12 @@ fn format_feedback_issue_notice(
     defer out.deinit();
 
     switch (disposition) {
-        .copied => try out.writer.writeAll("Feedback report copied to the clipboard.\n"),
-        .saved => |path| try out.writer.print("Clipboard copy failed. Feedback report saved at {s}.\n", .{path}),
-        .unavailable => try out.writer.writeAll("Could not copy or save the feedback report.\n"),
+        .copied_file => try out.writer.writeAll("Feedback copied as .md. Redact it, then "),
+        .copy_failed => |path| try out.writer.print("Clipboard copy failed. Redact {s}, then ", .{path}),
+        .saved => |path| try out.writer.print("Feedback saved at {s}. Redact it, then ", .{path}),
+        .unavailable => try out.writer.writeAll("Could not create feedback report. "),
     }
-    try out.writer.print(
-        "Open the prefilled GitHub form: \x1b]8;;{s}\x1b\\\x1b[4mReport issue\x1b[24m\x1b]8;;\x1b\\\n" ++
-            "Paste the full report into What happened?, then review and redact sensitive information.",
-        .{url},
-    );
+    try out.writer.print("\x1b]8;;{s}\x1b\\\x1b[4mReport issue\x1b[24m\x1b]8;;\x1b\\.", .{url});
     return out.toOwnedSlice();
 }
 
@@ -346,23 +344,24 @@ pub fn Handlers(comptime App: type) type {
             };
             defer app.alloc.free(url);
 
-            const copied = if (comptime @hasDecl(App, "clipboard"))
-                app.clipboard().copy(report) catch false
-            else
-                false;
-            var fallback_path: ?[]u8 = null;
-            defer if (fallback_path) |path| app.alloc.free(path);
-            const disposition: FeedbackIssueReportDisposition = if (copied)
-                .copied
-            else blk: {
-                fallback_path = writeFeedbackReportFile(app.alloc, report) catch break :blk .unavailable;
-                break :blk .{ .saved = fallback_path.? };
+            const report_path: ?[]u8 = writeFeedbackReportFile(app.alloc, report) catch null;
+            defer if (report_path) |path| app.alloc.free(path);
+            const disposition: FeedbackIssueReportDisposition = if (report_path) |path| blk: {
+                const copied = if (comptime @hasDecl(App, "clipboard"))
+                    app.clipboard().copy_file(app.alloc, path) catch false
+                else
+                    false;
+                if (copied) break :blk .{ .copied_file = path };
+                if (builtin.os.tag == .macos) break :blk .{ .copy_failed = path };
+                break :blk .{ .saved = path };
+            } else blk: {
+                break :blk .unavailable;
             };
             const body = try format_feedback_issue_notice(app.alloc, url, disposition);
             defer app.alloc.free(body);
             const tone: types.NoticeTone = switch (disposition) {
-                .copied, .saved => .neutral,
-                .unavailable => .@"error",
+                .copied_file, .saved => .neutral,
+                .copy_failed, .unavailable => .@"error",
             };
             try finish_feedback_notice(app, progress_entry_id, tone, body);
         }
@@ -3623,17 +3622,48 @@ fn expectNoHiddenSandboxLabels(text: []const u8) !void {
 
 test "feedback issue notice emits a balanced OSC 8 hyperlink" {
     const url = "https://github.com/vercel-labs/fx/issues/new?template=fx-report.yml";
-    const body = try format_feedback_issue_notice(std.testing.allocator, url, .copied);
+    const body = try format_feedback_issue_notice(std.testing.allocator, url, .{ .copied_file = "/tmp/report.md" });
     defer std.testing.allocator.free(body);
 
     try std.testing.expectEqualStrings(
-        "Feedback report copied to the clipboard.\n" ++
-            "Open the prefilled GitHub form: " ++
+        "Feedback copied as .md. Redact it, then " ++
             "\x1b]8;;https://github.com/vercel-labs/fx/issues/new?template=fx-report.yml\x1b\\" ++
-            "\x1b[4mReport issue\x1b[24m\x1b]8;;\x1b\\\n" ++
-            "Paste the full report into What happened?, then review and redact sensitive information.",
+            "\x1b[4mReport issue\x1b[24m\x1b]8;;\x1b\\.",
         body,
     );
+}
+
+test "feedback issue notice distinguishes Markdown file outcomes" {
+    const url = "https://github.com/vercel-labs/fx/issues/new?template=fx-report.yml";
+    const report_path = "/tmp/report.md";
+    const cases = [_]struct {
+        disposition: FeedbackIssueReportDisposition,
+        expected: []const u8,
+    }{
+        .{
+            .disposition = .{ .copied_file = report_path },
+            .expected = "Feedback copied as .md. Redact it, then ",
+        },
+        .{
+            .disposition = .{ .copy_failed = report_path },
+            .expected = "Clipboard copy failed. Redact /tmp/report.md, then ",
+        },
+        .{
+            .disposition = .{ .saved = report_path },
+            .expected = "Feedback saved at /tmp/report.md. Redact it, then ",
+        },
+        .{
+            .disposition = .unavailable,
+            .expected = "Could not create feedback report. ",
+        },
+    };
+
+    for (cases) |case| {
+        const body = try format_feedback_issue_notice(std.testing.allocator, url, case.disposition);
+        defer std.testing.allocator.free(body);
+        try std.testing.expect(std.mem.startsWith(u8, body, case.expected));
+        try std.testing.expect(std.mem.find(u8, body, "Report issue") != null);
+    }
 }
 
 test "feedback report file uses private randomized markdown path" {

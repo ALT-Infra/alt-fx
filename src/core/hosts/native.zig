@@ -7,6 +7,7 @@ const io_mod = @import("../shared/io.zig");
 
 pub const clipboard = host.Clipboard{
     .copy_fn = copyToClipboard,
+    .copy_file_fn = copy_file_to_clipboard,
 };
 
 pub const secret_store = native_secret_store.provider;
@@ -48,6 +49,181 @@ fn copyToClipboard(_: ?*anyopaque, text: []const u8) host.ClipboardError!bool {
         return error.CopyFailed;
     }
     return true;
+}
+
+const ClipboardProcessResult = struct {
+    term: std.process.Child.Term,
+    stderr: []u8,
+};
+
+fn collect_clipboard_process_output(
+    alloc: std.mem.Allocator,
+    child: *std.process.Child,
+    deadline: std.Io.Clock.Timestamp,
+) std.process.RunError![]u8 {
+    var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var multi_reader: std.Io.File.MultiReader = undefined;
+    multi_reader.init(alloc, io_mod.getIo(), multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer multi_reader.deinit();
+
+    const stdout_reader = multi_reader.reader(0);
+    const stderr_reader = multi_reader.reader(1);
+    while (multi_reader.fill(64, .{ .deadline = deadline })) |_| {
+        if (stdout_reader.buffered().len > 1024 or stderr_reader.buffered().len > 4096) {
+            return error.StreamTooLong;
+        }
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        else => |fill_err| return fill_err,
+    }
+    try multi_reader.checkAnyError();
+
+    return multi_reader.toOwnedSlice(1);
+}
+
+fn clipboard_process_term(status: c_int) std.process.Child.Term {
+    const raw_status: u32 = @bitCast(status);
+    return if (std.c.W.IFEXITED(raw_status))
+        .{ .exited = std.c.W.EXITSTATUS(raw_status) }
+    else if (std.c.W.IFSIGNALED(raw_status))
+        .{ .signal = std.c.W.TERMSIG(raw_status) }
+    else if (std.c.W.IFSTOPPED(raw_status))
+        .{ .stopped = std.c.W.STOPSIG(raw_status) }
+    else
+        .{ .unknown = raw_status };
+}
+
+fn close_clipboard_process_streams(child: *std.process.Child) void {
+    const io = io_mod.getIo();
+    if (child.stdin) |stdin| stdin.close(io);
+    if (child.stdout) |stdout| stdout.close(io);
+    if (child.stderr) |stderr| stderr.close(io);
+    child.stdin = null;
+    child.stdout = null;
+    child.stderr = null;
+}
+
+fn try_reap_clipboard_process(child: *std.process.Child) error{WaitFailed}!?std.process.Child.Term {
+    const pid = child.id orelse return error.WaitFailed;
+    var status: c_int = undefined;
+    const waited = std.c.waitpid(pid, &status, std.c.W.NOHANG);
+    if (waited == 0) return null;
+    if (waited != pid) return error.WaitFailed;
+
+    child.id = null;
+    return clipboard_process_term(status);
+}
+
+fn kill_and_wait_clipboard_process(child: *std.process.Child) !std.process.Child.Term {
+    const pid = child.id orelse return error.WaitFailed;
+    std.posix.kill(pid, .KILL) catch |err| switch (err) {
+        error.ProcessNotFound => {},
+        else => |kill_err| return kill_err,
+    };
+    return child.wait(io_mod.getIo());
+}
+
+fn wait_for_clipboard_process(
+    child: *std.process.Child,
+    deadline: std.Io.Clock.Timestamp,
+) !std.process.Child.Term {
+    const io = io_mod.getIo();
+    while (true) {
+        if (try try_reap_clipboard_process(child)) |term| return term;
+
+        const now = std.Io.Clock.Timestamp.now(io, .awake);
+        if (!std.Io.Clock.Timestamp.compare(now, .lt, deadline)) {
+            _ = try kill_and_wait_clipboard_process(child);
+            return error.Timeout;
+        }
+        try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+    }
+}
+
+fn run_clipboard_process(
+    alloc: std.mem.Allocator,
+    argv: []const []const u8,
+    deadline: std.Io.Clock.Timestamp,
+) !ClipboardProcessResult {
+    var child = try std.process.spawn(io_mod.getIo(), .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
+    defer child.kill(io_mod.getIo());
+    defer close_clipboard_process_streams(&child);
+
+    const term = wait_for_clipboard_process(&child, deadline) catch |err| {
+        if (child.id != null) {
+            _ = kill_and_wait_clipboard_process(&child) catch |cleanup_err| {
+                debug_trace.logf("host", "clipboard file copy cleanup failed err={s}", .{@errorName(cleanup_err)});
+            };
+        }
+        return err;
+    };
+    const stderr = try collect_clipboard_process_output(alloc, &child, deadline);
+    return .{
+        .term = term,
+        .stderr = stderr,
+    };
+}
+
+// Publish eager file representations so the pasteboard server owns them after
+// this short-lived process exits.
+fn copy_file_to_clipboard(_: ?*anyopaque, alloc: std.mem.Allocator, path: []const u8) host.ClipboardError!bool {
+    if (comptime builtin.os.tag != .macos) return false;
+
+    const script =
+        \\function run(argv) {
+        \\  ObjC.import("AppKit");
+        \\  var url = $.NSURL.fileURLWithPath(argv[0]).standardizedURL;
+        \\  var expected = ObjC.unwrap(url.absoluteString);
+        \\  var pb = $.NSPasteboard.generalPasteboard;
+        \\  pb.clearContents;
+        \\  if (!pb.setStringForType(expected, "public.file-url")) {
+        \\    throw new Error("public.file-url materialization failed");
+        \\  }
+        \\  var files = $.NSArray.arrayWithObject(argv[0]);
+        \\  if (!pb.setPropertyListForType(files, "NSFilenamesPboardType")) {
+        \\    throw new Error("NSFilenamesPboardType materialization failed");
+        \\  }
+        \\  var copiedValue = pb.stringForType("public.file-url");
+        \\  if (!copiedValue) throw new Error("public.file-url readback missing");
+        \\  var copied = ObjC.unwrap(copiedValue);
+        \\  if (copied !== expected) throw new Error("public.file-url readback mismatch");
+        \\  var copiedFiles = ObjC.deepUnwrap(pb.propertyListForType("NSFilenamesPboardType"));
+        \\  if (!copiedFiles || copiedFiles.length !== 1 || copiedFiles[0] !== argv[0]) {
+        \\    throw new Error("NSFilenamesPboardType readback mismatch");
+        \\  }
+        \\}
+    ;
+    const argv: []const []const u8 = &.{ "osascript", "-l", "JavaScript", "-e", script, path };
+    const started_ms = io_mod.milliTimestamp();
+    const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+        .clock = .awake,
+        .raw = .fromSeconds(5),
+    });
+    const result = run_clipboard_process(alloc, argv, deadline) catch |err| {
+        const finished_ms = io_mod.milliTimestamp();
+        const elapsed_ms = if (finished_ms >= started_ms) finished_ms - started_ms else 0;
+        debug_trace.logf("host", "clipboard file copy process failed err={s} elapsed_ms={d}", .{ @errorName(err), elapsed_ms });
+        return error.CopyFailed;
+    };
+    defer alloc.free(result.stderr);
+
+    const finished_ms = io_mod.milliTimestamp();
+    const elapsed_ms = if (finished_ms >= started_ms) finished_ms - started_ms else 0;
+    switch (result.term) {
+        .exited => |code| {
+            if (code == 0) return true;
+            debug_trace.logf("host", "clipboard file copy failed exit_code={d} elapsed_ms={d} stderr={s}", .{ code, elapsed_ms, result.stderr });
+        },
+        .signal => |signal| debug_trace.logf("host", "clipboard file copy failed term=signal signal={d} elapsed_ms={d} stderr={s}", .{ @intFromEnum(signal), elapsed_ms, result.stderr }),
+        .stopped => |signal| debug_trace.logf("host", "clipboard file copy failed term=stopped signal={d} elapsed_ms={d} stderr={s}", .{ @intFromEnum(signal), elapsed_ms, result.stderr }),
+        .unknown => |status| debug_trace.logf("host", "clipboard file copy failed term=unknown status={d} elapsed_ms={d} stderr={s}", .{ status, elapsed_ms, result.stderr }),
+    }
+    return error.CopyFailed;
 }
 
 fn clipboardCommand(os_tag: std.Target.Os.Tag) ?[]const []const u8 {
