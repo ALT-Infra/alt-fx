@@ -1959,6 +1959,7 @@ describe("effect-aware command permissions", () => {
       );
 
       const escapes = await activeSession.capturePaneEscapes();
+      expect(escapes).not.toContain("Trace:");
       expect(escapes).not.toContain("Report issue");
       expect(escapes).not.toContain("fx.sh/feedback");
       expect(escapes).not.toContain("github.com");
@@ -2024,6 +2025,7 @@ describe("effect-aware command permissions", () => {
         readdirSync(root.root).filter((entry) => entry.startsWith("fx-trace-")),
       ).toHaveLength(0);
       const escapes = await activeSession.capturePaneEscapes();
+      expect(escapes).not.toContain("Feedback:");
       expect(escapes).not.toContain("github.com");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 

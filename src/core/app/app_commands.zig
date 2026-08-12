@@ -49,7 +49,7 @@ const TranscriptEntry = transcript_runtime.TranscriptEntry;
 
 fn finish_trace_notice(app: anytype, entry_id: u32, tone: types.NoticeTone, body: []const u8) !void {
     const notice: types.SemanticNotice = .{
-        .topic = "trace",
+        .topic = "",
         .tone = tone,
         .body = body,
     };
@@ -322,14 +322,14 @@ pub fn Handlers(comptime App: type) type {
                 false;
             if (opened) {
                 try app.writeDomainNotice(.{
-                    .topic = "feedback",
+                    .topic = "",
                     .tone = .neutral,
                     .body = "Opened https://fx.sh/feedback.",
                 }, true);
                 return;
             }
             try app.writeDomainNotice(.{
-                .topic = "feedback",
+                .topic = "",
                 .tone = .@"error",
                 .body = "Could not open https://fx.sh/feedback. Open it manually.",
             }, true);
@@ -337,7 +337,7 @@ pub fn Handlers(comptime App: type) type {
 
         fn handleTraceReport(app: *App) !void {
             const progress_entry_id = try app.appendDomainNotice(.{
-                .topic = "trace",
+                .topic = "",
                 .tone = .neutral,
                 .body = "Preparing trace...",
             });
