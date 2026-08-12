@@ -13,6 +13,7 @@ on:
           - major
 
 permissions:
+  actions: write
   contents: write
   pull-requests: write
 
@@ -242,20 +243,60 @@ jobs:
         run: |
           NEW="${{ steps.version.outputs.new }}"
           BRANCH="prepare-v${NEW}"
+          REF="refs/heads/${BRANCH}"
 
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -b "$BRANCH"
-          git add src/main.zig README.md CHANGELOG.md
-          git commit -m "Prepare v${NEW} release"
           EXISTING_PR=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
           if [ -n "$EXISTING_PR" ]; then
             echo "Closing existing PR #${EXISTING_PR} for ${BRANCH}"
             gh pr close "$EXISTING_PR" --comment "Superseded by a new prepare-release run."
           fi
 
-          git push origin --delete "$BRANCH" 2>/dev/null || true
-          git push -u origin "$BRANCH"
+          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/${BRANCH}" >/dev/null 2>&1 || true
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f ref="$REF" \
+            -f sha="$GITHUB_SHA" \
+            >/dev/null
+
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg ref "$REF" \
+            --arg expected_head "$GITHUB_SHA" \
+            --arg headline "Prepare v${NEW} release" \
+            --arg main_zig "$(base64 -w 0 src/main.zig)" \
+            --arg readme "$(base64 -w 0 README.md)" \
+            --arg changelog "$(base64 -w 0 CHANGELOG.md)" \
+            '{
+              query: "mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }",
+              variables: {
+                input: {
+                  branch: {
+                    repositoryNameWithOwner: $repository,
+                    refName: $ref
+                  },
+                  expectedHeadOid: $expected_head,
+                  message: {headline: $headline},
+                  fileChanges: {
+                    additions: [
+                      {path: "src/main.zig", contents: $main_zig},
+                      {path: "README.md", contents: $readme},
+                      {path: "CHANGELOG.md", contents: $changelog}
+                    ]
+                  }
+                }
+              }
+            }' > /tmp/create-release-commit.json
+
+          COMMIT_SHA=$(gh api graphql --input /tmp/create-release-commit.json --jq '.data.createCommitOnBranch.commit.oid')
+          if [ -z "$COMMIT_SHA" ]; then
+            echo "::error::GitHub did not return the release commit SHA"
+            exit 1
+          fi
+
+          VERIFIED=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${COMMIT_SHA}" --jq '.commit.verification.verified')
+          if [ "$VERIFIED" != "true" ]; then
+            echo "::error::Release commit ${COMMIT_SHA} does not have a verified signature"
+            exit 1
+          fi
 
           gh pr create \
             --title "Prepare v${NEW} release" \
@@ -269,3 +310,7 @@ jobs:
           When merged, CI will detect the version change, cross-compile platform binaries, and publish the GitHub release automatically.
           EOF
           )"
+
+          gh workflow run ci.yml --ref "$BRANCH"
+          gh workflow run bench.yml --ref "$BRANCH"
+          gh workflow run full-ci.yml --ref "$BRANCH"
