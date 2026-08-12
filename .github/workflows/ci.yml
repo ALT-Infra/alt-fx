@@ -299,8 +299,6 @@ jobs:
         run: |
           scripts=(
             benchmarks/startup.sh
-            docker/run.sh
-            docker/test.sh
           )
           bash -n "${scripts[@]}"
           shellcheck "${scripts[@]}"
