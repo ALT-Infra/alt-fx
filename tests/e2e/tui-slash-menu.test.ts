@@ -1281,6 +1281,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).toContain("←→ Change");
 
       await session.sendKeys("Right");
+      await waitForSettingValue(settingsPath, "input_appearance", "lines");
       grid = await waitForAppearanceMenu(session, "lines  tint");
       pane = grid.join("\n");
       expect(pane).not.toContain("✓");
@@ -1289,6 +1290,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("Tab");
       await session.waitForText("minimal  legacy", 5_000);
       await session.sendKeys("Right");
+      await waitForSettingValue(settingsPath, "maxxing_mode", "legacy");
       grid = await waitForAppearanceMenu(session, "minimal  legacy");
       pane = grid.join("\n");
       expect(pane).not.toContain("✓");

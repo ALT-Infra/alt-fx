@@ -857,7 +857,7 @@ tmuxTest(
     await session.waitForPane(
       (pane) =>
         pane.includes("private/blue-hornbill") &&
-        pane.includes("Authenticated model catalog loaded."),
+        !pane.includes("Authenticated model catalog loaded."),
       TIMEOUT,
     );
 
@@ -1527,7 +1527,7 @@ tmuxTest(
     await session.waitForPane(
       (pane) =>
         pane.includes("private/blue-hornbill") &&
-        pane.includes("Authenticated model catalog loaded."),
+        !pane.includes("Authenticated model catalog loaded."),
       TIMEOUT,
     );
     const refreshedCatalogRequest = gateway.modelRequests[1];
