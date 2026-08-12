@@ -1484,14 +1484,8 @@ fn formatAllowlistChange(
     return out.toOwnedSlice();
 }
 
-/// Score a model ID against a user query for fuzzy matching.
-/// Higher score = better match. Returns 0 for no match.
-///
-/// Scoring:
-///  - Exact case-insensitive substring: 100 + length bonus
-///  - All query tokens present (space/dash/slash separated): 80 + token count bonus
-///  - Subsequence match: 40 + matched char density
-///  - Partial token match: 20
+/// Scores prefix and substring matches above token, subsequence, and partial matches.
+/// Higher scores rank first; zero means no match.
 pub fn fuzzyModelScore(id: []const u8, query: []const u8) i32 {
     if (query.len == 0) return 0;
     if (id.len == 0) return 0;

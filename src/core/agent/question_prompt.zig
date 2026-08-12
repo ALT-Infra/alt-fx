@@ -1152,7 +1152,6 @@ test "syncFrom appends freeform slot to every entry" {
     };
     try prompt.syncFrom(std.testing.allocator, &entries);
 
-    // Each entry should have one extra option appended.
     try std.testing.expectEqual(@as(usize, 3), prompt.entries.items[0].options.items.len);
     try std.testing.expectEqual(@as(usize, 2), prompt.entries.items[1].options.items.len);
 
@@ -1231,7 +1230,6 @@ test "insert actions do not navigate freeform choices" {
     prompt.moveChoice(-1);
     try std.testing.expectEqual(@as(u8, 3), currentChoiceIndex(&prompt));
 
-    // Inserting a letter into freeform must not navigate options.
     _ = try prompt.apply(std.testing.allocator, .{ .insert_ascii = 'k' });
     try std.testing.expectEqual(@as(u8, 3), currentChoiceIndex(&prompt));
     try std.testing.expectEqualStrings("k", prompt.entries.items[0].freeform_buffer.items);

@@ -1,14 +1,7 @@
-//! Best-effort lifecycle-state reporter for the herdr agent multiplexer
-//! (https://herdr.dev). When fx runs inside a herdr pane, herdr injects
-//! HERDR_SOCKET_PATH and HERDR_PANE_ID; we open that unix socket and push
-//! newline-delimited JSON so the pane shows authoritative idle/working/blocked
-//! state instead of herdr's terminal-output heuristics.
+//! Best-effort lifecycle reporter for the herdr agent multiplexer.
 //!
-//! herdr closes the socket after responding to each request, so every report
-//! opens a fresh connection (connect, write one line, drain reply, close).
-//! Reporting is fire-and-forget: failures are swallowed so a slow or absent
-//! herdr never breaks the fx session. Reply drains use a short socket timeout
-//! so a hung herdr cannot freeze the main thread.
+//! Each report uses a short-lived Unix socket. Failures and reply timeouts are
+//! ignored so the integration cannot block or terminate an fx session.
 
 const std = @import("std");
 const io_mod = @import("../../core/shared/io.zig");
@@ -18,12 +11,12 @@ const jsonrpc = @import("../../acp/jsonrpc.zig");
 
 pub const State = enum { idle, working, blocked };
 
-/// herdr caps custom_status at 32 bytes.
+// herdr protocol limits custom status to 32 bytes.
 const custom_status_max = 32;
-/// Bound how long we wait for herdr's one-line reply before closing.
+/// Maximum wait for herdr's one-line reply.
 const response_timeout = std.posix.timeval{ .sec = 0, .usec = 250_000 };
 
-/// Non-official integrations report under a `custom:` source prefix.
+// Third-party reporters use the `custom:` source prefix.
 const source = "custom:fx";
 const agent_name = "fx";
 
@@ -45,8 +38,6 @@ pub const Client = struct {
     pane_id: []u8 = &.{},
     next_id: u64 = 1,
 
-    /// Enable reporting only when both env vars are present and FX_HERDR is not
-    /// an explicit opt-out. Pure so it can be unit-tested without touching env.
     pub fn shouldEnable(
         fx_herdr: ?[]const u8,
         socket_path: ?[]const u8,
@@ -61,8 +52,6 @@ pub const Client = struct {
         return path.len > 0 and pane.len > 0;
     }
 
-    /// Resolve config from the environment. No-op (stays disabled) when fx is
-    /// not running under herdr or the user opted out.
     pub fn initFromEnv(self: *Client, alloc: std.mem.Allocator) void {
         const socket_path = io_mod.getenv("HERDR_SOCKET_PATH");
         const pane_id = io_mod.getenv("HERDR_PANE_ID");

@@ -8407,9 +8407,6 @@ test "source-less surface paint keeps transcript lines one to one under full tra
     try runtime.enableShadowVt(alloc);
 
     try runtime.transcript.appendSlice(alloc, "a\nsummary\nb\n");
-    // A folded block with no captured lines: the paint walk never expands
-    // folded blocks without a source snapshot, so its capacity count must
-    // stay one to one with the transcript's hard lines.
     try runtime.folded_command_blocks.append(alloc, .{ .summary_transcript_index = 2 });
     runtime.full_transcript.depth = .review;
 
@@ -8706,9 +8703,6 @@ test "prepared command output paint clears stale hint before projecting newest h
     try std.testing.expectEqual(@as(usize, 8), block.total_lines);
     try std.testing.expectEqual(@as(usize, 8), block.lines.items.len);
     const newest_entry_id = block.lines.items[7].entry_id.?;
-    // The prepared batch only appends placeholders and requests paint. These
-    // raw bytes prove the regression exercises source-preparation overrides
-    // rather than an eager synchronization rewrite.
     try expectRawEntryBytes(
         &runtime,
         old_hint_entry_id,
@@ -9718,9 +9712,6 @@ test "recomputeCursorFromTranscript respects resized width" {
 }
 
 test "recomputeCursorFromTranscript skips ANSI in styled rows" {
-    // Replay math treats SGR bytes as controls, not visible cells. Styled
-    // transcript rows often end in `\x1b[0m` before the final newline; ANSI-aware
-    // width keeps cursor_col at the next visible cell.
     var runtime = TranscriptRuntime{
         .layout = .{
             .rows = 24,
@@ -9734,7 +9725,6 @@ test "recomputeCursorFromTranscript skips ANSI in styled rows" {
     };
     defer runtime.deinit(std.testing.allocator);
 
-    // One bar row, no trailing newline so the replay lands on the styled line.
     const bar_row = "\x1b[48;5;235m\x1b[39m❯ hello\x1b[0m";
     try runtime.transcript.appendSlice(std.testing.allocator, bar_row);
 
@@ -9742,7 +9732,6 @@ test "recomputeCursorFromTranscript skips ANSI in styled rows" {
     runtime.cursor_col = 99;
     runtime.recomputeCursorFromTranscript();
 
-    // Visible width of "❯ hello" is 7, so next-write column is 8.
     try std.testing.expectEqual(@as(u16, 8), runtime.cursor_col);
 }
 
@@ -9821,7 +9810,6 @@ test "updateExtraInputRows shrink preserves pre-fx scrollback" {
     try runtime.updateExtraInputRows(std.testing.allocator, &metrics, 7);
     try runtime.updateExtraInputRows(std.testing.allocator, &metrics, 0);
 
-    // Nothing has scrolled, so fx still owns rows 12..36 only.
     try std.testing.expectEqual(@as(u16, 12), runtime.viewport_top_row);
 }
 
@@ -10527,9 +10515,7 @@ test "streamAssistantChunk opens a new assistant_turn after a user_turn" {
 
 test "appendUserTurnOwned frees text, images, and image slices when entries.append OOMs" {
     const base = std.testing.allocator;
-    // fail_index = 4: the first four allocations (text dupe, images
-    // alloc, path dupe, media_type dupe) succeed; the fifth (entries
-    // internal grow on first append) returns OutOfMemory.
+    // Fail after all transferred slices exist, when the entries list first grows.
     var failing = std.testing.FailingAllocator.init(base, .{ .fail_index = 4 });
     const alloc = failing.allocator();
 
@@ -10548,9 +10534,6 @@ test "appendUserTurnOwned frees text, images, and image slices when entries.appe
         runtime.appendUserTurnOwned(alloc, .{ .text = text, .images = images }),
     );
 
-    // No entry landed — the append that would have owned the bundle
-    // failed. The method must have freed text + every image slice +
-    // the outer images slice itself before propagating.
     try std.testing.expectEqual(@as(usize, 0), runtime.entries.items.len);
     try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
 }
@@ -11551,8 +11534,6 @@ test "lookupAssistantSegments resolves assistant ids and rejects others" {
     var runtime = TranscriptRuntime{};
     defer runtime.deinit(alloc);
 
-    // Open a user turn first so the assistant entry sits mid-list and
-    // the lookup has to walk past a non-assistant variant.
     const prompt = try alloc.dupe(u8, "hello");
     const user_id = try runtime.appendUserTurnOwned(alloc, .{ .text = prompt, .images = &.{} });
 
@@ -11560,21 +11541,16 @@ test "lookupAssistantSegments resolves assistant ids and rejects others" {
     const segs = runtime.lookupAssistantSegments(assistant_id) orelse unreachable;
     try segs.text.appendSlice(alloc, "tok");
 
-    // Positive case — returned pointer references the right segments.
     const looked_up = runtime.lookupAssistantSegments(assistant_id);
     try std.testing.expect(looked_up != null);
     try std.testing.expectEqualStrings("tok", looked_up.?.text.items);
 
-    // A raw-bytes entry id must not resolve to an assistant segments
-    // pointer, even though it is a valid entry id.
     const raw = try alloc.dupe(u8, "banner");
     const raw_id = try runtime.appendRawBytesEntry(alloc, raw);
     try std.testing.expect(runtime.lookupAssistantSegments(raw_id) == null);
 
-    // A user-turn id is likewise not an assistant.
     try std.testing.expect(runtime.lookupAssistantSegments(user_id) == null);
 
-    // A stamped-but-absent id returns null.
     try std.testing.expect(runtime.lookupAssistantSegments(std.math.maxInt(u32)) == null);
 }
 
@@ -12914,7 +12890,6 @@ test "replaceTrailingTranscriptLineSilent swaps the trailing entry's bytes in pl
     const replaced = try runtime.replaceTrailingTranscriptLineSilent(alloc, "Thinking... done\n");
     try std.testing.expect(replaced);
     try std.testing.expectEqual(@as(usize, 1), runtime.entries.items.len);
-    // Entry id preserved — same slot, new bytes.
     try std.testing.expectEqual(initial_id, runtime.entries.items[0].id());
     try std.testing.expectEqualStrings("Thinking... done\n", runtime.entries.items[0].raw_bytes.bytes);
 }
@@ -12978,8 +12953,6 @@ test "updateRawBytesEntry returns false for non-raw_bytes entry" {
     try std.testing.expect(!ok);
 }
 
-// Raw entry updates are keyed by entry id, not by transcript tail position.
-// Intervening appends must not turn an update into a fresh copy below.
 test "updateRawBytesEntry updates modal entry in place after intervening append" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{};
@@ -13023,13 +12996,6 @@ test "tool status raw entry updates after command output appends" {
     try std.testing.expect(std.mem.indexOf(u8, source.bytes, "Running npm test") == null);
 }
 
-// Pin the shared wrapping contract between advanceCursor, visualRowsForLine,
-// and wrapAssistantText. Text that fills the last column must not add an extra
-// visual row or trigger resize scrollback fixups.
-//
-// For the same text and cols, advanceCursor advances cursor_row by the same
-// count as visualRowsForLine - 1: visualRowsForLine returns total rows, while
-// advanceCursor reports rows advanced from the starting row.
 test "advanceCursor row advance matches visualRowsForLine - 1 for wrap-exact content" {
     var sink = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), "/dev/null", .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
@@ -13048,8 +13014,6 @@ test "advanceCursor row advance matches visualRowsForLine - 1 for wrap-exact con
     };
     defer runtime.deinit(std.testing.allocator);
 
-    // "abcdef" at cols=3 is exactly two full rows ("abc" and "def").
-    // visualRowsForLine returns 2, so advanceCursor should advance by 1.
     const text = "abcdef";
     try std.testing.expectEqual(@as(u16, 2), visualRowsForLine(text, 3));
 
@@ -13059,11 +13023,6 @@ test "advanceCursor row advance matches visualRowsForLine - 1 for wrap-exact con
     try std.testing.expectEqual(@as(u16, 2), runtime.cursor_row);
 }
 
-// Same consistency check with a multi-line wrap to exercise both soft
-// wraps and hard newlines together. "abcdef\nghijkl" is 2 rows on the
-// first line ("abc", "def") then hard \n, then 2 rows on the second
-// line ("ghi", "jkl") — 4 rows total, so advanceCursor should advance
-// by 3 from the starting row.
 test "advanceCursor row advance matches visualRowsForLine - 1 across hard newlines" {
     var sink = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), "/dev/null", .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
@@ -13091,18 +13050,6 @@ test "advanceCursor row advance matches visualRowsForLine - 1 across hard newlin
     try std.testing.expectEqual(@as(u16, 4), runtime.cursor_row);
 }
 
-// Mid-row transcript continuations defer scroll until the next paint. The
-// cursor still clamps to content_bottom for footer placement, while
-// viewport_top_row moves upward so the repaint can use the reclaimed
-// terminal rows.
-//
-// 1000 X's at cols=80 from cursor_col=40:
-//   row 35 holds 41 runes (cols 40..80 = 41 cells), rune 42 wraps.
-//   rows 36..46: 80 runes each (880 runes, runes 42..921).
-//   row 47: 79 runes (runes 922..1000).
-//   walk.end_row = 47, so it overflows content_bottom.
-// After: viewport_top is unchanged; the next frame computes terminal
-// scroll from the committed and prepared viewport selections.
 test "writeTranscriptBytes mid-row continuation defers scroll after first paint" {
     const alloc = std.testing.allocator;
     var sink = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), "/dev/null", .{ .mode = .write_only });
@@ -13138,19 +13085,6 @@ test "writeTranscriptBytes mid-row continuation defers scroll after first paint"
     try std.testing.expectEqual(@as(u16, 35), runtime.cursor_row);
 }
 
-// Replaceable transcript lines update the buffer without terminal emission, so
-// they cannot cause natural scroll and must not emit explicit scroll. The
-// position tracker still updates `self.cursor_row` (capped at `layout.rows`)
-// and `self.cursor_col` for between-tick heuristics. Paint owns the
-// authoritative position state on the next render.
-//
-// Layout: rows=40, content_bottom=35, cols=10, viewport_top=35,
-//         cursor=(35, 1).
-// Text:   10 "XXXXXXXXXX" segments joined by 9 "\n"s → 10 rows.
-//         walk.end_row = 35 + 9 = 44.
-// After:  viewport_top stays at 35 (no scroll emitted).
-//         cursor_row = min(44, layout.rows=40) = 40.
-//         cursor_col = 11 (end of last segment, off-by-one tolerated).
 test "appendReplaceableTranscriptLine does not emit scroll (buffer-only)" {
     const alloc = std.testing.allocator;
     var sink = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), "/dev/null", .{ .mode = .write_only });
@@ -13189,11 +13123,6 @@ test "appendReplaceableTranscriptLine does not emit scroll (buffer-only)" {
     try std.testing.expectEqual(@as(u16, 40), runtime.cursor_row);
 }
 
-// Streaming chunk-split equivalence: the same total content written as one call
-// or two calls must produce identical viewport state.
-//
-// 2000 X's at cols=80, from cursor=(35, 1), viewport_top=35.
-// Both variants keep viewport_top=35 and cursor clamped to row 35.
 test "streamed chunk-split produces same viewport as single emission" {
     const alloc = std.testing.allocator;
 
@@ -14098,7 +14027,7 @@ test "transcript lifecycle identity updates are idempotent and atomic" {
         "read_file",
         runtime.toolActivityRecord(provisional_id).?.tool_name.?,
     );
-    // Fill the map and reuse its freed size class so stale record pointers fail deterministically.
+    // Force record-map growth so stale pointers fail deterministically.
     inline for ([_][]const u8{ "alias", "target", "fill-1", "fill-2", "fill-3" }) |call_id| {
         _ = try runtime.applyToolLifecycle(alloc, .{ .provisional = .{
             .id = lifecycleId(1, call_id),

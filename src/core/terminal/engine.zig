@@ -252,21 +252,9 @@ pub const Grid = struct {
     tab_stops: []bool,
     sync_active: bool = false,
     sync_buffer: std.ArrayList(u8) = .empty,
-    /// When true (default), `\x1b[?2026h` ... `\x1b[?2026l` blocks are
-    /// buffered and applied atomically at the DECRST — matching what a
-    /// DEC-2026-aware terminal does. When false, bytes inside a sync
-    /// block are applied immediately; the DECSET/DECRST are still
-    /// parsed (so `sync_active` reflects state for anyone inspecting
-    /// it) but have no gating effect on writes.
-    ///
-    /// The shadow grid used by `TranscriptRuntime.renderTranscriptViewport`
-    /// sets this to false: the render emits a clear inside a sync block
-    /// and then clones the grid to build `next_screen`. If writes were
-    /// buffered, the clone would capture the pre-clear cells and the
-    /// diff would see "no change" → emit nothing → the clear silently
-    /// wins at DECRST, erasing everything the diff should have
-    /// preserved. Immediate apply keeps the shadow in sync with what
-    /// our diff is reasoning about.
+    /// Controls whether DEC-2026 blocks apply atomically or immediately.
+    /// Shadow grids disable buffering so clones include in-block clears;
+    /// otherwise DECRST could erase content omitted from the subsequent diff.
     defer_sync_updates: bool = true,
     /// Active SGR state. Updated by `\x1b[Nm` and applied to any cell
     /// the cursor writes into (and to the bg of cells cleared by EL/ED).
@@ -282,7 +270,7 @@ pub const Grid = struct {
     csi_intermediate_count: u8 = 0,
     osc_saw_esc: bool = false,
     /// Captured OSC payload bytes (between `\x1b]` and the terminator).
-    /// Kept so we can interpret OSC 8 (hyperlink) sequences; other OSC
+    /// Retained to interpret OSC 8 (hyperlink) sequences; other OSC
     /// codes are still ignored.
     osc_buffer: std.ArrayList(u8) = .empty,
     dcs_saw_esc: bool = false,
@@ -496,12 +484,8 @@ pub const Grid = struct {
         return physical_row * cols + col;
     }
 
-    /// Feed raw bytes (a fragment of fx's output) through the emulator.
-    /// Partial sequences are preserved across calls — if `bytes` ends
-    /// mid-CSI, the next call resumes correctly. When a sync-updates
-    /// block is active (`\x1b[?2026h`) writes are buffered until the
-    /// matching DECRST (`\x1b[?2026l`) is seen, at which point the
-    /// whole block is applied atomically.
+    /// Feeds output through the emulator, preserving partial control sequences.
+    /// DEC-2026 blocks are buffered until the matching DECRST when enabled.
     pub fn feed(self: *Grid, bytes: []const u8) !void {
         var result = try self.feedMode(bytes, .journal_replay);
         result.deinit(self.alloc);
@@ -847,13 +831,8 @@ pub const Grid = struct {
         try self.dispatchOsc();
     }
 
-    /// Interpret an OSC payload that has just been terminated by BEL or
-    /// ESC `\`. Only OSC 8 (hyperlink) is acted on; other codes are
-    /// dropped silently, matching the previous behaviour.
-    ///
-    /// OSC 8 syntax: `8 ; params ; URI`. An empty URI closes the
-    /// current hyperlink; a non-empty URI opens a new one and updates
-    /// `current_style.hyperlink_id` so subsequent writes inherit it.
+    /// Handles terminated OSC 8 payloads and ignores other OSC codes.
+    /// Empty URIs close the active link; non-empty URIs open one.
     fn dispatchOsc(self: *Grid) !void {
         const payload = self.osc_buffer.items;
         if (payload.len < 2 or payload[0] != '8' or payload[1] != ';') return;
@@ -1606,14 +1585,7 @@ pub const Grid = struct {
                 self.eraseRange(0, total);
             },
             3 => {
-                // `\x1b[3J` is an xterm extension that clears the
-                // scrollback buffer only; the visible display is
-                // untouched. This emulator has no scrollback model, so
-                // the correct behavior is a no-op. (Historically this
-                // branch was aliased to `2` which wiped the visible
-                // grid — wrong per the spec, and makes fx's
-                // scrollback-wipe-on-repaint appear to clobber pre-fx
-                // shell history in the harness.)
+                // ED 3 clears scrollback only; this emulator has no scrollback model.
             },
             else => {},
         }
@@ -1649,13 +1621,8 @@ pub const Grid = struct {
         if (self.feed_stats) |stats| stats.touchRow(bottom);
     }
 
-    /// Apply `\x1b[...m` SGR parameters to `current_style`. fx uses a
-    /// narrow subset: reset (0); bold/dim/italic/underline/reverse/strike
-    /// (1, 2, 3, 4, 7, 9) and their clears (22, 23, 24, 27, 29);
-    /// basic 8/16-colour palette (30-37,
-    /// 40-47, 90-97, 100-107), and the 256/truecolor extensions
-    /// (38/48 followed by ;5;N or ;2;R;G;B). Unknown codes are ignored.
-    /// `\x1b[m` with no params is treated as `\x1b[0m` (full reset).
+    /// Applies supported SGR attributes and palette, indexed, or truecolor values.
+    /// Unknown codes are ignored; an empty parameter list performs a full reset.
     fn applySgr(self: *Grid) !void {
         if (self.csi_param_count == 0) {
             self.resetSgrPresentation();
@@ -2212,35 +2179,15 @@ pub const Grid = struct {
         };
     }
 
-    /// Compare `prev` and `next` cell-by-cell and emit the minimal ANSI
-    /// byte stream that transforms a terminal currently displaying
-    /// `prev` into one displaying `next`. Grids must share dimensions.
-    ///
-    /// The algorithm walks rows independently. For each row that has
-    /// any differing cell it: positions the cursor to the first diff,
-    /// walks cells up to the last diff, and emits codepoints with
-    /// inline SGR transitions. A final `\x1b[0m` is emitted if the
-    /// last style was non-default so the terminal is not left in a
-    /// coloured state. The cursor is homed to row 1 col 1 after
-    /// emission so callers can chain subsequent output deterministically.
-    ///
-    /// Trailing-half cells of wide glyphs (width=0) are skipped when
-    /// emitting but still mark the row as changed when they differ.
+    /// Emits the ANSI diff between equal-sized grids. Wide-glyph continuation
+    /// cells affect change detection but are not emitted independently.
     pub fn diffTo(prev: Grid, next: Grid, out: *std.Io.Writer) !void {
         return diffBand(prev, next, 1, next.rows, out);
     }
 
-    /// Band-limited variant of `diffTo`. Only rows in the inclusive
-    /// range `[top_row, bottom_row]` are compared or emitted; cells
-    /// outside the band are left untouched. fx uses this to diff only
-    /// its own viewport band — rows above `viewport_top_row` carry
-    /// pre-fx shell scrollback that must never be clobbered by a
-    /// repaint, even when shadow_vt has no model of it.
-    ///
-    /// Returns without emitting if the band is empty (top > bottom).
-    /// Cursor is left at (top_row, 1) when there were no diffs, or
-    /// wherever the last emit landed it. Callers that care about
-    /// exact final position should emit a CUP themselves.
+    /// Diffs only the inclusive row band, preserving terminal content outside it.
+    /// Empty bands emit nothing; callers that require a final cursor position
+    /// must emit their own CUP sequence.
     pub fn diffBand(
         prev: Grid,
         next: Grid,
@@ -2995,7 +2942,7 @@ fn renderColor(color: Color) contracts.CellColor {
 }
 
 /// Paint an immutable engine snapshot as the complete outer terminal
-/// viewport. This deliberately does not add Fx chrome: every visible cell,
+/// viewport. This deliberately does not add fx chrome: every visible cell,
 /// cursor fact, and interactive terminal mode comes from the hosted child.
 pub fn writeFullSnapshot(
     snapshot: contracts.RenderSnapshot,
@@ -3137,21 +3084,9 @@ fn wideCellLead(cells: []const Cell, row_base: usize, col: u16) ?u16 {
     };
 }
 
-/// Emit an SGR sequence that moves the terminal from "some unknown
-/// prior style" to `next`. We play it safe and emit a full reset
-/// followed by the target state. Cost: a few bytes per transition,
-/// compared to tracking deltas perfectly — worth it for correctness
-/// since the prev-style tracking assumes a single unbroken emission
-/// stream, which breaks if anything else writes to the terminal
-/// between frames (e.g. a signal handler, a logging call).
+/// Transitions between OSC 8 hyperlinks without closing a valid active link first.
 fn emitHyperlinkTransition(out: *std.Io.Writer, grid: Grid, prev_id: u32, next_id: u32) !void {
-    // Per the OSC 8 spec, "it is perfectly legal to switch from one
-    // hyperlink to another without explicitly closing the first one",
-    // so a bare new-open is enough when transitioning between two
-    // links. An explicit close is only needed to terminate a link
-    // (next_id == 0) or to close out a previously-active link before
-    // entering plain text. When prev_id == 0 there is nothing to
-    // close.
+    // OSC 8 permits opening a new link without explicitly closing the active one.
     if (next_id == 0) {
         try out.writeAll("\x1b]8;;\x1b\\");
         return;
@@ -3175,6 +3110,7 @@ fn emitHyperlinkOpen(
     try out.writeAll("\x1b\\");
 }
 
+/// Resets unknown prior style before applying the target state.
 fn emitSgrTransition(out: *std.Io.Writer, next: Style) !void {
     try out.writeAll("\x1b[0m");
     if (next.flags.bold) try out.writeAll("\x1b[1m");
@@ -3808,7 +3744,6 @@ test "sync updates buffer until DECRST" {
 
     try g.feed("\x1b[?2026h");
     try g.feed("ab");
-    // Mid-sync: the grid has not yet applied the writes.
     try expectRow(g, 1, "");
 
     try g.feed("\x1b[?2026l");
@@ -3877,7 +3812,6 @@ test "SGR tracks indexed bg and applies it to written cells" {
     const c3 = g.cellAt(1, 3).?;
     try testing.expect(c1.style.bg.eql(.{ .indexed = 236 }));
     try testing.expect(c2.style.bg.eql(.{ .indexed = 236 }));
-    // Cell 3 was never written — keeps default bg.
     try testing.expect(c3.style.bg.eql(.default));
 }
 
@@ -3885,8 +3819,6 @@ test "EL with active bg fills cleared cells with that bg" {
     var g = try Grid.init(testing.allocator, 6, 1);
     defer g.deinit();
     try g.feed("\x1b[48;5;236mhi\x1b[K");
-    // Cells 1-2 have the written text with bg. Cells 3-6 were cleared
-    // by EL with the bg still active — they should carry the bg too.
     var col: u16 = 1;
     while (col <= 6) : (col += 1) {
         const c = g.cellAt(1, col).?;
@@ -4051,11 +3983,7 @@ fn gridsEqual(a: Grid, b: Grid) bool {
     return true;
 }
 
-/// Feed an initial state into a fresh Grid, clone it, mutate the
-/// clone with `mutate_bytes`, then run `diffTo(prev, next)` and feed
-/// the resulting bytes back into prev. Assert that prev ended up
-/// equal to next — this is the round-trip guarantee the renderer
-/// relies on.
+/// Verifies that applying the diff between two grids reproduces the target grid.
 fn assertDiffRoundTrip(
     cols: u16,
     rows: u16,
@@ -4248,8 +4176,6 @@ test "OSC 8 hyperlink round-trips through diffBand" {
     buf = writer.toArrayList();
 
     try testing.expect(std.mem.find(u8, buf.items, "\x1b]8;;https://x.com/vercel_dev\x1b\\") != null);
-    // Trailing close so the hyperlink does not leak into rows emitted
-    // after the band.
     try testing.expect(std.mem.endsWith(u8, buf.items, "\x1b]8;;\x1b\\"));
 }
 

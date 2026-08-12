@@ -2795,7 +2795,6 @@ describe.skipIf(SKIP)("tui: resize", () => {
       expect(grid.length).toBeGreaterThan(0);
       const footer = findFooter(grid);
       expect(footer).not.toBeNull();
-      // Dividers should match the new width (tolerating trailing trims).
       const dividerRow = footerDividerRow(footer!);
       expect(grid[dividerRow]!.length).toBeGreaterThanOrEqual(40);
       expect(grid[dividerRow]!.length).toBeLessThanOrEqual(60);
@@ -3274,8 +3273,6 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const grid = await session.capturePaneGrid();
       const dividerWidths = grid.filter(isDividerRow).map((line) => line.length);
       expect(dividerWidths.length).toBeGreaterThanOrEqual(1);
-      // At least one divider must match the NEW pane width (80), not the
-      // old 120. Tolerate trailing-space trim.
       const newWidth = dividerWidths.filter((w) => w >= 60 && w <= 80);
       expect(newWidth.length).toBeGreaterThanOrEqual(1);
     },
@@ -3291,9 +3288,6 @@ describe.skipIf(SKIP)("tui: resize", () => {
 
       const grid = await session.capturePaneGrid();
       const dividerWidths = grid.filter(isDividerRow).map((line) => line.length);
-      // A healthy footer has exactly two dividers (top + bottom). Three
-      // is the upper bound tolerated for a settled frame; anything higher
-      // means stale divider rows survived the settled resize repaint.
       expect(dividerWidths.length).toBeLessThanOrEqual(3);
       for (const w of dividerWidths) {
         expect(w).toBeGreaterThanOrEqual(60);
@@ -3308,14 +3302,9 @@ describe.skipIf(SKIP)("tui: resize", () => {
     async () => {
       session = await launchAt(120, 40);
       await session.sendKeys("invalid-dim-recovery");
-      // footer_rows is 4 in src/main.zig, so rows <= 4 triggers
-      // error.TerminalTooSmall; fx should swallow it (src/main.zig:748-752).
       await session.resizeWindow(40, 3, 400);
       expect(session.isAlive()).toBe(true);
 
-      // Recover to a sane size; app must still be responsive and have
-      // exactly one valid footer after the pending resize invalidation
-      // repaints the frame.
       await session.resizeWindow(100, 30, 500);
       const grid = await session.capturePaneGrid();
       expect(grid.join("\n")).toContain("invalid-dim-recovery");
@@ -3329,9 +3318,6 @@ describe.skipIf(SKIP)("tui: resize", () => {
     "rapid resize storm settles into exactly one footer",
     async () => {
       session = await launchAt(120, 40);
-      // Fire a burst faster than the 100 ms debounce so only the last
-      // size is latched. The test asserts that the settled frame has
-      // one and only one well-formed footer.
       await session.resizeWindow(110, 38, 20);
       await session.resizeWindow(100, 36, 20);
       await session.resizeWindow(90, 34, 20);

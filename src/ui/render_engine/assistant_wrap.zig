@@ -112,8 +112,7 @@ fn wrapAssistantTextWithBaseGutter(
         if (ch == 0x1b) {
             const end = display_width.ansiSequenceEnd(text, i);
             if (end <= i) {
-                // Incomplete escape at end of buffer. Pass through and
-                // break so we do not loop forever.
+                // Preserve an incomplete trailing escape without stalling the loop.
                 try out.appendSlice(alloc, text[i..]);
                 break;
             }

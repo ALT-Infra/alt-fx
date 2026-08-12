@@ -81,12 +81,8 @@ pub fn eventf(scope: []const u8, event: []const u8, ctx: TraceContext, comptime 
     line.end();
 }
 
-// logf and eventf are instantiated once per format-args tuple, so anything in
-// their bodies is duplicated across every distinct call shape. TraceLine keeps
-// the line machinery in non-generic helpers compiled once; only the per-tuple
-// print call below stays generic. A failed line swallows the error, keeps
-// accepting prints, and end() drops it without writing, matching the old
-// catch-return behavior.
+// Keep generic trace wrappers small by centralizing line assembly here.
+// Failed lines accept remaining writes but emit nothing.
 const TraceLine = struct {
     out: std.Io.Writer.Allocating,
     failed: bool,

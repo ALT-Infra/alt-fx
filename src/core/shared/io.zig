@@ -4,14 +4,13 @@ const darwin_process_spawn = @import("darwin_process_spawn.zig");
 
 pub const RawEnviron = [*:null]const ?[*:0]const u8;
 
-// Set once from main() before any threads are spawned. Read-only thereafter.
+// Process globals are installed before threads start and remain read-only.
 var real_io: ?std.Io = null;
 
 // Fallback used by non-test code only when setIo was not called. The real
 // application installs `real_io` from main before spawning threads.
 var fallback_threaded: std.Io.Threaded = .init_single_threaded;
 
-// Set once from main() before any threads are spawned. Read-only thereafter.
 var global_environ: ?*const std.process.Environ.Map = null;
 var global_environ_block: ?std.process.Environ.Block = null;
 var global_raw_environ: ?RawEnviron = null;

@@ -930,10 +930,8 @@ test "clearing the credential choice removes the key rather than blanking it" {
     var application = try applyUserPatchToRoot(arena.allocator(), &root, .{ .clear_credential_source = true });
     try std.testing.expect(application.changed);
     try std.testing.expect(!root.object.contains("credential_source"));
-    // Unrelated preferences survive the clear.
     try std.testing.expect(root.object.contains("model"));
 
-    // Clearing an absent key is a no-op rather than a spurious write.
     application = try applyUserPatchToRoot(arena.allocator(), &root, .{ .clear_credential_source = true });
     try std.testing.expect(!application.changed);
 }

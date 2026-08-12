@@ -2025,7 +2025,7 @@ pub fn billingProjectionEql(first: Snapshot, second: Snapshot) bool {
 pub fn writeSnapshot(writer: *std.Io.Writer, snapshot: Snapshot) !void {
     try validateSnapshot(snapshot);
     // Keep the durable session payload in the exact pre-usage-dashboard
-    // shape. Older Fx binaries reject unknown snapshot fields instead of
+    // shape. Older fx binaries reject unknown snapshot fields instead of
     // ignoring them; richer metrics and recovery hints live in the validated
     // session sidecar.
     try writer.writeAll("{\"billing\":");

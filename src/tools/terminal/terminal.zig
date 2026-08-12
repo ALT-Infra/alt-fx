@@ -104,7 +104,7 @@ pub const MonitorOperationInput = struct {
 };
 
 /// Public semantic terminal input. Authority and persistence fields are
-/// intentionally absent; Core derives them from the current Fx session.
+/// intentionally absent; Core derives them from the current fx session.
 pub const Input = struct {
     action: contracts.Action,
     session_id: ?[]const u8 = null,

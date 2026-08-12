@@ -1,6 +1,4 @@
-// Renders submitted user turns in the normal background-card presentation or
-// the experimental minimal presentation. Owns row collection and wrap math so
-// the rest of `ui/` treats the prompt as a single opaque helper.
+// Renders submitted user turns and owns their row collection and wrapping.
 const std = @import("std");
 const build_checkpoint = @import("../render_engine/build_checkpoint.zig");
 const display_width = @import("../../core/shared/display_width.zig");
@@ -25,9 +23,7 @@ const osc8_prefix = "\x1b]8;;";
 const osc8_terminator = "\x1b\\";
 const osc8_close = osc8_prefix ++ osc8_terminator;
 
-// Fallback card styles used ONLY when OSC-11 fails (no TTY, minimal terminal
-// that doesn't answer the query). Each fallback owns a contrasting indexed
-// foreground instead of relying on the terminal default.
+// Indexed-color fallbacks for terminals that do not answer OSC 11.
 const fallback_bar_dark = "\x1b[48;5;238m\x1b[38;5;250m";
 const fallback_bar_light = "\x1b[48;5;255m\x1b[38;5;16m";
 const accent_dark = "\x1b[38;5;252m";
@@ -39,8 +35,6 @@ pub var user_message_style: []const u8 = fallback_bar_dark;
 var user_message_style_buf: [64]u8 = undefined;
 var marker_style: []const u8 = dark_marker_style;
 
-// Called once from `initTheme`. Computes the stable card style from the
-// session's startup terminal bg and stores it into `user_message_style`.
 pub fn setStyle(light: bool, terminal_bg: ?Rgb) void {
     user_message_style = computeCardStyle(light, terminal_bg, &user_message_style_buf);
     marker_style = if (light) light_marker_style else dark_marker_style;
@@ -108,10 +102,7 @@ fn lastSpaceIn(slice: []const u8) ?usize {
     return null;
 }
 
-// Cuts the first row_budget display-cells off `text`, preferring the last
-// whitespace inside the cut so words don't split mid-glyph. Returns the byte
-// length of the cut AND the byte length to skip before the next iteration
-// (which may include a trailing wrap-point space).
+// Returns display-safe keep and skip boundaries, preferring whitespace.
 const WrapCut = struct { keep_bytes: usize, skip_bytes: usize };
 
 fn wrapCut(text: []const u8, row_budget: usize) WrapCut {
@@ -123,7 +114,7 @@ fn wrapCut(text: []const u8, row_budget: usize) WrapCut {
         return .{ .keep_bytes = sp, .skip_bytes = sp + 1 };
     }
 
-    // No space within budget — force at least one display unit so caller loops advance.
+    // Force one display unit when no break point fits so the loop advances.
     if (prefix.len == 0) {
         var end: usize = 0;
         while (end < text.len and text[end] == 0x1b) {

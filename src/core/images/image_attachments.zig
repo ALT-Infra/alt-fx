@@ -1001,8 +1001,6 @@ pub fn imageBadgeVisibleWidth(image_id: usize) usize {
     return "[Image ".len + digits + "]".len;
 }
 
-/// Bump-and-return helper for image-id counters. Centralises the trivial
-/// increment so every App / FakeApp doesn't reimplement it.
 pub fn allocateImageId(counter: *usize) usize {
     const id = counter.*;
     counter.* += 1;
@@ -1178,12 +1176,8 @@ pub fn imagePlaceholderSpanEndingAt(text: []const u8, byte_offset: usize) ?Image
 
 pub const ExpandWithBadgesResult = struct { cursor_out: ?usize, expanded_any: bool };
 
-/// Walks `text` and emits it to `writer`, replacing each `[Image #<id>]`
-/// placeholder with a path-free badge carrying the attachment's own id, so a
-/// badge names the same image everywhere the id is used.
-/// If `cursor_in` is non-null, returns the byte offset in the emitted output
-/// that corresponds to the cursor's byte offset in `text`.
-/// Placeholders whose id is not in `images` are emitted verbatim.
+/// Replaces known image placeholders with path-free badges keyed by attachment ID.
+/// Unknown placeholders pass through; `cursor_out` maps `cursor_in` to output bytes.
 pub fn expandPlaceholdersWithBadges(
     alloc: std.mem.Allocator,
     writer: *std.Io.Writer,

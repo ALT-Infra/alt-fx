@@ -294,7 +294,7 @@ fn readLinuxProcStat(file: std.Io.File, buffer: []u8) !usize {
     while (true) {
         // A process can disappear after open, and procfs reports that read as
         // ESRCH. Read directly so the expected race does not reach Zig's
-        // unexpected-errno reporter before we can classify it.
+        // unexpected-errno reporter before classification.
         const rc = std.posix.system.read(file.handle, buffer.ptr, buffer.len);
         switch (std.posix.errno(rc)) {
             .SUCCESS => {

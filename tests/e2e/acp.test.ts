@@ -906,7 +906,6 @@ async function continueRecovery(client: AcpClient, timeoutMs = LIVE_TIMEOUT) {
   throw new Error(`ACP recovery continuation timed out; messages=${JSON.stringify(messages)}`);
 }
 
-// Model-independent ACP scenarios.
 describe("acp: model-independent", () => {
   test("response waits continue across an internal read slice timeout", async () => {
     let reads = 0;
@@ -6720,7 +6719,6 @@ describe("acp: model catalog authentication", () => {
   }
 });
 
-// Model-backed ACP scenarios.
 describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
   let client: AcpClient;
 
@@ -6974,11 +6972,9 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
         await client.request("session/new", { mcpServers: [] }, 2);
         await client.readLine(); // consume session/update notification
 
-        // Cancel with no active prompt should be safe
         client.send({ jsonrpc: "2.0", method: "session/cancel", params: {} });
         await new Promise((r) => setTimeout(r, 300));
 
-        // Server is still alive — can still process requests
         const listResp = await client.request("session/list", {}, 3) as any;
         expect(listResp.result).toBeDefined();
         expect(Array.isArray(listResp.result.sessions)).toBe(true);

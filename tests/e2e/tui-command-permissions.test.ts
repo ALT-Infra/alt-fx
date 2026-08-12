@@ -4373,8 +4373,7 @@ describe("effect-aware command permissions", () => {
       let childInitialChecked = false;
       let childContinuationDeliveryChecked = false;
       const secondSeen: string[] = [];
-      // Only the root session writes progress lines to this process's stderr, so the
-      // root and child tool calls are counted separately.
+      // Only the root session writes progress to this process's stderr.
       const rootSubagentCallIds = new Set<string>();
       const childSubagentCallIds = new Set<string>();
       const secondRoute = (body: string) => {

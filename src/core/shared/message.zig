@@ -24,13 +24,8 @@ pub const Content = union(enum) {
     }
 };
 
-/// One role-tagged request message in a core conversation.
-///
-/// Ownership of `content` and `tool_calls` is tracked via the `owns_*` boolean
-/// flags rather than type-level distinctions (fx/AGENTS.md prefers `[]u8` for
-/// owned, `[]const u8` for borrowed). `tool_calls` aliases `types.ToolCall`,
-/// whose inner fields are `?[]const u8`, so the flags keep ownership explicit
-/// without duplicating the request message shape.
+/// One role-tagged request message. Explicit flags track ownership because
+/// `ToolCall` byte slices do not encode it at the type level.
 pub const Message = struct {
     role: Role,
     content: ?Content = null,

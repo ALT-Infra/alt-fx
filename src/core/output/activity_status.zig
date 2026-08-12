@@ -299,16 +299,12 @@ test "thinking clock freezes while waiting on user input and excludes the wait" 
     var stream: StreamState = .{ .active = true, .turn_started_ms = 1_000 };
     var buf: [64]u8 = undefined;
 
-    // 4s of thinking, then an approval opens.
     syncWaitingClock(&stream, true, 5_000);
     try std.testing.expectEqual(@as(i64, 5_000), stream.waiting_since_ms);
 
-    // The counter stays frozen at 4s and the marker holds steady no matter
-    // how long the approval sits unanswered.
     try std.testing.expectEqualStrings("• Thinking (4s)", buildThinkingLabel(&buf, stream, 900_000).?);
     try std.testing.expectEqual(@as(?bool, true), thinkingBlinkVisible(stream, 900_000));
 
-    // Answered after 895s: the wait is excluded, the clock resumes at 4s.
     syncWaitingClock(&stream, false, 900_000);
     try std.testing.expectEqual(@as(i64, 0), stream.waiting_since_ms);
     try std.testing.expectEqualStrings("• Thinking (4s)", buildThinkingLabel(&buf, stream, 900_000).?);
@@ -317,8 +313,6 @@ test "thinking clock freezes while waiting on user input and excludes the wait" 
 
 test "waiting clock accumulates across repeated prompts in one turn" {
     var stream: StreamState = .{ .active = true, .turn_started_ms = 0 };
-    // Without a turn clock there is nothing to shift, but the waiting flag
-    // still clears.
     syncWaitingClock(&stream, true, 1_000);
     syncWaitingClock(&stream, false, 9_000);
     try std.testing.expectEqual(@as(i64, 0), stream.turn_started_ms);
@@ -329,7 +323,6 @@ test "waiting clock accumulates across repeated prompts in one turn" {
     syncWaitingClock(&stream, false, 10_000);
     syncWaitingClock(&stream, true, 11_000);
     syncWaitingClock(&stream, false, 20_000);
-    // 1s + 1s of real thinking around two prompts totaling 17s of waiting.
     var buf: [64]u8 = undefined;
     try std.testing.expectEqualStrings("• Thinking (2s)", buildThinkingLabel(&buf, stream, 20_000).?);
 }

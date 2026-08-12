@@ -1,15 +1,8 @@
 const std = @import("std");
 
-// std.mem.sort stamps out its entire stable block sort for every element
-// type and comparator pair; across fx call sites that adds hundreds of KiB
-// of near-identical machine code. This module keeps one non-generic stable
-// sort and reduces each call site to a comparator thunk.
-//
-// Algorithm: insertion-sorted runs merged bottom-up with symmerge
-// (Kim & Kutzner, "Stable Minimum Storage Merging by Symmetric Comparisons",
-// 2004): stable, in place, O(n log n) comparisons, O(n log^2 n) swaps. The
-// extra swap factor is irrelevant at fx data sizes (session, path, and
-// catalog scale lists).
+// Share one stable sort across element types to avoid duplicating generic code.
+// Uses insertion-sorted runs and in-place SymMerge (Kim and Kutzner, 2004):
+// O(n log n) comparisons and O(n log^2 n) swaps.
 
 /// Drop-in replacement for std.mem.sort: stable, in place, same signature.
 pub fn sort(

@@ -156,10 +156,6 @@ export function buildEvalProcessEnv(
   };
 }
 
-// ---------------------------------------------------------------------------
-// Eval runner
-// ---------------------------------------------------------------------------
-
 export async function runEval(
   prompt: string,
   opts: EvalOptions = {},
