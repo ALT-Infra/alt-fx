@@ -4176,18 +4176,18 @@ describe("gateway stream lifecycle", () => {
     }
   }, 30_000);
 
-  test("over-cap Retry-After pauses once and explicit continue preserves context", async () => {
-    const root = createFixtureRoot("retry-after-pause-continue");
+  test("exhausted retry budget pauses once and explicit continue preserves context", async () => {
+    const root = createFixtureRoot("retry-budget-pause-continue");
     const tracePath = join(root.root, "trace.log");
     let continued = false;
     const gateway = startGateway(() =>
       continued
         ? fakeGatewayFinalText("Recovered after explicit continuation.")
-        : unavailableResponse("31")
+        : unavailableResponse("0")
     );
     try {
       const first = await runFx(
-        ["ask", "--json", "--auto", "Pause on the provider cooldown."],
+        ["ask", "--json", "--auto", "Pause after exhausting recovery."],
         {
           cwd: root.workspace,
           env: fixtureEnv(root, gateway, tracePath),
@@ -4196,10 +4196,10 @@ describe("gateway stream lifecycle", () => {
       );
       const paused = parseAskJson(first.stdout);
       expect(first.code).toBe(1);
-      expect(gateway.requestCount()).toBe(1);
+      expect(gateway.requestCount()).toBe(10);
       expect(paused.recovery?.state).toBe("paused");
       expect(paused.recovery?.cause).toBe("provider_unavailable");
-      expect(paused.recovery?.attempt).toBe(1);
+      expect(paused.recovery?.attempt).toBe(10);
       expect(paused.recovery?.attempt_limit).toBe(10);
       expect(paused.recovery?.required_action).toBe("continue_later");
       expect(paused.recovery?.durable).toBe(true);
@@ -4209,7 +4209,7 @@ describe("gateway stream lifecycle", () => {
         { cwd: root.workspace, env: { HOME: root.home } },
       );
       expect(detail.code).toBe(0);
-      expect(gateway.requestCount()).toBe(1);
+      expect(gateway.requestCount()).toBe(10);
 
       continued = true;
       const resumed = await runFx(
@@ -4230,8 +4230,8 @@ describe("gateway stream lifecycle", () => {
       const recovered = parseAskJson(resumed.stdout);
       expect(resumed.code).toBe(0);
       expect(recovered.output).toContain("Recovered after explicit continuation.");
-      expect(gateway.requestCount()).toBe(2);
-      expect(gateway.requests[1]!.body).toContain("Pause on the provider cooldown.");
+      expect(gateway.requestCount()).toBe(11);
+      expect(gateway.requests[10]!.body).toContain("Pause after exhausting recovery.");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -4251,7 +4251,7 @@ describe("gateway stream lifecycle", () => {
           delta: partialText,
         })}\n\n`,
       ),
-      unavailableResponse("31"),
+      ...Array.from({ length: 9 }, () => unavailableResponse("0")),
       fakeGatewayFinalText(`${partialText}${finalText}`),
     ];
     const gateway = startGateway(() =>
@@ -4270,7 +4270,7 @@ describe("gateway stream lifecycle", () => {
       expect(first.code).toBe(1);
       expect(paused.output).toBe(partialText);
       expect(paused.recovery?.state).toBe("paused");
-      expect(gateway.requestCount()).toBe(2);
+      expect(gateway.requestCount()).toBe(10);
 
       const resumed = await runFx(
         [
@@ -4290,7 +4290,7 @@ describe("gateway stream lifecycle", () => {
       const recovered = parseAskJson(resumed.stdout);
       expect(resumed.code).toBe(0);
       expect(recovered.output).toBe(`${partialText}${finalText}`);
-      expect(gateway.requestCount()).toBe(3);
+      expect(gateway.requestCount()).toBe(11);
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });

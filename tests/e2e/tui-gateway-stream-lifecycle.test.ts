@@ -1883,13 +1883,16 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const finalText = "Interactive recovery completed.";
       const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
         "fx-tui-recovery-continue-",
-        [retryAfterUnavailable(31), fakeGatewayFinalText(finalText)],
+        [
+          ...Array.from({ length: 10 }, () => retryAfterUnavailable(0)),
+          fakeGatewayFinalText(finalText),
+        ],
       );
 
       await session!.sendText(originalPrompt);
-      await session!.waitForText("recovery paused after 1/10 attempts", TIMEOUT);
+      await session!.waitForText("recovery paused after 10/10 attempts", TIMEOUT);
       await session!.waitForComposer(TIMEOUT);
-      expect(queuedGateway.requests).toHaveLength(1);
+      expect(queuedGateway.requests).toHaveLength(10);
 
       await session!.sendText("/continue");
       try {
@@ -1905,8 +1908,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       }
       const scrollback = await session!.captureFullScrollback();
 
-      expect(queuedGateway.requests).toHaveLength(2);
-      expect(queuedGateway.requests[1]!.body).toContain(originalPrompt);
+      expect(queuedGateway.requests).toHaveLength(11);
+      expect(queuedGateway.requests[10]!.body).toContain(originalPrompt);
       expect(scrollback.split(originalPrompt).length - 1).toBe(1);
       expect(scrollback).toContain(finalText);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -1966,7 +1969,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         "fx-tui-recovery-tool-lifecycle-",
         [
           fakeGatewayToolCall("read_before_pause", "read_file", { path: "before.txt" }),
-          retryAfterUnavailable(31),
+          ...Array.from({ length: 10 }, () => retryAfterUnavailable(0)),
           fakeGatewayToolCall("read_after_pause", "read_file", { path: "after.txt" }),
           fakeGatewayFinalText(finalText),
         ],
@@ -1975,14 +1978,14 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       writeFileSync(join(root!, "workspace", "after.txt"), "after\n");
 
       await session!.sendText("Read both fixture files across recovery.");
-      await session!.waitForText("recovery paused after 1/10 attempts", TIMEOUT);
-      expect(queuedGateway.requests).toHaveLength(2);
+      await session!.waitForText("recovery paused after 10/10 attempts", TIMEOUT);
+      expect(queuedGateway.requests).toHaveLength(11);
 
       await session!.sendText("/continue");
       await session!.waitForText(finalText, TIMEOUT);
       const scrollback = await session!.captureFullScrollback();
 
-      expect(queuedGateway.requests).toHaveLength(4);
+      expect(queuedGateway.requests).toHaveLength(13);
       expect(scrollback).toContain("└ Read before.txt");
       expect(scrollback).toContain("└ Read after.txt");
       expect(scrollback).toContain(finalText);
@@ -1992,9 +1995,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "Fast failure continuation preserves exact model identity and remaining budget",
+    "Fast failure heartbeat preserves exact model identity through its retry budget",
     async () => {
-      const responses: FakeGatewayResponse[] = [retryAfterUnavailable(31)];
+      const responses: FakeGatewayResponse[] = [];
       for (let index = 0; index < 10; index += 1) {
         responses.push(retryAfterUnavailable(0));
       }
@@ -2014,10 +2017,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
 
       await session!.sendText("Preserve the Fast recovery budget.");
-      await session!.waitForText("recovery paused after 1/10 attempts", TIMEOUT);
-      expect(queuedGateway.requests).toHaveLength(1);
-
-      await session!.sendText("/continue");
       await session!.waitForText("recovery paused after 10/10 attempts", TIMEOUT);
 
       expect(queuedGateway.requests).toHaveLength(10);
@@ -2148,21 +2147,21 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         "fx-tui-recovery-partial-continue-",
         [
           partialEofResponse(partialText),
-          retryAfterUnavailable(31),
+          ...Array.from({ length: 9 }, () => retryAfterUnavailable(0)),
           fakeGatewayFinalText(`${partialText}${finalText}`),
         ],
       );
 
       await session!.sendText("Recover the interrupted response without duplication.");
-      await session!.waitForText("recovery paused after 2/10 attempts", TIMEOUT);
+      await session!.waitForText("recovery paused after 10/10 attempts", TIMEOUT);
       await session!.waitForComposer(TIMEOUT);
-      expect(queuedGateway.requests).toHaveLength(2);
+      expect(queuedGateway.requests).toHaveLength(10);
 
       await session!.sendText("/continue");
       await session!.waitForText(finalText, TIMEOUT);
       const scrollback = await session!.captureFullScrollback();
 
-      expect(queuedGateway.requests).toHaveLength(3);
+      expect(queuedGateway.requests).toHaveLength(11);
       expect(scrollback.split(partialText).length - 1).toBe(1);
       expect(scrollback.split(finalText).length - 1).toBe(1);
       expect(readFileSync(stderrPath, "utf8")).toBe("");

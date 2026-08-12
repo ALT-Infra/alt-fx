@@ -1088,7 +1088,7 @@ describe("acp: model-independent", () => {
       const finalTextSuffix = "ACP recovery completed.";
       const gateway = startFakeGateway([
         partialEofResponse(partialText),
-        retryAfterUnavailable(31),
+        ...Array.from({ length: 9 }, () => retryAfterUnavailable(0)),
         finalText(`${partialText}${finalTextSuffix}`),
       ]);
       try {
@@ -1104,7 +1104,7 @@ describe("acp: model-independent", () => {
           TIMEOUT,
         );
         expect(paused.promptResult.result.stopReason).toBe("refused");
-        expect(gateway.requests).toHaveLength(2);
+        expect(gateway.requests).toHaveLength(10);
         const pausedUpdates = JSON.stringify(paused.messages);
         expect(pausedUpdates).toContain("modelResponseRecovery");
         expect(pausedUpdates).toContain('"state":"paused"');
@@ -1114,8 +1114,8 @@ describe("acp: model-independent", () => {
         const resumed = await continueRecovery(client, TIMEOUT);
         expect(resumed.promptResult.error).toBeUndefined();
         expect(resumed.promptResult.result.stopReason).toBe("end_turn");
-        expect(gateway.requests).toHaveLength(3);
-        expect(gateway.requests[2]!.body).toContain(
+        expect(gateway.requests).toHaveLength(11);
+        expect(gateway.requests[10]!.body).toContain(
           "Preserve this ACP prompt through recovery.",
         );
         const allUpdates = JSON.stringify([...paused.messages, ...resumed.messages]);
@@ -1195,7 +1195,7 @@ describe("acp: model-independent", () => {
           path: "recovery-fixture.txt",
         }),
         partialEofResponse(partialText),
-        retryAfterUnavailable(31),
+        ...Array.from({ length: 9 }, () => retryAfterUnavailable(0)),
         finalText(`${partialText}${finalTextSuffix}`),
       ]);
       try {
@@ -1210,7 +1210,7 @@ describe("acp: model-independent", () => {
           TIMEOUT,
         );
         expect(paused.promptResult.result.stopReason).toBe("refused");
-        expect(gateway.requests).toHaveLength(3);
+        expect(gateway.requests).toHaveLength(11);
 
         await client.close();
         client = await AcpClient.create({
@@ -1248,8 +1248,8 @@ describe("acp: model-independent", () => {
         const resumed = await continueRecovery(client, TIMEOUT);
         expect(resumed.promptResult.error).toBeUndefined();
         expect(resumed.promptResult.result.stopReason).toBe("end_turn");
-        expect(gateway.requests).toHaveLength(4);
-        expect(gateway.requests[3]!.body).toContain(toolEvidence);
+        expect(gateway.requests).toHaveLength(12);
+        expect(gateway.requests[11]!.body).toContain(toolEvidence);
         const restartedUpdates = JSON.stringify([
           ...loadMessages,
           ...resumed.messages,
