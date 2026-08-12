@@ -216,6 +216,28 @@ cd tests/e2e && bun test tui-*.test.ts               # just TUI tests (requires 
 
 TUI tests use tmux to drive the interactive terminal. They require `tmux` to be installed.
 
+## Pull Request Classification
+
+Every pull request must have exactly one `type:` label, chosen by its primary intent:
+
+* `type: bug`: fixes incorrect behavior
+
+* `type: feature`: adds a new user-facing capability
+
+* `type: improvement`: improves existing user-facing behavior
+
+* `type: docs`: changes documentation only
+
+* `type: maintenance`: changes internal tooling, dependencies, CI, or implementation structure without a user-facing behavior change
+
+* `type: release`: prepares or repairs a release
+
+* `type: security`: fixes or hardens a security boundary
+
+Assign the label when the PR is opened and keep it accurate when the PR changes. If the authenticated contributor cannot manage labels, state the required label and keep the PR in draft until a maintainer or repository agent applies it. For a mixed PR, choose the label that describes the primary reason the PR exists. If that is ambiguous, ask before applying or changing the label.
+
+Keep PR titles as clean imperative sentences, such as `Restore feedback report file clipboard`. Do not add bracketed prefixes such as `[bug]`, `[feature]`, or `[improvement]`. Type belongs in the label, not the title.
+
 ## Full CI on Feature Branches
 
 Do not run the complete deterministic test suite locally as the default development loop. Run the focused test for the changed path, build the binary, and exercise that path with `./zig-out/bin/fx`.

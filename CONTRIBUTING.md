@@ -43,6 +43,26 @@ Once the focused checks pass, create a clean checkpoint commit, push the non-`ma
 
 Standard PR CI labels Debug and ReleaseSafe Build & Test and deterministic E2E results separately. Do not mark the draft PR ready until all four Full CI jobs and the final ship gate have succeeded for the exact current commit. Each platform aggregate requires both optimization modes. A result from an older commit does not count. Live model evals are separate from this gate because they require credentials and are not deterministic.
 
+## Pull Requests
+
+Every PR must carry exactly one label that describes its primary intent:
+
+* `type: bug`: fixes incorrect behavior
+
+* `type: feature`: adds a new user-facing capability
+
+* `type: improvement`: improves existing user-facing behavior
+
+* `type: docs`: changes documentation only
+
+* `type: maintenance`: changes internal tooling, dependencies, CI, or implementation structure without a user-facing behavior change
+
+* `type: release`: prepares or repairs a release
+
+* `type: security`: fixes or hardens a security boundary
+
+If you cannot manage labels, a maintainer or repository agent will apply the label before review. For a mixed PR, choose the label that best describes why the PR exists. Keep the title as a clean imperative sentence and do not add bracketed type prefixes such as `[bug]` or `[improvement]`.
+
 ## Repo Shape
 
 * `src/main.zig`: composition root only
