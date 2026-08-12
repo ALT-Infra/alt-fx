@@ -172,20 +172,8 @@ noinline fn runeWidth(codepoint: u21) usize {
     return 1;
 }
 
-// Returns true when a rune of display width `w` starting at column `col`
-// would overflow a terminal of `cols` columns. fx runs DECAWM-OFF
-// session-wide, so the wrap is strict: a rune whose rightmost cell lands on
-// column `cols` does not wrap; only `col + w - 1 > cols` does.
-//
-// Preconditions (not re-checked; callers must enforce):
-// - cols >= 1
-// - w >= 1
-//
-// Future callers that cannot guarantee those preconditions should inline the
-// guards at the call site rather than weakening this helper.
-//
-// The intermediate sum is widened to `u32` so `col = 65535` cannot trap in
-// safety-checked builds.
+/// Returns whether width `w` at one-based `col` exceeds `cols` under DECAWM-OFF.
+/// Requires non-zero inputs and widens arithmetic to avoid `u16` overflow.
 pub fn shouldWrapAt(col: u16, w: u16, cols: u16) bool {
     return @as(u32, col) + @as(u32, w) - 1 > @as(u32, cols);
 }

@@ -2085,8 +2085,7 @@ fn collectGitHubRepoIdentity(arena: Allocator, git_dir: []const u8, started_ns: 
 fn detectGitWorktreeState(arena: Allocator, workspace_root: []const u8, git_dir: []const u8, started_ns: i128) GitWorktreeState {
     if (gitReadExpired(started_ns)) return .unknown;
 
-    // This is a bounded hint, not `git status`: a small index can prove some
-    // obvious tracked-file dirtiness, but it cannot rule out untracked files.
+    // This bounded hint can prove tracked-file changes but cannot detect untracked files.
     const dirty_markers = [_][]const u8{
         "MERGE_HEAD",
         "CHERRY_PICK_HEAD",

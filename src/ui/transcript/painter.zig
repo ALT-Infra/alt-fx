@@ -656,12 +656,8 @@ fn collectMeasuredSourceRows(
     return null;
 }
 
-/// Byte offset where measured visual row `rows` begins, walking `groups`
-/// forward from `span_start` and measuring each group at `target_cols`.
-/// Landing on a group boundary yields the next group's start; consuming
-/// every row lands on the span end. Returns null when the groups hold
-/// fewer than `rows` rows. Both the advance and rewind endpoint paths
-/// derive their offsets through this walk so the two stay inverse.
+/// Finds the byte offset after `rows` visual rows. Shared endpoint logic keeps
+/// forward and reverse projection walks inverse.
 fn flowOffsetAfterMeasuredRows(
     batch: VisibleTranscriptBatch,
     groups: []const MeasuredSourceRow,

@@ -3224,9 +3224,7 @@ describe("cli: models", () => {
     TIMEOUT,
   );
 
-  // The real gateway grants team-private models on the API key alone; it ignores
-  // x-vercel-ai-gateway-team here and rejects fx login tokens outright. The fake
-  // below mirrors that, so the catalog credential rule is exercised as shipped.
+  // Mirror the gateway's credential handling for private model catalogs.
   for (const scenario of [
     {
       name: "uses the anonymous public catalog without a credential",

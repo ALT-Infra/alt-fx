@@ -4889,8 +4889,7 @@ test "input escape parser handles cmd+r as all-session resume picker" {
 }
 
 test "input escape parser handles ctrl+a/ctrl+e via kitty protocol" {
-    // ESC[97;5u — Kitty protocol for Ctrl+A (keycode 'a'=97, modifier 5=ctrl+1)
-    // Should remap to byte 1 (Ctrl+A) which the byte handler maps to Home.
+    // ESC[97;5u is Kitty's Ctrl+A encoding.
     var stage: u8 = 1;
     var param: u16 = 0;
     var param2: u16 = 0;
@@ -4903,8 +4902,7 @@ test "input escape parser handles ctrl+a/ctrl+e via kitty protocol" {
     try std.testing.expectEqual(@as(?InputEscapeAction, .{ .remapped_byte = 1 }), ctrl_a);
     try std.testing.expectEqual(@as(u8, 0), stage);
 
-    // ESC[101;5u — Kitty protocol for Ctrl+E (keycode 'e'=101, modifier 5=ctrl+1)
-    // Should remap to byte 5 (Ctrl+E) which the byte handler maps to End.
+    // ESC[101;5u is Kitty's Ctrl+E encoding.
     stage = 1;
     param = 0;
     param2 = 0;

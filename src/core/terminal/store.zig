@@ -2365,7 +2365,7 @@ pub fn loadOrCreateOwnerCatalogClaim(
     return operation.ownOwnerCatalogClaim(alloc, claim);
 }
 
-/// Reloads authority for the current Fx owner without trusting caller-supplied
+/// Reloads authority for the current fx owner without trusting caller-supplied
 /// cwd, backend, or generation. Those facts are recovered from durable state;
 /// the active profile/session/workspace/transport/sandbox identity must still
 /// match exactly.
@@ -2461,7 +2461,7 @@ pub fn reloadHumanTakeoverAuthorityClaim(
     }, .humanTakeover());
 }
 
-/// Reloads a proof only through the managed-child capability of the durable Fx
+/// Reloads a proof only through the managed-child capability of the durable fx
 /// session that owns it. A terminal id alone cannot select proof storage.
 pub fn reloadAuthorityClaim(
     alloc: Allocator,

@@ -830,7 +830,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         await session.waitForText("anthropic/claude-opus-4.8", TIMEOUT);
         expect(readFileSync(settingsPath, "utf8")).toBe(initialSettings);
         await session.sendKeys("Enter");
-        // Gateway order is preserved after Fx's default sentinel.
+        // Gateway order is preserved after fx's default sentinel.
         await session.waitForText("default", TIMEOUT);
         for (let i = 0; i < 2; i += 1) await session.sendKeys("Down");
         await session.waitForText("xhigh", TIMEOUT);

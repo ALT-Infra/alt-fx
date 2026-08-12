@@ -327,13 +327,6 @@ test "approval prompt treats Ctrl+C as deny without exiting" {
 }
 
 test "kitty-protocol Ctrl+C decodes to byte 3" {
-    // `\x1b[99;5u` is how kitty-keyboard sends Ctrl+C. fx enables the
-    // protocol at startup, so any modern terminal (iTerm2, Ghostty,
-    // WezTerm, kitty) delivers Ctrl+C as this multi-byte sequence
-    // rather than the plain byte 3. The main escape decoder
-    // must translate it back to byte 3 before it reaches
-    // approval/subagent routing — otherwise Ctrl+C during an
-    // approval is silently swallowed.
     const input_runtime = @import("../input/runtime.zig");
     var stage: u8 = 1;
     var param: u16 = 0;

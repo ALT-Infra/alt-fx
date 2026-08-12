@@ -831,18 +831,6 @@ fn formatFullToolStatus(alloc: Allocator, text: []const u8, cols: u16) ![]u8 {
     return out.toOwnedSlice(alloc);
 }
 
-/// Walk the entry list and produce a byte stream shaped for the given
-/// column width. Each entry kind reshapes at paint time:
-///   - `raw_bytes`: fixed-shape banners, system notices, command
-///     summaries, and spinners with stored trailing tails normalized.
-///   - `user_turn`: rebuilt via the user prompt card renderer at the current
-///     cols so the card border and display-only skill spans track the
-///     terminal width.
-///   - `assistant_turn`: reflowed via `wrapAssistantText` so streamed
-///     markdown text wraps to the current cols with SGR preserved.
-/// Inter-block visual gaps are inserted here so producers do not own
-/// spacing policy.
-/// Returned slice is owned by the caller and freed with `alloc`.
 pub fn renderTableForTranscript(
     alloc: Allocator,
     table: assistant_presentation.TablePayload,
@@ -2021,6 +2009,7 @@ const RenderEntriesBuilder = struct {
     }
 };
 
+/// Reflows structured entries at paint-time width and centralizes block spacing.
 fn renderEntries(
     alloc: Allocator,
     entries: []const TranscriptEntry,

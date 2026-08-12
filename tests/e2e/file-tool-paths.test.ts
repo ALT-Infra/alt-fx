@@ -249,10 +249,7 @@ type SubagentTurn = {
   execution?: { tool_steps?: Array<{ tool_results?: SubagentToolResult[] }> };
 };
 
-// The child's durable record is the authoritative account of what its tools
-// actually did, and it survives host shutdown. Its shape depends on how the
-// child ended: an interrupted turn reports completed_tool_names, a finished turn
-// reports full tool_results. Both carry the read outcome.
+// Interrupted and completed child turns persist tool outcomes in different fields.
 function readSubagentChild(home: string) {
   const sessionsDir = join(home, ".fx", "sessions");
   const children = readdirSync(sessionsDir)
@@ -292,12 +289,7 @@ function readSubagentChild(home: string) {
   };
 }
 
-// A noninteractive host exits as soon as the parent turn resolves, which can
-// interrupt a one-off child before it runs a single tool. Holding the parent's
-// post-create response keeps the host alive on a deterministic signal, the
-// child's own tool result, rather than on a timer, then releases it so ordinary
-// shutdown and the async host-exit contract still apply. The deadline exists
-// only so a regression reports a missing child read instead of hanging.
+// Hold the parent open until the child read completes; the deadline prevents hangs.
 function createChildReadGate(deadlineMs: number) {
   const { promise: opened, resolve: release } = Promise.withResolvers<void>();
   let output: string | null = null;

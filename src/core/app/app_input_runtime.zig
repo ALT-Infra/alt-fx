@@ -862,9 +862,7 @@ pub fn Runtime(comptime App: type) type {
         ) !void {
             const byte = raw.byte;
             const max_input_len = input_limits.composer_bytes;
-            // max-level cue on the rising edge of the slash command menu: fire
-            // once when this byte makes it appear, not on every keystroke while
-            // it stays open. Cheap no-op unless the max level is on.
+            // Fire the max-level cue only when the slash menu becomes visible.
             const slash_menu_was_visible = slashMenuVisibleForCue(app);
             defer announceSlashMenuOpened(app, slash_menu_was_visible);
             if (try routeActivePasteByte(app, byte)) return;
@@ -10063,7 +10061,6 @@ test "escape on a freeform draft arms then clears before cancelling the batch" {
     try std.testing.expect(app.question_prompt.isFreeformSelected());
     _ = try app.question_prompt.apply(alloc, .{ .insert_ascii = 'k' });
 
-    // First Esc arms the double-tap clear and leaves the draft alone.
     app.input_runtime.terminal_action_decoder.stage = 1;
     app.input_runtime.terminal_action_decoder.cancel_pending = true;
     app.input_runtime.terminal_action_decoder.started_ms = 0;
@@ -10074,7 +10071,6 @@ test "escape on a freeform draft arms then clears before cancelling the batch" {
     try std.testing.expect(app.question_prompt.isActive());
     try std.testing.expect(!app.worker.cancel_requested);
 
-    // Second Esc inside the window clears the field but keeps the batch.
     app.input_runtime.terminal_action_decoder.stage = 1;
     app.input_runtime.terminal_action_decoder.cancel_pending = true;
     app.input_runtime.terminal_action_decoder.started_ms = 0;
@@ -10086,7 +10082,6 @@ test "escape on a freeform draft arms then clears before cancelling the batch" {
     try std.testing.expect(!app.input_runtime.gestures.escapeClearArmed());
     try std.testing.expect(!app.worker.cancel_requested);
 
-    // Third Esc on the empty field cancels the batch.
     app.input_runtime.terminal_action_decoder.stage = 1;
     app.input_runtime.terminal_action_decoder.cancel_pending = true;
     app.input_runtime.terminal_action_decoder.started_ms = 0;

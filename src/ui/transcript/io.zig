@@ -1,6 +1,6 @@
 // Host contract:
 // - fields: stdout_file, shadow_vt, shadow_vt_alloc, layout,
-//   viewport_top_row, installed pre-Fx document state
+//   viewport_top_row, installed pre-fx document state
 // This module owns the normal frame sink. Exact probes, lifecycle controls,
 // titles, crash recovery, and noninteractive output stay with their domain
 // owners.
@@ -22,10 +22,7 @@ pub fn enableShadowVt(shell: anytype, alloc: Allocator) !void {
     const grid = try alloc.create(vt_emulator.Grid);
     errdefer alloc.destroy(grid);
     grid.* = try vt_emulator.Grid.init(alloc, cols, rows);
-    // The shadow is a render oracle, not a terminal emulator — we
-    // need writes to land in the grid immediately so the render's
-    // clone-and-diff can reason about current state, not a buffered
-    // pre-sync snapshot.
+    // The render oracle needs committed cells, not deferred sync state.
     grid.defer_sync_updates = false;
     grid.autowrap = false;
     shell.shadow_vt = grid;

@@ -127,11 +127,7 @@ pub fn themeNeedsUpdate(light: bool, terminal_bg: ?TerminalRgb) bool {
     return current.r != background.r or current.g != background.g or current.b != background.b;
 }
 
-// Theme detection result. `rgb` is present only when we actually probed the
-// terminal (no override, terminal answered OSC-11). On the override path
-// `rgb` is always null — the user explicitly chose light/dark so paying a
-// 200ms OSC-11 timeout is wasteful, and the card module has a conservative
-// fallback shade for that case.
+// Explicit theme overrides skip OSC 11, leaving `rgb` null for fallback shading.
 pub const ThemeDetection = theme_detection.Detection;
 pub const TerminalBackground = theme_protocol.Background;
 pub const explicitThemeOverride = theme_detection.explicitThemeOverride;

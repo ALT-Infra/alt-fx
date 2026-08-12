@@ -70,7 +70,7 @@ pub const SgrState = struct {
         }
 
         // Exact full-body match against the known single-parameter codes the
-        // markdown renderer emits. Multi-parameter SGRs we recognize are
+        // markdown renderer emits. Recognized multi-parameter SGRs are
         // matched whole (e.g. "38;5;245"); anything else is ignored.
         if (std.mem.eql(u8, body, "1")) self.bold = true else if (std.mem.eql(u8, body, "2")) self.dim = true else if (std.mem.eql(u8, body, "3")) self.italic = true else if (std.mem.eql(u8, body, "4")) self.underline = true else if (std.mem.eql(u8, body, "9")) self.strike = true else if (std.mem.eql(u8, body, "22")) {
             self.bold = false;
@@ -115,7 +115,7 @@ pub const AssistantPacer = struct {
     deferred_started_ns: ?i128 = null,
     /// Tracks which SGR attributes the terminal should have active at the
     /// start of the next emit. Other frame-work (footer, body renders)
-    /// between ticks can emit their own `\x1b[0m`, so we re-establish state
+    /// between ticks can emit their own `\x1b[0m`, so state is restored
     /// by prefixing each emit with `\x1b[0m` + the active opens.
     sgr: SgrState = .{},
 
@@ -342,13 +342,7 @@ pub const AssistantPacer = struct {
         while (emitted < count and i < self.pending.items.len) {
             const first = self.pending.items[i];
             if (first == 0x1b) {
-                // ANSI escape sequences emit atomically without
-                // consuming codepoint budget. writeTranscript
-                // interposes cursor moves between batches, so
-                // splitting a sequence would produce literal `[1m`
-                // on screen. If the sequence is incomplete (no
-                // terminator yet), hold the tail for a later tick
-                // rather than emit a partial escape.
+                // Emit ANSI sequences atomically; hold incomplete tails for a later tick.
                 const end = display_width.ansiSequenceEnd(self.pending.items, i);
                 if (end > i) {
                     if (!ansiSequenceComplete(self.pending.items, i, end)) break;
@@ -361,20 +355,10 @@ pub const AssistantPacer = struct {
             i += len;
             emitted += 1;
         }
-        // Do NOT greedily include trailing escapes past the last
-        // visible character. Eagerly gobbling a trailing close SGR
-        // would flip `sgr` state in the same emit that was supposed
-        // to leave it open (breaking mid-turn styling), and the
-        // prefix-with-reset logic below re-establishes state on the
-        // next emit so attaching the close early buys nothing.
+        // Leave trailing close sequences for the next emit so tracked SGR state stays open.
         if (i == 0) return;
 
-        // Re-establish SGR state before emitting content. Other renderers
-        // (footer, body) may have emitted `\x1b[0m` between ticks, so the
-        // terminal could be in a clean state while our tracker says bold or
-        // bg-gray are still open. Prefix each emit with `\x1b[0m` + the
-        // active opens so the content always renders with the intended
-        // styling regardless of what happened since the previous emit.
+        // Restore tracked SGR state because other renderers may reset it between ticks.
         if (self.sgr.isActive()) {
             var prefix_buf: [48]u8 = undefined;
             const reset = "\x1b[0m";
@@ -490,11 +474,9 @@ test "enqueue and drain emits bytes paced by time" {
     try pacer.enqueue(alloc, "hello world");
     try std.testing.expect(pacer.hasPending());
 
-    // first tick seeds last_emit_ns AND emits 1 char immediately (no 8ms latency)
     try pacer.tick(alloc, 0, cap.callbacks());
     try std.testing.expectEqualStrings("h", cap.emitted.items);
 
-    // advance 100ms at base 400 cps → budget 40 → emits remaining 10 chars
     try pacer.tick(alloc, 100_000_000, cap.callbacks());
     try std.testing.expectEqualStrings("hello world", cap.emitted.items);
     try std.testing.expectEqual(@as(usize, 0), pacer.pending.items.len);
@@ -509,9 +491,7 @@ test "tick emits only budget-many codepoints" {
 
     try pacer.enqueue(alloc, "abcdefghij");
 
-    // first tick: emits "a" (1 char immediate)
     try pacer.tick(alloc, 0, cap.callbacks());
-    // 10ms at base 400 cps (backlog too small to scale) → 4 more chars = "bcde"
     try pacer.tick(alloc, 10_000_000, cap.callbacks());
     try std.testing.expectEqualStrings("abcde", cap.emitted.items);
     try std.testing.expectEqual(@as(usize, 5), pacer.pending.items.len);
@@ -524,10 +504,8 @@ test "emit preserves UTF-8 multi-byte boundaries" {
     var cap = TestCapture{};
     defer cap.deinit();
 
-    // "áñ" = 0xc3 0xa1 0xc3 0xb1 (4 bytes, 2 codepoints)
     try pacer.enqueue(alloc, "áñ");
 
-    // first tick emits 1 codepoint → "á" (2 bytes)
     try pacer.tick(alloc, 0, cap.callbacks());
     try std.testing.expectEqualStrings("á", cap.emitted.items);
     try std.testing.expectEqual(@as(usize, 2), pacer.pending.items.len);
@@ -540,16 +518,14 @@ test "partial UTF-8 at buffer tail is held until rest arrives" {
     var cap = TestCapture{};
     defer cap.deinit();
 
-    // 0xc3 alone is a valid 2-byte lead, incomplete
+    // 0xc3 begins a two-byte sequence.
     try pacer.enqueue(alloc, &[_]u8{0xc3});
 
-    // first tick tries to emit 1 codepoint, but the sequence is incomplete → no emit
     try pacer.tick(alloc, 0, cap.callbacks());
     try pacer.tick(alloc, 100_000_000, cap.callbacks());
     try std.testing.expectEqual(@as(usize, 0), cap.emitted.items.len);
     try std.testing.expectEqual(@as(usize, 1), pacer.pending.items.len);
 
-    // now arrives the continuation byte → "á"
     try pacer.enqueue(alloc, &[_]u8{0xa1});
     try pacer.tick(alloc, 200_000_000, cap.callbacks());
     try std.testing.expectEqualStrings("á", cap.emitted.items);
@@ -562,8 +538,7 @@ test "rate scales smoothly with backlog" {
     var cap = TestCapture{};
     defer cap.deinit();
 
-    // 1000 chars → after 1st tick emits 1, backlog=999, cps = 999*1000/1500 = 666
-    // 10ms budget = 10_000_000 * 666 / 1e9 = 6 → total 7 chars
+    // A 999-character backlog yields 666 cps and six characters in 10 ms.
     var big: [1000]u8 = undefined;
     @memset(&big, 'x');
     try pacer.enqueue(alloc, &big);
@@ -580,7 +555,6 @@ test "large backlog paces without atomic dump" {
     var cap = TestCapture{};
     defer cap.deinit();
 
-    // 5000 chars is a huge first burst — must NOT dump atomically
     var huge: [5000]u8 = undefined;
     @memset(&huge, 'y');
     try pacer.enqueue(alloc, &huge);
@@ -588,7 +562,7 @@ test "large backlog paces without atomic dump" {
     try pacer.tick(alloc, 0, cap.callbacks());
     try pacer.tick(alloc, 1_000_000, cap.callbacks());
 
-    // cps capped at max_chars_per_sec (5000) → 1ms budget = 5 chars; total 1 + 5 = 6
+    // The capped rate emits five characters in 1 ms after the initial tick.
     try std.testing.expect(cap.emitted.items.len < 50);
     try std.testing.expect(pacer.pending.items.len > 4900);
 }
@@ -769,7 +743,6 @@ test "deferFinish defers and fires when buffer drains" {
     try std.testing.expect(deferred);
     try std.testing.expect(pacer.finished);
 
-    // first tick emits "h"; second tick drains "i" and fires deferred finish
     try pacer.tick(alloc, 0, cap.callbacks());
     try pacer.tick(alloc, 10_000_000, cap.callbacks());
     try std.testing.expectEqualStrings("hi", cap.emitted.items);
@@ -939,7 +912,7 @@ test "finish-drain mode uses higher rate" {
     defer types.freeHistoryTurn(alloc, turn);
     _ = try pacer.deferFinish(alloc, .{ .turn = turn });
 
-    // finish-drain target_ms=200: backlog=499 → cps=2495, 10ms budget=24 → 1 (first) + 24 = 25
+    // At 2,495 cps, 10 ms emits 24 characters after the initial tick.
     try pacer.tick(alloc, 0, cap.callbacks());
     try pacer.tick(alloc, 10_000_000, cap.callbacks());
     try std.testing.expectEqual(@as(usize, 25), cap.emitted.items.len);
@@ -1005,14 +978,10 @@ test "ANSI escape sequences are emitted atomically without consuming codepoint b
 
     try pacer.enqueue(alloc, "\x1b[1mhi\x1b[22m!");
 
-    // first tick seeds + emits 1 codepoint: the preceding \x1b[1m rides along atomically
     try pacer.tick(alloc, 0, cap.callbacks());
     try std.testing.expectEqualStrings("\x1b[1mh", cap.emitted.items);
 
-    // advance 100ms, budget drains the rest. Because `\x1b[1m` was already
-    // seen but not yet closed, the next emit re-establishes bold state with
-    // a leading `\x1b[0m\x1b[1m` so any mid-stream SGR reset (e.g. from the
-    // footer) cannot leave the tail of this word unstyled.
+    // Each chunk restores open SGR state in case another renderer reset it.
     try pacer.tick(alloc, 100_000_000, cap.callbacks());
     try std.testing.expectEqualStrings("\x1b[1mh\x1b[0m\x1b[1mi\x1b[22m!", cap.emitted.items);
     try std.testing.expectEqual(@as(usize, 0), pacer.pending.items.len);
@@ -1025,13 +994,11 @@ test "incomplete ANSI sequence at tail is held until completion arrives" {
     var cap = TestCapture{};
     defer cap.deinit();
 
-    // \x1b[1 has no terminator yet
     try pacer.enqueue(alloc, "x\x1b[1");
     try pacer.tick(alloc, 0, cap.callbacks());
     try std.testing.expectEqualStrings("x", cap.emitted.items);
     try std.testing.expectEqual(@as(usize, 3), pacer.pending.items.len);
 
-    // now the terminator arrives
     try pacer.enqueue(alloc, "my");
     try pacer.tick(alloc, 100_000_000, cap.callbacks());
     try std.testing.expectEqualStrings("x\x1b[1my", cap.emitted.items);
@@ -1044,14 +1011,10 @@ test "sgr state re-established after open sgr in prior emit" {
     var cap = TestCapture{};
     defer cap.deinit();
 
-    // Inline code spans multiple emits.
     try pacer.enqueue(alloc, "\x1b[38;5;245mcode\x1b[39m done");
     try pacer.tick(alloc, 0, cap.callbacks()); // emits `\x1b[38;5;245mc`
     try pacer.tick(alloc, 100_000_000, cap.callbacks()); // emits rest
 
-    // Second emit must start with `\x1b[0m\x1b[38;5;245m` to re-establish the
-    // code foreground in case the footer or another renderer issued a reset
-    // between ticks.
     try std.testing.expect(std.mem.indexOf(u8, cap.emitted.items, "\x1b[38;5;245mc\x1b[0m\x1b[38;5;245m") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.emitted.items, "\x1b[39m") != null);
 }
@@ -1147,7 +1110,6 @@ test "no sgr prefix emitted when state is clean" {
     var cap = TestCapture{};
     defer cap.deinit();
 
-    // Plain text has no open SGR, so no reset prefix should be added.
     try pacer.enqueue(alloc, "hello");
     try pacer.tick(alloc, 0, cap.callbacks());
     try pacer.tick(alloc, 100_000_000, cap.callbacks());
@@ -1163,11 +1125,9 @@ test "sgr state clears after closing code" {
 
     try pacer.enqueue(alloc, "\x1b[1mA\x1b[22mB");
     try pacer.tick(alloc, 0, cap.callbacks()); // emits `\x1b[1mA`
-    // State should still be bold-on here.
     try std.testing.expect(pacer.sgr.bold);
 
     try pacer.tick(alloc, 100_000_000, cap.callbacks()); // emits `\x1b[0m\x1b[1m\x1b[22mB`
-    // After consuming the close, state is clean.
     try std.testing.expect(!pacer.sgr.bold);
 }
 

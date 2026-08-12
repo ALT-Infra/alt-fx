@@ -496,7 +496,6 @@ pub const Store = struct {
         };
     }
 
-    /// Opens the store using HOME-based config discovery.
     /// Opens a writable store rooted at `$HOME`, creating the layout if needed.
     pub fn init(alloc: Allocator, workspace_root: []const u8) !Store {
         const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
@@ -12048,8 +12047,6 @@ test "history page rejects longer changed prefix and malformed cursor before rep
     try replaceHistoryPageFixture(alloc, ctx.store, "history-longer-stale", 30, 6, "new");
     try std.testing.expectError(error.StaleHistoryPageCursor, ctx.store.loadHistoryPage(alloc, "history-longer-stale", cursor, 2));
 
-    // If replay occurred first this nonexistent session would report not found.
-    // Invalid cursor wins, proving the parse/structure boundary runs first.
     try std.testing.expectError(
         error.InvalidHistoryPageCursor,
         ctx.store.loadHistoryPage(alloc, "not-created", "not-a-v2-cursor", 2),

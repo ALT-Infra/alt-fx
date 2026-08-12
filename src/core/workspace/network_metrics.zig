@@ -1,7 +1,4 @@
-// In-memory ring buffer of recent gateway HTTP calls. Used by /feedback
-// to surface latency / error patterns without forcing a persistent trace
-// log. Process-wide and lock-protected: callers do not need to plumb the
-// buffer through their context.
+// Process-wide ring buffer used by /feedback for recent network diagnostics.
 
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
@@ -115,7 +112,6 @@ pub fn snapshot(out: []NetworkCall) usize {
     const n = @min(stored, out.len);
     var i: usize = 0;
     while (i < n) : (i += 1) {
-        // Copy the last n records oldest-first.
         const idx = (head + ring_capacity - n + i) % ring_capacity;
         out[i] = ring[idx];
     }

@@ -103,10 +103,8 @@ pub const FooterViewport = struct {
     rows: std.ArrayList(ComposedFooterRow) = .empty,
     cursor: Cursor = .{ .row = 1, .col = 1 },
     cursor_visible: bool = true,
-    /// True once `beginFrame` has been called at least once, so we
-    /// know `geometry.top` points at a real footer band. Without this,
-    /// `eraseCurrentFrame` called before the footer has ever laid out
-    /// would clear from row 1 and wipe pre-fx shell scrollback.
+    /// True after `beginFrame` establishes valid footer geometry. Erasing
+    /// earlier would start at row 1 and wipe pre-fx shell scrollback.
     has_frame: bool = false,
     /// Set when transcript/body rendering emits a clear that can touch
     /// the footer band. A later footer render must repaint even when

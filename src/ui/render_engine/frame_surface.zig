@@ -346,7 +346,7 @@ pub const FrameSurface = struct {
         return target;
     }
 
-    /// Removes Fx-owned color, emphasis, and hyperlink presentation while
+    /// Removes fx-owned color, emphasis, and hyperlink presentation while
     /// preserving glyphs, geometry, ownership, and shell-owned cells.
     pub fn neutralizeFxOwnedPresentation(self: *FrameSurface) void {
         for (self.cells) |*cell| {

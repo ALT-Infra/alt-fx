@@ -2178,15 +2178,12 @@ test "slash completion labels strip argument prefixes" {
     try std.testing.expectEqualStrings("lines", nthSlashCompletionLabel(testSlashRegistry(), "/input ", 0).?);
     try std.testing.expectEqualStrings("tint", nthSlashCompletionLabel(testSlashRegistry(), "/input ", 1).?);
     try std.testing.expectEqualStrings("tint", nthSlashCompletionLabel(testSlashRegistry(), "/input t", 0).?);
-    // Sandbox labels are also stripped
     try std.testing.expectEqualStrings("os", nthSlashCompletionLabel(testSlashRegistry(), "/sandbox ", 0).?);
     try std.testing.expectEqualStrings("none", nthSlashCompletionLabel(testSlashRegistry(), "/sandbox ", 1).?);
-    // Permission labels are also stripped
     try std.testing.expectEqualStrings("ask", nthSlashCompletionLabel(testSlashRegistry(), "/permissions ", 0).?);
     try std.testing.expectEqualStrings("auto", nthSlashCompletionLabel(testSlashRegistry(), "/permissions ", 1).?);
     try std.testing.expectEqualStrings("yolo", nthSlashCompletionLabel(testSlashRegistry(), "/permissions ", 2).?);
     try std.testing.expectEqualStrings("reset", nthSlashCompletionLabel(testSlashRegistry(), "/permissions ", 3).?);
-    // Allowlist labels reflect the argument stage
     try std.testing.expectEqualStrings("view", nthSlashCompletionLabel(testSlashRegistry(), "/allowlist ", 0).?);
     try std.testing.expectEqualStrings("add", nthSlashCompletionLabel(testSlashRegistry(), "/allowlist ", 1).?);
     try std.testing.expectEqualStrings("command", nthSlashCompletionLabel(testSlashRegistry(), "/allowlist add ", 0).?);
@@ -2194,7 +2191,6 @@ test "slash completion labels strip argument prefixes" {
     try std.testing.expectEqualStrings("url", nthSlashCompletionLabel(testSlashRegistry(), "/allowlist remove u", 0).?);
     try std.testing.expectEqualStrings("read_file", nthSlashCompletionLabel(testSlashRegistry(), "/allowlist remove tool ", 0).?);
     try std.testing.expectEqualStrings("commands", nthSlashCompletionLabel(testSlashRegistry(), "/allowlist reset c", 0).?);
-    // Non-arg completions return the full command
     try std.testing.expectEqualStrings("/help", nthSlashCompletionLabel(testSlashRegistry(), "/he", 0).?);
 }
 

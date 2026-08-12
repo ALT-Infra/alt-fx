@@ -1,12 +1,7 @@
 const std = @import("std");
 
-// std.mem.Allocator.free and std.ArrayList.deinit are small generic
-// functions that LLVM inlines at every call site, and Zig re-materializes
-// every active defer at every error exit. In functions with many try sites
-// a single `defer list.deinit(alloc)` line expands into dozens of copies of
-// the full free path (safety fill plus devirtualized allocator free). This
-// module keeps that path in one non-generic function so each copy is a
-// single call.
+// Centralize generic free paths that Zig would otherwise duplicate at each
+// error exit, reducing generated code to one call per cleanup site.
 
 /// Drop-in replacement for `alloc.free(slice)`.
 pub fn free(alloc: std.mem.Allocator, memory: anytype) void {

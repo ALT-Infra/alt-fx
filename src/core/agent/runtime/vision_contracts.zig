@@ -483,11 +483,8 @@ pub noinline fn project_text_only_messages(
     return projected;
 }
 
-/// Produces an arena-scoped native-route view that preserves raw images and
-/// omits Vision evidence outside the root turn beginning at
-/// `current_user_message_index`. A Vision call is retained only when its
-/// assistant message is followed by a contiguous tool-result block containing
-/// its structured route rejection, and only that result position is retained.
+/// Produces arena-scoped native-route messages with raw images. Retains only
+/// root-turn Vision calls followed by contiguous structured route rejections.
 /// Canonical history is unchanged.
 pub noinline fn project_native_messages(
     alloc: Allocator,
