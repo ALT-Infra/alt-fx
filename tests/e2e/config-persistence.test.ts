@@ -1319,11 +1319,15 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
 
         expect(tree(home)).toEqual([
           ".fx",
+          ".fx/history.jsonl",
+          ".fx/history.lock",
           ".fx/sessions",
           ".fx/settings.json",
           ".fx/settings.lock",
         ]);
         expect(statSync(join(home, ".fx")).mode & 0o777).toBe(0o700);
+        expect(statSync(join(home, ".fx", "history.jsonl")).mode & 0o777).toBe(0o600);
+        expect(statSync(join(home, ".fx", "history.lock")).mode & 0o777).toBe(0o600);
         expect(statSync(join(home, ".fx", "settings.json")).mode & 0o777).toBe(0o600);
         expect(statSync(join(home, ".fx", "settings.lock")).mode & 0o777).toBe(0o600);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
