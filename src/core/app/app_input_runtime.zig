@@ -11261,6 +11261,30 @@ test "app_input_runtime submit resolves slash completion through core command sp
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 }
 
+test "app_input_runtime recalls a submitted slash command with history previous" {
+    const alloc = std.testing.allocator;
+    var app = FakeSubmitApp{ .alloc = alloc };
+    defer app.deinit();
+
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "/he");
+    app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
+
+    try Runtime(FakeSubmitApp).submit(&app, 100);
+
+    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.composer_history.count());
+    try std.testing.expectEqualStrings(
+        "/help",
+        app.input_runtime.composer_history.entryText(0).?,
+    );
+
+    try input_completion_runtime.CompletionRuntime(FakeSubmitApp).navigatePromptHistory(
+        &app,
+        -1,
+    );
+
+    try std.testing.expectEqualStrings("/help", app.input_runtime.edit_state.input.items);
+}
+
 test "app_input_runtime submit preserves a dismissed slash query" {
     const alloc = std.testing.allocator;
     var app = FakeSubmitApp{ .alloc = alloc };
@@ -11371,7 +11395,11 @@ test "app_input_runtime routes pending image list locally and preserves its plac
     try std.testing.expectEqual(@as(usize, 1), app.pending_images.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.preflight_count);
     try std.testing.expectEqual(@as(usize, 0), app.queue_accept_count);
-    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.composer_history.count());
+    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.composer_history.count());
+    try std.testing.expectEqualStrings(
+        "/images",
+        app.input_runtime.composer_history.entryText(0).?,
+    );
     try std.testing.expect(app.last_prompt == null);
 }
 
@@ -11430,7 +11458,17 @@ test "app_input_runtime clears pending image placeholders after image command st
         try std.testing.expectEqual(@as(usize, 0), app.pending_images.items.len);
         try std.testing.expectEqual(@as(usize, 0), app.preflight_count);
         try std.testing.expectEqual(@as(usize, 0), app.queue_accept_count);
-        try std.testing.expectEqual(@as(usize, 0), app.input_runtime.composer_history.count());
+        const expected_history_count: usize = if (fail_after_clear) 0 else 1;
+        try std.testing.expectEqual(
+            expected_history_count,
+            app.input_runtime.composer_history.count(),
+        );
+        if (!fail_after_clear) {
+            try std.testing.expectEqualStrings(
+                "/images clear",
+                app.input_runtime.composer_history.entryText(0).?,
+            );
+        }
         try std.testing.expect(app.last_prompt == null);
     }
 }
@@ -11587,7 +11625,11 @@ test "app_input_runtime keeps a repeated image command local while an image is p
         try std.testing.expectEqualStrings("[Image #1][Image #2]", app.input_runtime.edit_state.input.items);
         try std.testing.expectEqual(@as(usize, 0), app.preflight_count);
         try std.testing.expectEqual(@as(usize, 0), app.queue_accept_count);
-        try std.testing.expectEqual(@as(usize, 0), app.input_runtime.composer_history.count());
+        try std.testing.expectEqual(@as(usize, 1), app.input_runtime.composer_history.count());
+        try std.testing.expectEqualStrings(
+            last_command,
+            app.input_runtime.composer_history.entryText(0).?,
+        );
         try std.testing.expect(app.last_prompt == null);
         try std.testing.expectEqual(@as(usize, 0), app.last_images.len);
         try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
@@ -12533,7 +12575,7 @@ test "app_input_runtime persists expanded pasted prompt bytes" {
     );
 }
 
-test "app_input_runtime excludes slash commands from durable prompt history" {
+test "app_input_runtime persists slash commands in durable prompt history" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -12554,8 +12596,13 @@ test "app_input_runtime excludes slash commands from durable prompt history" {
         100,
     );
     defer prompt_history_store.freeLoadedEntries(alloc, entries);
-    try std.testing.expectEqual(@as(usize, 0), entries.len);
-    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.composer_history.count());
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqualStrings("/help", entries[0].text);
+    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.composer_history.count());
+    try std.testing.expectEqualStrings(
+        "/help",
+        app.input_runtime.composer_history.entryText(0).?,
+    );
 }
 
 test "app_input_runtime excludes image-bearing prompts from durable history" {

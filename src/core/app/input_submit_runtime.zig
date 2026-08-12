@@ -69,11 +69,11 @@ pub fn SubmitRuntime(comptime App: type) type {
             const resolved_slash_submission = resolvedSlashSubmission(app, left_trimmed);
             if (knownSlashCommand(app, resolved_slash_submission)) |command| {
                 if (requiresPromptCredential(command, resolved_slash_submission) and !try preflightPrompt(app)) return;
-                try submitSlashCommand(app, left_trimmed, null);
+                try submitSlashCommand(app, left_trimmed, null, max_prompt_history);
                 return;
             }
             if (shouldRouteUnknownSlashCommand(app, resolved_slash_submission)) {
-                try submitSlashCommand(app, left_trimmed, null);
+                try submitSlashCommand(app, left_trimmed, null, max_prompt_history);
                 return;
             }
             if (pendingImagesPrefixEnd(
@@ -90,6 +90,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                         app,
                         command_text,
                         expanded.text[0..command_start],
+                        max_prompt_history,
                     );
                     return;
                 }
@@ -345,7 +346,12 @@ pub fn SubmitRuntime(comptime App: type) type {
             return null;
         }
 
-        fn submitSlashCommand(app: *App, text: []const u8, retained_prefix: ?[]const u8) !void {
+        fn submitSlashCommand(
+            app: *App,
+            text: []const u8,
+            retained_prefix: ?[]const u8,
+            max_prompt_history: usize,
+        ) !void {
             const command_text = resolvedSlashSubmission(app, text);
             const command_copy = try app.alloc.dupe(u8, command_text);
             defer app.alloc.free(command_copy);
@@ -391,6 +397,11 @@ pub fn SubmitRuntime(comptime App: type) type {
                 app.shell.render_requests.request(.footer);
             };
             try App.handleCommand(app, command_copy);
+            recordAcceptedSlashCommandHistory(
+                app,
+                max_prompt_history,
+                command_copy,
+            );
         }
 
         fn projectRetainedImageTokens(
@@ -722,17 +733,54 @@ pub fn SubmitRuntime(comptime App: type) type {
             max_prompt_history: usize,
             accepted: *const AcceptedDraftProjection,
         ) void {
-            if (comptime @hasField(App, "prompt_history")) {
-                if (!app.prompt_history.enabled) return;
-            }
-            app.input_runtime.composer_history.record(
-                app.alloc,
+            recordComposerHistory(
+                app,
                 max_prompt_history,
                 accepted.input,
                 accepted.pasted_blocks.items,
                 app.pending_images.items,
                 accepted.image_tokens.items,
                 accepted.skill_tokens.items,
+            );
+        }
+
+        fn recordAcceptedSlashCommandHistory(
+            app: *App,
+            max_prompt_history: usize,
+            command: []const u8,
+        ) void {
+            recordComposerHistory(
+                app,
+                max_prompt_history,
+                command,
+                &.{},
+                &.{},
+                &.{},
+                &.{},
+            );
+            recordAcceptedPrompt(app, command);
+        }
+
+        fn recordComposerHistory(
+            app: *App,
+            max_prompt_history: usize,
+            text: []const u8,
+            pasted: []const paste_blocks.PastedBlock,
+            images: []const types.ImageAttachment,
+            image_tokens: []const entity_spans.ImageTokenSpan,
+            skill_tokens: []const registered_entities.SkillTokenSpan,
+        ) void {
+            if (comptime @hasField(App, "prompt_history")) {
+                if (!app.prompt_history.enabled) return;
+            }
+            app.input_runtime.composer_history.record(
+                app.alloc,
+                max_prompt_history,
+                text,
+                pasted,
+                images,
+                image_tokens,
+                skill_tokens,
             ) catch |err| {
                 debug_trace.logf(
                     "input",
