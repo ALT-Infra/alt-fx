@@ -76,12 +76,16 @@ fn format_feedback_issue_notice(
     defer out.deinit();
 
     switch (disposition) {
-        .copied_file => try out.writer.writeAll("Feedback copied as .md. Redact it, then "),
+        .copied_file => try out.writer.writeAll("Feedback copied to clipboard. "),
         .copy_failed => |path| try out.writer.print("Clipboard copy failed. Redact {s}, then ", .{path}),
         .saved => |path| try out.writer.print("Feedback saved at {s}. Redact it, then ", .{path}),
         .unavailable => try out.writer.writeAll("Could not create feedback report. "),
     }
     try out.writer.print("\x1b]8;;{s}\x1b\\\x1b[4mReport issue\x1b[24m\x1b]8;;\x1b\\.", .{url});
+    switch (disposition) {
+        .copied_file => try out.writer.writeAll(" Please ensure its redaction before sharing."),
+        else => {},
+    }
     return out.toOwnedSlice();
 }
 
@@ -3626,9 +3630,10 @@ test "feedback issue notice emits a balanced OSC 8 hyperlink" {
     defer std.testing.allocator.free(body);
 
     try std.testing.expectEqualStrings(
-        "Feedback copied as .md. Redact it, then " ++
+        "Feedback copied to clipboard. " ++
             "\x1b]8;;https://github.com/vercel-labs/fx/issues/new?template=fx-report.yml\x1b\\" ++
-            "\x1b[4mReport issue\x1b[24m\x1b]8;;\x1b\\.",
+            "\x1b[4mReport issue\x1b[24m\x1b]8;;\x1b\\. " ++
+            "Please ensure its redaction before sharing.",
         body,
     );
 }
@@ -3642,7 +3647,7 @@ test "feedback issue notice distinguishes Markdown file outcomes" {
     }{
         .{
             .disposition = .{ .copied_file = report_path },
-            .expected = "Feedback copied as .md. Redact it, then ",
+            .expected = "Feedback copied to clipboard. ",
         },
         .{
             .disposition = .{ .copy_failed = report_path },

@@ -1946,10 +1946,16 @@ describe("effect-aware command permissions", () => {
       await activeSession.waitForText("Report issue", TIMEOUT);
       await activeSession.waitForText(
         process.platform === "darwin"
-          ? "Feedback copied as .md"
+          ? "Feedback copied to clipboard"
           : "Feedback saved at",
         TIMEOUT,
       );
+      if (process.platform === "darwin") {
+        await activeSession.waitForText(
+          "Please ensure its redaction before sharing.",
+          TIMEOUT,
+        );
+      }
 
       const escapes = await activeSession.capturePaneEscapes();
       expect(escapes).toContain("Report issue");
