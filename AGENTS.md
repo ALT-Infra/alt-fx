@@ -352,7 +352,16 @@ When the PR merges, CI compares the version tag to what exists in git. If the ta
 
 ### Writing the changelog
 
-Whether automated or manual, the changelog follows the same format. Group changes under `### New Features`, `### Bug Fixes`, `### Improvements`, etc. Bold the feature/fix name, then describe it concisely. Reference PR numbers in parentheses.
+Whether automated or manual, the changelog is public product copy. Describe observable user behavior, not the engineering process behind it. Use the diff, commits, and merged pull requests as research evidence only.
+
+Public changelog entries must:
+
+* Spell the product name `fx`. Preserve different casing only when it is part of an exact code identifier such as `FX_MODEL`.
+* Use only relevant sections from `### Breaking Changes`, `### New Features`, `### Improvements`, `### Bug Fixes`, and `### Security`. Omit empty sections.
+* Bold a short feature or fix name, then describe the user-visible change after a colon.
+* Omit pull request numbers, issue numbers, commit hashes, contributor names, and author attribution.
+* Omit internal details such as repository moves, website or marketing work, CDN layout, CI workflows, test fixtures, branch history, and implementation-only refactors. Translate relevant work into its public user outcome or leave it out.
+* Avoid forcing every merged change into the notes. A change without a public user outcome does not need a bullet.
 
 Only the current release should have markers; remove `<!-- release:start -->` and `<!-- release:end -->` from any previous entry:
 
@@ -362,23 +371,17 @@ Only the current release should have markers; remove `<!-- release:start -->` an
 <!-- release:start -->
 ### New Features
 
-- **Foo command** — Added `foo` command for bar (#42)
-
-### Contributors
-
-- @ctate
+- **Interactive terminal startup:** Start an interactive shell when the `terminal` tool receives an empty command
 <!-- release:end -->
 
 ## 0.2.5
 
 ### Improvements
 
-- **Inline CLI rendering** — Replaced the alternate-screen TUI ...
+- **Inline rendering:** Keep the active conversation visible in terminal scrollback
 ```
 
-Include a `### Contributors` section listing GitHub usernames (with `@` prefix) of everyone who contributed. Check the git log between the previous tag and HEAD.
-
-Do not prefix entries with commit hashes. Use descriptive section names.
+Do not add a `### Contributors` section or tracker references. Use descriptive section names.
 
 Do not create version tags manually. Do not change `build.zig.zon` version (it is a placeholder).
 
