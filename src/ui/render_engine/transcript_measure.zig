@@ -7,14 +7,8 @@ pub const WalkResult = struct {
     end_col: u16,
 };
 
-/// Uncapped visual-row walker. Given `bytes` and a starting `(row, col)`
-/// at column-width `cols`, returns the `(row, col)` after the walk.
-///
-/// DECAWM-OFF wrap predicate: a rune of display width `w` at column
-/// `col` wraps only on strict overflow, `col + w - 1 > cols`. A rune
-/// whose rightmost cell lands on column `cols` does not wrap. This
-/// matches assistant wrapping and `visualRowsForLine`; a property test
-/// locks the agreement.
+/// Walks visual rows without capping the result to the viewport. Under
+/// DECAWM-OFF, glyphs wrap only when they exceed the right margin.
 pub fn walkText(start_row: u32, start_col: u16, bytes: []const u8, cols: u16) WalkResult {
     if (bytes.len == 0 or cols == 0) return .{ .end_row = start_row, .end_col = start_col };
 
@@ -81,16 +75,8 @@ pub fn nextCursorColForLine(line: []const u8, cols: u16) u16 {
     return @min(cols, walkText(1, 1, line, cols).end_col);
 }
 
-/// Return the byte offset in `text` where visual row (skip_rows + 1)
-/// begins. Used by the partial-tail renderer: when the oldest
-/// fully-fitting entry's predecessor overflows by K rows, we need to
-/// emit only the last `line_rows - K` rows of that predecessor to
-/// cover the top of the viewport without bleed. Walks the line the
-/// same way `visualRowsForLine` counts rows (ANSI skipped, `\r` resets
-/// col, `\n` advances row, `col + w - 1 > cols` soft-wraps) and
-/// returns the byte index where row (skip_rows + 1) starts. If
-/// `skip_rows` exceeds the line's actual row count, returns
-/// `text.len`.
+/// Returns the byte offset of visual row `skip_rows + 1` using the same
+/// ANSI-aware wrapping rules as `visualRowsForLine`.
 pub fn skipVisualRowsInLine(text: []const u8, cols: u16, skip_rows: u16) usize {
     if (skip_rows == 0 or cols == 0 or text.len == 0) return 0;
 

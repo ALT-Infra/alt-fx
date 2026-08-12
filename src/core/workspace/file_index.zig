@@ -1,29 +1,10 @@
-//! Ultra-fast workspace file index for the @-mention picker.
+//! Background workspace file index for the @-mention picker.
 //!
-//! The index is populated on a background thread from the canonical bounded
-//! Git/fallback workspace provider
-//! and stored in generation-owned parallel flat buffers:
-//!
-//!   - `paths_buf`        concatenated path bytes, no separators
-//!   - `lower_buf`        parallel buffer lowercased for case-insensitive match
-//!   - `offsets[i..i+1]`  byte range within both buffers for path `i`
-//!   - `basename_starts`  byte offset of each path's basename within the path
-//!   - `kinds`            authoritative file-or-directory kind for each path
-//!   - `char_masks`       per-path `u32` bitmap of a-z letters present, used
-//!                        as an O(1) reject before any subsequence scan; bit 31
-//!                        marks paths that need Unicode scoring
-//!
-//! Initial construction is progressive: the loader pre-allocates exact-size
-//! buffers up front, then fills them one path at a time, bumping that
-//! generation's atomic `ready_count` with `.release` ordering after each
-//! entry. Readers load `ready_count` with `.acquire` and scan indices in
-//! `[0, ready_count)`. Once a completed active generation exists, replacement
-//! loads remain private until a finished main-thread reap adopts them.
-//!
-//! Ready generation buffers are immutable and shared without locking. Search
-//! selects one generation, walks it once, and keeps the top-N in a small
-//! fixed-size array. ASCII subsequence scans operate on pre-lowercased bytes,
-//! so matching is a tight byte-compare loop suitable for 100k+ candidates.
+//! Each generation owns immutable parallel buffers. The loader publishes complete
+//! prefixes with release stores; readers acquire `ready_count` before scanning.
+//! Replacement generations remain private until the main thread adopts them.
+//! Search uses pre-lowercased paths and a per-path ASCII bitmap to reject
+//! impossible subsequence matches before scoring.
 
 const std = @import("std");
 const file_picker_path = @import("../input/file_picker_path.zig");
@@ -493,13 +474,7 @@ pub const FileIndex = struct {
         return candidateKindMatchesStat(expected_kind, stat.kind);
     }
 
-    /// Build the index synchronously from a pre-loaded path list. The list
-    /// uses nul bytes or newlines as separators, matching `git ls-files -z`
-    /// and the newline-separated directory-walk fallback. Intended for
-    /// benchmarks and tests that want to skip the threaded loader.
-    ///
-    /// On return the index has `ready_count == count()` and `state == .ready`,
-    /// so callers can search it immediately.
+    /// Builds a ready index synchronously from NUL- or newline-delimited paths.
     pub fn buildFromRaw(self: *FileIndex, alloc: Allocator, raw_list: []const u8) !void {
         try self.buildFromSource(alloc, .{ .file_raw = raw_list });
     }
@@ -990,9 +965,7 @@ fn acceptedCandidate(candidate: Candidate) ?Candidate {
     return candidate;
 }
 
-/// Pre-scan `raw_list` applying the same filters as the fill pass so we can
-/// allocate exact-size buffers once and avoid reallocation during the
-/// concurrent fill. Cheap: a single byte scan plus per-path bookkeeping.
+/// Applies fill-pass filters to size generation buffers before publication.
 fn countAndSize(source: CandidateSource) RawTotals {
     var n: u32 = 0;
     var bytes: u32 = 0;
@@ -1009,10 +982,7 @@ fn countAndSize(source: CandidateSource) RawTotals {
     return .{ .n = n, .bytes = bytes };
 }
 
-/// Compute the a-z bitmap for `bytes`. Bit `n` is set iff the lower-cased
-/// input contains the letter `'a' + n`. Non-letters and non-ASCII bytes
-/// contribute no bits, which is what makes the filter sound: a query with
-/// non-letter chars just produces a sparser query mask, never a false reject.
+/// Returns an a-z presence bitmap. Non-ASCII input cannot cause false rejection.
 fn alphaMask(bytes: []const u8) u32 {
     var m: u32 = 0;
     for (bytes) |b| {
@@ -2179,8 +2149,6 @@ test "bitmap prefilter rejects when required letter is absent" {
     const raw = "docs/readme.md\nsrc/main.zig\n";
     try index.buildFromRaw(alloc, raw);
 
-    // "xyz" shares no letters with either path, so rankTopN rejects both
-    // via the bitmap without touching the subsequence scan.
     var search: TestSearchBuffer(4) = .{};
     try std.testing.expectEqual(@as(usize, 0), (try search.run(&index, "xyz")).len);
 }
@@ -2208,9 +2176,6 @@ test "search returns partial results while ready_count is below total" {
     var index = FileIndex{};
     defer index.deinit(alloc);
 
-    // Build a full index, then simulate the loader thread being only partway
-    // through by pretending only the first two entries are published. The
-    // state stays .loading to model "still indexing".
     try index.buildFromRaw(alloc, "src/wasm_term_main.zig\nsrc/main.zig\nREADME.md\nsrc/core/shared/io.zig\n");
     try std.testing.expectEqual(@as(usize, 4), index.count());
 
@@ -2223,19 +2188,14 @@ test "search returns partial results while ready_count is below total" {
 
     var search: TestSearchBuffer(4) = .{};
     const results = try search.run(&index, "main");
-    // Only the first two entries are searchable; "main" matches both of
-    // them. README.md and src/core/shared/io.zig should not appear.
     try std.testing.expectEqual(@as(usize, 2), results.len);
     for (results) |result| {
         try std.testing.expect(std.mem.indexOf(u8, result.path, "main") != null);
     }
 
-    // Publishing the rest adds the non-matching entries without changing
-    // results for this query.
     generation.ready_count.store(4, .release);
     try std.testing.expectEqual(@as(usize, 2), (try search.run(&index, "main")).len);
 
-    // And a query that only the later entries match now returns them.
     const readme_results = try search.run(&index, "README");
     try std.testing.expectEqual(@as(usize, 1), readme_results.len);
     try std.testing.expectEqualStrings("README.md", readme_results[0].path);

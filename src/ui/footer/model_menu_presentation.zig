@@ -12,15 +12,14 @@ const ModelMenuProjection = render_input.ModelMenuProjection;
 
 const header_rows: u16 = 1;
 const roomy_top_gap_rows: u16 = 1;
-const title_rows: u16 = 1;
-const item_gap_rows: u16 = 1;
+const item_rows: u16 = 1;
 
 const ModelMenuLayout = struct {
     match_count: usize = 0,
     selected: usize = 0,
     visible_items: u16 = 0,
     first_item_row: u16 = header_rows,
-    item_stride: u16 = title_rows,
+    item_stride: u16 = item_rows,
     row_count: u16 = 0,
 
     fn build(projection: ModelMenuProjection, row_budget: u16) ModelMenuLayout {
@@ -52,16 +51,15 @@ const ModelMenuLayout = struct {
             };
         }
         const first_item_row = header_rows + roomy_top_gap_rows;
-        const item_stride = title_rows + item_gap_rows;
-        const item_budget = (row_budget - first_item_row +| item_gap_rows) / item_stride;
+        const item_budget = row_budget - first_item_row;
         const visible_items: u16 = @intCast(@min(match_count, @max(item_budget, 1)));
         return .{
             .match_count = match_count,
             .selected = selected,
             .visible_items = visible_items,
             .first_item_row = first_item_row,
-            .item_stride = item_stride,
-            .row_count = first_item_row + visible_items * item_stride - item_gap_rows,
+            .item_stride = item_rows,
+            .row_count = first_item_row + visible_items,
         };
     }
 };
@@ -229,13 +227,13 @@ fn providerRangeWidth(
 }
 
 fn modelFactsColumn(projection: ModelMenuProjection, width: u16) ?usize {
-    const prefix_width: usize = if (width <= 4) 2 else 4;
-    const content_width = @as(usize, width) -| 2;
+    const indent_width: usize = if (width <= 2) 0 else 2;
+    const content_width: usize = width;
     var facts_width: usize = 0;
     for (projection.items) |item| {
         facts_width = @max(facts_width, compactFactsWidth(item.capabilities));
     }
-    if (facts_width == 0 or content_width < prefix_width + 8 + 2 + facts_width) return null;
+    if (facts_width == 0 or content_width < indent_width + 8 + 2 + facts_width) return null;
     return content_width - facts_width;
 }
 
@@ -248,21 +246,19 @@ fn composeTitleRow(
 ) !std.ArrayList(u8) {
     var row: std.ArrayList(u8) = .empty;
     errdefer row.deinit(alloc);
-    const indent_width: u16 = if (width <= 4) 0 else 2;
+    const indent_width: u16 = if (width <= 2) 0 else 2;
     if (indent_width > 0) try row.appendSlice(alloc, "  ");
-    try row.appendSlice(alloc, if (selected) ui_render.tag_style else ui_render.dim_style);
-    try row_text.appendClipped(alloc, &row, if (selected) "● " else "○ ", width -| indent_width);
-    if (!selected) try row.appendSlice(alloc, ui_render.reset_style);
+    try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else ui_render.dim_style);
 
     var facts: std.ArrayList(u8) = .empty;
     defer facts.deinit(alloc);
     try appendCompactFacts(alloc, &facts, item.capabilities);
 
     const prefix_width = display_width.visibleWidthIgnoringAnsi(row.items);
-    const content_width = @as(usize, width) -| 2;
+    const content_width = @as(usize, width);
     const facts_start = facts_column orelse content_width;
     const show_facts = facts.items.len > 0 and facts_start >= prefix_width + 8 + 2;
-    const id_budget = if (show_facts) facts_start - prefix_width - 2 else @as(usize, width) -| prefix_width;
+    const id_budget = if (show_facts) facts_start - prefix_width - 2 else content_width -| prefix_width;
     try row_text.appendSingleLineMiddleEllipsized(alloc, &row, item.id, id_budget);
     if (selected) try row.appendSlice(alloc, ui_render.reset_style);
 
@@ -337,7 +333,6 @@ fn composeStateRow(alloc: Allocator, projection: ModelMenuProjection, width: u16
 
 fn loadedCatalogStatusText(state: model_cache_runtime.ModelMenuCatalogState) ?[]const u8 {
     if (retryableFailureText(state.failure)) |text| return text;
-    if (state.access_level == .authenticated) return "Authenticated model catalog loaded.";
     if (state.private_models_hidden) {
         const reason = state.public_only_reason orelse return "Using the public model catalog.";
         return switch (reason) {
@@ -407,7 +402,7 @@ test "model menu renders provider tabs and compact model facts" {
         .items = &items,
     };
     const rows = menuRowCount(projection, 120, 20);
-    try std.testing.expectEqual(@as(u16, 5), rows);
+    try std.testing.expectEqual(@as(u16, 4), rows);
 
     var header = try composeModelMenuRow(alloc, projection, 0, 120, rows);
     defer header.deinit(alloc);
@@ -417,7 +412,9 @@ test "model menu renders provider tabs and compact model facts" {
 
     var title = try composeModelMenuRow(alloc, projection, 2, 120, rows);
     defer title.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, title.items, "● anthropic/claude-opus-4.8") != null);
+    try std.testing.expect(std.mem.find(u8, title.items, "anthropic/claude-opus-4.8") != null);
+    try std.testing.expect(std.mem.find(u8, title.items, "●") == null);
+    try std.testing.expect(std.mem.find(u8, title.items, "○") == null);
     try std.testing.expect(std.mem.find(u8, title.items, "1M context · 128K output · Fast") != null);
     try std.testing.expect(std.mem.find(u8, title.items, "Anthropic") == null);
     try std.testing.expect(std.mem.find(u8, title.items, "Current") == null);
@@ -509,6 +506,8 @@ test "model menu states and navigation budget stay bounded" {
 }
 
 test "model menu status follows provenance and retryable failure precedence" {
+    try std.testing.expect(loadedCatalogStatusText(.{ .access_level = .authenticated }) == null);
+
     const cases = [_]struct {
         state: model_cache_runtime.ModelMenuCatalogState,
         expected: []const u8,
@@ -517,7 +516,6 @@ test "model menu status follows provenance and retryable failure precedence" {
         .{ .state = .{ .public_only_reason = .fx_login_team_required, .private_models_hidden = true }, .expected = "Choose a Vercel team to load its private models." },
         .{ .state = .{ .public_only_reason = .fx_login_refresh_required, .private_models_hidden = true }, .expected = "Vercel sign-in must refresh before team-private models can load." },
         .{ .state = .{ .public_only_reason = .credential_refresh_failed, .private_models_hidden = true }, .expected = "Vercel sign-in refresh failed; using the public model catalog." },
-        .{ .state = .{ .access_level = .authenticated }, .expected = "Authenticated model catalog loaded." },
         .{ .state = .{ .public_only_reason = .authenticated_credential_rejected, .private_models_hidden = true }, .expected = "Your Gateway credential was rejected; using the public model catalog." },
         .{ .state = .{ .failure = .{ .category = .transport, .retryable = true } }, .expected = "Could not reach AI Gateway; retry /models." },
         .{ .state = .{ .access_level = .public_only, .public_only_reason = .no_credential, .private_models_hidden = true, .failure = .{ .category = .rate_limited, .retryable = true } }, .expected = "AI Gateway rate limited model discovery; retry /models." },
@@ -594,7 +592,7 @@ test "model menu facts share a left-aligned column" {
 
     var first = try composeModelMenuRow(alloc, projection, 2, 80, rows);
     defer first.deinit(alloc);
-    var second = try composeModelMenuRow(alloc, projection, 4, 80, rows);
+    var second = try composeModelMenuRow(alloc, projection, 3, 80, rows);
     defer second.deinit(alloc);
 
     const first_label = std.mem.find(u8, first.items, "1M context").?;

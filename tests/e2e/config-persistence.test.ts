@@ -143,9 +143,9 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         });
         await session.waitForText("Run /help", TIMEOUT);
         await session.sendText("/appearance");
-        await session.waitForText("Appearance · Choose one", TIMEOUT);
-        expect(await session.capturePane()).toContain("Tint ✓");
-        expect(await session.capturePane()).toContain("Minimal ✓");
+        await session.waitForText("Input appearance", TIMEOUT);
+        expect(await session.capturePane()).toContain("lines  tint");
+        expect(await session.capturePane()).toContain("minimal  legacy");
         await session.sendKeys("Escape");
         await session.waitForComposer(TIMEOUT);
         await session.sendText("/appearance input lines");
@@ -167,9 +167,9 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         });
         await secondSession.waitForText("Run /help", TIMEOUT);
         await secondSession.sendText("/appearance");
-        await secondSession.waitForText("Appearance · Choose one", TIMEOUT);
-        expect(await secondSession.capturePane()).toContain("Lines ✓");
-        expect(await secondSession.capturePane()).toContain("Normal ✓");
+        await secondSession.waitForText("Input appearance", TIMEOUT);
+        expect(await secondSession.capturePane()).toContain("lines  tint");
+        expect(await secondSession.capturePane()).toContain("minimal  legacy");
         await secondSession.sendKeys("Escape");
         await secondSession.waitForComposer(TIMEOUT);
         await secondSession.sendText("/appearance input tint");
@@ -366,11 +366,12 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           TIMEOUT,
         );
         await session.sendText("/statusline");
-        const statusline = await session.waitForText("Enter Toggle", TIMEOUT);
-        expect(statusline).toContain("Status line:");
-        expect(statusline).toContain("Sandbox ✓");
-        expect(statusline).toContain("Context ✓");
-        expect(statusline).toContain("Session ✓");
+        const statusline = await session.waitForText("Sandbox  ", TIMEOUT);
+        expect(statusline).toContain("Status line");
+        expect(statusline).toContain("Sandbox");
+        expect(statusline).toContain("Context");
+        expect(statusline).toContain("Session");
+        expect(statusline).toContain("off  on");
         await session.sendKeys("Escape");
         await session.waitForComposer(TIMEOUT);
         await session.sendText("/quit");
@@ -464,9 +465,11 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         });
         await session.waitForText("Run /help", TIMEOUT);
         await session.sendText("/sandbox");
-        const sandbox = await session.waitForText("Enter Apply", TIMEOUT);
-        expect(sandbox).toContain("Sandbox:");
-        expect(sandbox).toContain("None ✓");
+        const sandbox = await session.waitForText("←→ Change", TIMEOUT);
+        expect(sandbox).toContain("Sandbox");
+        expect(sandbox).toContain("Command sandbox");
+        expect(sandbox).toContain("os  none");
+        expect(sandbox).not.toContain("✓");
         await session.sendKeys("Escape");
         await session.waitForComposer(TIMEOUT);
         await session.sendText("/allowlist view local");
@@ -830,7 +833,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         await session.waitForText("anthropic/claude-opus-4.8", TIMEOUT);
         expect(readFileSync(settingsPath, "utf8")).toBe(initialSettings);
         await session.sendKeys("Enter");
-        // Gateway order is preserved after Fx's default sentinel.
+        // Gateway order is preserved after fx's default sentinel.
         await session.waitForText("default", TIMEOUT);
         for (let i = 0; i < 2; i += 1) await session.sendKeys("Down");
         await session.waitForText("xhigh", TIMEOUT);
@@ -1319,11 +1322,15 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
 
         expect(tree(home)).toEqual([
           ".fx",
+          ".fx/history.jsonl",
+          ".fx/history.lock",
           ".fx/sessions",
           ".fx/settings.json",
           ".fx/settings.lock",
         ]);
         expect(statSync(join(home, ".fx")).mode & 0o777).toBe(0o700);
+        expect(statSync(join(home, ".fx", "history.jsonl")).mode & 0o777).toBe(0o600);
+        expect(statSync(join(home, ".fx", "history.lock")).mode & 0o777).toBe(0o600);
         expect(statSync(join(home, ".fx", "settings.json")).mode & 0o777).toBe(0o600);
         expect(statSync(join(home, ".fx", "settings.lock")).mode & 0o777).toBe(0o600);
         expect(readFileSync(stderrPath, "utf8")).toBe("");

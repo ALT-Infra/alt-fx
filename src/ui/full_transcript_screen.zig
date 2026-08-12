@@ -4242,7 +4242,6 @@ test "projection window handles scroll offsets at and past the document tail" {
     const measurement = try measureProjection(alloc, &projection, null, 10);
     try std.testing.expectEqual(@as(u32, 3), measurement.total_rows);
 
-    // A tail window taller than the remaining rows yields just those rows.
     const tail = try renderProjectionViewportSource(alloc, &projection, null, 10, 5, 2);
     defer alloc.free(tail);
     try std.testing.expect(std.mem.indexOf(u8, tail, "three") != null);

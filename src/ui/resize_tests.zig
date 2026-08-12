@@ -1,12 +1,5 @@
-//! Deterministic grid-level tests for the resize pipeline.
-//!
-//! Each test wires up a `TranscriptRuntime` whose stdout is a
-//! read/write tmp file, drives a scenario by calling public API
-//! (writeTranscript, applyResizeWithLayout, updateExtraInputRows, ...),
-//! feeds the emitted ANSI through `vt_emulator.Grid`, and asserts on
-//! the resulting cell grid. No real TTY, SIGWINCH, or tmux.
-//!
-//! Pulled into the test binary by `shell_runtime.zig`'s `test {}` block.
+//! Grid-level resize tests that replay `TranscriptRuntime` output through
+//! `vt_emulator.Grid` without a TTY or signals.
 
 const std = @import("std");
 
@@ -1097,8 +1090,7 @@ fn expectActiveInputSurvivesResize(
     defer approval.deinit(alloc);
 
     try h.shell.initViewport(&h.metrics, 15);
-    // The viewport call positions stale footer geometry below the tiny
-    // targets; the committed production frame owns from the terminal top.
+    // Tiny targets require the committed frame to own the full terminal.
     h.shell.owned_top_row = 1;
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
@@ -4378,10 +4370,6 @@ test "settled resize emits a replay_viewport pass" {
     const before_replays = h.metrics.debounced_resizes;
     try h.driveResize(60, 20, 4, true);
 
-    // A settled resize with a real size change must emit exactly one
-    // redraw pass (metrics.debounced_resizes += 1). The mode is
-    // replay_viewport whenever either the geometry changed or a prior
-    // live pass flagged pending_settled_width_reflow.
     try std.testing.expectEqual(before_replays + 1, h.metrics.debounced_resizes);
 }
 
@@ -4425,7 +4413,6 @@ test "live resize keeps pending_settled_width_reflow set" {
     try h.driveResize(60, 24, 4, false);
     try std.testing.expect(h.shell.render_requests.pending_settled_width_reflow);
 
-    // A subsequent settled pass clears the flag.
     try h.driveResize(60, 24, 4, true);
     try std.testing.expect(!h.shell.render_requests.pending_settled_width_reflow);
 }
@@ -4437,7 +4424,6 @@ test "no-op resize at settled pass is a noop" {
 
     const before = h.metrics.debounced_resizes;
     try h.driveResize(80, 24, 4, true);
-    // Same dimensions, no prior pending replay -> no redraw.
     try std.testing.expectEqual(before, h.metrics.debounced_resizes);
 }
 
@@ -4448,9 +4434,6 @@ test "resize clips cursor_row into the new content band" {
 
     h.shell.cursor_row = 18;
     try h.driveResize(60, 12, 4, true);
-    // content_bottom after resize = 12 - 4 = 8. Cursor must be pulled
-    // inside that band before the footer repaint, otherwise the footer
-    // gets stomped.
     try std.testing.expect(h.shell.cursor_row <= h.shell.layout.content_bottom);
 }
 
@@ -4495,7 +4478,6 @@ test "updateExtraInputRows shrink repaints transcript into freed rows" {
     try h.shell.writeTranscript(h.alloc, &h.metrics, "alpha\nbeta\n", true);
     try h.flush();
 
-    // Picker opens (footer grows by 3 extra input rows) then closes.
     try h.shell.updateExtraInputRows(h.alloc, &h.metrics, 3);
     try h.renderTranscriptFrame();
     try h.flush();
@@ -4503,8 +4485,6 @@ test "updateExtraInputRows shrink repaints transcript into freed rows" {
     try h.renderTranscriptFrame();
     try h.flush();
 
-    // After the footer shrinks back, the transcript must be visible in
-    // the content band again — neither blank nor stale picker rows.
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(h.alloc);
     var found_alpha = false;
@@ -4767,7 +4747,6 @@ test "settled resize clears reflowed rows above the launch-owned viewport" {
     try h.renderTranscriptFrameIfDirty();
     try h.flush();
 
-    // Simulate a reflowed row just above the pre-resize Fx viewport.
     try h.vt.resize(80, 23);
     try h.vt.feed("\x1b[9;1HPRE-FX-ROW");
     try shell_runtime.applyResizeWithLayout(
@@ -5627,9 +5606,6 @@ test "approval footer growth preserves raw status row over stale footer frame" {
 
     try h.shell.initViewport(&h.metrics, 15);
 
-    // Frame 1: establish the existing transcript/footer ownership.
-    // With no approval banner active and no transcript content yet, the
-    // footer owns the current cursor row.
     try renderTestFooter(&h, &input, &approval, &frame_redraw);
     try h.flush();
 
@@ -5640,10 +5616,7 @@ test "approval footer growth preserves raw status row over stale footer frame" {
     _ = try h.shell.appendRawTranscriptEntry(alloc, status_line ++ "\n");
     _ = try approval.syncRequest(alloc, .{ .label = "skill next-best-practices" });
 
-    // Frame 2 models the production tick order: transcript paint first,
-    // then footer render notices approval activation and grows the
-    // footer band. The prior footer clear must not erase the just-painted
-    // status row.
+    // Footer growth follows transcript paint; its stale clear must preserve the status row.
     try renderTestFooter(&h, &input, &approval, &frame_redraw);
     try h.flush();
 
@@ -6109,12 +6082,8 @@ test "replaceable line survives a replay_viewport pass" {
     _ = try h.shell.appendReplaceableTranscriptLine(h.alloc, &h.metrics, "progress one\n");
     try h.flush();
 
-    // Drive a settled resize that triggers replay_viewport.
     try h.driveResize(40, 10, 4, true);
 
-    // The replaceable slot must still point at a real row so the next
-    // replace keeps updating the transcript in place rather than
-    // accumulating stale lines.
     try std.testing.expect(
         try h.shell.replaceTrailingTranscriptLine(h.alloc, &h.metrics, "progress two\n"),
     );
@@ -6139,20 +6108,12 @@ test "grow after shrink-overflow restores transcript inside fx's viewport band" 
     var h = try Harness.init(std.testing.allocator, 80, 30, 4);
     defer h.deinit();
 
-    // initViewport(1) simulates fx launched at the top of a fresh
-    // terminal. No pre-fx scrollback to protect, so fx's band is
-    // rows 1..content_bottom.
     try h.shell.initViewport(&h.metrics, 1);
     try h.shell.writeTranscript(h.alloc, &h.metrics, "header one\nheader two\nheader three\n", true);
     try h.flush();
 
-    // Shrink small enough that the content + footer overflow, as the
-    // user does when they drag the terminal short.
     try h.driveResize(80, 7, 4, true);
 
-    // Then grow back. The transcript must be painted at the top of
-    // fx's viewport band, not left as stale rows from the shrink and
-    // not left missing entirely.
     try h.driveResize(80, 30, 4, true);
 
     try expectRowPrefix(&h, 1, "header one");
@@ -6365,8 +6326,6 @@ test "settled resize clears pre-fx shell history and reanchors at row one" {
     var h = try Harness.init(std.testing.allocator, 40, 20, 4);
     defer h.deinit();
 
-    // Park the VT cursor at row 1 and simulate three rows of shell
-    // output that were on screen BEFORE fx launched.
     try h.vt.feed("\x1b[1;1H");
     try h.vt.feed("$ ls\n");
     try h.vt.feed("README.md  src  tests\n");
@@ -6376,7 +6335,6 @@ test "settled resize clears pre-fx shell history and reanchors at row one" {
     try h.shell.writeTranscript(h.alloc, &h.metrics, "first fx line\nsecond fx line\n", true);
     try h.flush();
 
-    // Trigger both directions of the settled-resize path.
     try h.driveResize(40, 24, 4, true);
     try h.driveResize(40, 16, 4, true);
 
@@ -6450,12 +6408,6 @@ test "visual epoch reset reanchors at row one and preserves viewport reservation
     try expectGridNotContains(&h, "old visual epoch");
 }
 
-// Replaceable lines whose original content spans multiple visual rows
-// must have every one of those rows cleared when the next replacement
-// lands, otherwise the tail rows remain on screen as orphans below the
-// new replacement text. The common real-world trigger is a streaming
-// assistant whose in-progress line contains embedded newlines, or a
-// short replacement following a longer one.
 test "multi-row replaceable line clears every old visual row on replace" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 40, 12, 4);
@@ -6487,11 +6439,6 @@ test "multi-row replaceable line clears every old visual row on replace" {
     }
 }
 
-// After a shrink, transcript lines that used to fit on one row now wrap
-// to multiple visual rows. The viewport replay must show the wrapped
-// content across those rows rather than silently truncating to the new
-// column width — otherwise the tail of every long message disappears
-// when the user narrows the window.
 test "shrink preserves wrapped line content across visual rows" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 80, 20, 4);
@@ -6546,12 +6493,6 @@ test "compact file diffs retain their gutter and color after resize" {
     try std.testing.expect(continuation.style.fg.eql(.{ .indexed = 252 }));
 }
 
-// A settled replay_viewport pass must wipe any content that sits below
-// `content_bottom` before redrawing — otherwise a narrowing resize
-// leaves rows that the terminal reflowed (or any stray row that
-// pre-existed outside fx's viewport band) visible until something else
-// overwrites them. This is the "row below footer looks stale after drag
-// stops" symptom users see at the window bottom.
 test "replay_viewport wipes content below the viewport band" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 40, 12, 4);
@@ -6561,9 +6502,6 @@ test "replay_viewport wipes content below the viewport band" {
     try h.shell.writeTranscript(alloc, &h.metrics, "alpha\n", true);
     try h.flush();
 
-    // Plant a row OUTSIDE fx's content band (content_bottom = 12 - 4 = 8).
-    // Row 10 is below content_bottom and would normally hold terminal
-    // reflow remnants after a shrink.
     try h.vt.feed("\x1b[10;1Horphan_below_footer");
 
     try shell_runtime.requestRedraw(&h.shell, &h.metrics, .replay_viewport);
@@ -6573,11 +6511,6 @@ test "replay_viewport wipes content below the viewport band" {
     try expectRowEmpty(&h, 10);
 }
 
-// Default behavior: preserve terminal scrollback so the user can scroll
-// The transcript byte buffer is a paint-time cache derived from the
-// entries list; every paint regenerates it at the current cols. This
-// is what makes reshape work — a user card that was submitted at 80
-// cols shows up re-cut to 30 cols after a resize.
 test "large tabbed user turn keeps frame scroll plan aligned" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 72, 16, 4);
@@ -6662,9 +6595,6 @@ test "paint regenerates user card bytes at current cols" {
     try std.testing.expect(h.shell.transcript.items.len > wide_bytes.len);
 }
 
-// Assistant streams arrive as raw tokens with no wraps; paint reflows them
-// at the current width, including the assistant gutter, so resize produces
-// fresh wrap rows instead of clipping against DECAWM-off.
 test "paint regenerates assistant text with wraps at current cols" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 80, 24, 4);
@@ -6674,8 +6604,6 @@ test "paint regenerates assistant text with wraps at current cols" {
 
     const assistant_id = try h.shell.appendAssistantTurnEntry(alloc);
     const segs = h.shell.lookupAssistantSegments(assistant_id) orelse unreachable;
-    // 120 chars of ASCII — at 80 cols wraps once, at 30 cols wraps many
-    // times, exercising the wrapAssistantText reshape on each paint.
     const body = "abcdefghijklmnopqrstuvwxyz0123456789" ** 4;
     try segs.text.appendSlice(alloc, body[0..120]);
 
@@ -6695,10 +6623,6 @@ test "paint regenerates assistant text with wraps at current cols" {
     }
 }
 
-// Replaceable status lines are raw_bytes entries. After a paint regen,
-// `replaceable_start` must refresh to the start of the trailing
-// raw_bytes entry in the regenerated buffer so subsequent replaces
-// splice at the right offset.
 test "paint refreshes replaceable_start to trailing raw_bytes entry" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 80, 24, 4);
@@ -6719,10 +6643,6 @@ test "paint refreshes replaceable_start to trailing raw_bytes entry" {
     );
 }
 
-// Read every byte the shell has emitted since the last Harness.flush —
-// includes content the VT has already consumed. Useful for asserting
-// that a particular ANSI escape (like the scrollback-wipe) appears in
-// the raw output stream.
 fn readEmittedSince(h: *Harness, since_offset: u64) ![]u8 {
     const total = try h.file.length(io_mod.getIo());
     const want: usize = @intCast(total - since_offset);
@@ -6744,10 +6664,6 @@ fn gridContains(grid: Grid, needle: []const u8) !void {
     return error.TestMissingMarker;
 }
 
-// Mid-drag (settled=false) uses the cheap resize_light path. It must
-// NOT trigger reconstructive paint — doing so on every SIGWINCH during
-// a drag would flash the scrollback away a dozen times per drag and
-// create visible flicker.
 test "mid-drag resize does not emit scrollback wipe" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 80, 24, 4);
@@ -6851,9 +6767,6 @@ test "theme reset retints Fx entries and replays the retained transcript once" {
     try expectGridContains(&h, "FX THEME INLINE CODE");
 }
 
-// Reset replay must fill the cleared terminal with the reflowed transcript
-// before it advances into normal history. This fixture exceeds the viewport so
-// the first marker cannot be satisfied by the final-tail repaint alone.
 pub fn testReconstructiveFullTranscriptReplay() !void {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 80, 24, 4);
@@ -6907,8 +6820,7 @@ pub fn testReconstructiveFullTranscriptReplay() !void {
     const middle_idx = std.mem.find(u8, emitted, middle_marker) orelse return error.TestMissingMiddleEntry;
     const final_idx = std.mem.find(u8, emitted, final_marker) orelse return error.TestMissingFinalEntry;
 
-    // Bound the replay segment at the first complete transcript copy. The
-    // following final-tail repaint is allowed to repeat visible markers.
+    // Limit uniqueness checks to the reconstructive replay, before the final-tail paint.
     const replay = emitted[first_idx .. final_idx + final_marker.len];
     try std.testing.expect(reset_idx < first_idx);
     try std.testing.expect(reset_idx < replay_origin_idx);
@@ -6930,11 +6842,6 @@ pub fn testReconstructiveFullTranscriptReplay() !void {
     try std.testing.expect(h.last_frame.committed_scroll_rows > 0);
 }
 
-// A typical fx conversation alternates user → assistant → user. The
-// entries list should mirror that sequence one-to-one with
-// monotonically increasing ids; any ordering bug (e.g. the pacer
-// opening a duplicate assistant_turn mid-response) would show up as
-// an unexpected entry count or kind.
 test "turn ordering produces user → assistant → user entries with monotonic ids" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 80, 24, 4);
@@ -6961,13 +6868,6 @@ test "turn ordering produces user → assistant → user entries with monotonic 
     try std.testing.expect(id_assistant < id_b);
 }
 
-// The paint pipeline's value proposition during streaming is that
-// each paint diffs against the shadow grid and emits only what
-// changed. If a token lands on row N, rows 1..N-1 should produce
-// zero delta bytes — otherwise every keystroke flickers the whole
-// viewport. This test streams multiple tokens and asserts that the
-// second paint (after a small text append) emits far fewer bytes
-// than the first full paint.
 test "streaming paint produces a minimal delta on unchanged rows" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 80, 24, 4);
@@ -6982,26 +6882,15 @@ test "streaming paint produces a minimal delta on unchanged rows" {
     try h.flush();
     const baseline_end = try h.file.length(io_mod.getIo());
 
-    // One new character of content — should only repaint the one row
-    // that gained a token.
     try h.shell.writeTranscript(alloc, &h.metrics, "x", true);
     h.shell.transcript_band_dirty = true;
     try h.renderTranscriptFrameIfDirty();
     const delta_end = try h.file.length(io_mod.getIo());
 
     const delta_bytes: usize = @intCast(delta_end - baseline_end);
-    // A full repaint at 80x20 content band would be well over 2KB. A
-    // minimal delta for one new character should be dramatically
-    // smaller — ~100 bytes is the typical order when shadow diffing
-    // is working.
     try std.testing.expect(delta_bytes < 1024);
 }
 
-// When a single assistant turn's wrapped text exceeds the visible
-// band, the fit algorithm picks the last N visual rows. The top row
-// of the viewport shows the TAIL of an overflowing predecessor
-// thanks to partial-tail rendering (#39.4). Without this, the top
-// row would bleed through with stale cells from a previous frame.
 test "partial-tail emission fills top rows when an entry overflows the band" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 30, 10, 4);
@@ -7009,9 +6898,6 @@ test "partial-tail emission fills top rows when an entry overflows the band" {
 
     try h.shell.initViewport(&h.metrics, 1);
 
-    // Assistant turn with 200 chars at cols=30 wraps to ~7 visual
-    // rows — well over the ~5-row visible band (content_bottom=6
-    // minus top_row=1, so 6 visible rows, minus any trailing blank).
     const assistant_id = try h.shell.appendAssistantTurnEntry(alloc);
     const segs = h.shell.lookupAssistantSegments(assistant_id) orelse unreachable;
     const body = "abcdefghijklmnopqrstuvwxyz0123456789" ** 6;
@@ -7020,8 +6906,6 @@ test "partial-tail emission fills top rows when an entry overflows the band" {
     try h.renderTranscriptFrame();
     try h.flush();
 
-    // Every row in the content band must have SOME visible content
-    // (no blank-row holes that would be bleed-through).
     var r: u16 = 1;
     var filled_rows: u16 = 0;
     while (r <= h.shell.layout.content_bottom) : (r += 1) {
@@ -7033,8 +6917,6 @@ test "partial-tail emission fills top rows when an entry overflows the band" {
     try std.testing.expect(filled_rows >= h.shell.layout.content_bottom - 1);
 }
 
-// Partial-tail emission starts after a prefix reset. Until the renderer replays
-// skipped SGR state, the surviving tail is expected to be unstyled.
 test "partial-tail emission drops SGR state from the oldest-visible line" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 30, 10, 4);
@@ -7042,7 +6924,6 @@ test "partial-tail emission drops SGR state from the oldest-visible line" {
 
     try h.shell.initViewport(&h.metrics, 1);
 
-    // The line wraps past the content band and forces `partial_skip_rows`.
     const line = "\x1b[1m" ++ ("X" ** 200) ++ "\x1b[0m\n";
     try h.shell.writeTranscript(alloc, &h.metrics, line, true);
     try h.flush();
@@ -7060,7 +6941,6 @@ test "partial-tail emission drops SGR state from the oldest-visible line" {
     }
     try std.testing.expect(filled_rows >= h.shell.layout.content_bottom - 1);
 
-    // The top row begins after the skipped bold opener.
     const top_cell = h.vt.cellAt(1, 1) orelse {
         std.debug.print("expected cell at row 1 col 1\n", .{});
         return error.TestMissingTopCell;
@@ -7069,7 +6949,6 @@ test "partial-tail emission drops SGR state from the oldest-visible line" {
     try std.testing.expect(!top_cell.style.flags.bold);
 }
 
-// Continuation rows must reopen SGR after assistant text wraps.
 test "assistant text preserves SGR across wrap boundaries at narrow cols" {
     const alloc = std.testing.allocator;
 
@@ -7082,7 +6961,6 @@ test "assistant text preserves SGR across wrap boundaries at narrow cols" {
     var wrapped_lines: usize = 0;
     while (line_it.next()) |line| {
         if (line.len == 0) continue;
-        // The first row inherits SGR from the original input.
         if (!first) {
             if (std.mem.find(u8, line, "\x1b[1m") == null) {
                 std.debug.print("wrapped line missing bold reopen: '{s}'\n", .{line});
@@ -7095,15 +6973,12 @@ test "assistant text preserves SGR across wrap boundaries at narrow cols" {
     try std.testing.expect(wrapped_lines > 1);
 }
 
-// Overflowing resize content must stay pinned to the footer without interior
-// blank rows.
 test "narrow-drag resize pins overflowing content to content_bottom" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 120, 40, 4);
     defer h.deinit();
     try h.shell.initViewport(&h.metrics, 1);
 
-    // More content than the viewport can display at 30 columns.
     try h.shell.writeTranscript(alloc, &h.metrics, ("A" ** 3000) ++ "\n", true);
     try h.shell.writeTranscript(alloc, &h.metrics, ("B" ** 3000) ++ "\n", true);
     try h.shell.writeTranscript(alloc, &h.metrics, ("C" ** 3000) ++ "\n", true);

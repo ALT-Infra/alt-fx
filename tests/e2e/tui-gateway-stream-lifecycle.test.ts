@@ -5991,8 +5991,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.sendText("/maxxing");
       await session.waitForPane(
         (pane) =>
-          pane.includes("Appearance · Choose one") &&
-          pane.includes("Minimal ✓"),
+          pane.includes("Appearance") &&
+          pane.includes("Maxxing mode") &&
+          pane.includes("minimal  legacy"),
         TIMEOUT,
       );
       await session.sendKeys("Escape");
@@ -6119,8 +6120,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.sendText("/maxxing");
       await session.waitForPane(
         (pane) =>
-          pane.includes("Appearance · Choose one") &&
-          pane.includes("Minimal ✓"),
+          pane.includes("Appearance") &&
+          pane.includes("Maxxing mode") &&
+          pane.includes("minimal  legacy"),
         TIMEOUT,
       );
       await session.sendKeys("Escape");
@@ -6221,8 +6223,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.sendText("/maxxing");
       await session.waitForPane(
         (pane) =>
-          pane.includes("Appearance · Choose one") &&
-          pane.includes("Minimal ✓"),
+          pane.includes("Appearance") &&
+          pane.includes("Maxxing mode") &&
+          pane.includes("minimal  legacy"),
         TIMEOUT,
       );
       await session.sendKeys("Escape");

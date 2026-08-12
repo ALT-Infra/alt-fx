@@ -1133,10 +1133,8 @@ pub const Runtime = struct {
         return self.adoptCredential(alloc, &credential);
     }
 
-    /// Drops the current selection and re-runs precedence. Distinct from the
-    /// logout reconcile, which only acts when a login was active: clearing a
-    /// remembered choice can leave any source selected, and leaving it in place
-    /// would keep the session on the source the user just un-remembered.
+    /// Drops the current selection and re-runs precedence after the user clears
+    /// a remembered credential source.
     pub fn reselectByPrecedence(self: *Self, alloc: Allocator) !bool {
         return self.reselectByPrecedenceWithDeps(alloc, self, probeCredentialSource, loadRuntimeCredentialSource);
     }

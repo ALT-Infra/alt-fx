@@ -1139,9 +1139,7 @@ pub fn CompletionRuntime(comptime App: type) type {
 
             const stage: ModelPickerStage = if (supports_effort) .effort else .fast;
             try setModelComposerText(app, "/model {s} ", .{model});
-            // Land on the recommended pair so switching is just Enter-Enter:
-            // product default (falling back to the model's first option) and
-            // fast on whenever the model offers it.
+            // Preselect the product effort default and enable Fast mode when supported.
             try app.input_runtime.picker.beginModelPickerFlow(
                 app.alloc,
                 model,

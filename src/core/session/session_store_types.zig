@@ -285,11 +285,8 @@ pub const DoctorInspectionOptions = struct {
     compaction_byte_threshold: u64 = 128 * 1024 * 1024,
 };
 
-/// A narrow, copyable view of the four `Store` fields the relocated discovery
-/// and migration helpers actually read. Passing this instead of `Store` lets
-/// those modules depend on a small data struct rather than the facade, which
-/// is what keeps the module graph acyclic. `canonical_root` is held by value to
-/// match the historical `var root = self.canonical_root;` copy semantics.
+/// Copyable store state shared with discovery and migration without introducing
+/// a dependency on the `Store` facade. `canonical_root` retains value semantics.
 pub const StoreContext = struct {
     sessions_dir: []const u8,
     home_dir: []const u8,

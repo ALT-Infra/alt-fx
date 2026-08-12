@@ -216,6 +216,28 @@ cd tests/e2e && bun test tui-*.test.ts               # just TUI tests (requires 
 
 TUI tests use tmux to drive the interactive terminal. They require `tmux` to be installed.
 
+## Pull Request Classification
+
+Every pull request must have exactly one `type:` label, chosen by its primary intent:
+
+* `type: bug`: fixes incorrect behavior
+
+* `type: feature`: adds a new user-facing capability
+
+* `type: improvement`: improves existing user-facing behavior
+
+* `type: docs`: changes documentation only
+
+* `type: maintenance`: changes internal tooling, dependencies, CI, or implementation structure without a user-facing behavior change
+
+* `type: release`: prepares or repairs a release
+
+* `type: security`: fixes or hardens a security boundary
+
+Assign the label when the PR is opened and keep it accurate when the PR changes. If the authenticated contributor cannot manage labels, state the required label and keep the PR in draft until a maintainer or repository agent applies it. For a mixed PR, choose the label that describes the primary reason the PR exists. If that is ambiguous, ask before applying or changing the label.
+
+Keep PR titles as clean imperative sentences, such as `Restore feedback report file clipboard`. Do not add bracketed prefixes such as `[bug]`, `[feature]`, or `[improvement]`. Type belongs in the label, not the title.
+
 ## Full CI on Feature Branches
 
 Do not run the complete deterministic test suite locally as the default development loop. Run the focused test for the changed path, build the binary, and exercise that path with `./zig-out/bin/fx`.
@@ -330,7 +352,16 @@ When the PR merges, CI compares the version tag to what exists in git. If the ta
 
 ### Writing the changelog
 
-Whether automated or manual, the changelog follows the same format. Group changes under `### New Features`, `### Bug Fixes`, `### Improvements`, etc. Bold the feature/fix name, then describe it concisely. Reference PR numbers in parentheses.
+Whether automated or manual, the changelog is public product copy. Describe observable user behavior, not the engineering process behind it. Use the diff, commits, and merged pull requests as research evidence only.
+
+Public changelog entries must:
+
+* Spell the product name `fx`. Preserve different casing only when it is part of an exact code identifier such as `FX_MODEL`.
+* Use only relevant sections from `### Breaking Changes`, `### New Features`, `### Improvements`, `### Bug Fixes`, and `### Security`. Omit empty sections.
+* Bold a short feature or fix name, then describe the user-visible change after a colon.
+* Omit pull request numbers, issue numbers, commit hashes, contributor names, and author attribution.
+* Omit internal details such as repository moves, website or marketing work, CDN layout, CI workflows, test fixtures, branch history, and implementation-only refactors. Translate relevant work into its public user outcome or leave it out.
+* Avoid forcing every merged change into the notes. A change without a public user outcome does not need a bullet.
 
 Only the current release should have markers; remove `<!-- release:start -->` and `<!-- release:end -->` from any previous entry:
 
@@ -340,23 +371,17 @@ Only the current release should have markers; remove `<!-- release:start -->` an
 <!-- release:start -->
 ### New Features
 
-- **Foo command** — Added `foo` command for bar (#42)
-
-### Contributors
-
-- @ctate
+- **Interactive terminal startup:** Start an interactive shell when the `terminal` tool receives an empty command
 <!-- release:end -->
 
 ## 0.2.5
 
 ### Improvements
 
-- **Inline CLI rendering** — Replaced the alternate-screen TUI ...
+- **Inline rendering:** Keep the active conversation visible in terminal scrollback
 ```
 
-Include a `### Contributors` section listing GitHub usernames (with `@` prefix) of everyone who contributed. Check the git log between the previous tag and HEAD.
-
-Do not prefix entries with commit hashes. Use descriptive section names.
+Do not add a `### Contributors` section or tracker references. Use descriptive section names.
 
 Do not create version tags manually. Do not change `build.zig.zon` version (it is a placeholder).
 

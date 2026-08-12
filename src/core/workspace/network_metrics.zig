@@ -115,7 +115,6 @@ pub fn snapshot(out: []NetworkCall) usize {
     const n = @min(stored, out.len);
     var i: usize = 0;
     while (i < n) : (i += 1) {
-        // Copy the last n records oldest-first.
         const idx = (head + ring_capacity - n + i) % ring_capacity;
         out[i] = ring[idx];
     }

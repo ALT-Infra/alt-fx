@@ -37,6 +37,7 @@ const skill_runtime = @import("../skills/skill_runtime.zig");
 const file_index = @import("../workspace/file_index.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const types = @import("../shared/types.zig");
+const subagent_input = @import("../subagent/input_action.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const auto_upgrade = @import("../upgrade/auto_upgrade.zig");
 const upgrade_helpers = @import("../upgrade/upgrade_helpers.zig");
@@ -624,6 +625,7 @@ pub fn Runtime(comptime App: type) type {
                             decoded.composer_shortcut,
                             decoded.approval_focused_edit,
                             decoded.question_action,
+                            decoded.subagent_action,
                             decoded.cancel_pending,
                             input_limits.composer_bytes,
                         )) {
@@ -862,9 +864,7 @@ pub fn Runtime(comptime App: type) type {
         ) !void {
             const byte = raw.byte;
             const max_input_len = input_limits.composer_bytes;
-            // max-level cue on the rising edge of the slash command menu: fire
-            // once when this byte makes it appear, not on every keystroke while
-            // it stays open. Cheap no-op unless the max level is on.
+            // Fire the max-level cue only when the slash menu becomes visible.
             const slash_menu_was_visible = slashMenuVisibleForCue(app);
             defer announceSlashMenuOpened(app, slash_menu_was_visible);
             if (try routeActivePasteByte(app, byte)) return;
@@ -926,6 +926,7 @@ pub fn Runtime(comptime App: type) type {
             composer_shortcut: ?input_action.ShortcutAction,
             approval_focused_edit: ?approval_decision.DraftAction,
             question_action: ?question_prompt.Action,
+            subagent_action: ?subagent_input.Action,
             was_cancel_pending: bool,
             max_input_len: usize,
         ) !ResolvedEscapeRoute {
@@ -994,7 +995,12 @@ pub fn Runtime(comptime App: type) type {
                             approval_focused_edit,
                         );
                     } else {
-                        try subagent_rt.routeSubagentEscapeAction(app, resolved);
+                        try subagent_rt.routeSubagentEscapeAction(
+                            app,
+                            resolved,
+                            composer_shortcut,
+                            subagent_action,
+                        );
                     }
                     return .done;
                 }
@@ -1024,7 +1030,7 @@ pub fn Runtime(comptime App: type) type {
             }
 
             if (appearanceMenuActive(app)) {
-                routeAppearanceMenuEscapeAction(app, resolved);
+                try routeAppearanceMenuEscapeAction(app, resolved);
                 return .done;
             }
 
@@ -1287,7 +1293,7 @@ pub fn Runtime(comptime App: type) type {
             }
             if (comptime runtime_profile.allows(App, .subagents)) {
                 if (app.subagents.isViewActive()) {
-                    try subagent_rt.handleSubagentViewByte(app, byte);
+                    try subagent_rt.handleSubagentRawInput(app, raw);
                     return true;
                 }
             }
@@ -1967,7 +1973,7 @@ pub fn Runtime(comptime App: type) type {
         fn submitAppearanceMenuSelection(app: *App) !void {
             const change = app.input_runtime.appearance_menu.selectedChange() orelse return;
             if (comptime @hasDecl(App, "notificationPreferences")) {
-                try app_commands.applySettingsCatalogChange(app, change);
+                try app_commands.applySettingsCatalogMenuChange(app, change);
             }
             app.shell.render_requests.request(.footer);
         }
@@ -1995,7 +2001,7 @@ pub fn Runtime(comptime App: type) type {
                 .usage, .workspace => unreachable,
             } orelse return;
             if (comptime @hasDecl(App, "notificationPreferences")) {
-                try app_commands.applySettingsCatalogChange(app, change);
+                try app_commands.applySettingsCatalogMenuChange(app, change);
             }
             app.shell.render_requests.request(.footer);
         }
@@ -2067,6 +2073,21 @@ pub fn Runtime(comptime App: type) type {
                 }
                 return;
             }
+            if ((menu == .statusline or menu == .sandbox) and
+                (resolved == .cursor_left or resolved == .cursor_right))
+            {
+                const snapshot = app_commands.settingsCatalogSnapshot(app);
+                const delta: i32 = if (resolved == .cursor_left) -1 else 1;
+                const change = switch (menu) {
+                    .statusline => app.input_runtime.statusline_menu.changeSelectedOption(&snapshot, delta),
+                    .sandbox => app.input_runtime.sandbox_menu.changeSelectedOption(&snapshot, delta),
+                    .usage, .workspace => unreachable,
+                } orelse return;
+                if (comptime @hasDecl(App, "notificationPreferences")) {
+                    try app_commands.applySettingsCatalogMenuChange(app, change);
+                }
+                return;
+            }
             const delta: i32 = switch (resolved) {
                 .cursor_up => -1,
                 .cursor_down => 1,
@@ -2085,10 +2106,21 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        fn routeAppearanceMenuEscapeAction(app: *App, resolved: input_action.Action) void {
+        fn routeAppearanceMenuEscapeAction(app: *App, resolved: input_action.Action) !void {
             switch (resolved) {
-                .cursor_up => _ = app.input_runtime.appearance_menu.move(-1),
-                .cursor_down => _ = app.input_runtime.appearance_menu.move(1),
+                .cursor_up, .cursor_down => {
+                    _ = app.input_runtime.appearance_menu.cycleSection(1);
+                },
+                .cursor_left, .cursor_right => {
+                    const snapshot = app_commands.settingsCatalogSnapshot(app);
+                    const change = app.input_runtime.appearance_menu.changeSelectedOption(
+                        &snapshot,
+                        if (resolved == .cursor_left) -1 else 1,
+                    ) orelse return;
+                    if (comptime @hasDecl(App, "notificationPreferences")) {
+                        try app_commands.applySettingsCatalogMenuChange(app, change);
+                    }
+                },
                 .toggle_permission_mode => _ = app.input_runtime.appearance_menu.cycleSection(-1),
                 else => return,
             }
@@ -2418,7 +2450,12 @@ pub fn Runtime(comptime App: type) type {
                         }
                         return;
                     }
-                    try subagent_rt.routeSubagentEscapeAction(app, .escape);
+                    try subagent_rt.routeSubagentEscapeAction(
+                        app,
+                        .escape,
+                        null,
+                        .escape,
+                    );
                     return;
                 }
             }
@@ -2479,7 +2516,12 @@ pub fn Runtime(comptime App: type) type {
             if (comptime runtime_profile.allows(App, .subagents)) {
                 if (app.subagents.isViewActive()) {
                     _ = disarmEscapeClear(app);
-                    try subagent_rt.routeSubagentEscapeAction(app, .escape);
+                    try subagent_rt.routeSubagentEscapeAction(
+                        app,
+                        .escape,
+                        null,
+                        .escape,
+                    );
                     return;
                 }
             }
@@ -2808,6 +2850,8 @@ const RoutingSubagents = struct {
     active: bool = false,
     main_approval_presented: bool = false,
     handled_keys: usize = 0,
+    handled_raw_keys: usize = 0,
+    handled_actions: usize = 0,
     last_handled_key: ?u8 = null,
     last_main_approval_id: ?u64 = null,
     toggle_view_calls: usize = 0,
@@ -2837,14 +2881,16 @@ const RoutingSubagents = struct {
         return alloc.dupe(u8, "");
     }
 
-    pub fn handleKey(self: *RoutingSubagents, _: std.mem.Allocator, byte: u8) !@import("../../ui/subagent/controller.zig").KeyAction {
+    pub fn handleKey(self: *RoutingSubagents, _: std.mem.Allocator, byte: u8) !subagent_input.Command {
         self.handled_keys += 1;
+        self.handled_raw_keys += 1;
         self.last_handled_key = byte;
         return .none;
     }
 
-    pub fn handleAction(self: *RoutingSubagents, _: std.mem.Allocator, action: @import("../../ui/subagent/controller.zig").InputAction) !@import("../../ui/subagent/controller.zig").KeyAction {
+    pub fn handleAction(self: *RoutingSubagents, _: std.mem.Allocator, action: subagent_input.Action) !subagent_input.Command {
         self.handled_keys += 1;
+        self.handled_actions += 1;
         self.last_handled_key = switch (action) {
             .escape => 0x1b,
             .up, .left => 25,
@@ -2854,12 +2900,12 @@ const RoutingSubagents = struct {
         return .none;
     }
 
-    pub fn handleKeyWithMainApproval(self: *RoutingSubagents, alloc: std.mem.Allocator, byte: u8, main_approval_id: ?u64) !@import("../../ui/subagent/controller.zig").KeyAction {
+    pub fn handleKeyWithMainApproval(self: *RoutingSubagents, alloc: std.mem.Allocator, byte: u8, main_approval_id: ?u64) !subagent_input.Command {
         self.last_main_approval_id = main_approval_id;
         return self.handleKey(alloc, byte);
     }
 
-    pub fn handleActionWithMainApproval(self: *RoutingSubagents, alloc: std.mem.Allocator, action: @import("../../ui/subagent/controller.zig").InputAction, main_approval_id: ?u64) !@import("../../ui/subagent/controller.zig").KeyAction {
+    pub fn handleActionWithMainApproval(self: *RoutingSubagents, alloc: std.mem.Allocator, action: subagent_input.Action, main_approval_id: ?u64) !subagent_input.Command {
         self.last_main_approval_id = main_approval_id;
         return self.handleAction(alloc, action);
     }
@@ -4906,6 +4952,7 @@ test "app_input_runtime ctrl-l preserves an active inline picker" {
         &app,
         .{ .composer_shortcut = .redraw },
         .redraw,
+        null,
         null,
         null,
         false,
@@ -8071,6 +8118,7 @@ test "app_input_runtime active multiline history moves vertically before advanci
         null,
         null,
         null,
+        null,
         false,
         4096,
     );
@@ -9030,9 +9078,13 @@ test "app_input_runtime routes keys to subagent view when no modal is active" {
 
     try feedRoutingBytes(&app, "\x1b[A");
     try std.testing.expectEqual(@as(usize, 1), app.subagents.handled_keys);
+    try std.testing.expectEqual(@as(usize, 1), app.subagents.handled_actions);
+    try std.testing.expectEqual(@as(usize, 0), app.subagents.handled_raw_keys);
 
     try Runtime(RoutingFakeApp).handleByte(&app, 'x', 4096, 100);
     try std.testing.expectEqual(@as(usize, 2), app.subagents.handled_keys);
+    try std.testing.expectEqual(@as(usize, 1), app.subagents.handled_actions);
+    try std.testing.expectEqual(@as(usize, 1), app.subagents.handled_raw_keys);
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
 }
 
@@ -10063,7 +10115,6 @@ test "escape on a freeform draft arms then clears before cancelling the batch" {
     try std.testing.expect(app.question_prompt.isFreeformSelected());
     _ = try app.question_prompt.apply(alloc, .{ .insert_ascii = 'k' });
 
-    // First Esc arms the double-tap clear and leaves the draft alone.
     app.input_runtime.terminal_action_decoder.stage = 1;
     app.input_runtime.terminal_action_decoder.cancel_pending = true;
     app.input_runtime.terminal_action_decoder.started_ms = 0;
@@ -10074,7 +10125,6 @@ test "escape on a freeform draft arms then clears before cancelling the batch" {
     try std.testing.expect(app.question_prompt.isActive());
     try std.testing.expect(!app.worker.cancel_requested);
 
-    // Second Esc inside the window clears the field but keeps the batch.
     app.input_runtime.terminal_action_decoder.stage = 1;
     app.input_runtime.terminal_action_decoder.cancel_pending = true;
     app.input_runtime.terminal_action_decoder.started_ms = 0;
@@ -10086,7 +10136,6 @@ test "escape on a freeform draft arms then clears before cancelling the batch" {
     try std.testing.expect(!app.input_runtime.gestures.escapeClearArmed());
     try std.testing.expect(!app.worker.cancel_requested);
 
-    // Third Esc on the empty field cancels the batch.
     app.input_runtime.terminal_action_decoder.stage = 1;
     app.input_runtime.terminal_action_decoder.cancel_pending = true;
     app.input_runtime.terminal_action_decoder.started_ms = 0;
@@ -11062,6 +11111,7 @@ test "composer shortcut line delete handles decoded and raw mutations" {
             .delete_to_line_start,
             null,
             null,
+            null,
             false,
             4096,
         );
@@ -11141,6 +11191,7 @@ test "composer shortcut line delete preserves no-op picker redraw and metadata s
         .delete_to_line_start,
         null,
         null,
+        null,
         false,
         4096,
     );
@@ -11154,6 +11205,7 @@ test "composer shortcut line delete preserves no-op picker redraw and metadata s
         &app,
         .delete_to_line_end,
         .delete_to_line_end,
+        null,
         null,
         null,
         false,
@@ -11259,6 +11311,30 @@ test "app_input_runtime submit resolves slash completion through core command sp
     try std.testing.expect(app.last_prompt == null);
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+}
+
+test "app_input_runtime recalls a submitted slash command with history previous" {
+    const alloc = std.testing.allocator;
+    var app = FakeSubmitApp{ .alloc = alloc };
+    defer app.deinit();
+
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "/he");
+    app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
+
+    try Runtime(FakeSubmitApp).submit(&app, 100);
+
+    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.composer_history.count());
+    try std.testing.expectEqualStrings(
+        "/help",
+        app.input_runtime.composer_history.entryText(0).?,
+    );
+
+    try input_completion_runtime.CompletionRuntime(FakeSubmitApp).navigatePromptHistory(
+        &app,
+        -1,
+    );
+
+    try std.testing.expectEqualStrings("/help", app.input_runtime.edit_state.input.items);
 }
 
 test "app_input_runtime submit preserves a dismissed slash query" {
@@ -11371,7 +11447,11 @@ test "app_input_runtime routes pending image list locally and preserves its plac
     try std.testing.expectEqual(@as(usize, 1), app.pending_images.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.preflight_count);
     try std.testing.expectEqual(@as(usize, 0), app.queue_accept_count);
-    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.composer_history.count());
+    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.composer_history.count());
+    try std.testing.expectEqualStrings(
+        "/images",
+        app.input_runtime.composer_history.entryText(0).?,
+    );
     try std.testing.expect(app.last_prompt == null);
 }
 
@@ -11430,7 +11510,14 @@ test "app_input_runtime clears pending image placeholders after image command st
         try std.testing.expectEqual(@as(usize, 0), app.pending_images.items.len);
         try std.testing.expectEqual(@as(usize, 0), app.preflight_count);
         try std.testing.expectEqual(@as(usize, 0), app.queue_accept_count);
-        try std.testing.expectEqual(@as(usize, 0), app.input_runtime.composer_history.count());
+        try std.testing.expectEqual(
+            @as(usize, 1),
+            app.input_runtime.composer_history.count(),
+        );
+        try std.testing.expectEqualStrings(
+            "/images clear",
+            app.input_runtime.composer_history.entryText(0).?,
+        );
         try std.testing.expect(app.last_prompt == null);
     }
 }
@@ -11587,7 +11674,11 @@ test "app_input_runtime keeps a repeated image command local while an image is p
         try std.testing.expectEqualStrings("[Image #1][Image #2]", app.input_runtime.edit_state.input.items);
         try std.testing.expectEqual(@as(usize, 0), app.preflight_count);
         try std.testing.expectEqual(@as(usize, 0), app.queue_accept_count);
-        try std.testing.expectEqual(@as(usize, 0), app.input_runtime.composer_history.count());
+        try std.testing.expectEqual(@as(usize, 1), app.input_runtime.composer_history.count());
+        try std.testing.expectEqualStrings(
+            last_command,
+            app.input_runtime.composer_history.entryText(0).?,
+        );
         try std.testing.expect(app.last_prompt == null);
         try std.testing.expectEqual(@as(usize, 0), app.last_images.len);
         try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
@@ -12533,7 +12624,7 @@ test "app_input_runtime persists expanded pasted prompt bytes" {
     );
 }
 
-test "app_input_runtime excludes slash commands from durable prompt history" {
+test "app_input_runtime persists slash commands in durable prompt history" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -12554,8 +12645,13 @@ test "app_input_runtime excludes slash commands from durable prompt history" {
         100,
     );
     defer prompt_history_store.freeLoadedEntries(alloc, entries);
-    try std.testing.expectEqual(@as(usize, 0), entries.len);
-    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.composer_history.count());
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqualStrings("/help", entries[0].text);
+    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.composer_history.count());
+    try std.testing.expectEqualStrings(
+        "/help",
+        app.input_runtime.composer_history.entryText(0).?,
+    );
 }
 
 test "app_input_runtime excludes image-bearing prompts from durable history" {

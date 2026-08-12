@@ -1192,7 +1192,6 @@ tmuxTest(
     await active.waitForPane((pane) => pane.includes("[Image 1]"), READY_TIMEOUT);
     expect(localGateway.requests).toHaveLength(0);
 
-    // The regression: this second command used to submit "[Image #1]/image ..." as a prompt.
     await typeLiteral(active, `/image ${second}`);
     await active.sendKeys("Enter");
     await active.waitForPane(
@@ -1225,7 +1224,6 @@ tmuxTest(
     const body = localGateway.requests[0]!.body;
     const fileParts = body.match(/"type":"file"/g) ?? [];
     expect(fileParts).toHaveLength(2);
-    // Model-visible text must carry neither the command nor any local path or URI.
     expect(body).not.toContain("/image ");
     expect(body).not.toContain(first);
     expect(body).not.toContain(second);
@@ -1238,7 +1236,6 @@ tmuxTest(
     expect(fullScrollback).toContain("● Images: 2 pending");
     expect(fullScrollback).toContain("Both images received.");
     expect(fullScrollback).not.toContain("ImageContextAdapterFailed");
-    // Exactly one user turn reached the transcript.
     expect(fullScrollback.match(/describe both/g) ?? []).toHaveLength(1);
 
     const finalGrid = await active.capturePaneGrid();
@@ -1308,8 +1305,6 @@ tmuxTest(
     await active.sendKeys("Enter");
     await active.waitForPane((pane) => pane.includes("turn 1 complete"), READY_TIMEOUT);
 
-    // The regression: the second image used to render as [Image 1] because the
-    // badge was numbered by appearance inside the drafted text.
     await typeLiteral(active, `/image ${second}`);
     await active.sendKeys("Enter");
     await active.waitForPane((pane) => pane.includes("[Image 2]"), READY_TIMEOUT);
@@ -1594,8 +1589,9 @@ tmuxTest(
     await active.sendText("/input");
     await active.waitForPane(
       (pane) =>
-        pane.includes("Appearance · Choose one") &&
-        pane.includes("Tint ✓"),
+        pane.includes("Appearance") &&
+        pane.includes("Input appearance") &&
+        pane.includes("lines  tint"),
       READY_TIMEOUT,
     );
     await active.sendKeys("Escape");

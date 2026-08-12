@@ -155,7 +155,7 @@ const TranscriptRecoveryReceipt = struct {
     materialized_flow_len: ?usize = null,
     remaining_resize_reflow_rows: u16 = 0,
     remaining_semantic_rows: u32 = 0,
-    // This suffix of semantic debt may advance the current projection.
+    // Only this remaining semantic suffix may advance the current projection.
     remaining_semantic_progress_rows: u32 = 0,
     remaining_unplanned_scroll_rows: u16 = 0,
     attempt_cols: u16 = 0,
@@ -4297,9 +4297,8 @@ pub const TranscriptRuntime = struct {
     layout: Layout = undefined,
     cursor_row: u16 = 1,
     cursor_col: u16 = 1,
-    /// Top terminal row owned by fx. Rows above this belong to whatever
-    /// scrollback content existed before fx started (shell prompt, prior
-    /// command output) and must not be touched by our repaint logic.
+    /// Top terminal row owned by fx. Rows above this contain pre-fx scrollback
+    /// and must not be touched by fx repaint logic.
     /// Initialized to the cursor row captured at `initViewport`, and
     /// decreased as the transcript scrolls until it reaches row 1.
     viewport_top_row: u16 = 1,
@@ -4438,14 +4437,9 @@ pub const TranscriptRuntime = struct {
     replaceable_last_line: bool = false,
     replaceable_row: u16 = 1,
     replaceable_start: usize = 0,
-    /// The shadow terminal. Every byte emitted is also fed into this
-    /// in-process vt_emulator, so its cell grid always reflects what
-    /// the terminal is currently displaying. The viewport renderer
-    /// uses it as the `prev` state for cell-level diffing; under
-    /// FX_TRACE the grid is also dumped to the trace log at each
-    /// synchronized-update boundary. Enabled unconditionally at
-    /// bootstrap (see `app_lifecycle.zig`), so callers that run
-    /// after init can rely on it being non-null.
+    /// In-process terminal shadow used as the previous state for cell diffs.
+    /// Bootstrap enables it unconditionally; FX_TRACE dumps it at synchronized
+    /// update boundaries.
     shadow_vt: ?*vt_emulator.Grid = null,
     shadow_vt_alloc: ?Allocator = null,
     /// Detached presentations share a physical terminal shadow with their
@@ -6106,14 +6100,9 @@ pub const TranscriptRuntime = struct {
         );
     }
 
-    /// Append a user-turn entry. Takes ownership of `turn.text` and
-    /// every slice inside `turn.images` — all must be allocated by
-    /// `alloc`. On success the new entry owns the bundle and frees it on
-    /// `clearTranscript` / `deinit`. On error (OOM inside `entries.append`)
-    /// the method frees `turn.text`, each image's `.path` and
-    /// `.media_type`, and the outer `turn.images` slice before
-    /// propagating — callers must not double-free. Returns the stamped
-    /// entry id.
+    /// Consumes `turn` regardless of outcome. All owned slices must use `alloc`;
+    /// the entry owns them on success and this method frees them on failure.
+    /// Returns the stamped entry id.
     pub fn appendUserTurnOwned(self: *TranscriptRuntime, alloc: Allocator, turn: types.UserTurn) !u32 {
         return transcript_store.appendUserTurnOwned(self, alloc, turn);
     }
@@ -6162,7 +6151,7 @@ pub const TranscriptRuntime = struct {
     /// assistant-turn entry with `id`, or null if no such entry exists
     /// (including when `id` belongs to a `raw_bytes` or `user_turn`
     /// entry). The returned pointer is stable only until the next
-    /// `entries` append; resolve just before use.
+    /// `entries` append; resolve immediately before use.
     pub fn lookupAssistantSegments(self: *TranscriptRuntime, id: u32) ?*AssistantTurnSegments {
         return transcript_store.lookupAssistantSegments(self, id);
     }
@@ -6175,16 +6164,9 @@ pub const TranscriptRuntime = struct {
         return transcript_store.tailAssistantSegments(self);
     }
 
-    /// Mirror `text` into the transcript byte buffer and attach it to
-    /// the trailing `assistant_turn` entry. If the trailing entry is
-    /// already an `assistant_turn`, extend its segments in place;
-    /// otherwise open a new `assistant_turn` entry for this chunk.
-    /// Returns the id of the entry that received the chunk. This is
-    /// the pacer's canonical write path — routing bytes through the
-    /// byte-buffer writer directly (via `writeTranscript`) would
-    /// record them as `raw_bytes` entries, which would double-count
-    /// on paint-time reflow and stop `wrapAssistantText` from
-    /// re-flowing them at the current cols on resize.
+    /// Appends paced text to the trailing assistant entry, creating one if needed,
+    /// and mirrors it into the transcript buffer. Using `writeTranscript` here
+    /// would also create raw entries and double-count content during reflow.
     pub fn streamAssistantChunk(
         self: *TranscriptRuntime,
         alloc: Allocator,
@@ -8608,12 +8590,8 @@ pub const TranscriptRuntime = struct {
         transition.consumed = true;
     }
 
-    /// Writes bytes to the transcript buffer without mirroring them
-    /// into the structured entries list. Use this when the caller is
-    /// going to append a structured entry of its own (user card, pacer
-    /// stream) so the entries list does not double-record the content.
-    /// Prefer `writeTranscript` for raw banners, notices, and any
-    /// other content that should appear as a `raw_bytes` entry.
+    /// Writes only to the byte buffer for callers that separately append a
+    /// structured entry. Use `writeTranscript` when raw-entry mirroring is needed.
     pub fn writeTranscriptBytes(self: *TranscriptRuntime, alloc: Allocator, metrics: *Metrics, text: []const u8, record: bool) !void {
         return transcript_writer.writeTranscriptBytes(self, alloc, metrics, text, record);
     }
@@ -8680,12 +8658,8 @@ pub const TranscriptRuntime = struct {
         );
     }
 
-    /// Writes bytes to the transcript buffer AND mirrors them into the
-    /// structured entries list as a `raw_bytes` entry. Default path for
-    /// any caller that does not manage its own entry accounting.
-    /// Structured writers (user card, pacer) should call
-    /// `writeTranscriptBytes` and append their own entry instead to
-    /// avoid double-recording the content.
+    /// Writes to the byte buffer and mirrors the content as a raw entry.
+    /// Structured writers must use `writeTranscriptBytes` to avoid duplication.
     pub fn writeTranscript(self: *TranscriptRuntime, alloc: Allocator, metrics: *Metrics, text: []const u8, record: bool) !void {
         return transcript_writer.writeTranscript(self, alloc, metrics, text, record);
     }
@@ -9717,23 +9691,10 @@ pub const TranscriptRuntime = struct {
         }
     }
 
-    /// Thin cap-applying wrapper around `walkText`. The walk logic
-    /// lives in `walkText`; this function applies the DECAWM-OFF cap
-    /// on `self.cursor_row` (cursor cannot live below the viewport —
-    /// LF at the bottom row stays at the bottom while the terminal
-    /// scrolls) and returns the uncapped `WalkResult` for callers
-    /// that need the true row count.
-    ///
-    /// Scroll-math callers (`writeTranscriptBytes`,
-    /// `appendReplaceableTranscriptLine`)
-    /// MUST consume `result.end_row` from the return value — NOT
-    /// `self.cursor_row` — to compute `scroll_amount`. `self.cursor_row`
-    /// is capped at `layout.rows`, so it under-counts overflow and
-    /// would leave phantom blank rows at the top of the band when
-    /// content runs past the viewport bottom.
-    ///
-    /// `result.end_col` may equal `self.layout.cols + 1` in
-    /// wrap-exact cases; frame preparation tolerates this off-by-one.
+    /// Updates the capped terminal cursor and returns the uncapped text walk.
+    /// Scroll calculations must use `result.end_row`, not `self.cursor_row`,
+    /// which cannot represent overflow below the viewport. Wrap-exact walks may
+    /// return `layout.cols + 1` in `end_col`.
     pub fn advanceCursor(self: *TranscriptRuntime, text: []const u8) WalkResult {
         const result = walkText(@as(u32, self.cursor_row), self.cursor_col, text, self.layout.cols);
         self.cursor_col = result.end_col;
@@ -10882,7 +10843,6 @@ test "terminal reset drops stale mid-scrollback footer clear before reanchor" {
     runtime.footer_viewport.geometry.top = 25;
     runtime.footer_viewport.externally_invalidated = true;
 
-    // Job-control suspend records a footer erase against the pre-stop band.
     try runtime.recordFrameInvalidation(.{
         .reason = .external_clear,
         .top = 25,
@@ -10905,8 +10865,6 @@ test "terminal reset drops stale mid-scrollback footer clear before reanchor" {
     try std.testing.expectEqual(@as(u16, 1), pending.ranges()[0].top);
     try std.testing.expectEqual(@as(u16, 36), pending.ranges()[0].bottom);
 
-    // Compact post-reset bands must accept the reanchor and reject the old
-    // footer clear (the failure mode that aborted fg after idle park).
     var plan = render_engine.paint_plan.PaintPlan{
         .layout = runtime.layout,
         .viewport = .{

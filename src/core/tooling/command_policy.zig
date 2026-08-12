@@ -13,7 +13,7 @@ pub fn command_risk_note_for(command: []const u8) ?[]const u8 {
     return risk_note_for(risk);
 }
 
-/// Returns a narrow alternative when the command text makes a safer path obvious.
+/// Returns a narrow alternative when the command text has an unambiguous safer path.
 pub fn command_safer_alternative_for(command: []const u8) ?[]const u8 {
     const analysis = command_classification.analysis_command_tail(command);
     if (risk_kind_in_analysis(analysis)) |risk| {

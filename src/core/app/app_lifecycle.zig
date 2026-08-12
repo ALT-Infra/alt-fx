@@ -32,16 +32,8 @@ const TranscriptRuntime = transcript_runtime.TranscriptRuntime;
 pub const ResizeHandler = shell_runtime.ResizeHandler;
 pub const default_permission_mode = config_runtime.default_permission_mode;
 
-/// Minimal terminal-state restoration emitted by the abnormal-exit
-/// signal handlers. Kept as a compile-time string so the handler can
-/// write it via a single async-signal-safe `write(2)` call without
-/// any formatting or allocation.
-///
-/// Restores: DECAWM (autowrap), SGR defaults, cursor visibility,
-/// bracketed paste and theme notifications off, kitty keyboard flags off,
-/// modifyOtherKeys off.
-/// Ends with a newline so the user's next shell prompt starts on its
-/// own row rather than bleeding into fx's last emit.
+/// Compile-time terminal restoration for one async-signal-safe `write(2)` call.
+/// Resets terminal modes and ends with a newline before the next shell prompt.
 const abnormal_exit_restore_prefix = "\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1004l\x1b[?1006l\x1b[?1l\x1b>\x1b[?1049l\x1b[?7h\x1b[4l\x1b[?6l\x1b[0m\x1b[?25h\x1b[?2031l\x1b[?2004l";
 const abnormal_exit_restore = abnormal_exit_restore_prefix ++ "\x1b[<u\x1b[>4;0m\n";
 const tmux_abnormal_exit_restore = abnormal_exit_restore_prefix ++ "\x1b[>4;0m\n";
@@ -52,23 +44,15 @@ const alternate_screen_enter = "\x1b[?1049h";
 const alternate_mouse_tracking_enter = "\x1b[?1000h\x1b[?1006h";
 const terminal_takeover_reset = "\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1004l\x1b[?1006l\x1b[?1l\x1b>\x1b[?2004l\x1b[<u\x1b[>4;0m\x1b[4l\x1b[?6l\x1b[?7h\x1b[0m\x1b[?25h";
 
-/// Stored so `uninstallAbnormalExitHandlers` can restore them. Only
-/// written from `installAbnormalExitHandlers` at bootstrap and read
-/// from `uninstallAbnormalExitHandlers` at shutdown. Never mutated from
-/// signal context.
+/// Original handlers, written at bootstrap and restored at shutdown.
+/// Signal context never mutates them.
 var old_sigterm_action: ?std.posix.Sigaction = null;
 var old_sighup_action: ?std.posix.Sigaction = null;
 
-/// Signal handler for SIGTERM / SIGHUP. It restores terminal state and
-/// re-raises the signal with the default disposition so the process
-/// terminates.
-///
-/// MUST be async-signal-safe: only `write(2)`, `sigaction(2)`, and
-/// `raise(3)` are used. No allocation, no std.Io wrappers, no Zig
-/// mutexes, because those can deadlock from signal context.
+/// Restores terminal state, installs the default disposition, and re-raises.
+/// Must remain async-signal-safe: only `write(2)`, `sigaction(2)`, and `raise(3)`.
 fn abnormalExitHandlerWithRestore(comptime restore: []const u8, sig: std.posix.SIG) void {
-    // libc write() is async-signal-safe. Ignore the return; there is
-    // nothing we can do from signal context if it fails.
+    // Signal context cannot recover from a failed async-signal-safe write.
     _ = std.c.write(
         std.posix.STDOUT_FILENO,
         restore.ptr,

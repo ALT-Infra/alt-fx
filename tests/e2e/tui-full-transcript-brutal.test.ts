@@ -979,9 +979,7 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
     writeMetrics();
     const finalScrollback = await waitForScrollback(session, LIVE_DONE, TIMEOUT * 2);
     expect(finalScrollback).toContain(LIVE_DONE);
-    // A physical terminal reset reconstructs scrollback and then paints the
-    // visible viewport, so one semantic line can legitimately appear twice in
-    // a tmux capture. Verify persisted product state, where duplication matters.
+    // Terminal reset may duplicate a visible line in tmux; durable state must not.
     expect(committedAssistantOccurrences(paths.home, LIVE_DONE)).toBe(1);
     if ((config.settledCycles ?? 0) > 0) {
       await thrashViewer(
@@ -1020,20 +1018,16 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
     const budgetTransitions = (config.settledCycles ?? 0) > 0
       ? summary.settledTransitions
       : summary.transitions;
-    // A 50k-line alternate-buffer swap includes terminal backpressure. Keep
-    // this below the pre-cache 4s tail while leaving room for host jitter.
+    // The budget includes terminal backpressure and host jitter.
     expect(budgetTransitions.review.p95Ms).toBeLessThan(3_500);
     expect(budgetTransitions.full.p95Ms).toBeLessThan(3_000);
     expect(budgetTransitions.close.p95Ms).toBeLessThan(1_500);
     expect(budgetTransitions.resize.p95Ms).toBeLessThan(3_000);
     if ((config.settledCycles ?? 0) > 0) {
-      // A resized alternate-screen close must not replay the complete compact
-      // transcript before the next Review open. Only the visible repair frame
-      // and the Review viewport should cross the terminal boundary.
+      // A resized close may emit the repair frame and next Review viewport only.
       expect(summary.settledTerminalBytes.review.maxBytes).toBeLessThan(64 * 1024);
     }
-    // Live tool/assistant mutations can invalidate the old primary viewport,
-    // but the next Review open must still be independent of total chat size.
+    // Review-open cost must remain independent of total chat size.
     expect(summary.terminalBytes.review.maxBytes).toBeLessThan(128 * 1024);
     expect(summary.terminalBytes.close.maxBytes).toBeLessThan(256 * 1024);
     expect(summary.memory.growthRssKib).toBeLessThan(256 * 1024);

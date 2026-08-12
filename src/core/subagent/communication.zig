@@ -268,7 +268,7 @@ pub const RelationshipApproval = struct {
 
 /// Durable projection of one canonical prepared request. The executable
 /// payload is represented by its canonical digest; human surfaces receive only
-/// the bounded label, explanation, and optional file review exposed by Fx.
+/// the bounded label, explanation, and optional file review exposed by fx.
 pub const Approval = struct {
     id: []u8,
     kind: ApprovalKind,

@@ -956,7 +956,16 @@ pub fn composeFooterFrame(
     else if (appearance_active)
         try input_presentation.composeAppearanceMenuHintRow(alloc, shell.layout.cols)
     else if (compact_command_menu) |menu|
-        try input_presentation.composeCompactCommandMenuHintRow(alloc, shell.layout.cols, menu)
+        switch (menu) {
+            .statusline => try input_presentation.composeHintRow(
+                alloc,
+                false,
+                input.active_label,
+                ctx,
+                shell.layout.cols,
+            ),
+            else => try input_presentation.composeCompactCommandMenuHintRow(alloc, shell.layout.cols, menu),
+        }
     else if (input.show_picker and input.picker_kind == .slash and input.slash_menu_layout != null)
         try input_presentation.composeSlashMenuHintRow(alloc, shell.layout.cols)
     else blk: {

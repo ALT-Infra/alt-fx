@@ -15,14 +15,7 @@ pub const default_enabled: bool = builtin.os.tag == .macos;
 pub const Cue = notification_contract.Cue;
 pub const Kind = notification_contract.Kind;
 
-// Short chimes rendered from cuelume's recipes (MIT, Daniel White): `success`
-// is three ascending sine tones, `error` a muted knock with two descending
-// triangles, `bloom` a warm detuned swell for startup, `press` a dull knock
-// for cancellation, `click` cuelume's press+release pair for model/fast changes,
-// `release` a brighter springy tick for the max double-Esc input clear,
-// `toggle` a two-part click-clack for the max slash-menu open. The asset mapping
-// stays here so the semantic cue contract does not own player-specific files.
-// Assets are IMA4 CAF, afplay-native, to keep the embedded bytes small.
+// IMA4 CAF chimes derived from cuelume's MIT-licensed recipes by Daniel White.
 fn embeddedChime(cue: Cue) []const u8 {
     return switch (cue) {
         inline else => |named_cue| @embedFile(@tagName(named_cue) ++ ".caf"),
@@ -39,11 +32,7 @@ var sound_path_mutex: std.Io.Mutex = .init;
 var materialized_paths = [_]?[]const u8{null} ** std.enums.values(Cue).len;
 var sound_path_bufs: [std.enums.values(Cue).len][std.fs.max_path_bytes]u8 = undefined;
 
-// afplay needs a file path, so each embedded chime is written to the temp dir
-// on first use. Lazily, because startup has a tight budget. A size-matched
-// regular file from a prior launch is reused; rewrites are installed atomically
-// so a pre-existing symlink is replaced rather than followed. Returns null
-// (caller falls back to the bell) if the write fails.
+// Materialize lazily to protect startup latency. Atomic replacement avoids following symlinks.
 fn ensureCueSoundPath(cue: Cue) ?[]const u8 {
     const idx = @intFromEnum(cue);
     sound_path_mutex.lockUncancelable(io_mod.getIo());

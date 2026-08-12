@@ -91,19 +91,10 @@ fn runBoundary(test_controls: session_log.TestControls, boundary: session_log.Bo
     try test_controls.boundary(boundary);
 }
 
-/// Performs the legacy -> schema-v3 migration for a session whose writer lock
-/// is already held. This is one atomic responsibility: stage the canonical
-/// projection, then swap authority under the commit lock with crash boundaries,
-/// then replay the committed log into the returned writable session.
-///
-/// The staged-commit protocol (and its lock ordering) lives in the helpers
-/// below and must not be reordered: `assertMigratable` (fence + no existing
-/// authority), stable legacy snapshot, canonical projection write, unchanged
-/// re-check, then `commitMigrationAuthorityLocked` (intent -> marker -> manifest
-/// -> validate -> drop intent, each gated by a test boundary). On any error the
-/// orchestrator's errdefers release `legacy` and `state`; partial on-disk state
-/// is recovered by the resume path, not here. Takes ownership of `writable` and
-/// `lifecycle.*` only on success.
+/// Migrates legacy state to schema v3 while the caller holds the writer lock.
+/// Commit order is fixed: migration fence, stable snapshot, projection write,
+/// unchanged recheck, then intent, marker, manifest, validation, and intent removal.
+/// Resume handles partial disk state. Ownership transfers only on success.
 pub fn migrateLegacyLocked(
     ctx: StoreContext,
     alloc: Allocator,
