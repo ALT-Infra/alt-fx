@@ -34,6 +34,7 @@ pub const ParsedCommand = union(enum) {
     skills: []const u8,
     copy,
     feedback,
+    trace,
     compact,
     settings: []const u8,
     alias: []const u8,
@@ -79,6 +80,7 @@ pub const CommandHandlers = struct {
     handle_skills: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     copy_last: *const fn (ctx: *anyopaque) anyerror!void,
     submit_feedback: *const fn (ctx: *anyopaque) anyerror!void,
+    create_trace: *const fn (ctx: *anyopaque) anyerror!void,
     compact_history: *const fn (ctx: *anyopaque) anyerror!void,
     handle_settings: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_alias: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
@@ -130,6 +132,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .skills => .{ .skills = payload },
         .copy => .copy,
         .feedback => .feedback,
+        .trace => .trace,
         .compact => .compact,
         .settings => .{ .settings = payload },
         .alias => .{ .alias = payload },
@@ -189,6 +192,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .skills => |rest| try handlers.handle_skills(handlers.ctx, rest),
         .copy => try handlers.copy_last(handlers.ctx),
         .feedback => try handlers.submit_feedback(handlers.ctx),
+        .trace => try handlers.create_trace(handlers.ctx),
         .compact => try handlers.compact_history(handlers.ctx),
         .settings => |rest| try handlers.handle_settings(handlers.ctx, rest),
         .alias => |rest| try handlers.handle_alias(handlers.ctx, rest),
@@ -316,6 +320,7 @@ test "parse extracts mcp command payload" {
 test "parse recognizes exact no-payload commands" {
     try std.testing.expectEqual(ParsedCommand.copy, parse(testSlashRegistry(), "/copy"));
     try std.testing.expectEqual(ParsedCommand.feedback, parse(testSlashRegistry(), "/feedback"));
+    try std.testing.expectEqual(ParsedCommand.trace, parse(testSlashRegistry(), "/trace"));
     try std.testing.expectEqual(ParsedCommand.compact, parse(testSlashRegistry(), "/compact"));
     try std.testing.expectEqual(ParsedCommand.credits, parse(testSlashRegistry(), "/credits"));
     try std.testing.expectEqual(ParsedCommand.credits, parse(testSlashRegistry(), "/balance"));
@@ -569,6 +574,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .handle_skills = unexpectedPayload,
         .copy_last = unexpectedNoPayload,
         .submit_feedback = unexpectedNoPayload,
+        .create_trace = unexpectedNoPayload,
         .compact_history = unexpectedNoPayload,
         .handle_settings = unexpectedPayload,
         .handle_alias = unexpectedPayload,

@@ -638,7 +638,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       const afterResponse = await capture("after-response");
       const closedComposerRow = composerRow(afterResponse);
       await session.sendLiteralText("/");
-      await session.waitForText("Commands 38", 5_000);
+      await session.waitForText("Commands 39", 5_000);
       const afterSlash = await capture("after-slash");
       await session.sendLiteralText("f");
       await session.waitForText("/feedback", 5_000);
@@ -654,7 +654,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForPane(
         (pane) =>
           composerContains(pane, "/feedback") &&
-          !pane.includes("copy a Markdown report file and show a GitHub link"),
+          !pane.includes("open the fx feedback form"),
         5_000,
       );
       const afterDismiss = await capture("after-dismiss");
@@ -662,7 +662,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForPane(
         (pane) =>
           composerContains(pane, "/feedbackx") &&
-          !pane.includes("copy a Markdown report file and show a GitHub link"),
+          !pane.includes("open the fx feedback form"),
         5_000,
       );
       const afterDismissEdit = await capture("after-dismiss-edit");
@@ -1103,7 +1103,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
 
       await session.sendText("/help");
-      let grid = await waitForHelpMenu(session, 38);
+      let grid = await waitForHelpMenu(session, 39);
       let pane = grid.join("\n");
       expect(pane).not.toContain("𝒇x");
       expect(pane).not.toContain("Run /help for commands");
@@ -1123,11 +1123,11 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).not.toContain("/clear");
 
       await session.sendKeys("C-u");
-      await waitForHelpMenu(session, 38);
+      await waitForHelpMenu(session, 39);
       await session.sendKeys("Down");
       await session.sendKeys("Enter");
       pane = await session.waitForPane(
-        (current) => hasEmptyComposer(current) && !current.includes("Commands 38"),
+        (current) => hasEmptyComposer(current) && !current.includes("Commands 39"),
         5_000,
       );
       expect(composerContains(pane, "/clear")).toBe(false);
@@ -1136,7 +1136,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("C-u");
       await session.sendText("/help");
-      await waitForHelpMenu(session, 38);
+      await waitForHelpMenu(session, 39);
       await session.sendLiteralText("additional directories");
       await waitForHelpMenu(session, 1);
       await session.sendKeys("Enter");
@@ -1153,7 +1153,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("C-u");
       await session.sendText("/help");
-      await waitForHelpMenu(session, 38);
+      await waitForHelpMenu(session, 39);
       await session.sendLiteralText("no command can match this query");
       await session.waitForText("No commands found.", 5_000);
       await session.sendKeys("Escape");
@@ -1339,7 +1339,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
 
       await session.sendText("/help");
-      let pane = await session.waitForText("Commands 38", 5_000);
+      let pane = await session.waitForText("Commands 39", 5_000);
       expect(pane).toContain("/help");
       expect(pane).not.toContain("● /help");
       await session.sendKeys("Escape");
@@ -1424,7 +1424,6 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("Right");
       grid = await waitForStatuslineMenu(session, "off  on");
       pane = grid.join("\n");
-      expect(JSON.parse(readFileSync(settingsPath, "utf8")).statusLine.sandbox).toBe(true);
       expect(JSON.parse(readFileSync(settingsPath, "utf8")).statusLine.sandbox).toBe(true);
 
       await session.sendKeys("Down");
@@ -3012,7 +3011,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
 
       await session.sendLiteralText("/");
-      await session.waitForText("Commands 38", 5_000);
+      await session.waitForText("Commands 39", 5_000);
 
       for (let i = 0; i < 5; i += 1) {
         await session.sendKeys("Down");
