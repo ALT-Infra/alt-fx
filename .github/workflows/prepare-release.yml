@@ -61,14 +61,8 @@ jobs:
           fi
 
           git log "${PREV_TAG}..HEAD" --oneline > /tmp/log.txt
-          git log "${PREV_TAG}..HEAD" --format='%an <%ae>' | sort -u > /tmp/authors.txt
-
-          head -60 CHANGELOG.md > /tmp/prev-changelog.txt
-
           echo "Diff: ${DIFF_SIZE} bytes, $(wc -l < /tmp/diff.txt) lines"
           echo "Commits: $(wc -l < /tmp/log.txt)"
-          echo "Authors:"
-          cat /tmp/authors.txt
 
       - name: Generate changelog with AI
         env:
@@ -80,17 +74,18 @@ jobs:
           cat > /tmp/system-prompt.txt <<'SYSPROMPT'
           You write changelogs for fx, an open-source AI-powered CLI tool written in Zig.
 
-          You will receive the actual code diff since the last release, a diff stat summary, a commit log, contributor info, and a previous changelog for format reference.
+          You will receive the actual code diff since the last release, a diff stat summary, and a commit log. Treat the commit log as private research context.
 
           Rules:
           - Base your changelog ONLY on what the diff actually shows. Do not trust commit messages or PR descriptions as authoritative — they go stale. The diff is the source of truth.
-          - Group changes under ### New Features, ### Bug Fixes, ### Improvements, ### Breaking Changes as appropriate. Omit empty sections.
-          - Bold the feature/fix name, then describe concisely what changed. Use an emdash (—) as separator, never double hyphens (--).
-          - Reference PR numbers in parentheses where visible in merge commits (e.g. #42). If you cannot determine a PR number, omit it rather than guessing.
-          - Include a ### Contributors section with GitHub @usernames. You will be given git author names to help map these.
-          - Match the tone and format of the previous changelog entries exactly.
+          - Write public, user-facing product notes. Describe observable behavior and outcomes, not how the work was implemented or delivered.
+          - Always spell the product name fx. Preserve different casing only for exact code identifiers such as FX_MODEL.
+          - Group changes under ### Breaking Changes, ### New Features, ### Improvements, ### Bug Fixes, and ### Security as appropriate. Omit empty sections.
+          - Bold a short feature or fix name, then describe the user-visible change after a colon.
+          - Do not include pull request or issue numbers, links to trackers, commit hashes, contributor names, author attribution, or a Contributors section.
+          - Do not include internal details such as repository moves, website or marketing work, CDN layout, CI workflows, tests or fixtures, branch history, or implementation-only refactors. Translate relevant work into its public user outcome or omit it.
+          - Do not force every commit into the changelog. Omit changes without a public user outcome.
           - Output ONLY the changelog body (the content that goes between the release markers). Do not include the ## version heading, do not include the <!-- release:start/end --> markers, do not include any preamble or explanation.
-          - Do not prefix entries with commit hashes.
           - Do not use emojis.
           SYSPROMPT
 
@@ -104,8 +99,6 @@ jobs:
             --rawfile diff_stat /tmp/diff-stat.txt \
             --rawfile src_diff /tmp/diff.txt \
             --rawfile commit_log /tmp/log.txt \
-            --rawfile authors /tmp/authors.txt \
-            --rawfile prev_changelog /tmp/prev-changelog.txt \
             '{
               prompt: [
                 {role: "system", content: $system},
@@ -115,8 +108,6 @@ jobs:
                     $user_header + "\n\n## Diff stat (file-level summary)\n" + $diff_stat
                     + "\n\n## Source diff (src/ changes — the ground truth)\n" + $src_diff
                     + "\n\n## Commit log (supplementary context only — do not trust these as authoritative)\n" + $commit_log
-                    + "\n\n## Git authors\n" + $authors
-                    + "\n\n## Previous changelog (for format and voice reference)\n" + $prev_changelog
                   )
                 }]}
               ]
@@ -170,6 +161,42 @@ jobs:
             exit 1
           fi
           cat /tmp/changelog-body.md
+
+          python3 <<'PYEOF'
+          import re
+          from pathlib import Path
+
+          body = Path("/tmp/changelog-body.md").read_text()
+          forbidden = {
+              "contributor attribution": r"(?im)^###\s+contributors\b|\bcontributors?\b|\bauthors?\b",
+              "tracker references": r"(?i)#[0-9]+\b|\bPRs?\s*#?[0-9]+\b|\bpull requests?\b|github\.com/[^\s)]+/(?:pull|issues|commit)/",
+              "internal web or delivery details": r"(?i)\b(?:fx-web|website|marketing|CDN|deployments?|repository moves?|repository split|repo(?:sitory)? migration)\b|vercel-labs/[A-Za-z0-9_.-]+",
+              "internal engineering details": r"(?i)\b(?:CI|workflows?|tests?|fixtures?|branch history|Git history|commit hashes?|implementation-only refactors?|refactors?)\b",
+          }
+          errors = [label for label, pattern in forbidden.items() if re.search(pattern, body)]
+          if re.search(r"(?<![A-Za-z0-9_])(?:Fx|FX)(?![A-Za-z0-9_])", body):
+              errors.append("product name is not lowercase fx")
+
+          allowed_headings = {
+              "### Breaking Changes",
+              "### New Features",
+              "### Improvements",
+              "### Bug Fixes",
+              "### Security",
+          }
+          headings = set(re.findall(r"(?m)^### .+$", body))
+          if not headings.issubset(allowed_headings):
+              errors.append("unsupported changelog section")
+
+          bullets = re.findall(r"(?m)^- .+$", body)
+          if not bullets or any(not re.match(r"^- \*\*[^*]+:\*\* \S", bullet) for bullet in bullets):
+              errors.append("release bullets must use '- **Name:** Description'")
+
+          if errors:
+              for error in errors:
+                  print(f"::error::Public changelog policy violation: {error}")
+              raise SystemExit(1)
+          PYEOF
 
       - name: Update version and changelog
         run: |
