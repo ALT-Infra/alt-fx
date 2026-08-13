@@ -1559,6 +1559,7 @@ pub fn Runtime(comptime App: type) type {
             try app.prepareLiveSessionResume(log_options);
             loaded_owned = false;
             try installResumedSession(app, &loaded);
+            requestSubagentBackgroundRecovery(app);
             startResumedSessionReconciliation(app);
             try app.finishLiveSessionResume();
             return true;
@@ -2739,6 +2740,11 @@ pub fn Runtime(comptime App: type) type {
             const host = app.session_persistence.subagent_host orelse return;
             const store = if (app.session_persistence.store) |*value| value else return;
             host.rebind(store, app, subagentAuthorityResolver(app));
+            requestSubagentBackgroundRecovery(app);
+        }
+
+        fn requestSubagentBackgroundRecovery(app: *App) void {
+            const host = app.session_persistence.subagent_host orelse return;
             host.requestBackgroundRecovery(io_mod.milliTimestamp()) catch |err| {
                 debug_trace.logf(
                     "subagent",
@@ -7232,6 +7238,19 @@ test "interactive session resume uses the live transition and shared restore pat
     try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
     try std.testing.expectEqualStrings("● Session: resumed: saved prompt", app.notices.items[0]);
     try std.testing.expect(!app.session_persistence.session_picker.active);
+
+    const host = app.session_persistence.subagent_host.?;
+    const recovery_deadline = io_mod.milliTimestamp() + 5_000;
+    while ((host.recoveryState() == .scheduled or
+        host.recoveryState() == .running) and
+        io_mod.milliTimestamp() < recovery_deadline)
+    {
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+    try std.testing.expectEqual(
+        subagent_tool_host.RecoveryState.complete,
+        host.recoveryState(),
+    );
 }
 
 test "interactive session resume preserves the current writer when the target is unavailable" {
