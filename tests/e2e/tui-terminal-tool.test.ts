@@ -1285,7 +1285,7 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
-  "TUI explains external monitor rejection and preserves local monitor flow",
+  "TUI normalizes gateway start composites, explains external monitor rejection, and preserves local monitor flow",
   async () => {
     const fixture = createFixture("fx-tui-terminal-monitor-path-scope-");
     const outsidePath = join(fixture.root, "outside-ready");
@@ -1304,14 +1304,16 @@ test.skipIf(!tmuxAvailable())(
           clean_start: true,
         },
         backend: "native",
-        return_when: { kind: "exit" },
-        wait_ceiling_ms: 20_000,
-        initial_monitors: [{
-          condition: { kind: "path_exists", path: outsidePath },
-          check_interval_ms: 25,
+        return_when: JSON.stringify({ kind: "started" }),
+        initial_monitors: JSON.stringify([{
+          condition: {
+            kind: "path_exists",
+            path: outsidePath,
+            check_interval_ms: 25,
+          },
           notify: { kind: "on_match" },
           lifetime: { kind: "until_match" },
-        }],
+        }]),
       }),
       (body) => {
         const result = toolResultText(body, "terminal_external_path");

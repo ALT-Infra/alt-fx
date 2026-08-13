@@ -40,6 +40,14 @@ const NotifyKind = enum {
 };
 const LifetimeKind = enum { until_match, until_session_end, duration };
 const MonitorOperationKind = enum { add, update, pause, @"resume", remove };
+const composite_argument_fields = [_][]const u8{
+    "shell",
+    "return_when",
+    "dimensions",
+    "initial_monitors",
+    "write",
+    "monitor",
+};
 
 pub const ShellInput = struct {
     kind: ShellKind = .user_login,
@@ -180,25 +188,27 @@ pub fn decode(
     ctx: tool_dispatch.DispatchContext,
     args_json: []const u8,
 ) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
-    var raw = std.json.parseFromSlice(
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var raw = std.json.parseFromSliceLeaky(
         std.json.Value,
-        ctx.allocator,
+        arena,
         args_json,
-        .{},
+        .{ .allocate = .alloc_always },
     ) catch {
         return .{ .failure = try ctx.allocator.dupe(
             u8,
             "terminal arguments must match the advertised action schema",
         ) };
     };
-    defer raw.deinit();
-    if (raw.value != .object) {
+    if (raw != .object) {
         return .{ .failure = try ctx.allocator.dupe(
             u8,
             "terminal arguments must match the advertised action schema",
         ) };
     }
-    const raw_action = raw.value.object.get("action") orelse {
+    const raw_action = raw.object.get("action") orelse {
         return .{ .failure = try ctx.allocator.dupe(
             u8,
             "terminal arguments must match the advertised action schema",
@@ -216,7 +226,7 @@ pub fn decode(
             "terminal arguments must match the advertised action schema",
         ) };
     };
-    if (unexpectedActionField(action, raw.value.object)) |field_name| {
+    if (unexpectedActionField(action, raw.object)) |field_name| {
         return .{ .failure = try std.fmt.allocPrint(
             ctx.allocator,
             "terminal {s} field \"{s}\" is not allowed",
@@ -224,10 +234,27 @@ pub fn decode(
         ) };
     }
 
+    normalizeCompositeArguments(arena, &raw) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            return .{ .failure = try ctx.allocator.dupe(
+                u8,
+                "terminal arguments must match the advertised action schema",
+            ) };
+        },
+    };
+
+    var normalized: std.Io.Writer.Allocating = .init(ctx.allocator);
+    defer normalized.deinit();
+    std.json.Stringify.value(raw, .{}, &normalized.writer) catch
+        return error.OutOfMemory;
+    const normalized_json = try normalized.toOwnedSlice();
+    defer ctx.allocator.free(normalized_json);
+
     const parsed = std.json.parseFromSlice(
         Input,
         ctx.allocator,
-        args_json,
+        normalized_json,
         .{ .allocate = .alloc_always },
     ) catch {
         return .{ .failure = try ctx.allocator.dupe(
@@ -241,6 +268,39 @@ pub fn decode(
         .ptr = owned,
         .deinit_fn = inputDeinit,
     } };
+}
+
+fn normalizeCompositeArguments(
+    alloc: Allocator,
+    root: *std.json.Value,
+) !void {
+    for (composite_argument_fields) |field_name| {
+        const value = root.object.getPtr(field_name) orelse continue;
+        if (value.* != .string) continue;
+        const decoded = try std.json.parseFromSliceLeaky(
+            std.json.Value,
+            alloc,
+            value.string,
+            .{ .allocate = .alloc_always },
+        );
+        if (decoded != .object and decoded != .array) {
+            return error.InvalidCompositeArgument;
+        }
+        value.* = decoded;
+    }
+
+    const initial_monitors = root.object.getPtr("initial_monitors") orelse return;
+    if (initial_monitors.* != .array) return;
+    for (initial_monitors.array.items) |*monitor| {
+        if (monitor.* != .object) continue;
+        const condition = monitor.object.getPtr("condition") orelse continue;
+        if (condition.* != .object) continue;
+        const interval = condition.object.get("check_interval_ms") orelse continue;
+        _ = condition.object.orderedRemove("check_interval_ms");
+        if (monitor.object.get("check_interval_ms") == null) {
+            try monitor.object.put(alloc, "check_interval_ms", interval);
+        }
+    }
 }
 
 fn inputDeinit(ptr: *anyopaque, alloc: Allocator) void {
@@ -1064,6 +1124,55 @@ test "terminal start accepts native and tmux backend contracts" {
                 }
             },
         }
+    }
+}
+
+test "terminal decoder normalizes gateway stringified start composites" {
+    const alloc = std.testing.allocator;
+    const args =
+        "{\"action\":\"start\",\"cwd\":\"/workspace\",\"backend\":\"native\",\"command\":\"printf SHOULD_NOT_RUN\",\"return_when\":\"{\\\"kind\\\":\\\"started\\\"}\",\"initial_monitors\":\"[{\\\"condition\\\":{\\\"kind\\\":\\\"path_exists\\\",\\\"path\\\":\\\"/private/tmp/fx-monitor-outside-ready\\\",\\\"check_interval_ms\\\":1000},\\\"notify\\\":{\\\"kind\\\":\\\"on_match\\\"},\\\"lifetime\\\":{\\\"kind\\\":\\\"until_match\\\"}}]\"}";
+    const decoded = try decode(.{ .allocator = alloc }, args);
+    switch (decoded) {
+        .failure => |message| {
+            defer alloc.free(message);
+            return error.TestUnexpectedResult;
+        },
+        .input => |input| {
+            defer input.deinit(alloc);
+            const parsed = input.as(OwnedInput).parsed.value;
+            try std.testing.expectEqual(ReturnKind.started, parsed.return_when.?.kind);
+            try std.testing.expectEqual(@as(usize, 1), parsed.initial_monitors.len);
+            const monitor = parsed.initial_monitors[0];
+            try std.testing.expectEqual(MonitorConditionKind.path_exists, monitor.condition.kind);
+            try std.testing.expectEqualStrings(
+                "/private/tmp/fx-monitor-outside-ready",
+                monitor.condition.path.?,
+            );
+            try std.testing.expectEqual(@as(?u64, 1000), monitor.check_interval_ms);
+            try std.testing.expectEqual(NotifyKind.on_match, monitor.notify.kind);
+            try std.testing.expectEqual(LifetimeKind.until_match, monitor.lifetime.kind);
+        },
+    }
+}
+
+test "terminal decoder rejects malformed gateway composite strings" {
+    const alloc = std.testing.allocator;
+    const decoded = try decode(
+        .{ .allocator = alloc },
+        "{\"action\":\"start\",\"return_when\":\"not-json\"}",
+    );
+    switch (decoded) {
+        .input => |input| {
+            input.deinit(alloc);
+            return error.TestUnexpectedResult;
+        },
+        .failure => |message| {
+            defer alloc.free(message);
+            try std.testing.expectEqualStrings(
+                "terminal arguments must match the advertised action schema",
+                message,
+            );
+        },
     }
 }
 
