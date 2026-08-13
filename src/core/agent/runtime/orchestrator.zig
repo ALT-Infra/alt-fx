@@ -2559,6 +2559,7 @@ fn processQueuedPromptLoop(
                 arena,
                 active_api_key,
                 job.gateway_team,
+                lifecycle.scope.session_id,
                 gateway_model,
                 config.gateway_retry_count,
                 config.gateway_chat_url,

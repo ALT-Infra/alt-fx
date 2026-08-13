@@ -370,6 +370,7 @@ fn streamAgentCompletion(
         .{
             .api_key = request.api_key,
             .team = request.team,
+            .session_id = request.session_id,
             .model = request.model,
             .retry_count = request.retry_count,
             .chat_url = request.chat_url,

@@ -49,6 +49,14 @@ fn stream(
     if (request.team) |team| {
         if (team.len > 0) try headers.append(alloc, .{ .name = "x-vercel-ai-gateway-team", .value = team });
     }
+    if (request.session_id) |session_id| {
+        if (session_id.len > 0) {
+            try headers.appendSlice(alloc, &.{
+                .{ .name = "x-session-id", .value = session_id },
+                .{ .name = "x-session-affinity", .value = session_id },
+            });
+        }
+    }
 
     var headers_json: std.Io.Writer.Allocating = .init(alloc);
     defer headers_json.deinit();
