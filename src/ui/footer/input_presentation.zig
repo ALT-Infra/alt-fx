@@ -7,7 +7,7 @@ const list_window = @import("../../core/shared/list_window.zig");
 const skill_runtime = @import("../../core/skills/skill_runtime.zig");
 const types = @import("../../core/shared/types.zig");
 const paste_blocks = @import("../../core/input/pasted_blocks.zig");
-const ui_input = @import("../input/runtime.zig");
+const core_input_runtime = @import("../../core/input/runtime.zig");
 const visual_layout = @import("../input/visual_layout.zig");
 const ui_render = @import("../render.zig");
 const picker_presentation = @import("picker_presentation.zig");
@@ -15,7 +15,7 @@ const render_input = @import("render_input.zig");
 const row_text = @import("row_text.zig");
 
 const Allocator = std.mem.Allocator;
-const InputRuntime = ui_input.InputRuntime;
+const InputRuntime = core_input_runtime.Runtime;
 const RenderContext = render_input.RenderContext;
 
 const max_status_line_len: usize = 512;
@@ -490,11 +490,11 @@ pub fn composeSettingsMenuHintRow(
 
 pub fn composeAppearanceMenuHintRow(alloc: Allocator, width: u16) !std.ArrayList(u8) {
     const variants = [_][]const u8{
-        "↑↓ Navigate     Tab Section     Enter Apply     Esc Close",
-        "↑↓ Navigate  Tab Section  Enter Apply  Esc Close",
-        "↑↓ Move  Tab Section  Enter Apply  Esc",
-        "Enter Apply  Esc Close",
-        "Enter Esc",
+        "↑↓ Navigate     ←→ Change     Tab Section     Esc Close",
+        "↑↓ Navigate  ←→ Change  Tab Section  Esc Close",
+        "↑↓ Move  ←→ Change  Tab  Esc",
+        "←→ Change  Esc Close",
+        "←→ Esc",
     };
     var hint = variants[variants.len - 1];
     for (variants) |candidate| {
@@ -519,14 +519,14 @@ pub fn composeCompactCommandMenuHintRow(
 ) !std.ArrayList(u8) {
     const variants = switch (menu) {
         .statusline => [_][]const u8{
-            "↑↓ Navigate     Enter Toggle     Esc Close",
-            "↑↓ Move  Enter Toggle  Esc",
-            "Enter Esc",
+            "",
+            "",
+            "",
         },
         .sandbox => [_][]const u8{
-            "↑↓ Navigate     Enter Apply     Esc Close",
-            "↑↓ Move  Enter Apply  Esc",
-            "Enter Esc",
+            "↑↓ Navigate     ←→ Change     Esc Close",
+            "↑↓ Move  ←→ Change  Esc",
+            "←→ Esc",
         },
         .usage => [_][]const u8{
             "←→ Scope     ↑↓ Model     Enter Expand     R Refresh     Esc Close",
@@ -1538,7 +1538,7 @@ test "compose hint row uses dots in subagent view" {
 }
 
 test "compose hint row keeps active child identity ahead of model status" {
-    var input = ui_input.InputRuntime{};
+    var input = InputRuntime{};
     defer input.deinit(std.testing.allocator);
     var ctx = testRenderContext(&input);
     ctx.selected_subagent_label = "header-child";

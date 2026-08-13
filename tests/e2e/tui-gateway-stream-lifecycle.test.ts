@@ -1260,7 +1260,7 @@ async function runCanonicalLifecycleFixture(
     reachedFinal = settled.matched;
     if (reachedFinal) {
       await session.sendText("/help");
-      const help = await waitForPaneOrDone(session, "Commands 38", donePath);
+      const help = await waitForPaneOrDone(session, "Commands 39", donePath);
       helpVisible = help.matched;
       requestCountAfterHelp = queuedGateway.requests.length;
       if (helpVisible) {
@@ -5990,8 +5990,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.sendText("/maxxing");
       await session.waitForPane(
         (pane) =>
-          pane.includes("Appearance · Choose one") &&
-          pane.includes("Minimal ✓"),
+          pane.includes("Appearance") &&
+          pane.includes("Maxxing mode") &&
+          pane.includes("minimal  legacy"),
         TIMEOUT,
       );
       await session.sendKeys("Escape");
@@ -6118,8 +6119,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.sendText("/maxxing");
       await session.waitForPane(
         (pane) =>
-          pane.includes("Appearance · Choose one") &&
-          pane.includes("Minimal ✓"),
+          pane.includes("Appearance") &&
+          pane.includes("Maxxing mode") &&
+          pane.includes("minimal  legacy"),
         TIMEOUT,
       );
       await session.sendKeys("Escape");
@@ -6220,8 +6222,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.sendText("/maxxing");
       await session.waitForPane(
         (pane) =>
-          pane.includes("Appearance · Choose one") &&
-          pane.includes("Minimal ✓"),
+          pane.includes("Appearance") &&
+          pane.includes("Maxxing mode") &&
+          pane.includes("minimal  legacy"),
         TIMEOUT,
       );
       await session.sendKeys("Escape");
@@ -7096,7 +7099,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(gateway.requestCount()).toBe(1);
 
       await session.sendText("/help");
-      await session.waitForText("Commands 38", TIMEOUT);
+      await session.waitForText("Commands 39", TIMEOUT);
       expect(gateway.requestCount()).toBe(1);
       await session.sendKeys("Escape");
     },

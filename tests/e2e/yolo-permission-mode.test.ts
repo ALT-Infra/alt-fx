@@ -218,8 +218,8 @@ describe.skipIf(!tmuxAvailable())("yolo interactive mode", () => {
       expect(resumedWarning).toContain("YOLO ·");
 
       await session.sendText("/sandbox");
-      const sandboxPane = await session.waitForText("Enter Apply", TIMEOUT);
-      expect(sandboxPane).toContain("Sandbox:");
+      const sandboxPane = await session.waitForText("←→ Change", TIMEOUT);
+      expect(sandboxPane).toContain("Command sandbox");
       expect(sandboxPane).not.toContain(WARNING);
       await Bun.sleep(4_300);
 

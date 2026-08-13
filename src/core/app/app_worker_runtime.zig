@@ -16,15 +16,15 @@ const assistant_pacer = @import("../../ui/assistant/pacer.zig");
 const ui_render = @import("../../ui/render.zig");
 const activity_runtime = @import("../output/activity_runtime.zig");
 const worker_status = @import("../output/worker_status.zig");
+const core_input_runtime = @import("../input/runtime.zig");
 const render_input = @import("../../ui/footer/render_input.zig");
 const interaction_state = @import("../../ui/footer/interaction_state.zig");
-const ui_input = @import("../../ui/input/runtime.zig");
 const render_request = @import("../../ui/render_request.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 
 const QueuePreview = worker_runtime.QueuePreview;
 const WorkerEvent = worker_runtime.WorkerEvent;
-const InputRuntime = ui_input.InputRuntime;
+const InputRuntime = core_input_runtime.Runtime;
 
 const CancelledEventAdmission = enum {
     admit,

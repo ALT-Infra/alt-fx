@@ -6,6 +6,7 @@ const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const paste_blocks = @import("../input/pasted_blocks.zig");
 const registered_entities = @import("../input/registered_entities.zig");
+const core_input_runtime = @import("../input/runtime.zig");
 const entity_spans = @import("../shared/entity_spans.zig");
 const visual_layout = @import("../../ui/input/visual_layout.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
@@ -740,7 +741,6 @@ fn projectSkillDisplaySpansForCommit(
     return projected.toOwnedSlice(alloc);
 }
 
-const ui_input = @import("../../ui/input/runtime.zig");
 const kill_ring = @import("../input/kill_ring.zig");
 const render_request = @import("../../ui/render_request.zig");
 
@@ -752,7 +752,7 @@ const ReviewTestApp = struct {
     alloc: std.mem.Allocator,
     worker: worker_runtime.WorkerRuntime = .{},
     queued_prompt_review: State = .{},
-    input_runtime: ui_input.InputRuntime = .{},
+    input_runtime: core_input_runtime.Runtime = .{},
     pending_images: std.ArrayList(types.ImageAttachment) = .empty,
     shell: ReviewTestShell = .{},
 

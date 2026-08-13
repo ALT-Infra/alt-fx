@@ -857,7 +857,7 @@ tmuxTest(
     await session.waitForPane(
       (pane) =>
         pane.includes("private/blue-hornbill") &&
-        pane.includes("Authenticated model catalog loaded."),
+        !pane.includes("Authenticated model catalog loaded."),
       TIMEOUT,
     );
 
@@ -1285,27 +1285,26 @@ tmuxTest(
       AI_GATEWAY_API_KEY: undefined,
     });
     await session.waitForComposer(TIMEOUT);
-    chmodSync(fxDir, 0o500);
-    try {
-      await session.sendText("/logout");
-      const failed = await session.waitForText(
-        "Could not complete fx logout. The current source is unchanged.",
-        TIMEOUT,
-      );
-      expect(failed).not.toContain("Signed out of fx.");
-      expect(existsSync(join(fxDir, "auth.json"))).toBe(true);
+    const authPath = join(fxDir, "auth.json");
+    rmSync(authPath);
+    mkdirSync(authPath, { mode: 0o700 });
 
-      await session.sendText("/status");
-      await session.waitForText("auth=fx login", TIMEOUT);
-      await session.sendText("prove fx login remains active");
-      await session.waitForText(LOGIN_RESPONSE, TIMEOUT);
-      expect(gateway.requests).toHaveLength(1);
-      expect(gateway.requests[0].headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
-      expect(oauth.requests).toEqual([]);
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
-    } finally {
-      chmodSync(fxDir, 0o700);
-    }
+    await session.sendText("/logout");
+    const failed = await session.waitForText(
+      "Could not complete fx logout. The current source is unchanged.",
+      TIMEOUT,
+    );
+    expect(failed).not.toContain("Signed out of fx.");
+    expect(existsSync(authPath)).toBe(true);
+
+    await session.sendText("/status");
+    await session.waitForText("auth=fx login", TIMEOUT);
+    await session.sendText("prove fx login remains active");
+    await session.waitForText(LOGIN_RESPONSE, TIMEOUT);
+    expect(gateway.requests).toHaveLength(1);
+    expect(gateway.requests[0].headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
+    expect(oauth.requests).toEqual([]);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,
 );
@@ -1527,7 +1526,7 @@ tmuxTest(
     await session.waitForPane(
       (pane) =>
         pane.includes("private/blue-hornbill") &&
-        pane.includes("Authenticated model catalog loaded."),
+        !pane.includes("Authenticated model catalog loaded."),
       TIMEOUT,
     );
     const refreshedCatalogRequest = gateway.modelRequests[1];

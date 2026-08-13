@@ -1,8 +1,8 @@
-//! Local diagnostic collection used by `/feedback`.
+//! Local diagnostic collection used by `/trace`.
 //!
 //! This is intentionally separate from `debug_trace.zig`: trace is an opt-in,
 //! low-level event log, while diagnostics are small in-memory summaries that
-//! make the user-initiated feedback report useful without requiring tracing.
+//! make the user-initiated trace report useful without requiring tracing.
 
 const network_metrics = @import("network_metrics.zig");
 const tool_call_metrics = @import("tool_call_metrics.zig");

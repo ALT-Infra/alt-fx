@@ -1,4 +1,7 @@
-// Process-wide ring buffer used by /feedback for recent network diagnostics.
+// In-memory ring buffer of recent gateway HTTP calls. Used by /trace
+// to surface latency / error patterns without forcing a persistent trace
+// log. Process-wide and lock-protected: callers do not need to plumb the
+// buffer through their context.
 
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");

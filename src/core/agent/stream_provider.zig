@@ -107,6 +107,8 @@ pub const BuildRequest = struct {
 pub const Request = struct {
     api_key: []const u8,
     team: ?[]const u8,
+    /// Borrowed for the duration of `Provider.stream`.
+    session_id: ?[]const u8 = null,
     model: []const u8,
     retry_count: usize,
     chat_url: []const u8,

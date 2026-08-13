@@ -7,7 +7,7 @@ const approval_prompt = @import("../../core/permissions/approval_prompt.zig");
 const file_index = @import("../../core/workspace/file_index.zig");
 const types = @import("../../core/shared/types.zig");
 const activity_runtime = @import("../../core/output/activity_runtime.zig");
-const ui_input = @import("../input/runtime.zig");
+const core_input_runtime = @import("../../core/input/runtime.zig");
 const visual_layout = @import("../input/visual_layout.zig");
 const user_message_card = @import("../assistant/user_message_card.zig");
 const ui_render = @import("../render.zig");
@@ -39,7 +39,7 @@ const FooterRows = footer_layout.FooterRows;
 const PaintPlan = engine_paint_plan.PaintPlan;
 const TranscriptBlockKind = transcript_blocks.TranscriptBlockKind;
 const ViewportSelection = viewport_selection.ViewportSelection;
-const InputRuntime = ui_input.InputRuntime;
+const InputRuntime = core_input_runtime.Runtime;
 const TranscriptRuntime = transcript_runtime.TranscriptRuntime;
 const ApprovalPrompt = approval_prompt.ApprovalPrompt;
 const ApprovalProjection = approval_prompt.Projection;
@@ -956,7 +956,16 @@ pub fn composeFooterFrame(
     else if (appearance_active)
         try input_presentation.composeAppearanceMenuHintRow(alloc, shell.layout.cols)
     else if (compact_command_menu) |menu|
-        try input_presentation.composeCompactCommandMenuHintRow(alloc, shell.layout.cols, menu)
+        switch (menu) {
+            .statusline => try input_presentation.composeHintRow(
+                alloc,
+                false,
+                input.active_label,
+                ctx,
+                shell.layout.cols,
+            ),
+            else => try input_presentation.composeCompactCommandMenuHintRow(alloc, shell.layout.cols, menu),
+        }
     else if (input.show_picker and input.picker_kind == .slash and input.slash_menu_layout != null)
         try input_presentation.composeSlashMenuHintRow(alloc, shell.layout.cols)
     else blk: {
@@ -2156,7 +2165,7 @@ test "minimal maxxing renders a white connected rail across composer rows" {
     var frame = try composeFooterFrame(alloc, &shell, planner_input, frame_plan.paint);
     defer frame.deinit(alloc);
 
-    try std.testing.expectEqual(ui_input.InputAppearance.tint, ctx.input_appearance);
+    try std.testing.expectEqual(core_input_runtime.InputAppearance.tint, ctx.input_appearance);
     try std.testing.expectEqual(@as(u16, 0), frame_plan.paint.footer.composer_top_chrome_rows);
     const first_input_row = frame_plan.paint.footer.input_base - 2;
     try expectFrameRowTextTrimmed(&frame, first_input_row, shell.layout.cols, "┃ one");

@@ -135,6 +135,37 @@ fn expectRouteStatus(
     try std.testing.expectEqualStrings(expected_label, status.label(&label_buf));
 }
 
+test "processQueuedPrompt projects lifecycle session identity to the provider" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .content = "ok" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    const config = fixture.config();
+    var lifecycle = test_support.testLifecycleContext(
+        lifecycle_hooks.RuntimeView.empty(),
+        alloc,
+        config.workspace_root,
+    );
+    lifecycle.scope.session_id = "session-provider-123";
+
+    try test_support.runFakePromptWithLifecycle(
+        &gateway,
+        &hooks,
+        config,
+        fixture.job(),
+        lifecycle,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_session_ids.items.len);
+    try std.testing.expectEqualStrings(
+        "session-provider-123",
+        gateway.request_session_ids.items[0].?,
+    );
+}
+
 fn makeOwnedProviderPrompt(alloc: Allocator, text: []const u8, model: []const u8) !QueuedPrompt {
     const prompt = try alloc.dupe(u8, text);
     errdefer alloc.free(prompt);
@@ -827,7 +858,10 @@ test "required Vision rejects non-Vision before effects and stays required until
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     hooks.tool_registry = .{ .tools = vision_and_read_file_tools[0..] };
     defer hooks.deinit();
-    var vision_runtime = VisionAgentToolRuntime{ .alloc = alloc };
+    var vision_runtime = VisionAgentToolRuntime{
+        .alloc = alloc,
+        .session_id = "session-vision-123",
+    };
     defer vision_runtime.deinit();
     var executor = VisionAndReadExecutor{ .vision = vision_runtime.delegate() };
     hooks.execute_delegate = executor.delegate();
@@ -850,15 +884,25 @@ test "required Vision rejects non-Vision before effects and stays required until
     job.permission_mode = .ask;
 
     const config = fixture.config();
+    var lifecycle = test_support.testLifecycleContext(
+        lifecycle_view,
+        alloc,
+        config.workspace_root,
+    );
+    lifecycle.scope.session_id = "session-vision-123";
     try test_support.runFakePromptWithLifecycle(
         &gateway,
         &hooks,
         config,
         job,
-        test_support.testLifecycleContext(lifecycle_view, alloc, config.workspace_root),
+        lifecycle,
     );
 
     try std.testing.expectEqual(@as(usize, 5), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 5), gateway.request_session_ids.items.len);
+    for (gateway.request_session_ids.items) |session_id| {
+        try std.testing.expectEqualStrings("session-vision-123", session_id.?);
+    }
     try expectBodyContains(&gateway, 0, "\"toolChoice\":{\"type\":\"required\"}");
     try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"required\"}");
     try expectBodyContains(&gateway, 1, "call_read_while_vision_required");
@@ -3802,6 +3846,30 @@ test "processQueuedPrompt cancellation during HTTP backoff finishes interrupted"
     const checkpoint = hooks.recovery_checkpoints.items[hooks.recovery_checkpoints.items.len - 1];
     try std.testing.expectEqual(@as(usize, 1), checkpoint.consumed_provider_attempts);
     try std.testing.expect(!checkpoint.outstanding_reservation);
+}
+
+test "processQueuedPrompt cancellation during network backoff clears retry status" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .stream_error = error.ReadFailed },
+        .{ .content = "must not send" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    hooks.cancel_on_auto_retry_status = &fixture.cancel_flag;
+    var config = fixture.config();
+    config.max_provider_attempts = 3;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
+    try std.testing.expectEqual(@as(usize, 1), hooks.interrupted_history_count);
+    try std.testing.expectEqual(@as(usize, 1), hooks.route_recovery_statuses.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.route_recovery_clear_count);
 }
 
 test "processQueuedPrompt disables provider option fast after a replay safe SSE failure" {

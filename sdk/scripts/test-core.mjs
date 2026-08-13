@@ -23,6 +23,8 @@ const catalogModels = [
 ];
 let fetchCalls = 0;
 let requestedModel;
+let requestedSessionId;
+let requestedSessionAffinity;
 const persistedConfig = new Map([
   ["model", "sdk/catalog-alpha"],
   ["mode", "code"],
@@ -39,7 +41,10 @@ const mockFetch = async (url, init) => {
   fetchCalls++;
   if (init.method !== "POST") throw new Error(`unexpected method ${init.method}`);
   const requestBody = JSON.parse(new TextDecoder().decode(init.body));
-  requestedModel = new Headers(init.headers).get("ai-language-model-id");
+  const headers = new Headers(init.headers);
+  requestedModel = headers.get("ai-language-model-id");
+  requestedSessionId = headers.get("x-session-id");
+  requestedSessionAffinity = headers.get("x-session-affinity");
   if (!Array.isArray(requestBody.prompt) && !Array.isArray(requestBody.messages)) {
     throw new Error("gateway request did not contain prompt messages");
   }
@@ -151,6 +156,8 @@ if (chunks.filter((chunk) => chunk.trim().length > 0).length < 2) throw new Erro
 if (stopReason !== "end_turn") throw new Error(`unexpected stop reason: ${stopReason}`);
 if (fetchCalls !== 1) throw new Error(`expected one gateway fetch, got ${fetchCalls}`);
 if (requestedModel !== "sdk/browser-test-model") throw new Error(`gateway request used unexpected model: ${requestedModel}`);
+if (requestedSessionId !== session.id) throw new Error(`gateway request used unexpected session id: ${requestedSessionId}`);
+if (requestedSessionAffinity !== session.id) throw new Error(`gateway request used unexpected session affinity: ${requestedSessionAffinity}`);
 
 await session.close();
 let closedSessionRejected = false;

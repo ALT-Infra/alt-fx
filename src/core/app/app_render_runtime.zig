@@ -11,6 +11,7 @@ const worker_runtime = @import("../agent/worker_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const picker_state = @import("../input/picker_state.zig");
+const core_input_runtime = @import("../input/runtime.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const model_cache_runtime = @import("model_cache_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -1418,7 +1419,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn transcriptInputPending(context: *anyopaque) bool {
             const app: *App = @ptrCast(@alignCast(context));
-            if (app.input_runtime.hasPendingTerminalInput()) return true;
+            if (app.terminal_input_runtime.hasPendingTerminalInput()) return true;
             const state = app.terminal.pollInput(0) catch |err| {
                 debug_trace.logf(
                     "frame_schedule",
@@ -3734,13 +3735,14 @@ const BufferedInputCheckpointTestApp = struct {
     };
 
     terminal: Terminal = .{},
-    input_runtime: ui_input.InputRuntime = .{},
+    input_runtime: core_input_runtime.Runtime = .{},
+    terminal_input_runtime: ui_input.Runtime = .{},
 };
 
 test "transcript checkpoint sees input retained above an empty terminal" {
     var app = BufferedInputCheckpointTestApp{};
-    app.input_runtime.terminal_theme_monitor.start();
-    _ = app.input_runtime.terminal_theme_monitor.feed(0x1b, 0);
+    app.terminal_input_runtime.terminal_theme_monitor.start();
+    _ = app.terminal_input_runtime.terminal_theme_monitor.feed(0x1b, 0);
     var checkpoint = Runtime(BufferedInputCheckpointTestApp).transcriptBuildCheckpoint(&app).?;
 
     try std.testing.expectError(error.InputPending, build_checkpoint.poll(&checkpoint));
@@ -4337,7 +4339,8 @@ const CoordinatorTestApp = struct {
     terminal: shell_runtime.TerminalState = .{},
     shell: transcript_runtime.TranscriptRuntime,
     metrics: types.Metrics = .{},
-    input_runtime: ui_input.InputRuntime = .{},
+    input_runtime: core_input_runtime.Runtime = .{},
+    terminal_input_runtime: ui_input.Runtime = .{},
     approval_prompt: approval_prompt.ApprovalPrompt = .{},
     approval_screen: interaction_state.ApprovalScreenState = .{},
     question_prompt: question_prompt.QuestionPrompt = .{},
@@ -4369,6 +4372,7 @@ const CoordinatorTestApp = struct {
     fn deinit(self: *CoordinatorTestApp) void {
         self.shell.deinit(self.alloc);
         self.input_runtime.deinit(self.alloc);
+        self.terminal_input_runtime.deinit(self.alloc);
         self.approval_prompt.deinit(self.alloc);
         self.question_prompt.deinit(self.alloc);
         self.subagents.deinit(self.alloc);

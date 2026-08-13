@@ -963,6 +963,7 @@ fn executeVisionRequest(
         .stream_provider = state.runtime.agent_stream_provider,
         .api_key = state.runtime.api_key,
         .gateway_team = state.runtime.gateway_team,
+        .session_id = state.runtime.lifecycle_scope.session_id,
         .retry_count = state.runtime.gateway_retry_count,
         .chat_url = state.runtime.gateway_chat_url,
         .cancel_flag = state.runtime.cancel_flag,

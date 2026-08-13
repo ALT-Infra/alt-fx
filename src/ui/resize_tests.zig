@@ -19,7 +19,7 @@ const approval_prompt = @import("../core/permissions/approval_prompt.zig");
 const render_input = @import("footer/render_input.zig");
 const footer_viewport = @import("footer/viewport.zig");
 const activity_runtime = @import("../core/output/activity_runtime.zig");
-const input_runtime = @import("input/runtime.zig");
+const core_input_runtime = @import("../core/input/runtime.zig");
 const ui_render = @import("render.zig");
 const render_engine = @import("render_engine.zig");
 const render_request = @import("render_request.zig");
@@ -36,7 +36,7 @@ const Metrics = types.Metrics;
 const TranscriptPreparationSource = transcript_runtime.TranscriptPreparationSource;
 const TranscriptRuntime = transcript_runtime.TranscriptRuntime;
 const Grid = vt_emulator.Grid;
-const InputRuntime = input_runtime.InputRuntime;
+const InputRuntime = core_input_runtime.Runtime;
 
 const TestBodyDisposition = enum {
     paint,
@@ -5369,7 +5369,7 @@ test "slash main page renders header categories selection range and contextual c
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    try expectGridContains(&h, "Commands 38 · Type to filter");
+    try expectGridContains(&h, "Commands 39 · Type to filter");
     try expectGridContains(&h, "1–6");
     try expectGridContains(&h, "/help");
     try expectGridContains(&h, "General");
@@ -5390,7 +5390,7 @@ test "slash main page renders header categories selection range and contextual c
 
     try expectGridContains(&h, "ask");
     try expectGridContains(&h, "test-model");
-    try expectGridNotContains(&h, "Commands 38");
+    try expectGridNotContains(&h, "Commands 39");
     try expectGridNotContains(&h, "↑↓ Navigate");
 }
 

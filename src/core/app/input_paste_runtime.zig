@@ -76,7 +76,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
                     .{},
                 );
             }
-            app.input_runtime.resetEscapeDecoder();
+            app.terminal_input_runtime.resetEscapeDecoder();
             if (gesture_reset.clearedAny()) {
                 app.shell.render_requests.request(.footer);
             }

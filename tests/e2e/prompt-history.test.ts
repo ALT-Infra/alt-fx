@@ -85,7 +85,7 @@ describe.skipIf(!tmuxAvailable())("prompt history", () => {
   });
 
   serialTest(
-    "accepted model-facing prompts survive restart while slash commands do not",
+    "accepted prompts and slash commands survive restart",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-prompt-history-"));
       try {
@@ -109,7 +109,7 @@ describe.skipIf(!tmuxAvailable())("prompt history", () => {
         await session.sendText("PLAN10_PROMPT_HISTORY_SENTINEL");
         await session.waitForText("HTTP 401", TIMEOUT);
         await session.sendText("/help");
-        await session.waitForText("Commands 38", TIMEOUT);
+        await session.waitForText("Commands 39", TIMEOUT);
         await session.sendKeys("Escape");
         await session.waitForPane((pane) => !pane.includes("Enter Open"), TIMEOUT);
         await session.sendText("/quit");
@@ -119,7 +119,8 @@ describe.skipIf(!tmuxAvailable())("prompt history", () => {
         const historyPath = join(home, ".fx", "history.jsonl");
         const history = readFileSync(historyPath, "utf8");
         expect(history).toContain("PLAN10_PROMPT_HISTORY_SENTINEL");
-        expect(history).not.toContain("/help");
+        expect(history).toContain("/help");
+        expect(history).toContain("/quit");
 
         session = await TmuxSession.create({
           cwd: workspaceRoot,
@@ -127,8 +128,25 @@ describe.skipIf(!tmuxAvailable())("prompt history", () => {
         });
         await session.waitForText("Run /help", TIMEOUT);
         await session.sendKeys("Up");
-        const pane = await session.waitForText("PLAN10_PROMPT_HISTORY_SENTINEL", TIMEOUT);
-        expect(pane).toContain("PLAN10_PROMPT_HISTORY_SENTINEL");
+        let pane = await session.waitForPane(
+          (current) => currentComposerLine(current).includes("/quit"),
+          TIMEOUT,
+        );
+        expect(currentComposerLine(pane)).toContain("/quit");
+
+        await session.sendKeys("C-p");
+        pane = await session.waitForPane(
+          (current) => currentComposerLine(current).includes("/help"),
+          TIMEOUT,
+        );
+        expect(currentComposerLine(pane)).toContain("/help");
+
+        await session.sendKeys("C-p");
+        pane = await session.waitForPane(
+          (current) => currentComposerLine(current).includes("PLAN10_PROMPT_HISTORY_SENTINEL"),
+          TIMEOUT,
+        );
+        expect(currentComposerLine(pane)).toContain("PLAN10_PROMPT_HISTORY_SENTINEL");
       } finally {
         rmSync(root, { recursive: true, force: true });
       }
@@ -219,28 +237,58 @@ describe.skipIf(!tmuxAvailable())("prompt history", () => {
         await session.waitForText("HTTP 401", TIMEOUT);
         await session.waitForPane(hasEmptyComposer, TIMEOUT);
         await session.sendKeys("Up");
-        const recalled = await session.waitForPane(
+        let recalled = await session.waitForPane(
           (pane) => {
             const composer = currentComposerLine(pane);
             return (
-              composer.includes("PLAN10_HISTORY_WORKSPACE_A") ||
+              composer.includes("/settings") ||
               composer.includes("PLAN10_HISTORY_DISABLED")
             );
           },
           TIMEOUT,
         );
-        const composer = currentComposerLine(recalled);
+        let composer = currentComposerLine(recalled);
+        expect(composer).not.toContain("PLAN10_HISTORY_DISABLED");
+        expect(composer).toContain("/settings");
+
+        await session.sendKeys("C-p");
+        recalled = await session.waitForPane(
+          (pane) => {
+            const current = currentComposerLine(pane);
+            return (
+              current.includes("/quit") ||
+              current.includes("PLAN10_HISTORY_DISABLED")
+            );
+          },
+          TIMEOUT,
+        );
+        composer = currentComposerLine(recalled);
+        expect(composer).not.toContain("PLAN10_HISTORY_DISABLED");
+        expect(composer).toContain("/quit");
+
+        await session.sendKeys("C-p");
+        recalled = await session.waitForPane(
+          (pane) => {
+            const current = currentComposerLine(pane);
+            return (
+              current.includes("PLAN10_HISTORY_WORKSPACE_A") ||
+              current.includes("PLAN10_HISTORY_DISABLED")
+            );
+          },
+          TIMEOUT,
+        );
+        composer = currentComposerLine(recalled);
         expect(composer).not.toContain("PLAN10_HISTORY_DISABLED");
         expect(composer).toContain("PLAN10_HISTORY_WORKSPACE_A");
         await session.sendKeys("C-u");
         await session.waitForPane(hasEmptyComposer, TIMEOUT);
-        await session.sendText("/quit");
-        await session.waitForSessionEnd(TIMEOUT);
+        await session.kill();
         session = null;
 
         const history = readFileSync(historyPath, "utf8");
         expect(history).toContain("PLAN10_HISTORY_WORKSPACE_A");
         expect(history).toContain("PLAN10_HISTORY_WORKSPACE_B");
+        expect(history).toContain("/settings");
         expect(history).not.toContain("PLAN10_HISTORY_DISABLED");
       } finally {
         rmSync(root, { recursive: true, force: true });

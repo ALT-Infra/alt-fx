@@ -3946,6 +3946,12 @@ describe("cli: ask success", () => {
         const firstJson = JSON.parse(first.stdout.trim());
         expect(typeof firstJson.session_id).toBe("string");
         expect(firstJson.session_id.length).toBeGreaterThan(0);
+        expect(gateway.requests[0]?.headers.get("x-session-id")).toBe(
+          firstJson.session_id,
+        );
+        expect(gateway.requests[0]?.headers.get("x-session-affinity")).toBe(
+          firstJson.session_id,
+        );
         expect(
           existsSync(
             join(savedHome, ".fx", "sessions", firstJson.session_id),
@@ -3981,6 +3987,12 @@ describe("cli: ask success", () => {
         expect(JSON.parse(resumed.stdout.trim()).session_id).toBe(
           firstJson.session_id,
         );
+        expect(gateway.requests[1]?.headers.get("x-session-id")).toBe(
+          firstJson.session_id,
+        );
+        expect(gateway.requests[1]?.headers.get("x-session-affinity")).toBe(
+          firstJson.session_id,
+        );
         const detail = await runFx(
           ["session", "--id", firstJson.session_id, "--json"],
           {
@@ -4012,6 +4024,8 @@ describe("cli: ask success", () => {
         expect(noSave.code).toBe(0);
         expect(noSave.stderr).toBe("");
         expect(JSON.parse(noSave.stdout.trim()).session_id).toBe("");
+        expect(gateway.requests[2]?.headers.get("x-session-id")).toBeNull();
+        expect(gateway.requests[2]?.headers.get("x-session-affinity")).toBeNull();
         expect(existsSync(join(noSaveHome, ".fx"))).toBe(false);
         expect(gateway.requests).toHaveLength(3);
       } finally {
