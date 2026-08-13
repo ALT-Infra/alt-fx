@@ -81,6 +81,7 @@ const ResumeInvocation = struct {
 };
 
 const resume_id_alias_prefix = "--resume-";
+pub const upgrade_relaunch_arg = "--upgrade-relaunch";
 
 // The one resume alias that asks which session to open. Every other spelling
 // names its target, so it resumes without a prompt.
@@ -119,6 +120,7 @@ pub const LaunchModifiers = struct {
 
 pub const InteractiveLaunch = struct {
     requested_resume: ?ResumeTarget = null,
+    upgrade_relaunch: bool = false,
     record_requested: bool = false,
     modifiers: LaunchModifiers = .{},
 
@@ -523,14 +525,22 @@ pub fn parseInteractiveLaunch(
                 invocation.args[0 .. invocation.args.len - 1]
             else
                 invocation.args;
+            const upgrade_relaunch = !invocation.top_level_alias and
+                resume_args.len == 2 and
+                std.mem.eql(u8, resume_args[1], upgrade_relaunch_arg);
+            const target_args = if (upgrade_relaunch)
+                resume_args[0..1]
+            else
+                resume_args;
             const target = try parseResumeArgs(
                 alloc,
                 command_catalog,
-                resume_args,
+                target_args,
                 invocation.top_level_alias,
             );
             return .{ .interactive = .{
                 .requested_resume = target,
+                .upgrade_relaunch = upgrade_relaunch,
                 .record_requested = record_requested,
                 .modifiers = global_args.takeModifiers(),
             } };

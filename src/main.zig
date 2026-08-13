@@ -605,7 +605,14 @@ const App = struct {
         app.context_limits.applyCommandLine(launch.modifiers.context_limit_overrides);
         if (comptime host_profile.durable_sessions or host_profile.js_host_sessions) {
             if (app.requested_resume != null) {
-                try SessionAppRuntime.resumeRequestedSession(&app);
+                if (launch.upgrade_relaunch) {
+                    try SessionAppRuntime.resumeRequestedSessionAfterUpgrade(
+                        &app,
+                        app_version,
+                    );
+                } else {
+                    try SessionAppRuntime.resumeRequestedSession(&app);
+                }
                 app.terminalTitle().setModel(app.selected_model.items);
             }
         }
