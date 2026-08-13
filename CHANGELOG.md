@@ -1,8 +1,29 @@
 # fx
 
-## 0.4.0
+## 0.4.1
 
 <!-- release:start -->
+
+### New Features
+
+- **Private diagnostic traces:** `/trace` creates a private Markdown diagnostic; on macOS, fx copies the file to the clipboard, while other platforms save it and print its path
+
+### Improvements
+
+- **Feedback flow:** `/feedback` opens the feedback form without creating a trace or changing the clipboard
+- **Inline settings menus:** `/appearance`, `/statusline`, and `/sandbox` use compact inline controls, preview status-line changes live, and apply updates without extra transcript messages
+- **Slash command history:** Accepted slash commands persist with prompt history, recall their resolved form, and remain available after restart
+- **Network recovery:** Native agent turns automatically retry transient network failures, including immediate connection resets and macOS wake errors, through one bounded recovery flow
+- **Terminal tool calls:** fx accepts structured terminal arguments encoded as JSON strings and rejects fields that do not belong to the selected action before changing the session
+
+### Bug Fixes
+
+- **Terminal monitor paths:** Show `Failed start: path is outside the workspace` when a start monitor resolves beyond its terminal workspace
+- **Terminal titles:** Restore `fx · <model>` on startup, keep it current after resume and model selection, and clear it after startup failures or shutdown
+- **Resumed subagents:** Prevent Ctrl+X manager refreshes from restarting incomplete recovery while allowing later explicit subagent operations to retry it
+<!-- release:end -->
+
+## 0.4.0
 
 ### New Features
 
@@ -20,7 +41,6 @@
 
 - **Interactive terminal startup:** Start an interactive shell when the `terminal` tool receives an empty command
 - **Ctrl+X manager layout:** Keep the close action visible on narrow terminals and align status labels correctly for wide Unicode names
-<!-- release:end -->
 
 ## 0.3.73
 
