@@ -1260,7 +1260,6 @@ fn streamGatewayCompletionCoreWithOptions(
         defer req.deinit();
         debug_trace.eventf("gateway", "after_http_open_connect", trace_ctx, "attempt={d}", .{attempt + 1});
         debug_trace.eventf("gateway", "after_request_open", trace_ctx, "attempt={d}", .{attempt + 1});
-        if (req.connection) |conn| configureTcpKeepalive(conn.stream_writer.stream.socket.handle);
 
         var cancel_watch_done = std.atomic.Value(bool).init(false);
         var system_resumed = std.atomic.Value(bool).init(false);
@@ -1634,26 +1633,6 @@ fn waitForBoundedCancellation(cancel_flag: *std.atomic.Value(bool)) anyerror!voi
 
 fn waitForBoundedDeadline(deadline: std.Io.Clock.Timestamp) anyerror!void {
     try deadline.wait(io_mod.getIo());
-}
-
-fn configureTcpKeepalive(sock: std.posix.socket_t) void {
-    const enabled: c_int = 1;
-    std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.KEEPALIVE, std.mem.asBytes(&enabled)) catch return;
-
-    const idle_secs: c_int = 10;
-    const interval_secs: c_int = 5;
-    const probe_count: c_int = 3;
-    const idle_option: u32 = switch (builtin.os.tag) {
-        .macos, .ios, .tvos, .watchos, .visionos => std.posix.TCP.KEEPALIVE,
-        else => if (@hasDecl(std.posix.TCP, "KEEPIDLE")) std.posix.TCP.KEEPIDLE else return,
-    };
-    std.posix.setsockopt(sock, std.posix.IPPROTO.TCP, idle_option, std.mem.asBytes(&idle_secs)) catch {};
-    if (@hasDecl(std.posix.TCP, "KEEPINTVL")) {
-        std.posix.setsockopt(sock, std.posix.IPPROTO.TCP, std.posix.TCP.KEEPINTVL, std.mem.asBytes(&interval_secs)) catch {};
-    }
-    if (@hasDecl(std.posix.TCP, "KEEPCNT")) {
-        std.posix.setsockopt(sock, std.posix.IPPROTO.TCP, std.posix.TCP.KEEPCNT, std.mem.asBytes(&probe_count)) catch {};
-    }
 }
 
 const GatewayCancelWatcher = struct {
@@ -5326,6 +5305,7 @@ fn testAwakeDeadlineAfter(milliseconds: i64) std.Io.Clock.Timestamp {
 }
 
 const LoopbackGatewayMode = enum {
+    reset_on_accept,
     tls_handshake_stall,
     request_send_stall,
     response_head_stall,
@@ -5472,6 +5452,19 @@ const LoopbackGatewayFixture = struct {
         self.accepted.store(true, .seq_cst);
 
         switch (self.mode) {
+            .reset_on_accept => {
+                const reset_on_close: std.posix.linger = .{
+                    .onoff = 1,
+                    .linger = 0,
+                };
+                try std.posix.setsockopt(
+                    stream.socket.handle,
+                    std.posix.SOL.SOCKET,
+                    std.posix.SO.LINGER,
+                    std.mem.asBytes(&reset_on_close),
+                );
+                self.markStage();
+            },
             .tls_handshake_stall => {
                 self.markStage();
                 self.hold();
@@ -6100,6 +6093,58 @@ test "agent-owned provider attempts return the first TLS setup failure" {
 
     try std.testing.expectEqual(@as(usize, 1), probe.attempts);
     try std.testing.expectEqual(DeliveryCertainty.State.definitely_unsent, delivery.load());
+    harness.fixture.deinit();
+    if (harness.fixture.failure) |err| return err;
+}
+
+test "agent-owned provider attempts return immediate peer resets without transport retry" {
+    var harness = try ConnectionSetupHarness.init(.reset_on_accept, false);
+    defer harness.deinit();
+    try harness.start();
+
+    var probe = RequestOpenProbe{};
+    var delivery = DeliveryCertainty.init();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var callback_ctx: u8 = 0;
+    const result = streamGatewayCompletionCoreWithOptions(
+        std.testing.allocator,
+        .{
+            .api_key = "test-key",
+            .model = "test/model",
+            .retry_count = 3,
+            .chat_url = harness.url,
+            .payload = "{}",
+            .delivery = &delivery,
+            .provider_attempt_owner = .agent,
+        },
+        @ptrCast(&callback_ctx),
+        discardConnectionSetupTestChunk,
+        null,
+        &cancel_flag,
+        null,
+        false,
+        .{
+            .setup_timing = .{ .timeout_ms = 1000 },
+            .request_open_override = probe.requestOpenOverride(),
+        },
+    );
+    if (result) |success_value| {
+        var success = success_value;
+        success.deinit(std.testing.allocator);
+        return error.TestExpectedPeerReset;
+    } else |err| {
+        const evidence = networkFailureEvidence(
+            err,
+            delivery.load(),
+        ) orelse return error.TestExpectedNetworkFailureEvidence;
+        try std.testing.expectEqual(
+            agent_stream_provider.NetworkFailureCause.transport_interrupted,
+            evidence.cause,
+        );
+        try std.testing.expectEqual(delivery.load(), evidence.delivery);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), probe.attempts);
     harness.fixture.deinit();
     if (harness.fixture.failure) |err| return err;
 }

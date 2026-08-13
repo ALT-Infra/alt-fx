@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { createServer, type Socket } from "node:net";
 import {
   chmodSync,
   existsSync,
@@ -3034,6 +3035,121 @@ describe("gateway stream lifecycle", () => {
       rmSync(root.root, { recursive: true, force: true });
     }
   }, 30_000);
+
+  test("default fx ask recovers after an immediate peer reset", async () => {
+    const expectedOutput = "Recovered after immediate peer reset.";
+    const responseBody = await fakeGatewayFinalText(expectedOutput).text();
+
+    for (let iteration = 1; iteration <= 12; iteration += 1) {
+      const root = createFixtureRoot(`immediate-peer-reset-${iteration}`);
+      const tracePath = join(root.root, "trace.log");
+      const sockets = new Set<Socket>();
+      let connections = 0;
+      let requests = 0;
+      let socketFailure: Error | undefined;
+      const server = createServer((socket) => {
+        sockets.add(socket);
+        socket.on("close", () => sockets.delete(socket));
+        socket.on("error", (error) => {
+          socketFailure ??= error;
+        });
+        connections += 1;
+        if (connections === 1) {
+          socket.resetAndDestroy();
+          return;
+        }
+
+        let request = Buffer.alloc(0);
+        let requestHandled = false;
+        socket.on("data", (chunk) => {
+          if (requestHandled) return;
+          if (request.length + chunk.length > 1024 * 1024) {
+            socketFailure ??= new Error("reset fixture request exceeded 1 MiB");
+            socket.destroy();
+            return;
+          }
+          request = Buffer.concat([request, chunk]);
+          const headerEnd = request.indexOf("\r\n\r\n");
+          if (headerEnd < 0) return;
+          const headers = request.subarray(0, headerEnd).toString("utf8");
+          const lengthMatch = /\r\ncontent-length:\s*(\d+)/i.exec(`\r\n${headers}`);
+          const contentLength = lengthMatch ? Number.parseInt(lengthMatch[1]!, 10) : 0;
+          if (request.length < headerEnd + 4 + contentLength) return;
+
+          requestHandled = true;
+          requests += 1;
+          const response =
+            "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: text/event-stream\r\n" +
+            `Content-Length: ${Buffer.byteLength(responseBody)}\r\n` +
+            "Connection: close\r\n\r\n" +
+            responseBody;
+          socket.end(response);
+        });
+      });
+
+      try {
+        await new Promise<void>((resolve, reject) => {
+          server.once("error", reject);
+          server.listen(0, "127.0.0.1", resolve);
+        });
+        const address = server.address();
+        if (address === null || typeof address === "string") {
+          throw new Error("missing reset fixture address");
+        }
+        const result = await runFx(
+          ["ask", "--json", "--auto", "--no-save", "Recover after the immediate reset."],
+          {
+            cwd: root.workspace,
+            env: {
+              HOME: root.home,
+              AI_GATEWAY_API_KEY: "fake-gateway-lifecycle-key",
+              VERCEL_OIDC_TOKEN: undefined,
+              FX_E2E_GATEWAY_CHAT_URL:
+                `http://127.0.0.1:${address.port}/v1/ai/chat/completions`,
+              FX_MODEL: MODEL,
+              FX_TRACE_LOG: tracePath,
+              FX_TRACE_SCOPES: "agent,core,gateway,stream",
+            },
+            timeoutMs: 15_000,
+          },
+        );
+        const trace = readFileSync(tracePath, "utf8");
+        if (result.code !== 0 || result.signal !== null || result.stderr !== "") {
+          throw new Error(
+            `peer-reset iteration ${iteration} failed: code=${result.code} signal=${result.signal}\n` +
+              `stdout:\n${result.stdout}\nstderr:\n${result.stderr}\ntrace:\n${trace}`,
+          );
+        }
+        const json = parseAskJson(result.stdout);
+        const opens = trace.split("\n").filter((line) =>
+          line.includes("event=after_request_open")
+        );
+
+        expect(result.code).toBe(0);
+        expect(result.signal).toBeNull();
+        expect(result.stderr).toBe("");
+        expect(json.exit_code).toBe(0);
+        expect(json.output).toBe(expectedOutput);
+        expect(json.recovery?.state).toBe("recovered");
+        expect(json.recovery?.attempt).toBe(2);
+        expect(connections).toBe(2);
+        expect(requests).toBe(1);
+        expect(socketFailure).toBeUndefined();
+        expect(opens).toHaveLength(2);
+        expect(opens.every((line) => line.includes("attempt=1"))).toBe(true);
+        expect(trace).toContain("provider_attempts=1/10");
+        expect(trace).toContain("recovery=retry_request");
+        expect(trace).toContain("event=stream_complete");
+      } finally {
+        for (const socket of sockets) socket.destroy();
+        if (server.listening) {
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+        }
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }
+  }, 60_000);
 
   test("default fx ask regenerates an unstarted streamed tool after provider failure", async () => {
     const root = createFixtureRoot("provider-error-tool-start-turn");
