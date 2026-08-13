@@ -3292,20 +3292,25 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
   );
 
   test(
-    "restarted parent reports external child ownership and disables cancel",
+    "in-process resumed parent bounds external-owner recovery and disables cancel",
     async () => {
       const fixture = createFixture();
       const childName = "external-owner-child";
+      const parentPrompt = "EXTERNAL_OWNER_PARENT_SESSION";
+      const parentComplete = "EXTERNAL_OWNER_PARENT_SAVED";
       const directMessage = "EXTERNAL_OWNER_DIRECT_TURN";
       const queuedMessage = "EXTERNAL_OWNER_QUEUED_TURN";
       const queuedComplete = "EXTERNAL_OWNER_QUEUE_COMPLETE";
       const directStream = controlledTextResponse("EXTERNAL_OWNER_STREAM_START\n");
       const parentStderrPath = join(root!, "external-owner-parent.stderr");
+      const parentTracePath = join(root!, "external-owner-parent.trace");
       const directStderrPath = join(root!, "external-owner-direct.stderr");
       writeFileSync(parentStderrPath, "");
+      writeFileSync(parentTracePath, "");
       writeFileSync(directStderrPath, "");
       const gateway = startDynamicFakeGateway((body) => {
         const latest = latestPrompt(body);
+        if (latest.includes(parentPrompt)) return fakeGatewayFinalText(parentComplete);
         if (latest.includes(queuedMessage)) return fakeGatewayFinalText(queuedComplete);
         if (latest.includes(directMessage)) return directStream.response;
         return fakeGatewayFinalText("unexpected external-owner request");
@@ -3333,6 +3338,8 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         });
         const setup = session;
         await setup.waitForComposer(TIMEOUT);
+        await setup.sendText(parentPrompt);
+        await setup.waitForText(parentComplete, TIMEOUT);
         await setup.sendKeys("C-x");
         await setup.waitForText("Agents & processes", TIMEOUT);
         await setup.sendLiteralText("c");
@@ -3398,9 +3405,17 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         directStream.push("EXTERNAL_OWNER_STREAM_HELD\n");
         directStream.push("EXTERNAL_OWNER_STREAM_READY\n");
         await direct.waitForText("EXTERNAL_OWNER_STREAM_HELD", TIMEOUT);
+        const childEventsPath = join(
+          fixture.home,
+          ".fx",
+          "sessions",
+          childId,
+          "events.jsonl",
+        );
+        const childEventsBeforeResume = readFileSync(childEventsPath, "utf8");
 
         session = await TmuxSession.create({
-          cmd: `${FX_BIN} resume ${parentId}`,
+          cmd: FX_BIN,
           cwd: fixture.workspace,
           env: {
             HOME: fixture.home,
@@ -3410,6 +3425,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
             FX_GATEWAY_CHAT_URL: gateway.chatUrl,
             FX_MODEL: FAKE_GATEWAY_MODEL,
             FX_AUTO_UPGRADE: "0",
+            FX_TRACE_LOG: parentTracePath,
             NO_COLOR: "1",
           },
           width: 96,
@@ -3418,6 +3434,27 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         });
         const parent = session;
         await parent.waitForComposer(TIMEOUT);
+        const requestsBeforeResume = gateway.requestCount();
+        await parent.sendText("/resume");
+        await parent.waitForText("Sessions", TIMEOUT);
+        await parent.sendLiteralText(parentPrompt);
+        await parent.waitForPane(
+          (pane) => pane.includes("Sessions 1") && pane.includes(parentPrompt),
+          TIMEOUT,
+        );
+        await parent.sendKeys("Enter");
+        await parent.waitForText(`● Session: resumed: ${parentPrompt}`, TIMEOUT);
+        const recoveryMarker = `background host recovery finished root_id=${parentId}`;
+        await parent.waitForPane(
+          () => readFileSync(parentTracePath, "utf8").includes(recoveryMarker),
+          TIMEOUT,
+        );
+        const recoveryTrace = readFileSync(parentTracePath, "utf8");
+        expect(recoveryTrace).toContain("state=deferred");
+        expect(recoveryTrace).toContain("busy=1");
+        expect(gateway.requestCount()).toBe(requestsBeforeResume);
+
+        await Bun.sleep(1_300);
         await parent.sendKeys("C-x");
         const externalTree = await parent.waitForPane(
           (pane) =>
@@ -3431,6 +3468,16 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         );
         expect(externalLine).toContain("external busy");
         expect(externalLine).not.toContain("idle");
+        await parent.sendKeys("C-x");
+        await parent.waitForComposer(TIMEOUT);
+        await parent.sendKeys("C-x");
+        await parent.waitForText("Agents & processes", TIMEOUT);
+        expect(countOccurrences(
+          readFileSync(parentTracePath, "utf8"),
+          recoveryMarker,
+        )).toBe(1);
+        expect(gateway.requestCount()).toBe(requestsBeforeResume);
+        expect(readFileSync(childEventsPath, "utf8")).toBe(childEventsBeforeResume);
         await parent.sendKeys("Enter");
         const externalDetail = await parent.waitForPane(
           (pane) =>

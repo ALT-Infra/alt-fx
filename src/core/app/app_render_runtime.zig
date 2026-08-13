@@ -2795,15 +2795,6 @@ pub fn Runtime(comptime App: type) type {
             else
                 app.subagents.refreshDue(io_mod.milliTimestamp(), force);
             if (!refresh_due) return;
-            if (!count_only) {
-                host.requestBackgroundRecovery(now_ms) catch |err| {
-                    debug_trace.logf(
-                        "subagent",
-                        "manager background recovery unavailable root_id={s} outcome={s}",
-                        .{ host.root_id, @errorName(err) },
-                    );
-                };
-            }
             const source = subagent_projection.Source{
                 .root_id = host.root_id,
                 .manager = &host.manager,

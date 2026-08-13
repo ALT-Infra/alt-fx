@@ -27,7 +27,6 @@ const tool_set_contract = @import("../tooling/tool_set.zig");
 const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
-const recovery_retry_delay_ms: i64 = 1_000;
 const inspect_wait_external_poll_ms: i64 = 100;
 
 const TargetAuthorizationTestHook = struct {
@@ -48,10 +47,57 @@ fn runAfterTargetAuthorizationTestHook() void {
 
 pub const RecoveryState = enum(u8) {
     pending,
+    scheduled,
     running,
-    retryable,
+    deferred,
     complete,
 };
+
+const RecoveryTrigger = enum {
+    automatic,
+    explicit,
+};
+
+const RecoveryStartDecision = enum {
+    schedule,
+    start,
+    wait,
+    no_effect,
+};
+
+const RecoveryFinishOutcome = enum {
+    fully_reconciled,
+    incomplete,
+    failed,
+};
+
+fn decideRecoveryStart(
+    state: RecoveryState,
+    trigger: RecoveryTrigger,
+) RecoveryStartDecision {
+    return switch (state) {
+        .pending => switch (trigger) {
+            .automatic => .schedule,
+            .explicit => .start,
+        },
+        .scheduled, .running => switch (trigger) {
+            .automatic => .no_effect,
+            .explicit => .wait,
+        },
+        .deferred => switch (trigger) {
+            .automatic => .no_effect,
+            .explicit => .start,
+        },
+        .complete => .no_effect,
+    };
+}
+
+fn recoveryStateAfterFinish(outcome: RecoveryFinishOutcome) RecoveryState {
+    return switch (outcome) {
+        .fully_reconciled => .complete,
+        .incomplete, .failed => .deferred,
+    };
+}
 
 pub const BackgroundRecoveryError = error{ThreadSpawnFailed};
 
@@ -172,10 +218,9 @@ pub const Runtime = struct {
     authority_resolver: authority.Resolver,
     owner: execution.Owner,
     recovery_mutex: std.Io.Mutex = .init,
-    recovery_pending: bool = true,
+    recovery_condition: std.Io.Condition = .init,
     recovery_thread: ?std.Thread = null,
     recovery_state: std.atomic.Value(RecoveryState) = .init(.pending),
-    recovery_next_retry_ms: std.atomic.Value(i64) = .init(0),
 
     pub fn create(
         alloc: Allocator,
@@ -1114,63 +1159,100 @@ pub const Runtime = struct {
         };
     }
 
-    /// Completes restart reconciliation at most once for this host.
-    /// Partial and failed attempts remain pending for a later caller.
-    /// It never starts child execution; explicit lifecycle resume remains the
-    /// only path that makes interrupted work runnable.
+    /// Completes restart reconciliation for an explicit subagent operation.
+    /// An admitted background attempt finishes first; a deferred attempt may
+    /// then be retried once by this caller. Recovery never starts child work.
     pub fn reconcileAfterRestart(
         self: *Runtime,
         timestamp_ms: i64,
     ) execution.RecoveryError!execution.RecoveryReport {
-        self.recovery_mutex.lockUncancelable(io_mod.getIo());
-        defer self.recovery_mutex.unlock(io_mod.getIo());
-        if (!self.recovery_pending) {
-            self.recovery_state.store(.complete, .release);
-            return .{};
+        const io = io_mod.getIo();
+        self.recovery_mutex.lockUncancelable(io);
+        defer self.recovery_mutex.unlock(io);
+
+        while (true) {
+            const state = self.recovery_state.load(.acquire);
+            switch (decideRecoveryStart(state, .explicit)) {
+                .no_effect => return .{},
+                .wait => {
+                    std.debug.assert(state == .scheduled);
+                    self.recovery_condition.waitUncancelable(io, &self.recovery_mutex);
+                },
+                .start => {
+                    switch (state) {
+                        .pending => if (self.recovery_state.cmpxchgStrong(
+                            .pending,
+                            .running,
+                            .acq_rel,
+                            .acquire,
+                        ) != null) continue,
+                        .deferred => self.recovery_state.store(.running, .release),
+                        else => unreachable,
+                    }
+                    return self.runRecoveryLocked(timestamp_ms);
+                },
+                .schedule => unreachable,
+            }
         }
-        self.recovery_state.store(.running, .release);
+    }
+
+    fn runRecoveryLocked(
+        self: *Runtime,
+        timestamp_ms: i64,
+    ) execution.RecoveryError!execution.RecoveryReport {
+        std.debug.assert(self.recovery_state.load(.acquire) == .running);
         const report = self.owner.recoverTree(
             self.root_id,
             timestamp_ms,
         ) catch |err| {
-            self.markRecoveryRetryable(timestamp_ms);
+            self.finishRecoveryLocked(.failed);
             return err;
         };
-        if (report.fullyReconciled()) {
-            self.recovery_pending = false;
-            self.recovery_state.store(.complete, .release);
-        } else {
-            self.markRecoveryRetryable(timestamp_ms);
-        }
+        self.finishRecoveryLocked(if (report.fullyReconciled())
+            .fully_reconciled
+        else
+            .incomplete);
         return report;
     }
 
-    /// Schedules restart reconciliation on the host-owned background thread.
-    /// Manager rendering and input handling never wait for this work. A partial
-    /// attempt may be retried after a bounded delay; callers still share the
-    /// same serialized `reconcileAfterRestart` boundary.
+    fn finishRecoveryLocked(self: *Runtime, outcome: RecoveryFinishOutcome) void {
+        self.recovery_state.store(recoveryStateAfterFinish(outcome), .release);
+        self.recovery_condition.broadcast(io_mod.getIo());
+    }
+
+    /// Admits at most one automatic restart reconciliation for this host.
+    /// Partial or failed work remains deferred until an explicit operation.
     pub fn requestBackgroundRecovery(
         self: *Runtime,
         timestamp_ms: i64,
     ) BackgroundRecoveryError!void {
-        const state = self.recovery_state.load(.acquire);
-        if (state == .complete or state == .running) return;
-        if (self.recovery_thread) |thread| {
-            if (state != .retryable or
-                timestamp_ms < self.recovery_next_retry_ms.load(.acquire))
-            {
-                return;
+        while (true) {
+            const state = self.recovery_state.load(.acquire);
+            switch (decideRecoveryStart(state, .automatic)) {
+                .no_effect => return,
+                .schedule => {
+                    if (self.recovery_state.cmpxchgStrong(
+                        .pending,
+                        .scheduled,
+                        .acq_rel,
+                        .acquire,
+                    ) != null) continue;
+                    break;
+                },
+                .start, .wait => unreachable,
             }
-            thread.join();
-            self.recovery_thread = null;
         }
-        self.recovery_state.store(.running, .release);
+
         self.recovery_thread = std.Thread.spawn(
             .{},
             backgroundRecoveryMain,
             .{ self, timestamp_ms },
         ) catch {
-            self.markRecoveryRetryable(timestamp_ms);
+            const io = io_mod.getIo();
+            self.recovery_mutex.lockUncancelable(io);
+            self.recovery_state.store(.deferred, .release);
+            self.recovery_condition.broadcast(io);
+            self.recovery_mutex.unlock(io);
             return error.ThreadSpawnFailed;
         };
     }
@@ -1179,30 +1261,28 @@ pub const Runtime = struct {
         return self.recovery_state.load(.acquire);
     }
 
-    fn markRecoveryRetryable(self: *Runtime, timestamp_ms: i64) void {
-        const retry_at_ms = std.math.add(
-            i64,
-            timestamp_ms,
-            recovery_retry_delay_ms,
-        ) catch std.math.maxInt(i64);
-        self.recovery_next_retry_ms.store(retry_at_ms, .release);
-        self.recovery_state.store(.retryable, .release);
-    }
-
     fn backgroundRecoveryMain(self: *Runtime, timestamp_ms: i64) void {
-        const report = self.reconcileAfterRestart(timestamp_ms) catch |err| {
+        const io = io_mod.getIo();
+        self.recovery_mutex.lockUncancelable(io);
+        std.debug.assert(self.recovery_state.load(.acquire) == .scheduled);
+        self.recovery_state.store(.running, .release);
+        const report = self.runRecoveryLocked(timestamp_ms) catch |err| {
+            self.recovery_mutex.unlock(io);
             debug_trace.logf(
                 "subagent",
-                "background host recovery deferred root_id={s} outcome={s}",
+                "background host recovery deferred root_id={s} trigger=automatic state=deferred outcome={s}",
                 .{ self.root_id, @errorName(err) },
             );
             return;
         };
+        const final_state = self.recovery_state.load(.acquire);
+        self.recovery_mutex.unlock(io);
         debug_trace.logf(
             "subagent",
-            "background host recovery completed root_id={s} changed={d} interrupted={d} completed={d} busy={d} failed={d}",
+            "background host recovery finished root_id={s} trigger=automatic state={s} changed={d} interrupted={d} completed={d} busy={d} failed={d}",
             .{
                 self.root_id,
+                @tagName(final_state),
                 report.sessions_changed,
                 report.work_interrupted,
                 report.work_completed,
@@ -4962,6 +5042,45 @@ const ConcurrentRecovery = struct {
     }
 };
 
+test "recovery policy admits one automatic pass and explicit-only retries" {
+    const StartCase = struct {
+        state: RecoveryState,
+        trigger: RecoveryTrigger,
+        expected: RecoveryStartDecision,
+    };
+    const start_cases = [_]StartCase{
+        .{ .state = .pending, .trigger = .automatic, .expected = .schedule },
+        .{ .state = .pending, .trigger = .explicit, .expected = .start },
+        .{ .state = .scheduled, .trigger = .automatic, .expected = .no_effect },
+        .{ .state = .scheduled, .trigger = .explicit, .expected = .wait },
+        .{ .state = .running, .trigger = .automatic, .expected = .no_effect },
+        .{ .state = .running, .trigger = .explicit, .expected = .wait },
+        .{ .state = .deferred, .trigger = .automatic, .expected = .no_effect },
+        .{ .state = .deferred, .trigger = .explicit, .expected = .start },
+        .{ .state = .complete, .trigger = .automatic, .expected = .no_effect },
+        .{ .state = .complete, .trigger = .explicit, .expected = .no_effect },
+    };
+    for (start_cases) |case| {
+        try std.testing.expectEqual(
+            case.expected,
+            decideRecoveryStart(case.state, case.trigger),
+        );
+    }
+
+    try std.testing.expectEqual(
+        RecoveryState.complete,
+        recoveryStateAfterFinish(.fully_reconciled),
+    );
+    try std.testing.expectEqual(
+        RecoveryState.deferred,
+        recoveryStateAfterFinish(.incomplete),
+    );
+    try std.testing.expectEqual(
+        RecoveryState.deferred,
+        recoveryStateAfterFinish(.failed),
+    );
+}
+
 test "concurrent first recovery callers serialize one durable transition" {
     const setup_alloc = std.testing.allocator;
     const thread_alloc = std.heap.c_allocator;
@@ -5195,9 +5314,43 @@ test "background recovery is single flight while manager projection stays readab
         .ctx = &barrier,
         .sync_dir = RecoverySyncBarrier.syncDir,
     } };
+    var recovery_mutex_locked = false;
+    var explicit_thread: ?std.Thread = null;
+    defer {
+        if (recovery_mutex_locked) recovered.recovery_mutex.unlock(std.testing.io);
+        barrier.release.store(true, .seq_cst);
+        if (explicit_thread) |thread| thread.join();
+    }
+    recovered.recovery_mutex.lockUncancelable(std.testing.io);
+    recovery_mutex_locked = true;
     try recovered.requestBackgroundRecovery(30);
+    try std.testing.expectEqual(RecoveryState.scheduled, recovered.recoveryState());
+
+    var explicit_ready = std.atomic.Value(usize).init(0);
+    var explicit_start = std.atomic.Value(bool).init(true);
+    var explicit_completed = std.atomic.Value(usize).init(0);
+    var explicit = ConcurrentRecovery{
+        .host = recovered,
+        .timestamp_ms = 31,
+        .ready = &explicit_ready,
+        .start = &explicit_start,
+        .completed = &explicit_completed,
+    };
+    explicit_thread = try std.Thread.spawn(.{}, ConcurrentRecovery.run, .{&explicit});
+    while (explicit_ready.load(.seq_cst) == 0) {
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+    const claim_deadline = io_mod.milliTimestamp() + 100;
+    while (explicit_completed.load(.seq_cst) == 0 and
+        io_mod.milliTimestamp() < claim_deadline)
+    {
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+    try std.testing.expectEqual(@as(usize, 0), explicit_completed.load(.seq_cst));
+
+    recovered.recovery_mutex.unlock(std.testing.io);
+    recovery_mutex_locked = false;
     try barrier.waitUntilEntered();
-    defer barrier.release.store(true, .seq_cst);
     try std.testing.expectEqual(RecoveryState.running, recovered.recoveryState());
 
     try recovered.requestBackgroundRecovery(30);
@@ -5215,8 +5368,13 @@ test "background recovery is single flight while manager projection stays readab
     }
 
     barrier.release.store(true, .seq_cst);
+    explicit_thread.?.join();
+    explicit_thread = null;
+    try std.testing.expect(explicit.failure == null);
+    try std.testing.expectEqual(@as(usize, 0), explicit.report.sessions_changed);
     const deadline = io_mod.milliTimestamp() + 5_000;
-    while (recovered.recoveryState() == .running and
+    while ((recovered.recoveryState() == .scheduled or
+        recovered.recoveryState() == .running) and
         io_mod.milliTimestamp() < deadline)
     {
         std.Thread.yield() catch std.atomic.spinLoopHint();
@@ -5235,7 +5393,7 @@ test "background recovery is single flight while manager projection stays readab
     recovery_live = false;
 }
 
-test "failed recovery attempts remain retryable" {
+test "partial automatic recovery stays deferred until explicit retry" {
     const setup_alloc = std.testing.allocator;
     const runtime_alloc = std.heap.c_allocator;
     const root_id = "01J00000000000000000000000";
@@ -5310,29 +5468,42 @@ test "failed recovery attempts remain retryable" {
         .{},
     );
     defer recovered.deinit();
+    var sync_failure = CreateSyncFailure{};
+    recovered.owner.child_store_options = .{ .replace_ops = .{
+        .ctx = &sync_failure,
+        .sync_dir = CreateSyncFailure.syncDir,
+    } };
+    try recovered.requestBackgroundRecovery(30);
+    const deferred_deadline = io_mod.milliTimestamp() + 5_000;
+    while ((recovered.recoveryState() == .scheduled or
+        recovered.recoveryState() == .running) and
+        io_mod.milliTimestamp() < deferred_deadline)
+    {
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+    try std.testing.expectEqual(RecoveryState.deferred, recovered.recoveryState());
+    try std.testing.expectEqual(@as(usize, 1), sync_failure.calls);
+
+    try recovered.requestBackgroundRecovery(31);
+    try recovered.requestBackgroundRecovery(30_000);
+    try std.testing.expectEqual(RecoveryState.deferred, recovered.recoveryState());
+    try std.testing.expectEqual(@as(usize, 1), sync_failure.calls);
+
     var failing = std.testing.FailingAllocator.init(runtime_alloc, .{
         .fail_index = 0,
     });
     recovered.owner.alloc = failing.allocator();
     try std.testing.expectError(
         error.OutOfMemory,
-        recovered.reconcileAfterRestart(30),
+        recovered.reconcileAfterRestart(31),
     );
+    try std.testing.expectEqual(RecoveryState.deferred, recovered.recoveryState());
     recovered.owner.alloc = runtime_alloc;
-
-    var sync_failure = CreateSyncFailure{};
-    recovered.owner.child_store_options = .{ .replace_ops = .{
-        .ctx = &sync_failure,
-        .sync_dir = CreateSyncFailure.syncDir,
-    } };
-    const partial = try recovered.reconcileAfterRestart(31);
-    try std.testing.expectEqual(@as(usize, 1), partial.sessions_failed);
-    try std.testing.expect(recovered.recovery_pending);
 
     recovered.owner.child_store_options = .{};
     const report = try recovered.reconcileAfterRestart(32);
     try std.testing.expect(report.fullyReconciled());
-    try std.testing.expect(!recovered.recovery_pending);
+    try std.testing.expectEqual(RecoveryState.complete, recovered.recoveryState());
     var interrupted = try store.load(setup_alloc);
     defer interrupted.deinit(setup_alloc);
     try std.testing.expectEqual(domain.State.interrupted, interrupted.state);
@@ -6151,8 +6322,8 @@ test "concurrent duplicate create calls share one durable reservation" {
         .{},
     );
     defer second_host.deinit();
-    first_host.recovery_pending = false;
-    second_host.recovery_pending = false;
+    first_host.recovery_state.store(.complete, .release);
+    second_host.recovery_state.store(.complete, .release);
     const identity_epoch = try first_host.issueOperationIdentity(
         alloc,
         "concurrent-create",
