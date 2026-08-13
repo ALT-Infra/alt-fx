@@ -838,16 +838,24 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
     });
     await session.waitForComposer(TIMEOUT);
     await session.sendText("Build the prepared mixed history under sustained load.");
-    const history = await waitForScrollback(
+    await waitForScrollback(
       session,
       HISTORY_DONE,
       config.historyTimeoutMs ?? TIMEOUT * 4,
+    );
+    // Held transcript rows settle into native scrollback on the frames
+    // right after the answer completes; wait for the settled markers
+    // instead of asserting one racy snapshot.
+    await waitForScrollback(session, compactToolMarker(0), TIMEOUT);
+    const history = await waitForScrollback(
+      session,
+      compactToolMarker(totalTools - 1),
+      TIMEOUT,
     );
     expect(countOccurrences(history, HISTORY_DONE)).toBe(1);
     expect(history).toContain(firstChatMarker(config));
     expect(history).toContain(lastChatMarker(config));
     expect(history).toContain(compactToolMarker(0));
-    expect(history).toContain(compactToolMarker(totalTools - 1));
 
     await session.sendText("Run the prepared live command while I inspect the transcript.");
     await session.waitForText(LIVE_START, TIMEOUT);

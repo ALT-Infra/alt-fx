@@ -1149,6 +1149,9 @@ pub fn Runtime(comptime App: type) type {
             }
 
             const runtime = app.subagents.childConversationRuntime().?;
+            // A live child can still stream into its trailing assistant
+            // entry; a finished child's tail is final.
+            runtime.setAssistantTailWritable(view.chat.live != null);
             if (!std.meta.eql(runtime.layout, app.shell.layout)) {
                 runtime.layout = app.shell.layout;
                 runtime.markTranscriptDirty();
