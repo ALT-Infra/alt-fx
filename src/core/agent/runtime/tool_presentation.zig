@@ -1820,6 +1820,59 @@ test "file edit preflight failure reports the exact mismatch" {
     );
 }
 
+test "terminal path scope failure appends the exact status detail" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    var hooks = capture.hooks();
+    hooks.describe_tool_action_denied = struct {
+        fn describe(
+            _: *anyopaque,
+            target: Allocator,
+            _: ToolCall,
+            _: ?[]const u8,
+            label: []const u8,
+            _: []const []const u8,
+        ) ![]const u8 {
+            return std.fmt.allocPrint(target, "{s} start", .{label});
+        }
+    }.describe;
+    const failure = "{\"failure\":{\"action\":\"start\",\"code\":\"path_outside_workspace\"}}";
+
+    try finishExecutedToolStatus(
+        &hooks,
+        arena,
+        5,
+        .{
+            .id = "terminal_path_scope",
+            .name = "terminal",
+            .arguments_json = "{\"action\":\"start\"}",
+        },
+        true,
+        null,
+        .{
+            .status = .failure,
+            .model_output = failure,
+            .status_detail = "path is outside the workspace",
+        },
+        failure,
+        .{ .output_bytes = failure.len, .stored_output_bytes = failure.len },
+        null,
+        &.{},
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), capture.events.items.len);
+    const terminal = capture.events.items[0].terminal;
+    try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
+    try std.testing.expectEqualStrings(
+        "Failed start: path is outside the workspace",
+        terminal.outcome.summary,
+    );
+}
+
 test "command completion publishes its combined artifact handle" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);

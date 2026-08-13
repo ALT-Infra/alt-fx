@@ -657,7 +657,7 @@ const protocolFixtureDefinitions = {
   },
   current_checkpoint: {
     range: { minimum: 4, current: 5 },
-    capabilities: 7,
+    capabilities: 15,
   },
 } as const;
 
@@ -812,7 +812,7 @@ class FrameClient {
 async function handshake(
   socketPath: string,
   clientRange: Range,
-  capabilities = 7,
+  capabilities = 15,
   helloRevision = clientRange.current,
 ): Promise<{
   client: FrameClient;
@@ -4504,37 +4504,49 @@ test.each([
   expect(await waitForExit(host)).toBe(0);
 }, 10_000);
 
-test("poll paths reject symlink escapes before child release", async () => {
-  const home = makeHome();
-  const outside = mkdtempSync(join(tmpdir(), "fx-terminal-monitor-outside-"));
-  homes.push(outside);
-  writeFileSync(join(outside, "ready"), "ready");
-  symlinkSync(outside, join(home, "escape"));
-  const paths = hostPaths(home);
-  const marker = join(home, "monitor-started");
-  const host = startHost(home, undefined, 500);
-  await waitFor(() => existsSync(paths.socket));
-  const connected = await handshake(paths.socket, { minimum: 4, current: 5 });
-  const frame = await requestAction(connected.client, connected.revision!, 211, "start", {
-    cwd: home,
-    command: `: > '${marker}'`,
-    shell: { executable: { path: TERMINAL_FIXTURE_SHELL, clean_start: true } },
-    backend: "native",
-    return_when: { exit: {} },
-    wait_ceiling_ms: 5_000,
-    dimensions: { rows: 24, columns: 80 },
-    initial_monitors: [{
-      condition: { path_exists: join(home, "escape", "ready") },
-      check_schedule: { interval_ms: 25 },
-      notify_schedule: { on_match: {} },
-      lifetime: { until_match: {} },
-    }],
-  });
-  expect(failure(frame).code).toBe("invalid_request");
-  expect(existsSync(marker)).toBe(false);
-  expect(directChildPids(host.pid!)).toEqual([]);
-  connected.client.close();
-  expect(await waitForExit(host)).toBe(0);
+test("poll path escapes preserve exact failures only for capable peers", async () => {
+  for (const testCase of [
+    { capabilities: 15, expectedCode: "path_outside_workspace" },
+    { capabilities: 7, expectedCode: "invalid_request" },
+  ]) {
+    const home = makeHome();
+    const outside = mkdtempSync(join(tmpdir(), "fx-terminal-monitor-outside-"));
+    homes.push(outside);
+    writeFileSync(join(outside, "ready"), "ready");
+    symlinkSync(outside, join(home, "escape"));
+    const paths = hostPaths(home);
+    const marker = join(home, "monitor-started");
+    const host = startHost(home, undefined, 500);
+    await waitFor(() => existsSync(paths.socket));
+    const connected = await handshake(
+      paths.socket,
+      { minimum: 4, current: 5 },
+      testCase.capabilities,
+    );
+    const frame = await requestAction(connected.client, connected.revision!, 211, "start", {
+      cwd: home,
+      command: `: > '${marker}'`,
+      shell: { executable: { path: TERMINAL_FIXTURE_SHELL, clean_start: true } },
+      backend: "native",
+      return_when: { exit: {} },
+      wait_ceiling_ms: 5_000,
+      dimensions: { rows: 24, columns: 80 },
+      initial_monitors: [{
+        condition: { path_exists: join(home, "escape", "ready") },
+        check_schedule: { interval_ms: 25 },
+        notify_schedule: { on_match: {} },
+        lifetime: { until_match: {} },
+      }],
+    });
+    expect(failure(frame).code).toBe(testCase.expectedCode);
+    expect(existsSync(marker)).toBe(false);
+    expect(directChildPids(host.pid!)).toEqual([]);
+    const terminalState = join(home, ".fx", "sessions", TERMINAL_OWNER_SESSION);
+    expect(readdirSync(terminalState).filter((name) => name.includes("terminal-")))
+      .toEqual([]);
+    connected.client.close();
+    expect(await waitForExit(host)).toBe(0);
+  }
 }, 10_000);
 
 test("custom probe re-canonicalization rejects a post-install symlink swap", async () => {

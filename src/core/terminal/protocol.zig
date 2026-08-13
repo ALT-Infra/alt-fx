@@ -175,6 +175,24 @@ fn projectResultV4(result: contracts.Result) contracts.Result {
     return result;
 }
 
+pub fn projectResultForCapabilities(
+    result: contracts.Result,
+    capabilities: u64,
+) contracts.Result {
+    const failure = switch (result) {
+        .success => return result,
+        .failure => |value| value,
+    };
+    if (failure.code != .path_outside_workspace or
+        capabilities & contracts.protocol_capability_path_outside_workspace_error != 0)
+    {
+        return result;
+    }
+    var compatible = failure;
+    compatible.code = .invalid_request;
+    return .{ .failure = compatible };
+}
+
 pub fn decodeFrame(alloc: Allocator, bytes: []const u8) DecodeError!DecodedFrame {
     const header = try Header.decode(bytes);
     const payload_len: usize = header.envelope.payload_len;
@@ -462,6 +480,52 @@ test "revision four projection never exposes degraded monitor state" {
     const response_json = response.bytes[header_len..];
     try std.testing.expect(std.mem.find(u8, response_json, "degraded") == null);
     try std.testing.expect(std.mem.find(u8, response_json, "protocol_incompatible") != null);
+}
+
+fn expectProjectedErrorCode(
+    capabilities: u64,
+    expected: contracts.StructuredErrorCode,
+) !void {
+    const projected = projectResultForCapabilities(.{ .failure = .{
+        .action = .start,
+        .code = .path_outside_workspace,
+    } }, capabilities);
+    var encoded = try encodeFrame(
+        std.testing.allocator,
+        contracts.current_protocol_revision,
+        0,
+        .{ .value = 1 },
+        .{ .response = projected },
+    );
+    defer encoded.deinit(std.testing.allocator);
+    var decoded = try decodeFrame(std.testing.allocator, encoded.bytes);
+    defer decoded.deinit();
+    const response = switch (decoded.message().payload) {
+        .response => |value| value,
+        else => return error.TestExpectedResponse,
+    };
+    const failure = switch (response) {
+        .failure => |value| value,
+        .success => return error.TestExpectedFailure,
+    };
+    try std.testing.expectEqual(expected, failure.code);
+}
+
+test "host protocol projects path scope failures by negotiated capability" {
+    try expectProjectedErrorCode(
+        contracts.protocol_capability_path_outside_workspace_error,
+        .path_outside_workspace,
+    );
+    try expectProjectedErrorCode(0, .invalid_request);
+
+    const generic: contracts.Result = .{ .failure = .{
+        .action = .start,
+        .code = .invalid_request,
+    } };
+    try std.testing.expectEqual(
+        contracts.StructuredErrorCode.invalid_request,
+        projectResultForCapabilities(generic, 0).failure.code,
+    );
 }
 
 test "host protocol fuzzes the real untrusted frame decoder" {

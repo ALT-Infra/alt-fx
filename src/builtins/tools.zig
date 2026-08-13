@@ -116,7 +116,7 @@ const terminal_monitor_condition_schema = gateway_schema.ObjectSchema{
         .{ .name = "signal", .json_type = .string, .enum_values = &.{ "hangup", "interrupt", "quit", "terminate", "kill" } },
         .{ .name = "host", .json_type = .string },
         .{ .name = "port", .json_type = .integer, .minimum = 1, .maximum = 65535 },
-        .{ .name = "path", .json_type = .string },
+        .{ .name = "path", .json_type = .string, .description = "Required for path conditions. The path must resolve within the terminal workspace; external paths are rejected." },
         .{ .name = "minimum_bytes", .json_type = .integer },
         .{ .name = "command", .json_type = .string },
         .{ .name = "cwd", .json_type = .string },
@@ -1028,6 +1028,7 @@ pub const terminal = ToolSpec{
     .decode = terminal_impl.decode,
     .validate = terminal_impl.validate,
     .call = terminal_impl.call,
+    .authorized_result_mapper = terminal_impl.mapAuthorizedResult,
     .reads_only_fn = terminal_impl.readsOnly,
     .irreversible_fn = terminal_impl.isIrreversible,
 };
@@ -1390,6 +1391,7 @@ test "terminal tool schema exposes one exact object branch per action" {
     try std.testing.expect(terminal.requires_approval);
     try std.testing.expectEqual(tool_dispatch.ExecutorKind.terminal, terminal.executor_kind);
     try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.none, terminal.permission_target_kind);
+    try std.testing.expect(terminal.authorized_result_mapper != null);
 
     const expected = [_]struct {
         action: []const u8,
@@ -1446,6 +1448,7 @@ test "terminal tool schema exposes one exact object branch per action" {
     );
 
     const output_quiet_duration = schemaProperty(terminal_monitor_condition_schema, "duration_ms").?;
+    const monitor_path = schemaProperty(terminal_monitor_condition_schema, "path").?;
     const notification_interval = schemaProperty(terminal_monitor_notify_schema, "interval_ms").?;
     const lifetime_duration = schemaProperty(terminal_monitor_lifetime_schema, "duration_ms").?;
     const check_interval = schemaProperty(terminal_monitor_definition_schema, "check_interval_ms").?;
@@ -1460,6 +1463,10 @@ test "terminal tool schema exposes one exact object branch per action" {
     try std.testing.expectEqual(@as(?usize, maximum_lifetime_ms), lifetime_duration.maximum);
     try std.testing.expectEqual(@as(?usize, minimum_schedule_ms), check_interval.minimum);
     try std.testing.expectEqual(@as(?usize, maximum_schedule_ms), check_interval.maximum);
+    try std.testing.expectEqualStrings(
+        "Required for path conditions. The path must resolve within the terminal workspace; external paths are rejected.",
+        monitor_path.description,
+    );
     try std.testing.expectEqualStrings(
         "Required for polling conditions tcp_ready, http_ready, path_exists, path_changed, path_size, and custom_probe. Event-driven conditions process_exit, exit_code, signal, output_contains, output_matches, output_quiet, and screen_matches omit it; materialized values are ignored.",
         check_interval.description,
