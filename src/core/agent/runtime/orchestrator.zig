@@ -2672,7 +2672,8 @@ fn processQueuedPromptLoop(
                     ),
                     step_ctx,
                 );
-                if (will_auto_retry) {
+                const auto_retry_status_published = will_auto_retry;
+                if (auto_retry_status_published) {
                     try pushAutoRetryStatus(
                         deps,
                         consumed_attempts,
@@ -2729,7 +2730,10 @@ fn processQueuedPromptLoop(
                 }
                 if (cancel_requested or !delay_completed) {
                     runtime_telemetry.traceCancelObserved(step_ctx, false);
-                    try clearAutoRetryStatusIfNeeded(deps, recovery_strategy != null);
+                    try clearAutoRetryStatusIfNeeded(
+                        deps,
+                        recovery_strategy != null or auto_retry_status_published,
+                    );
                     try stream_ctx.provisional_statuses.finishTrackedCancelled(
                         deps,
                         stream_ctx.alloc,

@@ -3848,6 +3848,30 @@ test "processQueuedPrompt cancellation during HTTP backoff finishes interrupted"
     try std.testing.expect(!checkpoint.outstanding_reservation);
 }
 
+test "processQueuedPrompt cancellation during network backoff clears retry status" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .stream_error = error.ReadFailed },
+        .{ .content = "must not send" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    hooks.cancel_on_auto_retry_status = &fixture.cancel_flag;
+    var config = fixture.config();
+    config.max_provider_attempts = 3;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
+    try std.testing.expectEqual(@as(usize, 1), hooks.interrupted_history_count);
+    try std.testing.expectEqual(@as(usize, 1), hooks.route_recovery_statuses.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.route_recovery_clear_count);
+}
+
 test "processQueuedPrompt disables provider option fast after a replay safe SSE failure" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{
