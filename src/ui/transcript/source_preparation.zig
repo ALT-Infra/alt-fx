@@ -36,8 +36,8 @@ pub const ToolTurnFloor = struct {
     start_byte: usize,
 };
 
-/// Activity-independent finality boundary candidates recorded while the flow
-/// was rendered. Offsets are valid for the source's `bytes` at its `cols`.
+/// Activity-independent finality boundary candidates for the prepared flow.
+/// Each offset addresses the source's `bytes` at its `cols`.
 /// Selection against frame-fresh producer facts (lifecycle watermark,
 /// assistant-tail writability) happens in the scroll planner, outside any
 /// source cache.

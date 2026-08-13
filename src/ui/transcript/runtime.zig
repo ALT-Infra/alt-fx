@@ -129,6 +129,10 @@ const CommittedTranscriptAnchor = struct {
     measured_history_origin: ?transcript_painter.MeasuredHistoryOrigin = null,
     row_provenance: []transcript_blocks.RowProvenance = &.{},
     normal_buffer_recovery_pending: bool = false,
+    /// Stable-anchor settlement obligation. It is preserved while final rows
+    /// remain ahead of history and cleared once history reaches the viewport.
+    /// The offset gap alone is insufficient because footer displacement can
+    /// create the same shape without content debt.
     history_catchup_pending: bool = false,
 
     fn deinit(self: *CommittedTranscriptAnchor, alloc: Allocator) void {
@@ -6910,7 +6914,13 @@ pub const TranscriptRuntime = struct {
     }
 
     pub fn setAssistantTailWritable(self: *TranscriptRuntime, writable: bool) void {
+        if (self.assistant_tail_writable == writable) return;
         self.assistant_tail_writable = writable;
+        debug_trace.logf(
+            "scroll",
+            "assistant tail writability changed writable={s}",
+            .{if (writable) "true" else "false"},
+        );
     }
 
     /// Selects the finality floor in flow bytes from the prepared paint's
@@ -6969,32 +6979,6 @@ pub const TranscriptRuntime = struct {
             if (index < visual_rows.len) rows += visual_rows[index];
         }
         return rows;
-    }
-
-    /// Ability check for releasing on a byte-incompatible frame: the exact
-    /// held range must be materializable this frame through the history
-    /// replay. Mirrors resolveTransitionAppendBase's admission conditions so
-    /// the plan never authorizes a scroll the append path cannot back with
-    /// content.
-    fn incompatibleReleaseReplayResolves(
-        self: *const TranscriptRuntime,
-        prepared: *const transcript_painter.PreparedTranscriptSurfacePaint,
-        anchor: CommittedTranscriptAnchor,
-        releasable_offset: u32,
-    ) bool {
-        if (releasable_offset <= anchor.history_visual_offset) return false;
-        if (anchor.layout_id != self.committed_frame_layout.layout_id) return false;
-        if (self.committed_frame_layout.terminal_cols != self.layout.cols) return false;
-        if (self.committed_frame_layout.terminal_rows != self.layout.rows) return false;
-        if (self.resize_history_row_delta != null) return false;
-        return compatibleHistoryReplayRange(
-            prepared,
-            self.layout.cols,
-            prepared.bytes,
-            anchor.flow,
-            anchor.history_visual_offset,
-            releasable_offset,
-        ) != null;
     }
 
     /// The largest visual offset whose rows are all backed by final entries,
@@ -7249,11 +7233,12 @@ pub const TranscriptRuntime = struct {
                 // the floor clamps that range, so the budget is measured
                 // from the committed viewport, not from history.
                 releasable_offset -| anchor.visual_offset
-        else if (self.incompatibleReleaseReplayResolves(
+        else if (self.compatibleCommittedHistoryReplayRange(
             prepared,
             anchor,
+            prepared.bytes,
             releasable_offset,
-        ))
+        ) != null)
             releasable_advance
         else
             0;
@@ -7771,11 +7756,9 @@ pub const TranscriptRuntime = struct {
                 } else if (target.history_visual_offset >= target.visual_offset) {
                     target.history_catchup_pending = false;
                 } else if (scroll_facts.finality_hold) {
-                    // Finality withheld release; mark the debt so the next
-                    // eligible frame settles it through the existing
-                    // catch-up replay. Recomputed from the floor on every
-                    // commit, so the mark survives any interlude that drops
-                    // it. Footer displacement never sets this.
+                    // Finality withheld release. Preserve the obligation on
+                    // stable anchors until history catches the viewport;
+                    // footer displacement alone never creates one.
                     target.history_catchup_pending = true;
                 }
             },
@@ -7849,6 +7832,15 @@ pub const TranscriptRuntime = struct {
         clear_rows: u16,
     };
 
+    fn committedLayoutMatches(
+        self: *const TranscriptRuntime,
+        anchor: CommittedTranscriptAnchor,
+    ) bool {
+        return anchor.layout_id == self.committed_frame_layout.layout_id and
+            self.committed_frame_layout.terminal_cols == self.layout.cols and
+            self.committed_frame_layout.terminal_rows == self.layout.rows;
+    }
+
     fn compatibleHistoryReplayRange(
         prepared: *const transcript_painter.PreparedTranscriptSurfacePaint,
         cols: u16,
@@ -7890,6 +7882,25 @@ pub const TranscriptRuntime = struct {
         };
     }
 
+    fn compatibleCommittedHistoryReplayRange(
+        self: *const TranscriptRuntime,
+        prepared: *const transcript_painter.PreparedTranscriptSurfacePaint,
+        anchor: CommittedTranscriptAnchor,
+        target_flow: []const u8,
+        target_history_visual_offset: u32,
+    ) ?TransitionHistoryReplay {
+        if (!self.committedLayoutMatches(anchor)) return null;
+        if (self.resize_history_row_delta != null) return null;
+        return compatibleHistoryReplayRange(
+            prepared,
+            self.layout.cols,
+            target_flow,
+            anchor.flow,
+            anchor.history_visual_offset,
+            target_history_visual_offset,
+        );
+    }
+
     const TransitionAppendBase = struct {
         flow_len: usize,
         history_replay: ?TransitionHistoryReplay = null,
@@ -7909,23 +7920,17 @@ pub const TranscriptRuntime = struct {
     ) !?TransitionAppendBase {
         switch (self.transcript_commit_state) {
             .stable => |anchor| {
-                if (!destructive_invalidation and
-                    anchor.layout_id == self.committed_frame_layout.layout_id and
-                    self.committed_frame_layout.terminal_cols == self.layout.cols and
-                    self.committed_frame_layout.terminal_rows == self.layout.rows)
-                {
+                if (!destructive_invalidation) {
                     const replay_from_history = target_history_visual_offset >
                         anchor.history_visual_offset and
                         (scroll_facts.geometry_rebase or
                             anchor.normal_buffer_recovery_pending or
                             anchor.history_catchup_pending);
                     if (replay_from_history) {
-                        const replay = compatibleHistoryReplayRange(
+                        const replay = self.compatibleCommittedHistoryReplayRange(
                             prepared,
-                            self.layout.cols,
+                            anchor,
                             target_flow,
-                            anchor.flow,
-                            anchor.history_visual_offset,
                             target_history_visual_offset,
                         );
                         if (replay) |history_replay| {
@@ -7943,7 +7948,8 @@ pub const TranscriptRuntime = struct {
                             };
                         }
                     }
-                    if (target_flow.len >= anchor.flow.len and
+                    if (self.committedLayoutMatches(anchor) and
+                        target_flow.len >= anchor.flow.len and
                         std.mem.startsWith(u8, target_flow, anchor.flow))
                     {
                         return .{
@@ -10680,6 +10686,42 @@ test "owned stable transition traces a superseded pending resume source" {
     ) != null);
 }
 
+test "assistant tail writability transitions are traceable" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.fs.path.join(alloc, &.{ root, "assistant-tail.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "scroll");
+    debug_trace.logf("scroll", "assistant tail trace test start", .{});
+
+    var runtime = TranscriptRuntime{ .layout = testLayoutWithRows(8) };
+    defer runtime.deinit(alloc);
+    runtime.setAssistantTailWritable(false);
+    runtime.setAssistantTailWritable(true);
+    debug_trace.shutdown();
+
+    var trace_file = try std.Io.Dir.openFileAbsolute(std.testing.io, trace_path, .{});
+    defer trace_file.close(std.testing.io);
+    const trace = try io_mod.readFileToEnd(alloc, &trace_file, 4096);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(
+        u8,
+        trace,
+        "assistant tail writability changed writable=false",
+    ) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        trace,
+        "assistant tail writability changed writable=true",
+    ) != null);
+}
+
 test "stable resume publication starts a fresh retained source epoch" {
     const alloc = std.testing.allocator;
     const retained_flow =
@@ -11639,7 +11681,7 @@ test "source rewrite replays unchanged history prefix after footer projection re
     }
 }
 
-test "history replay starts at committed source top before preserved row release" {
+test "history replay starts at committed source top and follows resize eligibility" {
     const alloc = std.testing.allocator;
     const committed_flow =
         "source-row-01\nsource-row-02\nsource-row-03\nsource-row-04\n";
@@ -11735,6 +11777,17 @@ test "history replay starts at committed source top before preserved row release
     );
     try std.testing.expectEqual(@as(u16, 4), scroll_plan.preserved_release_rows);
     try std.testing.expectEqual(@as(u16, 8), scroll_plan.terminal_scroll_rows);
+
+    runtime.resize_history_row_delta = 1;
+    const resize_facts = runtime.planTranscriptScroll(&prepared);
+    const resize_append_base = (try runtime.resolveTransitionAppendBase(
+        &prepared,
+        resize_facts,
+        false,
+        source.bytes,
+        resize_facts.target_visual_offset,
+    )) orelse return error.TestExpectedNaturalAppendBase;
+    try std.testing.expect(resize_append_base.history_replay == null);
 }
 
 test "preserved source rewrite holds the normal buffer at committed history" {
