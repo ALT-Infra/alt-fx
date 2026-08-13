@@ -7402,8 +7402,8 @@ pub const TranscriptRuntime = struct {
         staged_flow_end: ?usize = null,
         projection_staged: bool = false,
         // The frame slides the viewport past withheld release with an
-        // in-place repaint; a document append would scroll the same rows
-        // physically without a matching plan.
+        // in-place repaint. Any document append is bounded separately to
+        // the rows the frame may release.
         hold_staged: bool = false,
 
         fn init(
@@ -7716,7 +7716,6 @@ pub const TranscriptRuntime = struct {
                     target.body_disposition == .paint and
                     !scroll_facts.geometry_rebase and
                     !scroll_facts.recovery_rebase and
-                    scroll_facts.semantic_rows == 0 and
                     !self.fullTranscriptActive() and
                     !prepared.selection.split_active and
                     !target_layout.transcript_area.isEmpty() and
@@ -8342,11 +8341,23 @@ pub const TranscriptRuntime = struct {
             target_flow.len
         else
             null;
+        const held_projected_flow_end: ?usize = if (target.hold_staged)
+            if (append_base) |base|
+                transcript_painter.preparedTranscriptFlowOffsetForVisualOffset(
+                    prepared,
+                    self.layout.cols,
+                    base.visual_offset + base.visual_rows +
+                        accepted.semantic_progress_rows,
+                )
+            else
+                null
+        else
+            null;
         const projected_flow_end: ?usize = if (append_base) |base|
             if (base.history_replay) |replay|
                 replay.flow_end
             else
-                natural_projected_flow_end
+                held_projected_flow_end orelse natural_projected_flow_end
         else
             natural_projected_flow_end;
         var document_append = render_engine.frame_scroll_plan.FrameDocumentAppend{};
@@ -8391,7 +8402,6 @@ pub const TranscriptRuntime = struct {
                 },
             );
         } else if (append_base != null and
-            !target.hold_staged and
             (!scroll_facts.recovery_rebase or append_is_history_replay) and
             !scroll_facts.recovery_projection_deferred and
             (if (append_is_history_replay)

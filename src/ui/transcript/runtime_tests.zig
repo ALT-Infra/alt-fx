@@ -15341,6 +15341,81 @@ test "catch-up release materializes history before staging a larger finality hol
     }
 }
 
+test "partial finality release bounds append before staging withheld viewport" {
+    const alloc = std.testing.allocator;
+    const committed_flow =
+        "row-00\nrow-01\nrow-02\nrow-03\n" ++
+        "row-04\nrow-05\nrow-06\nrow-07\n";
+    const target_flow = committed_flow ++
+        "row-08\nrow-09\nrow-10\nrow-11\nrow-12\nrow-13\n";
+    const finality_floor = "row-00\nrow-01\nrow-02\nrow-03\nrow-04\n".len;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+
+    var committed_source = try testSource(alloc, committed_flow, runtime.layout.cols);
+    defer committed_source.deinit(alloc);
+    var committed_prepared = try prepareTestSourceForCurrentArea(
+        &runtime,
+        alloc,
+        &committed_source,
+    );
+    defer committed_prepared.deinit(alloc);
+    try installStableAnchorForTest(
+        &runtime,
+        alloc,
+        committed_flow,
+        committed_prepared.selection,
+        preparedVisualOffsetForTest(&committed_prepared),
+        committed_prepared.cursor.cursor_row,
+        committed_prepared.cursor.cursor_col,
+        1,
+    );
+    switch (runtime.transcript_commit_state) {
+        .stable => |*anchor| anchor.total_visual_rows = 8,
+        .invalid, .recovering => return error.TestExpectedStableTranscript,
+    }
+
+    var source = try testSource(alloc, target_flow, runtime.layout.cols);
+    defer source.deinit(alloc);
+    source.finality.mutation_pin_start = finality_floor;
+    var prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &source);
+    defer prepared.deinit(alloc);
+    const facts = runtime.planTranscriptScroll(&prepared);
+    try std.testing.expect(facts.source_compatible);
+    try std.testing.expectEqual(@as(u32, 4), facts.source_visual_offset);
+    try std.testing.expectEqual(@as(u32, 10), facts.target_visual_offset);
+    try std.testing.expectEqual(@as(u32, 1), facts.semantic_rows);
+    try std.testing.expectEqual(@as(u16, 1), facts.planned_rows);
+    try std.testing.expect(facts.finality_hold);
+
+    const scroll_plan = render_engine.frame_scroll_plan.merge(
+        runtime.layout.rows,
+        runtime.owned_top_row,
+        0,
+        facts.planned_rows,
+    );
+    var plan = testPaintPlan(&runtime, prepared.selection);
+    var transition = try runtime.finalizeTranscriptTransition(
+        alloc,
+        &source,
+        &prepared,
+        render_engine.frame_layout.CommittedLayoutSnapshot.fromPaintPlan(plan),
+        &plan,
+        scroll_plan,
+    );
+    defer transition.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "row-08\r\n",
+        transition.document_append.bytes,
+    );
+    try std.testing.expectEqual(@as(u32, 10), transition.visual_offset);
+    try std.testing.expectEqual(@as(u32, 5), transition.history_visual_offset);
+}
+
 test "recovery growth does not release rows past the finality floor" {
     const alloc = std.testing.allocator;
     const attempt_flow =
