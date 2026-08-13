@@ -4,6 +4,7 @@ const edit_contract = @import("../input/editor_state.zig");
 const file_picker_path = @import("../input/file_picker_path.zig");
 const horizontal_navigation = @import("../input/horizontal_navigation.zig");
 const picker_state = @import("../input/picker_state.zig");
+const core_input_runtime = @import("../input/runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const display_width = @import("../shared/display_width.zig");
 const list_window = @import("../shared/list_window.zig");
@@ -228,14 +229,16 @@ pub fn CompletionRuntime(comptime App: type) type {
             }
 
             const scan = if (page)
-                app.input_runtime.scanInputCursorRows(
+                ui_input.scanInputCursorRows(
+                    &app.input_runtime,
                     direction,
                     row_count,
                     app.shell.layout.cols,
                     app.pending_images.items,
                 )
             else
-                app.input_runtime.scanInputCursorVertical(
+                ui_input.scanInputCursorVertical(
+                    &app.input_runtime,
                     direction,
                     app.shell.layout.cols,
                     app.pending_images.items,
@@ -397,7 +400,8 @@ pub fn CompletionRuntime(comptime App: type) type {
                 snapshot,
                 app.input_runtime.edit_state.input.items,
             );
-            const scan = app.input_runtime.scanInputCursorVertical(
+            const scan = ui_input.scanInputCursorVertical(
+                &app.input_runtime,
                 .down,
                 app.shell.layout.cols,
                 app.pending_images.items,
@@ -422,7 +426,8 @@ pub fn CompletionRuntime(comptime App: type) type {
                 app.slashRegistry(),
                 app.input_runtime.edit_state.input.items,
             );
-            const scan = app.input_runtime.scanInputCursorVertical(
+            const scan = ui_input.scanInputCursorVertical(
+                &app.input_runtime,
                 .down,
                 app.shell.layout.cols,
                 app.pending_images.items,
@@ -453,7 +458,8 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         fn modelMenuVisibleItems(app: *App) u16 {
-            const scan = app.input_runtime.scanInputCursorVertical(
+            const scan = ui_input.scanInputCursorVertical(
+                &app.input_runtime,
                 .down,
                 app.shell.layout.cols,
                 app.pending_images.items,
@@ -489,7 +495,8 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         fn skillsMenuVisibleRows(app: *App) u16 {
-            const scan = app.input_runtime.scanInputCursorVertical(
+            const scan = ui_input.scanInputCursorVertical(
+                &app.input_runtime,
                 .down,
                 app.shell.layout.cols,
                 app.pending_images.items,
@@ -511,7 +518,8 @@ pub fn CompletionRuntime(comptime App: type) type {
         };
 
         fn footerRowBudget(app: *App) FooterRowBudget {
-            const scan = app.input_runtime.scanInputCursorVertical(
+            const scan = ui_input.scanInputCursorVertical(
+                &app.input_runtime,
                 .down,
                 app.shell.layout.cols,
                 app.pending_images.items,
@@ -540,7 +548,8 @@ pub fn CompletionRuntime(comptime App: type) type {
 
         fn sessionPickerVisibleItems(app: *App) u16 {
             const picker = &app.session_persistence.session_picker;
-            const scan = app.input_runtime.scanInputCursorVertical(
+            const scan = ui_input.scanInputCursorVertical(
+                &app.input_runtime,
                 .down,
                 app.shell.layout.cols,
                 app.pending_images.items,
@@ -1291,7 +1300,7 @@ pub fn CompletionRuntime(comptime App: type) type {
 
 const FilePickerTestApp = struct {
     alloc: std.mem.Allocator,
-    input_runtime: ui_input.InputRuntime = .{},
+    input_runtime: core_input_runtime.Runtime = .{},
     pending_images: std.ArrayList(types.ImageAttachment) = .empty,
     queued_prompt_review: input_queue_runtime.State = .{},
     stream: types.StreamState = .{},
@@ -1336,7 +1345,7 @@ const FilesystemFilePickerTestApp = struct {
     workspace_root: []const u8,
     workspace: app_workspace_runtime.State = .{},
     file_index: file_index.FileIndex = .{},
-    input_runtime: ui_input.InputRuntime = .{},
+    input_runtime: core_input_runtime.Runtime = .{},
     pending_images: std.ArrayList(types.ImageAttachment) = .empty,
 
     fn deinit(self: *FilesystemFilePickerTestApp) void {
@@ -1410,7 +1419,7 @@ const inline_completion_test_slash_registry = command_specs.SlashRegistry{
 
 const InlineCompletionTestApp = struct {
     alloc: std.mem.Allocator,
-    input_runtime: ui_input.InputRuntime = .{},
+    input_runtime: core_input_runtime.Runtime = .{},
     pending_images: std.ArrayList(types.ImageAttachment) = .empty,
     queued_prompt_review: input_queue_runtime.State = .{},
     skills: struct {
@@ -1448,7 +1457,7 @@ const InlineCompletionTestApp = struct {
 
 const ModelPickerCompletionTestApp = struct {
     alloc: std.mem.Allocator,
-    input_runtime: ui_input.InputRuntime = .{},
+    input_runtime: core_input_runtime.Runtime = .{},
 
     fn deinit(self: *ModelPickerCompletionTestApp) void {
         self.input_runtime.deinit(self.alloc);

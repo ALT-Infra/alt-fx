@@ -14,6 +14,7 @@ const projection = @import("../../core/subagent/ui_projection.zig");
 const terminal_projection = @import("../../core/terminal/ui_projection.zig");
 const skill_contract = @import("../../core/skills/skill_contract.zig");
 const input_action = @import("../../core/input/input_action.zig");
+const core_input_runtime = @import("../../core/input/runtime.zig");
 const subagent_input = @import("../../core/subagent/input_action.zig");
 const horizontal_navigation = @import("../../core/input/horizontal_navigation.zig");
 const paste_framing = @import("../../core/input/paste_framing.zig");
@@ -249,7 +250,7 @@ const FormState = struct {
     kind: FormKind = .none,
     target_id: ?[]u8 = null,
     expected_generation: ?u64 = null,
-    editors: [form_editor_count]ui_input.InputRuntime = [_]ui_input.InputRuntime{.{}} ** form_editor_count,
+    editors: [form_editor_count]core_input_runtime.Runtime = [_]core_input_runtime.Runtime{.{}} ** form_editor_count,
     field_index: usize = 0,
     permission_mode: types.PermissionMode = .yolo,
     notifications_enabled: bool = false,
@@ -296,7 +297,7 @@ const FormState = struct {
         return available[@min(self.field_index, available.len - 1)];
     }
 
-    fn editorForField(self: *FormState, field: FormField) ?*ui_input.InputRuntime {
+    fn editorForField(self: *FormState, field: FormField) ?*core_input_runtime.Runtime {
         const index: ?usize = switch (field) {
             .name => 0,
             .model => 1,
@@ -704,7 +705,7 @@ pub const ChildRouteState = struct {
     chat: ?projection.ChildChat = null,
     unavailable: ?projection.ChildUnavailable = null,
     pages: projection.ChildChatPageCache = .{},
-    editor: ui_input.InputRuntime = .{},
+    editor: core_input_runtime.Runtime = .{},
     scroll_from_bottom: usize = 0,
     max_scroll: usize = 0,
     invocation_id: ?[]u8 = null,
@@ -782,7 +783,7 @@ pub const ChildRouteState = struct {
 pub const ChildPresentationView = struct {
     chat: *const projection.ChildChat,
     pages: *const projection.ChildChatPageCache,
-    editor: *const ui_input.InputRuntime,
+    editor: *const core_input_runtime.Runtime,
     submission_failure: ?SubmissionFailure,
     input_failure: ?ChildInputFailure,
     rows_from_bottom: u32,
@@ -798,7 +799,7 @@ const ChildViewportBookmark = struct {
 
 const ChildDraft = struct {
     child_id: []u8,
-    editor: ui_input.InputRuntime = .{},
+    editor: core_input_runtime.Runtime = .{},
 
     fn deinit(self: *ChildDraft, alloc: Allocator) void {
         alloc.free(self.child_id);
@@ -1377,7 +1378,7 @@ pub const Runtime = struct {
         return self.childComposerEditable();
     }
 
-    pub fn childComposerEditor(self: *Runtime) ?*ui_input.InputRuntime {
+    pub fn childComposerEditor(self: *Runtime) ?*core_input_runtime.Runtime {
         if (!self.childComposerEditable()) return null;
         return &self.child.editor;
     }
@@ -1395,9 +1396,9 @@ pub const Runtime = struct {
             else => return self.child.editor.moveInputCursor(intent),
         };
         const scan = if (intent.kind == .page_up or intent.kind == .page_down)
-            self.child.editor.scanInputCursorRows(direction, page_rows, terminal_cols, &.{})
+            ui_input.scanInputCursorRows(&self.child.editor, direction, page_rows, terminal_cols, &.{})
         else
-            self.child.editor.scanInputCursorVertical(direction, terminal_cols, &.{});
+            ui_input.scanInputCursorVertical(&self.child.editor, direction, terminal_cols, &.{});
         return self.child.editor.vertical_navigation.applyTargetWithSelection(
             &self.child.editor.edit_state,
             &self.child.editor.entities,
@@ -3378,7 +3379,7 @@ pub const Runtime = struct {
                 current_index = self.child_drafts.items.len - 1;
             }
             std.mem.swap(
-                ui_input.InputRuntime,
+                core_input_runtime.Runtime,
                 &self.child.editor,
                 &self.child_drafts.items[current_index.?].editor,
             );
@@ -3387,7 +3388,7 @@ pub const Runtime = struct {
         self.child.clear(alloc);
         if (self.childDraftIndex(next_child_id)) |next_index| {
             std.mem.swap(
-                ui_input.InputRuntime,
+                core_input_runtime.Runtime,
                 &self.child.editor,
                 &self.child_drafts.items[next_index].editor,
             );
@@ -7077,7 +7078,7 @@ test "main approval notification opens from an empty manager without owning reso
 
 test "child composer input submission and refresh stay independent from main state" {
     const alloc = std.testing.allocator;
-    var main_editor = ui_input.InputRuntime{};
+    var main_editor = core_input_runtime.Runtime{};
     defer main_editor.deinit(alloc);
     try main_editor.insertionState().insertSlice(alloc, "untouched main 🧭", .preserve);
     const main_cursor = main_editor.edit_state.cursor;

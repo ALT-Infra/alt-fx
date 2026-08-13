@@ -1,5 +1,7 @@
 const std = @import("std");
 const input_action = @import("../input/input_action.zig");
+const core_input_runtime = @import("../input/runtime.zig");
+const ui_input = @import("../../ui/input/runtime.zig");
 const input_visual_layout = @import("../../ui/input/visual_layout.zig");
 const shell_runtime = @import("../../ui/shell_runtime.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
@@ -780,7 +782,8 @@ pub fn SubagentRuntime(comptime App: type) type {
 
         fn moveChildModelMenu(app: *App, delta: i32) void {
             const view = app.subagents.childPresentationView() orelse return;
-            const scan = view.editor.scanInputCursorVertical(
+            const scan = ui_input.scanInputCursorVertical(
+                view.editor,
                 .down,
                 app.shell.layout.cols,
                 &.{},
@@ -805,7 +808,8 @@ pub fn SubagentRuntime(comptime App: type) type {
 
         fn moveChildSkillsMenu(app: *App, delta: i32) void {
             const view = app.subagents.childPresentationView() orelse return;
-            const scan = view.editor.scanInputCursorVertical(
+            const scan = ui_input.scanInputCursorVertical(
+                view.editor,
                 .down,
                 app.shell.layout.cols,
                 &.{},
@@ -878,7 +882,7 @@ const TestSubagents = struct {
 
 const TestApp = struct {
     alloc: std.mem.Allocator = std.testing.allocator,
-    input_runtime: @import("../../ui/input/runtime.zig").InputRuntime = .{},
+    input_runtime: core_input_runtime.Runtime = .{},
     subagents: TestSubagents = .{},
     session_persistence: app_session_runtime.Persistence = .{},
     shell: transcript_runtime.TranscriptRuntime = .{},
@@ -914,7 +918,7 @@ const CatalogTestState = struct {
 
 const CatalogTestApp = struct {
     alloc: std.mem.Allocator = std.testing.allocator,
-    input_runtime: @import("../../ui/input/runtime.zig").InputRuntime = .{},
+    input_runtime: core_input_runtime.Runtime = .{},
     subagents: CatalogTestSubagents = .{},
     model_cache: CatalogTestState = .{},
     skills: CatalogTestState = .{},

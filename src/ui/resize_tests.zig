@@ -19,7 +19,7 @@ const approval_prompt = @import("../core/permissions/approval_prompt.zig");
 const render_input = @import("footer/render_input.zig");
 const footer_viewport = @import("footer/viewport.zig");
 const activity_runtime = @import("../core/output/activity_runtime.zig");
-const input_runtime = @import("input/runtime.zig");
+const core_input_runtime = @import("../core/input/runtime.zig");
 const ui_render = @import("render.zig");
 const render_engine = @import("render_engine.zig");
 const render_request = @import("render_request.zig");
@@ -36,7 +36,7 @@ const Metrics = types.Metrics;
 const TranscriptPreparationSource = transcript_runtime.TranscriptPreparationSource;
 const TranscriptRuntime = transcript_runtime.TranscriptRuntime;
 const Grid = vt_emulator.Grid;
-const InputRuntime = input_runtime.InputRuntime;
+const InputRuntime = core_input_runtime.Runtime;
 
 const TestBodyDisposition = enum {
     paint,
