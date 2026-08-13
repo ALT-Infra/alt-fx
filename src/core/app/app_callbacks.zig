@@ -7,6 +7,7 @@ const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
+const core_input_runtime = @import("../input/runtime.zig");
 const app_worker_runtime = @import("app_worker_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const change_tracker_mod = @import("../workspace/change_tracker.zig");
@@ -1368,7 +1369,7 @@ const FakeApp = struct {
     alloc: std.mem.Allocator,
     worker: FakeWorker = .{},
     session: FakeSession = .{},
-    input_runtime: @import("../../ui/input/runtime.zig").InputRuntime = .{},
+    input_runtime: core_input_runtime.Runtime = .{},
     selected_model: std.ArrayList(u8) = .empty,
     model_completion_values: []const []const u8 = &.{},
     change_tracker: change_tracker_mod.ChangeTracker = .{},

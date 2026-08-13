@@ -137,8 +137,8 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasField(App, "pending_images")) {
                 if (app.pending_images.items.len > 0) return "submit or clear pending images before upgrading";
             }
-            if (comptime @hasField(App, "input_runtime")) {
-                if (app.input_runtime.hasPendingTerminalAction()) return "finish the key sequence before upgrading";
+            if (comptime @hasField(App, "terminal_input_runtime")) {
+                if (app.terminal_input_runtime.hasPendingTerminalAction()) return "finish the key sequence before upgrading";
             }
             return null;
         }
@@ -208,9 +208,12 @@ const TestWorker = struct {
 const TestInputRuntime = struct {
     edit_state: editor_state.State = .{},
     paste: paste_framing.State = .{},
+};
+
+const TestTerminalInputRuntime = struct {
     terminal_action_pending: bool = false,
 
-    fn hasPendingTerminalAction(self: *const TestInputRuntime) bool {
+    fn hasPendingTerminalAction(self: *const TestTerminalInputRuntime) bool {
         return self.terminal_action_pending;
     }
 };
@@ -233,6 +236,7 @@ const TestApp = struct {
     upgrader: TestUpgrader = .{},
     worker: TestWorker = .{},
     input_runtime: TestInputRuntime = .{},
+    terminal_input_runtime: TestTerminalInputRuntime = .{},
     shell: TestShell = .{},
     stream: struct { active: bool = false } = .{},
     should_exit: bool = false,
@@ -469,7 +473,7 @@ test "app_upgrade_runtime rejects mid key sequence before reload" {
     var app = TestApp{ .alloc = std.testing.allocator };
     defer app.deinit();
     app.upgrader.state = .ready;
-    app.input_runtime.terminal_action_pending = true;
+    app.terminal_input_runtime.terminal_action_pending = true;
     var deps = TestDepsState{};
 
     const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, deps.deps());

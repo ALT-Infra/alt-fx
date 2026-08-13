@@ -7,9 +7,9 @@ const terminal_projection = @import("../../core/terminal/ui_projection.zig");
 const execution = @import("../../core/subagent/execution.zig");
 const domain = @import("../../core/subagent/domain.zig");
 const input_action = @import("../../core/input/input_action.zig");
+const core_input_runtime = @import("../../core/input/runtime.zig");
 const skill_contract = @import("../../core/skills/skill_contract.zig");
 const subagent_runtime = @import("runtime.zig");
-const ui_input = @import("../input/runtime.zig");
 const render_request = @import("../render_request.zig");
 const transcript_runtime = @import("../transcript/runtime.zig");
 
@@ -228,7 +228,7 @@ pub const Controller = struct {
         return self.runtime.childComposerFocused();
     }
 
-    pub fn childComposerEditor(self: *Controller) ?*ui_input.InputRuntime {
+    pub fn childComposerEditor(self: *Controller) ?*core_input_runtime.Runtime {
         return self.runtime.childComposerEditor();
     }
 

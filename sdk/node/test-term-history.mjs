@@ -81,14 +81,16 @@ await waitFor(
 );
 const restoreError = second.events.find((event) => event.type === "history.restore_error");
 if (restoreError) throw restoreError.error;
-if (!second.events.some((event) => event.type === "history.restore" && event.count === 1)) {
-  throw new Error("second terminal did not restore one host prompt history entry");
+if (!second.events.some((event) => event.type === "history.restore" && event.count === 2)) {
+  throw new Error("second terminal did not restore the host prompt and slash command history entries");
 }
 second.runtime.write("\x1b[A");
-await waitFor(second.terminal, () => grid(second.terminal).includes("remember this prompt"), "restored Up-arrow prompt");
+await waitFor(second.terminal, () => grid(second.terminal).includes("/exit"), "restored Up-arrow slash command");
+second.runtime.write("\x10");
+await waitFor(second.terminal, () => grid(second.terminal).includes("remember this prompt"), "restored Ctrl-P prompt");
 if (grid(second.terminal).includes("durable prompt history unavailable")) {
   throw new Error("terminal reported unavailable history despite a host provider");
 }
 second.runtime.write("\x15/exit\r");
 if (await waitForExit(second.runtime, "second terminal") !== 0) throw new Error("second terminal did not exit cleanly");
-console.log("headless history passed: host prompt history survived terminal recreation and restored through Up arrow");
+console.log("headless history passed: host prompt and slash command history survived terminal recreation");

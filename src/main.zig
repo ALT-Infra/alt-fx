@@ -19,6 +19,7 @@ const app_entry_runtime = @import("core/app/app_entry_runtime.zig");
 const acp_runner = @import("core/cli/acp_runner.zig");
 const acp_server = @import("acp/server.zig");
 const app_input_runtime = @import("core/app/app_input_runtime.zig");
+const core_input_runtime = @import("core/input/runtime.zig");
 const input_queue_runtime = @import("core/app/input_queue_runtime.zig");
 const app_bootstrap_runtime = @import("core/app/app_bootstrap_runtime.zig");
 const app_notification_runtime = @import("core/app/app_notification_runtime.zig");
@@ -162,7 +163,8 @@ const ToolExecutionResult = agent_runtime.ToolExecutionResult;
 const ApprovalPrompt = approval_prompt.ApprovalPrompt;
 const ApprovalScreenState = footer_runtime.ApprovalScreenState;
 const QuestionPrompt = question_prompt.QuestionPrompt;
-const InputRuntime = ui_input.InputRuntime;
+const InputRuntime = core_input_runtime.Runtime;
+const TerminalInputRuntime = ui_input.Runtime;
 const TerminalState = shell_runtime.TerminalState;
 const TranscriptRuntime = transcript_runtime.TranscriptRuntime;
 const ResumeProjection = resume_projection.ResumeProjection;
@@ -495,6 +497,7 @@ const App = struct {
 
     should_exit: bool = false,
     input_runtime: InputRuntime = .{},
+    terminal_input_runtime: TerminalInputRuntime = .{},
     queued_prompt_review: input_queue_runtime.State = .{},
     pending_images: std.ArrayList(types.ImageAttachment) = .empty,
     next_image_id: usize = 1,
@@ -792,6 +795,7 @@ const App = struct {
         self.clearPendingImages();
         self.pending_images.deinit(self.alloc);
         self.input_runtime.deinit(self.alloc);
+        self.terminal_input_runtime.deinit(self.alloc);
         self.shell.deinit(self.alloc);
         self.pacer.deinit(self.alloc);
         self.selected_model.deinit(self.alloc);
@@ -2124,10 +2128,10 @@ const App = struct {
     fn nativeClearProbeEligible(self: *const App, byte: u8) bool {
         if (byte < 32 or byte == 127) return false;
         if (io_mod.getenv("TMUX") != null) return false;
-        if (self.input_runtime.native_clear_probe.disabled() or
-            self.input_runtime.native_clear_probe.active() or
+        if (self.terminal_input_runtime.native_clear_probe.disabled() or
+            self.terminal_input_runtime.native_clear_probe.active() or
             self.input_runtime.paste.active() or
-            self.input_runtime.hasPendingTerminalAction() or
+            self.terminal_input_runtime.hasPendingTerminalAction() or
             self.question_prompt.isActive() or
             self.approval_prompt.isActive() or
             self.auth.apiKeyEntryActive() or
@@ -2138,7 +2142,7 @@ const App = struct {
             self.shell.layout.cols < cursor_probe.confirmation_tag_column or
             !shell_runtime.resizeLifecycleIdle(&self.shell) or
             resize_interlock.resizePending() or
-            !self.input_runtime.terminal_cursor_probe.canBegin())
+            !self.terminal_input_runtime.terminal_cursor_probe.canBegin())
         {
             return false;
         }
@@ -2146,9 +2150,9 @@ const App = struct {
     }
 
     pub fn prepareApiKeyInputBoundary(self: *App) void {
-        if (self.input_runtime.native_clear_probe.active()) {
-            const discarded = self.input_runtime.native_clear_probe.settle().len;
-            self.input_runtime.native_clear_probe.clearSettledInput();
+        if (self.terminal_input_runtime.native_clear_probe.active()) {
+            const discarded = self.terminal_input_runtime.native_clear_probe.settle().len;
+            self.terminal_input_runtime.native_clear_probe.clearSettledInput();
             debug_trace.logf(
                 "auth",
                 "api key stage discarded native-clear probe input bytes={d}",
@@ -2156,11 +2160,11 @@ const App = struct {
             );
         }
 
-        self.input_runtime.terminal_cursor_probe.cancel();
+        self.terminal_input_runtime.terminal_cursor_probe.cancel();
         var discarded: usize = 0;
-        while (self.input_runtime.terminal_cursor_probe.takeDeferredByte()) |byte| {
+        while (self.terminal_input_runtime.terminal_cursor_probe.takeDeferredByte()) |byte| {
             _ = byte;
-            std.debug.assert(self.input_runtime.terminal_cursor_probe.consumeDeferredInputDispatch());
+            std.debug.assert(self.terminal_input_runtime.terminal_cursor_probe.consumeDeferredInputDispatch());
             discarded += 1;
         }
         if (discarded > 0) {
@@ -2173,8 +2177,8 @@ const App = struct {
     }
 
     fn replayNativeClearProbeInput(self: *App) !void {
-        const retained = self.input_runtime.native_clear_probe.settle();
-        defer self.input_runtime.native_clear_probe.clearSettledInput();
+        const retained = self.terminal_input_runtime.native_clear_probe.settle();
+        defer self.terminal_input_runtime.native_clear_probe.clearSettledInput();
         for (retained) |retained_byte| {
             try self.handleTerminalInputByte(retained_byte);
             if (self.should_exit) return;
@@ -2183,7 +2187,7 @@ const App = struct {
 
     fn handleTerminalInputByte(self: *App, byte: u8) !void {
         const context = try InputAppRuntime.prepareTerminalDecode(self) orelse return;
-        const ingress = self.input_runtime.decodeTerminalByte(
+        const ingress = self.terminal_input_runtime.decodeTerminalByte(
             byte,
             context,
         );
@@ -2204,7 +2208,7 @@ const App = struct {
             );
             const replay = replay_byte orelse return;
             const context = try InputAppRuntime.prepareTerminalDecode(self) orelse return;
-            ingress = self.input_runtime.decodeTerminalByte(replay, context);
+            ingress = self.terminal_input_runtime.decodeTerminalByte(replay, context);
         }
     }
 
@@ -2216,20 +2220,20 @@ const App = struct {
     }
 
     fn retainDeferredNativeClearProbeInput(self: *App) !bool {
-        while (self.input_runtime.terminal_cursor_probe.takeDeferredByte()) |deferred| {
-            if (!self.input_runtime.native_clear_probe.canRetainBytes(1)) {
-                std.debug.assert(self.input_runtime.terminal_cursor_probe.consumeDeferredInputDispatch());
+        while (self.terminal_input_runtime.terminal_cursor_probe.takeDeferredByte()) |deferred| {
+            if (!self.terminal_input_runtime.native_clear_probe.canRetainBytes(1)) {
+                std.debug.assert(self.terminal_input_runtime.terminal_cursor_probe.consumeDeferredInputDispatch());
                 try self.finishNativeClearProbe(false);
                 try self.handleTerminalInputByte(deferred);
-                while (self.input_runtime.terminal_cursor_probe.takeDeferredByte()) |remaining| {
-                    std.debug.assert(self.input_runtime.terminal_cursor_probe.consumeDeferredInputDispatch());
+                while (self.terminal_input_runtime.terminal_cursor_probe.takeDeferredByte()) |remaining| {
+                    std.debug.assert(self.terminal_input_runtime.terminal_cursor_probe.consumeDeferredInputDispatch());
                     try self.handleTerminalInputByte(remaining);
                     if (self.should_exit) break;
                 }
                 return false;
             }
-            try self.input_runtime.native_clear_probe.retainBytes(self.alloc, &.{deferred});
-            std.debug.assert(self.input_runtime.terminal_cursor_probe.consumeDeferredInputDispatch());
+            try self.terminal_input_runtime.native_clear_probe.retainBytes(self.alloc, &.{deferred});
+            std.debug.assert(self.terminal_input_runtime.terminal_cursor_probe.consumeDeferredInputDispatch());
         }
         return true;
     }
@@ -2238,8 +2242,8 @@ const App = struct {
         if (!self.nativeClearProbeEligible(byte)) return false;
 
         const expected_row = self.shell.footer_viewport.cursor.row;
-        try self.input_runtime.native_clear_probe.begin(self.alloc, expected_row, byte);
-        self.input_runtime.terminal_cursor_probe.begin(
+        try self.terminal_input_runtime.native_clear_probe.begin(self.alloc, expected_row, byte);
+        self.terminal_input_runtime.terminal_cursor_probe.begin(
             .ansi_tagged,
             io_mod.milliTimestamp() + cursor_probe.response_idle_timeout_ms,
         ) catch {
@@ -2247,8 +2251,8 @@ const App = struct {
             return true;
         };
         self.terminal.requestResizeCursorPosition(.ansi_tagged) catch |err| {
-            self.input_runtime.terminal_cursor_probe.cancel();
-            self.input_runtime.native_clear_probe.disable(false);
+            self.terminal_input_runtime.terminal_cursor_probe.cancel();
+            self.terminal_input_runtime.native_clear_probe.disable(false);
             debug_trace.logf("native_clear", "native_clear_probe_write_failed err={s}", .{@errorName(err)});
             try self.replayNativeClearProbeInput();
             return true;
@@ -2262,11 +2266,11 @@ const App = struct {
     }
 
     fn handleNativeClearProbeInput(self: *App, byte: u8) !void {
-        self.input_runtime.terminal_cursor_probe.noteInputActivity(io_mod.milliTimestamp());
-        switch (self.input_runtime.terminal_cursor_probe.feed(byte)) {
+        self.terminal_input_runtime.terminal_cursor_probe.noteInputActivity(io_mod.milliTimestamp());
+        switch (self.terminal_input_runtime.terminal_cursor_probe.feed(byte)) {
             .pending => {},
             .position => |position| {
-                const expected_row = self.input_runtime.native_clear_probe.expectedRow();
+                const expected_row = self.terminal_input_runtime.native_clear_probe.expectedRow();
                 const reset_visual_epoch = position.row != expected_row;
                 debug_trace.logf(
                     "native_clear",
@@ -2279,13 +2283,13 @@ const App = struct {
                 debug_trace.logf("native_clear", "native_clear_probe_late_response_discarded", .{});
             },
             .forward => |forwarded| {
-                if (self.input_runtime.native_clear_probe.canRetainBytes(forwarded.slice().len)) {
-                    try self.input_runtime.native_clear_probe.retainBytes(self.alloc, forwarded.slice());
+                if (self.terminal_input_runtime.native_clear_probe.canRetainBytes(forwarded.slice().len)) {
+                    try self.terminal_input_runtime.native_clear_probe.retainBytes(self.alloc, forwarded.slice());
                     return;
                 }
 
-                _ = self.input_runtime.terminal_cursor_probe.expire(io_mod.milliTimestamp());
-                self.input_runtime.native_clear_probe.disable(true);
+                _ = self.terminal_input_runtime.terminal_cursor_probe.expire(io_mod.milliTimestamp());
+                self.terminal_input_runtime.native_clear_probe.disable(true);
                 debug_trace.logf("native_clear", "native_clear_probe_overflow", .{});
                 if (try self.retainDeferredNativeClearProbeInput()) {
                     try self.finishNativeClearProbe(false);
@@ -2299,10 +2303,10 @@ const App = struct {
     }
 
     fn collectNativeClearProbeFacts(self: *App) !void {
-        switch (self.input_runtime.terminal_cursor_probe.poll(io_mod.milliTimestamp())) {
+        switch (self.terminal_input_runtime.terminal_cursor_probe.poll(io_mod.milliTimestamp())) {
             .none => {},
             .probe_timed_out => {
-                self.input_runtime.native_clear_probe.disable(true);
+                self.terminal_input_runtime.native_clear_probe.disable(true);
                 debug_trace.logf("native_clear", "native_clear_probe_timeout", .{});
                 if (!try self.retainDeferredNativeClearProbeInput()) {
                     debug_trace.logf("native_clear", "native_clear_probe_overflow", .{});
@@ -2311,7 +2315,7 @@ const App = struct {
                 try self.finishNativeClearProbe(false);
             },
             .late_window_expired => {
-                self.input_runtime.native_clear_probe.finishLateResponse();
+                self.terminal_input_runtime.native_clear_probe.finishLateResponse();
                 debug_trace.logf("native_clear", "native_clear_probe_late_window_expired", .{});
             },
         }
@@ -2319,16 +2323,16 @@ const App = struct {
 
     fn collectThemeFacts(self: *App) !void {
         const now_ms = io_mod.milliTimestamp();
-        self.input_runtime.terminal_theme_monitor.poll(now_ms);
+        self.terminal_input_runtime.terminal_theme_monitor.poll(now_ms);
 
         // FX_THEME forces colors via detectTheme; keep owning protocol bytes
         // (monitor started) but never query or apply live theme updates.
         if (ui_render.explicitThemeOverride() != null) {
-            _ = self.input_runtime.terminal_theme_monitor.takeSettledUpdate();
+            _ = self.terminal_input_runtime.terminal_theme_monitor.takeSettledUpdate();
             return;
         }
 
-        if (self.input_runtime.terminal_theme_monitor.takeSettledUpdate()) |update| {
+        if (self.terminal_input_runtime.terminal_theme_monitor.takeSettledUpdate()) |update| {
             debug_trace.logf("theme", "theme_update_settled light={s} rgb={s}", .{
                 if (update.light) "true" else "false",
                 if (update.rgb == null) "fallback" else "terminal",
@@ -2336,19 +2340,19 @@ const App = struct {
             try RenderAppRuntime.applyThemeUpdate(self, update.light, update.rgb);
         }
         if (InputAppRuntime.terminalPasteActive(self) or
-            self.input_runtime.native_clear_probe.active() or
-            self.input_runtime.native_clear_probe.awaitingLateResponse())
+            self.terminal_input_runtime.native_clear_probe.active() or
+            self.terminal_input_runtime.native_clear_probe.awaitingLateResponse())
         {
             return;
         }
-        if (self.input_runtime.terminal_theme_monitor.takeQueryRequest(now_ms)) |request| {
+        if (self.terminal_input_runtime.terminal_theme_monitor.takeQueryRequest(now_ms)) |request| {
             debug_trace.logf("theme", "theme_query_requested kind={s}", .{@tagName(request)});
             const query_result = switch (request) {
                 .response_fence => self.terminal.requestThemeResponseFence(),
                 .background => self.terminal.requestThemeBackground(),
             };
             query_result catch |err| {
-                self.input_runtime.terminal_theme_monitor.failQuery(now_ms);
+                self.terminal_input_runtime.terminal_theme_monitor.failQuery(now_ms);
                 debug_trace.logf("theme", "theme_query_failed kind={s} err={s}", .{
                     @tagName(request),
                     @errorName(err),
@@ -2364,7 +2368,7 @@ const App = struct {
         if (!self.terminal_takeover.blocksFxSurface(&self.terminal)) {
             try self.collectThemeFacts();
         } else {
-            self.input_runtime.terminal_theme_monitor.poll(io_mod.milliTimestamp());
+            self.terminal_input_runtime.terminal_theme_monitor.poll(io_mod.milliTimestamp());
         }
 
         if (comptime !host_target.is_wasm) {
@@ -2396,8 +2400,8 @@ const App = struct {
         if (self.terminal_takeover.blocksFxSurface(&self.terminal)) {
             self.shell.layout = self.terminal.queryLayout(footer_rows) catch
                 self.shell.layout;
-        } else if (self.input_runtime.native_clear_probe.active() or
-            self.input_runtime.native_clear_probe.awaitingLateResponse())
+        } else if (self.terminal_input_runtime.native_clear_probe.active() or
+            self.terminal_input_runtime.native_clear_probe.awaitingLateResponse())
         {
             try self.collectNativeClearProbeFacts();
         } else {
@@ -2405,7 +2409,7 @@ const App = struct {
                 self.terminal,
                 &self.shell,
                 &self.metrics,
-                &self.input_runtime.terminal_cursor_probe,
+                &self.terminal_input_runtime.terminal_cursor_probe,
                 &resize_interlock,
                 footer_rows,
                 resize_debounce_ms,
@@ -2433,7 +2437,7 @@ const App = struct {
         if (!self.terminal_takeover.blocksFxSurface(&self.terminal)) {
             const input_now_ms = io_mod.milliTimestamp();
             InputAppRuntime.expireTerminalInputGestures(self, input_now_ms);
-            const terminal_input = self.input_runtime.flushTerminalAction(
+            const terminal_input = self.terminal_input_runtime.flushTerminalAction(
                 input_now_ms,
                 input_escape_timeout_ms,
                 InputAppRuntime.terminalPasteActive(self),
@@ -2453,7 +2457,7 @@ const App = struct {
         const self: *App = @ptrCast(@alignCast(ctx));
         if (!try WorkerAppRuntime.authorizeInteractiveAdmission(self)) return;
         if (try self.terminal_takeover.commit(App, self)) return;
-        if (self.input_runtime.native_clear_probe.active()) return;
+        if (self.terminal_input_runtime.native_clear_probe.active()) return;
         _ = self.admitPendingResizeSignal("post_input");
         try self.flushRequestedFrame();
     }
@@ -2481,14 +2485,14 @@ const App = struct {
     }
 
     fn handleCursorDeferredInputByte(self: *App, byte: u8) !void {
-        if (self.input_runtime.native_clear_probe.active()) {
-            if (self.input_runtime.native_clear_probe.canRetainBytes(1)) {
-                try self.input_runtime.native_clear_probe.retainBytes(self.alloc, &.{byte});
+        if (self.terminal_input_runtime.native_clear_probe.active()) {
+            if (self.terminal_input_runtime.native_clear_probe.canRetainBytes(1)) {
+                try self.terminal_input_runtime.native_clear_probe.retainBytes(self.alloc, &.{byte});
                 return;
             }
 
-            _ = self.input_runtime.terminal_cursor_probe.expire(io_mod.milliTimestamp());
-            self.input_runtime.native_clear_probe.disable(true);
+            _ = self.terminal_input_runtime.terminal_cursor_probe.expire(io_mod.milliTimestamp());
+            self.terminal_input_runtime.native_clear_probe.disable(true);
             debug_trace.logf("native_clear", "native_clear_probe_overflow", .{});
             try self.finishNativeClearProbe(false);
         }
@@ -2507,26 +2511,26 @@ const App = struct {
     fn handleAfterThemeMonitorByte(self: *App, byte: u8) !void {
         if (try self.routeActivePasteTransportByte(byte)) return;
         if (try self.terminal_takeover.handleByte(App, self, byte)) return;
-        if (!self.input_runtime.terminal_cursor_probe.interceptsInput()) {
+        if (!self.terminal_input_runtime.terminal_cursor_probe.interceptsInput()) {
             if (try self.beginNativeClearProbe(byte)) return;
             try self.handleTerminalInputByte(byte);
             return;
         }
 
-        if (self.input_runtime.native_clear_probe.active()) {
+        if (self.terminal_input_runtime.native_clear_probe.active()) {
             try self.handleNativeClearProbeInput(byte);
             return;
         }
 
-        self.input_runtime.terminal_cursor_probe.noteInputActivity(io_mod.milliTimestamp());
-        switch (self.input_runtime.terminal_cursor_probe.feed(byte)) {
+        self.terminal_input_runtime.terminal_cursor_probe.noteInputActivity(io_mod.milliTimestamp());
+        switch (self.terminal_input_runtime.terminal_cursor_probe.feed(byte)) {
             .pending => {},
             .position => |position| {
                 shell_runtime.completeResizeCursorProbe(&self.shell, position);
             },
             .late_response => {
-                if (self.input_runtime.native_clear_probe.awaitingLateResponse()) {
-                    self.input_runtime.native_clear_probe.finishLateResponse();
+                if (self.terminal_input_runtime.native_clear_probe.awaitingLateResponse()) {
+                    self.terminal_input_runtime.native_clear_probe.finishLateResponse();
                     debug_trace.logf("native_clear", "native_clear_probe_late_response_discarded", .{});
                 } else {
                     debug_trace.logf("resize", "cursor_measure_late_response_discarded", .{});
@@ -2542,7 +2546,7 @@ const App = struct {
     }
 
     fn handleThemeMonitorByte(self: *App, byte: u8) !void {
-        switch (self.input_runtime.terminal_theme_monitor.feed(
+        switch (self.terminal_input_runtime.terminal_theme_monitor.feed(
             byte,
             io_mod.milliTimestamp(),
         )) {
@@ -2559,7 +2563,7 @@ const App = struct {
     pub fn loopHandleByte(ctx: *anyopaque, byte: u8) !void {
         const self: *App = @ptrCast(@alignCast(ctx));
         if (!try WorkerAppRuntime.authorizeInteractiveAdmission(self)) return;
-        const deferred_source = self.input_runtime.consumeDeferredTerminalInputDispatch();
+        const deferred_source = self.terminal_input_runtime.consumeDeferredTerminalInputDispatch();
 
         if (deferred_source) |source| {
             switch (source) {
@@ -2575,7 +2579,7 @@ const App = struct {
         }
 
         switch (ui_input.terminalInputOwner(
-            &self.input_runtime.terminal_theme_monitor,
+            &self.terminal_input_runtime.terminal_theme_monitor,
             InputAppRuntime.terminalPasteActive(self),
             true,
         )) {
@@ -2592,7 +2596,7 @@ const App = struct {
         }
 
         if (try self.terminal_takeover.handleByte(App, self, byte)) return;
-        if (self.input_runtime.terminal_theme_monitor.enabled) {
+        if (self.terminal_input_runtime.terminal_theme_monitor.enabled) {
             try self.handleThemeMonitorByte(byte);
             return;
         }
@@ -2611,9 +2615,9 @@ const App = struct {
     pub fn loopNextCollectedByte(ctx: *anyopaque) ?u8 {
         const self: *App = @ptrCast(@alignCast(ctx));
         if (self.terminal_takeover.blocksFxSurface(&self.terminal)) {
-            return self.input_runtime.takeDeferredThemeMonitorByte();
+            return self.terminal_input_runtime.takeDeferredThemeMonitorByte();
         }
-        return self.input_runtime.takeDeferredTerminalInputByte();
+        return self.terminal_input_runtime.takeDeferredTerminalInputByte();
     }
 };
 

@@ -185,6 +185,15 @@ pub const AppearanceMenu = struct {
     pub fn selectedChange(self: *const AppearanceMenu) ?Change {
         return (self.selectedChoice() orelse return null).change;
     }
+
+    pub fn changeSelectedOption(self: *const AppearanceMenu, snapshot: *const Snapshot, delta: i32) ?Change {
+        if (!self.active or delta == 0) return null;
+        const setting: SettingId = if (self.selected_index % appearance_choices.len < 2)
+            .input_appearance
+        else
+            .maxxing_mode;
+        return cycleChange(snapshot, setting, delta);
+    }
 };
 
 pub fn appearanceChoiceCount() usize {
@@ -257,6 +266,12 @@ pub const StatuslineMenu = struct {
     pub fn selectedChange(self: *const StatuslineMenu, snapshot: Snapshot) ?Change {
         return (self.selectedChoice() orelse return null).toggledChange(snapshot);
     }
+
+    pub fn changeSelectedOption(self: *const StatuslineMenu, snapshot: *const Snapshot, delta: i32) ?Change {
+        if (delta == 0) return null;
+        const choice = self.selectedChoice() orelse return null;
+        return cycleChange(snapshot, choice.setting, delta);
+    }
 };
 
 pub fn statuslineChoiceCount() usize {
@@ -316,6 +331,11 @@ pub const SandboxMenu = struct {
 
     pub fn selectedChange(self: *const SandboxMenu) ?Change {
         return (self.selectedChoice() orelse return null).change;
+    }
+
+    pub fn changeSelectedOption(self: *const SandboxMenu, snapshot: *const Snapshot, delta: i32) ?Change {
+        if (!self.active or delta == 0) return null;
+        return cycleChange(snapshot, .sandbox, delta);
     }
 };
 
@@ -406,15 +426,7 @@ pub const Menu = struct {
     ) ?Change {
         if (delta == 0) return null;
         const item = self.selectedItem(snapshot, query) orelse return null;
-        const count = optionCount(snapshot, item.id);
-        if (count == 0) return null;
-
-        const current: i32 = @intCast(selectedOptionIndex(snapshot, item.id) orelse 0);
-        const count_signed: i32 = @intCast(count);
-        var next = current + delta;
-        while (next < 0) next += count_signed;
-        while (next >= count_signed) next -= count_signed;
-        return changeAt(snapshot, item.id, @intCast(next));
+        return cycleChange(snapshot, item.id, delta);
     }
 };
 
@@ -432,7 +444,7 @@ const specs = [_]Spec{
     .{ .id = .sound_level, .category = .notifications, .label = "Sound level", .description = "Choose off, on, or max interface sounds" },
     .{ .id = .sandbox, .category = .advanced, .label = "Command sandbox", .description = "Choose command process isolation for this workspace" },
     .{ .id = .startup_scrollback, .category = .advanced, .label = "Startup scrollback", .description = "Restore terminal output when Fx starts" },
-    .{ .id = .prompt_history, .category = .advanced, .label = "Prompt history", .description = "Save accepted prompts for composer history" },
+    .{ .id = .prompt_history, .category = .advanced, .label = "Prompt history", .description = "Save accepted prompts and slash commands for composer history" },
 };
 
 const on_off_options = [_][]const u8{ "off", "on" };
@@ -508,6 +520,17 @@ pub fn optionAt(snapshot: *const Snapshot, id: SettingId, index: usize) ?[]const
     const options = staticOptionsFor(id);
     if (index >= options.len) return null;
     return options[index];
+}
+
+fn cycleChange(snapshot: *const Snapshot, id: SettingId, delta: i32) ?Change {
+    const count = optionCount(snapshot, id);
+    if (count == 0) return null;
+    const current: i32 = @intCast(selectedOptionIndex(snapshot, id) orelse 0);
+    const count_signed: i32 = @intCast(count);
+    var next = current + delta;
+    while (next < 0) next += count_signed;
+    while (next >= count_signed) next -= count_signed;
+    return changeAt(snapshot, id, @intCast(next));
 }
 
 pub fn selectedOptionIndex(snapshot: *const Snapshot, id: SettingId) ?usize {

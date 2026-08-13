@@ -1,4 +1,4 @@
-// In-memory ring buffer of recent tool invocations. Used by /feedback so
+// In-memory ring buffer of recent tool invocations. Used by /trace so
 // the report shows which tools the model invoked, with bounded args/results
 // for normal tools, without forcing a persistent trace log. web_fetch is
 // compact-only because its prompt and fetched content are sensitive.

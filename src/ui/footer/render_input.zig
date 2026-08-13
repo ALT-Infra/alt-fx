@@ -18,7 +18,7 @@ const file_index = @import("../../core/workspace/file_index.zig");
 const workspace_menu = @import("../../core/workspace/workspace_menu.zig");
 const activity_runtime = @import("../../core/output/activity_runtime.zig");
 const usage_menu = @import("../../core/session/usage_menu.zig");
-const ui_input = @import("../input/runtime.zig");
+const core_input_runtime = @import("../../core/input/runtime.zig");
 const presentation_mode = @import("../../core/config/presentation_mode.zig");
 const ui_render = @import("../render.zig");
 const render_engine = @import("../render_engine.zig");
@@ -29,7 +29,7 @@ const interaction_state = @import("interaction_state.zig");
 const activity_overlay = render_engine.activity_overlay;
 const StreamState = types.StreamState;
 const ActivityProjection = activity_runtime.ActivityProjection;
-const InputRuntime = ui_input.InputRuntime;
+const InputRuntime = core_input_runtime.Runtime;
 const TranscriptRuntime = transcript_runtime.TranscriptRuntime;
 const SubagentStatus = @import("../../core/subagent/domain.zig").State;
 
@@ -291,7 +291,7 @@ pub fn modelMenuProjection(cache: *const model_cache_runtime.Runtime) ModelMenuP
 
 const max_static_status_activity_rows: u16 = 3;
 
-pub const InputAppearance = ui_input.InputAppearance;
+pub const InputAppearance = core_input_runtime.InputAppearance;
 pub const MaxxingMode = presentation_mode.MaxxingMode;
 
 pub const QueuedPromptCard = struct {

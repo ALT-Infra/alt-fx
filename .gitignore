@@ -24,13 +24,6 @@ sdk/dist/
 benchmarks/results/*.json
 benchmarks/baseline.json
 
-# Local Harbor release eval artifacts
-evals/.build/
-evals/jobs-out/
-evals/images/fx
-evals/**/__pycache__/
-evals/**/*.pyc
-
 # Local agent/editor/tooling directories from this workspace
 .adal/
 .agents/

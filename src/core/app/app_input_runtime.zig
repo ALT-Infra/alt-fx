@@ -14,6 +14,7 @@ const composer_insertion = @import("../input/composer_insertion.zig");
 const gesture_state = @import("../input/gesture_state.zig");
 const horizontal_navigation = @import("../input/horizontal_navigation.zig");
 const input_action = @import("../input/input_action.zig");
+const core_input_runtime = @import("../input/runtime.zig");
 const input_limit_rejection = @import("../input/input_limit_rejection.zig");
 const input_reset = @import("../input/input_reset.zig");
 const picker_state = @import("../input/picker_state.zig");
@@ -587,10 +588,10 @@ pub fn Runtime(comptime App: type) type {
             defer {
                 const paste_is_active = terminalPasteActive(app);
                 if (!paste_was_active and paste_is_active) {
-                    shell_runtime.suspendResizeCursorProbeForPaste(&app.input_runtime.terminal_cursor_probe);
+                    shell_runtime.suspendResizeCursorProbeForPaste(&app.terminal_input_runtime.terminal_cursor_probe);
                 } else if (paste_was_active and !paste_is_active) {
                     shell_runtime.resumeResizeCursorProbeAfterPaste(
-                        &app.input_runtime.terminal_cursor_probe,
+                        &app.terminal_input_runtime.terminal_cursor_probe,
                         io_mod.milliTimestamp(),
                     );
                 }
@@ -654,7 +655,7 @@ pub fn Runtime(comptime App: type) type {
         pub fn flushPendingEscape(app: *App, input_escape_timeout_ms: i64) !void {
             const now = io_mod.milliTimestamp();
             expireTerminalInputGestures(app, now);
-            const ingress = app.input_runtime.flushTerminalAction(
+            const ingress = app.terminal_input_runtime.flushTerminalAction(
                 now,
                 input_escape_timeout_ms,
                 terminalPasteActive(app),
@@ -687,7 +688,7 @@ pub fn Runtime(comptime App: type) type {
             max_prompt_history: usize,
         ) !void {
             var context = try prepareTerminalDecode(app) orelse return;
-            var ingress = app.input_runtime.decodeTerminalByte(
+            var ingress = app.terminal_input_runtime.decodeTerminalByte(
                 byte,
                 context,
             );
@@ -700,7 +701,7 @@ pub fn Runtime(comptime App: type) type {
                 );
                 const replay = replay_byte orelse return;
                 context = try prepareTerminalDecode(app) orelse return;
-                ingress = app.input_runtime.decodeTerminalByte(replay, context);
+                ingress = app.terminal_input_runtime.decodeTerminalByte(replay, context);
             }
         }
 
@@ -737,7 +738,7 @@ pub fn Runtime(comptime App: type) type {
             if (!paste_was_active) return;
             defer if (!terminalPasteActive(app)) {
                 shell_runtime.resumeResizeCursorProbeAfterPaste(
-                    &app.input_runtime.terminal_cursor_probe,
+                    &app.terminal_input_runtime.terminal_cursor_probe,
                     io_mod.milliTimestamp(),
                 );
             };
@@ -1030,7 +1031,7 @@ pub fn Runtime(comptime App: type) type {
             }
 
             if (appearanceMenuActive(app)) {
-                routeAppearanceMenuEscapeAction(app, resolved);
+                try routeAppearanceMenuEscapeAction(app, resolved);
                 return .done;
             }
 
@@ -1973,7 +1974,7 @@ pub fn Runtime(comptime App: type) type {
         fn submitAppearanceMenuSelection(app: *App) !void {
             const change = app.input_runtime.appearance_menu.selectedChange() orelse return;
             if (comptime @hasDecl(App, "notificationPreferences")) {
-                try app_commands.applySettingsCatalogChange(app, change);
+                try app_commands.applySettingsCatalogMenuChange(app, change);
             }
             app.shell.render_requests.request(.footer);
         }
@@ -2001,7 +2002,7 @@ pub fn Runtime(comptime App: type) type {
                 .usage, .workspace => unreachable,
             } orelse return;
             if (comptime @hasDecl(App, "notificationPreferences")) {
-                try app_commands.applySettingsCatalogChange(app, change);
+                try app_commands.applySettingsCatalogMenuChange(app, change);
             }
             app.shell.render_requests.request(.footer);
         }
@@ -2073,6 +2074,21 @@ pub fn Runtime(comptime App: type) type {
                 }
                 return;
             }
+            if ((menu == .statusline or menu == .sandbox) and
+                (resolved == .cursor_left or resolved == .cursor_right))
+            {
+                const snapshot = app_commands.settingsCatalogSnapshot(app);
+                const delta: i32 = if (resolved == .cursor_left) -1 else 1;
+                const change = switch (menu) {
+                    .statusline => app.input_runtime.statusline_menu.changeSelectedOption(&snapshot, delta),
+                    .sandbox => app.input_runtime.sandbox_menu.changeSelectedOption(&snapshot, delta),
+                    .usage, .workspace => unreachable,
+                } orelse return;
+                if (comptime @hasDecl(App, "notificationPreferences")) {
+                    try app_commands.applySettingsCatalogMenuChange(app, change);
+                }
+                return;
+            }
             const delta: i32 = switch (resolved) {
                 .cursor_up => -1,
                 .cursor_down => 1,
@@ -2091,10 +2107,21 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        fn routeAppearanceMenuEscapeAction(app: *App, resolved: input_action.Action) void {
+        fn routeAppearanceMenuEscapeAction(app: *App, resolved: input_action.Action) !void {
             switch (resolved) {
-                .cursor_up => _ = app.input_runtime.appearance_menu.move(-1),
-                .cursor_down => _ = app.input_runtime.appearance_menu.move(1),
+                .cursor_up, .cursor_down => {
+                    _ = app.input_runtime.appearance_menu.cycleSection(1);
+                },
+                .cursor_left, .cursor_right => {
+                    const snapshot = app_commands.settingsCatalogSnapshot(app);
+                    const change = app.input_runtime.appearance_menu.changeSelectedOption(
+                        &snapshot,
+                        if (resolved == .cursor_left) -1 else 1,
+                    ) orelse return;
+                    if (comptime @hasDecl(App, "notificationPreferences")) {
+                        try app_commands.applySettingsCatalogMenuChange(app, change);
+                    }
+                },
                 .toggle_permission_mode => _ = app.input_runtime.appearance_menu.cycleSection(-1),
                 else => return,
             }
@@ -2716,7 +2743,8 @@ const FakeApprovalCancelApp = struct {
     approval_screen: interaction_state.ApprovalScreenState = .{},
     question_prompt: question_prompt.QuestionPrompt = .{},
     subagents: FakeInactiveSubagents = .{},
-    input_runtime: test_ui_input.InputRuntime = .{},
+    input_runtime: core_input_runtime.Runtime = .{},
+    terminal_input_runtime: test_ui_input.Runtime = .{},
     pending_images: std.ArrayList(types.ImageAttachment) = .empty,
     shell: FakeApprovalShell = .{},
     stream: types.StreamState = .{ .active = true },
@@ -2737,6 +2765,7 @@ const FakeApprovalCancelApp = struct {
         self.clearPendingImages();
         self.pending_images.deinit(self.alloc);
         self.input_runtime.deinit(self.alloc);
+        self.terminal_input_runtime.deinit(self.alloc);
         self.shell.deinit(self.alloc);
         self.transcript.deinit(self.alloc);
         self.notice_topic.deinit(self.alloc);
@@ -2829,7 +2858,7 @@ const RoutingSubagents = struct {
     last_handled_key: ?u8 = null,
     last_main_approval_id: ?u64 = null,
     toggle_view_calls: usize = 0,
-    manager_paste: test_ui_input.InputRuntime = .{},
+    manager_paste: core_input_runtime.Runtime = .{},
 
     fn deinit(self: *RoutingSubagents, alloc: std.mem.Allocator) void {
         self.manager_paste.deinit(alloc);
@@ -3070,7 +3099,7 @@ fn routingFullTranscriptStyles() transcript_runtime.Styles {
     };
 }
 
-fn armCtrlCExitForTest(input_runtime: *test_ui_input.InputRuntime, armed_ms: i64) void {
+fn armCtrlCExitForTest(input_runtime: *core_input_runtime.Runtime, armed_ms: i64) void {
     input_runtime.gestures = gesture_state.disarmCtrlCExit(
         input_runtime.gestures,
     ).next;
@@ -3080,7 +3109,7 @@ fn armCtrlCExitForTest(input_runtime: *test_ui_input.InputRuntime, armed_ms: i64
     ).next;
 }
 
-fn armEscapeClearForTest(input_runtime: *test_ui_input.InputRuntime, armed_ms: i64) void {
+fn armEscapeClearForTest(input_runtime: *core_input_runtime.Runtime, armed_ms: i64) void {
     input_runtime.gestures = gesture_state.disarmEscapeClear(
         input_runtime.gestures,
     ).next;
@@ -3132,7 +3161,8 @@ const RoutingFakeApp = struct {
     approval_prompt: approval_prompt.ApprovalPrompt = .{},
     approval_screen: interaction_state.ApprovalScreenState = .{},
     question_prompt: question_prompt.QuestionPrompt = .{},
-    input_runtime: test_ui_input.InputRuntime = .{},
+    input_runtime: core_input_runtime.Runtime = .{},
+    terminal_input_runtime: test_ui_input.Runtime = .{},
     shell: transcript_runtime.TranscriptRuntime = .{},
     terminal: shell_runtime.TerminalState = .{},
     worker: RoutingWorker = .{},
@@ -3239,6 +3269,7 @@ const RoutingFakeApp = struct {
         self.approval_prompt.deinit(self.alloc);
         self.question_prompt.deinit(self.alloc);
         self.input_runtime.deinit(self.alloc);
+        self.terminal_input_runtime.deinit(self.alloc);
         self.subagents.deinit(self.alloc);
         self.shell.deinit(self.alloc);
         self.pending_images.deinit(self.alloc);
@@ -7101,9 +7132,9 @@ test "app_input_runtime decoded kitty Escape follows the raw Escape policy" {
         defer app.deinit();
         app.stream.active = true;
         try app.question_prompt.syncFrom(alloc, &entries);
-        app.input_runtime.terminal_action_decoder.stage = 1;
-        app.input_runtime.terminal_action_decoder.cancel_pending = true;
-        app.input_runtime.terminal_action_decoder.started_ms = 0;
+        app.terminal_input_runtime.terminal_action_decoder.stage = 1;
+        app.terminal_input_runtime.terminal_action_decoder.cancel_pending = true;
+        app.terminal_input_runtime.terminal_action_decoder.started_ms = 0;
 
         try Runtime(RoutingFakeApp).flushPendingEscape(&app, 0);
 
@@ -7169,7 +7200,7 @@ test "app_input_runtime decoded kitty Backspace edits the draft without cancelli
         try std.testing.expectEqualStrings("draf", app.input_runtime.edit_state.input.items);
         try std.testing.expect(!app.worker.cancel_requested);
         try std.testing.expect(app.stream.active);
-        try std.testing.expect(!app.input_runtime.terminal_action_decoder.cancel_pending);
+        try std.testing.expect(!app.terminal_input_runtime.terminal_action_decoder.cancel_pending);
     }
 }
 
@@ -7272,7 +7303,7 @@ test "app_input_runtime immediate ctrl+g follows bare Escape" {
 
     try std.testing.expectEqual(@as(usize, 1), app.upgrade_apply_count);
     try std.testing.expectEqual(@as(usize, 0), app.upgrade_denied_count);
-    try std.testing.expectEqual(@as(u8, 0), app.input_runtime.terminal_action_decoder.stage);
+    try std.testing.expectEqual(@as(u8, 0), app.terminal_input_runtime.terminal_action_decoder.stage);
 }
 
 test "app_input_runtime ctrl+r no longer invokes the ready upgrade shortcut" {
@@ -7322,7 +7353,7 @@ test "app_input_runtime immediate Ctrl-A follows bare Escape" {
 
     try std.testing.expectEqualStrings("Xabc", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(usize, 1), app.input_runtime.edit_state.cursor);
-    try std.testing.expectEqual(@as(u8, 0), app.input_runtime.terminal_action_decoder.stage);
+    try std.testing.expectEqual(@as(u8, 0), app.terminal_input_runtime.terminal_action_decoder.stage);
 }
 
 test "app_input_runtime immediate Ctrl-U follows slash completion Escape" {
@@ -7335,7 +7366,7 @@ test "app_input_runtime immediate Ctrl-U follows slash completion Escape" {
 
     try std.testing.expectEqualStrings("after", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(usize, 5), app.input_runtime.edit_state.cursor);
-    try std.testing.expectEqual(@as(u8, 0), app.input_runtime.terminal_action_decoder.stage);
+    try std.testing.expectEqual(@as(u8, 0), app.terminal_input_runtime.terminal_action_decoder.stage);
 }
 
 test "app_input_runtime immediate Ctrl-X follows bare Escape" {
@@ -7346,7 +7377,7 @@ test "app_input_runtime immediate Ctrl-X follows bare Escape" {
     try feedRoutingBytes(&app, "\x1b\x18");
 
     try std.testing.expectEqual(@as(usize, 1), app.subagents.toggle_view_calls);
-    try std.testing.expectEqual(@as(u8, 0), app.input_runtime.terminal_action_decoder.stage);
+    try std.testing.expectEqual(@as(u8, 0), app.terminal_input_runtime.terminal_action_decoder.stage);
 }
 
 test "app_input_runtime ctrl+d exits on an empty idle composer" {
@@ -7491,7 +7522,7 @@ test "app_input_runtime owns pending image discard and release" {
     const alloc = std.testing.allocator;
     const PendingImageLifecycleApp = struct {
         alloc: std.mem.Allocator,
-        input_runtime: test_ui_input.InputRuntime = .{},
+        input_runtime: core_input_runtime.Runtime = .{},
         pending_images: std.ArrayList(types.ImageAttachment) = .empty,
     };
 
@@ -7778,7 +7809,7 @@ test "app_input_runtime bare Escape disarms pending Ctrl-C exit" {
 
     try Runtime(RoutingFakeApp).handleByte(&app, 3, 4096, 100);
     try Runtime(RoutingFakeApp).handleByte(&app, 0x1b, 4096, 100);
-    app.input_runtime.terminal_action_decoder.started_ms = io_mod.milliTimestamp() - 31;
+    app.terminal_input_runtime.terminal_action_decoder.started_ms = io_mod.milliTimestamp() - 31;
     app.shell.render_requests.clearReason(.footer);
 
     try Runtime(RoutingFakeApp).flushPendingEscape(&app, 30);
@@ -8378,11 +8409,11 @@ test "app_input_runtime paste start drops pending gesture arms before capture" {
     try std.testing.expectEqual(paste_framing.Owner.composer, app.input_runtime.paste.owner);
     try std.testing.expect(!app.input_runtime.gestures.ctrlCExitArmed());
     try std.testing.expect(!app.input_runtime.gestures.escapeClearArmed());
-    try std.testing.expectEqual(@as(u8, 0), app.input_runtime.terminal_action_decoder.stage);
-    try std.testing.expectEqual(@as(u16, 0), app.input_runtime.terminal_action_decoder.param);
-    try std.testing.expectEqual(@as(u16, 0), app.input_runtime.terminal_action_decoder.param2);
-    try std.testing.expectEqual(@as(i64, 0), app.input_runtime.terminal_action_decoder.started_ms);
-    try std.testing.expect(!app.input_runtime.terminal_action_decoder.cancel_pending);
+    try std.testing.expectEqual(@as(u8, 0), app.terminal_input_runtime.terminal_action_decoder.stage);
+    try std.testing.expectEqual(@as(u16, 0), app.terminal_input_runtime.terminal_action_decoder.param);
+    try std.testing.expectEqual(@as(u16, 0), app.terminal_input_runtime.terminal_action_decoder.param2);
+    try std.testing.expectEqual(@as(i64, 0), app.terminal_input_runtime.terminal_action_decoder.started_ms);
+    try std.testing.expect(!app.terminal_input_runtime.terminal_action_decoder.cancel_pending);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 
     try feedRoutingBytes(&app, "\x1b[201~");
@@ -8857,30 +8888,30 @@ test "app_input_runtime active paste shields prompts from escape timeout cancell
     try Runtime(RoutingFakeApp).handleByte(&app, 0x1b, 4096, 100);
     try std.testing.expectEqual(@as(usize, 1), app.input_runtime.paste.end_match_len);
 
-    app.input_runtime.terminal_action_decoder.stage = 1;
-    app.input_runtime.terminal_action_decoder.started_ms = 0;
-    app.input_runtime.terminal_action_decoder.cancel_pending = true;
+    app.terminal_input_runtime.terminal_action_decoder.stage = 1;
+    app.terminal_input_runtime.terminal_action_decoder.started_ms = 0;
+    app.terminal_input_runtime.terminal_action_decoder.cancel_pending = true;
     try Runtime(RoutingFakeApp).flushPendingEscape(&app, 0);
 
     try std.testing.expectEqual(paste_framing.Owner.decision_prompt, app.input_runtime.paste.owner);
     try std.testing.expectEqual(@as(usize, 1), app.input_runtime.paste.end_match_len);
     try std.testing.expect(app.approval_prompt.isActive());
     try std.testing.expect(app.worker.submitted_permission == null);
-    try std.testing.expectEqual(@as(u8, 0), app.input_runtime.terminal_action_decoder.stage);
-    try std.testing.expect(!app.input_runtime.terminal_action_decoder.cancel_pending);
+    try std.testing.expectEqual(@as(u8, 0), app.terminal_input_runtime.terminal_action_decoder.stage);
+    try std.testing.expect(!app.terminal_input_runtime.terminal_action_decoder.cancel_pending);
 }
 
 test "app_input_runtime terminal paste pauses and resumes the resize cursor probe only at exact boundaries" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try app.input_runtime.terminal_cursor_probe.begin(.ansi_tagged, 0);
+    try app.terminal_input_runtime.terminal_cursor_probe.begin(.ansi_tagged, 0);
 
     for ("\x1b[200~") |byte| {
         try Runtime(RoutingFakeApp).handleTerminalByte(&app, byte, 4096, 100);
     }
     try std.testing.expectEqual(paste_framing.Owner.composer, app.input_runtime.paste.owner);
-    switch (app.input_runtime.terminal_cursor_probe.poll(std.math.maxInt(i64))) {
+    switch (app.terminal_input_runtime.terminal_cursor_probe.poll(std.math.maxInt(i64))) {
         .none => {},
         else => return error.TestExpectedEqual,
     }
@@ -8889,7 +8920,7 @@ test "app_input_runtime terminal paste pauses and resumes the resize cursor prob
         try Runtime(RoutingFakeApp).handleTerminalByte(&app, byte, 4096, 100);
     }
     try std.testing.expectEqual(paste_framing.Owner.composer, app.input_runtime.paste.owner);
-    switch (app.input_runtime.terminal_cursor_probe.poll(std.math.maxInt(i64))) {
+    switch (app.terminal_input_runtime.terminal_cursor_probe.poll(std.math.maxInt(i64))) {
         .none => {},
         else => return error.TestExpectedEqual,
     }
@@ -8902,7 +8933,7 @@ test "app_input_runtime terminal paste pauses and resumes the resize cursor prob
         paste_framing.InputLimits.single(4096),
     );
     try std.testing.expectEqual(paste_framing.Owner.none, app.input_runtime.paste.owner);
-    switch (app.input_runtime.terminal_cursor_probe.poll(std.math.maxInt(i64))) {
+    switch (app.terminal_input_runtime.terminal_cursor_probe.poll(std.math.maxInt(i64))) {
         .probe_timed_out => {},
         else => return error.TestExpectedEqual,
     }
@@ -9010,13 +9041,13 @@ test "app_input_runtime manager paste pauses and resumes cursor probe at exact b
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
     app.subagents.active = true;
-    try app.input_runtime.terminal_cursor_probe.begin(.ansi_tagged, 0);
+    try app.terminal_input_runtime.terminal_cursor_probe.begin(.ansi_tagged, 0);
 
     for ("\x1b[200~") |byte| {
         try Runtime(RoutingFakeApp).handleTerminalByte(&app, byte, 4096, 100);
     }
     try std.testing.expect(app.subagents.managerPasteActive());
-    switch (app.input_runtime.terminal_cursor_probe.poll(std.math.maxInt(i64))) {
+    switch (app.terminal_input_runtime.terminal_cursor_probe.poll(std.math.maxInt(i64))) {
         .none => {},
         else => return error.TestExpectedEqual,
     }
@@ -9025,7 +9056,7 @@ test "app_input_runtime manager paste pauses and resumes cursor probe at exact b
         try Runtime(RoutingFakeApp).handleTerminalByte(&app, byte, 4096, 100);
     }
     try std.testing.expect(app.subagents.managerPasteActive());
-    switch (app.input_runtime.terminal_cursor_probe.poll(std.math.maxInt(i64))) {
+    switch (app.terminal_input_runtime.terminal_cursor_probe.poll(std.math.maxInt(i64))) {
         .none => {},
         else => return error.TestExpectedEqual,
     }
@@ -9038,7 +9069,7 @@ test "app_input_runtime manager paste pauses and resumes cursor probe at exact b
         paste_framing.InputLimits.single(4096),
     );
     try std.testing.expect(!app.subagents.managerPasteActive());
-    switch (app.input_runtime.terminal_cursor_probe.poll(std.math.maxInt(i64))) {
+    switch (app.terminal_input_runtime.terminal_cursor_probe.poll(std.math.maxInt(i64))) {
         .probe_timed_out => {},
         else => return error.TestExpectedEqual,
     }
@@ -9536,7 +9567,7 @@ test "app_input_runtime full transcript malformed private CSI does not leak digi
     activateFullTranscriptForRoutingTest(&app);
 
     try feedRoutingBytes(&app, "\x1b[?12");
-    app.input_runtime.terminal_action_decoder.started_ms = 0;
+    app.terminal_input_runtime.terminal_action_decoder.started_ms = 0;
     try Runtime(RoutingFakeApp).flushPendingEscape(&app, 0);
 
     const draft = "CTRL_O_MALFORMED_ESCAPE_DRAFT";
@@ -9633,7 +9664,7 @@ test "app_input_runtime malformed escape bytes stay inert under composer-owned p
     try feedRoutingBytes(&app, "\x1b[9999999999999999999q\x03\x1b[A");
 
     try std.testing.expectEqual(paste_framing.Owner.composer, app.input_runtime.paste.owner);
-    try std.testing.expectEqual(@as(u8, 0), app.input_runtime.terminal_action_decoder.stage);
+    try std.testing.expectEqual(@as(u8, 0), app.terminal_input_runtime.terminal_action_decoder.stage);
     try std.testing.expect(!app.input_runtime.gestures.ctrlCExitArmed());
     try std.testing.expect(!app.should_exit);
 
@@ -9836,11 +9867,11 @@ test "app_input_runtime expired incomplete escape keeps approval cancellation be
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
     try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "run_command npm test" }));
-    app.input_runtime.terminal_action_decoder.stage = 3;
-    app.input_runtime.terminal_action_decoder.param = 20;
-    app.input_runtime.terminal_action_decoder.param2 = 2;
-    app.input_runtime.terminal_action_decoder.started_ms = 0;
-    app.input_runtime.terminal_action_decoder.cancel_pending = true;
+    app.terminal_input_runtime.terminal_action_decoder.stage = 3;
+    app.terminal_input_runtime.terminal_action_decoder.param = 20;
+    app.terminal_input_runtime.terminal_action_decoder.param2 = 2;
+    app.terminal_input_runtime.terminal_action_decoder.started_ms = 0;
+    app.terminal_input_runtime.terminal_action_decoder.cancel_pending = true;
 
     try Runtime(RoutingFakeApp).flushPendingEscape(&app, 0);
 
@@ -9855,15 +9886,15 @@ test "app_input_runtime refreshes the pending escape deadline on decoder progres
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
     const old_started_ms = io_mod.milliTimestamp() - 1;
-    app.input_runtime.terminal_action_decoder.stage = 1;
-    app.input_runtime.terminal_action_decoder.started_ms = old_started_ms;
-    app.input_runtime.terminal_action_decoder.cancel_pending = true;
+    app.terminal_input_runtime.terminal_action_decoder.stage = 1;
+    app.terminal_input_runtime.terminal_action_decoder.started_ms = old_started_ms;
+    app.terminal_input_runtime.terminal_action_decoder.cancel_pending = true;
 
     try Runtime(RoutingFakeApp).handleByte(&app, '[', 4096, 100);
 
-    try std.testing.expectEqual(@as(u8, 2), app.input_runtime.terminal_action_decoder.stage);
-    try std.testing.expect(app.input_runtime.terminal_action_decoder.started_ms > old_started_ms);
-    try std.testing.expect(app.input_runtime.terminal_action_decoder.cancel_pending);
+    try std.testing.expectEqual(@as(u8, 2), app.terminal_input_runtime.terminal_action_decoder.stage);
+    try std.testing.expect(app.terminal_input_runtime.terminal_action_decoder.started_ms > old_started_ms);
+    try std.testing.expect(app.terminal_input_runtime.terminal_action_decoder.cancel_pending);
 }
 
 test "app_input_runtime expired mouse prefixes discard their tails without cancelling approval" {
@@ -9884,7 +9915,7 @@ test "app_input_runtime expired mouse prefixes discard their tails without cance
         try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "run_command npm test" }));
 
         try feedRoutingBytes(&app, case.prefix);
-        app.input_runtime.terminal_action_decoder.started_ms = 0;
+        app.terminal_input_runtime.terminal_action_decoder.started_ms = 0;
         try Runtime(RoutingFakeApp).flushPendingEscape(&app, 0);
 
         try std.testing.expect(app.approval_prompt.isActive());
@@ -9893,7 +9924,7 @@ test "app_input_runtime expired mouse prefixes discard their tails without cance
         try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
         try std.testing.expect(app.approval_prompt.isActive());
         try std.testing.expect(!app.worker.cancel_requested);
-        try std.testing.expectEqual(@as(u8, 0), app.input_runtime.terminal_action_decoder.stage);
+        try std.testing.expectEqual(@as(u8, 0), app.terminal_input_runtime.terminal_action_decoder.stage);
     }
 }
 
@@ -9908,13 +9939,13 @@ test "app_input_runtime tail-less expired mouse recovery releases quietly" {
         try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "run_command npm test" }));
 
         try feedRoutingBytes(&app, prefix);
-        app.input_runtime.terminal_action_decoder.started_ms = 0;
+        app.terminal_input_runtime.terminal_action_decoder.started_ms = 0;
         try Runtime(RoutingFakeApp).flushPendingEscape(&app, 0);
         try std.testing.expect(app.approval_prompt.isActive());
         try std.testing.expect(!app.worker.cancel_requested);
 
         try Runtime(RoutingFakeApp).flushPendingEscape(&app, 0);
-        try std.testing.expectEqual(@as(u8, 0), app.input_runtime.terminal_action_decoder.stage);
+        try std.testing.expectEqual(@as(u8, 0), app.terminal_input_runtime.terminal_action_decoder.stage);
         try std.testing.expect(app.approval_prompt.isActive());
         try std.testing.expect(!app.worker.cancel_requested);
     }
@@ -9931,15 +9962,15 @@ test "app_input_runtime fresh Escape restarts expired mouse recovery before canc
         try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "run_command npm test" }));
 
         try feedRoutingBytes(&app, prefix);
-        app.input_runtime.terminal_action_decoder.started_ms = 0;
+        app.terminal_input_runtime.terminal_action_decoder.started_ms = 0;
         try Runtime(RoutingFakeApp).flushPendingEscape(&app, 0);
         try std.testing.expect(app.approval_prompt.isActive());
         try std.testing.expect(!app.worker.cancel_requested);
 
         try Runtime(RoutingFakeApp).handleByte(&app, 0x1b, 4096, 100);
-        try std.testing.expectEqual(@as(u8, 1), app.input_runtime.terminal_action_decoder.stage);
-        try std.testing.expect(app.input_runtime.terminal_action_decoder.cancel_pending);
-        app.input_runtime.terminal_action_decoder.started_ms = 0;
+        try std.testing.expectEqual(@as(u8, 1), app.terminal_input_runtime.terminal_action_decoder.stage);
+        try std.testing.expect(app.terminal_input_runtime.terminal_action_decoder.cancel_pending);
+        app.terminal_input_runtime.terminal_action_decoder.started_ms = 0;
         try Runtime(RoutingFakeApp).flushPendingEscape(&app, 0);
         try std.testing.expect(!app.approval_prompt.isActive());
         try std.testing.expect(app.worker.cancel_requested);
@@ -9951,18 +9982,18 @@ test "app_input_runtime fresh escape rearms generic decoder before paste start" 
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
     try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "run_command npm test" }));
-    app.input_runtime.terminal_action_decoder.stage = 3;
-    app.input_runtime.terminal_action_decoder.param = 20;
-    app.input_runtime.terminal_action_decoder.param2 = 2;
+    app.terminal_input_runtime.terminal_action_decoder.stage = 3;
+    app.terminal_input_runtime.terminal_action_decoder.param = 20;
+    app.terminal_input_runtime.terminal_action_decoder.param2 = 2;
     const old_started_ms = io_mod.milliTimestamp() - 1;
-    app.input_runtime.terminal_action_decoder.started_ms = old_started_ms;
-    app.input_runtime.terminal_action_decoder.cancel_pending = false;
+    app.terminal_input_runtime.terminal_action_decoder.started_ms = old_started_ms;
+    app.terminal_input_runtime.terminal_action_decoder.cancel_pending = false;
     app.stream.active = true;
 
     try Runtime(RoutingFakeApp).handleByte(&app, 0x1b, 4096, 100);
-    try std.testing.expectEqual(@as(u8, 1), app.input_runtime.terminal_action_decoder.stage);
-    try std.testing.expect(app.input_runtime.terminal_action_decoder.started_ms > old_started_ms);
-    try std.testing.expectEqual(app.stream.active, app.input_runtime.terminal_action_decoder.cancel_pending);
+    try std.testing.expectEqual(@as(u8, 1), app.terminal_input_runtime.terminal_action_decoder.stage);
+    try std.testing.expect(app.terminal_input_runtime.terminal_action_decoder.started_ms > old_started_ms);
+    try std.testing.expectEqual(app.stream.active, app.terminal_input_runtime.terminal_action_decoder.cancel_pending);
 
     try feedRoutingBytes(&app, "[200~");
     try std.testing.expectEqual(paste_framing.Owner.decision_prompt, app.input_runtime.paste.owner);
@@ -10089,9 +10120,9 @@ test "escape on a freeform draft arms then clears before cancelling the batch" {
     try std.testing.expect(app.question_prompt.isFreeformSelected());
     _ = try app.question_prompt.apply(alloc, .{ .insert_ascii = 'k' });
 
-    app.input_runtime.terminal_action_decoder.stage = 1;
-    app.input_runtime.terminal_action_decoder.cancel_pending = true;
-    app.input_runtime.terminal_action_decoder.started_ms = 0;
+    app.terminal_input_runtime.terminal_action_decoder.stage = 1;
+    app.terminal_input_runtime.terminal_action_decoder.cancel_pending = true;
+    app.terminal_input_runtime.terminal_action_decoder.started_ms = 0;
     try Runtime(FakeApprovalCancelApp).flushPendingEscape(&app, 0);
 
     try std.testing.expect(app.input_runtime.gestures.escapeClearArmed());
@@ -10099,9 +10130,9 @@ test "escape on a freeform draft arms then clears before cancelling the batch" {
     try std.testing.expect(app.question_prompt.isActive());
     try std.testing.expect(!app.worker.cancel_requested);
 
-    app.input_runtime.terminal_action_decoder.stage = 1;
-    app.input_runtime.terminal_action_decoder.cancel_pending = true;
-    app.input_runtime.terminal_action_decoder.started_ms = 0;
+    app.terminal_input_runtime.terminal_action_decoder.stage = 1;
+    app.terminal_input_runtime.terminal_action_decoder.cancel_pending = true;
+    app.terminal_input_runtime.terminal_action_decoder.started_ms = 0;
     try Runtime(FakeApprovalCancelApp).flushPendingEscape(&app, 0);
 
     try std.testing.expectEqual(@as(usize, 0), app.question_prompt.freeformDraftLen());
@@ -10110,9 +10141,9 @@ test "escape on a freeform draft arms then clears before cancelling the batch" {
     try std.testing.expect(!app.input_runtime.gestures.escapeClearArmed());
     try std.testing.expect(!app.worker.cancel_requested);
 
-    app.input_runtime.terminal_action_decoder.stage = 1;
-    app.input_runtime.terminal_action_decoder.cancel_pending = true;
-    app.input_runtime.terminal_action_decoder.started_ms = 0;
+    app.terminal_input_runtime.terminal_action_decoder.stage = 1;
+    app.terminal_input_runtime.terminal_action_decoder.cancel_pending = true;
+    app.terminal_input_runtime.terminal_action_decoder.started_ms = 0;
     try Runtime(FakeApprovalCancelApp).flushPendingEscape(&app, 0);
 
     try std.testing.expect(!app.question_prompt.isActive());
@@ -10126,9 +10157,9 @@ test "bare escape during approval uses worker-owned cancellation" {
         alloc,
         .{ .label = "run_command npm test" },
     ));
-    app.input_runtime.terminal_action_decoder.stage = 1;
-    app.input_runtime.terminal_action_decoder.cancel_pending = true;
-    app.input_runtime.terminal_action_decoder.started_ms = 0;
+    app.terminal_input_runtime.terminal_action_decoder.stage = 1;
+    app.terminal_input_runtime.terminal_action_decoder.cancel_pending = true;
+    app.terminal_input_runtime.terminal_action_decoder.started_ms = 0;
 
     try Runtime(FakeApprovalCancelApp).flushPendingEscape(&app, 0);
 
@@ -10147,9 +10178,9 @@ test "stale approval escape cancels and wakes the worker current request" {
         .{ .id = 41, .label = "stale A" },
     ));
     app.worker.active_permission_request_id = 42;
-    app.input_runtime.terminal_action_decoder.stage = 1;
-    app.input_runtime.terminal_action_decoder.cancel_pending = true;
-    app.input_runtime.terminal_action_decoder.started_ms = 0;
+    app.terminal_input_runtime.terminal_action_decoder.stage = 1;
+    app.terminal_input_runtime.terminal_action_decoder.cancel_pending = true;
+    app.terminal_input_runtime.terminal_action_decoder.started_ms = 0;
 
     try Runtime(RoutingFakeApp).flushPendingEscape(
         &app,
@@ -10290,7 +10321,7 @@ test "app_input_runtime keeps in-progress SGR mouse reports past bare escape tim
     app.stream.active = true;
 
     try feedRoutingBytes(&app, "\x1b[<65;79;");
-    app.input_runtime.terminal_action_decoder.started_ms = io_mod.milliTimestamp() - 31;
+    app.terminal_input_runtime.terminal_action_decoder.started_ms = io_mod.milliTimestamp() - 31;
 
     try Runtime(RoutingFakeApp).flushPendingEscape(&app, 30);
     try feedRoutingBytes(&app, "12M");
@@ -10299,8 +10330,8 @@ test "app_input_runtime keeps in-progress SGR mouse reports past bare escape tim
     try std.testing.expect(!app.worker.cancel_requested);
     try std.testing.expect(app.stream.active);
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
-    try std.testing.expectEqual(@as(u8, 0), app.input_runtime.terminal_action_decoder.stage);
-    try std.testing.expectEqual(@as(u8, 0), app.input_runtime.terminal_action_decoder.mouse.sgr_bytes);
+    try std.testing.expectEqual(@as(u8, 0), app.terminal_input_runtime.terminal_action_decoder.stage);
+    try std.testing.expectEqual(@as(u8, 0), app.terminal_input_runtime.terminal_action_decoder.mouse.sgr_bytes);
     try std.testing.expectEqual(@as(usize, 0), app.approval_screen.document_scroll_rows);
 }
 
@@ -10612,9 +10643,9 @@ test "bare escape trace captures approval interrupt context" {
         alloc,
         .{ .label = "run_command npm test" },
     ));
-    app.input_runtime.terminal_action_decoder.stage = 1;
-    app.input_runtime.terminal_action_decoder.cancel_pending = true;
-    app.input_runtime.terminal_action_decoder.started_ms = 0;
+    app.terminal_input_runtime.terminal_action_decoder.stage = 1;
+    app.terminal_input_runtime.terminal_action_decoder.cancel_pending = true;
+    app.terminal_input_runtime.terminal_action_decoder.started_ms = 0;
 
     try Runtime(FakeApprovalCancelApp).flushPendingEscape(&app, 0);
     debug_trace.shutdown();
@@ -10755,7 +10786,7 @@ const FakeSubmitApp = struct {
 
     alloc: std.mem.Allocator,
     workspace_root: []const u8 = "/tmp/workspace",
-    input_runtime: test_ui_input.InputRuntime = .{},
+    input_runtime: core_input_runtime.Runtime = .{},
     prompt_history: prompt_history_runtime.PromptHistoryRuntime = .{},
     pending_images: std.ArrayList(types.ImageAttachment) = .empty,
     stream: types.StreamState = .{},
@@ -10947,7 +10978,7 @@ const FakeSubmitApp = struct {
 const FrameSubmitApp = struct {
     alloc: std.mem.Allocator,
     workspace_root: []const u8 = "/tmp/workspace",
-    input_runtime: test_ui_input.InputRuntime = .{},
+    input_runtime: core_input_runtime.Runtime = .{},
     pending_images: std.ArrayList(types.ImageAttachment) = .empty,
     next_image_id_counter: usize = 1,
     shell: transcript_runtime.TranscriptRuntime,
@@ -11287,6 +11318,30 @@ test "app_input_runtime submit resolves slash completion through core command sp
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 }
 
+test "app_input_runtime recalls a submitted slash command with history previous" {
+    const alloc = std.testing.allocator;
+    var app = FakeSubmitApp{ .alloc = alloc };
+    defer app.deinit();
+
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "/he");
+    app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
+
+    try Runtime(FakeSubmitApp).submit(&app, 100);
+
+    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.composer_history.count());
+    try std.testing.expectEqualStrings(
+        "/help",
+        app.input_runtime.composer_history.entryText(0).?,
+    );
+
+    try input_completion_runtime.CompletionRuntime(FakeSubmitApp).navigatePromptHistory(
+        &app,
+        -1,
+    );
+
+    try std.testing.expectEqualStrings("/help", app.input_runtime.edit_state.input.items);
+}
+
 test "app_input_runtime submit preserves a dismissed slash query" {
     const alloc = std.testing.allocator;
     var app = FakeSubmitApp{ .alloc = alloc };
@@ -11397,7 +11452,11 @@ test "app_input_runtime routes pending image list locally and preserves its plac
     try std.testing.expectEqual(@as(usize, 1), app.pending_images.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.preflight_count);
     try std.testing.expectEqual(@as(usize, 0), app.queue_accept_count);
-    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.composer_history.count());
+    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.composer_history.count());
+    try std.testing.expectEqualStrings(
+        "/images",
+        app.input_runtime.composer_history.entryText(0).?,
+    );
     try std.testing.expect(app.last_prompt == null);
 }
 
@@ -11456,7 +11515,14 @@ test "app_input_runtime clears pending image placeholders after image command st
         try std.testing.expectEqual(@as(usize, 0), app.pending_images.items.len);
         try std.testing.expectEqual(@as(usize, 0), app.preflight_count);
         try std.testing.expectEqual(@as(usize, 0), app.queue_accept_count);
-        try std.testing.expectEqual(@as(usize, 0), app.input_runtime.composer_history.count());
+        try std.testing.expectEqual(
+            @as(usize, 1),
+            app.input_runtime.composer_history.count(),
+        );
+        try std.testing.expectEqualStrings(
+            "/images clear",
+            app.input_runtime.composer_history.entryText(0).?,
+        );
         try std.testing.expect(app.last_prompt == null);
     }
 }
@@ -11613,7 +11679,11 @@ test "app_input_runtime keeps a repeated image command local while an image is p
         try std.testing.expectEqualStrings("[Image #1][Image #2]", app.input_runtime.edit_state.input.items);
         try std.testing.expectEqual(@as(usize, 0), app.preflight_count);
         try std.testing.expectEqual(@as(usize, 0), app.queue_accept_count);
-        try std.testing.expectEqual(@as(usize, 0), app.input_runtime.composer_history.count());
+        try std.testing.expectEqual(@as(usize, 1), app.input_runtime.composer_history.count());
+        try std.testing.expectEqualStrings(
+            last_command,
+            app.input_runtime.composer_history.entryText(0).?,
+        );
         try std.testing.expect(app.last_prompt == null);
         try std.testing.expectEqual(@as(usize, 0), app.last_images.len);
         try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
@@ -12559,7 +12629,7 @@ test "app_input_runtime persists expanded pasted prompt bytes" {
     );
 }
 
-test "app_input_runtime excludes slash commands from durable prompt history" {
+test "app_input_runtime persists slash commands in durable prompt history" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -12580,8 +12650,13 @@ test "app_input_runtime excludes slash commands from durable prompt history" {
         100,
     );
     defer prompt_history_store.freeLoadedEntries(alloc, entries);
-    try std.testing.expectEqual(@as(usize, 0), entries.len);
-    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.composer_history.count());
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqualStrings("/help", entries[0].text);
+    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.composer_history.count());
+    try std.testing.expectEqualStrings(
+        "/help",
+        app.input_runtime.composer_history.entryText(0).?,
+    );
 }
 
 test "app_input_runtime excludes image-bearing prompts from durable history" {

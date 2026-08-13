@@ -21,6 +21,7 @@ const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const auto_upgrade = @import("../upgrade/auto_upgrade.zig");
 const update_target = @import("../upgrade/update_target.zig");
+const core_input_runtime = @import("../input/runtime.zig");
 const ui_render = @import("../../ui/render.zig");
 const ui_input = @import("../../ui/input/runtime.zig");
 const shell_runtime = @import("../../ui/shell_runtime.zig");
@@ -223,9 +224,9 @@ pub fn Runtime(comptime App: type) type {
                 try app.auth.refreshSourceInventory(app.alloc);
                 app.auth.openOnboardingPicker(app.alloc);
             }
-            if (comptime @hasField(App, "input_runtime") and @hasField(App, "terminal")) {
+            if (comptime @hasField(App, "terminal_input_runtime") and @hasField(App, "terminal")) {
                 // Own theme protocol bytes even under FX_THEME; probing stays gated.
-                app.input_runtime.terminal_theme_monitor.start();
+                app.terminal_input_runtime.terminal_theme_monitor.start();
                 if (startup.theme_monitor_enabled) {
                     app.terminal.enableThemeNotifications() catch |err| {
                         debug_trace.logf("theme", "theme_notification_enable_failed err={s}", .{@errorName(err)});
@@ -535,7 +536,8 @@ const TestApp = struct {
     permission_engine: permissions.PermissionEngine = .{},
     agent_step_limit: usize = 0,
     worker: worker_runtime.WorkerRuntime = .{},
-    input_runtime: ui_input.InputRuntime = .{},
+    input_runtime: core_input_runtime.Runtime = .{},
+    terminal_input_runtime: ui_input.Runtime = .{},
     context_enabled: bool = true,
     fast_mode: bool = false,
     auto_upgrade_enabled: bool = true,
@@ -573,6 +575,8 @@ const TestApp = struct {
             self.mcp_runtime = null;
         }
         self.skills.deinit(std.heap.c_allocator);
+        self.input_runtime.deinit(self.alloc);
+        self.terminal_input_runtime.deinit(self.alloc);
         self.shell.deinit(self.alloc);
         self.transcript.deinit(self.alloc);
     }

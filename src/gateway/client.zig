@@ -995,6 +995,8 @@ pub const StreamRequest = struct {
     chat_url: []const u8,
     payload: []const u8,
     team: ?[]const u8 = null,
+    /// Borrowed until `streamGatewayCompletion` returns.
+    session_id: ?[]const u8 = null,
     trace_ctx: debug_trace.TraceContext = .{},
     content_capture_limit: ?usize = null,
     delivery: ?*DeliveryCertainty = null,
@@ -1175,8 +1177,13 @@ fn streamGatewayCompletionCoreWithOptions(
     const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.api_key});
     defer alloc.free(auth_header);
 
-    var extra_headers_buf: [7]std.http.Header = undefined;
-    const extra_headers = gatewayExtraHeaders(&extra_headers_buf, model, request.team);
+    var extra_headers_buf: [9]std.http.Header = undefined;
+    const extra_headers = gatewayExtraHeaders(
+        &extra_headers_buf,
+        model,
+        request.team,
+        request.session_id,
+    );
 
     var attempt: usize = 0;
     var delivery_ambiguous = false;
@@ -1450,8 +1457,13 @@ fn streamGatewayCompletionCoreWithOptions(
     return error.HttpConnectionClosing;
 }
 
-fn gatewayExtraHeaders(buf: []std.http.Header, model: []const u8, team: ?[]const u8) []const std.http.Header {
-    std.debug.assert(buf.len >= 7);
+fn gatewayExtraHeaders(
+    buf: []std.http.Header,
+    model: []const u8,
+    team: ?[]const u8,
+    session_id: ?[]const u8,
+) []const std.http.Header {
+    std.debug.assert(buf.len >= 9);
     var len: usize = 0;
     buf[len] = .{ .name = "HTTP-Referer", .value = "https://github.com/vercel-labs/fx" };
     len += 1;
@@ -1471,6 +1483,14 @@ fn gatewayExtraHeaders(buf: []std.http.Header, model: []const u8, team: ?[]const
             len += 1;
         }
     }
+    if (session_id) |id| {
+        if (id.len > 0) {
+            buf[len] = .{ .name = "x-session-id", .value = id };
+            len += 1;
+            buf[len] = .{ .name = "x-session-affinity", .value = id };
+            len += 1;
+        }
+    }
     return buf[0..len];
 }
 
@@ -1487,13 +1507,45 @@ fn gatewayModelCatalogExtraHeaders(buf: []std.http.Header, team: ?[]const u8) []
 }
 
 test "gateway extra headers include selected team" {
-    var buf: [7]std.http.Header = undefined;
-    const headers = gatewayExtraHeaders(&buf, "anthropic/claude-opus-4.8", "team_123");
+    var buf: [9]std.http.Header = undefined;
+    const headers = gatewayExtraHeaders(&buf, "test/model", "team_123", null);
     try std.testing.expectEqualStrings("team_123", headerValue(headers, vercel_ai_gateway_team_header).?);
-    try std.testing.expectEqualStrings("anthropic/claude-opus-4.8", headerValue(headers, "ai-language-model-id").?);
+    try std.testing.expectEqualStrings("test/model", headerValue(headers, "ai-language-model-id").?);
 
-    const headers_without_team = gatewayExtraHeaders(&buf, "anthropic/claude-opus-4.8", "");
+    const headers_without_team = gatewayExtraHeaders(&buf, "test/model", "", null);
     try std.testing.expect(headerValue(headers_without_team, vercel_ai_gateway_team_header) == null);
+}
+
+test "gateway extra headers derive session identity and affinity together" {
+    var buf: [9]std.http.Header = undefined;
+    const cases = [_]struct {
+        session_id: ?[]const u8,
+        expected: ?[]const u8,
+    }{
+        .{ .session_id = null, .expected = null },
+        .{ .session_id = "", .expected = null },
+        .{ .session_id = "session_123", .expected = "session_123" },
+    };
+
+    for (cases) |case| {
+        const headers = gatewayExtraHeaders(
+            &buf,
+            "test/model",
+            "team_123",
+            case.session_id,
+        );
+        try std.testing.expectEqualStrings(
+            "team_123",
+            headerValue(headers, vercel_ai_gateway_team_header).?,
+        );
+        if (case.expected) |expected| {
+            try std.testing.expectEqualStrings(expected, headerValue(headers, "x-session-id").?);
+            try std.testing.expectEqualStrings(expected, headerValue(headers, "x-session-affinity").?);
+        } else {
+            try std.testing.expect(headerValue(headers, "x-session-id") == null);
+            try std.testing.expect(headerValue(headers, "x-session-affinity") == null);
+        }
+    }
 }
 
 fn headerValue(headers: []const std.http.Header, name: []const u8) ?[]const u8 {
@@ -7083,6 +7135,7 @@ test "gateway chat request sends fx user agent and attribution headers" {
             .retry_count = 1,
             .chat_url = url,
             .payload = "{}",
+            .session_id = "session_wire_123",
         },
         @ptrCast(&callback_ctx),
         Noop.onChunk,
@@ -7098,5 +7151,7 @@ test "gateway chat request sends fx user agent and attribution headers" {
     try std.testing.expectEqualStrings(user_agent, fixture.capturedHeaderValue("user-agent").?);
     try std.testing.expectEqualStrings("https://github.com/vercel-labs/fx", fixture.capturedHeaderValue("http-referer").?);
     try std.testing.expectEqualStrings("fx", fixture.capturedHeaderValue("x-title").?);
+    try std.testing.expectEqualStrings("session_wire_123", fixture.capturedHeaderValue("x-session-id").?);
+    try std.testing.expectEqualStrings("session_wire_123", fixture.capturedHeaderValue("x-session-affinity").?);
     try std.testing.expect(std.mem.find(u8, fixture.capturedHeaderValue("user-agent").?, "zig") == null);
 }

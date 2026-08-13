@@ -20,7 +20,7 @@ const question_ui = @import("question_ui.zig");
 const render_input = @import("render_input.zig");
 const surface_invalidation = @import("surface_invalidation.zig");
 const footer_paint_plan = @import("paint_plan.zig");
-const ui_input = @import("../input/runtime.zig");
+const core_input_runtime = @import("../../core/input/runtime.zig");
 const visual_layout = @import("../input/visual_layout.zig");
 const render_engine = @import("../render_engine.zig");
 const render_request = @import("../render_request.zig");
@@ -38,7 +38,7 @@ const FrameInvalidationSet = paint_plan.FrameInvalidationSet;
 const PaintPlan = paint_plan.PaintPlan;
 const ApprovalPrompt = approval_prompt.ApprovalPrompt;
 const ApprovalProjection = approval_prompt.Projection;
-const InputRuntime = ui_input.InputRuntime;
+const InputRuntime = core_input_runtime.Runtime;
 const PickerKind = input_presentation.PickerKind;
 const RenderContext = render_input.RenderContext;
 const FooterPlannerInput = footer_paint_plan.FooterPlannerInput;
@@ -1283,7 +1283,7 @@ fn footerGeometryForRows(rows: FooterRows, activity: ActivityPlacement) footer_v
 
 const surface_test_slash_specs = [_]command_specs.SlashSpec{
     .{ .kind = .help, .command = "/help", .help_entry = "/help", .completion_description = "show available slash commands", .presentation_category = .general },
-    .{ .kind = .feedback, .command = "/feedback", .help_entry = "/feedback", .completion_description = "copy a Markdown report file and show a GitHub link", .presentation_category = .product },
+    .{ .kind = .feedback, .command = "/feedback", .help_entry = "/feedback", .completion_description = "open the fx feedback form", .presentation_category = .product },
 };
 const surface_test_slash_registry = command_specs.SlashRegistry{ .commands = surface_test_slash_specs[0..] };
 

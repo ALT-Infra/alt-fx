@@ -322,7 +322,7 @@ tmuxTest(
     await waitForExactComposerRow(active, "❯ /");
 
     await active.sendKeys("Enter");
-    await active.waitForText("Commands 38", READY_TIMEOUT);
+    await active.waitForText("Commands 39", READY_TIMEOUT);
     await active.sendKeys("Escape");
     await active.waitForText("Run /help for commands", READY_TIMEOUT);
     expect(active.isAlive()).toBe(true);
@@ -1589,8 +1589,9 @@ tmuxTest(
     await active.sendText("/input");
     await active.waitForPane(
       (pane) =>
-        pane.includes("Appearance · Choose one") &&
-        pane.includes("Tint ✓"),
+        pane.includes("Appearance") &&
+        pane.includes("Input appearance") &&
+        pane.includes("lines  tint"),
       READY_TIMEOUT,
     );
     await active.sendKeys("Escape");
