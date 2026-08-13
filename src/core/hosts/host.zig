@@ -53,6 +53,31 @@ fn unavailableUrlOpen(
     return false;
 }
 
+pub const TerminalTitle = struct {
+    context: ?*anyopaque = null,
+    set_model_fn: *const fn (?*anyopaque, []const u8) void,
+    clear_fn: *const fn (?*anyopaque) void,
+
+    /// Borrows `model` for this call. Terminal write failures are intentionally
+    /// non-fatal because the title is presentation metadata.
+    pub fn setModel(self: TerminalTitle, model: []const u8) void {
+        self.set_model_fn(self.context, model);
+    }
+
+    pub fn clear(self: TerminalTitle) void {
+        self.clear_fn(self.context);
+    }
+};
+
+pub const unavailable_terminal_title: TerminalTitle = .{
+    .set_model_fn = ignoreTerminalTitleSetModel,
+    .clear_fn = ignoreTerminalTitleClear,
+};
+
+fn ignoreTerminalTitleSetModel(_: ?*anyopaque, _: []const u8) void {}
+
+fn ignoreTerminalTitleClear(_: ?*anyopaque) void {}
+
 pub const SecretStoreLoadError = std.mem.Allocator.Error || error{
     StoredKeyInsecure,
     StoredKeyUnreadable,
@@ -241,6 +266,47 @@ pub fn operatingSystemText(alloc: std.mem.Allocator) std.mem.Allocator.Error![]u
     const release = std.mem.sliceTo(&uts.release, 0);
     if (release.len == 0) return alloc.dupe(u8, sysname);
     return std.fmt.allocPrint(alloc, "{s} {s}", .{ sysname, release });
+}
+
+test "terminal title forwards borrowed model bytes and clear" {
+    const Capture = struct {
+        model: [64]u8 = undefined,
+        model_len: usize = 0,
+        clear_count: usize = 0,
+
+        fn setModel(raw: ?*anyopaque, model: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.model_len = @min(model.len, self.model.len);
+            @memcpy(self.model[0..self.model_len], model[0..self.model_len]);
+        }
+
+        fn clear(raw: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.clear_count += 1;
+        }
+
+        fn model_text(self: *const @This()) []const u8 {
+            return self.model[0..self.model_len];
+        }
+    };
+
+    var capture = Capture{};
+    const terminal_title = TerminalTitle{
+        .context = &capture,
+        .set_model_fn = Capture.setModel,
+        .clear_fn = Capture.clear,
+    };
+
+    terminal_title.setModel("provider/model");
+    terminal_title.clear();
+
+    try std.testing.expectEqualStrings("provider/model", capture.model_text());
+    try std.testing.expectEqual(@as(usize, 1), capture.clear_count);
+}
+
+test "unavailable terminal title accepts set and clear" {
+    unavailable_terminal_title.setModel("provider/model");
+    unavailable_terminal_title.clear();
 }
 
 test "native host capabilities expose sandbox and background process support" {

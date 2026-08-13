@@ -6,6 +6,7 @@ const auth_runtime = @import("../auth/auth_runtime.zig");
 const collections = @import("../shared/collections.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const host = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const output_contracts = @import("../output/output_contracts.zig");
@@ -16,7 +17,6 @@ const prompt_history_runtime = @import("../app/prompt_history_runtime.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
-const ui_render = @import("../../ui/render.zig");
 const render_request = @import("../../ui/render_request.zig");
 
 const freeStringList = collections.freeStringList;
@@ -253,15 +253,16 @@ fn appendLegacyCleanup(writer: *std.Io.Writer, cleanup: config_runtime.LegacyCle
     }
 }
 
-fn setTerminalTitle(model: []const u8) void {
-    if (builtin.is_test) {
-        return;
-    }
-    ui_render.setTerminalTitle(model);
-}
-
 pub fn Commands(comptime App: type) type {
     return struct {
+        fn terminalTitle(app: *App) host.TerminalTitle {
+            if (comptime @hasDecl(App, "terminalTitle")) {
+                return app.terminalTitle();
+            }
+            if (comptime builtin.is_test) return host.unavailable_terminal_title;
+            @compileError("interactive session commands require a terminal title host capability");
+        }
+
         fn update_channel_label(app: *App) []const u8 {
             if (comptime @hasField(App, "upgrader")) {
                 const Upgrader = @TypeOf(app.upgrader);
@@ -1124,7 +1125,7 @@ pub fn Commands(comptime App: type) type {
             try app.selected_model.appendSlice(app.alloc, resolved);
             try app.worker.syncQueuedPromptModel(std.heap.c_allocator, resolved);
             if (comptime @hasDecl(App, "persistAcceptedModel")) try app.persistAcceptedModel(resolved);
-            setTerminalTitle(resolved);
+            terminalTitle(app).setModel(resolved);
 
             if (announce) {
                 const active_response = if (comptime @hasField(App, "stream"))
@@ -1686,6 +1687,8 @@ const FakeApp = struct {
     permission_mode_preference_commit_count: usize = 0,
     last_preference_permission_mode: ?types.PermissionMode = null,
     semantic_write_count: usize = 0,
+    terminal_title_model: [128]u8 = undefined,
+    terminal_title_model_len: usize = 0,
 
     fn init(alloc: std.mem.Allocator, workspace_root: []const u8, model: []const u8) !FakeApp {
         var app = FakeApp{
@@ -1734,6 +1737,32 @@ const FakeApp = struct {
 
     fn toolRegistry(self: *const FakeApp) tool_dispatch.Registry {
         return self.tool_registry;
+    }
+
+    fn terminalTitle(self: *FakeApp) host.TerminalTitle {
+        return .{
+            .context = self,
+            .set_model_fn = setTerminalTitleModelForTest,
+            .clear_fn = clearTerminalTitleForTest,
+        };
+    }
+
+    fn setTerminalTitleModelForTest(raw: ?*anyopaque, model: []const u8) void {
+        const self: *FakeApp = @ptrCast(@alignCast(raw.?));
+        self.terminal_title_model_len = @min(model.len, self.terminal_title_model.len);
+        @memcpy(
+            self.terminal_title_model[0..self.terminal_title_model_len],
+            model[0..self.terminal_title_model_len],
+        );
+    }
+
+    fn clearTerminalTitleForTest(raw: ?*anyopaque) void {
+        const self: *FakeApp = @ptrCast(@alignCast(raw.?));
+        self.terminal_title_model_len = 0;
+    }
+
+    fn terminalTitleModelText(self: *const FakeApp) []const u8 {
+        return self.terminal_title_model[0..self.terminal_title_model_len];
     }
 
     fn snapshotCachedModelIds(self: *FakeApp, alloc: std.mem.Allocator) !?std.ArrayList([]u8) {
@@ -2164,6 +2193,7 @@ test "session_commands handleModel reports current model for empty query" {
 
     try std.testing.expectEqualStrings("● Model: anthropic/claude-opus-4.6\n", app.text());
     try std.testing.expect(app.worker.synced_model == null);
+    try std.testing.expectEqualStrings("", app.terminalTitleModelText());
 }
 
 test "session_commands handleModel resolves fuzzy cached model and syncs queued prompts" {
@@ -2180,6 +2210,7 @@ test "session_commands handleModel resolves fuzzy cached model and syncs queued 
 
     try std.testing.expectEqualStrings("anthropic/claude-sonnet-4-20250514", app.selected_model.items);
     try std.testing.expectEqualStrings("anthropic/claude-sonnet-4-20250514", app.worker.synced_model.?);
+    try std.testing.expectEqualStrings(app.selected_model.items, app.terminalTitleModelText());
     try expectTranscriptContains(&app, "● Switched to anthropic/claude-sonnet-4-20250514");
 }
 
@@ -2193,6 +2224,7 @@ test "session_commands handleModel falls back to raw query when model fetch fail
 
     try std.testing.expectEqualStrings("custom/provider-model", app.selected_model.items);
     try std.testing.expectEqualStrings("custom/provider-model", app.worker.synced_model.?);
+    try std.testing.expectEqualStrings(app.selected_model.items, app.terminalTitleModelText());
 }
 
 test "session_commands handlePermissions persists modes and reset clears session grants" {

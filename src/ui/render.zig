@@ -1,5 +1,6 @@
 const std = @import("std");
 const io_mod = @import("../core/shared/io.zig");
+const host = @import("../core/hosts/host.zig");
 const display_width = @import("../core/shared/display_width.zig");
 const types = @import("../core/shared/types.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
@@ -522,14 +523,19 @@ test "render width zero emits no row bytes and first cursor column" {
     try std.testing.expectEqual(@as(u16, 1), view.cursor_col);
 }
 
-pub fn setTerminalTitle(model: []const u8) void {
+pub const terminal_title: host.TerminalTitle = .{
+    .set_model_fn = setTerminalTitleModel,
+    .clear_fn = clearTerminalTitleProvider,
+};
+
+fn setTerminalTitleModel(_: ?*anyopaque, model: []const u8) void {
     const stdout = std.Io.File.stdout();
     stdout.writeStreamingAll(io_mod.getIo(), "\x1b]2;fx · ") catch return;
     stdout.writeStreamingAll(io_mod.getIo(), model) catch return;
     stdout.writeStreamingAll(io_mod.getIo(), "\x07") catch return;
 }
 
-pub fn clearTerminalTitle() void {
+fn clearTerminalTitleProvider(_: ?*anyopaque) void {
     const stdout = std.Io.File.stdout();
     stdout.writeStreamingAll(io_mod.getIo(), "\x1b]2;\x07") catch return;
 }
