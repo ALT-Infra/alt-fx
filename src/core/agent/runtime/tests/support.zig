@@ -9,6 +9,7 @@ const worker_runtime = @import("../../worker_runtime.zig");
 const background_runtime = @import("../../../background/background_runtime.zig");
 const builtin_context = @import("../../../../builtins/context.zig");
 const builtin_gateway = @import("../../../../builtins/gateway.zig");
+const gateway_client = @import("../../../../gateway/client.zig");
 const builtin_tools = @import("../../../../builtins/tools.zig");
 const session_runtime = @import("../../../session/session.zig");
 const session_codec = @import("../../../session/session_codec.zig");
@@ -215,7 +216,6 @@ pub const FakeCompletion = struct {
     stream_error: ?anyerror = null,
     stream_error_after_chunks: ?anyerror = null,
     stream_error_after_tool_starts: ?anyerror = null,
-    connection_statuses: []const types.GatewayConnectionStatus = &.{},
     chunks: []const []const u8 = &.{},
     reasoning_chunks: []const []const u8 = &.{},
     content: ?[]const u8 = null,
@@ -282,14 +282,14 @@ pub const FakeGateway = struct {
         const completion = self.completions[self.index];
         self.index += 1;
 
-        if (completion.pre_send_error) |err| return err;
+        if (completion.pre_send_error) |err| {
+            recordNetworkFailureEvidence(request, err);
+            return err;
+        }
         request.delivery.markPossiblySent();
 
-        if (request.connection_status) |sink| {
-            for (completion.connection_statuses) |status| try sink.publish(status);
-        }
-
         if (completion.stream_error) |err| {
+            recordNetworkFailureEvidence(request, err);
             return err;
         }
 
@@ -310,13 +310,19 @@ pub const FakeGateway = struct {
             request.on_content_chunk(request.callback_ctx, chunk);
         }
         if (completion.cancel_after_chunks) request.cancel_flag.store(true, .seq_cst);
-        if (completion.stream_error_after_chunks) |err| return err;
+        if (completion.stream_error_after_chunks) |err| {
+            recordNetworkFailureEvidence(request, err);
+            return err;
+        }
         if (request.on_tool_start) |start| {
             for (completion.streamed_tool_starts) |call| {
                 start(request.callback_ctx, call.id, call.name, null);
             }
         }
-        if (completion.stream_error_after_tool_starts) |err| return err;
+        if (completion.stream_error_after_tool_starts) |err| {
+            recordNetworkFailureEvidence(request, err);
+            return err;
+        }
         if (completion.cancel_during_tool_stream) {
             request.cancel_flag.store(true, .seq_cst);
             return error.Cancelled;
@@ -349,6 +355,16 @@ pub const FakeGateway = struct {
             },
             .generation_origin = "https://ai-gateway.vercel.sh",
         };
+    }
+
+    fn recordNetworkFailureEvidence(
+        request: agent_stream_provider.Request,
+        err: anyerror,
+    ) void {
+        request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(
+            err,
+            request.delivery.load(),
+        );
     }
 };
 
@@ -611,9 +627,9 @@ pub const FakeAgentRuntimeDeps = struct {
     enable_recovery_checkpoint: bool = false,
     recovery_checkpoints: std.ArrayList(session_codec.RecoveryCheckpoint) = .empty,
     recovery_checkpoint_error: ?anyerror = null,
-    pause_on_connectivity_status: bool = false,
+    cancel_on_recovery_reservation: ?*std.atomic.Value(bool) = null,
+    pause_on_auto_retry_status: bool = false,
     recovery_pause_flag: ?*std.atomic.Value(bool) = null,
-    recovery_pause_cancel_flag: ?*std.atomic.Value(bool) = null,
 
     pub fn init(alloc: Allocator) FakeAgentRuntimeDeps {
         return .{ .alloc = alloc };
@@ -738,6 +754,11 @@ pub const FakeAgentRuntimeDeps = struct {
             self.alloc,
             try checkpoint.dupe(self.alloc),
         );
+        if (checkpoint.outstanding_reservation) {
+            if (self.cancel_on_recovery_reservation) |cancel_flag| {
+                cancel_flag.store(true, .seq_cst);
+            }
+        }
     }
 
     fn resolveModelCapabilities(raw: *anyopaque, _: Allocator, model: []const u8) !model_capabilities.Capabilities {
@@ -1647,9 +1668,8 @@ pub const FakeAgentRuntimeDeps = struct {
         if (status.kind == .auto_retry) {
             if (self.cancel_on_auto_retry_status) |flag| flag.store(true, .seq_cst);
         }
-        if (self.pause_on_connectivity_status and status.action == .waiting_for_connectivity) {
+        if (self.pause_on_auto_retry_status and status.kind == .auto_retry) {
             if (self.recovery_pause_flag) |flag| flag.store(true, .seq_cst);
-            if (self.recovery_pause_cancel_flag) |flag| flag.store(true, .seq_cst);
         }
         var label_buf: [128]u8 = undefined;
         try self.record("route_recovery_status:{s}", .{status.label(&label_buf)});

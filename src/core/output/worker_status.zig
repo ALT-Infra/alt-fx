@@ -68,45 +68,6 @@ const RouteRecoveryStatus = struct {
     }
 };
 
-const GatewayConnectionStatus = struct {
-    status: types.GatewayConnectionStatus,
-    label: [128]u8 = undefined,
-    label_len: usize = 0,
-    expires_at_ms: i64 = 0,
-
-    fn init(status: types.GatewayConnectionStatus, now_ms: i64) GatewayConnectionStatus {
-        var result = GatewayConnectionStatus{
-            .status = status,
-            .expires_at_ms = if (status.isRecovered())
-                now_ms + recovered_status_visible_ms
-            else
-                0,
-        };
-        const label = status.label(&result.label) orelse "";
-        store_label(result.label[0..], &result.label_len, label);
-        return result;
-    }
-
-    fn projection(self: *const GatewayConnectionStatus) activity_runtime.ActivityProjection {
-        const tone: activity_runtime.ActivityProjection.Tone = if (self.status.tone()) |value|
-            switch (value) {
-                .neutral => .neutral,
-                .warning => .warning,
-                .success => .success,
-            }
-        else
-            .thinking;
-        return .{ .turn_thinking = .{
-            .label = self.label[0..self.label_len],
-            .tone = tone,
-        } };
-    }
-
-    fn is_expired(self: GatewayConnectionStatus, now_ms: i64) bool {
-        return self.expires_at_ms != 0 and now_ms >= self.expires_at_ms;
-    }
-};
-
 const ApiStatus = struct {
     label: [512]u8 = undefined,
     label_len: usize = 0,
@@ -129,14 +90,12 @@ const ApiStatus = struct {
 pub const State = union(enum) {
     none,
     route_recovery: RouteRecoveryStatus,
-    gateway_connection: GatewayConnectionStatus,
     api: ApiStatus,
 
     pub fn projection(self: *const State) ?activity_runtime.ActivityProjection {
         return switch (self.*) {
             .none => null,
             .route_recovery => |*status| status.projection(),
-            .gateway_connection => |*status| status.projection(),
             .api => |*status| status.projection(),
         };
     }
@@ -147,20 +106,6 @@ pub const State = union(enum) {
         now_ms: i64,
     ) void {
         self.* = .{ .route_recovery = RouteRecoveryStatus.init(status, now_ms) };
-    }
-
-    pub fn set_gateway_connection(
-        self: *State,
-        status: types.GatewayConnectionStatus,
-        now_ms: i64,
-    ) bool {
-        switch (status) {
-            .clear => return self.clear_gateway_connection(),
-            .connecting, .retrying, .recovered => {
-                self.* = .{ .gateway_connection = GatewayConnectionStatus.init(status, now_ms) };
-                return true;
-            },
-        }
     }
 
     pub fn set_api(
@@ -177,17 +122,7 @@ pub const State = union(enum) {
                 self.* = .none;
                 break :blk true;
             },
-            .none, .gateway_connection, .api => false,
-        };
-    }
-
-    pub fn clear_gateway_connection(self: *State) bool {
-        return switch (self.*) {
-            .gateway_connection => blk: {
-                self.* = .none;
-                break :blk true;
-            },
-            .none, .route_recovery, .api => false,
+            .none, .api => false,
         };
     }
 
@@ -197,14 +132,14 @@ pub const State = union(enum) {
                 self.* = .none;
                 break :blk true;
             } else false,
-            .none, .gateway_connection, .api => false,
+            .none, .api => false,
         };
     }
 
     pub fn clear(self: *State) bool {
         return switch (self.*) {
             .none => false,
-            .route_recovery, .gateway_connection, .api => blk: {
+            .route_recovery, .api => blk: {
                 self.* = .none;
                 break :blk true;
             },
@@ -218,10 +153,6 @@ pub const State = union(enum) {
     pub fn expire_transient(self: *State, now_ms: i64) bool {
         return switch (self.*) {
             .route_recovery => |status| if (status.is_expired(now_ms)) blk: {
-                self.* = .none;
-                break :blk true;
-            } else false,
-            .gateway_connection => |status| if (status.is_expired(now_ms)) blk: {
                 self.* = .none;
                 break :blk true;
             } else false,
@@ -279,27 +210,6 @@ test "worker status projects route recovery and expires recovered state" {
     try std.testing.expect(!state.expire_transient(2_499));
     try std.testing.expect(state.expire_transient(2_500));
     try std.testing.expect(state.projection() == null);
-}
-
-test "worker status gateway clear is scoped to gateway state" {
-    var state: State = .none;
-    try std.testing.expect(state.set_gateway_connection(.connecting, 1_000));
-    try std.testing.expect(state.clear_gateway_connection());
-    try std.testing.expect(state.projection() == null);
-
-    state.set_route_recovery(.{ .kind = .content_filter }, 1_000);
-    try std.testing.expect(!state.clear_gateway_connection());
-    switch (state.projection().?) {
-        .turn_thinking => |projection| try std.testing.expectEqualStrings("▲ blocked · content filter", projection.label),
-        .none, .tool_slot => return error.TestUnexpectedResult,
-    }
-
-    state.set_api("API status", .danger);
-    try std.testing.expect(!state.clear_gateway_connection());
-    switch (state.projection().?) {
-        .turn_thinking => |projection| try std.testing.expectEqualStrings("API status", projection.label),
-        .none, .tool_slot => return error.TestUnexpectedResult,
-    }
 }
 
 test "worker status API state is sticky until explicitly cleared" {

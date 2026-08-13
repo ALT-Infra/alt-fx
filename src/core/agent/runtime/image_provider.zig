@@ -70,6 +70,7 @@ pub fn inspect(
     };
     defer capture.deinit();
     var delivery = runtime_gateway_step.DeliveryCertainty.init();
+    var attempt_evidence: agent_stream_provider.AttemptEvidence = .{};
     const streamed = try runtime_gateway_step.streamGatewayCompletion(
         request.stream_provider,
         alloc,
@@ -81,8 +82,8 @@ pub fn inspect(
         request.chat_url,
         payload,
         null,
-        null,
         &delivery,
+        &attempt_evidence,
         @ptrCast(&capture),
         onContentChunk,
         null,

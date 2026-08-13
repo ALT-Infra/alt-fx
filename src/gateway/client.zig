@@ -13,6 +13,39 @@ pub fn isRetryableGatewayError(err: anyerror) bool {
         err == error.ConnectionTimedOut;
 }
 
+pub fn networkFailureEvidence(
+    err: anyerror,
+    delivery: DeliveryCertainty.State,
+) ?agent_stream_provider.NetworkFailureEvidence {
+    const cause: agent_stream_provider.NetworkFailureCause = if (err == error.SystemResumed)
+        .system_resumed
+    else if (isRetryableAgentNetworkError(err))
+        .transport_interrupted
+    else
+        return null;
+    return .{ .cause = cause, .delivery = delivery };
+}
+
+fn isRetryableAgentNetworkError(err: anyerror) bool {
+    return err == error.TlsInitializationFailed or
+        err == error.ConnectionSetupTimedOut or
+        err == error.UnknownHostName or
+        err == error.NameServerFailure or
+        err == error.NoAddressReturned or
+        err == error.DetectingNetworkConfigurationFailed or
+        err == error.AddressUnavailable or
+        err == error.ConnectionPending or
+        err == error.ConnectionRefused or
+        err == error.HostUnreachable or
+        err == error.NetworkUnreachable or
+        err == error.NetworkDown or
+        err == error.Timeout or
+        err == error.WouldBlock or
+        err == error.WriteFailed or
+        err == error.ReadFailed or
+        isRetryableGatewayError(err);
+}
+
 fn connectedIoFailure(
     cancelled: bool,
     system_resumed: bool,
@@ -43,6 +76,75 @@ test "isRetryableGatewayError matches active retryable transport errors" {
     try std.testing.expect(isRetryableGatewayError(error.ConnectionResetByPeer));
     try std.testing.expect(isRetryableGatewayError(error.ConnectionTimedOut));
     try std.testing.expect(!isRetryableGatewayError(error.AccessDenied));
+}
+
+test "native network failure evidence covers setup send read and resume failures" {
+    const Cases = struct {
+        err: anyerror,
+        cause: agent_stream_provider.NetworkFailureCause = .transport_interrupted,
+    };
+    const cases = [_]Cases{
+        .{ .err = error.TlsInitializationFailed },
+        .{ .err = error.ConnectionSetupTimedOut },
+        .{ .err = error.UnknownHostName },
+        .{ .err = error.NameServerFailure },
+        .{ .err = error.NoAddressReturned },
+        .{ .err = error.DetectingNetworkConfigurationFailed },
+        .{ .err = error.AddressUnavailable },
+        .{ .err = error.ConnectionPending },
+        .{ .err = error.ConnectionRefused },
+        .{ .err = error.ConnectionResetByPeer },
+        .{ .err = error.ConnectionTimedOut },
+        .{ .err = error.HostUnreachable },
+        .{ .err = error.NetworkUnreachable },
+        .{ .err = error.NetworkDown },
+        .{ .err = error.Timeout },
+        .{ .err = error.WouldBlock },
+        .{ .err = error.HttpConnectionClosing },
+        .{ .err = error.WriteFailed },
+        .{ .err = error.ReadFailed },
+        .{ .err = error.SystemResumed, .cause = .system_resumed },
+    };
+
+    for (cases) |case| {
+        const evidence = networkFailureEvidence(
+            case.err,
+            .possibly_sent,
+        ) orelse return error.TestExpectedNetworkFailureEvidence;
+        try std.testing.expectEqual(case.cause, evidence.cause);
+        try std.testing.expectEqual(
+            DeliveryCertainty.State.possibly_sent,
+            evidence.delivery,
+        );
+    }
+
+    const pre_send = networkFailureEvidence(
+        error.ConnectionRefused,
+        .definitely_unsent,
+    ).?;
+    try std.testing.expectEqual(
+        DeliveryCertainty.State.definitely_unsent,
+        pre_send.delivery,
+    );
+}
+
+test "native network failure evidence excludes opaque and configuration failures" {
+    const excluded = [_]anyerror{
+        error.JsHostStreamFailed,
+        error.OutOfMemory,
+        error.AccessDenied,
+        error.UnsupportedUriScheme,
+        error.ProtocolUnsupportedBySystem,
+        error.ResolvConfParseFailed,
+        error.InvalidDnsARecord,
+    };
+
+    for (excluded) |err| {
+        try std.testing.expectEqual(
+            @as(?agent_stream_provider.NetworkFailureEvidence, null),
+            networkFailureEvidence(err, .definitely_unsent),
+        );
+    }
 }
 
 const HttpResult = struct {
@@ -77,7 +179,6 @@ pub const ToolStartCallback = agent_stream_provider.ToolStartCallback;
 
 const gateway_retry_base_delay_ns: u64 = 150 * std.time.ns_per_ms;
 const gateway_connection_setup_timeout_ms: i64 = 30_000;
-const gateway_connection_visibility_delay_ms: i64 = 2_000;
 const gateway_retry_after_max_ns: u64 = 5 * std.time.ns_per_s;
 const gateway_transfer_buffer_bytes: usize = 256 * 1024;
 const provider_failure_detail_max_bytes: usize = 600;
@@ -576,16 +677,13 @@ pub fn postGatewayCompletion(
 /// Monotonic request-delivery evidence. It becomes possibly sent before the
 /// first body write so any later transport failure is treated as potentially billed.
 pub const DeliveryCertainty = agent_stream_provider.DeliveryCertainty;
-pub const GatewayConnectionStatusSink = agent_stream_provider.ConnectionStatusSink;
 
 const ConnectionSetupOutcome = union(enum) {
-    visibility_threshold,
     request_succeeded,
     request_failed: anyerror,
 };
 
 const ConnectionSetupAction = union(enum) {
-    continue_waiting,
     succeed,
     retry,
     fail: anyerror,
@@ -599,55 +697,27 @@ const ConnectionSetupSnapshot = struct {
     deadline: std.Io.Clock.Timestamp,
     cancelled: bool,
     delivery: DeliveryCertainty.State,
-    presentation_visible: bool,
     outcome: ConnectionSetupOutcome,
 };
 
 const ConnectionSetupDecision = struct {
     action: ConnectionSetupAction,
-    status: ?types.GatewayConnectionStatus = null,
 };
 
 fn decideConnectionSetup(snapshot: ConnectionSetupSnapshot) ConnectionSetupDecision {
-    if (snapshot.cancelled) {
-        return .{ .action = .cancelled, .status = .clear };
-    }
+    if (snapshot.cancelled) return .{ .action = .cancelled };
     if (!std.Io.Clock.Timestamp.compare(snapshot.now, .lt, snapshot.deadline)) {
-        return .{ .action = .{ .fail = error.ConnectionSetupTimedOut }, .status = .clear };
+        return .{ .action = .{ .fail = error.ConnectionSetupTimedOut } };
     }
 
     return switch (snapshot.outcome) {
-        .visibility_threshold => if (snapshot.presentation_visible)
-            .{ .action = .continue_waiting }
-        else
-            .{ .action = .continue_waiting, .status = .connecting },
-        .request_succeeded => if (!snapshot.presentation_visible)
-            .{ .action = .succeed }
-        else if (snapshot.attempt == 1)
-            .{ .action = .succeed, .status = .clear }
-        else
-            .{
-                .action = .succeed,
-                .status = .{ .recovered = .{
-                    .number = snapshot.attempt,
-                    .limit = snapshot.attempt_limit,
-                } },
-            },
+        .request_succeeded => .{ .action = .succeed },
         .request_failed => |err| if (isRetryableConnectionSetupError(err) and
             snapshot.delivery == .definitely_unsent and
             snapshot.attempt < snapshot.attempt_limit)
-            .{
-                .action = .retry,
-                .status = if (snapshot.presentation_visible)
-                    .{ .retrying = .{
-                        .number = snapshot.attempt,
-                        .limit = snapshot.attempt_limit,
-                    } }
-                else
-                    null,
-            }
+            .{ .action = .retry }
         else
-            .{ .action = .{ .fail = err }, .status = .clear },
+            .{ .action = .{ .fail = err } },
     };
 }
 
@@ -657,41 +727,16 @@ fn isRetryableConnectionSetupError(err: anyerror) bool {
 
 const ConnectionSetupTiming = struct {
     timeout_ms: i64 = gateway_connection_setup_timeout_ms,
-    visibility_delay_ms: i64 = gateway_connection_visibility_delay_ms,
 };
 
-test "connection setup defaults keep the production timeout and visibility delay" {
+test "connection setup keeps the production timeout" {
     const timing = ConnectionSetupTiming{};
 
     try std.testing.expectEqual(@as(i64, 30_000), timing.timeout_ms);
-    try std.testing.expectEqual(@as(i64, 2_000), timing.visibility_delay_ms);
-}
-
-test "terminal connection decision ignores clear callback failure" {
-    const actions = [_]ConnectionSetupAction{
-        .cancelled,
-        .{ .fail = error.ConnectionSetupTimedOut },
-    };
-
-    for (actions) |action| {
-        var capture = ConnectionStatusCapture{ .fail_on_push = 0 };
-        var status_active = true;
-        try publishConnectionSetupDecisionStatus(
-            capture.sink(),
-            .{ .action = action, .status = .clear },
-            &status_active,
-        );
-
-        try std.testing.expect(!status_active);
-        try std.testing.expectEqual(@as(usize, 1), capture.push_count);
-        try std.testing.expectEqual(@as(usize, 0), capture.len);
-    }
 }
 
 const ConnectionSetupEpoch = struct {
     deadline: std.Io.Clock.Timestamp,
-    visibility_deadline: std.Io.Clock.Timestamp,
-    presentation_visible: bool = false,
 
     fn init(timing: ConnectionSetupTiming) ConnectionSetupEpoch {
         const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
@@ -699,10 +744,6 @@ const ConnectionSetupEpoch = struct {
             .deadline = .{
                 .clock = .awake,
                 .raw = started.raw.addDuration(.fromMilliseconds(timing.timeout_ms)),
-            },
-            .visibility_deadline = .{
-                .clock = .awake,
-                .raw = started.raw.addDuration(.fromMilliseconds(timing.visibility_delay_ms)),
             },
         };
     }
@@ -744,121 +785,14 @@ const RequestOpenOperation = struct {
     }
 };
 
-fn publishGatewayConnectionStatus(
-    sink: ?GatewayConnectionStatusSink,
-    status: ?types.GatewayConnectionStatus,
-) anyerror!void {
-    const value = status orelse return;
-    if (sink) |connection_status| try connection_status.publish(value);
-}
-
-fn publishTrackedGatewayConnectionStatus(
-    sink: ?GatewayConnectionStatusSink,
-    status: ?types.GatewayConnectionStatus,
-    status_active: *bool,
-) anyerror!void {
-    const value = status orelse return;
-    try publishGatewayConnectionStatus(sink, value);
-    status_active.* = switch (value) {
-        .connecting, .retrying, .recovered => true,
-        .clear => false,
-    };
-}
-
-fn publishGatewayConnectionClearPreserving(
-    sink: ?GatewayConnectionStatusSink,
-    terminal_err: anyerror,
-) void {
-    publishGatewayConnectionStatus(sink, .clear) catch |status_err| {
-        debug_trace.logf(
-            "stream",
-            "connection clear failed terminal_err={s} status_err={s}",
-            .{ @errorName(terminal_err), @errorName(status_err) },
-        );
-    };
-}
-
-fn publishConnectionSetupDecisionStatus(
-    sink: ?GatewayConnectionStatusSink,
-    decision: ConnectionSetupDecision,
-    status_active: *bool,
-) anyerror!void {
-    switch (decision.action) {
-        .fail => |terminal_err| {
-            if (decision.status) |status| switch (status) {
-                .clear => publishGatewayConnectionClearPreserving(sink, terminal_err),
-                .connecting, .retrying, .recovered => unreachable,
-            };
-            status_active.* = false;
-        },
-        .cancelled => {
-            if (decision.status) |status| switch (status) {
-                .clear => publishGatewayConnectionClearPreserving(sink, error.Cancelled),
-                .connecting, .retrying, .recovered => unreachable,
-            };
-            status_active.* = false;
-        },
-        .continue_waiting, .succeed, .retry => try publishTrackedGatewayConnectionStatus(
-            sink,
-            decision.status,
-            status_active,
-        ),
-    }
-}
-
-fn publishConnectionVisibilityIfDue(
-    epoch: *ConnectionSetupEpoch,
-    attempt: usize,
-    attempt_limit: usize,
-    delivery: DeliveryCertainty.State,
-    cancel_flag: *std.atomic.Value(bool),
-    sink: ?GatewayConnectionStatusSink,
-) anyerror!void {
-    if (epoch.presentation_visible) return;
-    const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
-    if (std.Io.Clock.Timestamp.compare(now, .lt, epoch.visibility_deadline)) return;
-
-    const decision = decideConnectionSetup(.{
-        .attempt = attempt,
-        .attempt_limit = attempt_limit,
-        .now = now,
-        .deadline = epoch.deadline,
-        .cancelled = cancel_flag.load(.seq_cst),
-        .delivery = delivery,
-        .presentation_visible = false,
-        .outcome = .visibility_threshold,
-    });
-    switch (decision.action) {
-        .continue_waiting => {
-            try publishGatewayConnectionStatus(sink, decision.status);
-            epoch.presentation_visible = true;
-        },
-        .cancelled => return error.Cancelled,
-        .fail => |err| return err,
-        .succeed, .retry => unreachable,
-    }
-}
-
 fn openGatewayRequestBounded(
     client: *std.http.Client,
     uri: std.Uri,
     options: std.http.Client.RequestOptions,
     request_open_override: ?RequestOpenOverride,
     epoch: *ConnectionSetupEpoch,
-    attempt: usize,
-    attempt_limit: usize,
-    delivery: DeliveryCertainty.State,
     cancel_flag: *std.atomic.Value(bool),
-    sink: ?GatewayConnectionStatusSink,
 ) anyerror!std.http.Client.Request {
-    try publishConnectionVisibilityIfDue(
-        epoch,
-        attempt,
-        attempt_limit,
-        delivery,
-        cancel_flag,
-        sink,
-    );
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
 
     const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
@@ -870,7 +804,6 @@ fn openGatewayRequestBounded(
         request: anyerror!std.http.Client.Request,
         cancelled: anyerror!void,
         deadline: anyerror!void,
-        visibility: anyerror!void,
     };
     const Cleanup = struct {
         fn drain(select: *std.Io.Select(Event)) void {
@@ -879,7 +812,7 @@ fn openGatewayRequestBounded(
                     var late_request = request_result catch continue;
                     late_request.deinit();
                 },
-                .cancelled, .deadline, .visibility => {},
+                .cancelled, .deadline => {},
             };
         }
     };
@@ -890,19 +823,13 @@ fn openGatewayRequestBounded(
         .options = options,
         .request_open_override = request_open_override,
     };
-    var select_buffer: [4]Event = undefined;
+    var select_buffer: [3]Event = undefined;
     var select: std.Io.Select(Event) = .init(io_mod.getIo(), &select_buffer);
     select.concurrent(.cancelled, waitForBoundedCancellation, .{cancel_flag}) catch |err| return err;
     select.concurrent(.deadline, waitForBoundedDeadline, .{epoch.deadline}) catch |err| {
         select.cancelDiscard();
         return err;
     };
-    if (!epoch.presentation_visible) {
-        select.concurrent(.visibility, waitForBoundedDeadline, .{epoch.visibility_deadline}) catch |err| {
-            select.cancelDiscard();
-            return err;
-        };
-    }
     select.concurrent(.request, RequestOpenOperation.run, .{&operation}) catch |err| {
         select.cancelDiscard();
         return err;
@@ -914,27 +841,6 @@ fn openGatewayRequestBounded(
             return err;
         };
         switch (event) {
-            .visibility => |visibility_result| {
-                visibility_result catch |err| {
-                    Cleanup.drain(&select);
-                    return err;
-                };
-                if (cancel_flag.load(.seq_cst)) {
-                    Cleanup.drain(&select);
-                    return error.Cancelled;
-                }
-                publishConnectionVisibilityIfDue(
-                    epoch,
-                    attempt,
-                    attempt_limit,
-                    delivery,
-                    cancel_flag,
-                    sink,
-                ) catch |err| {
-                    Cleanup.drain(&select);
-                    return err;
-                };
-            },
             .request => |request_result| {
                 Cleanup.drain(&select);
                 if (cancel_flag.load(.seq_cst)) {
@@ -943,33 +849,12 @@ fn openGatewayRequestBounded(
                     return error.Cancelled;
                 }
 
-                var owned_request = request_result catch |request_err| {
-                    publishConnectionVisibilityIfDue(
-                        epoch,
-                        attempt,
-                        attempt_limit,
-                        delivery,
-                        cancel_flag,
-                        sink,
-                    ) catch |visibility_err| return visibility_err;
-                    return request_err;
-                };
+                var owned_request = request_result catch |request_err| return request_err;
                 const result_now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
                 if (!std.Io.Clock.Timestamp.compare(result_now, .lt, epoch.deadline)) {
                     owned_request.deinit();
                     return error.ConnectionSetupTimedOut;
                 }
-                publishConnectionVisibilityIfDue(
-                    epoch,
-                    attempt,
-                    attempt_limit,
-                    delivery,
-                    cancel_flag,
-                    sink,
-                ) catch |err| {
-                    owned_request.deinit();
-                    return err;
-                };
                 return owned_request;
             },
             .cancelled => |cancelled_result| {
@@ -996,11 +881,7 @@ fn openGatewayRequestBounded(
 fn sleepGatewaySetupRetry(
     delay_ns: u64,
     epoch: *ConnectionSetupEpoch,
-    attempt: usize,
-    attempt_limit: usize,
-    delivery: DeliveryCertainty.State,
     cancel_flag: *std.atomic.Value(bool),
-    sink: ?GatewayConnectionStatusSink,
 ) anyerror!void {
     const retry_deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
         .clock = .awake,
@@ -1008,14 +889,6 @@ fn sleepGatewaySetupRetry(
     });
 
     while (true) {
-        try publishConnectionVisibilityIfDue(
-            epoch,
-            attempt,
-            attempt_limit,
-            delivery,
-            cancel_flag,
-            sink,
-        );
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
 
         const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
@@ -1027,12 +900,6 @@ fn sleepGatewaySetupRetry(
         var sleep_ns: i96 = 10 * std.time.ns_per_ms;
         sleep_ns = @min(sleep_ns, now.raw.durationTo(retry_deadline.raw).toNanoseconds());
         sleep_ns = @min(sleep_ns, now.raw.durationTo(epoch.deadline.raw).toNanoseconds());
-        if (!epoch.presentation_visible) {
-            sleep_ns = @min(
-                sleep_ns,
-                now.raw.durationTo(epoch.visibility_deadline.raw).toNanoseconds(),
-            );
-        }
         if (sleep_ns <= 0) continue;
         try io_mod.getIo().sleep(.fromNanoseconds(sleep_ns), .awake);
     }
@@ -1054,7 +921,6 @@ fn expectConnectionSetupActionTag(
 
 test "connection setup policy makes cancellation absorbing" {
     const outcomes = [_]ConnectionSetupOutcome{
-        .visibility_threshold,
         .request_succeeded,
         .{ .request_failed = error.TlsInitializationFailed },
     };
@@ -1066,11 +932,9 @@ test "connection setup policy makes cancellation absorbing" {
             .deadline = testAwakeTimestamp(30_000),
             .cancelled = true,
             .delivery = .definitely_unsent,
-            .presentation_visible = true,
             .outcome = outcome,
         });
         try expectConnectionSetupActionTag(.cancelled, decision.action);
-        try std.testing.expectEqual(types.GatewayConnectionStatus.clear, decision.status.?);
     }
 }
 
@@ -1082,11 +946,9 @@ test "connection setup policy bounds retry by deadline attempts and delivery" {
         .deadline = testAwakeTimestamp(30_000),
         .cancelled = false,
         .delivery = .definitely_unsent,
-        .presentation_visible = false,
         .outcome = .{ .request_failed = error.TlsInitializationFailed },
     });
     try expectConnectionSetupActionTag(.retry, retry.action);
-    try std.testing.expect(retry.status == null);
 
     const exhausted = decideConnectionSetup(.{
         .attempt = 3,
@@ -1095,11 +957,9 @@ test "connection setup policy bounds retry by deadline attempts and delivery" {
         .deadline = testAwakeTimestamp(30_000),
         .cancelled = false,
         .delivery = .definitely_unsent,
-        .presentation_visible = true,
         .outcome = .{ .request_failed = error.TlsInitializationFailed },
     });
     try expectConnectionSetupActionTag(.fail, exhausted.action);
-    try std.testing.expectEqual(types.GatewayConnectionStatus.clear, exhausted.status.?);
 
     const possibly_sent = decideConnectionSetup(.{
         .attempt = 1,
@@ -1108,7 +968,6 @@ test "connection setup policy bounds retry by deadline attempts and delivery" {
         .deadline = testAwakeTimestamp(30_000),
         .cancelled = false,
         .delivery = .possibly_sent,
-        .presentation_visible = true,
         .outcome = .{ .request_failed = error.TlsInitializationFailed },
     });
     try expectConnectionSetupActionTag(.fail, possibly_sent.action);
@@ -1120,7 +979,6 @@ test "connection setup policy bounds retry by deadline attempts and delivery" {
         .deadline = testAwakeTimestamp(30_000),
         .cancelled = false,
         .delivery = .definitely_unsent,
-        .presentation_visible = true,
         .outcome = .{ .request_failed = error.TlsInitializationFailed },
     });
     try expectConnectionSetupActionTag(.fail, timed_out.action);
@@ -1128,96 +986,6 @@ test "connection setup policy bounds retry by deadline attempts and delivery" {
         .fail => |err| try std.testing.expectEqual(error.ConnectionSetupTimedOut, err),
         else => return error.TestExpectedConnectionTimeout,
     }
-}
-
-test "connection setup policy suppresses pre-visibility lifecycle" {
-    const failed = decideConnectionSetup(.{
-        .attempt = 1,
-        .attempt_limit = 3,
-        .now = testAwakeTimestamp(100),
-        .deadline = testAwakeTimestamp(30_000),
-        .cancelled = false,
-        .delivery = .definitely_unsent,
-        .presentation_visible = false,
-        .outcome = .{ .request_failed = error.TlsInitializationFailed },
-    });
-    try expectConnectionSetupActionTag(.retry, failed.action);
-    try std.testing.expect(failed.status == null);
-
-    const succeeded = decideConnectionSetup(.{
-        .attempt = 2,
-        .attempt_limit = 3,
-        .now = testAwakeTimestamp(200),
-        .deadline = testAwakeTimestamp(30_000),
-        .cancelled = false,
-        .delivery = .definitely_unsent,
-        .presentation_visible = false,
-        .outcome = .request_succeeded,
-    });
-    try expectConnectionSetupActionTag(.succeed, succeeded.action);
-    try std.testing.expect(succeeded.status == null);
-}
-
-test "connection setup policy classifies visible success by global attempt" {
-    const threshold = decideConnectionSetup(.{
-        .attempt = 2,
-        .attempt_limit = 3,
-        .now = testAwakeTimestamp(2_000),
-        .deadline = testAwakeTimestamp(30_000),
-        .cancelled = false,
-        .delivery = .definitely_unsent,
-        .presentation_visible = false,
-        .outcome = .visibility_threshold,
-    });
-    try expectConnectionSetupActionTag(.continue_waiting, threshold.action);
-    try std.testing.expectEqual(types.GatewayConnectionStatus.connecting, threshold.status.?);
-
-    const first_attempt = decideConnectionSetup(.{
-        .attempt = 1,
-        .attempt_limit = 3,
-        .now = testAwakeTimestamp(2_001),
-        .deadline = testAwakeTimestamp(30_000),
-        .cancelled = false,
-        .delivery = .definitely_unsent,
-        .presentation_visible = true,
-        .outcome = .request_succeeded,
-    });
-    try expectConnectionSetupActionTag(.succeed, first_attempt.action);
-    try std.testing.expectEqual(types.GatewayConnectionStatus.clear, first_attempt.status.?);
-
-    const hidden_retry = decideConnectionSetup(.{
-        .attempt = 2,
-        .attempt_limit = 3,
-        .now = testAwakeTimestamp(2_001),
-        .deadline = testAwakeTimestamp(30_000),
-        .cancelled = false,
-        .delivery = .definitely_unsent,
-        .presentation_visible = true,
-        .outcome = .request_succeeded,
-    });
-    try expectConnectionSetupActionTag(.succeed, hidden_retry.action);
-    try std.testing.expectEqual(
-        types.GatewayConnectionStatus{ .recovered = .{ .number = 2, .limit = 3 } },
-        hidden_retry.status.?,
-    );
-}
-
-test "connection setup policy emits retry only after visibility" {
-    const decision = decideConnectionSetup(.{
-        .attempt = 1,
-        .attempt_limit = 3,
-        .now = testAwakeTimestamp(2_100),
-        .deadline = testAwakeTimestamp(30_000),
-        .cancelled = false,
-        .delivery = .definitely_unsent,
-        .presentation_visible = true,
-        .outcome = .{ .request_failed = error.ConnectionResetByPeer },
-    });
-    try expectConnectionSetupActionTag(.retry, decision.action);
-    try std.testing.expectEqual(
-        types.GatewayConnectionStatus{ .retrying = .{ .number = 1, .limit = 3 } },
-        decision.status.?,
-    );
 }
 
 pub const StreamRequest = struct {
@@ -1234,7 +1002,6 @@ pub const StreamRequest = struct {
     delivery: ?*DeliveryCertainty = null,
     on_reasoning_chunk: ?StreamCallback = null,
     on_tool_input_chunk: ?StreamCallback = null,
-    connection_status: ?GatewayConnectionStatusSink = null,
     provider_attempt_owner: ProviderAttemptOwner = .transport,
 };
 
@@ -1397,14 +1164,12 @@ fn streamGatewayCompletionCoreWithOptions(
     watch_connected_socket: bool,
     core_options: StreamCoreOptions,
 ) !StreamResult {
-    var connection_status_active = false;
-    errdefer |err| if (connection_status_active) {
-        publishGatewayConnectionClearPreserving(request.connection_status, err);
-    };
-
     const model = request.model;
     const payload = request.payload;
-    const retry_count = request.retry_count;
+    const retry_count = switch (request.provider_attempt_owner) {
+        .agent => 1,
+        .transport => request.retry_count,
+    };
     const trace_ctx = request.trace_ctx;
     const request_url = try resolveE2eGatewayUrl(e2e_gateway_chat_url_env, request.chat_url);
     const uri = try std.Uri.parse(request_url);
@@ -1431,11 +1196,6 @@ fn streamGatewayCompletionCoreWithOptions(
 
         if (setup_epoch == null) {
             setup_epoch = ConnectionSetupEpoch.init(core_options.setup_timing);
-            try publishTrackedGatewayConnectionStatus(
-                request.connection_status,
-                .clear,
-                &connection_status_active,
-            );
         }
         const epoch = &setup_epoch.?;
         const setup_delivery: DeliveryCertainty.State = if (request_body_possibly_sent)
@@ -1457,8 +1217,7 @@ fn streamGatewayCompletionCoreWithOptions(
             .extra_headers = extra_headers,
             .keep_alive = false,
             .redirect_behavior = .unhandled,
-        }, core_options.request_open_override, epoch, attempt + 1, retry_count, setup_delivery, cancel_flag, request.connection_status) catch |err| {
-            connection_status_active = epoch.presentation_visible;
+        }, core_options.request_open_override, epoch, cancel_flag) catch |err| {
             debug_trace.eventf("gateway", "http_open_connect_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
             const decision = decideConnectionSetup(.{
                 .attempt = attempt + 1,
@@ -1467,43 +1226,22 @@ fn streamGatewayCompletionCoreWithOptions(
                 .deadline = epoch.deadline,
                 .cancelled = cancel_flag.load(.seq_cst),
                 .delivery = setup_delivery,
-                .presentation_visible = epoch.presentation_visible,
                 .outcome = .{ .request_failed = err },
             });
-            publishConnectionSetupDecisionStatus(
-                request.connection_status,
-                decision,
-                &connection_status_active,
-            ) catch |status_err| {
-                publishGatewayConnectionClearPreserving(request.connection_status, status_err);
-                connection_status_active = false;
-                return @as(anyerror!StreamResult, status_err);
-            };
             switch (decision.action) {
                 .retry => {
                     sleepGatewaySetupRetry(
                         (attempt + 1) * gateway_retry_base_delay_ns,
                         epoch,
-                        attempt + 1,
-                        retry_count,
-                        setup_delivery,
                         cancel_flag,
-                        request.connection_status,
-                    ) catch |sleep_err| {
-                        connection_status_active = epoch.presentation_visible;
-                        publishGatewayConnectionClearPreserving(request.connection_status, sleep_err);
-                        connection_status_active = false;
-                        return @as(anyerror!StreamResult, sleep_err);
-                    };
-                    connection_status_active = epoch.presentation_visible;
+                    ) catch |sleep_err| return @as(anyerror!StreamResult, sleep_err);
                     continue;
                 },
                 .fail => |terminal_err| return @as(anyerror!StreamResult, terminal_err),
                 .cancelled => return error.Cancelled,
-                .continue_waiting, .succeed => unreachable,
+                .succeed => unreachable,
             }
         };
-        connection_status_active = epoch.presentation_visible;
         const setup_success = decideConnectionSetup(.{
             .attempt = attempt + 1,
             .attempt_limit = retry_count,
@@ -1511,19 +1249,8 @@ fn streamGatewayCompletionCoreWithOptions(
             .deadline = epoch.deadline,
             .cancelled = cancel_flag.load(.seq_cst),
             .delivery = setup_delivery,
-            .presentation_visible = epoch.presentation_visible,
             .outcome = .request_succeeded,
         });
-        publishConnectionSetupDecisionStatus(
-            request.connection_status,
-            setup_success,
-            &connection_status_active,
-        ) catch |status_err| {
-            req.deinit();
-            publishGatewayConnectionClearPreserving(request.connection_status, status_err);
-            connection_status_active = false;
-            return @as(anyerror!StreamResult, status_err);
-        };
         switch (setup_success.action) {
             .succeed => {},
             .fail => |terminal_err| {
@@ -1534,13 +1261,12 @@ fn streamGatewayCompletionCoreWithOptions(
                 req.deinit();
                 return error.Cancelled;
             },
-            .continue_waiting, .retry => unreachable,
+            .retry => unreachable,
         }
         setup_epoch = null;
         defer req.deinit();
         debug_trace.eventf("gateway", "after_http_open_connect", trace_ctx, "attempt={d}", .{attempt + 1});
         debug_trace.eventf("gateway", "after_request_open", trace_ctx, "attempt={d}", .{attempt + 1});
-        if (req.connection) |conn| configureTcpKeepalive(conn.stream_writer.stream.socket.handle);
 
         var cancel_watch_done = std.atomic.Value(bool).init(false);
         var system_resumed = std.atomic.Value(bool).init(false);
@@ -1959,26 +1685,6 @@ fn waitForBoundedCancellation(cancel_flag: *std.atomic.Value(bool)) anyerror!voi
 
 fn waitForBoundedDeadline(deadline: std.Io.Clock.Timestamp) anyerror!void {
     try deadline.wait(io_mod.getIo());
-}
-
-fn configureTcpKeepalive(sock: std.posix.socket_t) void {
-    const enabled: c_int = 1;
-    std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.KEEPALIVE, std.mem.asBytes(&enabled)) catch return;
-
-    const idle_secs: c_int = 10;
-    const interval_secs: c_int = 5;
-    const probe_count: c_int = 3;
-    const idle_option: u32 = switch (builtin.os.tag) {
-        .macos, .ios, .tvos, .watchos, .visionos => std.posix.TCP.KEEPALIVE,
-        else => if (@hasDecl(std.posix.TCP, "KEEPIDLE")) std.posix.TCP.KEEPIDLE else return,
-    };
-    std.posix.setsockopt(sock, std.posix.IPPROTO.TCP, idle_option, std.mem.asBytes(&idle_secs)) catch {};
-    if (@hasDecl(std.posix.TCP, "KEEPINTVL")) {
-        std.posix.setsockopt(sock, std.posix.IPPROTO.TCP, std.posix.TCP.KEEPINTVL, std.mem.asBytes(&interval_secs)) catch {};
-    }
-    if (@hasDecl(std.posix.TCP, "KEEPCNT")) {
-        std.posix.setsockopt(sock, std.posix.IPPROTO.TCP, std.posix.TCP.KEEPCNT, std.mem.asBytes(&probe_count)) catch {};
-    }
 }
 
 const GatewayCancelWatcher = struct {
@@ -5651,6 +5357,7 @@ fn testAwakeDeadlineAfter(milliseconds: i64) std.Io.Clock.Timestamp {
 }
 
 const LoopbackGatewayMode = enum {
+    reset_on_accept,
     tls_handshake_stall,
     request_send_stall,
     response_head_stall,
@@ -5797,6 +5504,19 @@ const LoopbackGatewayFixture = struct {
         self.accepted.store(true, .seq_cst);
 
         switch (self.mode) {
+            .reset_on_accept => {
+                const reset_on_close: std.posix.linger = .{
+                    .onoff = 1,
+                    .linger = 0,
+                };
+                try std.posix.setsockopt(
+                    stream.socket.handle,
+                    std.posix.SOL.SOCKET,
+                    std.posix.SO.LINGER,
+                    std.mem.asBytes(&reset_on_close),
+                );
+                self.markStage();
+            },
             .tls_handshake_stall => {
                 self.markStage();
                 self.hold();
@@ -5978,27 +5698,6 @@ pub const TestModelCatalogFixture = struct {
     }
 };
 
-const ConnectionStatusCapture = struct {
-    statuses: [8]types.GatewayConnectionStatus = undefined,
-    len: usize = 0,
-    push_count: usize = 0,
-    fail_on_push: ?usize = null,
-
-    fn sink(self: *@This()) GatewayConnectionStatusSink {
-        return .{ .ctx = @ptrCast(self), .push = push };
-    }
-
-    fn push(raw_ctx: *anyopaque, status: types.GatewayConnectionStatus) !void {
-        const self: *@This() = @ptrCast(@alignCast(raw_ctx));
-        const push_index = self.push_count;
-        self.push_count += 1;
-        if (self.fail_on_push == push_index) return error.TestConnectionStatusFailed;
-        if (self.len >= self.statuses.len) return error.TestConnectionStatusOverflow;
-        self.statuses[self.len] = status;
-        self.len += 1;
-    }
-};
-
 const RequestOpenProbe = struct {
     attempts: usize = 0,
     tls_failure_attempt: ?usize = null,
@@ -6059,69 +5758,11 @@ const ConnectionSetupHarness = struct {
 
 fn discardConnectionSetupTestChunk(_: *anyopaque, _: []const u8) void {}
 
-fn expectConnectionStatuses(
-    capture: *const ConnectionStatusCapture,
-    expected: []const types.GatewayConnectionStatus,
-) !void {
-    try std.testing.expectEqual(expected.len, capture.len);
-    for (expected, capture.statuses[0..capture.len]) |expected_status, actual_status| {
-        try std.testing.expectEqual(expected_status, actual_status);
-    }
-}
-
-test "request-open error observes a crossed visibility threshold before returning" {
-    var epoch = ConnectionSetupEpoch.init(.{
-        .timeout_ms = 1_000,
-        .visibility_delay_ms = 500,
-    });
-    const Probe = struct {
-        epoch: *ConnectionSetupEpoch,
-
-        fn open(
-            raw_ctx: *anyopaque,
-            _: *std.http.Client,
-            _: std.http.Method,
-            _: std.Uri,
-            _: std.http.Client.RequestOptions,
-        ) anyerror!std.http.Client.Request {
-            const self: *@This() = @ptrCast(@alignCast(raw_ctx));
-            self.epoch.visibility_deadline = testAwakeTimestamp(0);
-            return error.TlsInitializationFailed;
-        }
-    };
-    var probe = Probe{ .epoch = &epoch };
-    var capture = ConnectionStatusCapture{};
-    var cancel_flag = std.atomic.Value(bool).init(false);
-    var client: std.http.Client = .{
-        .allocator = std.testing.allocator,
-        .io = io_mod.getIo(),
-    };
-    defer client.deinit();
-    const uri = try std.Uri.parse("http://127.0.0.1:1/chat");
-
-    const result = openGatewayRequestBounded(
-        &client,
-        uri,
-        .{},
-        .{ .ctx = @ptrCast(&probe), .run = Probe.open },
-        &epoch,
-        1,
-        3,
-        .definitely_unsent,
-        &cancel_flag,
-        capture.sink(),
-    );
-
-    try std.testing.expectError(error.TlsInitializationFailed, result);
-    try expectConnectionStatuses(&capture, &.{.connecting});
-}
-
 test "direct gateway request-open cancellation interrupts real TLS setup" {
     var harness = try ConnectionSetupHarness.init(.tls_handshake_stall, true);
     defer harness.deinit();
     try harness.start();
 
-    var capture = ConnectionStatusCapture{};
     var cancel_flag = std.atomic.Value(bool).init(false);
     var request_done = std.atomic.Value(bool).init(false);
     const Cancel = struct {
@@ -6155,7 +5796,6 @@ test "direct gateway request-open cancellation interrupts real TLS setup" {
             .retry_count = 1,
             .chat_url = harness.url,
             .payload = "{}",
-            .connection_status = capture.sink(),
         },
         @ptrCast(&callback_ctx),
         discardConnectionSetupTestChunk,
@@ -6163,7 +5803,7 @@ test "direct gateway request-open cancellation interrupts real TLS setup" {
         &cancel_flag,
         null,
         false,
-        .{ .setup_timing = .{ .timeout_ms = 1000, .visibility_delay_ms = 0 } },
+        .{ .setup_timing = .{ .timeout_ms = 1000 } },
     );
     const elapsed_ms = started.durationTo(
         std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake),
@@ -6171,63 +5811,6 @@ test "direct gateway request-open cancellation interrupts real TLS setup" {
 
     try std.testing.expectError(error.Cancelled, result);
     try std.testing.expect(elapsed_ms < 500);
-    try expectConnectionStatuses(&capture, &.{ .clear, .connecting, .clear });
-    harness.fixture.deinit();
-    if (harness.fixture.failure) |err| return err;
-}
-
-test "connection clear callback failure preserves TLS setup cancellation" {
-    var harness = try ConnectionSetupHarness.init(.tls_handshake_stall, true);
-    defer harness.deinit();
-    try harness.start();
-
-    var capture = ConnectionStatusCapture{ .fail_on_push = 2 };
-    var cancel_flag = std.atomic.Value(bool).init(false);
-    var request_done = std.atomic.Value(bool).init(false);
-    const Cancel = struct {
-        fn run(
-            fixture: *LoopbackGatewayFixture,
-            flag: *std.atomic.Value(bool),
-            done: *std.atomic.Value(bool),
-        ) void {
-            if (!fixture.waitForStageOrDone(done)) return;
-            LoopbackGatewayFixture.sleepBlocking(30);
-            if (!done.load(.seq_cst)) flag.store(true, .seq_cst);
-        }
-    };
-    const cancel_thread = try std.Thread.spawn(.{}, Cancel.run, .{
-        &harness.fixture,
-        &cancel_flag,
-        &request_done,
-    });
-    defer {
-        request_done.store(true, .seq_cst);
-        cancel_thread.join();
-    }
-
-    var callback_ctx: u8 = 0;
-    const result = streamGatewayCompletionCoreWithOptions(
-        std.testing.allocator,
-        .{
-            .api_key = "test-key",
-            .model = "test/model",
-            .retry_count = 1,
-            .chat_url = harness.url,
-            .payload = "{}",
-            .connection_status = capture.sink(),
-        },
-        @ptrCast(&callback_ctx),
-        discardConnectionSetupTestChunk,
-        null,
-        &cancel_flag,
-        null,
-        false,
-        .{ .setup_timing = .{ .timeout_ms = 1000, .visibility_delay_ms = 0 } },
-    );
-
-    try std.testing.expectError(error.Cancelled, result);
-    try std.testing.expectEqual(@as(usize, 3), capture.push_count);
-    try expectConnectionStatuses(&capture, &.{ .clear, .connecting });
     harness.fixture.deinit();
     if (harness.fixture.failure) |err| return err;
 }
@@ -6237,7 +5820,6 @@ test "direct gateway request-open deadline interrupts real TLS setup" {
     defer harness.deinit();
     try harness.start();
 
-    var capture = ConnectionStatusCapture{};
     var delivery = DeliveryCertainty.init();
     var cancel_flag = std.atomic.Value(bool).init(false);
     var callback_ctx: u8 = 0;
@@ -6251,7 +5833,6 @@ test "direct gateway request-open deadline interrupts real TLS setup" {
             .chat_url = harness.url,
             .payload = "{}",
             .delivery = &delivery,
-            .connection_status = capture.sink(),
         },
         @ptrCast(&callback_ctx),
         discardConnectionSetupTestChunk,
@@ -6259,7 +5840,7 @@ test "direct gateway request-open deadline interrupts real TLS setup" {
         &cancel_flag,
         null,
         false,
-        .{ .setup_timing = .{ .timeout_ms = 80, .visibility_delay_ms = 0 } },
+        .{ .setup_timing = .{ .timeout_ms = 80 } },
     );
     const elapsed_ms = started.durationTo(
         std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake),
@@ -6268,80 +5849,12 @@ test "direct gateway request-open deadline interrupts real TLS setup" {
     try std.testing.expectError(error.ConnectionSetupTimedOut, result);
     try std.testing.expect(elapsed_ms < 400);
     try std.testing.expectEqual(DeliveryCertainty.State.definitely_unsent, delivery.load());
-    try expectConnectionStatuses(&capture, &.{ .clear, .connecting, .clear });
     harness.fixture.deinit();
     if (harness.fixture.failure) |err| return err;
-}
-
-test "connection clear callback failure preserves TLS setup timeout" {
-    var harness = try ConnectionSetupHarness.init(.tls_handshake_stall, true);
-    defer harness.deinit();
-    try harness.start();
-
-    var capture = ConnectionStatusCapture{ .fail_on_push = 2 };
-    var cancel_flag = std.atomic.Value(bool).init(false);
-    var callback_ctx: u8 = 0;
-    const result = streamGatewayCompletionCoreWithOptions(
-        std.testing.allocator,
-        .{
-            .api_key = "test-key",
-            .model = "test/model",
-            .retry_count = 1,
-            .chat_url = harness.url,
-            .payload = "{}",
-            .connection_status = capture.sink(),
-        },
-        @ptrCast(&callback_ctx),
-        discardConnectionSetupTestChunk,
-        null,
-        &cancel_flag,
-        null,
-        false,
-        .{ .setup_timing = .{ .timeout_ms = 80, .visibility_delay_ms = 0 } },
-    );
-
-    try std.testing.expectError(error.ConnectionSetupTimedOut, result);
-    try std.testing.expectEqual(@as(usize, 3), capture.push_count);
-    try expectConnectionStatuses(&capture, &.{ .clear, .connecting });
-    harness.fixture.deinit();
-    if (harness.fixture.failure) |err| return err;
-}
-
-test "connection clear callback failure preserves terminal TLS error" {
-    var probe = RequestOpenProbe{ .tls_failure_attempt = 0 };
-    var capture = ConnectionStatusCapture{ .fail_on_push = 1 };
-    var cancel_flag = std.atomic.Value(bool).init(false);
-    var callback_ctx: u8 = 0;
-    const result = streamGatewayCompletionCoreWithOptions(
-        std.testing.allocator,
-        .{
-            .api_key = "test-key",
-            .model = "test/model",
-            .retry_count = 1,
-            .chat_url = "http://127.0.0.1:1/chat",
-            .payload = "{}",
-            .connection_status = capture.sink(),
-        },
-        @ptrCast(&callback_ctx),
-        discardConnectionSetupTestChunk,
-        null,
-        &cancel_flag,
-        null,
-        false,
-        .{
-            .setup_timing = .{ .timeout_ms = 1000, .visibility_delay_ms = 500 },
-            .request_open_override = probe.requestOpenOverride(),
-        },
-    );
-
-    try std.testing.expectError(error.TlsInitializationFailed, result);
-    try std.testing.expectEqual(@as(usize, 2), capture.push_count);
-    try expectConnectionStatuses(&capture, &.{.clear});
 }
 
 test "TLS retry sleep consumes the original connection setup deadline" {
     var probe = RequestOpenProbe{ .tls_failure_attempt = 0 };
-    var capture = ConnectionStatusCapture{};
     var cancel_flag = std.atomic.Value(bool).init(false);
     var callback_ctx: u8 = 0;
     const result = streamGatewayCompletionCoreWithOptions(
@@ -6352,7 +5865,6 @@ test "TLS retry sleep consumes the original connection setup deadline" {
             .retry_count = 3,
             .chat_url = "http://127.0.0.1:1/chat",
             .payload = "{}",
-            .connection_status = capture.sink(),
         },
         @ptrCast(&callback_ctx),
         discardConnectionSetupTestChunk,
@@ -6361,28 +5873,21 @@ test "TLS retry sleep consumes the original connection setup deadline" {
         null,
         false,
         .{
-            .setup_timing = .{ .timeout_ms = 80, .visibility_delay_ms = 0 },
+            .setup_timing = .{ .timeout_ms = 80 },
             .request_open_override = probe.requestOpenOverride(),
         },
     );
 
     try std.testing.expectError(error.ConnectionSetupTimedOut, result);
     try std.testing.expectEqual(@as(usize, 1), probe.attempts);
-    try expectConnectionStatuses(&capture, &.{
-        .clear,
-        .connecting,
-        .{ .retrying = .{ .number = 1, .limit = 3 } },
-        .clear,
-    });
 }
 
-test "pre-send TLS retry emits no presentation before visibility" {
+test "transport-owned TLS setup retries before send" {
     var harness = try ConnectionSetupHarness.init(.success, false);
     defer harness.deinit();
     try harness.start();
 
     var probe = RequestOpenProbe{ .tls_failure_attempt = 0 };
-    var capture = ConnectionStatusCapture{};
     var cancel_flag = std.atomic.Value(bool).init(false);
     var callback_ctx: u8 = 0;
     var result = try streamGatewayCompletionCoreWithOptions(
@@ -6393,7 +5898,6 @@ test "pre-send TLS retry emits no presentation before visibility" {
             .retry_count = 2,
             .chat_url = harness.url,
             .payload = "{}",
-            .connection_status = capture.sink(),
         },
         @ptrCast(&callback_ctx),
         discardConnectionSetupTestChunk,
@@ -6402,26 +5906,23 @@ test "pre-send TLS retry emits no presentation before visibility" {
         null,
         false,
         .{
-            .setup_timing = .{ .timeout_ms = 1000, .visibility_delay_ms = 500 },
+            .setup_timing = .{ .timeout_ms = 1000 },
             .request_open_override = probe.requestOpenOverride(),
         },
     );
     defer result.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 2), probe.attempts);
-    try expectConnectionStatuses(&capture, &.{.clear});
     try std.testing.expectEqualStrings("ok", result.completion.content.?);
     harness.fixture.deinit();
     if (harness.fixture.failure) |err| return err;
 }
 
-test "new setup epoch clears stale connection state before quiet success" {
+test "a fresh setup epoch succeeds normally" {
     var harness = try ConnectionSetupHarness.init(.success, false);
     defer harness.deinit();
     try harness.start();
 
-    var capture = ConnectionStatusCapture{};
-    try capture.sink().publish(.{ .recovered = .{ .number = 2, .limit = 3 } });
     var cancel_flag = std.atomic.Value(bool).init(false);
     var callback_ctx: u8 = 0;
     var result = try streamGatewayCompletionCoreWithOptions(
@@ -6432,7 +5933,6 @@ test "new setup epoch clears stale connection state before quiet success" {
             .retry_count = 1,
             .chat_url = harness.url,
             .payload = "{}",
-            .connection_status = capture.sink(),
         },
         @ptrCast(&callback_ctx),
         discardConnectionSetupTestChunk,
@@ -6440,20 +5940,16 @@ test "new setup epoch clears stale connection state before quiet success" {
         &cancel_flag,
         null,
         false,
-        .{ .setup_timing = .{ .timeout_ms = 1000, .visibility_delay_ms = 500 } },
+        .{ .setup_timing = .{ .timeout_ms = 1000 } },
     );
     defer result.deinit(std.testing.allocator);
 
-    try expectConnectionStatuses(&capture, &.{
-        .{ .recovered = .{ .number = 2, .limit = 3 } },
-        .clear,
-    });
     try std.testing.expectEqualStrings("ok", result.completion.content.?);
     harness.fixture.deinit();
     if (harness.fixture.failure) |err| return err;
 }
 
-test "hidden TLS retry pending at visibility recovers without retry notice" {
+test "transport-owned TLS retry succeeds after delayed open" {
     var harness = try ConnectionSetupHarness.init(.success, false);
     defer harness.deinit();
     try harness.start();
@@ -6462,7 +5958,6 @@ test "hidden TLS retry pending at visibility recovers without retry notice" {
         .tls_failure_attempt = 0,
         .delays_ms = .{ 0, 100, 0 },
     };
-    var capture = ConnectionStatusCapture{};
     var cancel_flag = std.atomic.Value(bool).init(false);
     var callback_ctx: u8 = 0;
     var result = try streamGatewayCompletionCoreWithOptions(
@@ -6473,7 +5968,6 @@ test "hidden TLS retry pending at visibility recovers without retry notice" {
             .retry_count = 3,
             .chat_url = harness.url,
             .payload = "{}",
-            .connection_status = capture.sink(),
         },
         @ptrCast(&callback_ctx),
         discardConnectionSetupTestChunk,
@@ -6482,22 +5976,18 @@ test "hidden TLS retry pending at visibility recovers without retry notice" {
         null,
         false,
         .{
-            .setup_timing = .{ .timeout_ms = 1000, .visibility_delay_ms = 200 },
+            .setup_timing = .{ .timeout_ms = 1000 },
             .request_open_override = probe.requestOpenOverride(),
         },
     );
     defer result.deinit(std.testing.allocator);
 
-    try expectConnectionStatuses(&capture, &.{
-        .clear,
-        .connecting,
-        .{ .recovered = .{ .number = 2, .limit = 3 } },
-    });
+    try std.testing.expectEqual(@as(usize, 2), probe.attempts);
     harness.fixture.deinit();
     if (harness.fixture.failure) |err| return err;
 }
 
-test "visible TLS failure emits retrying then recovered" {
+test "transport-owned TLS retry succeeds after delayed failure" {
     var harness = try ConnectionSetupHarness.init(.success, false);
     defer harness.deinit();
     try harness.start();
@@ -6506,7 +5996,6 @@ test "visible TLS failure emits retrying then recovered" {
         .tls_failure_attempt = 0,
         .delays_ms = .{ 50, 0, 0 },
     };
-    var capture = ConnectionStatusCapture{};
     var cancel_flag = std.atomic.Value(bool).init(false);
     var callback_ctx: u8 = 0;
     var result = try streamGatewayCompletionCoreWithOptions(
@@ -6517,7 +6006,6 @@ test "visible TLS failure emits retrying then recovered" {
             .retry_count = 3,
             .chat_url = harness.url,
             .payload = "{}",
-            .connection_status = capture.sink(),
         },
         @ptrCast(&callback_ctx),
         discardConnectionSetupTestChunk,
@@ -6526,61 +6014,13 @@ test "visible TLS failure emits retrying then recovered" {
         null,
         false,
         .{
-            .setup_timing = .{ .timeout_ms = 1000, .visibility_delay_ms = 20 },
+            .setup_timing = .{ .timeout_ms = 1000 },
             .request_open_override = probe.requestOpenOverride(),
         },
     );
     defer result.deinit(std.testing.allocator);
 
-    try expectConnectionStatuses(&capture, &.{
-        .clear,
-        .connecting,
-        .{ .retrying = .{ .number = 1, .limit = 3 } },
-        .{ .recovered = .{ .number = 2, .limit = 3 } },
-    });
-    harness.fixture.deinit();
-    if (harness.fixture.failure) |err| return err;
-}
-
-test "retry status callback failure emits one compensating clear" {
-    var harness = try ConnectionSetupHarness.init(.success, false);
-    defer harness.deinit();
-    try harness.start();
-
-    var probe = RequestOpenProbe{
-        .tls_failure_attempt = 0,
-        .delays_ms = .{ 50, 0, 0 },
-    };
-    var capture = ConnectionStatusCapture{ .fail_on_push = 2 };
-    var cancel_flag = std.atomic.Value(bool).init(false);
-    var callback_ctx: u8 = 0;
-    const result = streamGatewayCompletionCoreWithOptions(
-        std.testing.allocator,
-        .{
-            .api_key = "test-key",
-            .model = "test/model",
-            .retry_count = 3,
-            .chat_url = harness.url,
-            .payload = "{}",
-            .connection_status = capture.sink(),
-        },
-        @ptrCast(&callback_ctx),
-        discardConnectionSetupTestChunk,
-        null,
-        &cancel_flag,
-        null,
-        false,
-        .{
-            .setup_timing = .{ .timeout_ms = 1000, .visibility_delay_ms = 20 },
-            .request_open_override = probe.requestOpenOverride(),
-        },
-    );
-
-    try std.testing.expectError(error.TestConnectionStatusFailed, result);
-    try std.testing.expectEqual(@as(usize, 4), capture.push_count);
-    try expectConnectionStatuses(&capture, &.{ .clear, .connecting, .clear });
-    try std.testing.expectEqual(@as(usize, 1), probe.attempts);
-    try std.testing.expect(!harness.fixture.accepted.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 2), probe.attempts);
     harness.fixture.deinit();
     if (harness.fixture.failure) |err| return err;
 }
@@ -6611,7 +6051,7 @@ test "response retry starts a fresh setup epoch without resetting delivery" {
         null,
         false,
         .{
-            .setup_timing = .{ .timeout_ms = 800, .visibility_delay_ms = 2000 },
+            .setup_timing = .{ .timeout_ms = 800 },
             .request_open_override = probe.requestOpenOverride(),
         },
     );
@@ -6651,7 +6091,7 @@ test "agent-owned provider attempts return the first retryable response" {
         null,
         false,
         .{
-            .setup_timing = .{ .timeout_ms = 1000, .visibility_delay_ms = 500 },
+            .setup_timing = .{ .timeout_ms = 1000 },
             .request_open_override = probe.requestOpenOverride(),
         },
     );
@@ -6660,6 +6100,103 @@ test "agent-owned provider attempts return the first retryable response" {
     try std.testing.expectEqual(std.http.Status.service_unavailable, result.status);
     try std.testing.expectEqual(@as(usize, 1), probe.attempts);
     try std.testing.expectEqual(DeliveryCertainty.State.possibly_sent, delivery.load());
+    harness.fixture.deinit();
+    if (harness.fixture.failure) |err| return err;
+}
+
+test "agent-owned provider attempts return the first TLS setup failure" {
+    var harness = try ConnectionSetupHarness.init(.success, false);
+    defer harness.deinit();
+    try harness.start();
+
+    var probe = RequestOpenProbe{ .tls_failure_attempt = 0 };
+    var delivery = DeliveryCertainty.init();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var callback_ctx: u8 = 0;
+    const result = streamGatewayCompletionCoreWithOptions(
+        std.testing.allocator,
+        .{
+            .api_key = "test-key",
+            .model = "test/model",
+            .retry_count = 3,
+            .chat_url = harness.url,
+            .payload = "{}",
+            .delivery = &delivery,
+            .provider_attempt_owner = .agent,
+        },
+        @ptrCast(&callback_ctx),
+        discardConnectionSetupTestChunk,
+        null,
+        &cancel_flag,
+        null,
+        false,
+        .{
+            .setup_timing = .{ .timeout_ms = 1000 },
+            .request_open_override = probe.requestOpenOverride(),
+        },
+    );
+    if (result) |success_value| {
+        var success = success_value;
+        success.deinit(std.testing.allocator);
+        return error.TestExpectedTlsInitializationFailure;
+    } else |err| {
+        try std.testing.expectEqual(error.TlsInitializationFailed, err);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), probe.attempts);
+    try std.testing.expectEqual(DeliveryCertainty.State.definitely_unsent, delivery.load());
+    harness.fixture.deinit();
+    if (harness.fixture.failure) |err| return err;
+}
+
+test "agent-owned provider attempts return immediate peer resets without transport retry" {
+    var harness = try ConnectionSetupHarness.init(.reset_on_accept, false);
+    defer harness.deinit();
+    try harness.start();
+
+    var probe = RequestOpenProbe{};
+    var delivery = DeliveryCertainty.init();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var callback_ctx: u8 = 0;
+    const result = streamGatewayCompletionCoreWithOptions(
+        std.testing.allocator,
+        .{
+            .api_key = "test-key",
+            .model = "test/model",
+            .retry_count = 3,
+            .chat_url = harness.url,
+            .payload = "{}",
+            .delivery = &delivery,
+            .provider_attempt_owner = .agent,
+        },
+        @ptrCast(&callback_ctx),
+        discardConnectionSetupTestChunk,
+        null,
+        &cancel_flag,
+        null,
+        false,
+        .{
+            .setup_timing = .{ .timeout_ms = 1000 },
+            .request_open_override = probe.requestOpenOverride(),
+        },
+    );
+    if (result) |success_value| {
+        var success = success_value;
+        success.deinit(std.testing.allocator);
+        return error.TestExpectedPeerReset;
+    } else |err| {
+        const evidence = networkFailureEvidence(
+            err,
+            delivery.load(),
+        ) orelse return error.TestExpectedNetworkFailureEvidence;
+        try std.testing.expectEqual(
+            agent_stream_provider.NetworkFailureCause.transport_interrupted,
+            evidence.cause,
+        );
+        try std.testing.expectEqual(delivery.load(), evidence.delivery);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), probe.attempts);
     harness.fixture.deinit();
     if (harness.fixture.failure) |err| return err;
 }
@@ -6690,7 +6227,7 @@ test "TLS setup does not retry after a response made delivery possible" {
         null,
         false,
         .{
-            .setup_timing = .{ .timeout_ms = 1000, .visibility_delay_ms = 500 },
+            .setup_timing = .{ .timeout_ms = 1000 },
             .request_open_override = probe.requestOpenOverride(),
         },
     );
@@ -6726,56 +6263,13 @@ test "TLS setup does not retry after delivery when no certainty sink is provided
         null,
         false,
         .{
-            .setup_timing = .{ .timeout_ms = 1000, .visibility_delay_ms = 500 },
+            .setup_timing = .{ .timeout_ms = 1000 },
             .request_open_override = probe.requestOpenOverride(),
         },
     );
 
     try std.testing.expectError(error.TlsInitializationFailed, result);
     try std.testing.expectEqual(@as(usize, 2), probe.attempts);
-    harness.fixture.deinit();
-    if (harness.fixture.failure) |err| return err;
-}
-
-test "connection status callback failure drains request-open before returning" {
-    var harness = try ConnectionSetupHarness.init(.success, false);
-    defer harness.deinit();
-    try harness.start();
-
-    var probe = RequestOpenProbe{ .delays_ms = .{ 200, 0, 0 } };
-    var capture = ConnectionStatusCapture{ .fail_on_push = 1 };
-    var cancel_flag = std.atomic.Value(bool).init(false);
-    var callback_ctx: u8 = 0;
-    const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
-    const result = streamGatewayCompletionCoreWithOptions(
-        std.testing.allocator,
-        .{
-            .api_key = "test-key",
-            .model = "test/model",
-            .retry_count = 1,
-            .chat_url = harness.url,
-            .payload = "{}",
-            .connection_status = capture.sink(),
-        },
-        @ptrCast(&callback_ctx),
-        discardConnectionSetupTestChunk,
-        null,
-        &cancel_flag,
-        null,
-        false,
-        .{
-            .setup_timing = .{ .timeout_ms = 1000, .visibility_delay_ms = 20 },
-            .request_open_override = probe.requestOpenOverride(),
-        },
-    );
-    const elapsed_ms = started.durationTo(
-        std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake),
-    ).raw.toMilliseconds();
-
-    try std.testing.expectError(error.TestConnectionStatusFailed, result);
-    try std.testing.expect(elapsed_ms < 300);
-    try std.testing.expect(!harness.fixture.accepted.load(.seq_cst));
-    try expectConnectionStatuses(&capture, &.{ .clear, .clear });
     harness.fixture.deinit();
     if (harness.fixture.failure) |err| return err;
 }

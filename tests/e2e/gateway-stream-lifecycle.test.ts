@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { createServer, type Socket } from "node:net";
 import {
   chmodSync,
   existsSync,
@@ -3035,6 +3036,121 @@ describe("gateway stream lifecycle", () => {
     }
   }, 30_000);
 
+  test("default fx ask recovers after an immediate peer reset", async () => {
+    const expectedOutput = "Recovered after immediate peer reset.";
+    const responseBody = await fakeGatewayFinalText(expectedOutput).text();
+
+    for (let iteration = 1; iteration <= 12; iteration += 1) {
+      const root = createFixtureRoot(`immediate-peer-reset-${iteration}`);
+      const tracePath = join(root.root, "trace.log");
+      const sockets = new Set<Socket>();
+      let connections = 0;
+      let requests = 0;
+      let socketFailure: Error | undefined;
+      const server = createServer((socket) => {
+        sockets.add(socket);
+        socket.on("close", () => sockets.delete(socket));
+        socket.on("error", (error) => {
+          socketFailure ??= error;
+        });
+        connections += 1;
+        if (connections === 1) {
+          socket.resetAndDestroy();
+          return;
+        }
+
+        let request = Buffer.alloc(0);
+        let requestHandled = false;
+        socket.on("data", (chunk) => {
+          if (requestHandled) return;
+          if (request.length + chunk.length > 1024 * 1024) {
+            socketFailure ??= new Error("reset fixture request exceeded 1 MiB");
+            socket.destroy();
+            return;
+          }
+          request = Buffer.concat([request, chunk]);
+          const headerEnd = request.indexOf("\r\n\r\n");
+          if (headerEnd < 0) return;
+          const headers = request.subarray(0, headerEnd).toString("utf8");
+          const lengthMatch = /\r\ncontent-length:\s*(\d+)/i.exec(`\r\n${headers}`);
+          const contentLength = lengthMatch ? Number.parseInt(lengthMatch[1]!, 10) : 0;
+          if (request.length < headerEnd + 4 + contentLength) return;
+
+          requestHandled = true;
+          requests += 1;
+          const response =
+            "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: text/event-stream\r\n" +
+            `Content-Length: ${Buffer.byteLength(responseBody)}\r\n` +
+            "Connection: close\r\n\r\n" +
+            responseBody;
+          socket.end(response);
+        });
+      });
+
+      try {
+        await new Promise<void>((resolve, reject) => {
+          server.once("error", reject);
+          server.listen(0, "127.0.0.1", resolve);
+        });
+        const address = server.address();
+        if (address === null || typeof address === "string") {
+          throw new Error("missing reset fixture address");
+        }
+        const result = await runFx(
+          ["ask", "--json", "--auto", "--no-save", "Recover after the immediate reset."],
+          {
+            cwd: root.workspace,
+            env: {
+              HOME: root.home,
+              AI_GATEWAY_API_KEY: "fake-gateway-lifecycle-key",
+              VERCEL_OIDC_TOKEN: undefined,
+              FX_E2E_GATEWAY_CHAT_URL:
+                `http://127.0.0.1:${address.port}/v1/ai/chat/completions`,
+              FX_MODEL: MODEL,
+              FX_TRACE_LOG: tracePath,
+              FX_TRACE_SCOPES: "agent,core,gateway,stream",
+            },
+            timeoutMs: 15_000,
+          },
+        );
+        const trace = readFileSync(tracePath, "utf8");
+        if (result.code !== 0 || result.signal !== null || result.stderr !== "") {
+          throw new Error(
+            `peer-reset iteration ${iteration} failed: code=${result.code} signal=${result.signal}\n` +
+              `stdout:\n${result.stdout}\nstderr:\n${result.stderr}\ntrace:\n${trace}`,
+          );
+        }
+        const json = parseAskJson(result.stdout);
+        const opens = trace.split("\n").filter((line) =>
+          line.includes("event=after_request_open")
+        );
+
+        expect(result.code).toBe(0);
+        expect(result.signal).toBeNull();
+        expect(result.stderr).toBe("");
+        expect(json.exit_code).toBe(0);
+        expect(json.output).toBe(expectedOutput);
+        expect(json.recovery?.state).toBe("recovered");
+        expect(json.recovery?.attempt).toBe(2);
+        expect(connections).toBe(2);
+        expect(requests).toBe(1);
+        expect(socketFailure).toBeUndefined();
+        expect(opens).toHaveLength(2);
+        expect(opens.every((line) => line.includes("attempt=1"))).toBe(true);
+        expect(trace).toContain("provider_attempts=1/10");
+        expect(trace).toContain("recovery=retry_request");
+        expect(trace).toContain("event=stream_complete");
+      } finally {
+        for (const socket of sockets) socket.destroy();
+        if (server.listening) {
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+        }
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }
+  }, 60_000);
+
   test("default fx ask regenerates an unstarted streamed tool after provider failure", async () => {
     const root = createFixtureRoot("provider-error-tool-start-turn");
     const tracePath = join(root.root, "trace.log");
@@ -4176,18 +4292,18 @@ describe("gateway stream lifecycle", () => {
     }
   }, 30_000);
 
-  test("over-cap Retry-After pauses once and explicit continue preserves context", async () => {
-    const root = createFixtureRoot("retry-after-pause-continue");
+  test("exhausted retry budget pauses once and explicit continue preserves context", async () => {
+    const root = createFixtureRoot("retry-budget-pause-continue");
     const tracePath = join(root.root, "trace.log");
     let continued = false;
     const gateway = startGateway(() =>
       continued
         ? fakeGatewayFinalText("Recovered after explicit continuation.")
-        : unavailableResponse("31")
+        : unavailableResponse("0")
     );
     try {
       const first = await runFx(
-        ["ask", "--json", "--auto", "Pause on the provider cooldown."],
+        ["ask", "--json", "--auto", "Pause after exhausting recovery."],
         {
           cwd: root.workspace,
           env: fixtureEnv(root, gateway, tracePath),
@@ -4196,10 +4312,10 @@ describe("gateway stream lifecycle", () => {
       );
       const paused = parseAskJson(first.stdout);
       expect(first.code).toBe(1);
-      expect(gateway.requestCount()).toBe(1);
+      expect(gateway.requestCount()).toBe(10);
       expect(paused.recovery?.state).toBe("paused");
       expect(paused.recovery?.cause).toBe("provider_unavailable");
-      expect(paused.recovery?.attempt).toBe(1);
+      expect(paused.recovery?.attempt).toBe(10);
       expect(paused.recovery?.attempt_limit).toBe(10);
       expect(paused.recovery?.required_action).toBe("continue_later");
       expect(paused.recovery?.durable).toBe(true);
@@ -4209,7 +4325,7 @@ describe("gateway stream lifecycle", () => {
         { cwd: root.workspace, env: { HOME: root.home } },
       );
       expect(detail.code).toBe(0);
-      expect(gateway.requestCount()).toBe(1);
+      expect(gateway.requestCount()).toBe(10);
 
       continued = true;
       const resumed = await runFx(
@@ -4230,8 +4346,8 @@ describe("gateway stream lifecycle", () => {
       const recovered = parseAskJson(resumed.stdout);
       expect(resumed.code).toBe(0);
       expect(recovered.output).toContain("Recovered after explicit continuation.");
-      expect(gateway.requestCount()).toBe(2);
-      expect(gateway.requests[1]!.body).toContain("Pause on the provider cooldown.");
+      expect(gateway.requestCount()).toBe(11);
+      expect(gateway.requests[10]!.body).toContain("Pause after exhausting recovery.");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -4251,7 +4367,7 @@ describe("gateway stream lifecycle", () => {
           delta: partialText,
         })}\n\n`,
       ),
-      unavailableResponse("31"),
+      ...Array.from({ length: 9 }, () => unavailableResponse("0")),
       fakeGatewayFinalText(`${partialText}${finalText}`),
     ];
     const gateway = startGateway(() =>
@@ -4270,7 +4386,7 @@ describe("gateway stream lifecycle", () => {
       expect(first.code).toBe(1);
       expect(paused.output).toBe(partialText);
       expect(paused.recovery?.state).toBe("paused");
-      expect(gateway.requestCount()).toBe(2);
+      expect(gateway.requestCount()).toBe(10);
 
       const resumed = await runFx(
         [
@@ -4290,7 +4406,7 @@ describe("gateway stream lifecycle", () => {
       const recovered = parseAskJson(resumed.stdout);
       expect(resumed.code).toBe(0);
       expect(recovered.output).toBe(`${partialText}${finalText}`);
-      expect(gateway.requestCount()).toBe(3);
+      expect(gateway.requestCount()).toBe(11);
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });

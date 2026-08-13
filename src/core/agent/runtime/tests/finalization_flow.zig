@@ -471,7 +471,7 @@ test "processQueuedPrompt terminal outcomes finalize exactly once before optiona
         .{ .completion = .{ .content = "Final" }, .outcome = .completed, .finish_count = 1 },
         .{ .completion = .{ .cancel_before_output = true }, .outcome = .interrupted, .finish_count = 1 },
         .{ .completion = .{ .status = .bad_request, .err_body = "bad" }, .outcome = .failed, .finish_count = 0 },
-        .{ .completion = .{ .stream_error = error.UnknownHostName }, .outcome = .failed, .finish_count = 0, .propagates_error = true },
+        .{ .completion = .{ .stream_error = error.TestProviderFailure }, .outcome = .failed, .finish_count = 0, .propagates_error = true },
     };
     for (cases) |case| {
         const completions = [_]FakeCompletion{case.completion};
@@ -482,7 +482,7 @@ test "processQueuedPrompt terminal outcomes finalize exactly once before optiona
         var fixture = PromptFixture{};
         if (case.propagates_error) {
             try std.testing.expectError(
-                error.UnknownHostName,
+                error.TestProviderFailure,
                 runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job()),
             );
         } else {
@@ -504,7 +504,7 @@ test "partial stream failure persists failed terminal reason" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{.{
         .chunks = &.{"partial response"},
-        .stream_error_after_chunks = error.UnknownHostName,
+        .stream_error_after_chunks = error.TestProviderFailure,
     }};
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
@@ -516,7 +516,7 @@ test "partial stream failure persists failed terminal reason" {
     config.max_provider_attempts = 1;
 
     try std.testing.expectError(
-        error.UnknownHostName,
+        error.TestProviderFailure,
         runFakePrompt(&gateway, &hooks, config, fixture.job()),
     );
 
@@ -573,13 +573,13 @@ test "processQueuedPrompt emits exactly one structured prompt finish per termina
     }
 
     {
-        const completions = [_]FakeCompletion{.{ .stream_error = error.UnknownHostName }};
+        const completions = [_]FakeCompletion{.{ .stream_error = error.TestProviderFailure }};
         var gateway = FakeGateway.init(alloc, &completions);
         defer gateway.deinit();
         var hooks = FakeAgentRuntimeDeps.init(alloc);
         defer hooks.deinit();
         var fixture = PromptFixture{};
-        try std.testing.expectError(error.UnknownHostName, runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job()));
+        try std.testing.expectError(error.TestProviderFailure, runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job()));
     }
 
     debug_trace.shutdown();
@@ -918,7 +918,7 @@ test "common Stop later stream failure persists copied partial text" {
         .{ .content = "candidate" },
         .{
             .chunks = &.{"partial"},
-            .stream_error_after_chunks = error.UnknownHostName,
+            .stream_error_after_chunks = error.TestProviderFailure,
         },
     });
     defer gateway.deinit();
@@ -935,7 +935,7 @@ test "common Stop later stream failure persists copied partial text" {
     const view = try registerStopTestHandler(&lifecycle_runtime, &handler);
 
     try std.testing.expectError(
-        error.UnknownHostName,
+        error.TestProviderFailure,
         runFakePromptWithLifecycle(
             &gateway,
             &deps,

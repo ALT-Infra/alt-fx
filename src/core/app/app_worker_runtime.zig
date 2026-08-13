@@ -194,10 +194,6 @@ pub fn Runtime(comptime App: type) type {
                     .admit
                 else
                     .drop,
-                .gateway_connection_status => |status| switch (status) {
-                    .clear => .admit,
-                    .connecting, .retrying, .recovered => .drop,
-                },
                 .command_output_complete => |lifecycle_id| if (cancelledCommandCompletionMatches(presenter, lifecycle_id))
                     .admit
                 else
@@ -809,20 +805,6 @@ pub fn Runtime(comptime App: type) type {
                         if (app.shell.worker_status_state().clear_route_recovery()) {
                             app.shell.render_requests.request(.footer);
                         }
-                    },
-                    .gateway_connection_status => |status| switch (status) {
-                        .clear => if (app.shell.worker_status_state().clear_gateway_connection()) {
-                            app.shell.render_requests.request(.footer);
-                        },
-                        .connecting, .retrying, .recovered => {
-                            if (!try requireAssistantTextDrain(handlers)) {
-                                try retainClaimedEventAndSuffix(app, &batch, "assistant_text_drain_blocked");
-                                drain_owns_current = false;
-                                break :events;
-                            }
-                            _ = app.shell.worker_status_state().set_gateway_connection(status, io_mod.milliTimestamp());
-                            app.shell.render_requests.request(.footer);
-                        },
                     },
                     .api_status_text => |text| {
                         resetStream(app, false);
@@ -2276,76 +2258,6 @@ test "core.app_worker_runtime clears route recovery activity on clear event but 
         .turn_thinking => |thinking| try std.testing.expectEqualStrings("▲ Provider unavailable · recovery paused after 3/3 attempts", thinking.label),
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
-}
-
-test "core.app_worker_runtime projects gateway connection lifecycle through one status row" {
-    var app = FakeApp.init(std.testing.allocator);
-    defer app.deinit();
-
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .gateway_connection_status = .connecting });
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .gateway_connection_status = .{
-        .retrying = .{ .number = 1, .limit = 3 },
-    } });
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .gateway_connection_status = .{
-        .recovered = .{ .number = 2, .limit = 3 },
-    } });
-    try tickNoop(&app);
-
-    switch (app.shell.activityProjection()) {
-        .turn_thinking => |thinking| {
-            try std.testing.expectEqual(activity_runtime.ActivityProjection.Tone.success, thinking.tone);
-            try std.testing.expectEqualStrings("Connection recovered · attempt 2/3", thinking.label);
-        },
-        .none, .tool_slot => return error.TestUnexpectedResult,
-    }
-    try std.testing.expectEqual(@as(usize, 0), app.shell.lifecycle.entries.items.len);
-
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .gateway_connection_status = .clear });
-    try tickNoop(&app);
-    try std.testing.expect(app.shell.activityProjection() == .none);
-}
-
-test "core.app_worker_runtime interrupted batch admits gateway clear and drops late presentation" {
-    const late_statuses = [_]types.GatewayConnectionStatus{
-        .connecting,
-        .{ .retrying = .{ .number = 1, .limit = 3 } },
-        .{ .recovered = .{ .number = 2, .limit = 3 } },
-    };
-
-    for (late_statuses) |late_status| {
-        var app = FakeApp.init(std.testing.allocator);
-        defer app.deinit();
-        app.worker.processing = true;
-
-        app.shell.worker_status_state().set_api("retained status", .danger);
-
-        app.worker.worker_cancel_requested.store(true, .seq_cst);
-        try app.worker.pushEvent(std.heap.c_allocator, .{ .gateway_connection_status = late_status });
-        try app.worker.pushEvent(std.heap.c_allocator, .{ .gateway_connection_status = .clear });
-        try queueTurnFinished(&app, 1, .interrupted);
-        try tickNoop(&app);
-
-        switch (app.shell.activityProjection()) {
-            .turn_thinking => |thinking| try std.testing.expectEqualStrings("retained status", thinking.label),
-            .none, .tool_slot => return error.TestUnexpectedResult,
-        }
-        try std.testing.expectEqual(@as(usize, 0), app.worker.events.items.len);
-    }
-}
-
-test "core.app_worker_runtime interrupted batch admits gateway clear" {
-    var app = FakeApp.init(std.testing.allocator);
-    defer app.deinit();
-    app.worker.processing = true;
-    try std.testing.expect(app.shell.worker_status_state().set_gateway_connection(.connecting, 0));
-
-    app.worker.worker_cancel_requested.store(true, .seq_cst);
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .gateway_connection_status = .clear });
-    try queueTurnFinished(&app, 1, .interrupted);
-    try tickNoop(&app);
-
-    try std.testing.expect(app.shell.activityProjection() == .none);
-    try std.testing.expectEqual(@as(usize, 0), app.worker.events.items.len);
 }
 
 test "core.app_worker_runtime recovery pause replaces cancelled waiting status" {

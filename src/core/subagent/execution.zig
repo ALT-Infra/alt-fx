@@ -1227,7 +1227,6 @@ fn livePresentationEventBytes(event: worker_runtime.WorkerEvent) ?usize {
         => |text| text.len,
         .command_output_complete,
         .clear_route_recovery_status,
-        .gateway_connection_status,
         .route_recovery_status,
         .turn_token_update,
         .tool_payload_started,

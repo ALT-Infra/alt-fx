@@ -968,7 +968,7 @@ fn appendReadFailureRecoveryContext(
         .continue_after_confirmed_tool => "<network_recovery>\nThe response stream was interrupted after a confirmed tool result. Continue from the confirmed result without repeating the tool.\n</network_recovery>",
         .reconcile_tool => "<network_recovery>\nThe response stream was interrupted after provider tool activity with an uncertain outcome. Reconcile the existing evidence before proposing any repeat action. Do not blindly replay the tool.\n</network_recovery>",
         .retry_request => "<network_recovery>\nThe provider response was interrupted before any assistant output or tool activity escaped. Re-run the response for the same user request.\n</network_recovery>",
-        .wait_for_connectivity, .pause, .stop => return messages,
+        .pause, .stop => return messages,
     };
     projected[messages.len] = .{
         .role = .system,
@@ -1092,7 +1092,6 @@ fn checkpointAction(
         .regenerate_tool => .regenerating_tool,
         .continue_after_confirmed_tool => .continuing_after_tool,
         .reconcile_tool => .reconciling_tool,
-        .wait_for_connectivity => .waiting_for_connectivity,
         .pause, .stop => .paused,
     };
 }
@@ -1220,18 +1219,6 @@ fn waitForRecoveryDelay(
     return !cancel_flag.load(.seq_cst);
 }
 
-noinline fn connectivityWaitExpired(
-    started: ?std.Io.Clock.Timestamp,
-    timeout_ms: ?i64,
-) bool {
-    const limit = timeout_ms orelse return false;
-    const begin = started orelse return false;
-    const elapsed = begin.durationTo(
-        std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake),
-    ).raw.toMilliseconds();
-    return elapsed >= limit;
-}
-
 fn recoveryPauseRequested(config: Config) bool {
     const flag = config.recovery_pause_flag orelse return false;
     return flag.load(.seq_cst);
@@ -1288,29 +1275,6 @@ noinline fn pushRouteRecoveryStatus(
 ) !void {
     try deps.push_route_recovery_status(deps.ctx, status);
 }
-
-const ModelGatewayConnectionStatusBridge = struct {
-    deps: *const AgentRuntimeDeps,
-    provider_attempt: usize,
-    attempt_limit: usize,
-
-    fn push(raw: *anyopaque, status: types.GatewayConnectionStatus) !void {
-        const self: *@This() = @ptrCast(@alignCast(raw));
-        switch (status) {
-            .connecting, .retrying => try pushRouteRecoveryStatus(self.deps, .{
-                .kind = .auto_retry,
-                .failed_attempt = self.provider_attempt,
-                .attempt_limit = self.attempt_limit,
-                .cause = .network_interrupted,
-                .action = .waiting_for_connectivity,
-            }),
-            .recovered, .clear => try self.deps.push_event(
-                self.deps.ctx,
-                .clear_route_recovery_status,
-            ),
-        }
-    }
-};
 
 noinline fn clearAutoRetryStatusIfNeeded(
     deps: *const AgentRuntimeDeps,
@@ -1436,7 +1400,6 @@ fn pushAutoRetryStatus(
             .regenerate_tool => .regenerating_tool,
             .continue_after_confirmed_tool => .continuing_after_tool,
             .reconcile_tool => .reconciling_tool,
-            .wait_for_connectivity => .waiting_for_connectivity,
             .pause => .paused,
             .stop => null,
         },
@@ -2234,9 +2197,6 @@ fn processQueuedPromptLoop(
         restoredRecoveryToolEvidence(checkpoint.tool_state)
     else
         .none;
-    var waiting_for_connectivity = false;
-    var connectivity_wait_started: ?std.Io.Clock.Timestamp = null;
-    var connectivity_probe_failures: usize = 0;
     var restore_recovery_source = job.recovery_checkpoint != null;
     var step: usize = 0;
     while (agent_steps.allowsStep(config.agent_step_limit, step)) : (step += 1) {
@@ -2340,12 +2300,7 @@ fn processQueuedPromptLoop(
             }
 
             gateway_model = job.model;
-            if (recoveryPauseRequested(config) or
-                (waiting_for_connectivity and connectivityWaitExpired(
-                    connectivity_wait_started,
-                    config.connectivity_wait_timeout_ms,
-                )))
-            {
+            if (recoveryPauseRequested(config)) {
                 recovery_strategy = .pause;
                 try persistRecoveryCheckpoint(
                     deps,
@@ -2549,11 +2504,7 @@ fn processQueuedPromptLoop(
 
             const gateway_wait_started_ms = io_mod.milliTimestamp();
             var gateway_delivery = runtime_gateway_step.DeliveryCertainty.init();
-            var connection_status_bridge = ModelGatewayConnectionStatusBridge{
-                .deps = deps,
-                .provider_attempt = semantic_attempt + 1,
-                .attempt_limit = semantic_limit,
-            };
+            var gateway_attempt_evidence: runtime_gateway_step.AttemptEvidence = .{};
             stream_result = runtime_gateway_step.streamGatewayCompletion(
                 deps.agent_stream_provider,
                 arena,
@@ -2564,12 +2515,9 @@ fn processQueuedPromptLoop(
                 config.gateway_retry_count,
                 config.gateway_chat_url,
                 request_payload,
-                .{
-                    .ctx = &connection_status_bridge,
-                    .push = ModelGatewayConnectionStatusBridge.push,
-                },
                 deps.cooperative_transport_pulse,
                 &gateway_delivery,
+                &gateway_attempt_evidence,
                 @ptrCast(&stream_ctx),
                 runtime_assistant_stream.onStreamContentChunk,
                 if (vision_mode == .required)
@@ -2594,15 +2542,17 @@ fn processQueuedPromptLoop(
                     debug_trace.logf("agent", "token progress publication failed source=gateway_error err={s}", .{@errorName(progress_err)});
                 };
                 const cancel_requested = config.cancel_flag.load(.seq_cst);
-                const delivery_state = gateway_delivery.load();
-                const consumed_attempts = semantic_attempt + @intFromBool(delivery_state == .possibly_sent);
-                const system_resumed = err == error.SystemResumed;
+                const consumed_attempts = semantic_attempt +
+                    @as(usize, @intFromBool(gateway_attempt_evidence.provider_admitted));
+                const network_failure = gateway_attempt_evidence.network_failure;
+                const failure_cause: model_response_recovery.FailureCause = if (network_failure) |evidence|
+                    switch (evidence.cause) {
+                        .transport_interrupted => .transport_interrupted,
+                        .system_resumed => .system_resumed,
+                    }
+                else
+                    recovery_cause;
                 if (recoveryPauseRequested(config)) {
-                    const pause_cause: model_response_recovery.FailureCause = if (system_resumed or
-                        (waiting_for_connectivity and recovery_cause == .system_resumed))
-                        .system_resumed
-                    else
-                        recovery_cause;
                     try persistRecoveryCheckpoint(
                         deps,
                         arena,
@@ -2619,7 +2569,7 @@ fn processQueuedPromptLoop(
                         semantic_limit,
                         consumed_attempts,
                         false,
-                        pause_cause,
+                        failure_cause,
                         .pause,
                         effectiveRecoveryToolEvidence(
                             preserved_tool_evidence,
@@ -2633,7 +2583,7 @@ fn processQueuedPromptLoop(
                         deps,
                         finalization,
                         &finish_trace,
-                        pause_cause,
+                        failure_cause,
                         consumed_attempts,
                         semantic_limit,
                         pausedRequiredAction(effectiveRecoveryToolEvidence(
@@ -2644,15 +2594,13 @@ fn processQueuedPromptLoop(
                     );
                     return;
                 }
-                const recoverable_error = err == error.ReadFailed or
-                    err == error.ConnectionResetByPeer or
-                    err == error.ConnectionTimedOut or
-                    err == error.HttpConnectionClosing or
-                    system_resumed;
-                var recovery_decision = if (recoverable_error)
+                var recovery_decision = if (network_failure) |evidence|
                     model_response_recovery.decide(.{
-                        .cause = if (system_resumed) .system_resumed else .transport_interrupted,
-                        .delivery = if (delivery_state == .possibly_sent) .possibly_sent else .definitely_unsent,
+                        .cause = failure_cause,
+                        .delivery = switch (evidence.delivery) {
+                            .definitely_unsent => .definitely_unsent,
+                            .possibly_sent => .possibly_sent,
+                        },
                         .attempts = .{ .consumed = consumed_attempts, .limit = semantic_limit },
                         .output = if (stream_ctx.raw_text.items.len > 0) .partial else .none,
                         .tool = effectiveRecoveryToolEvidence(
@@ -2664,40 +2612,16 @@ fn processQueuedPromptLoop(
                     })
                 else
                     model_response_recovery.Decision{ .strategy = .stop };
-                const replay_safe = recoverable_error and streamReplaySafe(&stream_ctx);
+                const replay_safe = network_failure != null and streamReplaySafe(&stream_ctx);
                 const reconciliation_tool_violation =
                     recovery_strategy == .reconcile_tool and stream_ctx.saw_tool_start;
-                const connectivity_retry = !reconciliation_tool_violation and (system_resumed or
-                    (waiting_for_connectivity and delivery_state == .definitely_unsent)) and
-                    consumed_attempts < semantic_limit and
-                    !connectivityWaitExpired(
-                        connectivity_wait_started,
-                        config.connectivity_wait_timeout_ms,
-                    );
-                if (connectivity_retry) {
-                    recovery_decision = .{
-                        .strategy = .wait_for_connectivity,
-                        .delay_ns = model_response_recovery.retryDelayNs(connectivity_probe_failures + 1),
-                    };
-                } else if (waiting_for_connectivity and
-                    connectivityWaitExpired(
-                        connectivity_wait_started,
-                        config.connectivity_wait_timeout_ms,
-                    ))
-                {
-                    recovery_decision = .{
-                        .strategy = .pause,
-                        .required_action = .continue_later,
-                    };
-                }
                 if (reconciliation_tool_violation) {
                     recovery_decision = .{
                         .strategy = .pause,
                         .required_action = .inspect_uncertain_tool,
                     };
                 }
-                const will_auto_retry = connectivity_retry or
-                    recovery_decision.reserve_provider_attempt;
+                const will_auto_retry = recovery_decision.reserve_provider_attempt;
                 debug_trace.eventf(
                     "gateway",
                     "stream_error",
@@ -2723,11 +2647,6 @@ fn processQueuedPromptLoop(
                         stream_ctx.raw_text.items,
                     );
                 }
-                const failure_cause: model_response_recovery.FailureCause = if (system_resumed or
-                    (waiting_for_connectivity and recovery_cause == .system_resumed))
-                    .system_resumed
-                else
-                    .transport_interrupted;
                 try persistRecoveryCheckpoint(
                     deps,
                     arena,
@@ -2753,7 +2672,8 @@ fn processQueuedPromptLoop(
                     ),
                     step_ctx,
                 );
-                if (will_auto_retry) {
+                const auto_retry_status_published = will_auto_retry;
+                if (auto_retry_status_published) {
                     try pushAutoRetryStatus(
                         deps,
                         consumed_attempts,
@@ -2810,7 +2730,10 @@ fn processQueuedPromptLoop(
                 }
                 if (cancel_requested or !delay_completed) {
                     runtime_telemetry.traceCancelObserved(step_ctx, false);
-                    try clearAutoRetryStatusIfNeeded(deps, recovery_strategy != null);
+                    try clearAutoRetryStatusIfNeeded(
+                        deps,
+                        recovery_strategy != null or auto_retry_status_published,
+                    );
                     try stream_ctx.provisional_statuses.finishTrackedCancelled(
                         deps,
                         stream_ctx.alloc,
@@ -2827,46 +2750,8 @@ fn processQueuedPromptLoop(
                         null,
                         &stream_ctx,
                     );
-                    if (system_resumed) {
-                        waiting_for_connectivity = true;
-                        connectivity_wait_started = std.Io.Clock.Timestamp.now(
-                            io_mod.getIo(),
-                            .awake,
-                        );
-                        connectivity_probe_failures = 0;
-                        const after_resume = model_response_recovery.decide(.{
-                            .cause = .response_interrupted,
-                            .delivery = .possibly_sent,
-                            .attempts = .{ .consumed = consumed_attempts, .limit = semantic_limit },
-                            .output = if (stream_ctx.raw_text.items.len > 0) .partial else .none,
-                            .tool = effectiveRecoveryToolEvidence(
-                                preserved_tool_evidence,
-                                null,
-                                &stream_ctx,
-                            ),
-                        });
-                        recovery_strategy = after_resume.strategy;
-                        recovery_cause = .system_resumed;
-                    } else if (delivery_state == .definitely_unsent) {
-                        if (!waiting_for_connectivity) {
-                            waiting_for_connectivity = true;
-                            connectivity_wait_started = std.Io.Clock.Timestamp.now(
-                                io_mod.getIo(),
-                                .awake,
-                            );
-                        }
-                        connectivity_probe_failures += 1;
-                        if (recovery_cause != .system_resumed) {
-                            recovery_cause = .transport_interrupted;
-                        }
-                        recovery_strategy = recovery_decision.strategy;
-                    } else {
-                        waiting_for_connectivity = false;
-                        connectivity_wait_started = null;
-                        connectivity_probe_failures = 0;
-                        recovery_strategy = recovery_decision.strategy;
-                        recovery_cause = .transport_interrupted;
-                    }
+                    recovery_strategy = recovery_decision.strategy;
+                    recovery_cause = failure_cause;
                     if (recovery_strategy == .regenerate_tool) {
                         recovery_has_unexecuted_tool_start = true;
                     }
@@ -2880,14 +2765,14 @@ fn processQueuedPromptLoop(
                         deps,
                         finalization,
                         &finish_trace,
-                        if (system_resumed) .system_resumed else recovery_cause,
+                        failure_cause,
                         consumed_attempts,
                         semantic_limit,
                         recoveryRequiredAction(recovery_decision.required_action),
                     );
                     return;
                 }
-                if (err == error.ReadFailed) {
+                if (network_failure != null) {
                     const exhausted_retryable =
                         stream_ctx.raw_text.items.len == 0 and
                         !stream_ctx.saw_provider_tool_start and
@@ -2956,11 +2841,6 @@ fn processQueuedPromptLoop(
                 arena,
                 gateway_delivery.load(),
             );
-            if (gateway_delivery.load() == .possibly_sent) {
-                waiting_for_connectivity = false;
-                connectivity_wait_started = null;
-                connectivity_probe_failures = 0;
-            }
             stream_result_set = true;
             if (recovery_strategy == .reconcile_tool and
                 stream_result.status == .ok and
@@ -3028,8 +2908,7 @@ fn processQueuedPromptLoop(
                     &completed_tool_names,
                 );
             }
-            const settled_attempts = semantic_attempt +
-                @intFromBool(gateway_delivery.load() == .possibly_sent);
+            const settled_attempts = semantic_attempt + 1;
             try persistRecoveryCheckpoint(
                 deps,
                 arena,
