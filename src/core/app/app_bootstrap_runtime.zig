@@ -32,6 +32,7 @@ const Allocator = std.mem.Allocator;
 pub const CapabilityProviders = struct {
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
     skill_root_policy: skill_contract.RootPolicy,
+    terminal_title: host.TerminalTitle,
 };
 
 fn BootstrapDeps(comptime App: type) type {
@@ -56,8 +57,6 @@ fn BootstrapDeps(comptime App: type) type {
         const WelcomeMessageFn = *const fn (Allocator) anyerror![]u8;
         const BeginFreshPersistedSessionFn = *const fn (*App) anyerror!void;
         const EnableSessionStoresFn = *const fn (*App) void;
-        const SetTerminalTitleFn = *const fn ([]const u8) void;
-
         bootstrap_interactive_app: BootstrapInteractiveAppFn,
         configure_session_preferences: ConfigureSessionPreferencesFn,
         initialize_persistence: InitializePersistenceFn,
@@ -69,7 +68,7 @@ fn BootstrapDeps(comptime App: type) type {
         welcome_message: WelcomeMessageFn,
         begin_fresh_persisted_session: BeginFreshPersistedSessionFn,
         enable_session_stores: EnableSessionStoresFn,
-        set_terminal_title: SetTerminalTitleFn,
+        terminal_title: host.TerminalTitle,
     };
 }
 
@@ -108,7 +107,7 @@ pub fn Runtime(comptime App: type) type {
                 .welcome_message = welcomeMessageDefault,
                 .begin_fresh_persisted_session = beginFreshPersistedSessionDefault,
                 .enable_session_stores = enableSessionStoresDefault,
-                .set_terminal_title = setTerminalTitleDefault,
+                .terminal_title = capability_providers.terminal_title,
             };
         }
 
@@ -164,10 +163,6 @@ pub fn Runtime(comptime App: type) type {
             app_session_runtime.Runtime(App).enableSessionStores(app);
         }
 
-        fn setTerminalTitleDefault(model: []const u8) void {
-            ui_render.setTerminalTitle(model);
-        }
-
         // Neutral one-line summary inline; the full detail stays behind Ctrl+O.
         fn writeCollapsedStartupNotice(app: *App, topic: []const u8, summary_lead: []const u8, detail: []const u8) !void {
             const summary = try std.fmt.allocPrint(app.alloc, "{s} (ctrl o to view)", .{summary_lead});
@@ -192,6 +187,7 @@ pub fn Runtime(comptime App: type) type {
                 .terminal = &app.terminal,
                 .shell = &app.shell,
                 .metrics = &app.metrics,
+                .terminal_title = deps.terminal_title,
                 .footer_rows = footer_rows,
                 .startup_min_body_rows = ui_render.welcome_message_reserved_rows,
                 .default_model = default_model,
@@ -441,7 +437,7 @@ pub fn Runtime(comptime App: type) type {
             if (app.requested_resume == null) {
                 try deps.begin_fresh_persisted_session(app);
                 deps.enable_session_stores(app);
-                deps.set_terminal_title(app.selected_model.items);
+                deps.terminal_title.setModel(app.selected_model.items);
             }
 
             switch (staged_resume_view) {
@@ -632,7 +628,10 @@ fn testDeps() BootstrapDeps(TestApp) {
         .welcome_message = welcomeMessageForTest,
         .begin_fresh_persisted_session = beginFreshPersistedSessionForTest,
         .enable_session_stores = enableSessionStoresForTest,
-        .set_terminal_title = setTerminalTitleForTest,
+        .terminal_title = .{
+            .set_model_fn = setTerminalTitleModelForTest,
+            .clear_fn = clearTerminalTitleForTest,
+        },
     };
 }
 
@@ -803,11 +802,17 @@ fn enableSessionStoresForTest(_: *TestApp) void {
     capture.recordEvent("enable_stores");
 }
 
-fn setTerminalTitleForTest(model: []const u8) void {
+fn setTerminalTitleModelForTest(_: ?*anyopaque, model: []const u8) void {
     const capture = active_capture.?;
     capture.title_len = @min(model.len, capture.title.len);
     @memcpy(capture.title[0..capture.title_len], model[0..capture.title_len]);
     capture.recordEvent("title");
+}
+
+fn clearTerminalTitleForTest(_: ?*anyopaque) void {
+    const capture = active_capture.?;
+    capture.title_len = 0;
+    capture.recordEvent("title_clear");
 }
 
 fn runBootstrapForTest(app: *TestApp, capture: *TestCapture) !void {

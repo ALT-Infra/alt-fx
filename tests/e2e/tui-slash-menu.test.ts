@@ -82,6 +82,13 @@ function captureViewportEscapes(session: TmuxSession): string {
   });
 }
 
+function capturePaneTitle(session: TmuxSession): string {
+  return execFileSync("tmux", ["display-message", "-p", "-t", session.name, "#{pane_title}"], {
+    stdio: "pipe",
+    encoding: "utf-8",
+  }).trimEnd();
+}
+
 async function waitForSkillsMenu(session: TmuxSession, count: number): Promise<string[]> {
   const deadline = Date.now() + TIMEOUT;
   let latest: string[] = [];
@@ -2403,6 +2410,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         height: 32,
       });
       await session.waitForComposer(10_000);
+      expect(capturePaneTitle(session)).toBe(`fx · ${currentModel}`);
 
       await session.sendText("/models");
       let grid = await waitForModelsMenu(session, 4);
@@ -2462,6 +2470,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       const settings = JSON.parse(readFileSync(fixture.settingsPath, "utf8")) as { model?: string };
       expect(settings.model).toBe(selectedModel);
+      expect(capturePaneTitle(session)).toBe(`fx · ${selectedModel}`);
       expect(session.isAlive()).toBe(true);
 
       await session.sendText("/quit");

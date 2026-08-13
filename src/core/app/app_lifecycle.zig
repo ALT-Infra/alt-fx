@@ -245,6 +245,7 @@ pub const BootstrapConfig = struct {
     terminal: *TerminalState,
     shell: *TranscriptRuntime,
     metrics: *Metrics,
+    terminal_title: host.TerminalTitle,
     footer_rows: u16,
     startup_min_body_rows: u16 = 0,
     default_model: []const u8,
@@ -426,7 +427,12 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
 
     state.credential_onboarding_skipped = credentialOnboardingDisabled();
 
-    errdefer shutdownInteractiveShell(cfg.terminal, cfg.shell, cfg.metrics);
+    errdefer shutdownInteractiveShell(
+        cfg.terminal,
+        cfg.shell,
+        cfg.metrics,
+        cfg.terminal_title,
+    );
 
     try cfg.terminal.enableRawMode();
     cfg.terminal.installResizeSignal(cfg.resize_handler);
@@ -533,12 +539,17 @@ fn pushLaunchRowsIntoScrollback(
     }
 }
 
-pub fn shutdownInteractiveShell(terminal: *TerminalState, shell: *TranscriptRuntime, metrics: *Metrics) void {
+pub fn shutdownInteractiveShell(
+    terminal: *TerminalState,
+    shell: *TranscriptRuntime,
+    metrics: *Metrics,
+    terminal_title: host.TerminalTitle,
+) void {
     leaveAlternateScreens(terminal, shell, metrics);
     terminal.uninstallResizeSignal();
     uninstallAbnormalExitHandlers();
     _ = writeLifecycleTerminalBytes(shell, metrics, normalExitRestoreSequence(io_mod.getenv("TMUX"))) catch {};
-    ui_render.clearTerminalTitle();
+    terminal_title.clear();
     record_tape.shutdown();
     finishLeavingInteractiveMode(terminal, shell, metrics);
 }

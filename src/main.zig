@@ -450,6 +450,10 @@ const App = struct {
         return if (comptime host_profile.clipboard) native_host.clipboard else host.unavailable_clipboard;
     }
 
+    pub fn terminalTitle(_: *const Self) host.TerminalTitle {
+        return ui_render.terminal_title;
+    }
+
     alloc: Allocator,
     terminal: TerminalState = .{},
 
@@ -589,6 +593,7 @@ const App = struct {
             .{
                 .load_mcp_runtime = if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
                 .skill_root_policy = if (comptime host_target.is_wasm) wasm_skill_root_policy else builtin_skills.root_policy,
+                .terminal_title = ui_render.terminal_title,
             },
         );
         errdefer app.deinit();
@@ -601,7 +606,7 @@ const App = struct {
         if (comptime host_profile.durable_sessions or host_profile.js_host_sessions) {
             if (app.requested_resume != null) {
                 try SessionAppRuntime.resumeRequestedSession(&app);
-                ui_render.setTerminalTitle(app.selected_model.items);
+                app.terminalTitle().setModel(app.selected_model.items);
             }
         }
         if (comptime host_profile.durable_sessions) {
@@ -827,7 +832,12 @@ const App = struct {
 
     pub fn releaseTerminal(self: *App) void {
         if (!self.terminal.raw_enabled and !self.terminal.signal_handler_installed) return;
-        app_lifecycle.shutdownInteractiveShell(&self.terminal, &self.shell, &self.metrics);
+        app_lifecycle.shutdownInteractiveShell(
+            &self.terminal,
+            &self.shell,
+            &self.metrics,
+            self.terminalTitle(),
+        );
     }
 
     pub fn runExternalInteractive(self: *App, argv: []const []const u8) !void {
