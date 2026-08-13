@@ -5403,7 +5403,15 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await active.waitForComposer(TIMEOUT);
         await active.sendText("Fill the main transcript for resize isolation.");
         await active.waitForText("MAIN_SCROLLBACK_160", TIMEOUT);
-        const mainScrollbackBefore = await active.captureFullScrollback();
+        // Finished rows settle into native scrollback a frame after the final
+        // marker paints, so wait for the settled capture instead of sampling
+        // the instant the marker appears.
+        const mainScrollbackBefore = await waitForFullScrollback(
+          active,
+          (scrollback) =>
+            scrollback.includes("MAIN_SCROLLBACK_001") &&
+            countOccurrences(scrollback, "MAIN_SCROLLBACK_") >= 150,
+        );
         const mainLineCountBefore = countOccurrences(
           mainScrollbackBefore,
           "MAIN_SCROLLBACK_",
