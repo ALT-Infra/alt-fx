@@ -79,6 +79,11 @@ pub const ResumeHandoffIntent = enum {
     upgrade_requested,
 };
 
+const ResumeNotice = union(enum) {
+    session,
+    upgrade: []const u8,
+};
+
 pub const ResumeViewStage = union(enum) {
     none,
     ready: u32,
@@ -1358,10 +1363,24 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn resumeRequestedSession(app: *App) !void {
+            return resumeRequestedSessionWithNotice(app, .session);
+        }
+
+        pub fn resumeRequestedSessionAfterUpgrade(
+            app: *App,
+            version: []const u8,
+        ) !void {
+            return resumeRequestedSessionWithNotice(app, .{ .upgrade = version });
+        }
+
+        fn resumeRequestedSessionWithNotice(
+            app: *App,
+            notice: ResumeNotice,
+        ) !void {
             if (comptime runtime_profile.allows(App, .js_host_sessions) and
                 !runtime_profile.allows(App, .durable_sessions))
             {
-                return resumeRequestedJsHostSession(app);
+                return resumeRequestedJsHostSessionWithNotice(app, notice);
             }
             var target = app.requested_resume orelse return;
             app.requested_resume = null;
@@ -1396,12 +1415,19 @@ pub fn Runtime(comptime App: type) type {
             errdefer if (loaded_owned) loaded.deinit(app.alloc);
 
             loaded_owned = false;
-            try installResumedSession(app, &loaded);
+            try installResumedSession(app, &loaded, notice);
             errdefer closeWritableSession(app, .{});
             try app.commitStartupResumeReplayAnchor();
         }
 
         fn resumeRequestedJsHostSession(app: *App) !void {
+            return resumeRequestedJsHostSessionWithNotice(app, .session);
+        }
+
+        fn resumeRequestedJsHostSessionWithNotice(
+            app: *App,
+            notice: ResumeNotice,
+        ) !void {
             var target = app.requested_resume orelse return;
             app.requested_resume = null;
             defer target.deinit(app.alloc);
@@ -1480,7 +1506,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             };
             defer display.deinit(app.alloc);
-            hydrateResumedSession(app, loaded.state, display.title) catch |err| {
+            hydrateResumedSession(app, loaded.state, display.title, notice) catch |err| {
                 traceJsHostRestoreFailure("hydrate", session_id, err);
                 try continueWithFreshJsHostSession(app);
                 return;
@@ -1558,7 +1584,7 @@ pub fn Runtime(comptime App: type) type {
 
             try app.prepareLiveSessionResume(log_options);
             loaded_owned = false;
-            try installResumedSession(app, &loaded);
+            try installResumedSession(app, &loaded, .session);
             requestSubagentBackgroundRecovery(app);
             startResumedSessionReconciliation(app);
             try app.finishLiveSessionResume();
@@ -1587,6 +1613,7 @@ pub fn Runtime(comptime App: type) type {
         fn installResumedSession(
             app: *App,
             loaded: *session_store.LoadedWritableSession,
+            notice: ResumeNotice,
         ) !void {
             var loaded_owned = true;
             errdefer if (loaded_owned) loaded.deinit(app.alloc);
@@ -1603,7 +1630,7 @@ pub fn Runtime(comptime App: type) type {
                 app.session_persistence.writable = null;
             }
             const active = &app.session_persistence.writable.?;
-            try hydrateResumedSession(app, active.state, display.title);
+            try hydrateResumedSession(app, active.state, display.title, notice);
             active.resume_view_stale = true;
             enableSessionStores(app);
             refreshSubagentProjectionAfterSessionInstall(app);
@@ -1613,6 +1640,7 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             state: session_codec.DurableSessionState,
             display_title: []const u8,
+            notice: ResumeNotice,
         ) !void {
             if (comptime @hasField(App, "next_image_id")) {
                 app.next_image_id = try nextImageIdForResumedHistory(
@@ -1654,7 +1682,7 @@ pub fn Runtime(comptime App: type) type {
                     .app = app,
                     .projection = &projection,
                 };
-                try writeResumedSessionNotice(app, &sink, display_title);
+                try writeResumeNotice(app, &sink, display_title, notice);
                 try replayHistoryToSink(app, &sink, state.history);
                 try writeRecoveryCheckpointToSink(app, &sink, state);
                 const projection_finished_ns = io_mod.nanoTimestamp();
@@ -1674,7 +1702,7 @@ pub fn Runtime(comptime App: type) type {
                 );
             } else {
                 var sink = LiveHistorySink(App){ .app = app };
-                try writeResumedSessionNotice(app, &sink, display_title);
+                try writeResumeNotice(app, &sink, display_title, notice);
                 try replayHistoryToSink(app, &sink, state.history);
                 try writeRecoveryCheckpointToSink(app, &sink, state);
             }
@@ -3257,19 +3285,33 @@ pub fn Runtime(comptime App: type) type {
             return display;
         }
 
-        fn writeResumedSessionNotice(
+        fn writeResumeNotice(
             app: *App,
             sink: anytype,
             display_title: []const u8,
+            notice: ResumeNotice,
         ) !void {
             try setCachedSessionTitle(app, display_title);
-            const notice = try std.fmt.allocPrint(app.alloc, "resumed: {s}", .{display_title});
-            defer app.alloc.free(notice);
-            try sink.appendNotice(.{
-                .topic = "session",
-                .tone = .neutral,
-                .body = notice,
-            });
+            switch (notice) {
+                .session => try sink.appendNotice(.{
+                    .topic = "session resumed",
+                    .tone = .neutral,
+                    .body = display_title,
+                }),
+                .upgrade => |version| {
+                    const body = try std.fmt.allocPrint(
+                        app.alloc,
+                        "𝒇x has been updated to v{s}",
+                        .{version},
+                    );
+                    defer app.alloc.free(body);
+                    try sink.appendNotice(.{
+                        .topic = "",
+                        .tone = .success,
+                        .body = body,
+                    });
+                },
+            }
         }
 
         fn writeRecoveryCheckpointToSink(
@@ -6790,7 +6832,7 @@ test "resume view persistence waits for main frame and retries failed writes" {
     try std.testing.expectEqual(std.Io.File.Kind.file, stat.kind);
 }
 
-test "resumeRequestedSession restores active session and replays history" {
+test "upgrade resume restores active session with the installed version notice" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6876,7 +6918,7 @@ test "resumeRequestedSession restores active session and replays history" {
     app.requested_resume = .{ .id = try alloc.dupe(u8, "session-1") };
     app.total_web_search_requests = 99;
 
-    try Runtime(TestApp).resumeRequestedSession(&app);
+    try Runtime(TestApp).resumeRequestedSessionAfterUpgrade(&app, "9.9.9");
 
     try std.testing.expect(app.requested_resume == null);
     try std.testing.expectEqual(@as(usize, 1), app.startup_resume_anchor_count);
@@ -6900,7 +6942,7 @@ test "resumeRequestedSession restores active session and replays history" {
     try std.testing.expectEqualStrings("inspect file", context[1].assistant.user.text);
     try std.testing.expectEqualStrings("run server", context[2].background_command.user.text);
     try std.testing.expectEqual(@as(usize, 3), app.notices.items.len);
-    try std.testing.expectEqualStrings("● Session: resumed: hello", app.notices.items[0]);
+    try std.testing.expectEqualStrings("● 𝒇x has been updated to v9.9.9", app.notices.items[0]);
     try std.testing.expect(std.mem.find(u8, app.notices.items[1], "older context") != null);
     try std.testing.expect(std.mem.find(u8, app.notices.items[2], "Re-check runtime context") != null);
     try std.testing.expectEqual(@as(usize, 2), app.completed_tool_statuses.items.len);
@@ -7236,7 +7278,7 @@ test "interactive session resume uses the live transition and shared restore pat
     );
     try std.testing.expectEqual(@as(usize, 1), app.session.historyLen());
     try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
-    try std.testing.expectEqualStrings("● Session: resumed: saved prompt", app.notices.items[0]);
+    try std.testing.expectEqualStrings("● Session resumed: saved prompt", app.notices.items[0]);
     try std.testing.expect(!app.session_persistence.session_picker.active);
 
     const host = app.session_persistence.subagent_host.?;
@@ -7523,7 +7565,7 @@ test "resumeRequestedSession replays active-tool interruption with live cancella
     try std.testing.expectEqualStrings("inspect the browser", app.cards.items[0].text);
     try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
     try std.testing.expectEqual(@as(usize, 2), app.notices.items.len);
-    try std.testing.expectEqualStrings("● Session: resumed: inspect the browser", app.notices.items[0]);
+    try std.testing.expectEqualStrings("● Session resumed: inspect the browser", app.notices.items[0]);
     try std.testing.expectEqualStrings("● System: cancelled", app.notices.items[1]);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "localhost") == null);
 }

@@ -324,6 +324,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
                 request.executablePath(),
                 "resume",
                 handoff.session_id,
+                cli_surface.upgrade_relaunch_arg,
             };
             const replace_err = deps.replace_process(
                 deps.replace_ctx,
@@ -597,8 +598,8 @@ const TestCapture = struct {
     replace_error: std.process.ReplaceError = error.InvalidExe,
     replace_calls: usize = 0,
     replace_arg_count: usize = 0,
-    replace_arg_bufs: [3][128]u8 = undefined,
-    replace_arg_lens: [3]usize = .{ 0, 0, 0 },
+    replace_arg_bufs: [4][128]u8 = undefined,
+    replace_arg_lens: [4]usize = .{ 0, 0, 0, 0 },
     fail_unexpected_format: bool = false,
 
     fn init(run_result: cli_surface.RunResult) TestCapture {
@@ -925,10 +926,11 @@ test "app entry relaunches only after teardown with the validated handoff" {
 
     try std.testing.expectEqual(@as(u8, 1), outcome.exit);
     try std.testing.expectEqual(@as(usize, 1), capture.replace_calls);
-    try std.testing.expectEqual(@as(usize, 3), capture.replace_arg_count);
+    try std.testing.expectEqual(@as(usize, 4), capture.replace_arg_count);
     try std.testing.expectEqualStrings("/tmp/fx-upgraded", capture.replaceArg(0));
     try std.testing.expectEqualStrings("resume", capture.replaceArg(1));
     try std.testing.expectEqualStrings("session-123", capture.replaceArg(2));
+    try std.testing.expectEqualStrings("--upgrade-relaunch", capture.replaceArg(3));
     try std.testing.expect(std.mem.find(
         u8,
         capture.stderr.written(),

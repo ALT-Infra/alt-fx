@@ -2987,7 +2987,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           stderrPath: resumedStderrPath,
         });
         active = session;
-        const resumedRoot = await active.waitForText("● Session: resumed:", TIMEOUT);
+        const resumedRoot = await active.waitForText("● Session resumed:", TIMEOUT);
         expect(resumedRoot).toContain("CHECKPOINT3_PARENT_CREATED_CHILD");
         expect(resumedRoot).not.toContain("ctrl+x manager");
         expect(hasEmptyComposer(resumedRoot)).toBe(true);
@@ -3177,7 +3177,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           height: 28,
           stderrPath: directStderrPath,
         });
-        const directPane = await direct.waitForText("● Session: resumed:", TIMEOUT);
+        const directPane = await direct.waitForText("● Session resumed:", TIMEOUT);
         expect(hasEmptyComposer(directPane)).toBe(true);
         expect(directPane).not.toContain("Agents & processes");
 
@@ -3443,7 +3443,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           TIMEOUT,
         );
         await parent.sendKeys("Enter");
-        await parent.waitForText(`● Session: resumed: ${parentPrompt}`, TIMEOUT);
+        await parent.waitForText(`● Session resumed: ${parentPrompt}`, TIMEOUT);
         const recoveryMarker = `background host recovery finished root_id=${parentId}`;
         await parent.waitForPane(
           () => readFileSync(parentTracePath, "utf8").includes(recoveryMarker),

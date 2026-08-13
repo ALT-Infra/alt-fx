@@ -3978,7 +3978,7 @@ test.skipIf(!tmuxAvailable())(
 
       await contender.sendKeys("Enter");
       const resumed = await waitForScrollback(contender, savedMarker);
-      expect(resumed).toContain(`● Session: resumed: ${savedTitle}`);
+      expect(resumed).toContain(`● Session resumed: ${savedTitle}`);
       expect(resumed).toContain(savedMarker);
       expect(resumed).not.toContain("SessionBusy");
       await waitForSessionPickerClosed(contender);
@@ -4846,16 +4846,21 @@ test.skipIf(!tmuxAvailable())(
       await fresh.kill();
       fresh = null;
 
+      const version = (await runFx(["--version"])).stdout.trim();
       await active.sendHexBytes(["07"]);
 
-      await active.waitForText("● Session: resumed", TIMEOUT);
+      const updatedNotice = `● 𝒇x has been updated to v${version}`;
+      await active.waitForText(updatedNotice, TIMEOUT);
       const resumed = await waitForScrollback(active, "UPGRADE_CTRL_G_INITIAL_DONE");
       expect(resumed).toContain("UPGRADE_CTRL_G_INITIAL_DONE");
+      expect(resumed).toContain(updatedNotice);
+      expect(resumed).not.toContain("● Session resumed:");
+      expect(resumed).not.toContain("● Session: resumed:");
 
       const argvLines = readFileSync(argvLogPath, "utf8").trim().split("\n");
       expect(argvLines).toEqual([
         installedFx,
-        `${installedFx}\tresume\t${sessionId}`,
+        `${installedFx}\tresume\t${sessionId}\t--upgrade-relaunch`,
       ]);
 
       await active.sendText("Continue after upgrade handoff.");
@@ -4939,9 +4944,10 @@ test.skipIf(!tmuxAvailable())(
         (name) => name.startsWith("commit.") && name.endsWith(".json"),
       )!;
       writeFileSync(join(sessionDir, watermarkName), "{}\n", { mode: 0o600 });
+      const version = (await runFx(["--version"])).stdout.trim();
       await active.sendHexBytes(["07"]);
 
-      await active.waitForText("● Session: resumed", TIMEOUT);
+      await active.waitForText(`● 𝒇x has been updated to v${version}`, TIMEOUT);
       const resumed = await waitForScrollback(
         active,
         "UPGRADE_CORRUPT_INITIAL_DONE",
@@ -4949,7 +4955,9 @@ test.skipIf(!tmuxAvailable())(
       expect(resumed).toContain("UPGRADE_CORRUPT_INITIAL_DONE");
       expect(active.isPaneAlive()).toBe(true);
       const argvLines = readFileSync(argvLogPath, "utf8").trim().split("\n");
-      expect(argvLines).toEqual([`${installedFx}\tresume\t${sessionId}`]);
+      expect(argvLines).toEqual([
+        `${installedFx}\tresume\t${sessionId}\t--upgrade-relaunch`,
+      ]);
 
       await active.sendText("Continue after repaired upgrade handoff.");
       await active.waitForText("UPGRADE_CORRUPT_FOLLOWUP_DONE", TIMEOUT);
@@ -5566,7 +5574,7 @@ test.skipIf(!tmuxAvailable())(
       }
       await active.sendKeys("Enter");
       const resumed = await waitForScrollback(active, workspaceBMarker);
-      expect(resumed).toContain("● Session: resumed: Save the workspace B transcript.");
+      expect(resumed).toContain("● Session resumed: Save the workspace B transcript.");
       expect(resumed).toContain(workspaceBMarker);
       expect(resumed).not.toContain(workspaceAMarker);
       expect(active.isPaneAlive()).toBe(true);
@@ -5877,16 +5885,16 @@ test.skipIf(!tmuxAvailable())(
       );
       await active.sendKeys("Enter");
       const resumed = await waitForSessionPickerClosed(active);
-      expect(resumed).toContain(`● Session: resumed: Save ${savedMarkers[0]!}.`);
+      expect(resumed).toContain(`● Session resumed: Save ${savedMarkers[0]!}.`);
       expect(resumed).toContain(savedMarkers[0]!);
 
       await active.sendText("/resume");
       await waitForSessionPicker(active);
       await active.sendKeys("Escape");
       const afterEscape = await waitForSessionPickerClosed(active);
-      expect(afterEscape).toContain(`● Session: resumed: Save ${savedMarkers[0]!}.`);
+      expect(afterEscape).toContain(`● Session resumed: Save ${savedMarkers[0]!}.`);
       expect(afterEscape).toContain(savedMarkers[0]!);
-      expect(afterEscape).not.toContain(`● Session: resumed: Save ${savedMarkers[10]!}.`);
+      expect(afterEscape).not.toContain(`● Session resumed: Save ${savedMarkers[10]!}.`);
       expect(afterEscape).not.toContain(savedMarkers[10]!);
 
       await active.sendText("/resume");
@@ -5902,7 +5910,7 @@ test.skipIf(!tmuxAvailable())(
       );
       await active.sendKeys("Enter");
       const secondResume = await waitForSessionPickerClosed(active);
-      expect(secondResume).toContain(`● Session: resumed: Save ${savedMarkers[10]!}.`);
+      expect(secondResume).toContain(`● Session resumed: Save ${savedMarkers[10]!}.`);
       expect(active.isPaneAlive()).toBe(true);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 

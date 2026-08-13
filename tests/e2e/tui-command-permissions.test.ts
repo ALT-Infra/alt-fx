@@ -5232,7 +5232,7 @@ describe("effect-aware command permissions", () => {
         toolCall("touch must-not-exist"),
         finalText("permission resume denial complete"),
       ]);
-      await resumed.session.waitForText("● Session: resumed", TIMEOUT);
+      await resumed.session.waitForText("● Session resumed", TIMEOUT);
       await resumed.session.waitForText("ask · gpt-5", TIMEOUT);
       await resumed.session.sendText("Create the marker after resuming.");
 
@@ -5252,7 +5252,7 @@ describe("effect-aware command permissions", () => {
 
       const resumedScrollback = await resumed.session.captureFullScrollback();
       expect(resumedScrollback).toContain("permission resume seed complete");
-      expect(resumedScrollback).toContain("● Session: resumed");
+      expect(resumedScrollback).toContain("● Session resumed");
     },
     90_000,
   );
