@@ -896,12 +896,16 @@ const Connection = struct {
         if (testRequestFailureRequested("response_encoding", correlation_id)) {
             return error.OutOfMemory;
         }
+        const compatible_result = protocol.projectResultForCapabilities(
+            result,
+            self.capabilities,
+        );
         var frame = try protocol.encodeFrame(
             self.alloc,
             self.revision,
             0,
             correlation_id,
-            .{ .response = result },
+            .{ .response = compatible_result },
         );
         defer frame.deinit(self.alloc);
         const zio = io_mod.getIo();

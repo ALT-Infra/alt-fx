@@ -27,10 +27,12 @@ pub const compatibility_hello_revision: u16 = previous_protocol_revision - 1;
 pub const protocol_capability_authority_generations: u64 = 1 << 0;
 pub const protocol_capability_screen_checkpoints: u64 = 1 << 1;
 pub const protocol_capability_tmux_recovery: u64 = 1 << 2;
+pub const protocol_capability_path_outside_workspace_error: u64 = 1 << 3;
 pub const known_protocol_capabilities: u64 =
     protocol_capability_authority_generations |
     protocol_capability_screen_checkpoints |
-    protocol_capability_tmux_recovery;
+    protocol_capability_tmux_recovery |
+    protocol_capability_path_outside_workspace_error;
 
 pub const Action = enum {
     start,
@@ -2366,6 +2368,7 @@ pub const HostMessage = struct {
 
 pub const StructuredErrorCode = enum {
     invalid_request,
+    path_outside_workspace,
     unsupported_host,
     shell_unavailable,
     pty_unavailable,

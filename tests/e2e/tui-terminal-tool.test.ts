@@ -458,6 +458,15 @@ function sessionRecords(home: string): Array<Record<string, unknown>> {
   });
 }
 
+function sessionEventLogs(home: string): string {
+  const sessionsRoot = join(home, ".fx", "sessions");
+  if (!existsSync(sessionsRoot)) return "";
+  return readdirSync(sessionsRoot).map((name) => {
+    const path = join(sessionsRoot, name, "events.jsonl");
+    return existsSync(path) ? readFileSync(path, "utf8") : "";
+  }).join("\n");
+}
+
 test.skipIf(!tmuxAvailable())(
   "manager terminal takeover forwards raw input resizes detaches and restores inline state",
   async () => {
@@ -1260,6 +1269,140 @@ test.skipIf(!tmuxAvailable())(
     expect(pane).not.toContain("InvalidCommand");
     expect(pane).not.toContain("Failed start");
     expect(gateway.requests).toHaveLength(3);
+
+    const record = await waitForTerminalRecord(
+      fixture.home,
+      (candidate) =>
+        candidate.session_id === terminalSessionId &&
+        candidate.lifecycle === "closed",
+    );
+    const terminalPid = Number(record.pid);
+    expect(Number.isSafeInteger(terminalPid) && terminalPid > 0).toBe(true);
+    await waitForOwnedProcessExit([terminalPid]);
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "TUI explains external monitor rejection and preserves local monitor flow",
+  async () => {
+    const fixture = createFixture("fx-tui-terminal-monitor-path-scope-");
+    const outsidePath = join(fixture.root, "outside-ready");
+    const localPath = join(fixture.workspace, "local-ready");
+    const rejectedMarker = join(fixture.workspace, "rejected-start-ran");
+    writeFileSync(outsidePath, "ready");
+    let terminalSessionId = "";
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("terminal_external_path", "terminal", {
+        action: "start",
+        cwd: fixture.workspace,
+        command: `printf SHOULD_NOT_RUN > ${JSON.stringify(rejectedMarker)}`,
+        shell: {
+          kind: "executable",
+          path: TERMINAL_FIXTURE_SHELL,
+          clean_start: true,
+        },
+        backend: "native",
+        return_when: { kind: "exit" },
+        wait_ceiling_ms: 20_000,
+        initial_monitors: [{
+          condition: { kind: "path_exists", path: outsidePath },
+          check_interval_ms: 25,
+          notify: { kind: "on_match" },
+          lifetime: { kind: "until_match" },
+        }],
+      }),
+      (body) => {
+        const result = toolResultText(body, "terminal_external_path");
+        expect(result).toContain('"code":"path_outside_workspace"');
+        expect(terminalRecords(fixture.home)).toEqual([]);
+        expect(existsSync(rejectedMarker)).toBe(false);
+        expect(sessionEventLogs(fixture.home)).toContain("path_outside_workspace");
+        const identity = JSON.parse(
+          readFileSync(
+            join(fixture.home, ".fx", "terminal-host", "host.json"),
+            "utf8",
+          ),
+        ) as { pid: string };
+        expect(directChildPids(Number(identity.pid))).toEqual([]);
+        return fakeGatewayToolCall("terminal_local_path", "terminal", {
+          action: "start",
+          cwd: fixture.workspace,
+          command: holdUntilCleanup(fixture.root),
+          shell: {
+            kind: "executable",
+            path: TERMINAL_FIXTURE_SHELL,
+            clean_start: true,
+          },
+          backend: "native",
+          return_when: { kind: "started" },
+          dimensions: { rows: 24, columns: 80 },
+          initial_monitors: [{
+            condition: { kind: "path_exists", path: localPath },
+            check_interval_ms: 25,
+            notify: { kind: "on_match" },
+            lifetime: { kind: "until_match" },
+          }],
+        });
+      },
+      async (body) => {
+        const result = JSON.parse(
+          toolResultText(body, "terminal_local_path"),
+        ) as {
+          success: { start: { session: { session_id: string } } };
+        };
+        terminalSessionId = result.success.start.session.session_id;
+        expect(terminalSessionId.length).toBeGreaterThan(0);
+        writeFileSync(localPath, "ready");
+        await Bun.sleep(150);
+        return fakeGatewayToolCall("terminal_local_inspect", "terminal", {
+          action: "inspect",
+          session_id: terminalSessionId,
+          after_event_id: 0,
+          max_events: 16,
+        });
+      },
+      (body) => {
+        const result = JSON.parse(
+          toolResultText(body, "terminal_local_inspect"),
+        ) as {
+          success: {
+            inspect: {
+              events: Array<{ monitor_id: string; reason: string }>;
+            };
+          };
+        };
+        expect(result.success.inspect.events.some((event) =>
+          event.monitor_id === "monitor-1" && event.reason === "matched"
+        )).toBe(true);
+        return fakeGatewayToolCall("terminal_local_close", "terminal", {
+          action: "close",
+          session_id: terminalSessionId,
+          close_policy: "force",
+        });
+      },
+      (body) => {
+        const result = toolResultText(body, "terminal_local_close");
+        expect(result).toContain('"lifecycle":"closed"');
+        return fakeGatewayFinalText("Terminal monitor path scope verified");
+      },
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway);
+
+    await active.sendText("Verify terminal monitor workspace paths.");
+    const pane = await active.waitForText(
+      "Terminal monitor path scope verified",
+      TIMEOUT,
+    );
+    expect(pane).toContain("Failed start: path is outside the workspace");
+    expect(pane).toContain("Used terminal start");
+    expect(pane).toContain("Used terminal inspect");
+    expect(pane).toContain("Used terminal close");
+    expect(gateway.requests).toHaveLength(5);
+    expect(gateway.requests[1]!.body).toContain("path_outside_workspace");
+    expect(existsSync(rejectedMarker)).toBe(false);
 
     const record = await waitForTerminalRecord(
       fixture.home,

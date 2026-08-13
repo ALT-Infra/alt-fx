@@ -867,6 +867,32 @@ fn stringifyResult(
     };
 }
 
+pub fn mapAuthorizedResult(
+    alloc: Allocator,
+    result: tool_dispatch.DispatchResult,
+) Allocator.Error!tool_dispatch.DispatchResult {
+    if (result.status != .failure or result.status_detail != null) return result;
+    var parsed = std.json.parseFromSlice(
+        contracts.Result,
+        alloc,
+        result.body,
+        .{},
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return result,
+    };
+    defer parsed.deinit();
+    const code = switch (parsed.value) {
+        .success => return result,
+        .failure => |failure| failure.code,
+    };
+    if (code != .path_outside_workspace) return result;
+
+    var mapped = result;
+    mapped.status_detail = try alloc.dupe(u8, "path is outside the workspace");
+    return mapped;
+}
+
 fn structuredFailure(
     alloc: Allocator,
     action: contracts.Action,
@@ -1175,6 +1201,47 @@ test "registered terminal validation enforces action-specific input before execu
         else => {},
     };
     try std.testing.expect(rejected == .failure);
+}
+
+test "terminal result mapper adds detail only for workspace path failures" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        status: tool_dispatch.DispatchResult.Status,
+        body: []const u8,
+        expected_detail: ?[]const u8,
+    }{
+        .{
+            .status = .failure,
+            .body = "{\"failure\":{\"action\":\"start\",\"code\":\"path_outside_workspace\",\"session_id\":null,\"retryable\":false}}",
+            .expected_detail = "path is outside the workspace",
+        },
+        .{
+            .status = .failure,
+            .body = "{\"failure\":{\"action\":\"start\",\"code\":\"invalid_request\",\"session_id\":null,\"retryable\":false}}",
+            .expected_detail = null,
+        },
+        .{ .status = .failure, .body = "not json", .expected_detail = null },
+        .{
+            .status = .success,
+            .body = "{\"success\":{\"close\":{\"session\":{}}}}",
+            .expected_detail = null,
+        },
+    };
+
+    for (cases) |case| {
+        const body = try alloc.dupe(u8, case.body);
+        var mapped = try mapAuthorizedResult(alloc, .{
+            .status = case.status,
+            .body = body,
+        });
+        defer mapped.deinit(alloc);
+        try std.testing.expectEqualStrings(case.body, mapped.body);
+        if (case.expected_detail) |expected| {
+            try std.testing.expectEqualStrings(expected, mapped.status_detail.?);
+        } else {
+            try std.testing.expect(mapped.status_detail == null);
+        }
+    }
 }
 
 test "terminal public wait ceiling maps to action-specific Core requests" {

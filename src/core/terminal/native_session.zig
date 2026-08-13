@@ -1118,7 +1118,14 @@ const SupportedRegistry = struct {
             session.durable.rollback_unreleased_start() catch {};
             session.deinitUnlaunched();
             if (err == error.OutOfMemory) return error.OutOfMemory;
-            return self.failure(.start, .invalid_request, null);
+            return self.failure(
+                .start,
+                if (err == error.PathOutsideWorkspace)
+                    .path_outside_workspace
+                else
+                    .invalid_request,
+                null,
+            );
         };
         self.profile.register_resident(&session.durable) catch {
             session.deinitUnlaunched();
