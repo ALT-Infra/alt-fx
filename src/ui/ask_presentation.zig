@@ -147,7 +147,8 @@ pub const Runtime = struct {
     pub fn finish(self: *Runtime) !void {
         try self.checkPendingError();
         if (self.finished) return;
-        if (self.shell.render_requests.hasPending()) try self.render();
+        self.shell.setAssistantTailWritable(false);
+        try self.render();
         try self.restoreTerminal();
         self.finished = true;
     }
@@ -478,4 +479,36 @@ test "ask presentation retains a streaming write failure until finish" {
     };
     const write_err = observed orelse return error.TestExpectedError;
     try std.testing.expectError(write_err, runtime.finish());
+}
+
+test "ask presentation finish closes the assistant producer" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var output = try tmp.dir.createFile(std.testing.io, "ask-finish.log", .{ .read = true });
+    defer output.close(io_mod.getIo());
+
+    var runtime = try Runtime.initConfigured(
+        alloc,
+        .{ .text = @constCast("show output") },
+        false,
+        output,
+        zeroFooterLayout(.{
+            .rows = 12,
+            .cols = 48,
+            .content_bottom = 12,
+            .divider_top_row = 12,
+            .input_row = 12,
+            .divider_bottom_row = 12,
+            .hint_row = 12,
+        }),
+        .{ .row = 1, .col = 1 },
+        true,
+    );
+    defer runtime.deinit();
+
+    try runtime.pushText("answer\n");
+    try std.testing.expect(runtime.shell.assistant_tail_writable);
+    try runtime.finish();
+    try std.testing.expect(!runtime.shell.assistant_tail_writable);
 }

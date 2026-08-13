@@ -7076,9 +7076,38 @@ pub const TranscriptRuntime = struct {
                         receipt.remaining_semantic_progress_rows
                     else
                         0;
-                const semantic_rows = retained_semantic_rows + growth_rows;
-                const semantic_progress_rows =
+                const candidate_semantic_rows = retained_semantic_rows + growth_rows;
+                const candidate_semantic_progress_rows =
                     retained_semantic_progress_rows + growth_rows;
+                // Retained debt repairs the attempted frame. Only source
+                // growth is a new content release that needs finality.
+                const semantic_rows, const semantic_progress_rows = if (self.finalityFloorBytes(prepared) != null) bounded: {
+                    const releasable_offset = self.finalityReleasableOffset(
+                        prepared,
+                        target_offset,
+                    );
+                    const bounded_growth_rows = @min(
+                        growth_rows,
+                        releasable_offset -| (receipt.accepted_history_visual_offset +
+                            retained_semantic_rows),
+                    );
+                    const bounded_rows = retained_semantic_rows + bounded_growth_rows;
+                    const bounded_progress_growth_rows = @min(
+                        growth_rows,
+                        releasable_offset -| (receipt.accepted_visual_offset +
+                            retained_semantic_progress_rows),
+                    );
+                    break :bounded .{
+                        bounded_rows,
+                        @min(
+                            retained_semantic_progress_rows + bounded_progress_growth_rows,
+                            bounded_rows,
+                        ),
+                    };
+                } else .{
+                    candidate_semantic_rows,
+                    candidate_semantic_progress_rows,
+                };
                 const acknowledged_visual_offset =
                     receipt.accepted_visual_offset + semantic_progress_rows;
                 const recovery_projection_deferred = recovery_progress_compatible and
@@ -7687,6 +7716,7 @@ pub const TranscriptRuntime = struct {
                     target.body_disposition == .paint and
                     !scroll_facts.geometry_rebase and
                     !scroll_facts.recovery_rebase and
+                    scroll_facts.semantic_rows == 0 and
                     !self.fullTranscriptActive() and
                     !prepared.selection.split_active and
                     !target_layout.transcript_area.isEmpty() and

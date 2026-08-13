@@ -15260,6 +15260,130 @@ test "finality floor holds unfenced tool turn across quiet ticks and settles aft
     try std.testing.expectEqual(settled.visual_offset, settled.history_visual_offset);
 }
 
+test "catch-up release materializes history before staging a larger finality hold" {
+    const alloc = std.testing.allocator;
+    const committed_flow =
+        "row-00\nrow-01\nrow-02\nrow-03\n" ++
+        "row-04\nrow-05\nrow-06\nrow-07\n";
+    const target_flow = committed_flow ++
+        "row-08\nrow-09\nrow-10\nrow-11\nrow-12\nrow-13\n";
+    const finality_floor = "row-00\nrow-01\nrow-02\n".len;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+
+    var committed_source = try testSource(alloc, committed_flow, runtime.layout.cols);
+    defer committed_source.deinit(alloc);
+    var committed_prepared = try prepareTestSourceForCurrentArea(
+        &runtime,
+        alloc,
+        &committed_source,
+    );
+    defer committed_prepared.deinit(alloc);
+    try installStableAnchorForTest(
+        &runtime,
+        alloc,
+        committed_flow,
+        committed_prepared.selection,
+        preparedVisualOffsetForTest(&committed_prepared),
+        committed_prepared.cursor.cursor_row,
+        committed_prepared.cursor.cursor_col,
+        1,
+    );
+    switch (runtime.transcript_commit_state) {
+        .stable => |*anchor| {
+            anchor.history_visual_offset = 0;
+            anchor.history_catchup_pending = true;
+        },
+        .invalid, .recovering => return error.TestExpectedStableTranscript,
+    }
+
+    var source = try testSource(alloc, target_flow, runtime.layout.cols);
+    defer source.deinit(alloc);
+    source.finality.mutation_pin_start = finality_floor;
+    var prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &source);
+    defer prepared.deinit(alloc);
+    const facts = runtime.planTranscriptScroll(&prepared);
+    try std.testing.expect(facts.source_compatible);
+    try std.testing.expectEqual(@as(u32, 3), facts.semantic_rows);
+    try std.testing.expect(facts.semantic_rows > 0);
+    try std.testing.expect(
+        facts.target_visual_offset - facts.source_visual_offset > facts.semantic_rows,
+    );
+    try std.testing.expect(facts.finality_hold);
+
+    const scroll_plan = render_engine.frame_scroll_plan.merge(
+        runtime.layout.rows,
+        runtime.owned_top_row,
+        0,
+        facts.planned_rows,
+    );
+    var plan = testPaintPlan(&runtime, prepared.selection);
+    var transition = try runtime.finalizeTranscriptTransition(
+        alloc,
+        &source,
+        &prepared,
+        render_engine.frame_layout.CommittedLayoutSnapshot.fromPaintPlan(plan),
+        &plan,
+        scroll_plan,
+    );
+    defer transition.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "row-00\r\nrow-01\r\nrow-02\r\n",
+        transition.document_append.bytes,
+    );
+    switch (transition.document_append.clear) {
+        .rows => |rows| try std.testing.expectEqual(@as(u16, 3), rows),
+        .remainder => return error.TestExpectedHistoryReplay,
+    }
+}
+
+test "recovery growth does not release rows past the finality floor" {
+    const alloc = std.testing.allocator;
+    const attempt_flow =
+        "row-00\nrow-01\nrow-02\nrow-03\n" ++
+        "row-04\nrow-05\nrow-06\nrow-07\n";
+    const grown_flow = attempt_flow ++
+        "row-08\nrow-09\nrow-10\nrow-11\n";
+    const finality_floor = "row-00\nrow-01\nrow-02\nrow-03\n".len;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+        .transcript_commit_state = .{ .recovering = .{
+            .accepted_visual_offset = 4,
+            .accepted_history_visual_offset = 4,
+            .attempt_visual_offset = 4,
+            .attempt_total_visual_rows = 8,
+            .materialized_visual_offset = 4,
+            .materialized_visual_rows = 4,
+            .materialized_flow_len = attempt_flow.len,
+            .attempt_cols = 20,
+            .tracks_semantic_progress = true,
+            .flow = try alloc.dupe(u8, attempt_flow),
+            .cursor_row = 4,
+            .cursor_col = 1,
+        } },
+    };
+    defer runtime.deinit(alloc);
+
+    var source = try testSource(alloc, grown_flow, runtime.layout.cols);
+    defer source.deinit(alloc);
+    source.finality.mutation_pin_start = finality_floor;
+    var prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &source);
+    defer prepared.deinit(alloc);
+
+    const facts = runtime.planTranscriptScroll(&prepared);
+    try std.testing.expect(facts.source_compatible);
+    try std.testing.expect(facts.recovery_progress_compatible);
+    try std.testing.expectEqual(@as(u32, 8), facts.target_visual_offset);
+    try std.testing.expectEqual(@as(u32, 0), facts.semantic_rows);
+    try std.testing.expectEqual(@as(u32, 0), facts.semantic_progress_rows);
+    try std.testing.expectEqual(@as(u16, 0), facts.planned_rows);
+}
+
 test "pending replacement notice holds release until the finished replacement settles" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{

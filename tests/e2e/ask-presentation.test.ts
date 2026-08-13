@@ -3,6 +3,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -15,6 +16,7 @@ import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   fakeGatewayPermissionDecision,
+  fakeGatewaySse,
   fakeGatewaySerializedToolCall,
   fakeGatewayToolCall,
   startFakeGateway,
@@ -279,6 +281,64 @@ describe("fx ask presentation", () => {
       expect(pane).toContain("const answer: u8 = 42;");
       expect(escaped).not.toMatch(/\x1b\[[0-9;]*m/);
       expect(escaped).not.toContain("\x1b]8;");
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TTY output taller than the pane survives in native scrollback",
+    async () => {
+      const root = createRoot();
+      const answerLines = Array.from(
+        { length: 60 },
+        (_, index) => `ANSWER_LINE_${String(index + 1).padStart(2, "0")}`,
+      );
+      const gateway = startFakeGateway([
+        fakeGatewaySse([
+          ...answerLines.map((line) => ({
+            type: "text-delta",
+            id: "answer_1",
+            delta: `${line}\n`,
+          })),
+          {
+            type: "finish",
+            finishReason: { unified: "stop", raw: "stop" },
+            usage: {
+              inputTokens: { total: 3 },
+              outputTokens: { total: 60 },
+            },
+          },
+        ]),
+      ]);
+      gateways.push(gateway);
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+
+      const session = await TmuxSession.create({
+        cmd: terminalCommand([
+          "ask",
+          "--no-save",
+          "Render every answer line.",
+        ]),
+        cwd: root.workspace,
+        env: gatewayEnv(root.home, gateway),
+        width: 80,
+        height: 12,
+        minimumHistoryLines: 200,
+        remainOnExit: true,
+        stderrPath,
+      });
+      sessions.push(session);
+
+      await session.waitForText("__FX_EXIT_0__", TIMEOUT);
+      const scrollback = await session.captureFullScrollback();
+      let previousIndex = -1;
+      for (const line of answerLines) {
+        const index = scrollback.indexOf(line);
+        expect(index, line).toBeGreaterThan(previousIndex);
+        previousIndex = index;
+      }
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,
   );

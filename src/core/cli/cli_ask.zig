@@ -1828,6 +1828,10 @@ fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentati
     std.debug.assert(turn_id != 0);
     _ = disposition;
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    try pushToolLifecycle(raw_ctx, .{ .turn_finished = .{
+        .turn_id = turn_id,
+        .outcome = outcome,
+    } });
     if (outcome == .failed or outcome == .paused) {
         ctx.failed = true;
     }
