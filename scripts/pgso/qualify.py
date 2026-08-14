@@ -30,6 +30,7 @@ MINIMUM_SAMPLES = 50
 MAXIMUM_REGRESSION = 0.10
 REQUIRED_EVIDENCE = (
     "identity",
+    "runtime",
     "artifacts",
     "corpus",
     "startup",

@@ -67,7 +67,7 @@
       "timeout_seconds": 60,
       "requires_tmux": false
     },
-    {"name": "e2e-cli", "argv": ["bun", "test", "--max-concurrency", "1", "./cli.test.ts"], "test_file": "cli.test.ts"},
+    {"name": "e2e-cli", "argv": ["bun", "test", "--max-concurrency", "1", "./cli.test.ts"], "test_file": "cli.test.ts", "allow_keychain": true},
     {"name": "e2e-ask-presentation", "argv": ["bun", "test", "--max-concurrency", "1", "./ask-presentation.test.ts"], "test_file": "ask-presentation.test.ts"},
     {"name": "e2e-config-persistence", "argv": ["bun", "test", "--max-concurrency", "1", "./config-persistence.test.ts"], "test_file": "config-persistence.test.ts"},
     {"name": "e2e-prompt-history", "argv": ["bun", "test", "--max-concurrency", "1", "./prompt-history.test.ts"], "test_file": "prompt-history.test.ts"},

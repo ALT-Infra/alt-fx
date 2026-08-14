@@ -12,6 +12,7 @@ The driver fails unless all of these match exactly:
 - generic `aarch64-macos` output
 - Zig `0.16.0`
 - LLVM `21.1.8` tools and profile runtime from one configured LLVM root
+- Bun `1.3.14`
 - the selected source commit, update channel, bitcode hash, corpus hash, and profile-generation flags
 
 The pipeline does not use the host CPU as the release target. The final candidate must match the control's architecture and minimum macOS version, contain a valid code signature, contain no profile sections or profile-runtime dependency, and produce no profile output when executed.
@@ -45,7 +46,7 @@ python3 -m scripts.pgso all \
 
 [`corpus.json`](corpus.json) references existing test owners instead of copying their behavior. It contains six direct CLI commands and thirty deterministic E2E files covering CLI, configuration, tools, Gateway lifecycle, fake web and vision routes, ACP, modern and legacy MCP, sessions, terminal hosting, TUI startup, resizing, rendering, permissions, interruption, subagents, and recovery.
 
-Sound-bearing `notifications.test.ts` and `tui-command-permissions.test.ts` are explicitly excluded. Live-model and live-network files are forbidden. Corpus processes receive an isolated home and tmux socket and cannot inherit model credentials, the caller's tmux session, or an external LLVM profile destination.
+Sound-bearing `notifications.test.ts` and `tui-command-permissions.test.ts` are explicitly excluded. Live-model and live-network files are forbidden. Corpus processes receive per-scenario homes and isolated tmux sockets and cannot inherit model credentials, the caller's tmux session, or an external LLVM profile destination. The CLI suite explicitly links the host Keychains directory into only its scenario home so its uniquely named fake macOS Keychain assertions can run; no other scenario receives that access.
 
 Each training scenario must create a new nonempty raw profile. The driver merges that batch into the accumulator atomically, deletes only the successfully merged raw files, and stops before profile use on any missing scenario, timeout, warning, merge failure, or cleanup failure.
 

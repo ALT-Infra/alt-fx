@@ -5,6 +5,7 @@ import dataclasses
 import json
 import os
 import pathlib
+import shutil
 import sys
 from collections.abc import Mapping, Sequence
 
@@ -39,6 +40,7 @@ from scripts.pgso.toolchain import Toolchain
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 DEFAULT_CORPUS = REPO_ROOT / "scripts" / "pgso" / "corpus.json"
 MUTATING_COMMANDS = ("build", "train", "qualify", "all")
+REQUIRED_BUN_VERSION = "1.3.14"
 
 
 def ensure_fresh_output(path: pathlib.Path) -> pathlib.Path:
@@ -88,6 +90,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--samples", type=int, default=50)
     parser.add_argument("--timeout-seconds", type=float, default=1800)
     parser.add_argument("--zig", default="zig")
+    parser.add_argument("--bun", default="bun")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -177,6 +180,63 @@ def _configuration(arguments: argparse.Namespace) -> dict[str, object]:
         "samples": arguments.samples,
         "timeout_seconds": arguments.timeout_seconds,
         "zig": arguments.zig,
+        "bun": arguments.bun,
+    }
+
+
+def _resolve_runtime_executable(command: str, label: str) -> pathlib.Path:
+    candidate = shutil.which(command)
+    if candidate is None:
+        raise PgsoError(f"missing runtime executable: {label}")
+    resolved = pathlib.Path(candidate).resolve()
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise PgsoError(f"runtime executable is not usable: {label}: {resolved}")
+    return resolved
+
+
+def _runtime_versions(
+    arguments: argparse.Namespace,
+    paths: PipelinePaths,
+) -> tuple[pathlib.Path, dict[str, str]]:
+    bun = _resolve_runtime_executable(arguments.bun, "Bun")
+    bun_result = run_checked(
+        (str(bun), "--version"),
+        cwd=REPO_ROOT,
+        env=os.environ.copy(),
+        timeout_s=30,
+        log_path=paths.logs / "bun-version.json",
+        require_empty_stderr=True,
+    )
+    bun_version = bun_result.stdout.strip()
+    if bun_version != REQUIRED_BUN_VERSION:
+        raise PgsoError(
+            f"PGSO requires Bun {REQUIRED_BUN_VERSION}; "
+            f"bun reported {bun_version}"
+        )
+
+    tmux = _resolve_runtime_executable("tmux", "tmux")
+    tmux_result = run_checked(
+        (str(tmux), "-V"),
+        cwd=REPO_ROOT,
+        env=os.environ.copy(),
+        timeout_s=30,
+        log_path=paths.logs / "tmux-version.json",
+        require_empty_stderr=True,
+    )
+    macos_result = run_checked(
+        ("sw_vers", "-productVersion"),
+        cwd=REPO_ROOT,
+        env=os.environ.copy(),
+        timeout_s=30,
+        log_path=paths.logs / "macos-version.json",
+        require_empty_stderr=True,
+    )
+    return bun, {
+        "bun_path": str(bun),
+        "bun_version": bun_version,
+        "tmux_path": str(tmux),
+        "tmux_version": tmux_result.stdout.strip(),
+        "macos_version": macos_result.stdout.strip(),
     }
 
 
@@ -196,6 +256,7 @@ def run_command(arguments: argparse.Namespace) -> pathlib.Path:
             arguments.llvm_bin,
             arguments.target,
         )
+        bun, runtime_versions = _runtime_versions(arguments, paths)
         corpus = load_corpus(arguments.corpus, repo_root=REPO_ROOT)
         source_sha = _git_output(
             ("rev-parse", "HEAD"),
@@ -217,6 +278,7 @@ def run_command(arguments: argparse.Namespace) -> pathlib.Path:
             stage,
             "passed",
             {
+                "runtime": runtime_versions,
                 "validation": {
                     "source_sha": source_sha,
                     "host_arch": toolchain.host_arch,
@@ -310,6 +372,7 @@ def run_command(arguments: argparse.Namespace) -> pathlib.Path:
             paths.raw_profiles,
             paths.merged_profile,
             toolchain=toolchain,
+            bun=bun,
         )
         merged_raw_profiles += training_result.merged_raw_profiles
         profile_summary = _profile_summary(toolchain, paths)
@@ -377,6 +440,7 @@ def run_command(arguments: argparse.Namespace) -> pathlib.Path:
             corpus,
             paths.candidate_binary,
             paths.root / "candidate-behavior",
+            bun=bun,
         )
         corpus_evidence = {
             "manifest_path": str(corpus.manifest_path),

@@ -7,12 +7,15 @@ import unittest
 from unittest import mock
 
 from scripts.pgso.__main__ import (
+    _runtime_versions,
     ensure_fresh_output,
     load_read_only_manifest,
     parse_args,
     run_command,
 )
 from scripts.pgso.model import PgsoError
+from scripts.pgso.pipeline import PipelinePaths
+from scripts.pgso.runner import CommandResult
 
 
 class PgsoCliTests(unittest.TestCase):
@@ -43,6 +46,7 @@ class PgsoCliTests(unittest.TestCase):
         self.assertEqual(50, arguments.samples)
         self.assertGreater(arguments.timeout_seconds, 0)
         self.assertTrue(str(arguments.corpus).endswith("scripts/pgso/corpus.json"))
+        self.assertEqual("bun", arguments.bun)
 
     def test_every_mutating_command_requires_toolchain_and_output(self) -> None:
         for command in ("build", "train", "qualify", "all"):
@@ -77,6 +81,7 @@ class PgsoCliTests(unittest.TestCase):
                     "eligible": True,
                     "evidence": {
                         "identity": {},
+                        "runtime": {},
                         "artifacts": {},
                         "corpus": {},
                         "startup": [],
@@ -124,6 +129,30 @@ class PgsoCliTests(unittest.TestCase):
         self.assertEqual("validate", payload["stage"])
         self.assertFalse(payload["eligible"])
         self.assertEqual("wrong LLVM version", payload["error"])
+
+    def test_runtime_validation_rejects_the_wrong_bun_version(self) -> None:
+        arguments = parse_args(self.required_arguments())
+        paths = PipelinePaths.create(self.root / "runtime-output")
+        executable = self.root / "bun"
+        executable.write_bytes(b"fake")
+        executable.chmod(0o755)
+        result = CommandResult(
+            argv=(str(executable), "--version"),
+            returncode=0,
+            stdout="1.3.12\n",
+            stderr="",
+            elapsed_seconds=0.01,
+        )
+
+        with mock.patch(
+            "scripts.pgso.__main__._resolve_runtime_executable",
+            return_value=executable,
+        ), mock.patch(
+            "scripts.pgso.__main__.run_checked",
+            return_value=result,
+        ):
+            with self.assertRaisesRegex(PgsoError, "requires Bun 1.3.14"):
+                _runtime_versions(arguments, paths)
 
 
 if __name__ == "__main__":

@@ -209,6 +209,14 @@ class PgsoCorpusTests(unittest.TestCase):
         self.assertNotIn("notifications.test.ts", corpus.test_files)
         self.assertNotIn("tui-command-permissions.test.ts", corpus.test_files)
         self.assertEqual(36, len(corpus.scenarios))
+        self.assertEqual(
+            ("e2e-cli",),
+            tuple(
+                scenario.name
+                for scenario in corpus.scenarios
+                if scenario.allow_keychain
+            ),
+        )
 
     def make_scenario(
         self,
@@ -225,6 +233,7 @@ class PgsoCorpusTests(unittest.TestCase):
             env_unset=("PGSO_UNSET_ME",),
             timeout_seconds=5,
             requires_tmux=requires_tmux,
+            allow_keychain=False,
             test_file=None,
             skip_reason=skip_reason,
         )
@@ -337,7 +346,7 @@ class PgsoCorpusTests(unittest.TestCase):
         self.assertNotIn("TMUX", calls[0]["env"])
         self.assertNotIn("TMUX_PANE", calls[0]["env"])
         self.assertEqual(
-            str(self.root / "output" / "profiles" / "home"),
+            str(self.root / "output" / "profiles" / "home" / "first"),
             calls[0]["env"]["HOME"],
         )
         self.assertEqual(
@@ -347,6 +356,7 @@ class PgsoCorpusTests(unittest.TestCase):
                 / "output"
                 / "profiles"
                 / "home"
+                / "first"
                 / ".tmux.conf"
             ).read_text(),
         )
@@ -379,6 +389,29 @@ class PgsoCorpusTests(unittest.TestCase):
             self.run_fixture(corpus)
 
         self.assertEqual("cleaned", marker.read_text())
+
+    def test_keychain_access_is_scoped_to_the_declared_scenario_home(self) -> None:
+        host_home = self.root / "host-home"
+        host_keychains = host_home / "Library" / "Keychains"
+        host_keychains.mkdir(parents=True)
+        scenario = dataclasses_replace_allow_keychain(
+            self.make_scenario("keychain")
+        )
+
+        with mock.patch.object(pathlib.Path, "home", return_value=host_home):
+            self.run_fixture(self.make_corpus(scenario))
+
+        link = (
+            self.root
+            / "output"
+            / "profiles"
+            / "home"
+            / "keychain"
+            / "Library"
+            / "Keychains"
+        )
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(host_keychains.resolve(), link.resolve())
 
     def test_run_stops_and_records_a_failed_scenario(self) -> None:
         corpus = self.make_corpus(
@@ -449,7 +482,7 @@ class PgsoCorpusTests(unittest.TestCase):
         self.assertTrue(
             all(
                 call[1]["HOME"]
-                == str(self.root / "behavior-output" / "home")
+                == str(self.root / "behavior-output" / "home" / call[0][1])
                 for call in calls
             )
         )
@@ -459,6 +492,7 @@ class PgsoCorpusTests(unittest.TestCase):
                 self.root
                 / "behavior-output"
                 / "home"
+                / "first"
                 / ".tmux.conf"
             ).read_text(),
         )
@@ -477,6 +511,12 @@ def dataclasses_replace_env(
     import dataclasses
 
     return dataclasses.replace(scenario, env_set=(*scenario.env_set, item))
+
+
+def dataclasses_replace_allow_keychain(scenario: Scenario) -> Scenario:
+    import dataclasses
+
+    return dataclasses.replace(scenario, allow_keychain=True)
 
 
 if __name__ == "__main__":

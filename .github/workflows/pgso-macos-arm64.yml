@@ -66,6 +66,7 @@ jobs:
             --output-dir "$PGSO_OUTPUT" \
             --target aarch64-macos \
             --update-channel stable \
+            --bun "$(which bun)" \
             --samples 50
 
       - name: Upload candidate evidence

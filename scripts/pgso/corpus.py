@@ -47,6 +47,7 @@ class Scenario:
     env_unset: tuple[str, ...]
     timeout_seconds: float
     requires_tmux: bool
+    allow_keychain: bool
     test_file: str | None
     skip_reason: str | None = None
 
@@ -198,6 +199,9 @@ def _parse_scenario(
     requires_tmux = values.get("requires_tmux")
     if not isinstance(requires_tmux, bool):
         raise PgsoError(f"scenario {name} requires_tmux must be a boolean")
+    allow_keychain = values.get("allow_keychain", False)
+    if not isinstance(allow_keychain, bool):
+        raise PgsoError(f"scenario {name} allow_keychain must be a boolean")
 
     test_file = values.get("test_file")
     if test_file is not None:
@@ -232,6 +236,7 @@ def _parse_scenario(
         env_unset=env_unset,
         timeout_seconds=float(timeout_seconds),
         requires_tmux=requires_tmux,
+        allow_keychain=allow_keychain,
         test_file=test_file,
         skip_reason=skip_reason,
     )
@@ -332,7 +337,11 @@ def _scenario_environment(runtime_home: pathlib.Path) -> dict[str, str]:
     return environment
 
 
-def _prepare_runtime_home(runtime_home: pathlib.Path) -> None:
+def _prepare_runtime_home(
+    runtime_home: pathlib.Path,
+    *,
+    allow_keychain: bool,
+) -> None:
     runtime_home.mkdir(parents=True, exist_ok=True)
     tmux_config = runtime_home / ".tmux.conf"
     if tmux_config.is_symlink():
@@ -341,6 +350,14 @@ def _prepare_runtime_home(runtime_home: pathlib.Path) -> None:
         "set-option -g history-limit 100000\n",
         encoding="utf-8",
     )
+    if allow_keychain:
+        source = pathlib.Path.home() / "Library" / "Keychains"
+        if not source.is_dir():
+            raise PgsoError(f"host Keychains directory does not exist: {source}")
+        library = runtime_home / "Library"
+        library.mkdir()
+        destination = library / "Keychains"
+        destination.symlink_to(source, target_is_directory=True)
 
 
 def _result(
@@ -356,6 +373,22 @@ def _result(
     )
 
 
+def _scenario_argv(
+    scenario: Scenario,
+    canonical: pathlib.Path,
+    bun: pathlib.Path | str,
+) -> tuple[str, ...]:
+    resolved: list[str] = []
+    for argument in scenario.argv:
+        if argument == "{binary}":
+            resolved.append(str(canonical))
+        elif argument == "bun":
+            resolved.append(str(bun))
+        else:
+            resolved.append(argument)
+    return tuple(resolved)
+
+
 def run_corpus(
     corpus: Corpus,
     binary: pathlib.Path,
@@ -363,6 +396,7 @@ def run_corpus(
     merged_profile: pathlib.Path,
     *,
     toolchain: object,
+    bun: pathlib.Path | str = "bun",
     command_runner: Callable[..., CommandResult] = run_checked,
     profile_merger: Callable[..., int] = merge_profile_batch,
 ) -> CorpusResult:
@@ -371,7 +405,7 @@ def run_corpus(
     log_dir = profile_dir.parent.parent / "logs" / "corpus"
     log_dir.mkdir(parents=True, exist_ok=True)
     runtime_home = profile_dir.parent / "home"
-    _prepare_runtime_home(runtime_home)
+    runtime_home.mkdir(parents=True, exist_ok=True)
     tmux_root = profile_dir.parent / "tmux"
     tmux_root.mkdir(parents=True, exist_ok=True)
 
@@ -390,11 +424,16 @@ def run_corpus(
             )
             continue
 
-        environment = _scenario_environment(runtime_home)
+        scenario_home = runtime_home / scenario.name
+        _prepare_runtime_home(
+            scenario_home,
+            allow_keychain=scenario.allow_keychain,
+        )
+        environment = _scenario_environment(scenario_home)
         for key in scenario.env_unset:
             environment.pop(key, None)
         environment.update(dict(scenario.env_set))
-        environment["HOME"] = str(runtime_home)
+        environment["HOME"] = str(scenario_home)
         environment["LLVM_PROFILE_FILE"] = str(
             profile_dir / f"{scenario.name}-%m-%p-%c.profraw"
         )
@@ -403,10 +442,7 @@ def run_corpus(
             tmux_dir.mkdir(parents=True, exist_ok=True)
             environment["TMUX_TMPDIR"] = str(tmux_dir)
 
-        argv = tuple(
-            str(canonical) if argument == "{binary}" else argument
-            for argument in scenario.argv
-        )
+        argv = _scenario_argv(scenario, canonical, bun)
         before = set(profile_dir.glob("*.profraw"))
         command_result: CommandResult | None = None
         scenario_error: Exception | None = None
@@ -504,13 +540,14 @@ def run_behavior_corpus(
     binary: pathlib.Path,
     output_dir: pathlib.Path,
     *,
+    bun: pathlib.Path | str = "bun",
     command_runner: Callable[..., CommandResult] = run_checked,
 ) -> CorpusResult:
     canonical = _install_training_binary(corpus, binary)
     log_dir = output_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     runtime_home = output_dir / "home"
-    _prepare_runtime_home(runtime_home)
+    runtime_home.mkdir(parents=True, exist_ok=True)
     tmux_root = output_dir / "tmux"
     tmux_root.mkdir(parents=True, exist_ok=True)
 
@@ -528,20 +565,22 @@ def run_behavior_corpus(
             )
             continue
 
-        environment = _scenario_environment(runtime_home)
+        scenario_home = runtime_home / scenario.name
+        _prepare_runtime_home(
+            scenario_home,
+            allow_keychain=scenario.allow_keychain,
+        )
+        environment = _scenario_environment(scenario_home)
         for key in scenario.env_unset:
             environment.pop(key, None)
         environment.update(dict(scenario.env_set))
-        environment["HOME"] = str(runtime_home)
+        environment["HOME"] = str(scenario_home)
         if scenario.requires_tmux:
             tmux_dir = tmux_root / scenario.name
             tmux_dir.mkdir(parents=True, exist_ok=True)
             environment["TMUX_TMPDIR"] = str(tmux_dir)
 
-        argv = tuple(
-            str(canonical) if argument == "{binary}" else argument
-            for argument in scenario.argv
-        )
+        argv = _scenario_argv(scenario, canonical, bun)
         command_result: CommandResult | None = None
         scenario_error: Exception | None = None
         try:
