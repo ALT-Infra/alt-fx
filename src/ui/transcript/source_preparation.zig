@@ -1,5 +1,6 @@
 const std = @import("std");
 const command_output_runtime = @import("command_output_runtime.zig");
+const debug_trace = @import("../../core/shared/debug_trace.zig");
 const build_checkpoint = @import("../render_engine/build_checkpoint.zig");
 const tool_group_projection = @import("tool_group_projection.zig");
 const render_engine = @import("../render_engine.zig");
@@ -26,6 +27,129 @@ test {
     _ = tool_group_projection;
 }
 
+/// Byte offset where an unfenced tool turn's first rendered entry begins.
+/// Whether the turn is still open is a frame-fresh fact (the lifecycle
+/// watermark), so every retained turn keeps a candidate and the planner
+/// selects against the live watermark.
+pub const ToolTurnFloor = struct {
+    turn_id: u64,
+    start_byte: usize,
+};
+
+/// Activity-independent finality boundary candidates for the prepared flow.
+/// Each offset addresses the source's `bytes` at its `cols`.
+/// Selection against frame-fresh producer facts (lifecycle watermark,
+/// assistant-tail writability) happens in the scroll planner, outside any
+/// source cache.
+pub const FinalityCandidates = struct {
+    mutation_pin_start: ?usize = null,
+    assistant_tail_start: ?usize = null,
+    tool_turn_floors: []ToolTurnFloor = &.{},
+
+    pub fn deinit(self: *FinalityCandidates, alloc: Allocator) void {
+        if (self.tool_turn_floors.len > 0) alloc.free(self.tool_turn_floors);
+        self.* = .{};
+    }
+
+    pub fn clone(self: *const FinalityCandidates, alloc: Allocator) !FinalityCandidates {
+        return .{
+            .mutation_pin_start = self.mutation_pin_start,
+            .assistant_tail_start = self.assistant_tail_start,
+            .tool_turn_floors = try alloc.dupe(ToolTurnFloor, self.tool_turn_floors),
+        };
+    }
+};
+
+const FinalityNominationKind = enum { mutation_pin, tool_turn, assistant_tail };
+
+const FinalityNomination = struct {
+    entry_id: u32,
+    kind: FinalityNominationKind,
+    turn_id: u64 = 0,
+};
+
+fn entryHiddenByActions(
+    entry_actions: []const transcript_blocks.EntryRenderAction,
+    index: usize,
+) bool {
+    if (entry_actions.len == 0) return false;
+    return entry_actions[index] == .hide;
+}
+
+/// Nominate the entries whose rendered start bytes bound the final flow
+/// prefix: the first entry carrying a live mutation pin, the first rendered
+/// entry of each tool turn, and a trailing assistant entry. Omitted and
+/// hidden entries contribute no flow bytes and are skipped.
+fn collectFinalityNominations(
+    self: anytype,
+    alloc: Allocator,
+    omitted_entry_id: ?u32,
+    entry_actions: []const transcript_blocks.EntryRenderAction,
+) !std.ArrayList(FinalityNomination) {
+    var nominations: std.ArrayList(FinalityNomination) = .empty;
+    errdefer nominations.deinit(alloc);
+
+    var entry_turn_ids: std.AutoHashMapUnmanaged(u32, u64) = .empty;
+    defer entry_turn_ids.deinit(alloc);
+    for (self.tool_details.items) |detail| {
+        const turn_id: u64 = if (detail.presentation_group_id) |group|
+            group.turn_id
+        else if (detail.lifecycle_id) |lifecycle|
+            lifecycle.turn_id
+        else
+            continue;
+        try entry_turn_ids.put(alloc, detail.entry_id, turn_id);
+    }
+
+    var pin_nominated = false;
+    var seen_turns: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer seen_turns.deinit(alloc);
+    for (self.entries.items, 0..) |entry, index| {
+        const entry_id = entry.id();
+        if (omitted_entry_id == entry_id) continue;
+        if (entryHiddenByActions(entry_actions, index)) continue;
+        if (!pin_nominated) {
+            const pinned = switch (entry) {
+                .raw_bytes => |raw| raw.lifecycle_pinned,
+                .semantic_notice => |notice| notice.pending_replacement,
+                else => false,
+            };
+            if (pinned) {
+                try nominations.append(alloc, .{
+                    .entry_id = entry_id,
+                    .kind = .mutation_pin,
+                });
+                pin_nominated = true;
+            }
+        }
+        if (entry == .raw_bytes and entry.raw_bytes.class == .tool_status) {
+            if (entry_turn_ids.get(entry_id)) |turn_id| {
+                const seen = try seen_turns.getOrPut(alloc, turn_id);
+                if (!seen.found_existing) {
+                    try nominations.append(alloc, .{
+                        .entry_id = entry_id,
+                        .kind = .tool_turn,
+                        .turn_id = turn_id,
+                    });
+                }
+            }
+        }
+    }
+    if (self.entries.items.len > 0) {
+        const tail = self.entries.items[self.entries.items.len - 1];
+        if (tail == .assistant_turn and
+            omitted_entry_id != tail.id() and
+            !entryHiddenByActions(entry_actions, self.entries.items.len - 1))
+        {
+            try nominations.append(alloc, .{
+                .entry_id = tail.id(),
+                .kind = .assistant_tail,
+            });
+        }
+    }
+    return nominations;
+}
+
 pub const TranscriptPreparationSource = struct {
     bytes: []u8,
     folded_summary_indices: []usize,
@@ -47,6 +171,7 @@ pub const TranscriptPreparationSource = struct {
     transcript_visible_lines: []viewport_selection.VisibleTranscriptLine = &.{},
     transcript_line_visual_rows: []u16 = &.{},
     transcript_visual_row_offsets: []u32 = &.{},
+    finality: FinalityCandidates = .{},
 
     pub fn deinit(self: *TranscriptPreparationSource, alloc: Allocator) void {
         if (self.bytes.len > 0) alloc.free(self.bytes);
@@ -56,6 +181,7 @@ pub const TranscriptPreparationSource = struct {
         if (self.transcript_visible_lines.len > 0) alloc.free(self.transcript_visible_lines);
         if (self.transcript_line_visual_rows.len > 0) alloc.free(self.transcript_line_visual_rows);
         if (self.transcript_visual_row_offsets.len > 0) alloc.free(self.transcript_visual_row_offsets);
+        self.finality.deinit(alloc);
         self.* = undefined;
     }
 
@@ -119,6 +245,8 @@ pub const TranscriptPreparationSource = struct {
         errdefer alloc.free(transcript_line_visual_rows);
         const transcript_visual_row_offsets = try alloc.dupe(u32, self.transcript_visual_row_offsets);
         errdefer alloc.free(transcript_visual_row_offsets);
+        var finality = try self.finality.clone(alloc);
+        errdefer finality.deinit(alloc);
         return .{
             .bytes = bytes,
             .folded_summary_indices = folded_summary_indices,
@@ -140,6 +268,7 @@ pub const TranscriptPreparationSource = struct {
             .transcript_visible_lines = transcript_visible_lines,
             .transcript_line_visual_rows = transcript_line_visual_rows,
             .transcript_visual_row_offsets = transcript_visual_row_offsets,
+            .finality = finality,
         };
     }
 };
@@ -339,6 +468,8 @@ fn prepareTranscriptSourceInternal(
     else
         aligned_actions;
 
+    var finality: FinalityCandidates = .{};
+    errdefer finality.deinit(alloc);
     if (self.entries.items.len > 0 and self.layout.cols > 0) {
         rendered_from_entries = true;
         const capture_provenance = observationEnabled(self, alloc) or
@@ -348,6 +479,21 @@ fn prepareTranscriptSourceInternal(
             self.entries.items[self.entries.items.len - 1].raw_bytes.id
         else
             null;
+        var finality_nominations = try collectFinalityNominations(
+            self,
+            alloc,
+            omitted_entry_id,
+            entry_actions,
+        );
+        defer finality_nominations.deinit(alloc);
+        const finality_entry_ids = try alloc.alloc(u32, finality_nominations.items.len);
+        defer alloc.free(finality_entry_ids);
+        const finality_entry_start_bytes = try alloc.alloc(?usize, finality_nominations.items.len);
+        defer alloc.free(finality_entry_start_bytes);
+        for (finality_nominations.items, 0..) |nomination, index| {
+            finality_entry_ids[index] = nomination.entry_id;
+            finality_entry_start_bytes[index] = null;
+        }
         const summary_entry_ids = try alloc.alloc(?u32, self.folded_command_blocks.items.len);
         defer alloc.free(summary_entry_ids);
         for (self.folded_command_blocks.items, 0..) |block, index| {
@@ -362,6 +508,8 @@ fn prepareTranscriptSourceInternal(
             .{
                 .target_entry_id = tracked_entry_id,
                 .target_byte_entry_id = replaceable_entry_id,
+                .finality_entry_ids = finality_entry_ids,
+                .finality_entry_start_bytes = finality_entry_start_bytes,
                 .omitted_entry_id = omitted_entry_id,
                 .folded_summary_entry_ids = summary_entry_ids,
                 .capture_provenance = capture_provenance,
@@ -376,6 +524,29 @@ fn prepareTranscriptSourceInternal(
         trailing_boundary_blank_rows = rendered.trailing_boundary_blank_rows;
         tracked_entry_start_line = rendered.target_entry_start_line;
         replaceable_entry_start_byte = rendered.target_entry_start_byte;
+        var tool_turn_floors: std.ArrayList(ToolTurnFloor) = .empty;
+        errdefer tool_turn_floors.deinit(alloc);
+        for (finality_nominations.items, 0..) |nomination, index| {
+            const start_byte = finality_entry_start_bytes[index] orelse blk: {
+                // A nominated entry that produced no bytes cannot anchor the
+                // boundary; hold the whole flow rather than release past it.
+                debug_trace.logf(
+                    "scroll",
+                    "finality_nomination_unrecorded entry_id={d} kind={s}",
+                    .{ nomination.entry_id, @tagName(nomination.kind) },
+                );
+                break :blk 0;
+            };
+            switch (nomination.kind) {
+                .mutation_pin => finality.mutation_pin_start = start_byte,
+                .assistant_tail => finality.assistant_tail_start = start_byte,
+                .tool_turn => try tool_turn_floors.append(alloc, .{
+                    .turn_id = nomination.turn_id,
+                    .start_byte = start_byte,
+                }),
+            }
+        }
+        finality.tool_turn_floors = try tool_turn_floors.toOwnedSlice(alloc);
     } else {
         bytes = try alloc.dupe(u8, self.transcript.items);
         folded_summary_indices = try alloc.alloc(usize, self.folded_command_blocks.items.len);
@@ -514,6 +685,7 @@ fn prepareTranscriptSourceInternal(
         .cols = self.layout.cols,
         .recorded_entries_authoritative = rendered_from_entries,
         .cache_origin_untrimmed = cache_origin_untrimmed,
+        .finality = finality,
     };
 }
 

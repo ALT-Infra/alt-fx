@@ -312,6 +312,9 @@ pub const TranscriptEntry = union(enum) {
         tone: types.NoticeTone,
         body: []const u8,
         visibility: types.NoticeVisibility,
+        // The producer will replace this entry in place; its bytes are not
+        // final and must not be released into terminal history.
+        pending_replacement: bool = false,
     };
 
     pub const UserTurnEntry = struct {
@@ -1870,6 +1873,8 @@ const BlockSequenceState = struct {
 const RenderEntriesOptions = struct {
     target_entry_id: ?u32 = null,
     target_byte_entry_id: ?u32 = null,
+    finality_entry_ids: []const u32 = &.{},
+    finality_entry_start_bytes: []?usize = &.{},
     omitted_entry_id: ?u32 = null,
     entry_actions: []const EntryRenderAction = &.{},
     summary_entry_ids: []const ?u32 = &.{},
@@ -1984,6 +1989,11 @@ const RenderEntriesBuilder = struct {
         const entry_id = entry.id();
         if (options.target_entry_id == entry_id) self.target_entry_start_line = self.line_index;
         if (options.target_byte_entry_id == entry_id) self.target_entry_start_byte = self.out.items.len;
+        for (options.finality_entry_ids, 0..) |finality_entry_id, index| {
+            if (finality_entry_id == entry_id) {
+                options.finality_entry_start_bytes[index] = self.out.items.len;
+            }
+        }
         for (options.summary_entry_ids, 0..) |summary_entry_id, index| {
             if (summary_entry_id != null and summary_entry_id.? == entry_id) {
                 options.summary_transcript_indices[index] = self.line_index + 1;
@@ -2211,6 +2221,8 @@ pub const TranscriptPreparationBytes = struct {
 pub const TranscriptPreparationOptions = struct {
     target_entry_id: ?u32 = null,
     target_byte_entry_id: ?u32 = null,
+    finality_entry_ids: []const u32 = &.{},
+    finality_entry_start_bytes: []?usize = &.{},
     omitted_entry_id: ?u32 = null,
     entry_actions: []const EntryRenderAction = &.{},
     folded_summary_entry_ids: []const ?u32 = &.{},
@@ -2259,6 +2271,8 @@ pub fn renderEntriesForPreparationInterruptible(
         .{
             .target_entry_id = options.target_entry_id,
             .target_byte_entry_id = options.target_byte_entry_id,
+            .finality_entry_ids = options.finality_entry_ids,
+            .finality_entry_start_bytes = options.finality_entry_start_bytes,
             .omitted_entry_id = options.omitted_entry_id,
             .entry_actions = options.entry_actions,
             .summary_entry_ids = options.folded_summary_entry_ids,

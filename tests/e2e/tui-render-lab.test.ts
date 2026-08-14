@@ -33,6 +33,7 @@ test("render-lab lists gated Plan B native scenarios", () => {
   expect(output).toContain("startup-scrollback-enabled-overflow");
   expect(output).toContain("active-tool-placement");
   expect(output).toContain("user-card-resize-replay-scrollback");
+  expect(output).toContain("tui-observability-gauntlet");
   expect(output).toContain("native-ghostty-relaunch");
   expect(output).toContain("native-terminal-app-relaunch");
   expect(output).toContain("native-terminal-app-command-k");
@@ -472,6 +473,82 @@ test("render-lab analyzer rejects expanded command marker corruption", () => {
       (failure) => failure.invariant,
     );
     expect(failures).toContain(entry.invariant);
+  }
+});
+
+test("render-lab analyzer rejects duplicate permission UI", () => {
+  outDir = mkdtempSync(join(tmpdir(), "fx-render-lab-analyzer-test-"));
+  const prompt = "Would you like to run the following command?";
+  for (const [name, prompts, rejected] of [
+    ["single", [prompt], false],
+    ["duplicate", [prompt, prompt], true],
+  ] as const) {
+    const manifest = writeAnalyzerFixture(
+      join(outDir, name),
+      [
+        "OBSERVABILITY_TRANSCRIPT_HEAD",
+        "OBSERVABILITY_TRANSCRIPT_TAIL",
+        ...prompts,
+        "1. Yes",
+      ],
+      null,
+      [],
+      "observability-permission-inline",
+    );
+    manifest.scenario = "tui-observability-gauntlet";
+
+    const failures = analyzeRun(manifest).failures.map(
+      (failure) => failure.invariant,
+    );
+
+    expect(failures.includes("observability-permission-singleton")).toBe(
+      rejected,
+    );
+  }
+});
+
+test("render-lab analyzer rejects reordered observability scrollback", () => {
+  outDir = mkdtempSync(join(tmpdir(), "fx-render-lab-analyzer-test-"));
+  const markers = ["OBSERVABILITY_PROMPT_HEAD", "OBSERVABILITY_PROMPT_TAIL"];
+  for (const [name, transcript, rejected] of [
+    [
+      "ordered",
+      ["OBSERVABILITY_TRANSCRIPT_HEAD", "OBSERVABILITY_TRANSCRIPT_TAIL"],
+      false,
+    ],
+    [
+      "reordered",
+      ["OBSERVABILITY_TRANSCRIPT_TAIL", "OBSERVABILITY_TRANSCRIPT_HEAD"],
+      true,
+    ],
+  ] as const) {
+    const scrollback = [
+      ...markers,
+      ...transcript,
+      "OBSERVABILITY_TOOL_OUTPUT",
+      "OBSERVABILITY_FINAL_RESPONSE",
+    ].join("\n");
+    const manifest = writeAnalyzerFixture(
+      join(outDir, name),
+      [
+        "OBSERVABILITY_FINAL_RESPONSE",
+        "────────────────",
+        "❯",
+        "────────────────",
+        "model",
+      ],
+      null,
+      markers,
+      "observability-final-restored",
+      scrollback,
+    );
+    manifest.scenario = "tui-observability-gauntlet";
+
+    const failures = analyzeRun(manifest).failures.map(
+      (failure) => failure.invariant,
+    );
+
+    expect(failures.includes("observability-scrollback-order")).toBe(rejected);
   }
 });
 

@@ -60,6 +60,11 @@ pub const ResizeObservationPhase = enum {
     reset_queued,
 };
 
+pub const HistoryReleasePolicy = enum {
+    finality_gated,
+    append_only,
+};
+
 pub const ResizeObservationResult = union(enum) {
     awaiting,
     measured: i32,
@@ -129,6 +134,10 @@ const CommittedTranscriptAnchor = struct {
     measured_history_origin: ?transcript_painter.MeasuredHistoryOrigin = null,
     row_provenance: []transcript_blocks.RowProvenance = &.{},
     normal_buffer_recovery_pending: bool = false,
+    /// Stable-anchor settlement obligation. It is preserved while final rows
+    /// remain ahead of history and cleared once history reaches the viewport.
+    /// The offset gap alone is insufficient because footer displacement can
+    /// create the same shape without content debt.
     history_catchup_pending: bool = false,
 
     fn deinit(self: *CommittedTranscriptAnchor, alloc: Allocator) void {
@@ -225,6 +234,12 @@ pub const TranscriptScrollFacts = struct {
     recovery_progress_compatible: bool = false,
     recovery_tracks_semantic_progress: bool = false,
     recovery_projection_deferred: bool = false,
+    /// The finality floor withheld release this frame (mutable rows above
+    /// the viewport top), or final rows remain to settle beyond what this
+    /// frame planned. Routes into history_catchup_pending at commit so the
+    /// existing catch-up machinery settles the debt; footer displacement
+    /// (visual ahead of history with nothing to settle) stays unflagged.
+    finality_hold: bool = false,
 };
 
 pub const RetainedTranscriptBody = render_engine.frame_retention.RetainedTranscriptBody;
@@ -245,6 +260,10 @@ const MaterializedEndpoint = struct {
 pub const TranscriptTransition = struct {
     scroll_plan: render_engine.frame_scroll_plan.FrameScrollPlan,
     document_append: render_engine.frame_scroll_plan.FrameDocumentAppend,
+    /// Final rows exist beyond materialized history that this frame could
+    /// not release; consuming the transition requests a follow-up frame so
+    /// the debt settles promptly instead of waiting for outside activity.
+    history_settle_pending: bool = false,
     /// Owns `document_append.bytes` when append preparation allocates wire bytes.
     document_append_bytes: []u8 = &.{},
     resize_reflow_rows: u16 = 0,
@@ -4302,6 +4321,16 @@ pub const TranscriptRuntime = struct {
     entries: std.ArrayList(TranscriptEntry) = .empty,
     lifecycle_state: activity_runtime.ToolActivityState = .{},
     worker_status: worker_status.State = .none,
+    /// Frame-fresh producer fact: whether a trailing assistant entry can
+    /// still receive bytes (stream open or pacer holding pending/deferred
+    /// output). Drivers set it before each frame; the scroll planner treats
+    /// a writable tail as non-final. Defaults to writable so a driver that
+    /// never reports closure over-holds instead of releasing mutable rows.
+    assistant_tail_writable: bool = true,
+    /// Interactive transcripts gate native-history release on producer
+    /// finality. One-shot presenters use append-only release because they do
+    /// not revisit rows after writing them.
+    history_release_policy: HistoryReleasePolicy = .finality_gated,
     /// Sorted by entry id so exact lookup stays bounded as history grows.
     tool_details: std.ArrayList(ToolDetailRecord) = .empty,
     /// Monotonically increasing id stamped onto each new entry by the
@@ -6824,6 +6853,88 @@ pub const TranscriptRuntime = struct {
         return self.planTranscriptScrollForFrame(prepared, false, false);
     }
 
+    pub fn setAssistantTailWritable(self: *TranscriptRuntime, writable: bool) void {
+        if (self.assistant_tail_writable == writable) return;
+        self.assistant_tail_writable = writable;
+        debug_trace.logf(
+            "scroll",
+            "assistant tail writability changed writable={s}",
+            .{if (writable) "true" else "false"},
+        );
+    }
+
+    /// Selects the finality floor in flow bytes from the prepared paint's
+    /// activity-independent candidates plus the frame-fresh producer facts
+    /// (lifecycle watermark, assistant-tail writability, replaceable tail).
+    /// Null means the whole flow is final. Pure over its inputs, so repeated
+    /// calls within one frame agree.
+    fn finalityFloorBytes(
+        self: *const TranscriptRuntime,
+        prepared: *const transcript_painter.PreparedTranscriptSurfacePaint,
+    ) ?usize {
+        if (self.history_release_policy == .append_only) return null;
+        const candidates = prepared.finality_candidates;
+        var floor: ?usize = null;
+        if (candidates.mutation_pin_start) |start| {
+            floor = if (floor) |value| @min(value, start) else start;
+        }
+        const watermark = self.finalizedToolTurnWatermark();
+        for (candidates.tool_turn_floors) |turn_floor| {
+            if (turn_floor.turn_id <= watermark) continue;
+            floor = if (floor) |value|
+                @min(value, turn_floor.start_byte)
+            else
+                turn_floor.start_byte;
+        }
+        if (prepared.replaceable_last_line) {
+            floor = if (floor) |value|
+                @min(value, prepared.replaceable_start)
+            else
+                prepared.replaceable_start;
+        }
+        if (candidates.assistant_tail_start) |start| {
+            if (self.assistant_tail_writable) {
+                floor = if (floor) |value| @min(value, start) else start;
+            }
+        }
+        return floor;
+    }
+
+    /// Visual rows contributed by the flow prefix [0..flow_offset). The
+    /// prefix boundary always lands on an entry start, which is a hard-line
+    /// start; a mid-line offset rounds down to its line, the safe direction.
+    fn preparedVisualRowsForFlowOffset(
+        prepared: *const transcript_painter.PreparedTranscriptSurfacePaint,
+        flow_offset: usize,
+    ) u32 {
+        if (flow_offset == 0) return 0;
+        if (flow_offset >= prepared.bytes.len) return prepared.sourceTotalVisualRows();
+        const lines = prepared.sourceVisibleLines();
+        const visual_rows = prepared.sourceVisualRows();
+        var rows: u32 = 0;
+        for (lines, 0..) |line, index| {
+            switch (line) {
+                .transcript => |t| if (t.ref.ref.start >= flow_offset) return rows,
+                .folded_line => {},
+            }
+            if (index < visual_rows.len) rows += visual_rows[index];
+        }
+        return rows;
+    }
+
+    /// The largest visual offset whose rows are all backed by final entries,
+    /// clamped to the frame's target offset. Release permission never
+    /// extends past this value.
+    fn finalityReleasableOffset(
+        self: *const TranscriptRuntime,
+        prepared: *const transcript_painter.PreparedTranscriptSurfacePaint,
+        target_offset: u32,
+    ) u32 {
+        const floor_bytes = self.finalityFloorBytes(prepared) orelse return target_offset;
+        const floor_rows = preparedVisualRowsForFlowOffset(prepared, floor_bytes);
+        return @min(target_offset, floor_rows);
+    }
+
     pub fn planTranscriptScrollForFrame(
         self: *const TranscriptRuntime,
         prepared: *const transcript_painter.PreparedTranscriptSurfacePaint,
@@ -6890,9 +7001,38 @@ pub const TranscriptRuntime = struct {
                         receipt.remaining_semantic_progress_rows
                     else
                         0;
-                const semantic_rows = retained_semantic_rows + growth_rows;
-                const semantic_progress_rows =
+                const candidate_semantic_rows = retained_semantic_rows + growth_rows;
+                const candidate_semantic_progress_rows =
                     retained_semantic_progress_rows + growth_rows;
+                // Retained debt repairs the attempted frame. Only source
+                // growth is a new content release that needs finality.
+                const semantic_rows, const semantic_progress_rows = if (self.finalityFloorBytes(prepared) != null) bounded: {
+                    const releasable_offset = self.finalityReleasableOffset(
+                        prepared,
+                        target_offset,
+                    );
+                    const bounded_growth_rows = @min(
+                        growth_rows,
+                        releasable_offset -| (receipt.accepted_history_visual_offset +
+                            retained_semantic_rows),
+                    );
+                    const bounded_rows = retained_semantic_rows + bounded_growth_rows;
+                    const bounded_progress_growth_rows = @min(
+                        growth_rows,
+                        releasable_offset -| (receipt.accepted_visual_offset +
+                            retained_semantic_progress_rows),
+                    );
+                    break :bounded .{
+                        bounded_rows,
+                        @min(
+                            retained_semantic_progress_rows + bounded_progress_growth_rows,
+                            bounded_rows,
+                        ),
+                    };
+                } else .{
+                    candidate_semantic_rows,
+                    candidate_semantic_progress_rows,
+                };
                 const acknowledged_visual_offset =
                     receipt.accepted_visual_offset + semantic_progress_rows;
                 const recovery_projection_deferred = recovery_progress_compatible and
@@ -6999,14 +7139,14 @@ pub const TranscriptRuntime = struct {
         const recovery_rebase = (!source_compatible and !geometry_rebase) or
             !width_stable or
             self.resize_history_row_delta != null;
-        const history_advance_rows: u32 = if (!source_compatible and
-            width_stable and
-            self.committed_frame_layout.terminal_rows == self.layout.rows and
-            self.resize_history_row_delta == null and
-            target_offset > anchor.history_visual_offset)
-            target_offset - anchor.history_visual_offset
-        else
-            0;
+        // Release requires two independent facts: permission (the rows are
+        // final, expressed by the finality floor) and ability (this frame
+        // materializes their exact bytes, which an incompatible frame
+        // cannot). Either fact missing forces zero release; the frame
+        // re-anchors on the new flow and the derived history debt settles
+        // on the next compatible frame through the existing replay.
+        const releasable_offset = self.finalityReleasableOffset(prepared, target_offset);
+        const releasable_advance = releasable_offset -| anchor.history_visual_offset;
         const committed_projection_offset = committedProjectionVisualOffset(anchor);
         const geometry_history_rows: u32 = if (geometry_rebase and
             ((source_compatible and source_visual_growth) or
@@ -7014,16 +7154,45 @@ pub const TranscriptRuntime = struct {
             target_offset -| anchor.history_visual_offset
         else
             0;
+        // Geometry displacement (footer growth over transcript rows) keeps
+        // its pre-existing semantics: displaced rows are preserved into
+        // history even when mutable, because inline rendering has nowhere
+        // else to keep them. The finality clamp governs content-driven
+        // release only.
         const semantic_rows: u32 = if (geometry_rebase)
             geometry_history_rows
         else if (!recovery_rebase)
-            if (anchor.normal_buffer_recovery_pending or
-                anchor.history_catchup_pending)
+            // Normal-buffer recovery restores rows the takeover already
+            // displaced into scrollback; that restore is display repair,
+            // not a content release, so the finality clamp does not apply.
+            if (anchor.normal_buffer_recovery_pending)
                 target_offset -| anchor.history_visual_offset
+            else if (anchor.history_catchup_pending)
+                releasable_advance
             else
-                target_offset -| anchor.visual_offset
+                // Rows leaving the screen top are [visual..visual+scroll);
+                // the floor clamps that range, so the budget is measured
+                // from the committed viewport, not from history.
+                releasable_offset -| anchor.visual_offset
+        else if (self.compatibleCommittedHistoryReplayRange(
+            prepared,
+            anchor,
+            prepared.bytes,
+            releasable_offset,
+        ) != null)
+            releasable_advance
         else
-            history_advance_rows;
+            0;
+        // A finality hold is either the floor sitting below the viewport
+        // (mutable rows above the top) or a same-geometry incompatible frame
+        // that had permission to release but no ability to materialize;
+        // geometry-driven recovery (resize, reflow) owns its own debt.
+        const finality_hold = releasable_offset < target_offset or
+            (recovery_rebase and
+                width_stable and
+                self.committed_frame_layout.terminal_rows == self.layout.rows and
+                self.resize_history_row_delta == null and
+                releasable_offset > anchor.history_visual_offset +| semantic_rows);
         const semantic_progress_rows: u32 = if (source_compatible or geometry_rebase)
             semantic_rows
         else
@@ -7048,13 +7217,14 @@ pub const TranscriptRuntime = struct {
         );
         debug_trace.logf(
             "scroll",
-            "transcript_transition_plan source_state=stable source_start={d} target_start={d} source_visual_offset={d} source_history_visual_offset={d} target_visual_offset={d} source_total_visual_rows={d} target_total_visual_rows={d} resize_reflow_candidate={d} resize_reflow_rows={d} semantic_rows={d} planned_rows={d} width_stable={s} source_compatible={s} footer_reservation_changed={s} replay_displaced_footer_history={s} geometry_rebase={s} recovery_rebase={s}",
+            "transcript_transition_plan source_state=stable source_start={d} target_start={d} source_visual_offset={d} source_history_visual_offset={d} target_visual_offset={d} releasable_visual_offset={d} source_total_visual_rows={d} target_total_visual_rows={d} resize_reflow_candidate={d} resize_reflow_rows={d} semantic_rows={d} planned_rows={d} width_stable={s} source_compatible={s} footer_reservation_changed={s} replay_displaced_footer_history={s} geometry_rebase={s} recovery_rebase={s}",
             .{
                 anchor.selection.start_line,
                 prepared.selection.start_line,
                 anchor.visual_offset,
                 anchor.history_visual_offset,
                 target_offset,
+                releasable_offset,
                 anchor.total_visual_rows,
                 target_total_visual_rows,
                 resize_reflow_candidate,
@@ -7079,6 +7249,7 @@ pub const TranscriptRuntime = struct {
             .source_compatible = source_compatible,
             .geometry_rebase = geometry_rebase,
             .recovery_rebase = recovery_rebase,
+            .finality_hold = finality_hold,
             .recovery_progress_compatible = !recovery_rebase,
             .recovery_tracks_semantic_progress = source_compatible or geometry_rebase,
         };
@@ -7156,6 +7327,10 @@ pub const TranscriptRuntime = struct {
         history_catchup_pending: bool = false,
         staged_flow_end: ?usize = null,
         projection_staged: bool = false,
+        // The frame slides the viewport past withheld release with an
+        // in-place repaint. Any document append is bounded separately to
+        // the rows the frame may release.
+        hold_staged: bool = false,
 
         fn init(
             prepared: *const transcript_painter.PreparedTranscriptSurfacePaint,
@@ -7404,7 +7579,16 @@ pub const TranscriptRuntime = struct {
                 target.normal_buffer_recovery_pending =
                     anchor.normal_buffer_recovery_pending;
                 target.history_catchup_pending = anchor.history_catchup_pending;
-                if (!scroll_facts.geometry_rebase) {
+                // A retained body advances only by the released rows. When
+                // the finality clamp withholds release from the plan itself
+                // (as opposed to a partial acceptance, which the recovery
+                // debt machinery owns), the viewport must still follow the
+                // flow, so the frame repaints instead of retaining.
+                const plan_covers_advance =
+                    scroll_facts.target_visual_offset -|
+                    committedProjectionVisualOffset(anchor) <=
+                    scroll_facts.semantic_rows;
+                if (!scroll_facts.geometry_rebase and plan_covers_advance) {
                     if (self.stableRetainedTransitionBody(
                         anchor,
                         source_bytes,
@@ -7454,6 +7638,42 @@ pub const TranscriptRuntime = struct {
                 {
                     target.normal_buffer_recovery_pending = false;
                 }
+                if (!target.projection_staged and
+                    target.body_disposition == .paint and
+                    !scroll_facts.geometry_rebase and
+                    !scroll_facts.recovery_rebase and
+                    !self.fullTranscriptActive() and
+                    !prepared.selection.split_active and
+                    !target_layout.transcript_area.isEmpty() and
+                    scroll_facts.target_visual_offset -|
+                        committedProjectionVisualOffset(anchor) >
+                        scroll_facts.semantic_rows and
+                    scroll_facts.target_visual_offset >= target.history_visual_offset)
+                {
+                    // The viewport advanced further than the plan may
+                    // release: slide the window with an in-place repaint at
+                    // the target offset. The rows passed over stay
+                    // unreleased and settle later through the replay.
+                    var projection_layout = self.layout;
+                    projection_layout.content_bottom = target_layout.transcript_area.bottom;
+                    try target.stagePreparedProjection(
+                        alloc,
+                        projection_layout,
+                        prepared,
+                        target_layout.transcript_area,
+                        scroll_facts.target_visual_offset,
+                    );
+                    target.hold_staged = true;
+                    debug_trace.logf(
+                        "scroll",
+                        "transcript_transition_hold_release target_visual_offset={d} history_visual_offset={d} semantic_rows={d}",
+                        .{
+                            scroll_facts.target_visual_offset,
+                            target.history_visual_offset,
+                            scroll_facts.semantic_rows,
+                        },
+                    );
+                }
                 if (self.stableHistoryFloor(target, anchor, scroll_facts)) |history_floor| {
                     var projection_layout = self.layout;
                     projection_layout.content_bottom = target_layout.transcript_area.bottom;
@@ -7476,6 +7696,11 @@ pub const TranscriptRuntime = struct {
                         target.visual_offset > target.history_visual_offset;
                 } else if (target.history_visual_offset >= target.visual_offset) {
                     target.history_catchup_pending = false;
+                } else if (scroll_facts.finality_hold) {
+                    // Finality withheld release. Preserve the obligation on
+                    // stable anchors until history catches the viewport;
+                    // footer displacement alone never creates one.
+                    target.history_catchup_pending = true;
                 }
             },
             .recovering => |receipt| {
@@ -7548,6 +7773,15 @@ pub const TranscriptRuntime = struct {
         clear_rows: u16,
     };
 
+    fn committedLayoutMatches(
+        self: *const TranscriptRuntime,
+        anchor: CommittedTranscriptAnchor,
+    ) bool {
+        return anchor.layout_id == self.committed_frame_layout.layout_id and
+            self.committed_frame_layout.terminal_cols == self.layout.cols and
+            self.committed_frame_layout.terminal_rows == self.layout.rows;
+    }
+
     fn compatibleHistoryReplayRange(
         prepared: *const transcript_painter.PreparedTranscriptSurfacePaint,
         cols: u16,
@@ -7589,6 +7823,25 @@ pub const TranscriptRuntime = struct {
         };
     }
 
+    fn compatibleCommittedHistoryReplayRange(
+        self: *const TranscriptRuntime,
+        prepared: *const transcript_painter.PreparedTranscriptSurfacePaint,
+        anchor: CommittedTranscriptAnchor,
+        target_flow: []const u8,
+        target_history_visual_offset: u32,
+    ) ?TransitionHistoryReplay {
+        if (!self.committedLayoutMatches(anchor)) return null;
+        if (self.resize_history_row_delta != null) return null;
+        return compatibleHistoryReplayRange(
+            prepared,
+            self.layout.cols,
+            target_flow,
+            anchor.flow,
+            anchor.history_visual_offset,
+            target_history_visual_offset,
+        );
+    }
+
     const TransitionAppendBase = struct {
         flow_len: usize,
         history_replay: ?TransitionHistoryReplay = null,
@@ -7608,23 +7861,17 @@ pub const TranscriptRuntime = struct {
     ) !?TransitionAppendBase {
         switch (self.transcript_commit_state) {
             .stable => |anchor| {
-                if (!destructive_invalidation and
-                    anchor.layout_id == self.committed_frame_layout.layout_id and
-                    self.committed_frame_layout.terminal_cols == self.layout.cols and
-                    self.committed_frame_layout.terminal_rows == self.layout.rows)
-                {
+                if (!destructive_invalidation) {
                     const replay_from_history = target_history_visual_offset >
                         anchor.history_visual_offset and
                         (scroll_facts.geometry_rebase or
                             anchor.normal_buffer_recovery_pending or
                             anchor.history_catchup_pending);
                     if (replay_from_history) {
-                        const replay = compatibleHistoryReplayRange(
+                        const replay = self.compatibleCommittedHistoryReplayRange(
                             prepared,
-                            self.layout.cols,
+                            anchor,
                             target_flow,
-                            anchor.flow,
-                            anchor.history_visual_offset,
                             target_history_visual_offset,
                         );
                         if (replay) |history_replay| {
@@ -7642,7 +7889,8 @@ pub const TranscriptRuntime = struct {
                             };
                         }
                     }
-                    if (target_flow.len >= anchor.flow.len and
+                    if (self.committedLayoutMatches(anchor) and
+                        target_flow.len >= anchor.flow.len and
                         std.mem.startsWith(u8, target_flow, anchor.flow))
                     {
                         return .{
@@ -8040,11 +8288,39 @@ pub const TranscriptRuntime = struct {
             target_flow.len
         else
             null;
+        const held_projected_flow_end: ?usize = if (target.hold_staged)
+            if (append_base) |base| held: {
+                const base_visual_end = base.visual_offset + base.visual_rows;
+                const target_base_flow_end =
+                    transcript_painter.preparedTranscriptFlowOffsetForVisualOffset(
+                        prepared,
+                        self.layout.cols,
+                        base_visual_end,
+                    ) orelse break :held null;
+                if (target_base_flow_end < base.flow_len) break :held null;
+                // Target growth can terminate the committed line at its byte
+                // endpoint. Charge that cursor movement before advancing into
+                // the final rows this frame may release.
+                const drift = walkText(
+                    1,
+                    base.cursor_col,
+                    target_flow[base.flow_len..target_base_flow_end],
+                    self.layout.cols,
+                ).end_row - 1;
+                if (drift > accepted.semantic_progress_rows) break :held base.flow_len;
+                break :held transcript_painter.preparedTranscriptFlowOffsetForVisualOffset(
+                    prepared,
+                    self.layout.cols,
+                    base_visual_end + accepted.semantic_progress_rows - drift,
+                );
+            } else null
+        else
+            null;
         const projected_flow_end: ?usize = if (append_base) |base|
             if (base.history_replay) |replay|
                 replay.flow_end
             else
-                natural_projected_flow_end
+                held_projected_flow_end orelse natural_projected_flow_end
         else
             natural_projected_flow_end;
         var document_append = render_engine.frame_scroll_plan.FrameDocumentAppend{};
@@ -8208,6 +8484,12 @@ pub const TranscriptRuntime = struct {
             .scroll_plan = scroll_plan,
             .document_append = document_append,
             .document_append_bytes = document_append_bytes,
+            .history_settle_pending = scroll_facts.recovery_rebase and
+                !self.fullTranscriptActive() and
+                self.finalityReleasableOffset(
+                    prepared,
+                    scroll_facts.target_visual_offset,
+                ) > target.history_visual_offset,
             .resize_reflow_rows = scroll_facts.resize_reflow_rows,
             .semantic_rows = scroll_facts.semantic_rows,
             .semantic_progress_rows = scroll_facts.semantic_progress_rows,
@@ -8518,6 +8800,11 @@ pub const TranscriptRuntime = struct {
             alloc.free(transition.folded_summary_indices);
             transition.folded_summary_indices = &.{};
         }
+        if (transition.history_settle_pending) {
+            // Final rows remain unmaterialized past this commit; guarantee a
+            // follow-up frame so the debt settles without external activity.
+            self.render_requests.request(.transcript);
+        }
         transition.consumed = true;
     }
 
@@ -8711,6 +8998,14 @@ pub const TranscriptRuntime = struct {
             error.InputPending => unreachable,
             else => |other| return other,
         };
+    }
+
+    pub fn appendReplaceableSemanticNotice(
+        self: *TranscriptRuntime,
+        alloc: Allocator,
+        notice: types.SemanticNotice,
+    ) !u32 {
+        return transcript_store.appendReplaceableSemanticNoticeAtomic(self, alloc, notice);
     }
 
     pub fn appendSemanticNotice(
@@ -10348,6 +10643,42 @@ test "owned stable transition traces a superseded pending resume source" {
     ) != null);
 }
 
+test "assistant tail writability transitions are traceable" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.fs.path.join(alloc, &.{ root, "assistant-tail.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "scroll");
+    debug_trace.logf("scroll", "assistant tail trace test start", .{});
+
+    var runtime = TranscriptRuntime{ .layout = testLayoutWithRows(8) };
+    defer runtime.deinit(alloc);
+    runtime.setAssistantTailWritable(false);
+    runtime.setAssistantTailWritable(true);
+    debug_trace.shutdown();
+
+    var trace_file = try std.Io.Dir.openFileAbsolute(std.testing.io, trace_path, .{});
+    defer trace_file.close(std.testing.io);
+    const trace = try io_mod.readFileToEnd(alloc, &trace_file, 4096);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(
+        u8,
+        trace,
+        "assistant tail writability changed writable=false",
+    ) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        trace,
+        "assistant tail writability changed writable=true",
+    ) != null);
+}
+
 test "stable resume publication starts a fresh retained source epoch" {
     const alloc = std.testing.allocator;
     const retained_flow =
@@ -11307,7 +11638,7 @@ test "source rewrite replays unchanged history prefix after footer projection re
     }
 }
 
-test "history replay starts at committed source top before preserved row release" {
+test "history replay starts at committed source top and follows resize eligibility" {
     const alloc = std.testing.allocator;
     const committed_flow =
         "source-row-01\nsource-row-02\nsource-row-03\nsource-row-04\n";
@@ -11403,6 +11734,17 @@ test "history replay starts at committed source top before preserved row release
     );
     try std.testing.expectEqual(@as(u16, 4), scroll_plan.preserved_release_rows);
     try std.testing.expectEqual(@as(u16, 8), scroll_plan.terminal_scroll_rows);
+
+    runtime.resize_history_row_delta = 1;
+    const resize_facts = runtime.planTranscriptScroll(&prepared);
+    const resize_append_base = (try runtime.resolveTransitionAppendBase(
+        &prepared,
+        resize_facts,
+        false,
+        source.bytes,
+        resize_facts.target_visual_offset,
+    )) orelse return error.TestExpectedNaturalAppendBase;
+    try std.testing.expect(resize_append_base.history_replay == null);
 }
 
 test "preserved source rewrite holds the normal buffer at committed history" {
