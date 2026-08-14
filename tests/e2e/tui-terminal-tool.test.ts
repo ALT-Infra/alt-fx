@@ -503,10 +503,12 @@ test.skipIf(!tmuxAvailable())(
     let pane = await active.waitForPane(
       (current) =>
         current.includes("Ctrl-] d detach") &&
-        current.includes("TAKEOVER_TOP"),
+        current.includes("TAKEOVER_TOP") &&
+        current.includes("TAKEOVER_BOTTOM"),
       TIMEOUT,
     );
     expect(pane).toContain("TAKEOVER_TOP");
+    expect(pane).toContain("TAKEOVER_BOTTOM");
     expect(pane).not.toContain("Agents & processes");
     expect(pane).not.toContain("Background processes");
     expect(pane).not.toContain("ctrl-x close");
