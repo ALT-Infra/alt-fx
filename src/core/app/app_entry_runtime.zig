@@ -20,6 +20,7 @@ const skill_contract = @import("../skills/skill_contract.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
+const mcp_contract = @import("../mcp/mcp_contract.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const update_target = @import("../upgrade/update_target.zig");
@@ -62,6 +63,7 @@ pub const Config = struct {
     context_registry: context_contract.Registry,
     mode_registry: mode_registry.Registry,
     tool_set: tool_set_contract.ToolSet,
+    inspect_mcp_profile_config: mcp_contract.InspectProfileConfigFn,
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
     acp_runner: acp_runner.Runner,
     devbox_provider: ?devbox_executor.Provider = null,
@@ -407,6 +409,7 @@ fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
         .context_registry = cfg.context_registry,
         .mode_registry = cfg.mode_registry,
         .tool_set = cfg.tool_set,
+        .inspect_mcp_profile_config = cfg.inspect_mcp_profile_config,
         .load_mcp_runtime = cfg.load_mcp_runtime,
         .acp_runner = cfg.acp_runner,
         .devbox_provider = cfg.devbox_provider,
@@ -505,6 +508,12 @@ fn noMcpRuntimeForTest(_: Allocator, _: @import("../mcp/elicitation.zig").Capabi
     return null;
 }
 
+fn noMcpConfigInspectionForTest(
+    _: Allocator,
+) error{OutOfMemory}!mcp_contract.ProfileConfigDiagnostic {
+    return .clear;
+}
+
 fn unexpectedAcpRunForTest(_: ?*anyopaque, _: Allocator, _: acp_runner.Config) anyerror!void {
     return error.TestUnexpectedAcpRun;
 }
@@ -533,6 +542,7 @@ fn testConfig() Config {
         .max_history_turns = 32,
         .context_registry = test_entry_context_registry,
         .mode_registry = .{ .default_mode_id = "entry" },
+        .inspect_mcp_profile_config = noMcpConfigInspectionForTest,
         .load_mcp_runtime = noMcpRuntimeForTest,
         .acp_runner = .{ .run_fn = unexpectedAcpRunForTest },
         .devbox_provider = test_devbox_provider,
@@ -817,6 +827,7 @@ test "app entry returns after handled CLI success without initializing app" {
     try std.testing.expect(capture.seen_config.?.url_opener.open_fn == cfg.url_opener.open_fn);
     try std.testing.expect(capture.seen_config.?.secret_store.context == cfg.secret_store.context);
     try std.testing.expect(capture.seen_config.?.secret_store.load_fn == cfg.secret_store.load_fn);
+    try std.testing.expect(capture.seen_config.?.inspect_mcp_profile_config == noMcpConfigInspectionForTest);
     try std.testing.expect(capture.seen_config.?.load_mcp_runtime == noMcpRuntimeForTest);
     try std.testing.expect(capture.seen_config.?.devbox_provider.?.execute_fn == unavailableDevboxForTest);
     try std.testing.expectEqual(@as(usize, 0), test_event_count);

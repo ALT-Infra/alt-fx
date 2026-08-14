@@ -432,6 +432,98 @@ describe("cli: version", () => {
 
 describe("cli: status", () => {
   test(
+    "status and doctor expose the MCP profile error that blocks ask startup",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-mcp-config-diagnostic-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const fxDir = join(home, ".fx");
+      mkdirSync(fxDir, { recursive: true, mode: 0o700 });
+      mkdirSync(workspace);
+      writeFileSync(join(fxDir, "mcp.json"), "{invalid json", { mode: 0o600 });
+      const gateway = startFakeGateway([]);
+
+      try {
+        const env = {
+          HOME: realpathSync(home),
+          AI_GATEWAY_API_KEY: "mcp-config-diagnostic-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_AUTO_UPGRADE: "0",
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+        };
+        const cwd = realpathSync(workspace);
+        const before = snapshotTree(home);
+
+        const statusText = await runFx(["status"], { cwd, env });
+        const statusJsonResult = await runFx(["status", "--json"], { cwd, env });
+        const doctorText = await runFx(["doctor"], { cwd, env });
+        const doctorJsonResult = await runFx(["doctor", "--json"], { cwd, env });
+        const ask = await runFx(
+          ["ask", "--json", "--no-save", "Do nothing."],
+          { cwd, env },
+        );
+
+        for (const result of [statusText, statusJsonResult, doctorText, doctorJsonResult]) {
+          expect(result.code).toBe(0);
+          expect(result.stderr).toBe("");
+        }
+        expect(statusText.stdout).toContain(
+          "[status] mcp_config_error=McpConfigInvalidJson\n",
+        );
+        expect(JSON.parse(statusJsonResult.stdout)).toMatchObject({
+          kind: "status",
+          mcp_config_error: "McpConfigInvalidJson",
+        });
+        expect(doctorText.stdout).toContain(
+          "[fail] mcp_config: failed to load ~/.fx/mcp.json: McpConfigInvalidJson\n",
+        );
+        const doctorJson = JSON.parse(doctorJsonResult.stdout);
+        expect(doctorJson.fail_count).toBe(1);
+        expect(
+          doctorJson.checks.filter(
+            (check: { name: string }) => check.name === "mcp_config",
+          ),
+        ).toEqual([
+          {
+            name: "mcp_config",
+            status: "fail",
+            detail: "failed to load ~/.fx/mcp.json: McpConfigInvalidJson",
+          },
+        ]);
+        expect(ask.code).toBe(1);
+        expect(ask.stderr).toBe("");
+        expect(JSON.parse(ask.stdout)).toMatchObject({
+          exit_code: 1,
+          error: "McpConfigInvalidJson",
+        });
+        expect(gateway.requestCount()).toBe(0);
+        expect(snapshotTree(home)).toEqual(before);
+
+        writeFileSync(join(fxDir, "mcp.json"), '{"mcp":{}}\n', { mode: 0o600 });
+        const validBefore = snapshotTree(home);
+        const validStatus = await runFx(["status", "--json"], { cwd, env });
+        const validDoctor = await runFx(["doctor", "--json"], { cwd, env });
+        expect(validStatus.code).toBe(0);
+        expect(validDoctor.code).toBe(0);
+        expect(JSON.parse(validStatus.stdout)).not.toHaveProperty("mcp_config_error");
+        expect(
+          JSON.parse(validDoctor.stdout).checks.some(
+            (check: { name: string }) => check.name === "mcp_config",
+          ),
+        ).toBe(false);
+        expect(gateway.requestCount()).toBe(0);
+        expect(snapshotTree(home)).toEqual(validBefore);
+      } finally {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "status and doctor share the missing auth snapshot",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-status-noauth-"));

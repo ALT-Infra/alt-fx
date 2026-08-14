@@ -367,6 +367,7 @@ pub const StatusSnapshot = struct {
     build_revision: []const u8 = "",
     auth: auth_runtime.StatusSnapshot = .{},
     auth_help: ?[]const u8 = null,
+    mcp_config_error: ?[]const u8 = null,
     permission_mode: types.PermissionMode,
     sandbox_backend: sandbox.BackendKind = .none,
     workspace_root: []const u8,
@@ -390,6 +391,9 @@ pub const StatusSnapshot = struct {
         try out.writer.print("[status] build_channel={s}\n", .{self.build_channel});
         if (self.build_revision.len > 0) {
             try out.writer.print("[status] build_revision={s}\n", .{self.build_revision});
+        }
+        if (self.mcp_config_error) |error_name| {
+            try out.writer.print("[status] mcp_config_error={s}\n", .{error_name});
         }
         try out.writer.print("[status] auth={s}\n", .{self.auth.activeSourceLabel()});
         try out.writer.print("[status] auth_refreshable={}\n", .{self.auth.refreshable()});
@@ -450,6 +454,10 @@ pub const StatusSnapshot = struct {
         try std.json.Stringify.value(self.build_channel, .{}, writer);
         try writer.writeAll(",\"build_revision\":");
         try std.json.Stringify.value(self.build_revision, .{}, writer);
+        if (self.mcp_config_error) |error_name| {
+            try writer.writeAll(",\"mcp_config_error\":");
+            try std.json.Stringify.value(error_name, .{}, writer);
+        }
         try writer.writeAll(",\"auth\":");
         try std.json.Stringify.value(self.auth.activeSourceLabel(), .{}, writer);
         try writer.print(",\"auth_refreshable\":{}", .{self.auth.refreshable()});
@@ -1806,6 +1814,38 @@ test "core status snapshot includes selected team when present" {
         "{\"kind\":\"status\",\"model\":\"alpha\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"fx login\",\"auth_refreshable\":true,\"team\":\"estebans\",\"permission_mode\":\"ask\",\"sandbox\":\"none\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":24}",
         json,
     );
+}
+
+test "MCP config diagnostic renders in status text and JSON but not interactive body" {
+    const snapshot = StatusSnapshot{
+        .model = "alpha",
+        .permission_mode = .ask,
+        .workspace_root = "/tmp/fx",
+        .history_turns = 0,
+        .session_permission_grants = 0,
+        .agent_step_limit = 24,
+        .mcp_config_error = "McpConfigInvalidJson",
+    };
+
+    const text = try snapshot.renderText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.find(
+        u8,
+        text,
+        "[status] mcp_config_error=McpConfigInvalidJson\n",
+    ) != null);
+
+    const json = try snapshot.renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.find(
+        u8,
+        json,
+        "\"mcp_config_error\":\"McpConfigInvalidJson\"",
+    ) != null);
+
+    const interactive = try snapshot.renderInteractiveBody(std.testing.allocator);
+    defer std.testing.allocator.free(interactive);
+    try std.testing.expect(std.mem.find(u8, interactive, "mcp_config_error") == null);
 }
 
 test "core permissions snapshot text and json stay stable" {
