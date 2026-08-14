@@ -40,6 +40,33 @@ pub const AttemptState = struct {
     }
 };
 
+/// Ephemeral backoff state. AttemptState remains the durable request budget.
+pub const RetryPacingState = union(enum) {
+    idle,
+    implicit: struct {
+        cause: FailureCause,
+        attempt: usize,
+    },
+
+    fn afterFailure(
+        self: RetryPacingState,
+        cause: FailureCause,
+        retry_after_seconds: ?u64,
+    ) RetryPacingState {
+        if (retry_after_seconds != null) return .idle;
+        return switch (self) {
+            .idle => .{ .implicit = .{ .cause = cause, .attempt = 1 } },
+            .implicit => |previous| if (previous.cause == cause)
+                .{ .implicit = .{
+                    .cause = cause,
+                    .attempt = previous.attempt +| 1,
+                } }
+            else
+                .{ .implicit = .{ .cause = cause, .attempt = 1 } },
+        };
+    }
+};
+
 pub const Strategy = enum {
     retry_request,
     continue_response,
@@ -63,6 +90,7 @@ pub const Evidence = struct {
     attempts: AttemptState,
     output: OutputEvidence = .none,
     tool: ToolEvidence = .none,
+    pacing: RetryPacingState = .idle,
     retry_after_seconds: ?u64 = null,
     cancelled: bool = false,
 };
@@ -70,6 +98,7 @@ pub const Evidence = struct {
 pub const Decision = struct {
     strategy: Strategy,
     delay_ns: u64 = 0,
+    next_pacing: RetryPacingState = .idle,
     reserve_provider_attempt: bool = false,
     required_action: RequiredAction = .none,
 };
@@ -112,26 +141,35 @@ pub noinline fn decide(evidence: Evidence) Decision {
         else
             .retry_request,
     };
+    const next_pacing = evidence.pacing.afterFailure(
+        evidence.cause,
+        evidence.retry_after_seconds,
+    );
     const delay_ns = if (evidence.retry_after_seconds) |seconds| blk: {
         const bounded_seconds: u64 = @min(seconds, max_retry_after_seconds);
         break :blk bounded_seconds * std.time.ns_per_s;
-    } else retryDelayNs(evidence.attempts.consumed);
+    } else switch (next_pacing) {
+        .idle => unreachable,
+        .implicit => |pacing| retryDelayNs(pacing.attempt),
+    };
     return .{
         .strategy = strategy,
         .delay_ns = delay_ns,
+        .next_pacing = next_pacing,
         .reserve_provider_attempt = true,
     };
 }
 
-/// Delay before the next provider request after `consumed` attempts: 250 ms,
+/// Delay before the next provider request after `attempt` consecutive implicit
+/// backoffs: 250 ms,
 /// 1 s, then exponential growth capped at 30 s.
-pub fn retryDelayNs(consumed: usize) u64 {
-    if (consumed == 0) return 0;
-    if (consumed == 1) return 250 * std.time.ns_per_ms;
+pub fn retryDelayNs(attempt: usize) u64 {
+    if (attempt == 0) return 0;
+    if (attempt == 1) return 250 * std.time.ns_per_ms;
 
     var seconds: u64 = 1;
-    var attempt: usize = 2;
-    while (attempt < consumed and seconds < max_retry_after_seconds) : (attempt += 1) {
+    var current: usize = 2;
+    while (current < attempt and seconds < max_retry_after_seconds) : (current += 1) {
         seconds = @min(seconds * 2, max_retry_after_seconds);
     }
     return seconds * std.time.ns_per_s;
@@ -326,8 +364,8 @@ test "retry schedule uses the approved cap" {
         30 * std.time.ns_per_s,
     };
     var total: u64 = 0;
-    for (expected, 1..) |delay, consumed| {
-        try std.testing.expectEqual(delay, retryDelayNs(consumed));
+    for (expected, 1..) |delay, attempt| {
+        try std.testing.expectEqual(delay, retryDelayNs(attempt));
         total += delay;
     }
     try std.testing.expectEqual(
@@ -336,14 +374,60 @@ test "retry schedule uses the approved cap" {
     );
 }
 
-test "system resume uses the same evidence sensitive recovery strategy" {
+test "implicit retry pacing is independent from the shared attempt budget" {
+    const first_network = decide(.{
+        .cause = .transport_interrupted,
+        .delivery = .possibly_sent,
+        .attempts = .{ .consumed = 6 },
+    });
+
+    try std.testing.expectEqual(Strategy.retry_request, first_network.strategy);
+    try std.testing.expectEqual(
+        @as(u64, 250 * std.time.ns_per_ms),
+        first_network.delay_ns,
+    );
+
+    const second_network = decide(.{
+        .cause = .transport_interrupted,
+        .delivery = .possibly_sent,
+        .attempts = .{ .consumed = 7 },
+        .pacing = first_network.next_pacing,
+    });
+    try std.testing.expectEqual(
+        @as(u64, std.time.ns_per_s),
+        second_network.delay_ns,
+    );
+
+    const provider_failure = decide(.{
+        .cause = .provider_unavailable,
+        .delivery = .possibly_sent,
+        .attempts = .{ .consumed = 8 },
+        .pacing = second_network.next_pacing,
+    });
+    try std.testing.expectEqual(
+        @as(u64, 250 * std.time.ns_per_ms),
+        provider_failure.delay_ns,
+    );
+
+    const explicitly_timed = decide(.{
+        .cause = .provider_unavailable,
+        .delivery = .possibly_sent,
+        .attempts = .{ .consumed = 9 },
+        .pacing = provider_failure.next_pacing,
+        .retry_after_seconds = 0,
+    });
+    try std.testing.expectEqual(@as(u64, 0), explicitly_timed.delay_ns);
+    try std.testing.expectEqual(RetryPacingState.idle, explicitly_timed.next_pacing);
+}
+
+test "system resume strategy uses independent retry pacing" {
     const retrying = decide(.{
         .cause = .system_resumed,
         .delivery = .definitely_unsent,
         .attempts = .{ .consumed = 4 },
     });
     try std.testing.expectEqual(Strategy.retry_request, retrying.strategy);
-    try std.testing.expectEqual(@as(u64, 4 * std.time.ns_per_s), retrying.delay_ns);
+    try std.testing.expectEqual(@as(u64, 250 * std.time.ns_per_ms), retrying.delay_ns);
     try std.testing.expect(retrying.reserve_provider_attempt);
 
     const continuing = decide(.{
