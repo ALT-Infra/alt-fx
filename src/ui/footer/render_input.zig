@@ -17,6 +17,7 @@ const workspace_access = @import("../../core/workspace/workspace_access.zig");
 const file_index = @import("../../core/workspace/file_index.zig");
 const workspace_menu = @import("../../core/workspace/workspace_menu.zig");
 const activity_runtime = @import("../../core/output/activity_runtime.zig");
+const transcript_presentation = @import("../../core/output/transcript_presentation.zig");
 const usage_menu = @import("../../core/session/usage_menu.zig");
 const core_input_runtime = @import("../../core/input/runtime.zig");
 const presentation_mode = @import("../../core/config/presentation_mode.zig");
@@ -371,7 +372,7 @@ pub const RenderContext = struct {
     question: ?question_prompt.Projection = null,
     statusline: ui_render.StatuslineItems = .{},
     activity: ActivityProjection = .none,
-    transcript_depth: transcript_runtime.TranscriptPresentationDepth = .inline_mode,
+    transcript_depth: transcript_presentation.Depth = .inline_mode,
     input: *const InputRuntime,
 };
 

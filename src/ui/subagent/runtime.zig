@@ -6,6 +6,7 @@ const types = @import("../../core/shared/types.zig");
 const domain = @import("../../core/subagent/domain.zig");
 const execution = @import("../../core/subagent/execution.zig");
 const diff_mod = @import("../../core/output/diff.zig");
+const transcript_presentation = @import("../../core/output/transcript_presentation.zig");
 const worker_runtime = @import("../../core/agent/worker_runtime.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const manager_mod = @import("../../core/subagent/manager.zig");
@@ -717,7 +718,7 @@ pub const ChildRouteState = struct {
     rendered_chat_rows: ?usize = null,
     viewport_mutation: ViewportMutation = .none,
     presentation: ?transcript_runtime.TranscriptRuntime = null,
-    presentation_transcript_depth: transcript_runtime.TranscriptPresentationDepth = .inline_mode,
+    presentation_transcript_depth: transcript_presentation.Depth = .inline_mode,
     presentation_live_work_id: ?[]u8 = null,
     presentation_live_event_count: usize = 0,
     presentation_next_diff_id: u32 = 1,
@@ -794,7 +795,7 @@ pub const ChildPresentationView = struct {
 const ChildViewportBookmark = struct {
     rows_from_bottom: usize,
     prior_total_rows: ?usize,
-    full_transcript: ?transcript_runtime.FullTranscriptViewportSnapshot,
+    full_transcript: ?transcript_presentation.Snapshot,
 };
 
 const ChildDraft = struct {
@@ -1887,7 +1888,7 @@ pub const Runtime = struct {
 
     pub fn childTranscriptPresentationDepth(
         self: Runtime,
-    ) transcript_runtime.TranscriptPresentationDepth {
+    ) transcript_presentation.Depth {
         if (self.childRouteId() == null) return .inline_mode;
         return self.child.presentation_transcript_depth;
     }
@@ -1895,8 +1896,8 @@ pub const Runtime = struct {
     pub fn setChildTranscriptPresentationDepth(
         self: *Runtime,
         alloc: Allocator,
-        requested: transcript_runtime.TranscriptPresentationDepth,
-    ) !transcript_runtime.TranscriptPresentationDepth {
+        requested: transcript_presentation.Depth,
+    ) !transcript_presentation.Depth {
         _ = self.childRouteId() orelse return .inline_mode;
         if (self.child.presentation) |*runtime| {
             _ = try runtime.setTranscriptPresentationDepth(alloc, requested);
@@ -3764,7 +3765,7 @@ pub const Runtime = struct {
 
     fn selectedChildFullTranscriptBookmark(
         self: *const Runtime,
-    ) ?transcript_runtime.FullTranscriptViewportSnapshot {
+    ) ?transcript_presentation.Snapshot {
         const child_id = self.childRouteId() orelse return null;
         const selected_id = self.selected_id orelse return null;
         if (!std.mem.eql(u8, selected_id, child_id)) return null;
@@ -7705,7 +7706,7 @@ test "child transcript depth survives transient presentation rebuilds" {
         try runtime.handle(alloc, .enter),
     );
     try std.testing.expectEqual(
-        transcript_runtime.TranscriptPresentationDepth.review,
+        transcript_presentation.Depth.review,
         try runtime.setChildTranscriptPresentationDepth(alloc, .review),
     );
     try std.testing.expect(runtime.childFullTranscriptRequested());
@@ -7743,7 +7744,7 @@ test "child transcript depth survives transient presentation rebuilds" {
 
     runtime.child.clearPresentation(alloc);
     try std.testing.expectEqual(
-        transcript_runtime.TranscriptPresentationDepth.full,
+        transcript_presentation.Depth.full,
         try runtime.setChildTranscriptPresentationDepth(alloc, .full),
     );
     try std.testing.expect(runtime.childFullTranscriptRequested());
@@ -7761,12 +7762,12 @@ test "child transcript depth survives transient presentation rebuilds" {
         runtime.childConversationRuntime().?.fullTranscriptActive(),
     );
     try std.testing.expectEqual(
-        transcript_runtime.TranscriptPresentationDepth.full,
+        transcript_presentation.Depth.full,
         runtime.childConversationRuntime().?.transcriptPresentationDepth(),
     );
 
     try std.testing.expectEqual(
-        transcript_runtime.TranscriptPresentationDepth.inline_mode,
+        transcript_presentation.Depth.inline_mode,
         try runtime.setChildTranscriptPresentationDepth(alloc, .inline_mode),
     );
     try std.testing.expect(

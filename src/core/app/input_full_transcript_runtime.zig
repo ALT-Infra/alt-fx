@@ -4,6 +4,7 @@ const app_lifecycle = @import("app_lifecycle.zig");
 const app_render_runtime = @import("app_render_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const input_action = @import("../input/input_action.zig");
+const transcript_presentation = @import("../output/transcript_presentation.zig");
 const types = @import("../shared/types.zig");
 const interaction_state = @import("../../ui/footer/interaction_state.zig");
 const approval_prompt = @import("../permissions/approval_prompt.zig");
@@ -15,7 +16,7 @@ pub fn Runtime(comptime App: type) type {
     return struct {
         const FullTranscriptKey = union(enum) {
             toggle,
-            navigate: transcript_runtime.TranscriptPresentationEvent,
+            navigate: transcript_presentation.Event,
             close,
             interrupt,
             subagent_manager,
@@ -84,7 +85,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn transitionScreen(
             app: *App,
-            event: transcript_runtime.TranscriptPresentationEvent,
+            event: transcript_presentation.Event,
         ) !void {
             if (childRouteActive(app)) {
                 const from = childPresentationDepth(app);
@@ -302,7 +303,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn childPresentationDepth(
             app: *App,
-        ) transcript_runtime.TranscriptPresentationDepth {
+        ) transcript_presentation.Depth {
             if (comptime @hasDecl(
                 @TypeOf(app.subagents),
                 "childTranscriptPresentationDepth",
@@ -317,7 +318,7 @@ pub fn Runtime(comptime App: type) type {
         const TransitionTrigger = enum { ctrl_o, left, right, escape, ctrl_c };
 
         fn triggerForEvent(
-            event: transcript_runtime.TranscriptPresentationEvent,
+            event: transcript_presentation.Event,
         ) TransitionTrigger {
             return switch (event) {
                 .toggle => .ctrl_o,
@@ -327,8 +328,8 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn logDepthTransition(
-            from: transcript_runtime.TranscriptPresentationDepth,
-            to: transcript_runtime.TranscriptPresentationDepth,
+            from: transcript_presentation.Depth,
+            to: transcript_presentation.Depth,
             route: TransitionRoute,
             trigger: TransitionTrigger,
         ) void {
@@ -339,7 +340,7 @@ pub fn Runtime(comptime App: type) type {
             );
         }
 
-        fn depthName(depth: transcript_runtime.TranscriptPresentationDepth) []const u8 {
+        fn depthName(depth: transcript_presentation.Depth) []const u8 {
             return switch (depth) {
                 .inline_mode => "inline",
                 .review => "review",
@@ -350,7 +351,7 @@ pub fn Runtime(comptime App: type) type {
 }
 
 const ApprovalRoutingSubagents = struct {
-    depth: transcript_runtime.TranscriptPresentationDepth = .review,
+    depth: transcript_presentation.Depth = .review,
     selected_child_id: []const u8 = "child-one",
     approval_child_id: []const u8 = "child-one",
 
@@ -364,15 +365,15 @@ const ApprovalRoutingSubagents = struct {
 
     pub fn childTranscriptPresentationDepth(
         self: *const ApprovalRoutingSubagents,
-    ) transcript_runtime.TranscriptPresentationDepth {
+    ) transcript_presentation.Depth {
         return self.depth;
     }
 
     pub fn setChildTranscriptPresentationDepth(
         self: *ApprovalRoutingSubagents,
         _: std.mem.Allocator,
-        requested: transcript_runtime.TranscriptPresentationDepth,
-    ) !transcript_runtime.TranscriptPresentationDepth {
+        requested: transcript_presentation.Depth,
+    ) !transcript_presentation.Depth {
         self.depth = requested;
         return self.depth;
     }
@@ -410,9 +411,9 @@ const ApprovalRoutingApp = struct {
 
     pub fn transitionFullTranscriptProjection(
         _: *ApprovalRoutingApp,
-        event: transcript_runtime.TranscriptPresentationEvent,
-    ) !transcript_runtime.TranscriptPresentationDepth {
-        return transcript_runtime.TranscriptPresentationDepth.inline_mode.transition(
+        event: transcript_presentation.Event,
+    ) !transcript_presentation.Depth {
+        return transcript_presentation.Depth.inline_mode.transition(
             event,
         );
     }
@@ -432,7 +433,7 @@ test "full transcript owns raw semantic and remapped ctrl-l" {
         .remapped_byte = 12,
     }));
     try std.testing.expectEqual(
-        transcript_runtime.TranscriptPresentationDepth.review,
+        transcript_presentation.Depth.review,
         app.subagents.depth,
     );
 }
@@ -452,7 +453,7 @@ test "selected child approval owns ctrl-o ahead of transcript depth" {
     );
 
     try std.testing.expectEqual(
-        transcript_runtime.TranscriptPresentationDepth.review,
+        transcript_presentation.Depth.review,
         app.subagents.depth,
     );
     try std.testing.expect(app.approval_prompt.isActive());
