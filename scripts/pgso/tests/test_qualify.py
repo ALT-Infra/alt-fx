@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import tempfile
 import unittest
@@ -261,6 +262,44 @@ class PgsoQualificationTests(unittest.TestCase):
         self.assertTrue(all(result.requested_samples == 100 for result in results))
         self.assertTrue(all(len(result.control_samples) == 100 for result in results))
         self.assertTrue(all(len(result.candidate_samples) == 100 for result in results))
+
+    def test_startup_measurement_disables_external_keychain_reads(self) -> None:
+        control = self.root / "control" / "fx"
+        candidate = self.root / "candidate" / "fx"
+        hyperfine = self.root / "tools" / "hyperfine"
+        for path in (control, candidate, hyperfine):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"executable")
+
+        _, base_runner = self.fake_startup_runner(
+            hyperfine=hyperfine,
+            control=control,
+            candidate=candidate,
+        )
+        environments: list[dict[str, str]] = []
+
+        def fake_run(argv, **kwargs):
+            environments.append(kwargs["env"])
+            return base_runner(argv, **kwargs)
+
+        with (
+            mock.patch.dict(os.environ, {"FX_DISABLE_KEYCHAIN": "0"}),
+            mock.patch("scripts.pgso.qualify.run_checked", side_effect=fake_run),
+        ):
+            measure_startup(
+                repo_root=self.root,
+                control_binary=control,
+                candidate_binary=candidate,
+                hyperfine_binary=hyperfine,
+                output_dir=self.root / "measurements",
+                samples=50,
+                timeout_s=10,
+            )
+
+        self.assertTrue(environments)
+        self.assertTrue(
+            all(environment["FX_DISABLE_KEYCHAIN"] == "1" for environment in environments)
+        )
 
     def test_startup_measurement_rejects_a_truncated_hyperfine_round(self) -> None:
         path = self.write_hyperfine_export(
