@@ -212,6 +212,7 @@ fn testExecutionAuthorityWithScope(
 pub const FakeCompletion = struct {
     status: std.http.Status = .ok,
     err_body: ?[]const u8 = null,
+    retry_after_seconds: ?u64 = null,
     pre_send_error: ?anyerror = null,
     stream_error: ?anyerror = null,
     stream_error_after_chunks: ?anyerror = null,
@@ -333,6 +334,7 @@ pub const FakeGateway = struct {
             return .{
                 .status = completion.status,
                 .err_body = err_body,
+                .retry_after_seconds = completion.retry_after_seconds,
                 .failure_schema = diagnostics.schema,
                 .failure_request_shape = diagnostics.request_shape,
                 .ownership = .owned,
@@ -582,6 +584,7 @@ pub const FakeAgentRuntimeDeps = struct {
     cancel_on_text: ?*std.atomic.Value(bool) = null,
     cancel_on_text_match: ?[]const u8 = null,
     cancel_on_auto_retry_status: ?*std.atomic.Value(bool) = null,
+    cancel_on_auto_retry_attempt: ?usize = null,
     cancel_on_permission: ?*std.atomic.Value(bool) = null,
     cancel_on_permission_name: ?[]const u8 = null,
     cancel_on_execute: ?*std.atomic.Value(bool) = null,
@@ -1666,7 +1669,13 @@ pub const FakeAgentRuntimeDeps = struct {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         try self.route_recovery_statuses.append(self.alloc, status);
         if (status.kind == .auto_retry) {
-            if (self.cancel_on_auto_retry_status) |flag| flag.store(true, .seq_cst);
+            if (self.cancel_on_auto_retry_status) |flag| {
+                if (self.cancel_on_auto_retry_attempt == null or
+                    self.cancel_on_auto_retry_attempt.? == status.failed_attempt)
+                {
+                    flag.store(true, .seq_cst);
+                }
+            }
         }
         if (self.pause_on_auto_retry_status and status.kind == .auto_retry) {
             if (self.recovery_pause_flag) |flag| flag.store(true, .seq_cst);

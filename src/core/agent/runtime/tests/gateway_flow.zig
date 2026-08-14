@@ -4108,6 +4108,35 @@ test "processQueuedPrompt routes native network failure classes through one hear
     }
 }
 
+test "processQueuedPrompt starts network pacing independently from the shared retry budget" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .status = .service_unavailable, .retry_after_seconds = 0 },
+        .{ .status = .service_unavailable, .retry_after_seconds = 0 },
+        .{ .status = .service_unavailable, .retry_after_seconds = 0 },
+        .{ .status = .service_unavailable, .retry_after_seconds = 0 },
+        .{ .status = .service_unavailable, .retry_after_seconds = 0 },
+        .{ .stream_error = error.ReadFailed },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    hooks.cancel_on_auto_retry_status = &fixture.cancel_flag;
+    hooks.cancel_on_auto_retry_attempt = 6;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 6), gateway.request_models.items.len);
+    try std.testing.expectEqual(@as(usize, 6), hooks.route_recovery_statuses.items.len);
+    const network_status = hooks.route_recovery_statuses.items[5];
+    try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.auto_retry, network_status.kind);
+    try std.testing.expectEqual(types.ModelRecoveryCause.network_interrupted, network_status.cause.?);
+    try std.testing.expectEqual(@as(usize, 6), network_status.failed_attempt);
+    try std.testing.expectEqual(@as(u64, 0), network_status.delay_seconds);
+}
+
 test "processQueuedPrompt does not retry opaque JS host stream failures" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{.{ .stream_error = error.JsHostStreamFailed }};

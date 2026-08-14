@@ -2185,6 +2185,7 @@ fn processQueuedPromptLoop(
         0
     else
         restored_attempts;
+    var retry_pacing: model_response_recovery.RetryPacingState = .idle;
     var recovery_strategy: ?model_response_recovery.Strategy = if (job.recovery_checkpoint) |checkpoint|
         restoredRecoveryStrategy(checkpoint)
     else
@@ -2602,6 +2603,7 @@ fn processQueuedPromptLoop(
                             .possibly_sent => .possibly_sent,
                         },
                         .attempts = .{ .consumed = consumed_attempts, .limit = semantic_limit },
+                        .pacing = retry_pacing,
                         .output = if (stream_ctx.raw_text.items.len > 0) .partial else .none,
                         .tool = effectiveRecoveryToolEvidence(
                             preserved_tool_evidence,
@@ -2752,6 +2754,7 @@ fn processQueuedPromptLoop(
                     );
                     recovery_strategy = recovery_decision.strategy;
                     recovery_cause = failure_cause;
+                    retry_pacing = recovery_decision.next_pacing;
                     if (recovery_strategy == .regenerate_tool) {
                         recovery_has_unexecuted_tool_start = true;
                     }
@@ -2957,6 +2960,7 @@ fn processQueuedPromptLoop(
                     semantic_attempt += 1;
                     recovery_strategy = .retry_request;
                     recovery_cause = .authentication;
+                    retry_pacing = .idle;
                     reset_stream_for_next_attempt = true;
                     skip_next_preflight_refresh = true;
                     continue;
@@ -2982,6 +2986,7 @@ fn processQueuedPromptLoop(
                     .cause = cause,
                     .delivery = .possibly_sent,
                     .attempts = .{ .consumed = semantic_attempt + 1, .limit = semantic_limit },
+                    .pacing = retry_pacing,
                     .output = if (stream_ctx.raw_text.items.len > 0) .partial else .none,
                     .tool = effectiveRecoveryToolEvidence(
                         preserved_tool_evidence,
@@ -3076,6 +3081,7 @@ fn processQueuedPromptLoop(
                         semantic_attempt += 1;
                         recovery_strategy = decision.strategy;
                         recovery_cause = cause;
+                        retry_pacing = decision.next_pacing;
                         reset_stream_for_next_attempt = true;
                         continue;
                     }
@@ -3147,6 +3153,7 @@ fn processQueuedPromptLoop(
                     .cause = cause,
                     .delivery = .possibly_sent,
                     .attempts = .{ .consumed = semantic_attempt + 1, .limit = semantic_limit },
+                    .pacing = retry_pacing,
                     .output = if (partial_assistant.len > 0) .partial else .none,
                     .tool = effectiveRecoveryToolEvidence(
                         preserved_tool_evidence,
@@ -3257,6 +3264,7 @@ fn processQueuedPromptLoop(
                         semantic_attempt += 1;
                         recovery_strategy = decision.strategy;
                         recovery_cause = cause;
+                        retry_pacing = decision.next_pacing;
                         if (decision.strategy == .regenerate_tool) {
                             recovery_has_unexecuted_tool_start = true;
                         }
@@ -3526,6 +3534,7 @@ fn processQueuedPromptLoop(
         }
         recovery_strategy = null;
         recovery_cause = .transport_interrupted;
+        retry_pacing = .idle;
         preserved_tool_evidence = .none;
 
         if (deps.report_usage) |report_fn| {
