@@ -491,6 +491,10 @@ pub const WorkerRuntime = struct {
     worker_cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     worker_recovery_pause_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     worker_connectivity_wait_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Set under `worker_mutex` once the active turn publishes its terminal
+    /// recovery pause. The turn may still be finalizing, but cannot perform
+    /// more model work, so one continuation may queue before processing clears.
+    recovery_continuation_ready: bool = false,
     queued_prompt_count: usize = 0,
     /// `null` means admission is open; otherwise queue take is paused for review.
     queue_admission: ?QueueReviewReason = null,
@@ -649,19 +653,27 @@ pub const WorkerRuntime = struct {
     }
 
     fn applyRecoveryStateEvent(self: *WorkerRuntime, event: WorkerEvent) void {
-        const waiting = switch (event) {
-            .route_recovery_status => |status| status.action == .waiting_for_connectivity,
+        switch (event) {
+            .route_recovery_status => |status| {
+                self.worker_connectivity_wait_active.store(
+                    status.action == .waiting_for_connectivity,
+                    .seq_cst,
+                );
+                self.recovery_continuation_ready = status.action == .paused;
+            },
             .clear_route_recovery_status,
             .finish_prompt,
             .error_text,
-            => false,
+            => {
+                self.worker_connectivity_wait_active.store(false, .seq_cst);
+                self.recovery_continuation_ready = false;
+            },
             .tool_lifecycle => |lifecycle| switch (lifecycle) {
-                .turn_finished => false,
+                .turn_finished => self.worker_connectivity_wait_active.store(false, .seq_cst),
                 .provisional, .authoritative_started, .progress, .terminal => return,
             },
             else => return,
-        };
-        self.worker_connectivity_wait_active.store(waiting, .seq_cst);
+        }
     }
 
     pub fn latchFinalizationFailure(self: *WorkerRuntime, failure: FinalizationFailure) void {
@@ -725,6 +737,7 @@ pub const WorkerRuntime = struct {
             !recoveryContinuationAdmission(
                 self.worker_processing,
                 self.queued_prompt_count,
+                self.recovery_continuation_ready,
             ))
         {
             return error.RecoveryBusy;
@@ -1021,6 +1034,7 @@ pub const WorkerRuntime = struct {
         self.worker_cancel_requested.store(false, .seq_cst);
         self.worker_recovery_pause_requested.store(false, .seq_cst);
         self.worker_connectivity_wait_active.store(false, .seq_cst);
+        self.recovery_continuation_ready = false;
         self.worker_processing = true;
         self.active_turn_id = job.turn_id;
         debug_trace.logf(
@@ -1675,14 +1689,63 @@ pub const WorkerRuntime = struct {
 fn recoveryContinuationAdmission(
     processing: bool,
     queued_count: usize,
+    terminal_pause_ready: bool,
 ) bool {
-    return !processing and queued_count == 0;
+    return queued_count == 0 and (!processing or terminal_pause_ready);
 }
 
-test "recovery continuation admission requires an idle empty worker" {
-    try std.testing.expect(recoveryContinuationAdmission(false, 0));
-    try std.testing.expect(!recoveryContinuationAdmission(true, 0));
-    try std.testing.expect(!recoveryContinuationAdmission(false, 1));
+test "recovery continuation admission requires an empty idle or terminally paused worker" {
+    try std.testing.expect(recoveryContinuationAdmission(false, 0, false));
+    try std.testing.expect(!recoveryContinuationAdmission(true, 0, false));
+    try std.testing.expect(recoveryContinuationAdmission(true, 0, true));
+    try std.testing.expect(!recoveryContinuationAdmission(false, 1, true));
+}
+
+test "terminal recovery pause admits continuation before worker cleanup" {
+    const alloc = std.testing.allocator;
+    var runtime: WorkerRuntime = .{};
+    defer runtime.deinit(alloc);
+
+    const Fixture = struct {
+        fn make(allocator: std.mem.Allocator) !QueuedPrompt {
+            var prompt = try makePrompt(allocator, "continue preserved turn", "model");
+            errdefer freeQueuedPrompt(allocator, prompt);
+            prompt.recovery_checkpoint = try (session_codec.RecoveryCheckpoint{
+                .turn_id = 41,
+                .user = .{ .text = @constCast("unfinished prompt") },
+                .assistant_source = @constCast("partial response"),
+                .cause = .network_interrupted,
+                .action = .paused,
+                .route_model = @constCast("model"),
+                .requested_fast_mode = false,
+                .fast_mode = false,
+                .max_provider_attempts = 10,
+                .consumed_provider_attempts = 10,
+            }).dupe(allocator);
+            return prompt;
+        }
+    };
+
+    runtime.worker_processing = true;
+    try runtime.pushEvent(alloc, .{ .route_recovery_status = .{
+        .kind = .terminal_provider_error,
+        .failed_attempt = 10,
+        .attempt_limit = 10,
+        .cause = .network_interrupted,
+        .action = .paused,
+        .required_action = .continue_later,
+    } });
+    try runtime.pushTurnFinished(alloc, .{
+        .turn_id = 41,
+        .outcome = .paused,
+    });
+
+    const continuation = try Fixture.make(alloc);
+    runtime.enqueuePrompt(alloc, continuation) catch |err| {
+        freeQueuedPrompt(alloc, continuation);
+        return err;
+    };
+    try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
 }
 
 test "connectivity wait state follows worker events before UI presentation" {
