@@ -2210,7 +2210,7 @@ test "core.app_worker_runtime projects route recovery status activity and clears
     switch (app.shell.activityProjection()) {
         .turn_thinking => |thinking| {
             try std.testing.expectEqual(activity_runtime.ActivityProjection.Tone.warning, thinking.tone);
-            try std.testing.expectEqualStrings("▲ Provider unavailable · retrying request · attempt 1/3", thinking.label);
+            try std.testing.expectEqualStrings("⚠ Provider unavailable · retrying request · attempt 1/3", thinking.label);
         },
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
@@ -2255,7 +2255,7 @@ test "core.app_worker_runtime clears route recovery activity on clear event but 
     } });
     try tickNoop(&app);
     switch (app.shell.activityProjection()) {
-        .turn_thinking => |thinking| try std.testing.expectEqualStrings("▲ Provider unavailable · recovery paused after 3/3 attempts", thinking.label),
+        .turn_thinking => |thinking| try std.testing.expectEqualStrings("⚠ Provider unavailable · recovery paused after 3/3 attempts", thinking.label),
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
 }
@@ -2286,7 +2286,7 @@ test "core.app_worker_runtime recovery pause replaces cancelled waiting status" 
 
     switch (app.shell.activityProjection()) {
         .turn_thinking => |thinking| try std.testing.expectEqualStrings(
-            "▲ Mac woke from sleep · connection still unavailable · recovery paused · attempt 2/10 · /continue to resume",
+            "⚠ Mac woke from sleep · connection still unavailable · recovery paused · attempt 2/10 · /continue to resume",
             thinking.label,
         ),
         .none, .tool_slot => return error.TestUnexpectedResult,
@@ -2338,13 +2338,13 @@ test "core.app_worker_runtime projects API status text as sticky status row" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
-    try app.worker.pushEvent(std.heap.c_allocator, .{ .api_status_text = try std.heap.c_allocator.dupe(u8, "▲ API access denied · HTTP 403 · Provider: wafer") });
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .api_status_text = try std.heap.c_allocator.dupe(u8, "⚠ API access denied · HTTP 403 · Provider: wafer") });
     try tickNoop(&app);
 
     switch (app.shell.activityProjection()) {
         .turn_thinking => |thinking| {
             try std.testing.expectEqual(activity_runtime.ActivityProjection.Tone.danger, thinking.tone);
-            try std.testing.expectEqualStrings("▲ API access denied · HTTP 403 · Provider: wafer", thinking.label);
+            try std.testing.expectEqualStrings("⚠ API access denied · HTTP 403 · Provider: wafer", thinking.label);
         },
         .none, .tool_slot => return error.TestUnexpectedResult,
     }

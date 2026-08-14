@@ -1,7 +1,10 @@
 const std = @import("std");
 const display_width = @import("display_width.zig");
+const text_utils = @import("text_utils.zig");
 
 const Allocator = std.mem.Allocator;
+const max_published_error_bytes: usize = 1024;
+const max_recovery_diagnostic_bytes: usize = 600;
 
 pub fn formatSchemaDiagnostic(alloc: Allocator, detail: []const u8) !?[]u8 {
     if (detail.len == 0) return null;
@@ -59,56 +62,86 @@ pub fn formatSchemaDiagnostic(alloc: Allocator, detail: []const u8) !?[]u8 {
 }
 
 pub fn formatHttpErrorMessage(alloc: Allocator, status: std.http.Status, detail: []const u8) ![]u8 {
-    if (detail.len == 0) return std.fmt.allocPrint(alloc, "HTTP {d}", .{@intFromEnum(status)});
-
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, detail, .{}) catch
-        return formatFallback(alloc, status, detail);
-    defer parsed.deinit();
-
-    const root = objectValue(parsed.value) orelse return formatFallback(alloc, status, detail);
-    const error_value = root.get("error") orelse return formatFallback(alloc, status, detail);
-    const error_object = objectValue(error_value) orelse return formatFallback(alloc, status, detail);
-    const param_object = if (error_object.get("param")) |param_value| objectValue(param_value) else null;
-    const code = stringField(error_object, "code") orelse if (param_object) |param| stringField(param, "name") else null;
-    const message = stringField(error_object, "message") orelse if (param_object) |param| stringField(param, "message") else null;
-    const provider = stringField(error_object, "provider") orelse providerFromGatewayMessage(message);
-
     const status_code = @intFromEnum(status);
     const title = if (status_code == 401 or status_code == 403)
         "API access denied"
     else
         "API request failed";
-    const description: ?[]const u8 = if (message) |message_text|
-        message_text
-    else if (code) |code_text|
-        code_text
-    else
-        null;
+    return formatHttpDiagnostic(alloc, status, detail, title, max_published_error_bytes);
+}
+
+pub fn formatHttpRecoveryDiagnostic(alloc: Allocator, status: std.http.Status, detail: []const u8) ![]u8 {
+    return formatHttpDiagnostic(alloc, status, detail, null, max_recovery_diagnostic_bytes);
+}
+
+fn formatHttpDiagnostic(
+    alloc: Allocator,
+    status: std.http.Status,
+    detail: []const u8,
+    title: ?[]const u8,
+    max_bytes: usize,
+) ![]u8 {
+    if (detail.len == 0) return std.fmt.allocPrint(alloc, "HTTP {d}", .{@intFromEnum(status)});
+
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, detail, .{}) catch
+        return formatFallbackBounded(alloc, status, detail, max_bytes);
+    defer parsed.deinit();
+
+    const root = objectValue(parsed.value) orelse
+        return formatFallbackBounded(alloc, status, detail, max_bytes);
+    const error_value = root.get("error") orelse
+        return formatFallbackBounded(alloc, status, detail, max_bytes);
+    const error_object = objectValue(error_value) orelse
+        return formatFallbackBounded(alloc, status, detail, max_bytes);
+    const param_object = if (error_object.get("param")) |param_value| objectValue(param_value) else null;
+    const code = stringField(error_object, "code") orelse
+        stringField(error_object, "type") orelse
+        if (param_object) |param| stringField(param, "name") else null;
+    const message = stringField(error_object, "message") orelse if (param_object) |param| stringField(param, "message") else null;
+    const provider = stringField(error_object, "provider") orelse providerFromGatewayMessage(message);
+
+    const raw = try formatParsedHttpMessage(
+        alloc,
+        title,
+        @intFromEnum(status),
+        provider,
+        code,
+        message,
+    );
+    defer alloc.free(raw);
+    return sanitizeExternalText(alloc, raw, max_bytes);
+}
+
+fn formatParsedHttpMessage(
+    alloc: Allocator,
+    title: ?[]const u8,
+    status_code: u16,
+    provider: ?[]const u8,
+    code: ?[]const u8,
+    message: ?[]const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+
+    if (title) |title_text| {
+        try out.writer.print("{s} · ", .{title_text});
+    }
+    try out.writer.print("HTTP {d}", .{status_code});
 
     if (provider) |provider_text| {
-        if (description) |description_text| {
-            return std.fmt.allocPrint(
-                alloc,
-                "{s} · HTTP {d} · Provider: {s} · {s}",
-                .{ title, status_code, provider_text, description_text },
-            );
+        try out.writer.print(" · Provider: {s}", .{provider_text});
+    }
+    if (code) |code_text| {
+        try out.writer.print(" · {s}", .{code_text});
+        if (message) |message_text| {
+            if (!std.mem.eql(u8, code_text, message_text)) {
+                try out.writer.print(": {s}", .{message_text});
+            }
         }
-        return std.fmt.allocPrint(
-            alloc,
-            "{s} · HTTP {d} · Provider: {s}",
-            .{ title, status_code, provider_text },
-        );
+    } else if (message) |message_text| {
+        try out.writer.print(" · {s}", .{message_text});
     }
-
-    if (description) |description_text| {
-        return std.fmt.allocPrint(
-            alloc,
-            "{s} · HTTP {d} · {s}",
-            .{ title, status_code, description_text },
-        );
-    }
-
-    return formatFallback(alloc, status, detail);
+    return out.toOwnedSlice();
 }
 
 pub fn formatMarkedLine(alloc: Allocator, marker_prefix: []const u8, message: []const u8, cols: u16) ![]u8 {
@@ -148,9 +181,24 @@ pub fn formatMarkedLine(alloc: Allocator, marker_prefix: []const u8, message: []
     return try out.toOwnedSlice(alloc);
 }
 
-fn formatFallback(alloc: Allocator, status: std.http.Status, detail: []const u8) ![]u8 {
+fn formatFallbackBounded(
+    alloc: Allocator,
+    status: std.http.Status,
+    detail: []const u8,
+    max_bytes: usize,
+) ![]u8 {
     if (detail.len == 0) return std.fmt.allocPrint(alloc, "HTTP {d}", .{@intFromEnum(status)});
-    return std.fmt.allocPrint(alloc, "HTTP {d}: {s}", .{ @intFromEnum(status), detail });
+    const raw = try std.fmt.allocPrint(alloc, "HTTP {d}: {s}", .{ @intFromEnum(status), detail });
+    defer alloc.free(raw);
+    return sanitizeExternalText(alloc, raw, max_bytes);
+}
+
+fn sanitizeExternalText(alloc: Allocator, raw: []const u8, max_bytes: usize) ![]u8 {
+    const masked = try text_utils.maskSecrets(alloc, raw);
+    defer if (masked.ptr != raw.ptr) alloc.free(masked);
+
+    const encoded = try text_utils.encodeTerminalSafe(alloc, masked, max_bytes);
+    return encoded.bytes;
 }
 
 fn objectValue(value: std.json.Value) ?std.json.ObjectMap {
@@ -312,7 +360,7 @@ test "formatHttpErrorMessage renders restricted provider details without raw JSO
     defer std.testing.allocator.free(line);
 
     try std.testing.expectEqualStrings(
-        "API access denied · HTTP 403 · Provider: wafer · demo account is restricted from provider wafer",
+        "API access denied · HTTP 403 · Provider: wafer · RestrictedProvidersError: demo account is restricted from provider wafer",
         line,
     );
 }
@@ -325,7 +373,7 @@ test "formatHttpErrorMessage renders live restricted provider body shape" {
     defer std.testing.allocator.free(line);
 
     try std.testing.expectEqualStrings(
-        "API access denied · HTTP 403 · Provider: wafer · Your team has restricted access to this provider. Contact the owner of the account for more details. Providers considered: wafer",
+        "API access denied · HTTP 403 · Provider: wafer · no_providers_available: Your team has restricted access to this provider. Contact the owner of the account for more details. Providers considered: wafer",
         line,
     );
 }
@@ -337,7 +385,7 @@ test "formatHttpErrorMessage renders API key and credits setup bodies" {
     const api_key_line = try formatHttpErrorMessage(std.testing.allocator, .unauthorized, api_key_detail);
     defer std.testing.allocator.free(api_key_line);
     try std.testing.expectEqualStrings(
-        "API access denied · HTTP 401 · Set AI_GATEWAY_API_KEY to use this endpoint.",
+        "API access denied · HTTP 401 · api_key_required: Set AI_GATEWAY_API_KEY to use this endpoint.",
         api_key_line,
     );
 
@@ -347,8 +395,49 @@ test "formatHttpErrorMessage renders API key and credits setup bodies" {
     const credits_line = try formatHttpErrorMessage(std.testing.allocator, .forbidden, credits_detail);
     defer std.testing.allocator.free(credits_line);
     try std.testing.expectEqualStrings(
-        "API access denied · HTTP 403 · Buy credits to use AI Gateway.",
+        "API access denied · HTTP 403 · credit_card_required: Buy credits to use AI Gateway.",
         credits_line,
+    );
+}
+
+test "formatHttpErrorMessage masks structured and fallback secrets" {
+    const alloc = std.testing.allocator;
+    const secret = "abcdefghijklmnop";
+    const structured_detail =
+        \\{"error":{"code":"provider_error","message":"AI_GATEWAY_API_KEY=abcdefghijklmnop"}}
+    ;
+    const structured = try formatHttpErrorMessage(alloc, .service_unavailable, structured_detail);
+    defer alloc.free(structured);
+    try std.testing.expectEqualStrings(
+        "API request failed · HTTP 503 · provider_error: AI_GATEWAY_API_KEY=[redacted]",
+        structured,
+    );
+    try std.testing.expect(std.mem.find(u8, structured, secret) == null);
+
+    const fallback = try formatHttpErrorMessage(
+        alloc,
+        .service_unavailable,
+        "API_KEY=abcdefghijklmnop",
+    );
+    defer alloc.free(fallback);
+    try std.testing.expectEqualStrings("HTTP 503: API_KEY=[redacted]", fallback);
+    try std.testing.expect(std.mem.find(u8, fallback, secret) == null);
+}
+
+test "formatHttpRecoveryDiagnostic keeps status code and provider error identity" {
+    const detail =
+        \\{"error":{"code":"no_available_providers","message":"No providers are currently available","provider":"wafer"}}
+    ;
+    const diagnostic = try formatHttpRecoveryDiagnostic(
+        std.testing.allocator,
+        .service_unavailable,
+        detail,
+    );
+    defer std.testing.allocator.free(diagnostic);
+
+    try std.testing.expectEqualStrings(
+        "HTTP 503 · Provider: wafer · no_available_providers: No providers are currently available",
+        diagnostic,
     );
 }
 

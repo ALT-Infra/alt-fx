@@ -925,11 +925,11 @@ pub fn Bindings(comptime App: type) type {
             const label = if (auth_failure != null)
                 try std.fmt.allocPrint(
                     std.heap.c_allocator,
-                    "▲ {s} · Run /setup to choose another source.",
+                    "⚠ {s} · Run /setup to choose another source.",
                     .{message},
                 )
             else
-                try std.fmt.allocPrint(std.heap.c_allocator, "▲ {s}", .{message});
+                try std.fmt.allocPrint(std.heap.c_allocator, "⚠ {s}", .{message});
             defer std.heap.c_allocator.free(label);
             try app_worker_runtime.Runtime(App).pushEvent(app, .{ .api_status_text = label });
         }

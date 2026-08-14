@@ -91,6 +91,7 @@ fn wrappedStaticActivityLabel(
     label: []const u8,
     cols: u16,
     max_rows: u16,
+    preserve_trailing_context: bool,
 ) !ActivityLabelPreview {
     const row = activityRowLabel(label);
     if (max_rows <= 1 or display_width.visibleWidthIgnoringAnsi(row) <= cols) {
@@ -112,22 +113,25 @@ fn wrappedStaticActivityLabel(
         const indent_width = if (first) prefix_width else continuation_indent_width;
         const available = if (safe_cols > indent_width) safe_cols - indent_width else 1;
         const last_row = row_count + 1 == max_rows;
-        var chunk: []const u8 = undefined;
-        if (last_row) {
+        if (last_row and display_width.visibleWidthIgnoringAnsi(remaining) > available) {
             const marker = omissionMarker(@intCast(@min(available, std.math.maxInt(u16))));
-            const chunk_width = if (available > marker.len) available - marker.len else 0;
-            chunk = display_width.wrapCutIgnoringAnsi(remaining, chunk_width);
-            if (chunk.len == 0 and remaining.len > 0 and chunk_width > 0) {
-                const unit = display_width.displayUnitAt(remaining, 0);
-                chunk = remaining[0..unit.byte_len];
-            }
-            try appendStaticActivityLine(alloc, &out, prefix, continuation_indent_width, chunk, first);
-            if (display_width.trimBreakWhitespace(remaining[chunk.len..]).len > 0 and marker.len > 0) {
+            const content_width = available -| marker.len;
+            if (preserve_trailing_context) {
+                const suffix = display_width.suffixByWidthIgnoringAnsi(remaining, content_width);
+                try appendStaticActivityLine(alloc, &out, prefix, continuation_indent_width, marker, first);
+                try out.appendSlice(alloc, suffix);
+            } else {
+                var chunk = display_width.wrapCutIgnoringAnsi(remaining, content_width);
+                if (chunk.len == 0 and content_width > 0) {
+                    const unit = display_width.displayUnitAt(remaining, 0);
+                    chunk = remaining[0..unit.byte_len];
+                }
+                try appendStaticActivityLine(alloc, &out, prefix, continuation_indent_width, chunk, first);
                 try out.appendSlice(alloc, marker);
             }
             remaining = "";
         } else {
-            chunk = display_width.wrapCutIgnoringAnsi(remaining, available);
+            var chunk = display_width.wrapCutIgnoringAnsi(remaining, available);
             if (chunk.len == 0) {
                 const unit = display_width.displayUnitAt(remaining, 0);
                 chunk = remaining[0..unit.byte_len];
@@ -195,8 +199,18 @@ fn paintPlannedActivityRow(
         .neutral, .warning, .success, .danger => true,
         .thinking, .tool_marker => false,
     };
+    const preserve_trailing_context = switch (input.style) {
+        .warning, .danger => true,
+        .thinking, .tool_marker, .neutral, .success => false,
+    };
     const preview = if (static_status)
-        try wrappedStaticActivityLabel(surface.alloc, input.label, surface.cols, max_rows)
+        try wrappedStaticActivityLabel(
+            surface.alloc,
+            input.label,
+            surface.cols,
+            max_rows,
+            preserve_trailing_context,
+        )
     else
         try previewActivityRowLabel(surface.alloc, input.label, surface.cols);
     defer preview.deinit(surface.alloc);
@@ -317,11 +331,11 @@ fn writeStaticStyledText(out: []u8, label: []const u8, style: []const u8) []cons
 
 test "activity status styles paint static colored text" {
     var buf: [128]u8 = undefined;
-    const result = writeStaticStyledText(&buf, "▲ API error", ui_render.warning_style);
+    const result = writeStaticStyledText(&buf, "⚠ API error", ui_render.warning_style);
     var expected_buf: [128]u8 = undefined;
     const expected = std.fmt.bufPrint(
         &expected_buf,
-        "{s}▲ API error{s}",
+        "{s}⚠ API error{s}",
         .{ ui_render.warning_style, ui_render.reset_style },
     ) catch return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings(expected, result);
@@ -524,20 +538,59 @@ test "activity surface painter wraps static status labels under marker" {
     defer fixtures.shadow.deinit();
 
     const result = try paintActivityIntoSurface(&fixtures.surface, .{
-        .label = "▲ API access denied · HTTP 403 · Provider: wafer · Your team has restricted access to this provider. Contact the owner of the account.",
+        .label = "⚠ API access denied · HTTP 403 · Provider: wafer · Your team has restricted access to this provider. Contact the owner of the account.",
         .shimmer_pos = -8,
         .style = .danger,
     });
 
     try std.testing.expect(result.painted);
     try std.testing.expectEqual(@as(u16, 3), result.row);
-    try std.testing.expectEqual(@as(u21, '▲'), fixtures.surface.cellAt(3, 1).?.codepoint);
+    try std.testing.expectEqual(@as(u21, '⚠'), fixtures.surface.cellAt(3, 1).?.codepoint);
     try std.testing.expectEqual(@as(u21, ' '), fixtures.surface.cellAt(4, 1).?.codepoint);
     try std.testing.expectEqual(@as(u21, ' '), fixtures.surface.cellAt(4, 2).?.codepoint);
     try std.testing.expect(fixtures.surface.cellAt(4, 3).?.codepoint != ' ');
     try std.testing.expectEqual(paint_plan.CellOwner.activity, fixtures.surface.cellAt(5, 1).?.owner);
     try std.testing.expectEqual(paint_plan.CellOwner.footer, fixtures.surface.cellAt(6, 1).?.owner);
     try fixtures.surface.validate();
+}
+
+test "static status truncation preserves recovery action and attempt suffix" {
+    const preview = try wrappedStaticActivityLabel(
+        std.testing.allocator,
+        "⚠ Provider unavailable · no_available_providers: No providers are currently available · retrying request in 4s · attempt 4/10",
+        32,
+        3,
+        true,
+    );
+    defer preview.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.startsWith(u8, preview.bytes, "⚠ Provider unavailable ·"));
+    try std.testing.expect(std.mem.indexOf(u8, preview.bytes, "no_available_providers:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, preview.bytes, "...") != null);
+    try std.testing.expect(std.mem.endsWith(u8, preview.bytes, "attempt 4/10"));
+
+    var lines = std.mem.splitScalar(u8, preview.bytes, '\n');
+    var line_count: usize = 0;
+    while (lines.next()) |line| {
+        line_count += 1;
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 32);
+    }
+    try std.testing.expectEqual(@as(usize, 3), line_count);
+}
+
+test "static status truncation preserves leading context for non-error statuses" {
+    const preview = try wrappedStaticActivityLabel(
+        std.testing.allocator,
+        "✓ Recovered · resumed after provider retry · later details are omitted",
+        24,
+        2,
+        false,
+    );
+    defer preview.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.startsWith(u8, preview.bytes, "✓ Recovered · resumed"));
+    try std.testing.expect(std.mem.endsWith(u8, preview.bytes, "..."));
+    try std.testing.expect(std.mem.indexOf(u8, preview.bytes, "later details") == null);
 }
 
 test "activity surface painter breaks static status rows at word boundaries" {
@@ -551,13 +604,13 @@ test "activity surface painter breaks static status rows at word boundaries" {
     defer fixtures.shadow.deinit();
 
     const result = try paintActivityIntoSurface(&fixtures.surface, .{
-        .label = "▲ aaaaaa bbbb",
+        .label = "⚠ aaaaaa bbbb",
         .shimmer_pos = -8,
         .style = .danger,
     });
 
     try std.testing.expect(result.painted);
-    try std.testing.expectEqual(@as(u21, '▲'), fixtures.surface.cellAt(3, 1).?.codepoint);
+    try std.testing.expectEqual(@as(u21, '⚠'), fixtures.surface.cellAt(3, 1).?.codepoint);
     try std.testing.expectEqual(@as(u21, 'a'), fixtures.surface.cellAt(3, 8).?.codepoint);
     try std.testing.expectEqual(@as(u21, ' '), fixtures.surface.cellAt(3, 10).?.codepoint);
     try std.testing.expectEqual(@as(u21, ' '), fixtures.surface.cellAt(4, 2).?.codepoint);

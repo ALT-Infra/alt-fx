@@ -6572,7 +6572,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
       const tapePath = join(root!, "selected-child-route-recovery.fxtape");
       const childPrompt = "SELECTED_CHILD_ROUTE_RECOVERY";
       const finalText = "SELECTED_CHILD_RECOVERED";
-      const retryText = "Provider unavailable · retrying request · attempt 1/10";
+      const retryText = "⚠ Provider unavailable · provider_error: selected child route failed once";
       let childRequests = 0;
       let releaseProviderError!: (response: Response) => void;
       const providerError = new Promise<Response>((resolve) => {

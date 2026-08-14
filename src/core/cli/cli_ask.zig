@@ -2749,7 +2749,7 @@ fn pushRouteRecoveryStatus(raw_ctx: *anyopaque, status: types.RouteRecoveryStatu
     ctx.last_recovery_status = status;
     const terminal = status.kind == .terminal_provider_error;
     if (ctx.output_mode == .json or (ctx.output_mode == .quiet and !terminal)) return;
-    var label_buf: [128]u8 = undefined;
+    var label_buf: [types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
     try pushSystemNotice(raw_ctx, status.label(&label_buf));
     if (terminal and ctx.writable == null) {
         try pushSystemNotice(
@@ -3351,7 +3351,7 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
         try failure.writeJson(&out.writer);
     }
     if (result.recovery) |recovery| {
-        var label_buf: [256]u8 = undefined;
+        var label_buf: [types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
         try out.writer.writeAll(",\"recovery\":{\"state\":");
         try std.json.Stringify.value(
             if (recovery.kind == .terminal_provider_error) "paused" else if (recovery.isRecovered()) "recovered" else "active",
@@ -7594,6 +7594,40 @@ test "render final JSON reports the successful recovery attempt" {
     const recovery = parsed.value.object.get("recovery").?.object;
     try std.testing.expectEqual(@as(i64, 3), recovery.get("attempt").?.integer);
     try std.testing.expectEqualStrings("recovered", recovery.get("state").?.string);
+    try std.testing.expectEqualStrings(
+        "✓ recovered · succeeded on attempt 3/10",
+        recovery.get("message").?.string,
+    );
+    try std.testing.expect(std.mem.find(u8, recovery.get("message").?.string, "provider_error") == null);
+}
+
+test "render final JSON includes the latest terminal recovery diagnostic" {
+    const alloc = std.testing.allocator;
+    const result = PromptRunResult{
+        .exit_code = 1,
+        .assistant_output = try alloc.dupe(u8, ""),
+        .recovery = .{
+            .kind = .terminal_provider_error,
+            .failed_attempt = 2,
+            .attempt_limit = 2,
+            .cause = .provider_unavailable,
+            .diagnostic = types.ModelFailureDiagnostic.init(
+                "HTTP 503 · no_available_providers: No providers are currently available",
+            ),
+        },
+    };
+    defer result.deinit(alloc);
+
+    const json = try renderFinalJsonResult(alloc, result);
+    defer alloc.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+    const recovery = parsed.value.object.get("recovery").?.object;
+    try std.testing.expectEqualStrings("paused", recovery.get("state").?.string);
+    try std.testing.expectEqualStrings(
+        "⚠ Provider unavailable · HTTP 503 · no_available_providers: No providers are currently available · recovery paused after 2/2 attempts",
+        recovery.get("message").?.string,
+    );
 }
 
 test "cli json records built in web_search completion" {

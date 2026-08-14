@@ -884,7 +884,7 @@ test "frame-owned activity preserves route recovery status tone" {
         .selected_subagent_label = null,
         .selected_subagent_status = null,
         .activity = .{ .turn_thinking = .{
-            .label = "▲ API error · attempt 1/3 failed · retrying",
+            .label = "⚠ API error · attempt 1/3 failed · retrying",
             .tone = .warning,
         } },
         .input = &input,
@@ -894,7 +894,7 @@ test "frame-owned activity preserves route recovery status tone" {
     switch (frameOwnedActivityProjection(&active_buf, &shell, ctx, null)) {
         .turn_thinking => |thinking| {
             try std.testing.expectEqual(ActivityProjection.Tone.warning, thinking.tone);
-            try std.testing.expectEqualStrings("▲ API error · attempt 1/3 failed · retrying", thinking.label);
+            try std.testing.expectEqualStrings("⚠ API error · attempt 1/3 failed · retrying", thinking.label);
         },
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
@@ -988,7 +988,7 @@ test "frame-owned activity shows live streaming token progress" {
 }
 
 test "static turn status reserves wrapped activity rows" {
-    const label = "▲ API access denied · HTTP 403 · Provider: wafer · Your team has restricted access to this provider. Contact the owner of the account.";
+    const label = "⚠ API access denied · HTTP 403 · Provider: wafer · Your team has restricted access to this provider. Contact the owner of the account.";
     const projection: ActivityProjection = .{ .turn_thinking = .{
         .label = label,
         .tone = .danger,
@@ -1004,7 +1004,7 @@ test "static turn status reserves wrapped activity rows" {
 }
 
 test "static turn status wraps at word boundaries" {
-    const label = "▲ aaaaaaaa bbbbbbbbbbb";
+    const label = "⚠ aaaaaaaa bbbbbbbbbbb";
     const projection: ActivityProjection = .{ .turn_thinking = .{
         .label = label,
         .tone = .danger,

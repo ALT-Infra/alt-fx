@@ -53,7 +53,7 @@ pub fn writeModelRecoveryInfoUpdate(
         try writer.print(",\"delaySeconds\":{d}", .{recovery.delay_seconds});
     }
     try writer.print(",\"durable\":{s},\"message\":", .{if (durable) "true" else "false"});
-    var label_buf: [256]u8 = undefined;
+    var label_buf: [core_types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
     try writeJsonStr(recovery.label(&label_buf), writer);
     try writer.writeAll("}}}}");
 }
@@ -345,12 +345,14 @@ test "model recovery info update is structured and clearable" {
         .cause = .system_resumed,
         .action = .paused,
         .required_action = .continue_later,
+        .diagnostic = core_types.ModelFailureDiagnostic.init("ConnectionResetByPeer"),
     }, true);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"state\":\"paused\"") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"cause\":\"system_resumed\"") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"requiredAction\":\"continue_later\"") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"attempt\":4") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"durable\":true") != null);
+    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "ConnectionResetByPeer") != null);
 
     out.writer.end = 0;
     try writeModelRecoveryInfoUpdate(&out.writer, .{
@@ -360,6 +362,7 @@ test "model recovery info update is structured and clearable" {
     }, true);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"state\":\"recovered\"") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"attempt\":5") != null);
+    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "ConnectionResetByPeer") == null);
 
     out.writer.end = 0;
     try writeModelRecoveryInfoUpdate(&out.writer, null, false);

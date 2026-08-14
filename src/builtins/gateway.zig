@@ -1705,7 +1705,7 @@ test "built-in credits provider maps Gateway HTTP denial" {
     try std.testing.expect(snapshot.used == null);
     try std.testing.expect(snapshot.plan == null);
     try std.testing.expectEqualStrings(
-        "API access denied · HTTP 403 · Buy credits to use AI Gateway.",
+        "API access denied · HTTP 403 · credit_card_required: Buy credits to use AI Gateway.",
         snapshot.err_message.?,
     );
 }

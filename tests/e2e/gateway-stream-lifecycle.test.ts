@@ -3017,8 +3017,8 @@ describe("gateway stream lifecycle", () => {
       const trace = readFileSync(tracePath, "utf8");
 
       expect(result.code).toBe(0);
-      expect(result.stderr).toContain("Provider unavailable · retrying request · attempt 1/10");
-      expect(result.stderr).toContain("Provider unavailable · retrying request in 1s · attempt 2/10");
+      expect(result.stderr).toContain("Provider unavailable · provider_error: turn route failure one · retrying request · attempt 1/10");
+      expect(result.stderr).toContain("Provider unavailable · provider_error: turn route failure two · retrying request in 1s · attempt 2/10");
       expect(result.stderr).toContain("recovered · succeeded on attempt 3/10");
       expect(result.stdout).toContain("Recovered in ask turn.");
       expect(gateway.requestCount()).toBe(3);
@@ -3028,8 +3028,8 @@ describe("gateway stream lifecycle", () => {
       expect(trace).toContain("semantic_attempt=1/10");
       expect(trace).toContain("semantic_attempt=2/10");
       expect(trace).toContain("retry=true");
-      expect(trace).toContain("detail=turn route failure one");
-      expect(trace).toContain("detail=turn route failure two");
+      expect(trace).toContain("detail=provider_error: turn route failure one");
+      expect(trace).toContain("detail=provider_error: turn route failure two");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -4361,9 +4361,11 @@ describe("gateway stream lifecycle", () => {
       expect(result.code).toBe(0);
       expect(json.exit_code).toBe(0);
       expect(json.output).toContain("Recovered after route retry.");
-      expect(json.output).not.toContain("▲ API error");
+      expect(json.output).not.toContain("⚠ API error");
       expect(json.recovery?.state).toBe("recovered");
       expect(json.recovery?.attempt).toBe(3);
+      expect(json.recovery?.message).not.toContain("provider_error");
+      expect(json.recovery?.message).not.toContain("first route failure");
       expect(result.stderr).toBe("");
       expect(gateway.requestCount()).toBe(3);
       expect(trace).toContain("event=route_failure");
@@ -4372,8 +4374,8 @@ describe("gateway stream lifecycle", () => {
       expect(trace).toContain("semantic_attempt=1/10");
       expect(trace).toContain("semantic_attempt=2/10");
       expect(trace).toContain("retry=true");
-      expect(trace).toContain("detail=first route failure");
-      expect(trace).toContain("detail=second route failure");
+      expect(trace).toContain("detail=provider_error: first route failure");
+      expect(trace).toContain("detail=provider_error: second route failure");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -4404,6 +4406,9 @@ describe("gateway stream lifecycle", () => {
       expect(json.recovery?.attempt_limit).toBe(10);
       expect(json.recovery?.required_action).toBe("continue_later");
       expect(json.recovery?.durable).toBe(true);
+      expect(json.recovery?.message).toContain(
+        "HTTP 503 · provider temporarily unavailable",
+      );
       expect(result.stderr).toBe("");
     } finally {
       gateway.stop();
@@ -4438,6 +4443,9 @@ describe("gateway stream lifecycle", () => {
       expect(paused.recovery?.attempt_limit).toBe(10);
       expect(paused.recovery?.required_action).toBe("continue_later");
       expect(paused.recovery?.durable).toBe(true);
+      expect(paused.recovery?.message).toContain(
+        "HTTP 503 · provider temporarily unavailable",
+      );
 
       const detail = await runFx(
         ["session", "--id", paused.session_id, "--json"],
@@ -4525,6 +4533,10 @@ describe("gateway stream lifecycle", () => {
       const recovered = parseAskJson(resumed.stdout);
       expect(resumed.code).toBe(0);
       expect(recovered.output).toBe(`${partialText}${finalText}`);
+      expect(recovered.recovery?.state).toBe("recovered");
+      expect(recovered.recovery?.message).not.toContain(
+        "provider temporarily unavailable",
+      );
       expect(gateway.requestCount()).toBe(11);
     } finally {
       gateway.stop();
@@ -4551,6 +4563,9 @@ describe("gateway stream lifecycle", () => {
       expect(result.code).toBe(1);
       expect(json.exit_code).toBe(1);
       expect(json.error).toBe("ModelError");
+      expect(json.recovery?.message).toContain(
+        "⚠ blocked · content_filter · content filter",
+      );
       expect(gateway.requestCount()).toBe(1);
       expect(result.stderr).toBe("");
       expect(trace).toContain("event=route_failure");
