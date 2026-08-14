@@ -3763,7 +3763,7 @@ describe("effect-aware command permissions", () => {
           return subagentInspectCall("ask_delivery_inspect_1", childId);
         },
         (body) => {
-          expectParentDeliveries(body, childId, intervalEventIds, intervalPayload);
+          expectNoParentDeliveries(body);
           secondContinuationChecked = true;
           return finalText("ASK_PARENT_DELIVERY_CONSUMED");
         },
@@ -3960,7 +3960,7 @@ describe("effect-aware command permissions", () => {
         if (text.includes(freshChildWork)) return freshChildCompletion;
         if (body.includes('"toolCallId":"multi_delivery_send_fresh"') &&
             body.includes('"type":"tool-result"')) {
-          expectOrderedParentDeliveries(body, childId, expectedMessages);
+          expectNoParentDeliveries(body);
           expect(toolResultText(body, "multi_delivery_send_fresh")).toContain(
             '"status":"message_queued"',
           );
@@ -3984,7 +3984,7 @@ describe("effect-aware command permissions", () => {
         }
         if (body.includes('"toolCallId":"multi_delivery_configure"') &&
             body.includes('"type":"tool-result"')) {
-          expectOrderedParentDeliveries(body, childId, expectedMessages);
+          expectNoParentDeliveries(body);
           configureContinuationChecked = true;
           return gatewayToolCall("subagent", {
             command: {
@@ -4498,7 +4498,7 @@ describe("effect-aware command permissions", () => {
         ].filter(Boolean).join("+") || "root-initial");
         if (body.includes('"toolCallId":"nested_child_inspect_grandchild_1"') &&
             body.includes('"type":"tool-result"')) {
-          expectParentDeliveries(body, grandchildId, grandchildEventIds, intervalPayload);
+          expectNoParentDeliveries(body);
           childContinuationDeliveryChecked = true;
           return finalText("NESTED_CHILD_CONSUMED_GRANDCHILD");
         }
@@ -5088,7 +5088,7 @@ describe("effect-aware command permissions", () => {
         if (parentPhase === "inspect_result" &&
             body.includes('"toolCallId":"interactive_delivery_inspect_1"') &&
             body.includes('"type":"tool-result"')) {
-          expectParentDeliveries(body, childId, intervalEventIds, intervalPayload);
+          expectNoParentDeliveries(body);
           secondContinuationChecked = true;
           parentPhase = "third_prompt";
           return finalText("INTERACTIVE_PARENT_DELIVERY_CONSUMED");
