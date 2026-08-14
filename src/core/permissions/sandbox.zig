@@ -252,12 +252,15 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
         .flags = 0,
     };
     std.posix.sigaction(std.posix.SIG.TERM, &supervisor_action, null);
-
+    if (comptime builtin.os.tag == .linux) {
+        _ = try std.posix.prctl(.SET_CHILD_SUBREAPER, .{@as(usize, 1)});
+    }
     var target = std.process.spawn(zio, .{
         .argv = args[2..],
         .stdin = .inherit,
         .stdout = .inherit,
         .stderr = .inherit,
+        .start_suspended = builtin.os.tag == .macos,
     }) catch |err| {
         writeForegroundSessionReplaceFailure(args[1], err);
         std.process.exit(foreground_session_replace_failure_exit_code);
@@ -285,11 +288,15 @@ fn waitForForegroundTarget(
     const target_pid = target.id orelse return error.ForegroundTargetMissing;
     var descendants = try process_tree.Tracker.init(std.heap.page_allocator);
     defer descendants.deinit();
+    if (comptime builtin.os.tag == .macos) {
+        try descendants.refresh(target_pid);
+        try std.posix.kill(target_pid, std.posix.SIG.CONT);
+    }
     var termination_started_ms: ?i64 = null;
     var forced = false;
 
     while (true) {
-        try descendants.refresh(target_pid);
+        try refreshForegroundTargetTree(&descendants, target_pid);
         const now_ms = io_mod.milliTimestamp();
         if (foregroundSessionTerminationRequested()) {
             if (termination_started_ms == null) {
@@ -307,7 +314,7 @@ fn waitForForegroundTarget(
         }
 
         if (try pollProcessLeader(target)) |term| {
-            try descendants.refresh(target_pid);
+            try refreshForegroundTargetTree(&descendants, target_pid);
             if (termination_started_ms == null and
                 foregroundSessionTerminationRequested())
             {
@@ -326,14 +333,11 @@ fn waitForForegroundTarget(
                 );
                 return term;
             }
-            const count = descendants.signalAll(std.posix.SIG.KILL);
+            const count = try cleanupCompletedForegroundTarget(
+                &descendants,
+                target_pid,
+            );
             if (count > 0) {
-                const started_ms = io_mod.milliTimestamp();
-                while (descendants.anyAlive() and
-                    io_mod.milliTimestamp() - started_ms < 250)
-                {
-                    io_mod.sleep(std.time.ns_per_ms);
-                }
                 debug_trace.logf(
                     "core",
                     "captured command target completed; tracked descendants terminated count={d}",
@@ -343,6 +347,46 @@ fn waitForForegroundTarget(
             return term;
         }
         io_mod.sleep(std.time.ns_per_ms);
+    }
+}
+
+fn cleanupCompletedForegroundTarget(
+    descendants: *process_tree.Tracker,
+    target_pid: std.posix.pid_t,
+) !usize {
+    const started_ms = io_mod.milliTimestamp();
+    var signaled: usize = 0;
+    var empty_scans: u8 = 0;
+    while (io_mod.milliTimestamp() - started_ms <
+        foreground_target_cleanup_wait_ms)
+    {
+        try refreshForegroundTargetTree(descendants, target_pid);
+        signaled += descendants.signalAll(std.posix.SIG.KILL);
+        if (descendants.anyAlive()) {
+            empty_scans = 0;
+        } else {
+            empty_scans += 1;
+            if (empty_scans >= 2) return signaled;
+        }
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    try refreshForegroundTargetTree(descendants, target_pid);
+    signaled += descendants.signalAll(std.posix.SIG.KILL);
+    return signaled;
+}
+
+fn refreshForegroundTargetTree(
+    descendants: *process_tree.Tracker,
+    target_pid: std.posix.pid_t,
+) !void {
+    try descendants.refresh(target_pid);
+    if (comptime builtin.os.tag == .linux) {
+        try descendants.refreshAdditionalRoot(std.c.getpid());
+    }
+    if (comptime builtin.os.tag == .macos) {
+        if (foregroundSessionTerminationRequested()) {
+            try descendants.refreshLineageProcesses();
+        }
     }
 }
 
@@ -369,16 +413,24 @@ fn waitForForegroundTargetDescendants(
     termination_started_ms: i64,
     forced: *bool,
 ) !void {
+    var empty_scans: u8 = 0;
     while (true) {
-        try descendants.refresh(target_pid);
-        if (!descendants.anyAlive()) return;
-
+        try refreshForegroundTargetTree(descendants, target_pid);
         const now_ms = io_mod.milliTimestamp();
         if (!forced.* and
             now_ms - termination_started_ms >= foreground_target_termination_grace_ms)
         {
             forced.* = true;
             forceKillForegroundTargetDescendants(descendants);
+        }
+        if (forced.*) {
+            _ = descendants.signalAll(std.posix.SIG.KILL);
+        }
+        if (descendants.anyAlive()) {
+            empty_scans = 0;
+        } else {
+            empty_scans += 1;
+            if (empty_scans >= 2) return;
         }
         if (forced.* and
             now_ms - termination_started_ms >=
@@ -1385,6 +1437,15 @@ fn executeProcessWithClosedInput(
     argv: []const []const u8,
     cwd: []const u8,
 ) !CollectedProcess {
+    if (comptime supports_foreground_session) {
+        return executeProcessWithDetachedSession(
+            scratch,
+            cfg,
+            argv,
+            cwd,
+            "",
+        );
+    }
     return executeProcessWithInput(scratch, cfg, argv, cwd, true, true);
 }
 
@@ -4503,7 +4564,7 @@ test "natural command completion terminates redirected descendant after setsid" 
             " open(\"{s}\",\"w\").write(str(os.getpid()))\n" ++
             " time.sleep(30)\n" ++
             "else:\n" ++
-            " time.sleep(0.1)'",
+            " pass'",
         .{pid_path},
     );
     defer alloc.free(command);
@@ -4517,6 +4578,71 @@ test "natural command completion terminates redirected descendant after setsid" 
     defer alloc.free(result.output);
     try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.foreground.exit_code);
 
+    const pid_text = try readAbsoluteFile(alloc, pid_path, 64);
+    defer alloc.free(pid_text);
+    const pid = try std.fmt.parseInt(
+        std.posix.pid_t,
+        std.mem.trim(u8, pid_text, " \t\r\n"),
+        10,
+    );
+    try expectProcessGone(pid);
+}
+
+test "cancellation preserves grace and removes an escaped descendant" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "escaped-cancel.pid" });
+    defer alloc.free(pid_path);
+    const term_path = try std.fs.path.join(alloc, &.{ workspace, "escaped-cancel.term" });
+    defer alloc.free(term_path);
+    const command = try std.fmt.allocPrint(
+        alloc,
+        "python3 -c 'import os,signal,time\n" ++
+            "pid=os.fork()\n" ++
+            "if pid == 0:\n" ++
+            " os.setsid()\n" ++
+            " open(\"{s}\",\"w\").write(str(os.getpid()))\n" ++
+            " def stop(signum,frame):\n" ++
+            "  open(\"{s}\",\"w\").write(\"TERM\")\n" ++
+            "  time.sleep(3)\n" ++
+            "  raise SystemExit(130)\n" ++
+            " signal.signal(signal.SIGTERM,stop)\n" ++
+            " time.sleep(0.2)\n" ++
+            " print(\"ESCAPED-GRACE-READY\",flush=True)\n" ++
+            " while True: time.sleep(1)\n" ++
+            "else:\n" ++
+            " while True: time.sleep(1)'",
+        .{ pid_path, term_path },
+    );
+    defer alloc.free(command);
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var trigger = CancelAfterOutput{
+        .flag = &cancel,
+        .needle = "ESCAPED-GRACE-READY",
+    };
+    const started_ms = io_mod.milliTimestamp();
+    const result = try executeCommand(.{
+        .backend = .none,
+        .workspace_root = workspace,
+        .max_command_output_bytes = 4096,
+        .cancel_flag = &cancel,
+        .output_chunk_ctx = @ptrCast(&trigger),
+        .on_output_chunk = CancelAfterOutput.onChunk,
+    }, alloc, command, workspace);
+    defer alloc.free(result.output);
+
+    try std.testing.expect(trigger.seen);
+    try std.testing.expect(result.cancelled);
+    try std.testing.expect(io_mod.milliTimestamp() - started_ms >= 500);
+    const term_text = try readAbsoluteFile(alloc, term_path, 64);
+    defer alloc.free(term_text);
+    try std.testing.expectEqualStrings("TERM", term_text);
     const pid_text = try readAbsoluteFile(alloc, pid_path, 64);
     defer alloc.free(pid_text);
     const pid = try std.fmt.parseInt(

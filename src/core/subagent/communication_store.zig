@@ -1,12 +1,14 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
+const permission_request = @import("../permissions/permission_request.zig");
 const session_child_store = @import("../session/session_child_store.zig");
 const types = @import("../shared/types.zig");
 const communication = @import("communication.zig");
 const domain = @import("domain.zig");
 
 const Allocator = std.mem.Allocator;
-const schema_version: u64 = 5;
+const schema_version: u64 = 6;
+const base64_delivery_schema_version: u64 = 5;
 const previous_capacity_schema_version: u64 = 4;
 const pre_capacity_schema_version: u64 = 3;
 const process_epoch_schema_version: u64 = 2;
@@ -81,6 +83,56 @@ const WireLedgerV5 = struct {
 const WireRecordV5 = struct {
     schema_version: u64,
     ledger: WireLedgerV5,
+};
+
+const WirePermissionGrantV6 = struct {
+    tool_name: []u8,
+    target_path: WireMessageV5,
+};
+
+const WireApprovalV6 = struct {
+    id: []u8,
+    kind: communication.ApprovalKind,
+    child_id: []u8,
+    root_id: []u8,
+    work_id: ?[]u8,
+    relationship: ?communication.RelationshipApproval = null,
+    prepared_fingerprint: [32]u8,
+    identity_fingerprint: [32]u8,
+    label: []u8,
+    explanation: ?[]u8,
+    command: ?WireMessageV5 = null,
+    file: ?permission_request.FileApprovalRequest = null,
+    grants: []WirePermissionGrantV6,
+    status: communication.ApprovalStatus,
+    created_at_ms: i64,
+    resolved_at_ms: ?i64 = null,
+    resolved_revision: ?u64 = null,
+};
+
+const WireLedgerV6 = struct {
+    session_id: []u8,
+    capacity_version: u64 = 0,
+    generation: u64 = 0,
+    next_sequence: u64 = 1,
+    deliveries: []WireDeliveryV5,
+    cursors: []communication.ConsumerCursor,
+    retention_targets: ?[]communication.RetentionTarget = null,
+    work_notifications: []communication.WorkNotification,
+    approvals: []WireApprovalV6,
+    parent_turn_evicted_through: u64 = 0,
+    authority_generation: u64 = 0,
+    authority_grants: []WirePermissionGrantV6,
+    legacy_operation_replay_closed: bool = false,
+    model_replay_floor: u64 = 0,
+    human_replay_floor: u64 = 0,
+    model_epoch_high: u64 = 0,
+    human_epoch_high: u64 = 0,
+};
+
+const WireRecordV6 = struct {
+    schema_version: u64,
+    ledger: WireLedgerV6,
 };
 
 comptime {
@@ -286,6 +338,9 @@ fn encodeWireCanonical(
     ledger: communication.Ledger,
 ) error{OutOfMemory}![]u8 {
     if (version == schema_version) {
+        return encodeWireCanonicalV6(alloc, ledger);
+    }
+    if (version == base64_delivery_schema_version) {
         return encodeWireCanonicalV5(alloc, ledger);
     }
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -295,6 +350,125 @@ fn encodeWireCanonical(
         .ledger = ledger,
     }, .{}, &out.writer) catch return error.OutOfMemory;
     return out.toOwnedSlice();
+}
+
+fn encodeWireCanonicalV6(
+    alloc: Allocator,
+    ledger: communication.Ledger,
+) error{OutOfMemory}![]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const deliveries = try arena.alloc(WireDeliveryV5, ledger.deliveries.len);
+    for (ledger.deliveries, deliveries) |delivery, *wire| {
+        wire.* = .{
+            .sequence = delivery.sequence,
+            .revision = delivery.revision,
+            .id = delivery.id,
+            .source_id = delivery.source_id,
+            .target_id = delivery.target_id,
+            .work_id = delivery.work_id,
+            .operation_id = delivery.operation_id,
+            .timestamp_ms = delivery.timestamp_ms,
+            .payload = switch (delivery.payload) {
+                .message => |content| .{ .message = try encodeWireTextV6(
+                    arena,
+                    content,
+                ) },
+                .milestone => |value| .{ .milestone = value },
+                .terminal => |value| .{ .terminal = value },
+                .interval => |value| .{ .interval = .{
+                    .state = value.state,
+                    .coalesced_ticks = value.coalesced_ticks,
+                } },
+                .approval => |value| .{ .approval = value },
+                .tool_activity => |value| .{ .tool_activity = value },
+            },
+        };
+    }
+    const approvals = try arena.alloc(WireApprovalV6, ledger.approvals.len);
+    for (ledger.approvals, approvals) |approval, *wire| {
+        wire.* = .{
+            .id = approval.id,
+            .kind = approval.kind,
+            .child_id = approval.child_id,
+            .root_id = approval.root_id,
+            .work_id = approval.work_id,
+            .relationship = approval.relationship,
+            .prepared_fingerprint = approval.prepared_fingerprint,
+            .identity_fingerprint = approval.identity_fingerprint,
+            .label = approval.label,
+            .explanation = approval.explanation,
+            .command = if (approval.command) |command|
+                try encodeWireTextV6(arena, command)
+            else
+                null,
+            .file = approval.file,
+            .grants = try encodeWireGrantsV6(arena, approval.grants),
+            .status = approval.status,
+            .created_at_ms = approval.created_at_ms,
+            .resolved_at_ms = approval.resolved_at_ms,
+            .resolved_revision = approval.resolved_revision,
+        };
+    }
+    const authority_grants = try encodeWireGrantsV6(
+        arena,
+        ledger.authority_grants,
+    );
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    std.json.Stringify.value(WireRecordV6{
+        .schema_version = schema_version,
+        .ledger = .{
+            .session_id = ledger.session_id,
+            .capacity_version = ledger.capacity_version,
+            .generation = ledger.generation,
+            .next_sequence = ledger.next_sequence,
+            .deliveries = deliveries,
+            .cursors = ledger.cursors,
+            .retention_targets = ledger.retention_targets,
+            .work_notifications = ledger.work_notifications,
+            .approvals = approvals,
+            .parent_turn_evicted_through = ledger.parent_turn_evicted_through,
+            .authority_generation = ledger.authority_generation,
+            .authority_grants = authority_grants,
+            .legacy_operation_replay_closed = ledger.legacy_operation_replay_closed,
+            .model_replay_floor = ledger.model_replay_floor,
+            .human_replay_floor = ledger.human_replay_floor,
+            .model_epoch_high = ledger.model_epoch_high,
+            .human_epoch_high = ledger.human_epoch_high,
+        },
+    }, .{}, &out.writer) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn encodeWireGrantsV6(
+    arena: Allocator,
+    grants: []const types.PermissionGrant,
+) error{OutOfMemory}![]WirePermissionGrantV6 {
+    const encoded = try arena.alloc(WirePermissionGrantV6, grants.len);
+    for (grants, encoded) |grant, *wire| {
+        wire.* = .{
+            .tool_name = grant.tool_name,
+            .target_path = try encodeWireTextV6(arena, grant.target_path),
+        };
+    }
+    return encoded;
+}
+
+fn encodeWireTextV6(
+    arena: Allocator,
+    content: []const u8,
+) error{OutOfMemory}!WireMessageV5 {
+    const encoded = try arena.alloc(
+        u8,
+        std.base64.standard.Encoder.calcSize(content.len),
+    );
+    _ = std.base64.standard.Encoder.encode(encoded, content);
+    return .{
+        .encoding = @constCast("base64"),
+        .data = encoded,
+    };
 }
 
 fn encodeWireCanonicalV5(
@@ -349,7 +523,7 @@ fn encodeWireCanonicalV5(
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     std.json.Stringify.value(WireRecordV5{
-        .schema_version = schema_version,
+        .schema_version = base64_delivery_schema_version,
         .ledger = .{
             .session_id = ledger.session_id,
             .capacity_version = ledger.capacity_version,
@@ -392,13 +566,15 @@ fn decode(alloc: Allocator, bytes: []const u8) LoadError!communication.Ledger {
         else => return error.InvalidCommunicationRecord,
     };
     if (version != schema_version and
+        version != base64_delivery_schema_version and
         version != previous_capacity_schema_version and
         version != pre_capacity_schema_version and
         version != process_epoch_schema_version and version != legacy_schema_version)
     {
         return error.UnsupportedCommunicationSchema;
     }
-    if (version == schema_version) return decodeV5(alloc, bytes);
+    if (version == schema_version) return decodeV6(alloc, bytes);
+    if (version == base64_delivery_schema_version) return decodeV5(alloc, bytes);
     var parsed = std.json.parseFromSlice(WireRecord, alloc, bytes, .{
         .allocate = .alloc_always,
     }) catch |err| switch (err) {
@@ -440,11 +616,11 @@ fn decode(alloc: Allocator, bytes: []const u8) LoadError!communication.Ledger {
     return parsed.value.ledger.clone(alloc) catch return error.OutOfMemory;
 }
 
-fn decodeV5(
+fn decodeV6(
     alloc: Allocator,
     bytes: []const u8,
 ) LoadError!communication.Ledger {
-    var parsed = std.json.parseFromSlice(WireRecordV5, alloc, bytes, .{
+    var parsed = std.json.parseFromSlice(WireRecordV6, alloc, bytes, .{
         .allocate = .alloc_always,
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -462,10 +638,75 @@ fn decodeV5(
         parsed.value.ledger.deliveries,
     );
     defer freeBorrowedV5Deliveries(alloc, deliveries);
+    const approvals = try decodeApprovalsV6(
+        alloc,
+        parsed.value.ledger.approvals,
+    );
+    defer freeBorrowedApprovalsV6(alloc, approvals);
+    const authority_grants = try decodeWireGrantsV6(
+        alloc,
+        parsed.value.ledger.authority_grants,
+    );
+    defer freeBorrowedWireGrantsV6(alloc, authority_grants);
     const wire = parsed.value.ledger;
     const borrowed = communication.Ledger{
         .session_id = wire.session_id,
         .capacity_version = wire.capacity_version,
+        .generation = wire.generation,
+        .next_sequence = wire.next_sequence,
+        .deliveries = deliveries,
+        .cursors = wire.cursors,
+        .retention_targets = wire.retention_targets,
+        .work_notifications = wire.work_notifications,
+        .approvals = approvals,
+        .parent_turn_evicted_through = wire.parent_turn_evicted_through,
+        .authority_generation = wire.authority_generation,
+        .authority_grants = authority_grants,
+        .legacy_operation_replay_closed = wire.legacy_operation_replay_closed,
+        .model_replay_floor = wire.model_replay_floor,
+        .human_replay_floor = wire.human_replay_floor,
+        .model_epoch_high = wire.model_epoch_high,
+        .human_epoch_high = wire.human_epoch_high,
+    };
+    communication.validateLedger(borrowed) catch
+        return error.InvalidCommunicationRecord;
+    const canonical_bytes = canonicalWireByteCount(
+        alloc,
+        schema_version,
+        borrowed,
+    ) catch return error.OutOfMemory;
+    if (canonical_bytes > max_canonical_record_bytes) {
+        return error.InvalidCommunicationRecord;
+    }
+    return borrowed.clone(alloc) catch return error.OutOfMemory;
+}
+
+fn decodeV5(
+    alloc: Allocator,
+    bytes: []const u8,
+) LoadError!communication.Ledger {
+    var parsed = std.json.parseFromSlice(WireRecordV5, alloc, bytes, .{
+        .allocate = .alloc_always,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidCommunicationRecord,
+    };
+    defer parsed.deinit();
+    if (parsed.value.schema_version != base64_delivery_schema_version or
+        parsed.value.ledger.capacity_version !=
+            communication.capacity_contract_version)
+    {
+        return error.InvalidCommunicationRecord;
+    }
+    const deliveries = try decodeV5Deliveries(
+        alloc,
+        parsed.value.ledger.deliveries,
+    );
+    defer freeBorrowedV5Deliveries(alloc, deliveries);
+    const wire = parsed.value.ledger;
+    var borrowed = communication.Ledger{
+        .session_id = wire.session_id,
+        .capacity_version = 0,
         .generation = wire.generation,
         .next_sequence = wire.next_sequence,
         .deliveries = deliveries,
@@ -484,15 +725,103 @@ fn decodeV5(
     };
     communication.validateLedger(borrowed) catch
         return error.InvalidCommunicationRecord;
-    const canonical_bytes = canonicalWireByteCount(
-        alloc,
-        schema_version,
-        borrowed,
-    ) catch return error.OutOfMemory;
-    if (canonical_bytes > max_canonical_record_bytes) {
-        return error.InvalidCommunicationRecord;
+    if (communication.capacityContractSatisfied(borrowed)) {
+        borrowed.capacity_version = communication.capacity_contract_version;
+        const canonical_bytes = canonicalWireByteCount(
+            alloc,
+            schema_version,
+            borrowed,
+        ) catch return error.OutOfMemory;
+        if (canonical_bytes > max_canonical_record_bytes) {
+            borrowed.capacity_version = 0;
+        }
     }
     return borrowed.clone(alloc) catch return error.OutOfMemory;
+}
+
+fn decodeApprovalsV6(
+    alloc: Allocator,
+    approvals: []const WireApprovalV6,
+) LoadError![]communication.Approval {
+    const decoded = try alloc.alloc(communication.Approval, approvals.len);
+    var built: usize = 0;
+    errdefer {
+        for (decoded[0..built]) |approval| {
+            if (approval.command) |command| alloc.free(command);
+            freeBorrowedWireGrantsV6(alloc, approval.grants);
+        }
+        alloc.free(decoded);
+    }
+    for (approvals) |approval| {
+        const command = if (approval.command) |command|
+            try decodeCanonicalMessage(alloc, command)
+        else
+            null;
+        const grants = decodeWireGrantsV6(alloc, approval.grants) catch |err| {
+            if (command) |value| alloc.free(value);
+            return err;
+        };
+        decoded[built] = .{
+            .id = approval.id,
+            .kind = approval.kind,
+            .child_id = approval.child_id,
+            .root_id = approval.root_id,
+            .work_id = approval.work_id,
+            .relationship = approval.relationship,
+            .prepared_fingerprint = approval.prepared_fingerprint,
+            .identity_fingerprint = approval.identity_fingerprint,
+            .label = approval.label,
+            .explanation = approval.explanation,
+            .command = command,
+            .file = approval.file,
+            .grants = grants,
+            .status = approval.status,
+            .created_at_ms = approval.created_at_ms,
+            .resolved_at_ms = approval.resolved_at_ms,
+            .resolved_revision = approval.resolved_revision,
+        };
+        built += 1;
+    }
+    return decoded;
+}
+
+fn decodeWireGrantsV6(
+    alloc: Allocator,
+    grants: []const WirePermissionGrantV6,
+) LoadError![]types.PermissionGrant {
+    const decoded = try alloc.alloc(types.PermissionGrant, grants.len);
+    var built: usize = 0;
+    errdefer {
+        for (decoded[0..built]) |grant| alloc.free(grant.target_path);
+        alloc.free(decoded);
+    }
+    for (grants) |grant| {
+        decoded[built] = .{
+            .tool_name = grant.tool_name,
+            .target_path = try decodeCanonicalMessage(alloc, grant.target_path),
+        };
+        built += 1;
+    }
+    return decoded;
+}
+
+fn freeBorrowedApprovalsV6(
+    alloc: Allocator,
+    approvals: []communication.Approval,
+) void {
+    for (approvals) |approval| {
+        if (approval.command) |command| alloc.free(command);
+        freeBorrowedWireGrantsV6(alloc, approval.grants);
+    }
+    alloc.free(approvals);
+}
+
+fn freeBorrowedWireGrantsV6(
+    alloc: Allocator,
+    grants: []types.PermissionGrant,
+) void {
+    for (grants) |grant| alloc.free(grant.target_path);
+    alloc.free(grants);
 }
 
 fn decodeV5Deliveries(
@@ -630,7 +959,151 @@ test "communication codec round trips owned durable state" {
     try std.testing.expectEqualStrings("hello", ledger.deliveries[0].payload.message);
 }
 
-test "schema v5 file approval projection round trips as independent owned state" {
+test "schema v6 persists near-limit captured command approvals" {
+    const command_environment = @import("../execution/command_environment.zig");
+    const terminal_contracts = @import("../terminal/contracts.zig");
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const command = try arena.alloc(u8, terminal_contracts.max_command_bytes);
+    @memset(command, 0x01);
+    command[0] = '#';
+    command[command.len - 1] = '\n';
+    const environments = [_]command_environment.Environment{
+        .legacy,
+        .{ .clean = "/bin/zsh" },
+        .{ .user = "/bin/zsh" },
+    };
+
+    for (environments) |environment| {
+        const approval_command = try command_environment.formatApprovalCommand(
+            arena,
+            environment,
+            command,
+        );
+        const command_identity = try command_environment.permissionCommandIdentity(
+            arena,
+            environment,
+            command,
+        );
+        const grant_target = try std.fmt.allocPrint(
+            arena,
+            "/tmp/workspace::{s}",
+            .{command_identity},
+        );
+        const grants = [_]types.PermissionGrant{.{
+            .tool_name = @constCast("bash"),
+            .target_path = grant_target,
+        }};
+
+        var approval_ledger = try communication.Ledger.init(alloc, "child");
+        defer approval_ledger.deinit(alloc);
+        _ = try communication.registerApproval(alloc, &approval_ledger, .{
+            .id = "near-limit-command",
+            .kind = .tool,
+            .child_id = "child",
+            .root_id = "root",
+            .work_id = "work",
+            .prepared_fingerprint = [_]u8{11} ** 32,
+            .label = "captured command",
+            .explanation = null,
+            .command = approval_command,
+            .grants = &grants,
+            .created_at_ms = 1,
+        });
+        const approval_bytes = try encode(alloc, approval_ledger);
+        defer alloc.free(approval_bytes);
+        try std.testing.expect(approval_bytes.len <= max_canonical_record_bytes);
+        try std.testing.expect(
+            std.mem.indexOf(u8, approval_bytes, "\"schema_version\":6") != null,
+        );
+        var restored_approval = try decode(alloc, approval_bytes);
+        defer restored_approval.deinit(alloc);
+        try std.testing.expectEqualStrings(
+            approval_command,
+            restored_approval.approvals[0].command.?,
+        );
+        try std.testing.expectEqualStrings(
+            grant_target,
+            restored_approval.approvals[0].grants[0].target_path,
+        );
+
+        var authority_ledger = try communication.Ledger.init(alloc, "root");
+        defer authority_ledger.deinit(alloc);
+        try std.testing.expect(try communication.applyAlwaysGrants(
+            alloc,
+            &authority_ledger,
+            &grants,
+        ));
+        const authority_bytes = try encode(alloc, authority_ledger);
+        defer alloc.free(authority_bytes);
+        try std.testing.expect(authority_bytes.len <= max_canonical_record_bytes);
+        var restored_authority = try decode(alloc, authority_bytes);
+        defer restored_authority.deinit(alloc);
+        try std.testing.expectEqualStrings(
+            grant_target,
+            restored_authority.authority_grants[0].target_path,
+        );
+    }
+}
+
+test "schema v6 rejects a malformed later grant without leaking partial state" {
+    const alloc = std.testing.allocator;
+    var ledger = try communication.Ledger.init(alloc, "child");
+    defer ledger.deinit(alloc);
+    const grants = [_]types.PermissionGrant{
+        .{
+            .tool_name = @constCast("read_file"),
+            .target_path = @constCast("/tmp/first-valid-target"),
+        },
+        .{
+            .tool_name = @constCast("write_file"),
+            .target_path = @constCast("/tmp/second-invalid-target"),
+        },
+    };
+    _ = try communication.registerApproval(alloc, &ledger, .{
+        .id = "partial-decode",
+        .kind = .tool,
+        .child_id = "child",
+        .root_id = "root",
+        .work_id = "work",
+        .prepared_fingerprint = [_]u8{12} ** 32,
+        .label = "partial decode",
+        .explanation = null,
+        .command = "printf command",
+        .grants = &grants,
+        .created_at_ms = 1,
+    });
+    const encoded = try encode(alloc, ledger);
+    defer alloc.free(encoded);
+    var second_target: [64]u8 = undefined;
+    const target_data = std.base64.standard.Encoder.encode(
+        &second_target,
+        grants[1].target_path,
+    );
+    const needle = try std.fmt.allocPrint(
+        alloc,
+        "\"data\":\"{s}\"",
+        .{target_data},
+    );
+    defer alloc.free(needle);
+    const malformed = try std.mem.replaceOwned(
+        u8,
+        alloc,
+        encoded,
+        needle,
+        "\"data\":\"%%%\"",
+    );
+    defer alloc.free(malformed);
+    try std.testing.expect(malformed.len < encoded.len);
+    try std.testing.expectError(
+        error.InvalidCommunicationRecord,
+        decode(alloc, malformed),
+    );
+}
+
+test "schema v6 file approval projection round trips as independent owned state" {
     const alloc = std.testing.allocator;
     var ledger = try communication.Ledger.init(alloc, "child");
     defer ledger.deinit(alloc);
@@ -685,6 +1158,10 @@ test "schema v5 approvals without file projection remain compatible" {
     const alloc = std.testing.allocator;
     var ledger = try communication.Ledger.init(alloc, "child");
     defer ledger.deinit(alloc);
+    const grants = [_]types.PermissionGrant{.{
+        .tool_name = @constCast("bash"),
+        .target_path = @constCast("/tmp/legacy-target"),
+    }};
     _ = try communication.registerApproval(alloc, &ledger, .{
         .id = "legacy-generic-approval",
         .kind = .tool,
@@ -694,10 +1171,16 @@ test "schema v5 approvals without file projection remain compatible" {
         .prepared_fingerprint = [_]u8{5} ** 32,
         .label = "terminal.exec printf ok",
         .explanation = null,
-        .grants = &.{},
+        .command = "printf legacy",
+        .grants = &grants,
         .created_at_ms = 1,
     });
-    const current = try encode(alloc, ledger);
+    ledger.capacity_version = communication.capacity_contract_version;
+    const current = try encodeWireCanonical(
+        alloc,
+        base64_delivery_schema_version,
+        ledger,
+    );
     defer alloc.free(current);
     try std.testing.expect(std.mem.find(u8, current, "\"file\":null,") != null);
     const legacy = try std.mem.replaceOwned(
@@ -717,9 +1200,17 @@ test "schema v5 approvals without file projection remain compatible" {
         "legacy-generic-approval",
         restored.approvals[0].id,
     );
+    try std.testing.expectEqualStrings(
+        "printf legacy",
+        restored.approvals[0].command.?,
+    );
+    try std.testing.expectEqualStrings(
+        "/tmp/legacy-target",
+        restored.approvals[0].grants[0].target_path,
+    );
 }
 
-test "schema v5 bounds a worst-escaped full message within the record equation" {
+test "schema v6 bounds a worst-escaped full message within the record equation" {
     const alloc = std.testing.allocator;
     var ledger = try communication.Ledger.init(alloc, "child");
     defer ledger.deinit(alloc);
@@ -1150,7 +1641,7 @@ test "valid mixed irreducible state cannot exceed the communication record" {
     }
     var approval_grants = try CapacityTestGrants.init(
         alloc,
-        18,
+        12,
         domain.max_admission_item_bytes,
     );
     defer approval_grants.deinit(alloc);
@@ -1177,7 +1668,7 @@ test "valid mixed irreducible state cannot exceed the communication record" {
     }
     var authority_grants = try CapacityTestGrants.init(
         alloc,
-        20,
+        32,
         domain.max_admission_item_bytes,
     );
     defer authority_grants.deinit(alloc);
@@ -1412,7 +1903,7 @@ test "schema v1 non-empty cursor without retention fields remains compatible" {
     try std.testing.expect(restored.legacy_operation_replay_closed);
 }
 
-test "schema v4 messages migrate to schema v5 canonical encoding" {
+test "schema v4 messages migrate to schema v6 canonical encoding" {
     const alloc = std.testing.allocator;
     var ledger = try communication.Ledger.init(alloc, "child");
     defer ledger.deinit(alloc);
@@ -1443,7 +1934,7 @@ test "schema v4 messages migrate to schema v5 canonical encoding" {
     const current = try encode(alloc, migrated);
     defer alloc.free(current);
     try std.testing.expect(
-        std.mem.indexOf(u8, current, "\"schema_version\":5") != null,
+        std.mem.indexOf(u8, current, "\"schema_version\":6") != null,
     );
     try std.testing.expect(
         std.mem.indexOf(u8, current, "\"encoding\":\"base64\"") != null,
@@ -1465,7 +1956,7 @@ test "schema v2 process epochs cannot seed manager delivery authority" {
         u8,
         alloc,
         current,
-        "\"schema_version\":5",
+        "\"schema_version\":6",
         "\"schema_version\":2",
     );
     defer alloc.free(legacy);
@@ -1508,7 +1999,7 @@ test "schema v1 resolved approvals receive a deterministic migration revision" {
         u8,
         alloc,
         current,
-        "\"schema_version\":5",
+        "\"schema_version\":6",
         "\"schema_version\":1",
     );
     defer alloc.free(versioned);
@@ -1601,7 +2092,7 @@ test "legacy over-budget records load and migrate only after safe reduction" {
     const migrated = try encode(alloc, restored);
     defer alloc.free(migrated);
     try std.testing.expect(
-        std.mem.indexOf(u8, migrated, "\"schema_version\":5") != null,
+        std.mem.indexOf(u8, migrated, "\"schema_version\":6") != null,
     );
     var current = try decode(alloc, migrated);
     defer current.deinit(alloc);

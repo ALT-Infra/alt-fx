@@ -39,6 +39,7 @@ const image_attachments = @import("../../images/image_attachments.zig");
 const runtime_assistant_stream = @import("assistant_stream.zig");
 const runtime_tool_presentation = @import("tool_presentation.zig");
 const runtime_execution_memory = @import("execution_memory.zig");
+const runtime_stop_policy = @import("stop_policy.zig");
 const runtime_tool_admission = @import("tool_admission.zig");
 const runtime_interruption = @import("interruption.zig");
 const runtime_parallel_execution = @import("parallel_execution.zig");
@@ -5476,6 +5477,43 @@ fn processQueuedPromptLoop(
                 !defer_auto_command_lifecycle)
             {
                 status_started = try runtime_tool_presentation.startToolVisibleLifecycle(deps, arena, turn_id, stream_ctx.provisional_statuses.presentation_group_id, tool_call, null, advertised_dynamic_tool_names);
+            }
+
+            if (try runtime_stop_policy.blockedNonLiveBackgroundRestart(
+                arena,
+                successful_source_messages,
+                tool_call,
+                job.prompt,
+            )) |blocked_output| {
+                _ = try stream_ctx.provisional_statuses.finishDeniedCall(
+                    deps,
+                    stream_ctx.alloc,
+                    arena,
+                    turn_id,
+                    tool_call,
+                    status_started,
+                    null,
+                    "Blocked",
+                    advertised_dynamic_tool_names,
+                );
+                debug_trace.eventf(
+                    "tool",
+                    "execution_result",
+                    step_ctx,
+                    "call_id={s} name={s} result_kind=blocked_non_live_background_restart model_output_bytes={d}",
+                    .{ tool_call.id, tool_call.name, blocked_output.len },
+                );
+                try runtime_tool_batch.appendToolResultContent(
+                    arena,
+                    &within_turn_suffix,
+                    &completed_tool_names,
+                    &step_batch,
+                    tool_call,
+                    blocked_output,
+                    null,
+                    .{ .increment_error = true },
+                );
+                continue;
             }
 
             var file_call_arena_state: std.heap.ArenaAllocator = undefined;
