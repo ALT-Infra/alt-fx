@@ -1935,8 +1935,9 @@ fn prepareTranscriptSurfacePaintInternal(
                     stable.flow_unchanged and
                     stable.visual_offset == stable.history_visual_offset and
                     source.tail_kind != .assistant_turn;
+                const repaint_required = self.render_requests.attemptHasInvalidations();
                 const invalidation_allows_preservation =
-                    !self.render_requests.attemptHasInvalidations() or
+                    !repaint_required or
                     settled_history_reflow;
                 const next_offset = prepared.sourceVisualOffsetFor(viewport_selection_snapshot);
                 if (allow_projection_rebase and
@@ -1976,11 +1977,13 @@ fn prepareTranscriptSurfacePaintInternal(
                         viewport_selection_snapshot.partial_skip_rows = committed.partial_skip_rows;
                         const stable_occupied_rows =
                             stable.occupied_last_row -| stable.selection.top_row +| 1;
-                        if (settled_history_reflow and
+                        const align_stable_cancel_to_bottom =
+                            (repaint_required or stable.occupied_last_row == bottom_row) and
+                            settled_history_reflow and
                             source.tail_kind == .cancel_notice and
                             stable_occupied_rows > 0 and
-                            stable_occupied_rows < visible_rows)
-                        {
+                            stable_occupied_rows < visible_rows;
+                        if (align_stable_cancel_to_bottom) {
                             top_row = bottom_row - stable_occupied_rows + 1;
                             visible_rows = stable_occupied_rows;
                             prepared.projection_area.top = top_row;
