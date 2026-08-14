@@ -29,6 +29,7 @@ from scripts.pgso.toolchain import Toolchain
 MINIMUM_SAMPLES = 50
 STARTUP_MINIMUM_SAMPLES = 100
 STARTUP_WARMUP_RUNS = 10
+STARTUP_ROUNDS = 10
 MAXIMUM_REGRESSION = 0.10
 REQUIRED_EVIDENCE = (
     "identity",
@@ -569,10 +570,10 @@ def measure_startup(
     logs.mkdir(parents=True, exist_ok=True)
     results: list[MeasurementResult] = []
     startup_samples = max(samples, STARTUP_MINIMUM_SAMPLES)
-    first_round_samples = startup_samples // 2
-    round_samples = (
-        first_round_samples,
-        startup_samples - first_round_samples,
+    samples_per_round, extra_samples = divmod(startup_samples, STARTUP_ROUNDS)
+    round_samples = tuple(
+        samples_per_round + (round_index < extra_samples)
+        for round_index in range(STARTUP_ROUNDS)
     )
 
     for command_name, command_argv in STARTUP_COMMANDS:
@@ -595,22 +596,18 @@ def measure_startup(
             "control": [],
             "candidate": [],
         }
-        for round_index, (count, order) in enumerate(
-            zip(
-                round_samples,
+        for round_index, count in enumerate(round_samples, start=1):
+            order = (
                 (
-                    (
-                        ("control", control_binary),
-                        ("candidate", candidate_binary),
-                    ),
-                    (
-                        ("candidate", candidate_binary),
-                        ("control", control_binary),
-                    ),
-                ),
-            ),
-            start=1,
-        ):
+                    ("control", control_binary),
+                    ("candidate", candidate_binary),
+                )
+                if round_index % 2 == 1
+                else (
+                    ("candidate", candidate_binary),
+                    ("control", control_binary),
+                )
+            )
             export_path = logs / f"{command_name}-round-{round_index}-samples.json"
             benchmark_argv: list[str] = [
                 str(hyperfine_binary),

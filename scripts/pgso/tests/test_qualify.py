@@ -238,27 +238,26 @@ class PgsoQualificationTests(unittest.TestCase):
         hyperfine_calls = [
             command for command in calls if command[0] == str(hyperfine)
         ]
-        self.assertEqual(12, len(hyperfine_calls))
-        for first, second in zip(hyperfine_calls[::2], hyperfine_calls[1::2]):
-            self.assertIn("--shell=none", first)
-            self.assertEqual("10", first[first.index("--warmup") + 1])
-            self.assertEqual("50", first[first.index("--runs") + 1])
-            self.assertEqual(
-                ["control", "candidate"],
-                [
-                    first[index + 1]
-                    for index, value in enumerate(first)
-                    if value == "--command-name"
-                ],
-            )
-            self.assertEqual(
-                ["candidate", "control"],
-                [
-                    second[index + 1]
-                    for index, value in enumerate(second)
-                    if value == "--command-name"
-                ],
-            )
+        self.assertEqual(60, len(hyperfine_calls))
+        for command_start in range(0, len(hyperfine_calls), 10):
+            command_rounds = hyperfine_calls[command_start : command_start + 10]
+            for round_index, command in enumerate(command_rounds):
+                self.assertIn("--shell=none", command)
+                self.assertEqual("10", command[command.index("--warmup") + 1])
+                self.assertEqual("10", command[command.index("--runs") + 1])
+                expected_order = (
+                    ["control", "candidate"]
+                    if round_index % 2 == 0
+                    else ["candidate", "control"]
+                )
+                self.assertEqual(
+                    expected_order,
+                    [
+                        command[index + 1]
+                        for index, value in enumerate(command)
+                        if value == "--command-name"
+                    ],
+                )
         self.assertTrue(all(result.requested_samples == 100 for result in results))
         self.assertTrue(all(len(result.control_samples) == 100 for result in results))
         self.assertTrue(all(len(result.candidate_samples) == 100 for result in results))
