@@ -1751,6 +1751,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const gateway = startFakeGateway([
         fakeGatewayFinalText(seedMarker),
         fakeGatewayToolCall("approval-cancel-resize", "terminal", {
+          action: "exec",
           command,
         }),
       ]);
