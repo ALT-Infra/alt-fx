@@ -13,7 +13,7 @@ afterEach(() => {
   if (workDir) { cleanupWorkDir(workDir); workDir = null; }
 });
 
-describe("eval: run command", () => {
+describe("eval: terminal exec", () => {
   test(
     "runs echo and reports the output",
     async () => {
@@ -25,7 +25,7 @@ describe("eval: run command", () => {
           timeoutSec: 60,
         },
       );
-      assertToolUsed(result, "run_command");
+      assertToolUsed(result, "terminal");
       expect(result.json.output).toContain("HELLO_FROM_FX");
       expect(result.json.exit_code).toBe(0);
     },

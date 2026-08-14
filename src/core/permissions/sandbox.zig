@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const command_contract = @import("../execution/command_contract.zig");
+const command_environment = @import("../execution/command_environment.zig");
 const background_process_provider = @import(
     "../execution/background_process_provider.zig",
 );
@@ -15,6 +16,7 @@ const artifact_digest = @import("../session/artifact_digest.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
+const shell_resolver = @import("../terminal/shell_resolver.zig");
 
 const Allocator = std.mem.Allocator;
 pub const CommandOutputStream = command_contract.CommandOutputStream;
@@ -296,6 +298,61 @@ pub fn executeCommand(
     };
 }
 
+pub fn executeCommandInEnvironment(
+    cfg: Config,
+    arena: Allocator,
+    command: []const u8,
+    cwd: []const u8,
+    environment: command_environment.Environment,
+) !command_contract.RunCommandResult {
+    switch (environment) {
+        .legacy => return executeCommand(cfg, arena, command, cwd),
+        .workspace_clean => return error.InvalidCommandEnvironment,
+        .clean, .user => {},
+    }
+
+    var scratch_state = std.heap.ArenaAllocator.init(arena);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+
+    var effective_cfg = cfg;
+    if (effective_cfg.timeout_started_ms == null) effective_cfg.timeout_started_ms = io_mod.milliTimestamp();
+    try BackendControl.init(effective_cfg).check();
+    const backend = resolveBackend(effective_cfg.backend);
+    const invocation = try shell_resolver.capturedInvocation(environment, command);
+    debug_trace.logf(
+        "core",
+        "sandbox explicit command environment={s} shell={s}",
+        .{ @tagName(std.meta.activeTag(environment)), invocation.path },
+    );
+    return switch (backend) {
+        .macos => executeMacOSInvocation(
+            arena,
+            scratch,
+            effective_cfg,
+            command,
+            cwd,
+            &invocation,
+        ),
+        .none, .auto => executeRawInvocation(
+            arena,
+            scratch,
+            effective_cfg,
+            command,
+            cwd,
+            &invocation,
+        ),
+        .vercel, .just_bash => blk: {
+            const projected = try shell_resolver.formatInvocationCommand(scratch, &invocation);
+            break :blk switch (backend) {
+                .vercel => executeVercel(arena, scratch, effective_cfg, projected, cwd),
+                .just_bash => executeJustBash(arena, scratch, effective_cfg, "just-bash", projected, cwd),
+                else => unreachable,
+            };
+        },
+    };
+}
+
 pub fn spawnPreparedBackground(
     cfg: Config,
     arena: Allocator,
@@ -380,6 +437,20 @@ fn executeMacOS(
         cwd,
         command,
     );
+    return formatCollectedOutput(alloc, command, cwd, result);
+}
+
+fn executeMacOSInvocation(
+    alloc: Allocator,
+    scratch: Allocator,
+    cfg: Config,
+    command: []const u8,
+    cwd: []const u8,
+    invocation: *const shell_resolver.Invocation,
+) !command_contract.RunCommandResult {
+    if (!host.current().os_sandbox) return unsupportedOsSandboxResult(alloc, command, cwd);
+    const argv = try buildDirectMacOSArgv(scratch, cfg, invocation.argv());
+    const result = try executeProcessWithClosedInput(scratch, cfg, argv, cwd);
     return formatCollectedOutput(alloc, command, cwd, result);
 }
 
@@ -1040,15 +1111,39 @@ fn finishCollectedProcess(
 }
 
 fn executeProcess(scratch: Allocator, cfg: Config, argv: []const []const u8, cwd: []const u8) !CollectedProcess {
+    return executeProcessWithInput(scratch, cfg, argv, cwd, false, true);
+}
+
+fn executeProcessWithClosedInput(
+    scratch: Allocator,
+    cfg: Config,
+    argv: []const []const u8,
+    cwd: []const u8,
+) !CollectedProcess {
+    return executeProcessWithInput(scratch, cfg, argv, cwd, true, true);
+}
+
+fn executeProcessWithInput(
+    scratch: Allocator,
+    cfg: Config,
+    argv: []const []const u8,
+    cwd: []const u8,
+    closed_input: bool,
+    isolate_process_group: bool,
+) !CollectedProcess {
     const started_ms = io_mod.milliTimestamp();
     var child = try std.process.spawn(io_mod.getIo(), .{
         .argv = argv,
-        .stdin = .ignore,
+        .stdin = if (closed_input) .pipe else .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
         .cwd = .{ .path = cwd },
-        .pgid = if (builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
+        .pgid = if (isolate_process_group and builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
     });
+    if (child.stdin) |input| {
+        input.close(io_mod.getIo());
+        child.stdin = null;
+    }
 
     var output = OutputCollector.init(scratch, cfg);
     defer output.deinit();
@@ -1509,6 +1604,84 @@ fn executeRawBash(
         command,
     );
     return formatCollectedOutput(alloc, command, cwd, result);
+}
+
+fn executeRawInvocation(
+    alloc: Allocator,
+    scratch: Allocator,
+    cfg: Config,
+    command: []const u8,
+    cwd: []const u8,
+    invocation: *const shell_resolver.Invocation,
+) !command_contract.RunCommandResult {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.InvalidCommandEnvironment;
+    }
+    const result = try executeProcessWithClosedInput(scratch, cfg, invocation.argv(), cwd);
+    return formatCollectedOutput(alloc, command, cwd, result);
+}
+
+test "explicit captured profiles execute exact shells without filtering stderr" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/bash", .{}) catch
+        return error.SkipZigTest;
+    const shell_path = "/bin/bash";
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cfg = Config{
+        .backend = .none,
+        .workspace_root = "/tmp",
+        .max_command_output_bytes = 16 * 1024,
+    };
+    const command = "printf 'profile-stdout'; printf 'profile-stderr' >&2";
+
+    const clean = try executeCommandInEnvironment(
+        cfg,
+        arena,
+        command,
+        "/tmp",
+        .{ .clean = shell_path },
+    );
+    try std.testing.expect(std.mem.find(u8, clean.output, "profile-stdout") != null);
+    try std.testing.expect(std.mem.find(u8, clean.output, "profile-stderr") != null);
+
+    const user = try executeCommandInEnvironment(
+        cfg,
+        arena,
+        command,
+        "/tmp",
+        .{ .user = shell_path },
+    );
+    try std.testing.expect(std.mem.find(u8, user.output, "profile-stdout") != null);
+    try std.testing.expect(std.mem.find(u8, user.output, "profile-stderr") != null);
+    if (std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{})) {
+        const zsh_user = try executeCommandInEnvironment(
+            cfg,
+            arena,
+            command,
+            "/tmp",
+            .{ .user = "/bin/zsh" },
+        );
+        try std.testing.expectEqualStrings(
+            "exit_code=0\n<stdout>\nprofile-stdout\n</stdout>\n<stderr>\nprofile-stderr\n</stderr>\n",
+            zsh_user.output,
+        );
+    } else |_| {}
+
+    const bash_user = try shell_resolver.capturedInvocation(.{ .user = shell_path }, command);
+    const no_tty = try executeProcessWithInput(
+        arena,
+        cfg,
+        bash_user.argv(),
+        "/tmp",
+        true,
+        false,
+    );
+    const no_tty_output = try formatCollectedOutput(arena, command, "/tmp", no_tty);
+    try std.testing.expect(std.mem.find(u8, no_tty_output.output, "bash: no job control in this shell\n") != null);
+    try std.testing.expect(std.mem.find(u8, no_tty_output.output, "profile-stderr") != null);
 }
 
 fn parseJustBashJson(alloc: Allocator, scratch: Allocator, cfg: Config, stdout_raw: []const u8, stderr_raw: []const u8, term: std.process.Child.Term, command: []const u8, cwd: []const u8, duration_ms: ?u64) !command_contract.RunCommandResult {

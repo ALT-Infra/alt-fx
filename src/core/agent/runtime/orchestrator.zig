@@ -38,7 +38,6 @@ const image_attachments = @import("../../images/image_attachments.zig");
 const runtime_assistant_stream = @import("assistant_stream.zig");
 const runtime_tool_presentation = @import("tool_presentation.zig");
 const runtime_execution_memory = @import("execution_memory.zig");
-const runtime_stop_policy = @import("stop_policy.zig");
 const runtime_tool_admission = @import("tool_admission.zig");
 const runtime_interruption = @import("interruption.zig");
 const runtime_parallel_execution = @import("parallel_execution.zig");
@@ -80,7 +79,14 @@ fn resolveLiveToolAuthority(
             call,
             advertised_dynamic_tool_names,
         );
-    const target_kind = if (deps.tool_registry.lookup(call.name)) |tool|
+    const command_call = try tooling_tool_admission.callUsesCommandAuthority(
+        deps.tool_registry,
+        arena,
+        call,
+    );
+    const target_kind = if (command_call)
+        tool_dispatch.PermissionTargetKind.command_cwd
+    else if (deps.tool_registry.lookup(call.name)) |tool|
         tool.permission_target_kind
     else
         .none;
@@ -118,8 +124,6 @@ fn rejectPermissionForLiveAuthority(
 
 const PreparationClassifierContext = struct {
     deps: *const AgentRuntimeDeps,
-    gateway_messages: []const ChatMessage,
-    user_prompt: []const u8,
 };
 
 fn preparationExecutionStatus(status: runtime_tool_contracts.ToolExecutionStatus) tool_preparation.ToolStatus {
@@ -178,21 +182,6 @@ fn prepareDeferredDynamicCandidate(
         .not_registered => false,
         .valid, .failure => true,
     };
-}
-
-fn prepareStopPolicyTerminal(
-    raw_ctx: ?*anyopaque,
-    alloc: Allocator,
-    call: ToolCall,
-) anyerror!?tool_preparation.CallbackTerminal {
-    const ctx: *PreparationClassifierContext = @ptrCast(@alignCast(raw_ctx.?));
-    const output = try runtime_stop_policy.blockedNonLiveBackgroundRestart(
-        alloc,
-        ctx.gateway_messages,
-        call,
-        ctx.user_prompt,
-    ) orelse return null;
-    return .{ .model_output = @constCast(output), .status = .failure };
 }
 
 fn preparedTerminalModelOutput(
@@ -900,7 +889,7 @@ fn reactiveSandboxWideningFailure(
         .status = .failure,
         .status_detail = "restricted attempt ran; broader retry did not run",
         .model_output = try tool_result_errors.toolExecutionFailureJson(arena, .{
-            .tool_name = "run_command",
+            .tool_name = "terminal",
             .message = "The restricted sandbox attempt ran and may have partial effects; the broader retry did not run.",
             .details = details[0..detail_count],
             .suggestion = "Inspect the retained restricted result and effects. Do not claim that the command never ran or retry unchanged.",
@@ -948,7 +937,7 @@ fn reactiveSandboxWideningRetryCancelled(
         .cancelled = true,
         .status_detail = "restricted attempt ran; broader retry was cancelled",
         .model_output = try tool_result_errors.toolExecutionFailureJson(arena, .{
-            .tool_name = "run_command",
+            .tool_name = "terminal",
             .message = "The restricted sandbox attempt completed, and the broader retry started before cancellation; either attempt may have partial effects.",
             .details = details[0..detail_count],
             .suggestion = "Inspect both retained results and effects before deciding whether another command is safe.",
@@ -4157,8 +4146,6 @@ fn processQueuedPromptLoop(
         defer preparation_batch.deinit(arena, arena);
         var classifier_ctx: PreparationClassifierContext = .{
             .deps = deps,
-            .gateway_messages = successful_source_messages,
-            .user_prompt = job.prompt,
         };
         if (deps.context_enabled) {
             for (prepared_tool_calls, 0..) |prepared_call, i| {
@@ -4178,7 +4165,7 @@ fn processQueuedPromptLoop(
                         .idempotent = prepareNoIdempotentTerminal,
                         .validation = prepareValidationTerminal,
                         .availability = prepareAvailabilityTerminal,
-                        .stop_policy = prepareStopPolicyTerminal,
+                        .stop_policy = prepareNoIdempotentTerminal,
                         .deferred_dynamic = prepareDeferredDynamicCandidate,
                     },
                 }) catch |err| {
@@ -4623,7 +4610,7 @@ fn processQueuedPromptLoop(
 
                     if (decision == .always) {
                         const target_path = try deps.permission_target_for_call(deps.ctx, arena, parallel_call, advertised_dynamic_tool_names);
-                        try runtime_tool_admission.applyInitialSessionGrants(deps, arena, &local_grants, config.workspace_root, parallel_call.name, target_path);
+                        try runtime_tool_admission.applyInitialSessionGrants(deps, arena, &local_grants, config.workspace_root, parallel_call, target_path);
                     }
 
                     if (!parallel_status_started[group_index]) {
@@ -5057,8 +5044,10 @@ fn processQueuedPromptLoop(
                                 );
                             },
                             .stop_policy => {
-                                const defer_auto_lifecycle = runtime_tool_admission.deferRunCommandLifecycleForAutoPermissionNotice(
-                                    tool_call.name,
+                                const defer_auto_lifecycle = try runtime_tool_admission.deferCapturedCommandLifecycleForAutoPermissionNotice(
+                                    deps.tool_registry,
+                                    arena,
+                                    tool_call,
                                     job.permission_mode,
                                     lifecycle.scope.kind == .interactive,
                                 );
@@ -5475,8 +5464,10 @@ fn processQueuedPromptLoop(
             else
                 local_grants.items;
             var status_started = false;
-            const defer_auto_command_lifecycle = runtime_tool_admission.deferRunCommandLifecycleForAutoPermissionNotice(
-                tool_call.name,
+            const defer_auto_command_lifecycle = try runtime_tool_admission.deferCapturedCommandLifecycleForAutoPermissionNotice(
+                deps.tool_registry,
+                arena,
+                tool_call,
                 action_permission_mode,
                 lifecycle.scope.kind == .interactive,
             );
@@ -5484,45 +5475,6 @@ fn processQueuedPromptLoop(
                 !defer_auto_command_lifecycle)
             {
                 status_started = try runtime_tool_presentation.startToolVisibleLifecycle(deps, arena, turn_id, stream_ctx.provisional_statuses.presentation_group_id, tool_call, null, advertised_dynamic_tool_names);
-            }
-
-            if (requires_legacy_classification) {
-                if (try runtime_stop_policy.blockedNonLiveBackgroundRestart(arena, successful_source_messages, tool_call, job.prompt)) |blocked_output| {
-                    if (!status_started and defer_auto_command_lifecycle) {
-                        status_started = try runtime_tool_presentation.startToolVisibleLifecycle(
-                            deps,
-                            arena,
-                            turn_id,
-                            stream_ctx.provisional_statuses.presentation_group_id,
-                            tool_call,
-                            null,
-                            advertised_dynamic_tool_names,
-                        );
-                    }
-                    _ = try stream_ctx.provisional_statuses.finishDeniedCall(
-                        deps,
-                        stream_ctx.alloc,
-                        arena,
-                        turn_id,
-                        tool_call,
-                        status_started,
-                        null,
-                        "Blocked",
-                        advertised_dynamic_tool_names,
-                    );
-                    debug_trace.eventf("tool", "execution_result", step_ctx, "call_id={s} name={s} result_kind=blocked_non_live_background_restart model_output_bytes={d}", .{ tool_call.id, tool_call.name, blocked_output.len });
-                    try runtime_tool_batch.appendToolResultContent(
-                        arena,
-                        &within_turn_suffix,
-                        &completed_tool_names,
-                        &step_batch,
-                        tool_call,
-                        blocked_output,
-                        null,
-                        .{ .increment_error = true },
-                    );
-                    continue;
-                }
             }
 
             var file_call_arena_state: std.heap.ArenaAllocator = undefined;
@@ -5910,7 +5862,11 @@ fn processQueuedPromptLoop(
                 );
                 return error.MissingToolExecutionAuthority;
             };
-            if (std.mem.eql(u8, tool_call.name, "run_command")) {
+            if (try tooling_tool_admission.callUsesCommandAuthority(
+                deps.tool_registry,
+                call_allocator,
+                tool_call,
+            )) {
                 if (execution_authority != .run_command) return error.InvalidRunCommandExecutionAuthority;
             } else if (is_file_mutation) {
                 if (execution_authority != .file_mutation) {
@@ -5969,13 +5925,13 @@ fn processQueuedPromptLoop(
                             arena,
                             &local_grants,
                             config.workspace_root,
-                            tool_call.name,
+                            tool_call,
                             target.canonical_path,
                         );
                     }
                 } else {
                     const target_path = try deps.permission_target_for_call(deps.ctx, arena, tool_call, advertised_dynamic_tool_names);
-                    try runtime_tool_admission.applyInitialSessionGrants(deps, arena, &local_grants, config.workspace_root, tool_call.name, target_path);
+                    try runtime_tool_admission.applyInitialSessionGrants(deps, arena, &local_grants, config.workspace_root, tool_call, target_path);
                 }
             }
 

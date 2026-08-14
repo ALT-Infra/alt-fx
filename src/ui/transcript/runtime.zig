@@ -26,6 +26,7 @@ const transcript_writer = @import("writer.zig");
 const ui_render = @import("../render.zig");
 const types = @import("../../core/shared/types.zig");
 const command_output_content = @import("../../core/tooling/command_output_content.zig");
+const captured_command = @import("../../core/tooling/captured_command.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 const result_store = @import("../../core/session/result_store.zig");
 const session_child_store = @import("../../core/session/session_child_store.zig");
@@ -2059,9 +2060,9 @@ test "nonzero command remains Ran and shows one neutral exit row" {
     _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
         .id = id,
         .reconciles_provisional_call_id = null,
-        .tool_name = "run_command",
+        .tool_name = "terminal",
         .activity_kind = .command,
-        .arguments_json = "{\"command\":\"false\"}",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"false\"}",
     } });
     _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
         .id = id,
@@ -2099,10 +2100,12 @@ test "nonzero streamed command reuses its active output block" {
     _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
         .id = id,
         .reconciles_provisional_call_id = null,
-        .tool_name = "run_command",
+        .tool_name = "terminal",
         .activity_kind = .command,
-        .arguments_json = "{\"command\":\"printf lines; exit 7\"}",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf lines; exit 7\"}",
     } });
+    const started_entry_id = runtime.toolActivityRecord(id).?.entry_id;
+    try std.testing.expect(runtime.toolDetailForEntry(started_entry_id).?.isCapturedCommand());
     var metrics: Metrics = .{};
     try runtime.writeCommandOutputChunkForLifecycle(
         alloc,
@@ -2113,6 +2116,7 @@ test "nonzero streamed command reuses its active output block" {
         "line-1\nline-2\nline-3\nline-4\nline-5\nline-6\n",
         true,
     );
+    try std.testing.expect(runtime.toolDetailForEntry(started_entry_id).?.isCapturedCommand());
     _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
         .id = id,
         .outcome = .{ .kind = .completed, .summary = "Ran printf lines; exit 7" },
@@ -2130,10 +2134,12 @@ test "nonzero streamed command reuses its active output block" {
 
     const block = runtime.command_output_blocks.items[0];
     const status_entry_id = runtime.toolActivityRecord(id).?.entry_id;
+    try std.testing.expect(runtime.toolDetailForEntry(status_entry_id).?.isCapturedCommand());
     try std.testing.expectEqual(
         block.entry_id,
         runtime.toolDetailForEntry(status_entry_id).?.command_output_entry_id,
     );
+    try std.testing.expect(command_output_runtime.processPresentationForBlock(&runtime, block) != null);
     var projection = try command_output_runtime.renderCompactCommandOutputWithProcessPresentation(
         alloc,
         block,
@@ -3691,6 +3697,7 @@ pub const ToolDetailRecord = transcript_blocks.ToolDetailRecord;
 
 const PendingToolDetailStart = struct {
     tool_name: ?[]u8 = null,
+    captured_command: ?bool = null,
     activity_kind: ?types.ToolActivityKind = null,
     arguments_json: ?[]u8 = null,
     lifecycle_id: ?types.ToolLifecycleId = null,
@@ -5333,6 +5340,9 @@ pub const TranscriptRuntime = struct {
         pending.activity_kind = activity_kind;
         if (arguments_json) |value| {
             pending.arguments_json = try alloc.dupe(u8, value);
+            pending.captured_command = try captured_command.isToolCall(alloc, tool_name, value);
+        } else if (std.mem.eql(u8, tool_name, "run_command")) {
+            pending.captured_command = true;
         }
         if (lifecycle_id) |id| {
             if (existing == null or !command_output_runtime.sameLifecycleId(existing.?.lifecycle_id, id)) {
@@ -5359,6 +5369,7 @@ pub const TranscriptRuntime = struct {
             alloc.free(detail.tool_name);
             detail.tool_name = pending.tool_name.?;
             pending.tool_name = null;
+            if (pending.captured_command) |value| detail.captured_command = value;
             if (pending.activity_kind) |kind| detail.activity_kind = kind;
             if (pending.arguments_json) |arguments_json| {
                 if (detail.arguments_json) |old| alloc.free(old);
@@ -5377,6 +5388,7 @@ pub const TranscriptRuntime = struct {
         const detail = ToolDetailRecord{
             .entry_id = entry_id,
             .tool_name = pending.tool_name.?,
+            .captured_command = pending.captured_command orelse false,
             .activity_kind = pending.activity_kind,
             .arguments_json = pending.arguments_json,
             .lifecycle_id = pending.lifecycle_id,

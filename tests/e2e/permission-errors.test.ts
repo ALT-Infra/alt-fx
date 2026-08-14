@@ -66,13 +66,13 @@ function toolResultText(body: string, toolCallId: string): string {
 
 describe("generic permission typed errors", () => {
   test(
-    "returns typed JSON for denied run_command",
+    "returns typed JSON for denied terminal",
     async () => {
       const root = createIsolatedRoot("fx-permission-error-");
       const marker = join(root.workspace, "denied-marker.txt");
       const toolCallId = "permission_denied_call";
       const gateway = startFakeGateway([
-        fakeGatewayToolCall(toolCallId, "run_command", {
+        fakeGatewayToolCall(toolCallId, "terminal", {
           command: `touch ${JSON.stringify(marker)}`,
         }),
         fakeGatewayFinalText("permission error observed"),
@@ -108,7 +108,7 @@ describe("generic permission typed errors", () => {
           timeoutMs: TIMEOUT,
         });
         const json = parseFxJson(result);
-        expect(json.tool_calls).toContainEqual({ name: "run_command", status: "error" });
+        expect(json.tool_calls).toContainEqual({ name: "terminal", status: "error" });
         expect(existsSync(marker)).toBe(false);
         expect(gateway.requests).toHaveLength(2);
 
@@ -117,7 +117,7 @@ describe("generic permission typed errors", () => {
         ) as { error: PermissionEcho };
         const echo = toolResult.error;
         expect(echo.type).toBe("tool_permission_denied");
-        expect(echo.tool_name).toBe("run_command");
+        expect(echo.tool_name).toBe("terminal");
         expect(echo.message).toBe("Tool access was denied by configured policy");
         expect(echo.reason).toBe("policy_denied");
         expect(echo.denied).toBe(true);

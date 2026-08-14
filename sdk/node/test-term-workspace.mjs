@@ -72,7 +72,7 @@ function sse(events) {
 
 function toolCall(id, command) {
   return sse([
-    { type: "tool-call", toolCallId: id, toolName: "run_command", input: { command } },
+    { type: "tool-call", toolCallId: id, toolName: "terminal", input: { action: "exec", command } },
     { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
   ]);
 }
@@ -122,8 +122,15 @@ const fetch = async (_url, init = {}) => {
   }
   const body = JSON.parse(requestDecoder.decode(init.body));
   if (!checkedToolProjection) {
-    if (body.tools?.length !== 1 || body.tools[0]?.name !== "run_command") {
+    if (body.tools?.length !== 1 || body.tools[0]?.name !== "terminal") {
       throw new Error(`workspace advertised unexpected tools: ${JSON.stringify(body.tools)}`);
+    }
+    const schema = body.tools[0]?.inputSchema;
+    if (JSON.stringify(schema?.required) !== JSON.stringify(["action", "command"]) ||
+        schema?.properties?.action?.enum?.[0] !== "exec" ||
+        Object.keys(schema?.properties || {}).join(",") !== "action,command" ||
+        schema?.additionalProperties !== false) {
+      throw new Error(`workspace advertised unexpected terminal schema: ${JSON.stringify(schema)}`);
     }
     checkedToolProjection = true;
   }

@@ -692,7 +692,7 @@ test "schema v5 approvals without file projection remain compatible" {
         .root_id = "root",
         .work_id = "work",
         .prepared_fingerprint = [_]u8{5} ** 32,
-        .label = "run_command printf ok",
+        .label = "terminal.exec printf ok",
         .explanation = null,
         .grants = &.{},
         .created_at_ms = 1,

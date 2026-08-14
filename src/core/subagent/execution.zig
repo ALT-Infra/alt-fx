@@ -5908,8 +5908,8 @@ test "canonical approval wait refreshes revoked authority and races reject relat
                 arena_state.allocator(),
                 .{
                     .id = "canonical-call",
-                    .name = "run_command",
-                    .arguments_json = "{\"command\":\"git status\"}",
+                    .name = "terminal",
+                    .arguments_json = "{\"action\":\"exec\",\"command\":\"git status\"}",
                 },
                 .auto,
                 &.{},
@@ -5949,7 +5949,7 @@ test "canonical approval wait refreshes revoked authority and races reject relat
         .workspace_root = "/tmp/workspace",
         .permission_grants = &.{},
         .permission_rules = .{ .rules = &rules },
-        .tool_registry = .{ .tools = &.{test_builtin_tools.run_command} },
+        .tool_registry = .{ .tools = &.{test_builtin_tools.terminal} },
         .worker = &turn.worker,
         .permission_prompter = turn.permissionPrompter(),
         .background = &background,
@@ -6093,8 +6093,8 @@ test "canonical approval wait refreshes revoked authority and races reject relat
         refreshed_arena.allocator(),
         .{
             .id = "canonical-call",
-            .name = "run_command",
-            .arguments_json = "{\"command\":\"git status\"}",
+            .name = "terminal",
+            .arguments_json = "{\"action\":\"exec\",\"command\":\"git status\"}",
         },
         "/tmp/workspace",
         "/tmp/workspace",
@@ -7852,7 +7852,7 @@ fn runProductionSandboxGenerationCase(
     }
 
     var host = LiveRevalidationHost{
-        .tool_name = "run_command",
+        .tool_name = "terminal",
         .sandbox_command = "npm test",
     };
     var authority = authority_mod.Resolver{
@@ -7922,8 +7922,8 @@ fn runProductionSandboxGenerationCase(
 
     const calls = [_]types.ToolCall{.{
         .id = "generation-bound-sandbox",
-        .name = "run_command",
-        .arguments_json = "{\"command\":\"npm test\"}",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"npm test\"}",
     }};
     const completions = [_]agent_test_support.FakeCompletion{
         .{ .tool_calls = &calls },
@@ -8026,7 +8026,7 @@ test "production child sandbox grant revocation requires a separate widening app
     }
 
     var host = LiveRevalidationHost{
-        .tool_name = "run_command",
+        .tool_name = "terminal",
         .sandbox_command = "npm test",
         .command_action = .ask,
         .changed_command_action = .allow,
@@ -8101,8 +8101,8 @@ test "production child sandbox grant revocation requires a separate widening app
 
     const calls = [_]types.ToolCall{.{
         .id = "revoked-sandbox-grant",
-        .name = "run_command",
-        .arguments_json = "{\"command\":\"npm test\"}",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"npm test\"}",
     }};
     const completions = [_]agent_test_support.FakeCompletion{
         .{ .tool_calls = &calls },

@@ -3188,7 +3188,7 @@ const Session = struct {
     ) !Session {
         var login_shell_buffer: [4096]u8 = undefined;
         const shell_path = switch (request.shell) {
-            .user_login => configuredLoginShellInto(&login_shell_buffer) orelse "",
+            .user_login => shell_resolver.configuredLoginShellInto(&login_shell_buffer) orelse "",
             .executable => |value| value.path,
         };
         const shell = try alloc.dupe(u8, shell_path);
@@ -3367,7 +3367,7 @@ const Session = struct {
         transport_root: []const u8,
     ) !void {
         var login_shell_buffer: [4096]u8 = undefined;
-        const configured = configuredLoginShellInto(&login_shell_buffer);
+        const configured = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
         var invocation = try shell_resolver.resolve(configured, request.shell);
         if (!std.mem.eql(u8, self.shell, invocation.path)) {
             self.alloc.free(self.shell);
@@ -3700,7 +3700,7 @@ const Session = struct {
 
     fn launchNative(self: *Session, request: contracts.StartRequest) !void {
         var login_shell_buffer: [4096]u8 = undefined;
-        const configured = configuredLoginShellInto(&login_shell_buffer);
+        const configured = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
         var invocation = try shell_resolver.resolve(
             configured,
             request.shell,
@@ -5981,25 +5981,6 @@ fn signalTestBarrier(name: []const u8) void {
         .{ .truncate = true },
     ) catch return;
     file.close(io_mod.getIo());
-}
-
-fn configuredLoginShellInto(buffer: []u8) ?[]const u8 {
-    var entry: std.c.passwd = undefined;
-    var scratch: [4096]u8 = undefined;
-    var found: ?*std.c.passwd = null;
-    if (std.c.getpwuid_r(
-        std.c.getuid(),
-        &entry,
-        &scratch,
-        scratch.len,
-        &found,
-    ) != 0) return null;
-    const record = found orelse return null;
-    const shell_ptr = record.shell orelse return null;
-    const shell = std.mem.span(shell_ptr);
-    if (shell.len == 0 or shell.len > buffer.len) return null;
-    @memcpy(buffer[0..shell.len], shell);
-    return buffer[0..shell.len];
 }
 
 fn outcomeFromTerm(term: std.process.Child.Term) ?contracts.ReturnOutcome {

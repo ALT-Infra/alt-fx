@@ -6432,14 +6432,14 @@ test "child approval card preserves the semantic label and live preview" {
     var snapshot = try pendingApprovalTestSnapshot(alloc, "semantic-label-id");
     alloc.free(snapshot.pending_approvals[0].request.label);
     snapshot.pending_approvals[0].request.label =
-        try alloc.dupe(u8, "run_command touch child-marker");
+        try alloc.dupe(u8, "terminal.exec touch child-marker");
     snapshot.pending_approvals[0].tool_arguments_preview =
         try alloc.dupe(u8, "{\"text\":\"child sentinel\"}");
     try std.testing.expect(try runtime.replaceSnapshot(alloc, snapshot));
 
     const card = runtime.mainApprovalRequest().?;
     try std.testing.expectEqualStrings(
-        "run_command touch child-marker",
+        "terminal.exec touch child-marker",
         card.label,
     );
     switch (card.origin) {
@@ -7055,14 +7055,14 @@ test "main approval notification opens from an empty manager without owning reso
     const layout = types.Layout{ .rows = 9, .cols = 72, .content_bottom = 5, .divider_top_row = 6, .input_row = 7, .divider_bottom_row = 8, .hint_row = 9 };
     const rendered = try paint(alloc, &runtime, layout, .{
         .id = 42,
-        .label = "run_command zig build test",
+        .label = "terminal.exec zig build test",
         .explanation = "requires confirmation",
         .command = "zig build test",
     });
     defer alloc.free(rendered);
     try std.testing.expect(std.mem.find(u8, rendered, "Main chat approval") != null);
     try std.testing.expect(std.mem.find(u8, rendered, "Request ID: 42") != null);
-    try std.testing.expect(std.mem.find(u8, rendered, "run_command zig build test") != null);
+    try std.testing.expect(std.mem.find(u8, rendered, "terminal.exec zig build test") != null);
     try std.testing.expect(std.mem.find(u8, rendered, "Read-only here") != null);
 
     runtime.setDegraded(alloc, .store_failure);

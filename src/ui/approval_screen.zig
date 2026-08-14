@@ -1502,7 +1502,7 @@ test "command approval screen wraps and scrolls a complete command review" {
     var screen_state = interaction_state.ApprovalScreenState{};
     var label: std.ArrayList(u8) = .empty;
     defer label.deinit(alloc);
-    try label.appendSlice(alloc, "run_command printf '%s' 'LONG_COMMAND_APPROVAL_START");
+    try label.appendSlice(alloc, "terminal.exec printf '%s' 'LONG_COMMAND_APPROVAL_START");
     try label.appendNTimes(alloc, 'x', 2048);
     try label.appendSlice(alloc, "LONG_COMMAND_APPROVAL_END'");
 
@@ -1552,7 +1552,7 @@ test "command approval screen preserves raw command newlines as rows" {
     var approval = approval_prompt.ApprovalPrompt{};
     defer approval.deinit(alloc);
     try std.testing.expect(try approval.syncRequest(alloc, .{
-        .label = "run_command cat <<'EOF'...",
+        .label = "terminal.exec cat <<'EOF'...",
         .command = "cat <<'EOF'\nline one\nEOF",
     }));
 
@@ -1587,7 +1587,7 @@ test "command approval screen preserves raw command newlines as rows" {
 test "command approval screen includes compact permission header" {
     const alloc = std.testing.allocator;
     var screen_state = interaction_state.ApprovalScreenState{};
-    const label = "run_command printf '%s' '" ++ ("x" ** 256) ++ "'";
+    const label = "terminal.exec printf '%s' '" ++ ("x" ** 256) ++ "'";
 
     var approval = approval_prompt.ApprovalPrompt{};
     defer approval.deinit(alloc);
@@ -1631,7 +1631,7 @@ test "command approval screen wraps commands at word boundaries" {
     var approval = approval_prompt.ApprovalPrompt{};
     defer approval.deinit(alloc);
     try std.testing.expect(try approval.syncRequest(alloc, .{
-        .label = "run_command curl --header alpha --header bravo",
+        .label = "terminal.exec curl --header alpha --header bravo",
     }));
 
     var rendered = try paint(alloc, approval.projection().?, &screen_state, &.{}, .{}, testLayout(13, 32), true);
@@ -1653,7 +1653,7 @@ test "command approval screen wraps commands at word boundaries" {
 test "bounded command approval previews route by complete command fit" {
     const command = "printf '" ++ ("x" ** 160) ++ "'";
     const request: permission_request.PermissionRequest = .{
-        .label = "run_command printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx...",
+        .label = "terminal.exec printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx...",
         .command = command,
     };
 
@@ -1675,7 +1675,7 @@ test "command and file approval screen routing preserves short inline and file r
     try std.testing.expect(!try needsScreen(
         std.testing.allocator,
         .{
-            .label = "run_command printf short",
+            .label = "terminal.exec printf short",
             .command = "printf short",
         },
         testLayout(24, 80),

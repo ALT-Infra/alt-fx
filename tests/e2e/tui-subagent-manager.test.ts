@@ -881,7 +881,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           return fakeGatewayFinalText("DEFAULT_YOLO_TOOL_COMPLETE");
         }
         if (body.includes(childPrompt)) {
-          return fakeGatewayToolCall(callId, "run_command", {
+          return fakeGatewayToolCall(callId, "terminal", {
             command: `printf yolo > ${JSON.stringify(marker)}`,
           });
         }
@@ -1624,13 +1624,13 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           if (next > commandCount) {
             return fakeGatewayFinalText("COMMAND_STREAM_CHILD_COMPLETE");
           }
-          return fakeGatewayToolCall(`command_stream_${next}`, "run_command", {
+          return fakeGatewayToolCall(`command_stream_${next}`, "terminal", {
             command:
               `printf COMMAND_${next}_START; sleep 0.35; printf COMMAND_${next}_END`,
           });
         }
         if (body.includes(childPrompt)) {
-          return fakeGatewayToolCall("command_stream_1", "run_command", {
+          return fakeGatewayToolCall("command_stream_1", "terminal", {
             command:
               "printf COMMAND_1_START; sleep 0.35; printf COMMAND_1_END",
           });
@@ -3756,7 +3756,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await active.waitForText("Review · ←/→ switch · ctrl o close", TIMEOUT);
         await active.sendKeys("Right");
         await active.waitForText("Full detail · ←/→ switch · ctrl o close", TIMEOUT);
-        releaseChildApproval(fakeGatewayToolCall(callId, "run_command", {
+        releaseChildApproval(fakeGatewayToolCall(callId, "terminal", {
           command: "printf approved > child-approval-effect.txt",
         }));
         const childApproval = await active.waitForPane(
@@ -5835,12 +5835,12 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           return fakeGatewayFinalText("CHECKPOINT2_SECOND_APPROVAL_COMPLETE");
         }
         if (body.includes(firstPrompt)) {
-          return fakeGatewayToolCall(firstCallId, "run_command", {
+          return fakeGatewayToolCall(firstCallId, "terminal", {
             command: `printf first > ${JSON.stringify(firstMarker)}`,
           });
         }
         if (body.includes(secondPrompt)) {
-          return fakeGatewayToolCall(secondCallId, "run_command", {
+          return fakeGatewayToolCall(secondCallId, "terminal", {
             command: `printf second > ${JSON.stringify(secondMarker)}`,
           });
         }
@@ -6383,7 +6383,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           return fakeGatewayFinalText("CANCEL_BLOCKED_APPROVAL_PARENT_READY");
         }
         if (body.includes(childPrompt)) {
-          return fakeGatewayToolCall(childCallId, "run_command", {
+          return fakeGatewayToolCall(childCallId, "terminal", {
             command: "printf denied > cancelled-approval-effect.txt",
           });
         }

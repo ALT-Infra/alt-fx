@@ -2368,7 +2368,7 @@ test "command approval fit includes the queued prompt banner" {
         .divider_bottom_row = 10,
         .hint_row = 11,
     };
-    const label = "run_command 12345678901234567";
+    const label = "terminal.exec 12345678901234567";
 
     try std.testing.expect(try commandApprovalFitsInline(
         std.testing.allocator,
@@ -2394,7 +2394,7 @@ test "command approval footer sizing paths use the complete command" {
     var prompt = ApprovalPrompt{};
     defer prompt.deinit(alloc);
     try std.testing.expect(try prompt.syncRequest(alloc, .{
-        .label = "run_command printf 'SURFACE_COMMAND_START...",
+        .label = "terminal.exec printf 'SURFACE_COMMAND_START...",
         .command = command,
     }));
 

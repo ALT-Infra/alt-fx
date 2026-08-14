@@ -2777,18 +2777,23 @@ pub fn decideToolAuthority(
         return .unavailable;
     }
     if (authority.permission_mode == .yolo) return .allow;
+    const permission_name = if (target_kind == .command_cwd and
+        std.mem.eql(u8, tool_name, "terminal"))
+        "run_command"
+    else
+        tool_name;
     return switch (try permissions.ruleDecisionFor(
         alloc,
         authority.rules,
         workspace_root,
-        tool_name,
+        permission_name,
         target,
         target_kind,
     )) {
         .allow => .allow,
         .deny => .deny,
-        .ask => if (permissions.sessionGrantAllowed(authority.grants, tool_name, target)) .allow else .ask,
-        .none => if (permissions.sessionGrantAllowed(authority.grants, tool_name, target)) .allow else .ask,
+        .ask => if (permissions.sessionGrantAllowed(authority.grants, permission_name, target)) .allow else .ask,
+        .none => if (permissions.sessionGrantAllowed(authority.grants, permission_name, target)) .allow else .ask,
     };
 }
 
@@ -5430,7 +5435,7 @@ test "live authority applies deny revocation and sibling grant isolation" {
         .pattern = @constCast("git push *"),
         .action = .deny,
     }};
-    const tools = [_][]const u8{"run_command"};
+    const tools = [_][]const u8{"terminal"};
     const allowed_grants = [_]types.PermissionGrant{.{
         .tool_name = @constCast("bash"),
         .target_path = @constCast("git status"),
@@ -5447,29 +5452,29 @@ test "live authority applies deny revocation and sibling grant isolation" {
     };
     try std.testing.expectEqual(
         ToolAuthorityDecision.deny,
-        try decideToolAuthority(alloc, authority, "/tmp", "run_command", "git push origin main", .none),
+        try decideToolAuthority(alloc, authority, "/tmp", "terminal", "git push origin main", .command_cwd),
     );
     try std.testing.expectEqual(
         ToolAuthorityDecision.allow,
-        try decideToolAuthority(alloc, authority, "/tmp", "run_command", "git status", .none),
+        try decideToolAuthority(alloc, authority, "/tmp", "terminal", "git status", .command_cwd),
     );
     var sibling = authority;
     sibling.grants = &.{};
     try std.testing.expectEqual(
         ToolAuthorityDecision.ask,
-        try decideToolAuthority(alloc, sibling, "/tmp", "run_command", "git status", .none),
+        try decideToolAuthority(alloc, sibling, "/tmp", "terminal", "git status", .command_cwd),
     );
     var child_claim = authority;
     child_claim.permission_mode = .ask;
     try std.testing.expectEqual(
         ToolAuthorityDecision.allow,
-        try decideToolAuthority(alloc, child_claim, "/tmp", "run_command", "git status", .none),
+        try decideToolAuthority(alloc, child_claim, "/tmp", "terminal", "git status", .command_cwd),
     );
     var yolo = authority;
     yolo.permission_mode = .yolo;
     try std.testing.expectEqual(
         ToolAuthorityDecision.allow,
-        try decideToolAuthority(alloc, yolo, "/tmp", "run_command", "git push origin main", .none),
+        try decideToolAuthority(alloc, yolo, "/tmp", "terminal", "git push origin main", .command_cwd),
     );
     try std.testing.expectEqual(
         ToolAuthorityDecision.unavailable,

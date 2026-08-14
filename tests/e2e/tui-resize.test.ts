@@ -1640,7 +1640,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const command =
         "for i in $(seq 1 96); do printf 'resize-stream-marker %03d\\n' \"$i\"; sleep 0.03; done";
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("resize-live-command", "run_command", { command }),
+        fakeGatewayToolCall("resize-live-command", "terminal", { command }),
         fakeGatewayFinalText(finalResponse),
       ]);
       gateways.push(gateway);
@@ -1750,7 +1750,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
 
       const gateway = startFakeGateway([
         fakeGatewayFinalText(seedMarker),
-        fakeGatewayToolCall("approval-cancel-resize", "run_command", {
+        fakeGatewayToolCall("approval-cancel-resize", "terminal", {
           command,
         }),
       ]);

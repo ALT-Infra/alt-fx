@@ -73,14 +73,50 @@ pub fn deferVisibleLifecycleUntilAfterPermission(tool_name: []const u8) bool {
         file_mutation_contract.isToolName(tool_name);
 }
 
-pub fn deferRunCommandLifecycleForAutoPermissionNotice(
-    tool_name: []const u8,
+pub fn deferCapturedCommandLifecycleForAutoPermissionNotice(
+    registry: tool_dispatch.Registry,
+    arena: Allocator,
+    call: ToolCall,
     permission_mode: PermissionMode,
     interactive_presentation: bool,
-) bool {
+) !bool {
     return interactive_presentation and
         permission_mode == .auto and
-        std.mem.eql(u8, tool_name, "run_command");
+        try tooling_tool_admission.callUsesCommandAuthority(
+            registry,
+            arena,
+            call,
+        );
+}
+
+test "auto permission lifecycle deferral applies only to terminal exec" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const exec = ToolCall{
+        .id = "exec",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"pwd\"}",
+    };
+    const start = ToolCall{
+        .id = "start",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"start\"}",
+    };
+    try std.testing.expect(try deferCapturedCommandLifecycleForAutoPermissionNotice(
+        test_builtin_tools.registry,
+        arena,
+        exec,
+        .auto,
+        true,
+    ));
+    try std.testing.expect(!try deferCapturedCommandLifecycleForAutoPermissionNotice(
+        test_builtin_tools.registry,
+        arena,
+        start,
+        .auto,
+        true,
+    ));
 }
 
 pub fn requestToolPermissionTraced(
@@ -567,11 +603,28 @@ pub fn applyInitialSessionGrants(
     arena: Allocator,
     local_grants: *std.ArrayList(PermissionGrant),
     workspace_root: []const u8,
-    tool_name: []const u8,
+    call: ToolCall,
     target_path: []const u8,
 ) !void {
-    const target_kind = if (hooks.tool_registry.lookup(tool_name)) |tool| tool.permission_target_kind else .none;
-    const grants = try permissions.suggestedSessionGrants(arena, workspace_root, tool_name, target_path, target_kind);
+    const command_call = try tooling_tool_admission.callUsesCommandAuthority(
+        hooks.tool_registry,
+        arena,
+        call,
+    );
+    const permission_name = if (command_call) "run_command" else call.name;
+    const target_kind = if (command_call)
+        tool_dispatch.PermissionTargetKind.command_cwd
+    else if (hooks.tool_registry.lookup(call.name)) |tool|
+        tool.permission_target_kind
+    else
+        .none;
+    const grants = try permissions.suggestedSessionGrants(
+        arena,
+        workspace_root,
+        permission_name,
+        target_path,
+        target_kind,
+    );
     for (grants) |grant| {
         // A broader sandbox retry is a separate scope and must receive its own
         // decision. Only that widening decision may retain a sandbox grant.

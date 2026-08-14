@@ -459,7 +459,7 @@ async function setupScenario(
       gateway = startFakeGateway([
         async () => {
           await gate.promise;
-          return fakeGatewayToolCall("observer_thinking_running", "run_command", {
+          return fakeGatewayToolCall("observer_thinking_running", "terminal", {
             command: "sleep 5 # this command is intentionally verbose so the running status must end with an omission marker at the terminal boundary",
           });
         },
@@ -483,7 +483,7 @@ async function setupScenario(
       gateway = startFakeGateway([
         async () => {
           await gate.promise;
-          return fakeGatewayToolCall("observer_thinking_final", "run_command", {
+          return fakeGatewayToolCall("observer_thinking_final", "terminal", {
             command: "printf OBSERVER_THINKING_TOOL_FINAL # this command is intentionally verbose so the completed status must wrap and truncate at the terminal boundary",
           });
         },
@@ -507,7 +507,7 @@ async function setupScenario(
       gateway = startFakeGateway([
         async () => {
           await gate.promise;
-          return fakeGatewayToolCall("observer_thinking_failed", "run_command", {
+          return fakeGatewayToolCall("observer_thinking_failed", "terminal", {
             command: "sh -c 'printf OBSERVER_THINKING_TOOL_FAILED >&2; exit 17' # this command is intentionally verbose so the failed status must wrap and truncate at the terminal boundary",
           });
         },

@@ -118,10 +118,10 @@ function gatewayToolCall(toolName: string, input: object, toolCallId: string) {
 
 function toolCall(
   command: string,
-  options: { background?: boolean } = {},
+  options: Record<string, never> = {},
   toolCallId = "command_1",
 ) {
-  return gatewayToolCall("run_command", { command, ...options }, toolCallId);
+  return gatewayToolCall("terminal", { action: "exec", command, ...options }, toolCallId);
 }
 
 function permissionDecision(
@@ -169,8 +169,8 @@ function toolCalls(command: string, callIds: string[]) {
     ...callIds.map((toolCallId) => ({
       type: "tool-call",
       toolCallId,
-      toolName: "run_command",
-      input: { command },
+      toolName: "terminal",
+      input: { action: "exec", command },
     })),
     {
       type: "finish",
@@ -184,14 +184,14 @@ function twoEffectfulCommandBatch(first: string, second: string) {
     {
       type: "tool-call",
       toolCallId: "history_feedback_first",
-      toolName: "run_command",
-      input: { command: first },
+      toolName: "terminal",
+      input: { action: "exec", command: first },
     },
     {
       type: "tool-call",
       toolCallId: "history_feedback_second",
-      toolName: "run_command",
-      input: { command: second },
+      toolName: "terminal",
+      input: { action: "exec", command: second },
     },
     {
       type: "finish",
@@ -1082,11 +1082,10 @@ function largeEffectfulCommand(marker: string) {
   return command;
 }
 
-async function expectSavedRunCommand(
+async function expectSavedTerminalExec(
   root: IsolatedRoot,
   sessionId: string,
   command: string,
-  background = false,
 ) {
   const result = await runFx(
     ["session", "--id", sessionId, "--json"],
@@ -1096,14 +1095,14 @@ async function expectSavedRunCommand(
   const detail = JSON.parse(result.stdout) as any;
   const step = detail.history
     .flatMap((turn: any) => turn.execution?.tool_steps ?? [])
-    .find((entry: any) => entry.tool_calls?.some((call: any) => call.name === "run_command"));
+    .find((entry: any) => entry.tool_calls?.some((call: any) => call.name === "terminal"));
   expect(step).toBeDefined();
-  const call = step.tool_calls.find((entry: any) => entry.name === "run_command");
+  const call = step.tool_calls.find((entry: any) => entry.name === "terminal");
   expect(JSON.parse(call.arguments_json)).toEqual(
-    expect.objectContaining({ command, ...(background ? { background: true } : {}) }),
+    expect.objectContaining({ action: "exec", command }),
   );
   expect(step.tool_results).toContainEqual(
-    expect.objectContaining({ tool_call_id: call.id, tool_name: "run_command", status: "success" }),
+    expect.objectContaining({ tool_call_id: call.id, tool_name: "terminal", status: "success" }),
   );
 }
 
@@ -1351,13 +1350,13 @@ describe("effect-aware command permissions", () => {
       const streamText = "DIRECT_NO_NOTICE_STREAM_TEXT";
       const gateway = startFakeGateway([
         sse([
-          { type: "tool-input-start", id: "command_1", toolName: "run_command" },
+          { type: "tool-input-start", id: "command_1", toolName: "terminal" },
           { type: "text-delta", id: "answer_1", delta: streamText },
           {
             type: "tool-call",
             toolCallId: "command_1",
-            toolName: "run_command",
-            input: { command: "pwd" },
+            toolName: "terminal",
+            input: { action: "exec", command: "pwd" },
           },
           {
             type: "finish",
@@ -1436,10 +1435,6 @@ describe("effect-aware command permissions", () => {
           name: "fxc110-failed.sh",
           body: "#!/bin/sh\nprintf 'FXC110_FAILED_STDERR\\n' >&2\nexit 7\n",
         },
-        {
-          name: "fxc110-background.sh",
-          body: "#!/bin/sh\nprintf 'FXC110_BACKGROUND_STDOUT\\n'\nsleep 1\n",
-        },
       ];
       for (const script of scripts) {
         const path = join(root.workspace, script.name);
@@ -1451,14 +1446,13 @@ describe("effect-aware command permissions", () => {
         { id: "fxc110-fast", command: "./fxc110-fast.sh" },
         { id: "fxc110-stream", command: "./fxc110-stream.sh" },
         { id: "fxc110-failed", command: "./fxc110-failed.sh" },
-        { id: "fxc110-background", command: "./fxc110-background.sh", background: true },
       ];
       const gateway = startFakeGateway([
         sse([
           ...calls.map((call) => ({
             type: "tool-input-start",
             id: call.id,
-            toolName: "run_command",
+            toolName: "terminal",
           })),
           {
             type: "text-delta",
@@ -1468,24 +1462,21 @@ describe("effect-aware command permissions", () => {
           ...calls.map((call) => ({
             type: "tool-call",
             toolCallId: call.id,
-            toolName: "run_command",
-            input: {
-              command: call.command,
-              ...(call.background ? { background: true } : {}),
-            },
+            toolName: "terminal",
+            input: { action: "exec", command: call.command },
           })),
           {
             type: "finish",
             finishReason: { unified: "tool-calls", raw: "tool-calls" },
           },
         ]),
+        finalText("FXC110_COMPLETE"),
       ]);
       const outputRows = [
         "│ FXC110_FAST_STDOUT",
         "│ FXC110_STREAM_STDOUT",
         "│ FXC110_STREAM_STDERR",
         "│ FXC110_FAILED_STDERR",
-        "│ FXC110_BACKGROUND_STDOUT",
       ];
       const expectNoOutputRows = (text: string) => {
         for (const row of outputRows) expect(text).not.toContain(row);
@@ -1511,12 +1502,9 @@ describe("effect-aware command permissions", () => {
       expect(running).toContain("Running ./fxc110-stream.sh");
       expectNoOutputRows(running);
 
-      await activeSession.waitForText(
-        "Background: Command #1 completed successfully.",
-        TIMEOUT,
-      );
+      await activeSession.waitForText("1 failed", TIMEOUT);
       const completed = await activeSession.captureFullScrollback();
-      expect(completed).toContain("4 tool calls");
+      expect(completed).toContain("3 tool calls");
       expect(completed).toContain("1 failed");
       for (const script of scripts) expect(completed).toContain(script.name);
       expectNoOutputRows(completed);
@@ -1532,7 +1520,7 @@ describe("effect-aware command permissions", () => {
       expect(full).toContain("FXC110_FAILED_STDERR");
 
       await activeSession.sendKeys("C-o");
-      await activeSession.waitForText("4 tool calls", TIMEOUT);
+      await activeSession.waitForText("3 tool calls", TIMEOUT);
       expectNoOutputRows(await activeSession.captureFullScrollback());
       await activeSession.resizeWindow(64, 28);
       expectNoOutputRows(await activeSession.captureFullScrollback());
@@ -1550,7 +1538,7 @@ describe("effect-aware command permissions", () => {
         height: 32,
       });
       await activeSession.waitForComposer(TIMEOUT);
-      await activeSession.waitForText("4 tool calls", TIMEOUT);
+      await activeSession.waitForText("3 tool calls", TIMEOUT);
       expectNoOutputRows(await activeSession.captureFullScrollback());
 
       await activeSession.sendKeys("C-o");
@@ -1565,7 +1553,7 @@ describe("effect-aware command permissions", () => {
       expect(resumedFull).toContain("FXC110_STREAM_STDOUT");
       expect(resumedFull).toContain("FXC110_STREAM_STDERR");
       expect(resumedFull).toContain("FXC110_FAILED_STDERR");
-      expect(gateway.requests).toHaveLength(1);
+      expect(gateway.requests).toHaveLength(2);
       expect(gateway.classifierRequests).toHaveLength(calls.length);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
@@ -2209,13 +2197,13 @@ describe("effect-aware command permissions", () => {
             {
               type: "tool-input-start",
               id: "scrollback_command",
-              toolName: "run_command",
+              toolName: "terminal",
             },
             {
               type: "tool-call",
               toolCallId: "scrollback_command",
-              toolName: "run_command",
-              input: { command: "seq 1 1" },
+              toolName: "terminal",
+              input: { action: "exec", command: "seq 1 1" },
             },
             {
               type: "finish",
@@ -2483,7 +2471,7 @@ describe("effect-aware command permissions", () => {
         await activeSession.kill();
         activeSession = null;
 
-        await expectSavedRunCommand(
+        await expectSavedTerminalExec(
           root,
           sessionIdFromHome(root),
           command,
@@ -3061,7 +3049,7 @@ describe("effect-aware command permissions", () => {
       expect(interrupted).toBeDefined();
       const retainedResult = interrupted.execution.tool_steps
         .flatMap((step: any) => step.tool_results)
-        .find((result: any) => result.tool_name === "run_command");
+        .find((result: any) => result.tool_name === "terminal");
       expect(retainedResult).toBeDefined();
       expect(retainedResult.status).toBe("failure");
       const retained = JSON.parse(retainedResult.output);
@@ -3337,8 +3325,8 @@ describe("effect-aware command permissions", () => {
             activity.tool_name,
             activity.phase,
           ])).toEqual([
-            ["run_command", "started"],
-            ["run_command", "succeeded"],
+            ["terminal", "started"],
+            ["terminal", "succeeded"],
           ]);
           return finalText("parent inspected canonical child");
         }
@@ -5714,7 +5702,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "TUI completes large foreground and background run commands after one-time approval",
+    "TUI completes a large terminal exec after one-time approval",
     async () => {
       const foregroundRoot = createIsolatedRoot();
       const foregroundMarker = "large-tui-foreground-marker";
@@ -5756,57 +5744,10 @@ describe("effect-aware command permissions", () => {
       expect(await activeSession.waitForSessionEnd()).toBe(true);
       await activeSession.kill();
       activeSession = null;
-      await expectSavedRunCommand(
+      await expectSavedTerminalExec(
         foregroundRoot,
         sessionIdFromHome(foregroundRoot),
         foregroundCommand,
-      );
-
-      const backgroundRoot = createIsolatedRoot();
-      const backgroundMarker = "large-tui-background-marker";
-      const backgroundCommand = largeEffectfulCommand(backgroundMarker);
-      const backgroundGateway = startFakeGateway([
-        toolCall(backgroundCommand, { background: true }),
-      ]);
-      const backgroundStderr = join(backgroundRoot.root, "background-stderr.log");
-      writeFileSync(backgroundStderr, "");
-
-      activeSession = await TmuxSession.create({
-        cmd: FX_BIN,
-        cwd: backgroundRoot.workspace,
-        env: gatewayEnv(backgroundRoot, backgroundGateway, {
-          FX_PERMISSION_MODE: "ask",
-        }),
-        stderrPath: backgroundStderr,
-        width: 120,
-        height: 40,
-      });
-      await activeSession.waitForComposer(TIMEOUT);
-      await activeSession.sendText("Run the large background fixture.");
-      await activeSession.waitForText(COMMAND_APPROVAL_PROMPT, TIMEOUT);
-      await activeSession.sendKeys("1");
-      await activeSession.sendKeys("Enter");
-      await activeSession.waitForText("Background: Command #1 completed successfully.", TIMEOUT);
-
-      const backgroundScrollback = await activeSession.captureFullScrollback();
-      expect(backgroundScrollback).toContain("● Background: Command #1 started. Log:");
-      expect(backgroundScrollback).toContain("● Background: Command #1 completed successfully.");
-      expect(backgroundScrollback).not.toContain("System: Background");
-      expect(backgroundScrollback).not.toContain("Background: Background");
-      expect(backgroundScrollback).not.toContain("integer does not fit in destination type");
-      expect(existsSync(join(backgroundRoot.workspace, backgroundMarker))).toBe(true);
-      expect(backgroundGateway.requests).toHaveLength(1);
-      expect(readFileSync(backgroundStderr, "utf8")).toBe("");
-
-      await activeSession.sendText("/quit");
-      expect(await activeSession.waitForSessionEnd()).toBe(true);
-      await activeSession.kill();
-      activeSession = null;
-      await expectSavedRunCommand(
-        backgroundRoot,
-        sessionIdFromHome(backgroundRoot),
-        backgroundCommand,
-        true,
       );
     },
     90_000,
@@ -5899,7 +5840,7 @@ describe("effect-aware command permissions", () => {
       expect(result.stderr.toLowerCase()).not.toContain("error");
       const json = JSON.parse(result.stdout.trim()) as any;
       expect(json.tool_calls).toHaveLength(1);
-      expect(json.tool_calls[0].name).toBe("run_command");
+      expect(json.tool_calls[0].name).toBe("terminal");
       expect(json.tool_calls[0].status).toBe("success");
       expect(json.tool_calls[0].command_result.command).toBe("pwd");
       expect(json.tool_calls[0].command_result.cwd).toBe(root.workspace);
@@ -5946,7 +5887,7 @@ describe("effect-aware command permissions", () => {
       const json = JSON.parse(result.stdout.trim()) as any;
       expect(json.output).toContain("classifier accept complete");
       expect(json.tool_calls).toContainEqual(
-        expect.objectContaining({ name: "run_command", status: "success" }),
+        expect.objectContaining({ name: "terminal", status: "success" }),
       );
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.classifierRequests).toHaveLength(1);
@@ -6209,7 +6150,7 @@ describe("effect-aware command permissions", () => {
       const json = JSON.parse(result.stdout.trim()) as any;
       expect(json.output).toContain("delegated classifier complete");
       expect(json.tool_calls).toContainEqual(
-        expect.objectContaining({ name: "run_command", status: "success" }),
+        expect.objectContaining({ name: "terminal", status: "success" }),
       );
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.classifierRequests).toHaveLength(1);
@@ -6308,7 +6249,7 @@ describe("effect-aware command permissions", () => {
       expect(cliJson.output).toContain("CLI preflight denial complete");
       expect(cliJson.tool_calls).toHaveLength(1);
       expect(cliJson.tool_calls[0]).toEqual(
-        expect.objectContaining({ name: "run_command", status: "error" }),
+        expect.objectContaining({ name: "terminal", status: "error" }),
       );
       expect(cliResult.stdout).not.toContain("sandbox_scope_required");
       expect(existsSync(cliMarker)).toBe(false);
@@ -6395,7 +6336,7 @@ describe("effect-aware command permissions", () => {
           expect(json.tool_calls).toHaveLength(1);
           expect(json.tool_calls[0]).toEqual(
             expect.objectContaining({
-              name: "run_command",
+              name: "terminal",
               status: "error",
               command_result: expect.objectContaining({
                 kind: "foreground",
@@ -6461,7 +6402,7 @@ describe("effect-aware command permissions", () => {
       expect(cliJson.output).toContain("large CLI complete");
       expect(cliJson.tool_calls).toHaveLength(1);
       expect(cliJson.tool_calls).toContainEqual(
-        expect.objectContaining({ name: "run_command", status: "success" }),
+        expect.objectContaining({ name: "terminal", status: "success" }),
       );
       expect(existsSync(join(cliRoot.workspace, cliMarker))).toBe(true);
       expect(cliGateway.requests).toHaveLength(2);
@@ -6470,7 +6411,7 @@ describe("effect-aware command permissions", () => {
       expect(cliReview).toContain("FX_LARGE_RUN_COMMAND_DONE");
       expect(cliReview).toContain("action_evidence_incomplete: false");
       expect(cliReview).not.toContain("...[evidence omitted]...");
-      await expectSavedRunCommand(cliRoot, cliJson.session_id, cliCommand);
+      await expectSavedTerminalExec(cliRoot, cliJson.session_id, cliCommand);
 
       const acpRoot = createIsolatedRoot();
       const acpMarker = "large-acp-marker";
@@ -6498,7 +6439,7 @@ describe("effect-aware command permissions", () => {
       expect(acpReview).toContain("FX_LARGE_RUN_COMMAND_DONE");
       expect(acpReview).toContain("action_evidence_incomplete: false");
       expect(acpReview).not.toContain("...[evidence omitted]...");
-      await expectSavedRunCommand(
+      await expectSavedTerminalExec(
         acpRoot,
         sessionIdFromHome(acpRoot),
         acpCommand,

@@ -167,8 +167,8 @@ function outerCommandCall() {
   return outerToolCalls([
     {
       id: "command_outer_1",
-      name: "run_command",
-      input: { command: "touch generic-preview-accepted.txt" },
+      name: "terminal",
+      input: { action: "exec", command: "touch generic-preview-accepted.txt" },
     },
   ]);
 }
@@ -180,8 +180,9 @@ function outerProjectionChangingCommandCall() {
   return outerToolCalls([
     {
       id: "projection_command_outer_1",
-      name: "run_command",
+      name: "terminal",
       input: {
+        action: "exec",
         command:
           `i=1; while [ "$i" -le 5000 ]; do printf 'PROJECTION_FIXTURE_%04d\\n' "$i"; i=$((i + 1)); done; ` +
           `: > ${PROJECTION_READY}; while [ ! -e ${PROJECTION_RELEASE} ]; do sleep 0.01; done`,
@@ -203,8 +204,8 @@ function outerLongCommandCall() {
   return outerToolCalls([
     {
       id: "long_command_outer_1",
-      name: "run_command",
-      input: { command },
+      name: "terminal",
+      input: { action: "exec", command },
     },
   ]);
 }
@@ -220,8 +221,8 @@ function outerScrollableLongCommandCall() {
   return outerToolCalls([
     {
       id: "scrollable_long_command_outer_1",
-      name: "run_command",
-      input: { command },
+      name: "terminal",
+      input: { action: "exec", command },
     },
   ]);
 }
@@ -233,18 +234,8 @@ function outerFittingCommandCall() {
   return outerToolCalls([
     {
       id: "fitting_command_outer_1",
-      name: "run_command",
-      input: { command },
-    },
-  ]);
-}
-
-function outerBackgroundCommandCall() {
-  return outerToolCalls([
-    {
-      id: "background_command_outer_1",
-      name: "run_command",
-      input: { command: "sleep 1", background: true },
+      name: "terminal",
+      input: { action: "exec", command },
     },
   ]);
 }
@@ -1716,31 +1707,6 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         ctx.gateway.requests[1]!.body,
         "use a safer command",
       )).toBe(true);
-      await assertProcessAliveAndClean(ctx);
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "background command approvals keep legacy Tab navigation and terminal completion",
-    async () => {
-      const ctx = await launchScenario([outerBackgroundCommandCall()]);
-      await ctx.session.sendText("Start the background command fixture.");
-      let pane = await ctx.session.waitForText(APPROVAL_PROMPT, TIMEOUT);
-      expectApprovalSelection(pane, 1, COMMAND_YES_CHOICE);
-      expect(pane).not.toContain("Tab Amend");
-
-      await ctx.session.sendKeys("Tab");
-      pane = await waitForPaneState(ctx.session, "background tab navigation", (value) =>
-        hasApprovalSelection(value, 2, COMMAND_ALWAYS_CHOICE),
-      );
-      expectApprovalSelection(pane, 2, COMMAND_ALWAYS_CHOICE);
-
-      await ctx.session.sendKeys("Up");
-      await ctx.session.sendLiteralText("1");
-      await ctx.session.waitForText("● Background: Command #", TIMEOUT);
-      expect(ctx.gateway.requests).toHaveLength(1);
-      expect(await ctx.session.capturePane()).not.toContain(APPROVAL_PROMPT);
       await assertProcessAliveAndClean(ctx);
     },
     TIMEOUT,

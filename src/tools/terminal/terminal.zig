@@ -5,14 +5,30 @@ const identity = @import("../../core/terminal/identity.zig");
 const operation = @import("../../core/terminal/operation.zig");
 const store = @import("../../core/terminal/store.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
+const command_environment = @import("../../core/execution/command_environment.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const pathing = @import("../../core/workspace/pathing.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 const workspace_access = @import("../../core/workspace/workspace_access.zig");
+const shell_resolver = @import("../../core/terminal/shell_resolver.zig");
 
 const Allocator = std.mem.Allocator;
 
 const ShellKind = enum { user_login, executable };
+pub const Action = enum {
+    exec,
+    start,
+    read,
+    screen,
+    write,
+    wait,
+    monitor,
+    inspect,
+    list,
+    resize,
+    signal,
+    close,
+};
 const ReturnKind = enum { started, exit, quiet, match };
 const PayloadKind = enum { text, keys, controls, paste };
 const MonitorConditionKind = enum {
@@ -114,12 +130,13 @@ pub const MonitorOperationInput = struct {
 /// Public semantic terminal input. Authority and persistence fields are
 /// intentionally absent; Core derives them from the current fx session.
 pub const Input = struct {
-    action: contracts.Action,
+    action: Action,
     session_id: ?[]const u8 = null,
 
     cwd: ?[]const u8 = null,
     command: ?[]const u8 = null,
-    shell: ShellInput = .{},
+    profile: ?command_environment.Profile = null,
+    shell: ?ShellInput = null,
     backend: ?contracts.Backend = null,
     return_when: ?ReturnInput = null,
     wait_ceiling_ms: ?u64 = null,
@@ -144,9 +161,10 @@ pub const Input = struct {
     close_policy: ?contracts.ClosePolicy = null,
 };
 
-pub fn actionFieldNames(action: contracts.Action) []const []const u8 {
+pub fn actionFieldNames(action: Action) []const []const u8 {
     return switch (action) {
-        .start => &.{ "action", "cwd", "command", "shell", "backend", "return_when", "wait_ceiling_ms", "dimensions", "initial_monitors" },
+        .exec => &.{ "action", "command", "cwd", "profile" },
+        .start => &.{ "action", "cwd", "command", "profile", "shell", "backend", "return_when", "wait_ceiling_ms", "dimensions", "initial_monitors" },
         .read => &.{ "action", "session_id", "cursor_segment", "cursor_offset" },
         .screen => &.{ "action", "session_id" },
         .write => &.{ "action", "session_id", "write", "lease" },
@@ -160,14 +178,14 @@ pub fn actionFieldNames(action: contracts.Action) []const []const u8 {
     };
 }
 
-fn actionAllowsField(action: contracts.Action, field_name: []const u8) bool {
+fn actionAllowsField(action: Action, field_name: []const u8) bool {
     for (actionFieldNames(action)) |allowed_name| {
         if (std.mem.eql(u8, allowed_name, field_name)) return true;
     }
     return false;
 }
 
-fn unexpectedActionField(action: contracts.Action, object: std.json.ObjectMap) ?[]const u8 {
+fn unexpectedActionField(action: Action, object: std.json.ObjectMap) ?[]const u8 {
     var fields = object.iterator();
     while (fields.next()) |entry| {
         if (!actionAllowsField(action, entry.key_ptr.*)) return entry.key_ptr.*;
@@ -220,7 +238,7 @@ pub fn decode(
             "terminal arguments must match the advertised action schema",
         ) };
     }
-    const action = std.meta.stringToEnum(contracts.Action, raw_action.string) orelse {
+    const action = std.meta.stringToEnum(Action, raw_action.string) orelse {
         return .{ .failure = try ctx.allocator.dupe(
             u8,
             "terminal arguments must match the advertised action schema",
@@ -317,6 +335,29 @@ pub fn validate(
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    if (input.action == .exec) {
+        if (input.command == null) {
+            return try ctx.allocator.dupe(u8, "terminal exec arguments are invalid: MissingCommand");
+        }
+        _ = resolveCwd(arena, ctx, input.cwd) catch |err| {
+            return try std.fmt.allocPrint(
+                ctx.allocator,
+                "terminal exec arguments are invalid: {s}",
+                .{@errorName(err)},
+            );
+        };
+        _ = commandEnvironment(arena, ctx, input.profile) catch |err| {
+            return try std.fmt.allocPrint(
+                ctx.allocator,
+                "terminal exec arguments are invalid: {s}",
+                .{@errorName(err)},
+            );
+        };
+        return null;
+    }
+    if (input.action == .start and input.profile != null and input.shell != null) {
+        return try ctx.allocator.dupe(u8, "terminal start fields \"profile\" and \"shell\" are mutually exclusive");
+    }
     const request = semanticRequest(arena, ctx, input) catch |err| {
         return @as(?[]u8, try std.fmt.allocPrint(
             ctx.allocator,
@@ -338,16 +379,18 @@ pub fn call(
     ctx: tool_dispatch.DispatchContext,
     erased: tool_dispatch.ToolInput,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+    const input = &erased.as(OwnedInput).parsed.value;
+    if (input.action == .exec) return callExec(ctx, input);
     const runtime = ctx.terminal_client orelse return structuredFailure(
         ctx.allocator,
-        erased.as(OwnedInput).parsed.value.action,
+        durableAction(input.action).?,
         null,
         .unsupported_host,
         false,
     );
     const owner = ctx.session_child_capability orelse return structuredFailure(
         ctx.allocator,
-        erased.as(OwnedInput).parsed.value.action,
+        durableAction(input.action).?,
         null,
         .authority_denied,
         false,
@@ -355,20 +398,18 @@ pub fn call(
     const durable_session_id = ctx.terminal_owner_session_id orelse
         return structuredFailure(
             ctx.allocator,
-            erased.as(OwnedInput).parsed.value.action,
+            durableAction(input.action).?,
             null,
             .authority_denied,
             false,
         );
-    const input = &erased.as(OwnedInput).parsed.value;
-
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var profile_user_buffer: [64]u8 = undefined;
     const profile_user = identity.profileUser(&profile_user_buffer) orelse return structuredFailure(
         ctx.allocator,
-        input.action,
+        durableAction(input.action).?,
         input.session_id,
         .unsupported_host,
         false,
@@ -396,7 +437,7 @@ pub fn call(
         }
         return structuredFailure(
             ctx.allocator,
-            input.action,
+            durableAction(input.action).?,
             input.session_id,
             mapErrorCode(err),
             false,
@@ -417,7 +458,7 @@ pub fn call(
         );
         return structuredFailure(
             ctx.allocator,
-            input.action,
+            durableAction(input.action).?,
             request.sessionId(),
             mapErrorCode(err),
             err == error.QueueFull,
@@ -431,7 +472,7 @@ pub fn call(
             defer completion.deinit();
             return resultFromCompletion(
                 ctx.allocator,
-                input.action,
+                durableAction(input.action).?,
                 request.sessionId(),
                 completion,
             );
@@ -446,6 +487,80 @@ pub fn call(
         }
         io_mod.sleep(2 * std.time.ns_per_ms);
     }
+}
+
+fn callExec(
+    ctx: tool_dispatch.DispatchContext,
+    input: *const Input,
+) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+    const backend = ctx.run_command_backend orelse return .{
+        .failure = try ctx.allocator.dupe(u8, "terminal exec backend is unavailable\n"),
+    };
+    const command = input.command orelse return .{
+        .failure = try ctx.allocator.dupe(u8, "terminal exec requires string field \"command\""),
+    };
+    const cwd = resolveCwd(ctx.allocator, ctx, input.cwd) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return .{ .failure = try std.fmt.allocPrint(
+            ctx.allocator,
+            "Unable to resolve command cwd: {s}",
+            .{@errorName(err)},
+        ) };
+    };
+    defer ctx.allocator.free(@constCast(cwd));
+    var environment_arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer environment_arena_state.deinit();
+    const environment_value = commandEnvironment(
+        environment_arena_state.allocator(),
+        ctx,
+        input.profile,
+    ) catch |err| {
+        return .{ .failure = try std.fmt.allocPrint(
+            ctx.allocator,
+            "Unable to resolve terminal exec profile: {s}",
+            .{@errorName(err)},
+        ) };
+    };
+    return backend.execute(ctx, .{
+        .command = command,
+        .resolved_cwd = cwd,
+        .environment = environment_value,
+    });
+}
+
+fn commandEnvironment(
+    alloc: Allocator,
+    ctx: tool_dispatch.DispatchContext,
+    profile: ?command_environment.Profile,
+) !command_environment.Environment {
+    if (ctx.captured_command_host == .workspace_clean) {
+        if (profile != null) return error.InvalidWorkspaceInput;
+        return .workspace_clean;
+    }
+    var login_shell_buffer: [4096]u8 = undefined;
+    const configured = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
+    return shell_resolver.environment(alloc, configured, profile);
+}
+
+fn durableAction(action: Action) ?contracts.Action {
+    return switch (action) {
+        .exec => null,
+        .start => .start,
+        .read => .read,
+        .screen => .screen,
+        .write => .write,
+        .wait => .wait,
+        .monitor => .monitor,
+        .inspect => .inspect,
+        .list => .list,
+        .resize => .resize,
+        .signal => .signal,
+        .close => .close,
+    };
+}
+
+pub fn isCapturedCommand(erased: tool_dispatch.ToolInput) bool {
+    return erased.as(OwnedInput).parsed.value.action == .exec;
 }
 
 const PreparedRequest = struct {
@@ -492,7 +607,7 @@ fn buildRequest(
             .repeated_probes = repeated_probes,
         });
         errdefer persistence.deinit();
-        const request = startRequest(input, cwd, definitions, persistence.view()) catch |err| {
+        const request = startRequest(arena, input, cwd, definitions, persistence.view()) catch |err| {
             return err;
         };
         try operation.validate(request);
@@ -550,6 +665,7 @@ fn buildAuthorizedRequest(
     authority: ?contracts.AuthorityClaim,
 ) !contracts.ActionRequest {
     return switch (input.action) {
+        .exec => unreachable,
         .start => unreachable,
         .read => .{ .read = .{
             .session_id = session_id,
@@ -622,10 +738,11 @@ fn semanticRequest(
     ctx: tool_dispatch.DispatchContext,
     input: *const Input,
 ) !contracts.ActionRequest {
+    if (input.action == .exec) return error.InvalidRequest;
     if (input.action == .start) {
         const cwd = try resolveCwd(arena, ctx, input.cwd);
         const definitions = try buildMonitorDefinitions(arena, input.initial_monitors);
-        return startRequest(input, cwd, definitions, null);
+        return startRequest(arena, input, cwd, definitions, null);
     }
     if (input.action == .list) {
         return build_list_request(arena, ctx, input, null);
@@ -663,6 +780,7 @@ fn build_list_request(
 }
 
 fn startRequest(
+    arena: Allocator,
     input: *const Input,
     cwd: []const u8,
     definitions: []const contracts.MonitorDefinition,
@@ -675,7 +793,7 @@ fn startRequest(
     return .{ .start = .{
         .cwd = cwd,
         .command = command,
-        .shell = try buildShell(input.shell),
+        .shell = try buildStartShell(arena, input),
         .backend = input.backend orelse .native,
         .return_when = if (input.return_when) |condition|
             try buildReturnCondition(condition)
@@ -719,6 +837,14 @@ fn buildShell(input: ShellInput) !contracts.ShellSpec {
             .clean_start = input.clean_start,
         } },
     };
+}
+
+fn buildStartShell(arena: Allocator, input: *const Input) !contracts.ShellSpec {
+    if (input.shell) |shell| return buildShell(shell);
+    const profile = input.profile orelse .user;
+    var login_shell_buffer: [4096]u8 = undefined;
+    const configured = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
+    return shell_resolver.profileShell(arena, configured, profile);
 }
 
 fn buildReturnCondition(input: ReturnInput) !contracts.ReturnCondition {
@@ -1002,7 +1128,7 @@ pub fn isIrreversible(_: tool_dispatch.ToolInput) bool {
 
 test "terminal decoder accepts every public action and owns its input" {
     const alloc = std.testing.allocator;
-    inline for (std.meta.tags(contracts.Action)) |action| {
+    inline for (std.meta.tags(Action)) |action| {
         const args = try std.fmt.allocPrint(
             alloc,
             "{{\"action\":\"{s}\"}}",
@@ -1028,10 +1154,11 @@ test "terminal decoder accepts every public action and owns its input" {
 
 test "terminal action field ownership is exact for every public action" {
     const expected = [_]struct {
-        action: contracts.Action,
+        action: Action,
         fields: []const []const u8,
     }{
-        .{ .action = .start, .fields = &.{ "action", "cwd", "command", "shell", "backend", "return_when", "wait_ceiling_ms", "dimensions", "initial_monitors" } },
+        .{ .action = .exec, .fields = &.{ "action", "command", "cwd", "profile" } },
+        .{ .action = .start, .fields = &.{ "action", "cwd", "command", "profile", "shell", "backend", "return_when", "wait_ceiling_ms", "dimensions", "initial_monitors" } },
         .{ .action = .read, .fields = &.{ "action", "session_id", "cursor_segment", "cursor_offset" } },
         .{ .action = .screen, .fields = &.{ "action", "session_id" } },
         .{ .action = .write, .fields = &.{ "action", "session_id", "write", "lease" } },
@@ -1044,7 +1171,7 @@ test "terminal action field ownership is exact for every public action" {
         .{ .action = .close, .fields = &.{ "action", "session_id", "close_policy" } },
     };
 
-    try std.testing.expectEqual(std.meta.tags(contracts.Action).len, expected.len);
+    try std.testing.expectEqual(std.meta.tags(Action).len, expected.len);
     for (expected) |want| {
         try std.testing.expectEqualSlices(
             []const u8,
@@ -1216,7 +1343,7 @@ test "terminal start canonicalizes interactive command representations" {
     };
 
     for (cases) |case| {
-        const request = try startRequest(&case.input, "/tmp", &.{}, null);
+        const request = try startRequest(std.testing.allocator, &case.input, "/tmp", &.{}, null);
         try request.validate();
         switch (request) {
             .start => |start| {

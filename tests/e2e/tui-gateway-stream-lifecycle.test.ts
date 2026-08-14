@@ -155,12 +155,12 @@ function missingFinishResponse() {
 function lengthLimitedCommandResponse(command: string) {
   return new Response(
     'data: {"type":"text-delta","id":"answer_1","delta":"TUI partial output"}\n\n' +
-      'data: {"type":"tool-input-start","id":"command_provisional","toolName":"run_command"}\n\n' +
+      'data: {"type":"tool-input-start","id":"command_provisional","toolName":"terminal"}\n\n' +
       `data: ${JSON.stringify({
         type: "tool-call",
         toolCallId: "command_final",
-        toolName: "run_command",
-        input: { command },
+        toolName: "terminal",
+        input: { action: "exec", command },
       })}\n\n` +
       'data: {"type":"finish","finishReason":{"unified":"length","raw":"length"}}\n\n' +
       "data: [DONE]\n\n",
@@ -2657,13 +2657,13 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const queuedGateway = startFakeGateway([
         fakeGatewaySerializedToolCall(
           "first_turn_command",
-          "run_command",
+          "terminal",
           '{"command":"printf preflight-failed > preflight.txt"}',
         ),
         () => heldGatewayResponse(hold),
         fakeGatewaySerializedToolCall(
           "queued_grep_command",
-          "run_command",
+          "terminal",
           '{"command":"grep -R \\"preflight\\" -n . | head"}',
         ),
         duplicateKeyToolResponse(),
@@ -4330,8 +4330,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
             {
               type: "tool-call",
               toolCallId: "queue_scrollback_command",
-              toolName: "run_command",
-              input: { command: "sleep 30" },
+              toolName: "terminal",
+              input: { action: "exec", command: "sleep 30" },
             },
             {
               type: "finish",
@@ -5051,7 +5051,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         ),
         fakeGatewaySerializedToolCall(
           "launch-history-command",
-          "run_command",
+          "terminal",
           JSON.stringify({
             command:
               "for i in $(seq -w 1 27); do printf 'docs/source-%s.md\\tWalter (1)\\n' \"$i\"; done",
@@ -5603,8 +5603,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           {
             type: "tool-call",
             toolCallId: supportedCallId,
-            toolName: "run_command",
-            input: { command: supportedCommand },
+            toolName: "terminal",
+            input: { action: "exec", command: supportedCommand },
           },
           {
             type: "finish",
@@ -5689,7 +5689,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         ),
       ).toBe(false);
       expect(trace).toContain(
-        `event=execution_start turn_id=1 step_id=1 call_id=${supportedCallId} name=run_command`,
+        `event=execution_start turn_id=1 step_id=1 call_id=${supportedCallId} name=terminal`,
       );
       expect(existsSync(tapePath)).toBe(true);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -5764,20 +5764,20 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           {
             type: "tool-call",
             toolCallId: "tool_summary_first",
-            toolName: "run_command",
-            input: { command: firstCommand },
+            toolName: "terminal",
+            input: { action: "exec", command: firstCommand },
           },
           {
             type: "tool-call",
             toolCallId: "tool_summary_nested",
-            toolName: "run_command",
-            input: { command: nestedCommand },
+            toolName: "terminal",
+            input: { action: "exec", command: nestedCommand },
           },
           {
             type: "tool-call",
             toolCallId: "tool_summary_third",
-            toolName: "run_command",
-            input: { command: thirdCommand },
+            toolName: "terminal",
+            input: { action: "exec", command: thirdCommand },
           },
           {
             type: "finish",
@@ -5952,8 +5952,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           {
             type: "tool-call",
             toolCallId: "minimal_command_one",
-            toolName: "run_command",
-            input: { command: firstCommand },
+            toolName: "terminal",
+            input: { action: "exec", command: firstCommand },
           },
           {
             type: "finish",
@@ -5982,8 +5982,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           {
             type: "tool-call",
             toolCallId: "minimal_command_two",
-            toolName: "run_command",
-            input: { command: secondCommand },
+            toolName: "terminal",
+            input: { action: "exec", command: secondCommand },
           },
           {
             type: "finish",
@@ -6001,8 +6001,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           {
             type: "tool-call",
             toolCallId: "minimal_command_live",
-            toolName: "run_command",
-            input: { command: liveCommand },
+            toolName: "terminal",
+            input: { action: "exec", command: liveCommand },
           },
           {
             type: "finish",
@@ -6136,7 +6136,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
 
       const cancelledGateway = startFakeGateway([
-        fakeGatewayToolCall("minimal_cancelled_command", "run_command", {
+        fakeGatewayToolCall("minimal_cancelled_command", "terminal", {
           command: "sleep 30",
         }),
       ]);
@@ -6458,7 +6458,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "argless streamed run_command start never renders bare Running while held open",
+    "argless streamed terminal start never renders bare Running while held open",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-run-command-provisional-")));
       const home = join(root, "home");
@@ -6480,7 +6480,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
             {
               type: "tool-input-start",
               id: "command_provisional",
-              toolName: "run_command",
+              toolName: "terminal",
             },
           ]),
       ]);
@@ -6505,17 +6505,17 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       });
 
       await session.waitForComposer(TIMEOUT);
-      await session.sendText("trigger a run_command but keep the stream open");
+      await session.sendText("trigger a terminal but keep the stream open");
       await waitForCondition(
         () => streamingGateway.requests.length === 1 && stream.started,
-        "held run_command stream start",
+        "held terminal stream start",
       );
       const scrollback = await waitForScrollback(
         session,
         (candidate) =>
           candidate.includes("● Preparing command") &&
           !hasBareRunningRow(candidate),
-        "argless run_command provisional row",
+        "argless terminal provisional row",
       );
 
       expect(stream.cancelled).toBe(false);
@@ -6628,7 +6628,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           .toHaveLength(1);
         expect(findUnavailableCapabilityReferences(request)).toEqual([]);
         expect(customProviderGuidanceState(request)).toEqual({
-          providerToolIndices: [24],
+          providerToolIndices: [23],
           guidanceMessageIndices: [1],
         });
         expect(
@@ -6662,7 +6662,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "multiline run_command keeps raw approval and persistence with compact activity",
+    "multiline terminal keeps raw approval and persistence with compact activity",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-multiline-command-")));
       const home = join(root, "home");
@@ -6687,7 +6687,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       writeFileSync(stderrPath, "");
 
       const commandGateway = startFakeGateway([
-        fakeGatewayToolCall("multiline_command", "run_command", { command }),
+        fakeGatewayToolCall("multiline_command", "terminal", { command }),
         fakeGatewayFinalText(finalText),
       ]);
       gateway = commandGateway;
@@ -6758,15 +6758,15 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const step = saved.history
         .flatMap((turn: any) => turn.execution?.tool_steps ?? [])
         .find((entry: any) =>
-          entry.tool_calls?.some((call: any) => call.name === "run_command")
+          entry.tool_calls?.some((call: any) => call.name === "terminal")
         );
       expect(step).toBeDefined();
-      const savedCall = step.tool_calls.find((call: any) => call.name === "run_command");
+      const savedCall = step.tool_calls.find((call: any) => call.name === "terminal");
       expect(JSON.parse(savedCall.arguments_json).command).toBe(command);
       expect(step.tool_results).toContainEqual(
         expect.objectContaining({
           tool_call_id: savedCall.id,
-          tool_name: "run_command",
+          tool_name: "terminal",
           status: "success",
         }),
       );
@@ -6781,7 +6781,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "same-step streamed run_command calls complete with owned output blocks",
+    "same-step streamed terminal calls complete with owned output blocks",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-parallel-command-")));
       const home = join(root, "home");
@@ -6807,14 +6807,14 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       const commandGateway = startFakeGateway([
         fakeGatewaySse([
-          { type: "tool-input-start", id: "stream_cmd_one", toolName: "run_command" },
+          { type: "tool-input-start", id: "stream_cmd_one", toolName: "terminal" },
           {
             type: "tool-input-delta",
             id: "stream_cmd_one",
             delta: JSON.stringify({ command: firstCommand }),
           },
           { type: "tool-input-end", id: "stream_cmd_one" },
-          { type: "tool-input-start", id: "stream_cmd_two", toolName: "run_command" },
+          { type: "tool-input-start", id: "stream_cmd_two", toolName: "terminal" },
           {
             type: "tool-input-delta",
             id: "stream_cmd_two",
@@ -6824,14 +6824,14 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           {
             type: "tool-call",
             toolCallId: "stream_cmd_one",
-            toolName: "run_command",
-            input: { command: firstCommand },
+            toolName: "terminal",
+            input: { action: "exec", command: firstCommand },
           },
           {
             type: "tool-call",
             toolCallId: "stream_cmd_two",
-            toolName: "run_command",
-            input: { command: secondCommand },
+            toolName: "terminal",
+            input: { action: "exec", command: secondCommand },
           },
           {
             type: "finish",
@@ -6980,7 +6980,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
 
       const followupGateway = startFakeGateway([
-        fakeGatewayToolCall("first_command", "run_command", { command: firstCommand }),
+        fakeGatewayToolCall("first_command", "terminal", { command: firstCommand }),
         fakeGatewayFinalText(firstFinal),
         fakeGatewaySse([
           {
@@ -6991,20 +6991,20 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           {
             type: "tool-call",
             toolCallId: "alpha_command",
-            toolName: "run_command",
-            input: { command: alphaCommand },
+            toolName: "terminal",
+            input: { action: "exec", command: alphaCommand },
           },
           {
             type: "tool-call",
             toolCallId: "seq_command",
-            toolName: "run_command",
-            input: { command: seqCommand },
+            toolName: "terminal",
+            input: { action: "exec", command: seqCommand },
           },
           {
             type: "tool-call",
             toolCallId: "failing_command",
-            toolName: "run_command",
-            input: { command: failingCommand },
+            toolName: "terminal",
+            input: { action: "exec", command: failingCommand },
           },
           {
             type: "finish",
@@ -7044,7 +7044,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.waitForComposer(TIMEOUT);
       await session.sendText(
-        "Use run_command to execute exactly this shell command, then do not explain: printf 'LINE_01\\nLINE_02\\nLINE_03\\nLINE_04\\nLINE_05\\nLINE_06\\nLINE_07\\nLINE_08\\n'; printf 'STDERR_LINE\\n' >&2; sleep 0.4; exit 7",
+        "Use terminal to execute exactly this shell command, then do not explain: printf 'LINE_01\\nLINE_02\\nLINE_03\\nLINE_04\\nLINE_05\\nLINE_06\\nLINE_07\\nLINE_08\\n'; printf 'STDERR_LINE\\n' >&2; sleep 0.4; exit 7",
       );
       await waitForCondition(
         () => followupGateway.requests.length >= 2,

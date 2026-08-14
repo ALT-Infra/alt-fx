@@ -389,7 +389,7 @@ done
     responses.push(batchResponse(batch, config));
   }
   responses.push(fakeGatewayFinalText(`${HISTORY_DONE}\n${TAIL_SENTINEL}`));
-  responses.push(fakeGatewayToolCall("ctrl-o-brutal-live", "run_command", {
+  responses.push(fakeGatewayToolCall("ctrl-o-brutal-live", "terminal", {
     command: "./ctrl-o-live.sh",
   }));
   responses.push(fakeGatewayFinalText(LIVE_DONE));

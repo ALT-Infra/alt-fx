@@ -26,6 +26,7 @@ const session_child_store = @import("../session/session_child_store.zig");
 const result_store = @import("../session/result_store.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
 const command_output_content = @import("../tooling/command_output_content.zig");
+const captured_command = @import("../tooling/captured_command.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
 const session_log = @import("../session/session_log.zig");
 const session_resume_view = @import("../session/session_resume_view.zig");
@@ -2115,7 +2116,8 @@ pub fn Runtime(comptime App: type) type {
             }
             if (activity_kind != .command or
                 tool_name == null or
-                !std.mem.eql(u8, tool_name.?, "run_command"))
+                (!std.mem.eql(u8, tool_name.?, "terminal") and
+                    !std.mem.eql(u8, tool_name.?, "run_command")))
             {
                 discardPendingCancelledCommand(app, terminal.id, "non_command_terminal");
                 return;
@@ -2330,9 +2332,14 @@ pub fn Runtime(comptime App: type) type {
                 pending.discard(app.alloc);
                 return appendHistoryTurnWithOutcome(app, turn, mode, snapshot_file_ownership);
             };
+            const is_command = try captured_command.isToolCall(
+                app.alloc,
+                call.name,
+                call.arguments_json,
+            );
             if (!pending.cancelled or
                 !pending.completed or
-                !std.mem.eql(u8, call.name, "run_command") or
+                !is_command or
                 !std.mem.eql(u8, call.id, pending.lifecycle_id.call_id))
             {
                 pending.discard(app.alloc);
@@ -3552,11 +3559,14 @@ pub fn Runtime(comptime App: type) type {
             if (try writeAnsweredQuestionResult(app, sink, call, result)) return;
             if (try writeCommittedFilePresentation(app, sink, call, result)) return;
 
-            const is_command = std.mem.eql(u8, result.tool_name, "run_command");
+            const is_command = try captured_command.isToolCall(
+                app.alloc,
+                call.name,
+                call.arguments_json,
+            );
             const context_deferred = types.isContextDeferredToolResult(result);
             const deferred = types.isDeferredToolResult(result);
-            const process_ran = is_command and
-                result.command_process_presentation != null;
+            const process_ran = result.command_process_presentation != null;
 
             var action_arena = std.heap.ArenaAllocator.init(app.alloc);
             defer action_arena.deinit();
@@ -7676,7 +7686,7 @@ test "cancelled command presentation survives a persisted session restart" {
                 .outcome = .{ .kind = .cancelled, .summary = "Cancelled slow" },
                 .command_artifact_handle = "fx-command-cancelled.log",
             } },
-            "run_command",
+            "terminal",
             .command,
         );
         Runtime(TestApp).recordCommandOutputComplete(&app, lifecycle_id);
@@ -7686,8 +7696,8 @@ test "cancelled command presentation survives a persisted session restart" {
             .assistant = @constCast("I started it."),
             .tool_call = .{
                 .id = "cancelled-command",
-                .name = "run_command",
-                .arguments_json = "{\"command\":\"slow\"}",
+                .name = "terminal",
+                .arguments_json = "{\"action\":\"exec\",\"command\":\"slow\"}",
             },
         } });
         session_id = try alloc.dupe(u8, app.session_persistence.writable.?.active_id);

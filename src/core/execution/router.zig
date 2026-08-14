@@ -20,11 +20,6 @@ pub fn foregroundResultComparisonLimit(
     return local_executor.foregroundResultComparisonLimit(route, approved_shell_limit);
 }
 
-pub const AuthorizedBackgroundCommand = struct {
-    command_ctx: command_admission.CommandContext,
-    source: command_admission.ShellAuthorizationSource,
-};
-
 pub fn prepareAuthorizedRoute(
     alloc: std.mem.Allocator,
     command_ctx: command_admission.CommandContext,
@@ -48,7 +43,7 @@ pub fn prepareAuthorizedRoute(
             ) catch return error.CommandAdmissionChanged;
             switch (admission) {
                 .direct_read_only => |plan| {
-                    debug_trace.logf("core", "run_command authority=direct_only route=direct_read_only", .{});
+                    debug_trace.logf("core", "terminal.exec authority=direct_only route=direct_read_only", .{});
                     break :blk .{ .direct_read_only = plan };
                 },
                 .approval_required => {
@@ -60,6 +55,14 @@ pub fn prepareAuthorizedRoute(
         .shell_allowed => |shell| blk: {
             if (!shell.fingerprint.matches(command_ctx)) {
                 return error.CommandAuthorityContextMismatch;
+            }
+            if (command_ctx.environment.requiresShellRoute()) {
+                debug_trace.logf("core", "terminal.exec authority=shell_allowed source={s} route=approved_shell environment=user", .{@tagName(shell.source)});
+                break :blk .{ .approved_shell = .{
+                    .command_ctx = command_ctx,
+                    .reason = .dynamic_shell,
+                    .source = shell.source,
+                } };
             }
             const admission = command_effect.plan(
                 alloc,
@@ -75,11 +78,11 @@ pub fn prepareAuthorizedRoute(
             } };
             switch (admission) {
                 .direct_read_only => |plan| {
-                    debug_trace.logf("core", "run_command authority=shell_allowed source={s} route=direct_read_only", .{@tagName(shell.source)});
+                    debug_trace.logf("core", "terminal.exec authority=shell_allowed source={s} route=direct_read_only", .{@tagName(shell.source)});
                     break :blk .{ .direct_read_only = plan };
                 },
                 .approval_required => |reason| {
-                    debug_trace.logf("core", "run_command authority=shell_allowed source={s} route=approved_shell reason={s}", .{ @tagName(shell.source), @tagName(reason) });
+                    debug_trace.logf("core", "terminal.exec authority=shell_allowed source={s} route=approved_shell reason={s}", .{ @tagName(shell.source), @tagName(reason) });
                     break :blk .{ .approved_shell = .{
                         .command_ctx = command_ctx,
                         .reason = reason,
@@ -108,50 +111,6 @@ pub fn executePlannedCommand(
     try validateConfigContext(cfg, command_ctx);
     const route = try prepareAuthorizedRoute(alloc, command_ctx, authority);
     return executePreparedRoute(cfg, alloc, route);
-}
-
-pub fn authorizeBackground(
-    alloc: std.mem.Allocator,
-    command_ctx: command_admission.CommandContext,
-    authority: command_admission.CommandExecutionAuthority,
-) !AuthorizedBackgroundCommand {
-    if (!command_ctx.background) return error.CommandIsNotBackground;
-    if (command_ctx.target_os != builtin.os.tag) return error.CommandTargetMismatch;
-    if (sandbox.resolveBackend(command_ctx.resolved_backend) != command_ctx.resolved_backend) {
-        return error.CommandBackendNotResolved;
-    }
-
-    const shell = switch (authority) {
-        .direct_only => return error.BackgroundRequiresShellAuthority,
-        .shell_allowed => |shell| shell,
-    };
-    if (!shell.fingerprint.matches(command_ctx)) {
-        return error.CommandAuthorityContextMismatch;
-    }
-
-    var admission = command_effect.plan(
-        alloc,
-        command_ctx.command,
-        command_ctx.resolved_cwd,
-        command_ctx.background,
-        command_ctx.resolved_backend,
-        command_ctx.target_os,
-    ) catch return error.BackgroundAuthorizationChanged;
-    defer admission.deinit(alloc);
-    switch (admission) {
-        .direct_read_only => return error.BackgroundAuthorizationChanged,
-        .approval_required => |reason| {
-            if (reason != .background_process) {
-                return error.BackgroundAuthorizationChanged;
-            }
-        },
-    }
-
-    debug_trace.logf("core", "run_command background_authorized=true source={s}", .{@tagName(shell.source)});
-    return .{
-        .command_ctx = command_ctx,
-        .source = shell.source,
-    };
 }
 
 pub fn validateConfigContext(
@@ -229,6 +188,19 @@ test "router keeps direct grammar on the safer route for every shell source" {
     }
 }
 
+test "router never sends explicit user profile through direct execution" {
+    var ctx = context("pwd", false);
+    ctx.environment = .{ .user = "/bin/zsh" };
+    var route = try prepareAuthorizedRoute(
+        std.testing.allocator,
+        ctx,
+        shellAuthority(ctx, .interactive_once),
+    );
+    defer route.deinit(std.testing.allocator);
+    try std.testing.expect(route == .approved_shell);
+    try std.testing.expectEqual(command_effect.ApprovalReason.dynamic_shell, route.approved_shell.reason);
+}
+
 test "router permits approval-bearing grammar only with sourced shell authority" {
     const ctx = context("touch created.txt", false);
     try std.testing.expectError(
@@ -273,34 +245,15 @@ test "router rejects shell fingerprint backend and target mismatches" {
         .max_command_output_bytes = 1024,
     };
     try std.testing.expectError(error.CommandBackendMismatch, validateConfigContext(cfg, ctx));
-}
 
-test "router authorizes background only from matching sourced shell authority" {
-    const ctx = context("pwd", true);
+    var changed_environment = ctx;
+    changed_environment.environment = .{ .clean = "/bin/zsh" };
     try std.testing.expectError(
-        error.BackgroundRequiresShellAuthority,
-        authorizeBackground(std.testing.allocator, ctx, directAuthority(ctx)),
-    );
-
-    const token = try authorizeBackground(
-        std.testing.allocator,
-        ctx,
-        shellAuthority(ctx, .interactive_always),
-    );
-    try std.testing.expectEqualStrings("pwd", token.command_ctx.command);
-    try std.testing.expectEqual(
-        command_admission.ShellAuthorizationSource.interactive_always,
-        token.source,
-    );
-
-    var foreground = ctx;
-    foreground.background = false;
-    try std.testing.expectError(
-        error.CommandIsNotBackground,
-        authorizeBackground(
+        error.CommandAuthorityContextMismatch,
+        prepareAuthorizedRoute(
             std.testing.allocator,
-            foreground,
-            shellAuthority(foreground, .configured_rule),
+            changed_environment,
+            shellAuthority(ctx, .interactive_once),
         ),
     );
 }

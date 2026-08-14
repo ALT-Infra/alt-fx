@@ -176,7 +176,7 @@ const test_tools = [_]tool_dispatch.Tool{
     builtin_tools.open_file,
     builtin_tools.web_fetch,
     builtin_tools.web_search,
-    builtin_tools.run_command,
+    builtin_tools.terminal,
     builtin_tools.skill,
     builtin_tools.install_skill,
     builtin_tools.subagent,
@@ -195,7 +195,7 @@ fn testExecutionAuthorityWithScope(
     call: ToolCall,
     scope: permission_auto_classifier.SandboxScope,
 ) command_admission.ToolExecutionAuthority {
-    if (!std.mem.eql(u8, call.name, "run_command")) return .ordinary;
+    if (!std.mem.eql(u8, call.name, "terminal")) return .ordinary;
     return .{ .run_command = .{ .shell_allowed = .{
         .fingerprint = .{
             .command = call.arguments_json,

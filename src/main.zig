@@ -1492,8 +1492,6 @@ const App = struct {
             .permission_mode = permission_mode,
             .permission_rules = permission_rules,
             .subagent_available = self.session_persistence.subagent_host != null,
-            .terminal_available = self.session_persistence.subagent_host != null and
-                tool_dispatch.ToolCapabilities.for_host(host.current()).terminalAvailable(),
         });
     }
 

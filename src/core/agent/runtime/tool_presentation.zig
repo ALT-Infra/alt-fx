@@ -77,7 +77,11 @@ pub const ProvisionalToolStatuses = struct {
                 .activity_kind = .read,
             } };
         }
-        const spec = registry.lookup(tool_name) orelse return null;
+        const lookup_name = if (std.mem.eql(u8, tool_name, "run_command"))
+            "terminal"
+        else
+            tool_name;
+        const spec = registry.lookup(lookup_name) orelse return null;
         return switch (spec.activity_kind) {
             .ask, .write, .edit => .ineligible,
             else => .{ .eligible = .{
@@ -698,7 +702,9 @@ fn formatProvisionalProgressLabel(
     label_value: ?[]const u8,
 ) ![]const u8 {
     const display_action_label =
-        if (label_value == null and std.mem.eql(u8, tool_name, "run_command"))
+        if (label_value == null and
+        (std.mem.eql(u8, tool_name, "run_command") or
+            std.mem.eql(u8, tool_name, "terminal")))
             "Preparing command"
         else
             action_label;
@@ -1255,7 +1261,7 @@ const test_tools = [_]tool_dispatch.Tool{
     test_builtin_tools.read_file,
     test_builtin_tools.write_file,
     test_builtin_tools.edit_file,
-    test_builtin_tools.run_command,
+    test_builtin_tools.terminal,
     test_builtin_tools.ask_user_question,
 };
 const test_tool_registry = tool_dispatch.Registry{ .tools = test_tools[0..] };
