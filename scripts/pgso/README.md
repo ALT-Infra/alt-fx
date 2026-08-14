@@ -52,7 +52,7 @@ Each training scenario must create a new nonempty raw profile. The driver merges
 
 ## Qualification policy
 
-Startup compares `help`, `--version`, `status --json`, `background --json`, `doctor --json`, and `sessions --json`. Heavy qualification compares file indexing at 100,000 paths, UI activity, and approval transcript, diff, combined, and large-payload workloads.
+Startup compares `help`, `--version`, `status --json`, `background --json`, `doctor --json`, and `sessions --json`. It executes the verified control and candidate from their immutable artifact paths; measurement never replaces `zig-out/bin/fx` between samples. Heavy qualification compares file indexing at 100,000 paths, UI activity, and approval transcript, diff, combined, and large-payload workloads.
 
 Every comparison uses at least 50 measured samples for each artifact. Pair order alternates AB then BA to balance ordering effects. Command failures and timeouts count as failed samples and are never replaced. A candidate fails when either p50 or p95 is more than 10% slower than its matching control. The existing Linux startup workflow remains the authority for the repository's absolute 2 ms command budget.
 

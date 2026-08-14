@@ -4,17 +4,19 @@ import json
 import pathlib
 import tempfile
 import unittest
+from unittest import mock
 
-from scripts.pgso.model import PgsoError, sha256_file
+from scripts.pgso.model import PgsoError
 from scripts.pgso.qualify import (
     BENCHMARK_PLANS,
     STARTUP_COMMANDS,
     EvidenceRecorder,
     compare_samples,
-    install_binary,
     measure_alternating,
+    measure_startup,
     percentile,
 )
+from scripts.pgso.runner import CommandResult
 
 
 class PgsoQualificationTests(unittest.TestCase):
@@ -122,25 +124,48 @@ class PgsoQualificationTests(unittest.TestCase):
         self.assertIsNone(result.comparison)
         self.assertEqual(49, len(result.candidate_samples))
 
-    def test_binary_installation_copies_and_verifies_the_exact_hash(self) -> None:
-        source = self.root / "candidate"
-        destination = self.root / "zig-out" / "bin" / "fx"
-        source.write_bytes(b"candidate-binary")
+    def test_startup_measurement_executes_immutable_artifacts_directly(self) -> None:
+        control = self.root / "control" / "fx"
+        candidate = self.root / "candidate" / "fx"
+        canonical = self.root / "zig-out" / "bin" / "fx"
+        for path, contents in (
+            (control, b"control"),
+            (candidate, b"candidate"),
+            (canonical, b"canonical"),
+        ):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(contents)
 
-        installed = install_binary(source, destination, sha256_file(source))
+        calls: list[tuple[str, ...]] = []
 
-        self.assertEqual(destination, installed)
-        self.assertEqual(sha256_file(source), sha256_file(destination))
+        def fake_run(argv, **_kwargs):
+            command = tuple(str(argument) for argument in argv)
+            calls.append(command)
+            elapsed = 1.0 if command[0] == str(control) else 0.9
+            return CommandResult(command, 0, "output\n", "", elapsed)
 
-    def test_binary_installation_rejects_a_canonical_symlink(self) -> None:
-        source = self.root / "candidate"
-        source.write_bytes(b"candidate-binary")
-        destination = self.root / "zig-out" / "bin" / "fx"
-        destination.parent.mkdir(parents=True)
-        destination.symlink_to(source)
+        with mock.patch("scripts.pgso.qualify.run_checked", side_effect=fake_run):
+            results = measure_startup(
+                repo_root=self.root,
+                control_binary=control,
+                candidate_binary=candidate,
+                output_dir=self.root / "measurements",
+                samples=50,
+                timeout_s=10,
+            )
 
-        with self.assertRaisesRegex(PgsoError, "cannot be a symlink"):
-            install_binary(source, destination, sha256_file(source))
+        self.assertTrue(all(result.passed for result in results))
+        self.assertEqual(b"canonical", canonical.read_bytes())
+        self.assertEqual(
+            [
+                (str(control), "help"),
+                (str(candidate), "help"),
+                (str(candidate), "help"),
+                (str(control), "help"),
+            ],
+            calls[:4],
+        )
+        self.assertNotIn(str(canonical), {command[0] for command in calls})
 
     def test_evidence_recorder_is_fail_closed_and_writes_atomically(self) -> None:
         manifest = self.root / "manifest.json"

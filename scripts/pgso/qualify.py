@@ -5,11 +5,10 @@ import json
 import math
 import os
 import pathlib
-import shutil
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 
-from scripts.pgso.model import PgsoError, sha256_file
+from scripts.pgso.model import PgsoError
 from scripts.pgso.pipeline import (
     ArtifactSpec,
     PipelinePaths,
@@ -343,33 +342,6 @@ def measure_alternating(
     )
 
 
-def install_binary(
-    source: pathlib.Path,
-    destination: pathlib.Path,
-    expected_sha256: str,
-) -> pathlib.Path:
-    if not source.is_file() or source.stat().st_size == 0:
-        raise PgsoError(f"source binary is missing or empty: {source}")
-    actual_source_sha256 = sha256_file(source)
-    if actual_source_sha256 != expected_sha256:
-        raise PgsoError(
-            "source binary hash mismatch: "
-            f"expected {expected_sha256}, got {actual_source_sha256}"
-        )
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.is_symlink():
-        raise PgsoError(f"canonical binary cannot be a symlink: {destination}")
-    if source.resolve() != destination.resolve():
-        shutil.copy2(source, destination)
-    installed_sha256 = sha256_file(destination)
-    if installed_sha256 != expected_sha256:
-        raise PgsoError(
-            "installed binary hash mismatch: "
-            f"expected {expected_sha256}, got {installed_sha256}"
-        )
-    return destination
-
-
 def _external_control_link_argv(
     toolchain: Toolchain,
     object_path: pathlib.Path,
@@ -538,9 +510,6 @@ def measure_startup(
     samples: int,
     timeout_s: float,
 ) -> tuple[MeasurementResult, ...]:
-    canonical = repo_root / "zig-out" / "bin" / "fx"
-    control_sha256 = sha256_file(control_binary)
-    candidate_sha256 = sha256_file(candidate_binary)
     home = output_dir / "home"
     logs = output_dir / "logs"
     home.mkdir(parents=True, exist_ok=True)
@@ -554,10 +523,8 @@ def measure_startup(
             argv: tuple[str, ...],
             sample_index: int,
         ) -> float:
-            expected = control_sha256 if label == "control" else candidate_sha256
-            install_binary(binary, canonical, expected)
             result = run_checked(
-                (str(canonical), *argv),
+                (str(binary), *argv),
                 cwd=repo_root,
                 env=_measurement_environment(home),
                 timeout_s=timeout_s,
