@@ -8,6 +8,7 @@ import pathlib
 import re
 import shutil
 import subprocess
+import tempfile
 from collections.abc import Callable, Mapping, Sequence
 
 from scripts.pgso.model import PgsoError, sha256_file
@@ -35,6 +36,7 @@ ISOLATED_ENVIRONMENT_KEYS = (
     "LLVM_PROFILE_FILE",
     "TMUX",
     "TMUX_PANE",
+    "TMUX_TMPDIR",
 )
 
 
@@ -313,7 +315,18 @@ def _install_training_binary(corpus: Corpus, binary: pathlib.Path) -> pathlib.Pa
     return canonical
 
 
-def _cleanup_tmux(environment: Mapping[str, str]) -> None:
+def _cleanup_tmux(
+    environment: Mapping[str, str],
+    tmux_dir: pathlib.Path,
+) -> None:
+    if (
+        tmux_dir.parent != pathlib.Path("/tmp")
+        or not tmux_dir.name.startswith("fxp-tmux-")
+        or tmux_dir.is_symlink()
+    ):
+        raise PgsoError(f"refusing to remove unowned tmux directory: {tmux_dir}")
+
+    cleanup_failure: tuple[str, BaseException] | None = None
     try:
         subprocess.run(
             ("tmux", "kill-server"),
@@ -324,9 +337,31 @@ def _cleanup_tmux(environment: Mapping[str, str]) -> None:
             check=False,
         )
     except FileNotFoundError as error:
-        raise PgsoError("tmux is required by the corpus scenario") from error
+        cleanup_failure = ("tmux is required by the corpus scenario", error)
     except subprocess.TimeoutExpired as error:
-        raise PgsoError("tmux cleanup timed out") from error
+        cleanup_failure = ("tmux cleanup timed out", error)
+
+    removal_failure: OSError | None = None
+    try:
+        shutil.rmtree(tmux_dir)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        removal_failure = error
+
+    if cleanup_failure is not None:
+        message, error = cleanup_failure
+        raise PgsoError(message) from error
+    if removal_failure is not None:
+        raise PgsoError(
+            f"could not remove tmux directory: {tmux_dir}"
+        ) from removal_failure
+
+
+def _new_tmux_dir() -> pathlib.Path:
+    tmux_dir = pathlib.Path(tempfile.mkdtemp(prefix="fxp-tmux-", dir="/tmp"))
+    tmux_dir.chmod(0o700)
+    return tmux_dir
 
 
 def _scenario_environment(runtime_home: pathlib.Path) -> dict[str, str]:
@@ -406,9 +441,6 @@ def run_corpus(
     log_dir.mkdir(parents=True, exist_ok=True)
     runtime_home = profile_dir.parent / "home"
     runtime_home.mkdir(parents=True, exist_ok=True)
-    tmux_root = profile_dir.parent / "tmux"
-    tmux_root.mkdir(parents=True, exist_ok=True)
-
     results: list[ScenarioResult] = []
     merged_raw_profiles = 0
     for scenario in corpus.scenarios:
@@ -438,8 +470,7 @@ def run_corpus(
             profile_dir / f"{scenario.name}-%m-%p-%c.profraw"
         )
         if scenario.requires_tmux:
-            tmux_dir = tmux_root / scenario.name
-            tmux_dir.mkdir(parents=True, exist_ok=True)
+            tmux_dir = _new_tmux_dir()
             environment["TMUX_TMPDIR"] = str(tmux_dir)
 
         argv = _scenario_argv(scenario, canonical, bun)
@@ -459,7 +490,7 @@ def run_corpus(
 
         if scenario.requires_tmux:
             try:
-                _cleanup_tmux(environment)
+                _cleanup_tmux(environment, tmux_dir)
             except Exception as error:
                 if scenario_error is None:
                     scenario_error = error
@@ -548,9 +579,6 @@ def run_behavior_corpus(
     log_dir.mkdir(parents=True, exist_ok=True)
     runtime_home = output_dir / "home"
     runtime_home.mkdir(parents=True, exist_ok=True)
-    tmux_root = output_dir / "tmux"
-    tmux_root.mkdir(parents=True, exist_ok=True)
-
     results: list[ScenarioResult] = []
     for scenario in corpus.scenarios:
         if scenario.skip_reason is not None:
@@ -576,8 +604,7 @@ def run_behavior_corpus(
         environment.update(dict(scenario.env_set))
         environment["HOME"] = str(scenario_home)
         if scenario.requires_tmux:
-            tmux_dir = tmux_root / scenario.name
-            tmux_dir.mkdir(parents=True, exist_ok=True)
+            tmux_dir = _new_tmux_dir()
             environment["TMUX_TMPDIR"] = str(tmux_dir)
 
         argv = _scenario_argv(scenario, canonical, bun)
@@ -596,7 +623,7 @@ def run_behavior_corpus(
 
         if scenario.requires_tmux:
             try:
-                _cleanup_tmux(environment)
+                _cleanup_tmux(environment, tmux_dir)
             except Exception as error:
                 if scenario_error is None:
                     scenario_error = error

@@ -189,7 +189,13 @@ class PgsoCorpusTests(unittest.TestCase):
             load_corpus(self.write_manifest(payload), repo_root=self.root)
 
     def test_load_rejects_environment_keys_owned_by_the_runner(self) -> None:
-        for key in ("HOME", "LLVM_PROFILE_FILE", "TMUX", "AI_GATEWAY_API_KEY"):
+        for key in (
+            "HOME",
+            "LLVM_PROFILE_FILE",
+            "TMUX",
+            "TMUX_TMPDIR",
+            "AI_GATEWAY_API_KEY",
+        ):
             with self.subTest(key=key):
                 payload = self.manifest()
                 scenarios = payload["scenarios"]
@@ -372,7 +378,7 @@ class PgsoCorpusTests(unittest.TestCase):
         fake_bin.mkdir()
         tmux = fake_bin / "tmux"
         tmux.write_text(
-            "#!/bin/sh\nprintf cleaned > \"$PGSO_TMUX_MARKER\"\n"
+            "#!/bin/sh\nprintf '%s' \"$TMUX_TMPDIR\" > \"$PGSO_TMUX_MARKER\"\n"
         )
         tmux.chmod(0o755)
         scenario = dataclasses_replace_env(
@@ -388,7 +394,11 @@ class PgsoCorpusTests(unittest.TestCase):
         ):
             self.run_fixture(corpus)
 
-        self.assertEqual("cleaned", marker.read_text())
+        tmux_tmp = pathlib.Path(marker.read_text())
+        self.assertEqual(pathlib.Path("/tmp"), tmux_tmp.parent)
+        self.assertTrue(tmux_tmp.name.startswith("fxp-tmux-"))
+        self.assertLess(len(f"{tmux_tmp}/tmux-501/default".encode()), 104)
+        self.assertFalse(tmux_tmp.exists())
 
     def test_keychain_access_is_scoped_to_the_declared_scenario_home(self) -> None:
         host_home = self.root / "host-home"
