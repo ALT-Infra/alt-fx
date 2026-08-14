@@ -97,6 +97,18 @@ function normalizeVolatileTokenRows(grid: string[]): string[] {
   );
 }
 
+function persistedCommunicationText(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (!value || typeof value !== "object") {
+    throw new Error("persisted communication text is not encoded text");
+  }
+  const wire = value as { encoding?: unknown; data?: unknown };
+  if (wire.encoding !== "base64" || typeof wire.data !== "string") {
+    throw new Error("persisted communication text has an unknown encoding");
+  }
+  return Buffer.from(wire.data, "base64").toString("utf8");
+}
+
 test("volatile token rows normalize before restored subagent comparison", () => {
   expect(normalizeVolatileTokenRows(["  (↑7 ↓5)"])).toEqual(["<status>"]);
   expect(normalizeVolatileTokenRows(["  0s (↑7 ↓5)"])).toEqual(["<status>"]);
@@ -1555,9 +1567,12 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           const path = join(sessionRoot, id, "subagent", "communication.json");
           if (!existsSync(path)) return [];
           const record = JSON.parse(readFileSync(path, "utf8")) as {
-            ledger: { authority_grants: Array<{ tool_name: string; target_path: string }> };
+            ledger: { authority_grants: Array<{ tool_name: string; target_path: unknown }> };
           };
-          return record.ledger.authority_grants;
+          return record.ledger.authority_grants.map((grant) => ({
+            tool_name: grant.tool_name,
+            target_path: persistedCommunicationText(grant.target_path),
+          }));
         });
         expect(authorityGrants.map((grant) => grant.tool_name)).toEqual([
           "edit",
