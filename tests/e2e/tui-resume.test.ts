@@ -2796,7 +2796,7 @@ test.skipIf(!tmuxAvailable())(
       fakeGatewaySerializedToolCall(
         "ctrl-o-spacing-command",
         "terminal",
-        JSON.stringify({ command }),
+        JSON.stringify({ action: "exec", command }),
         beforeMarker,
       ),
       fakeGatewayFinalText(afterMarker),
@@ -3106,6 +3106,7 @@ test.skipIf(!tmuxAvailable())(
           toolCallId: "ctrl-o-handoff-command",
           toolName: "terminal",
           input: {
+            action: "exec",
             command: "sh -c 'sleep 5; printf \"CTRL_O_HANDOFF_READY\\n\"'",
           },
         },
@@ -3339,6 +3340,7 @@ test.skipIf(!tmuxAvailable())(
           toolCallId: "ctrl-o-handoff-first",
           toolName: "terminal",
           input: {
+            action: "exec",
             command: "sh -c 'touch ctrl-o-handoff-first; printf \"CTRL_O_HANDOFF_FIRST_RUNNING\\n\"; sleep 1; printf \"CTRL_O_HANDOFF_FIRST_DONE\\n\"'",
           },
         },
@@ -3347,6 +3349,7 @@ test.skipIf(!tmuxAvailable())(
           toolCallId: "ctrl-o-handoff-second",
           toolName: "terminal",
           input: {
+            action: "exec",
             command: "touch ctrl-o-handoff-second && printf 'CTRL_O_HANDOFF_SECOND_DONE\\n'",
           },
         },
@@ -6170,7 +6173,7 @@ while :; do sleep 1; done
       fakeGatewaySerializedToolCall(
         "resume-cancelled-command",
         "terminal",
-        JSON.stringify({ command: "./resume-cancel.sh" }),
+        JSON.stringify({ action: "exec", command: "./resume-cancel.sh" }),
         assistantMarker,
       ),
       fakeGatewayFinalText(followUpMarker),

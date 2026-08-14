@@ -5053,6 +5053,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           "launch-history-command",
           "terminal",
           JSON.stringify({
+            action: "exec",
             command:
               "for i in $(seq -w 1 27); do printf 'docs/source-%s.md\\tWalter (1)\\n' \"$i\"; done",
           }),
