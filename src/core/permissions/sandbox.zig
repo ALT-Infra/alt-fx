@@ -2261,10 +2261,12 @@ fn collectOutput(
     const started_ms = BackendControl.init(cfg).started_ms;
     var signal_started_ms: ?i64 = null;
     var force_kill_sent = false;
+    var streams_finished = false;
 
     while (true) {
         try updateTerminationSignal(
             child,
+            process_group_id,
             cfg,
             started_ms,
             source,
@@ -2275,14 +2277,34 @@ fn collectOutput(
             if (try pollProcessLeader(child)) |term| {
                 leader_term.* = term;
                 if (process_group_id) |pid| {
-                    terminateRemainingProcessGroup(pid);
-                    debug_trace.logf(
-                        "core",
-                        "captured command leader completed; remaining process group terminated",
-                        .{},
-                    );
+                    if (source.* == .natural) {
+                        terminateRemainingProcessGroup(pid);
+                        debug_trace.logf(
+                            "core",
+                            "captured command leader completed; remaining process group terminated",
+                            .{},
+                        );
+                    } else {
+                        debug_trace.logf(
+                            "core",
+                            "captured command leader completed during {s}; remaining process group retains termination grace",
+                            .{@tagName(source.*)},
+                        );
+                    }
                 }
             }
+        }
+
+        if (streams_finished) {
+            if (source.* == .natural or
+                signal_started_ms == null or
+                force_kill_sent or
+                !remainingProcessGroupAlive(process_group_id))
+            {
+                break;
+            }
+            io_mod.sleep(10 * std.time.ns_per_ms);
+            continue;
         }
 
         const keep_reading = if (multi_reader.fill(4096, .{ .duration = .{ .raw = .{ .nanoseconds = 100_000_000 }, .clock = .awake } }))
@@ -2308,7 +2330,16 @@ fn collectOutput(
             stderr_r.tossBuffered();
         }
 
-        if (!keep_reading) break;
+        if (!keep_reading) {
+            streams_finished = true;
+            if (source.* == .natural or
+                signal_started_ms == null or
+                force_kill_sent or
+                !remainingProcessGroupAlive(process_group_id))
+            {
+                break;
+            }
+        }
     }
 
     if (launch_failure_probe) |probe| {
@@ -2415,6 +2446,7 @@ fn mapTerminationError(
 
 fn updateTerminationSignal(
     child: *std.process.Child,
+    process_group_id: ?std.posix.pid_t,
     cfg: Config,
     started_ms: i64,
     source: *TerminationSource,
@@ -2425,7 +2457,7 @@ fn updateTerminationSignal(
     if (signal_started_ms.* == null) {
         if (cancelRequested(cfg.cancel_flag)) {
             source.* = .cancelled;
-            try signalChild(child, false);
+            try signalChild(child, process_group_id, false);
             debug_trace.logf("core", "command termination requested source=cancelled", .{});
             signal_started_ms.* = now_ms;
         }
@@ -2435,7 +2467,7 @@ fn updateTerminationSignal(
                     // Timeout uses the same signal path as cancellation but
                     // records a distinct source for the post-wait mapping.
                     source.* = .timed_out;
-                    try signalChild(child, false);
+                    try signalChild(child, process_group_id, false);
                     debug_trace.logf("core", "command termination requested source=timeout", .{});
                     signal_started_ms.* = now_ms;
                 }
@@ -2445,7 +2477,7 @@ fn updateTerminationSignal(
 
     if (signal_started_ms.*) |sent_ms| {
         if (!force_kill_sent.* and now_ms - sent_ms >= 800) {
-            try signalChild(child, true);
+            try signalChild(child, process_group_id, true);
             debug_trace.logf("core", "command force-killed after termination grace expired", .{});
             force_kill_sent.* = true;
         }
@@ -2465,12 +2497,17 @@ fn emitOutputChunk(
     try callback(ctx, lifecycle_id, stream, chunk);
 }
 
-fn signalChild(child: *std.process.Child, force: bool) !void {
+fn signalChild(
+    child: *std.process.Child,
+    process_group_id: ?std.posix.pid_t,
+    force: bool,
+) !void {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
         child.kill(io_mod.getIo());
         return;
     }
 
+    if (process_group_id) |pid| return signalProcessGroup(pid, force);
     const pid = child.id orelse return;
     return signalProcessGroup(pid, force);
 }
@@ -2490,6 +2527,16 @@ fn terminateRemainingProcessGroup(pid: std.posix.pid_t) void {
             .{@errorName(err)},
         );
     };
+}
+
+fn remainingProcessGroupAlive(process_group_id: ?std.posix.pid_t) bool {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return false;
+    const pid = process_group_id orelse return false;
+    std.posix.kill(-pid, @enumFromInt(0)) catch |err| return switch (err) {
+        error.ProcessNotFound => false,
+        else => true,
+    };
+    return true;
 }
 
 fn cleanupChild(child: *std.process.Child) void {
