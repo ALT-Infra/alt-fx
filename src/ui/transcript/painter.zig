@@ -6,7 +6,7 @@
 //   replaceable_last_line, replaceable_row, replaceable_start,
 //   last_rendered_cols, last_paint_bottom_reserved_rows,
 //   last_visible_transcript_*, last_viewport_selection,
-//   paint_trace, has_painted_transcript,
+//   paint_trace, has_painted_transcript, resize_bottom_anchor_pending,
 //   footer_viewport, full_transcript, folded_command_blocks
 // - methods: ensurePaintReservation, beginPaint, endPaint,
 //   resetCursorTracking, advanceCursor,
@@ -1935,6 +1935,10 @@ fn prepareTranscriptSurfacePaintInternal(
                     stable.flow_unchanged and
                     stable.visual_offset == stable.history_visual_offset and
                     source.tail_kind != .assistant_turn;
+                const resize_anchored_cancel_growth =
+                    !stable.flow_unchanged and
+                    self.resize_bottom_anchor_pending and
+                    source.tail_kind == .cancel_notice;
                 const repaint_required = self.render_requests.attemptHasInvalidations();
                 const invalidation_allows_preservation =
                     !repaint_required or
@@ -1962,6 +1966,15 @@ fn prepareTranscriptSurfacePaintInternal(
                         "transcript_projection_history_floor source_offset={d} natural_offset={d}",
                         .{ stable.history_visual_offset, next_offset },
                     );
+                }
+                if (resize_anchored_cancel_growth and
+                    rows_budget > 0 and
+                    rows_budget < visible_rows)
+                {
+                    top_row += rows_budget;
+                    visible_rows -= rows_budget;
+                    prepared.projection_area.top = top_row;
+                    viewport_selection_snapshot.top_row = top_row;
                 }
                 if (invalidation_allows_preservation and
                     (!allow_projection_rebase or
