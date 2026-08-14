@@ -52,6 +52,20 @@ jobs:
           "$llvm_bin/opt" --version | grep -F "version 21.1.8"
           tmux -V
 
+      - name: Install pinned Hyperfine
+        run: |
+          archive="$RUNNER_TEMP/hyperfine-v1.20.0-aarch64-apple-darwin.tar.gz"
+          curl -fsSL \
+            https://github.com/sharkdp/hyperfine/releases/download/v1.20.0/hyperfine-v1.20.0-aarch64-apple-darwin.tar.gz \
+            -o "$archive"
+          printf '%s  %s\n' \
+            8ee7067016620447c9d2d6234ec9a4680f958b7ad983549b56334668f63075b5 \
+            "$archive" | shasum -a 256 -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+          hyperfine_bin="$RUNNER_TEMP/hyperfine-v1.20.0-aarch64-apple-darwin/hyperfine"
+          test "$("$hyperfine_bin" --version)" = "hyperfine 1.20.0"
+          echo "PGSO_HYPERFINE=$hyperfine_bin" >> "$GITHUB_ENV"
+
       - name: Install E2E dependencies
         run: bun install --frozen-lockfile
         working-directory: tests/e2e
@@ -67,6 +81,7 @@ jobs:
             --target aarch64-macos \
             --update-channel stable \
             --bun "$(which bun)" \
+            --hyperfine "$PGSO_HYPERFINE" \
             --samples 50
 
       - name: Upload candidate evidence

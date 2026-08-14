@@ -13,6 +13,7 @@ The driver fails unless all of these match exactly:
 - Zig `0.16.0`
 - LLVM `21.1.8` tools and profile runtime from one configured LLVM root
 - Bun `1.3.14`
+- Hyperfine `1.20.0`
 - the selected source commit, update channel, bitcode hash, corpus hash, and profile-generation flags
 
 The pipeline does not use the host CPU as the release target. The final candidate must match the control's architecture and minimum macOS version, contain a valid code signature, contain no profile sections or profile-runtime dependency, and produce no profile output when executed.
@@ -52,9 +53,9 @@ Each training scenario must create a new nonempty raw profile. The driver merges
 
 ## Qualification policy
 
-Startup compares `help`, `--version`, `status --json`, `background --json`, `doctor --json`, and `sessions --json`. It executes the verified control and candidate from their immutable artifact paths; measurement never replaces `zig-out/bin/fx` between samples. Heavy qualification compares file indexing at 100,000 paths, UI activity, and approval transcript, diff, combined, and large-payload workloads.
+Startup compares `help`, `--version`, `status --json`, `background --json`, `doctor --json`, and `sessions --json`. It first executes each verified immutable artifact once to require successful output and empty stderr. Timing then uses pinned Hyperfine with no intermediate shell, ten warmups per artifact in each round, at least 100 measured samples per artifact, and balanced control-then-candidate and candidate-then-control rounds. No per-sample Python process management or evidence-file write is included in the timed boundary, and measurement never replaces `zig-out/bin/fx`. Heavy qualification compares file indexing at 100,000 paths, UI activity, and approval transcript, diff, combined, and large-payload workloads.
 
-Every comparison uses at least 50 measured samples for each artifact. Pair order alternates AB then BA to balance ordering effects. Command failures and timeouts count as failed samples and are never replaced. A candidate fails when either p50 or p95 is more than 10% slower than its matching control. The existing Linux startup workflow remains the authority for the repository's absolute 2 ms command budget.
+Heavy comparisons use at least 50 measured samples for each artifact and alternate pair order AB then BA. Command failures and timeouts fail qualification and are never replaced. A candidate fails when either p50 or p95 is more than 10% slower than its matching control. The existing Linux startup workflow remains the authority for the repository's absolute 2 ms command budget.
 
 ## Output and failure behavior
 

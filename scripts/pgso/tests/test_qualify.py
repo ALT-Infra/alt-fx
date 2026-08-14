@@ -11,6 +11,7 @@ from scripts.pgso.qualify import (
     BENCHMARK_PLANS,
     STARTUP_COMMANDS,
     EvidenceRecorder,
+    _read_hyperfine_samples,
     compare_samples,
     measure_alternating,
     measure_startup,
@@ -28,6 +29,50 @@ class PgsoQualificationTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
+
+    def fake_startup_runner(
+        self,
+        *,
+        hyperfine: pathlib.Path,
+        control: pathlib.Path,
+        candidate: pathlib.Path,
+    ):
+        calls: list[tuple[str, ...]] = []
+
+        def fake_run(argv, **_kwargs):
+            command = tuple(str(argument) for argument in argv)
+            calls.append(command)
+            if command[0] != str(hyperfine):
+                return CommandResult(command, 0, "output\n", "", 0.01)
+
+            export_path = pathlib.Path(
+                command[command.index("--export-json") + 1]
+            )
+            runs = int(command[command.index("--runs") + 1])
+            results = []
+            for index, argument in enumerate(command):
+                if argument != "--command-name":
+                    continue
+                label = command[index + 1]
+                binary = command[index + 2].split(" ", 1)[0]
+                if label == "control":
+                    self.assertEqual(str(control), binary)
+                    times = [1.0] * runs
+                else:
+                    self.assertEqual("candidate", label)
+                    self.assertEqual(str(candidate), binary)
+                    times = [0.9] * runs
+                results.append({"command": label, "times": times})
+            export_path.parent.mkdir(parents=True, exist_ok=True)
+            export_path.write_text(json.dumps({"results": results}))
+            return CommandResult(command, 0, "", "", 0.01)
+
+        return calls, fake_run
+
+    def write_hyperfine_export(self, results) -> pathlib.Path:
+        path = self.root / "hyperfine.json"
+        path.write_text(json.dumps({"results": results}))
+        return path
 
     def test_percentile_uses_nearest_rank(self) -> None:
         samples = tuple(float(value) for value in range(1, 101))
@@ -127,28 +172,29 @@ class PgsoQualificationTests(unittest.TestCase):
     def test_startup_measurement_executes_immutable_artifacts_directly(self) -> None:
         control = self.root / "control" / "fx"
         candidate = self.root / "candidate" / "fx"
+        hyperfine = self.root / "tools" / "hyperfine"
         canonical = self.root / "zig-out" / "bin" / "fx"
         for path, contents in (
             (control, b"control"),
             (candidate, b"candidate"),
+            (hyperfine, b"hyperfine"),
             (canonical, b"canonical"),
         ):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(contents)
 
-        calls: list[tuple[str, ...]] = []
-
-        def fake_run(argv, **_kwargs):
-            command = tuple(str(argument) for argument in argv)
-            calls.append(command)
-            elapsed = 1.0 if command[0] == str(control) else 0.9
-            return CommandResult(command, 0, "output\n", "", elapsed)
+        calls, fake_run = self.fake_startup_runner(
+            hyperfine=hyperfine,
+            control=control,
+            candidate=candidate,
+        )
 
         with mock.patch("scripts.pgso.qualify.run_checked", side_effect=fake_run):
             results = measure_startup(
                 repo_root=self.root,
                 control_binary=control,
                 candidate_binary=candidate,
+                hyperfine_binary=hyperfine,
                 output_dir=self.root / "measurements",
                 samples=50,
                 timeout_s=10,
@@ -160,12 +206,137 @@ class PgsoQualificationTests(unittest.TestCase):
             [
                 (str(control), "help"),
                 (str(candidate), "help"),
-                (str(candidate), "help"),
-                (str(control), "help"),
             ],
-            calls[:4],
+            calls[:2],
         )
         self.assertNotIn(str(canonical), {command[0] for command in calls})
+
+    def test_startup_measurement_balances_warmed_hyperfine_rounds(self) -> None:
+        control = self.root / "control" / "fx"
+        candidate = self.root / "candidate" / "fx"
+        hyperfine = self.root / "tools" / "hyperfine"
+        for path in (control, candidate, hyperfine):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"executable")
+
+        calls, fake_run = self.fake_startup_runner(
+            hyperfine=hyperfine,
+            control=control,
+            candidate=candidate,
+        )
+        with mock.patch("scripts.pgso.qualify.run_checked", side_effect=fake_run):
+            results = measure_startup(
+                repo_root=self.root,
+                control_binary=control,
+                candidate_binary=candidate,
+                hyperfine_binary=hyperfine,
+                output_dir=self.root / "measurements",
+                samples=50,
+                timeout_s=10,
+            )
+
+        hyperfine_calls = [
+            command for command in calls if command[0] == str(hyperfine)
+        ]
+        self.assertEqual(12, len(hyperfine_calls))
+        for first, second in zip(hyperfine_calls[::2], hyperfine_calls[1::2]):
+            self.assertIn("--shell=none", first)
+            self.assertEqual("10", first[first.index("--warmup") + 1])
+            self.assertEqual("50", first[first.index("--runs") + 1])
+            self.assertEqual(
+                ["control", "candidate"],
+                [
+                    first[index + 1]
+                    for index, value in enumerate(first)
+                    if value == "--command-name"
+                ],
+            )
+            self.assertEqual(
+                ["candidate", "control"],
+                [
+                    second[index + 1]
+                    for index, value in enumerate(second)
+                    if value == "--command-name"
+                ],
+            )
+        self.assertTrue(all(result.requested_samples == 100 for result in results))
+        self.assertTrue(all(len(result.control_samples) == 100 for result in results))
+        self.assertTrue(all(len(result.candidate_samples) == 100 for result in results))
+
+    def test_startup_measurement_rejects_a_truncated_hyperfine_round(self) -> None:
+        path = self.write_hyperfine_export(
+            [
+                {"command": "control", "times": [1.0] * 50},
+                {"command": "candidate", "times": [0.9] * 49},
+            ]
+        )
+
+        with self.assertRaisesRegex(
+            PgsoError,
+            "Hyperfine round returned 49 candidate samples; expected 50",
+        ):
+            _read_hyperfine_samples(path, expected_samples=50)
+
+    def test_startup_measurement_rejects_duplicate_hyperfine_labels(self) -> None:
+        path = self.write_hyperfine_export(
+            [
+                {"command": "control", "times": [1.0] * 50},
+                {"command": "control", "times": [0.9] * 50},
+            ]
+        )
+
+        with self.assertRaisesRegex(
+            PgsoError,
+            "Hyperfine round contains duplicate label: control",
+        ):
+            _read_hyperfine_samples(path, expected_samples=50)
+
+    def test_startup_measurement_rejects_nonpositive_hyperfine_time(self) -> None:
+        path = self.write_hyperfine_export(
+            [
+                {"command": "control", "times": [0.0] + [1.0] * 49},
+                {"command": "candidate", "times": [0.9] * 50},
+            ]
+        )
+
+        with self.assertRaisesRegex(
+            PgsoError,
+            "Hyperfine control sample 0 must be finite and positive",
+        ):
+            _read_hyperfine_samples(path, expected_samples=50)
+
+    def test_startup_measurement_preserves_hyperfine_diagnostics(self) -> None:
+        control = self.root / "control" / "fx"
+        candidate = self.root / "candidate" / "fx"
+        hyperfine = self.root / "tools" / "hyperfine"
+        for path in (control, candidate, hyperfine):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"executable")
+
+        _, base_runner = self.fake_startup_runner(
+            hyperfine=hyperfine,
+            control=control,
+            candidate=candidate,
+        )
+
+        def fake_run(argv, **kwargs):
+            command = tuple(str(argument) for argument in argv)
+            if command[0] == str(hyperfine):
+                self.assertFalse(kwargs["require_empty_stderr"])
+            return base_runner(argv, **kwargs)
+
+        with mock.patch("scripts.pgso.qualify.run_checked", side_effect=fake_run):
+            results = measure_startup(
+                repo_root=self.root,
+                control_binary=control,
+                candidate_binary=candidate,
+                hyperfine_binary=hyperfine,
+                output_dir=self.root / "measurements",
+                samples=50,
+                timeout_s=10,
+            )
+
+        self.assertTrue(all(result.passed for result in results))
 
     def test_evidence_recorder_is_fail_closed_and_writes_atomically(self) -> None:
         manifest = self.root / "manifest.json"

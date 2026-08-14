@@ -41,6 +41,7 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 DEFAULT_CORPUS = REPO_ROOT / "scripts" / "pgso" / "corpus.json"
 MUTATING_COMMANDS = ("build", "train", "qualify", "all")
 REQUIRED_BUN_VERSION = "1.3.14"
+REQUIRED_HYPERFINE_VERSION = "1.20.0"
 
 
 def ensure_fresh_output(path: pathlib.Path) -> pathlib.Path:
@@ -91,6 +92,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--timeout-seconds", type=float, default=1800)
     parser.add_argument("--zig", default="zig")
     parser.add_argument("--bun", default="bun")
+    parser.add_argument("--hyperfine", default="hyperfine")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -181,6 +183,7 @@ def _configuration(arguments: argparse.Namespace) -> dict[str, object]:
         "timeout_seconds": arguments.timeout_seconds,
         "zig": arguments.zig,
         "bun": arguments.bun,
+        "hyperfine": arguments.hyperfine,
     }
 
 
@@ -197,7 +200,7 @@ def _resolve_runtime_executable(command: str, label: str) -> pathlib.Path:
 def _runtime_versions(
     arguments: argparse.Namespace,
     paths: PipelinePaths,
-) -> tuple[pathlib.Path, dict[str, str]]:
+) -> tuple[pathlib.Path, pathlib.Path, dict[str, str]]:
     bun = _resolve_runtime_executable(arguments.bun, "Bun")
     bun_result = run_checked(
         (str(bun), "--version"),
@@ -212,6 +215,23 @@ def _runtime_versions(
         raise PgsoError(
             f"PGSO requires Bun {REQUIRED_BUN_VERSION}; "
             f"bun reported {bun_version}"
+        )
+
+    hyperfine = _resolve_runtime_executable(arguments.hyperfine, "Hyperfine")
+    hyperfine_result = run_checked(
+        (str(hyperfine), "--version"),
+        cwd=REPO_ROOT,
+        env=os.environ.copy(),
+        timeout_s=30,
+        log_path=paths.logs / "hyperfine-version.json",
+        require_empty_stderr=True,
+    )
+    hyperfine_version = hyperfine_result.stdout.strip()
+    expected_hyperfine = f"hyperfine {REQUIRED_HYPERFINE_VERSION}"
+    if hyperfine_version != expected_hyperfine:
+        raise PgsoError(
+            f"PGSO requires Hyperfine {REQUIRED_HYPERFINE_VERSION}; "
+            f"hyperfine reported {hyperfine_version}"
         )
 
     tmux = _resolve_runtime_executable("tmux", "tmux")
@@ -231,9 +251,11 @@ def _runtime_versions(
         log_path=paths.logs / "macos-version.json",
         require_empty_stderr=True,
     )
-    return bun, {
+    return bun, hyperfine, {
         "bun_path": str(bun),
         "bun_version": bun_version,
+        "hyperfine_path": str(hyperfine),
+        "hyperfine_version": hyperfine_version,
         "tmux_path": str(tmux),
         "tmux_version": tmux_result.stdout.strip(),
         "macos_version": macos_result.stdout.strip(),
@@ -256,7 +278,7 @@ def run_command(arguments: argparse.Namespace) -> pathlib.Path:
             arguments.llvm_bin,
             arguments.target,
         )
-        bun, runtime_versions = _runtime_versions(arguments, paths)
+        bun, hyperfine, runtime_versions = _runtime_versions(arguments, paths)
         corpus = load_corpus(arguments.corpus, repo_root=REPO_ROOT)
         source_sha = _git_output(
             ("rev-parse", "HEAD"),
@@ -461,6 +483,7 @@ def run_command(arguments: argparse.Namespace) -> pathlib.Path:
             repo_root=REPO_ROOT,
             control_binary=control,
             candidate_binary=paths.candidate_binary,
+            hyperfine_binary=hyperfine,
             output_dir=paths.root / "measurements" / "startup",
             samples=arguments.samples,
             timeout_s=arguments.timeout_seconds,

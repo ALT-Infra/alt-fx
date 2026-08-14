@@ -47,6 +47,7 @@ class PgsoCliTests(unittest.TestCase):
         self.assertGreater(arguments.timeout_seconds, 0)
         self.assertTrue(str(arguments.corpus).endswith("scripts/pgso/corpus.json"))
         self.assertEqual("bun", arguments.bun)
+        self.assertEqual("hyperfine", arguments.hyperfine)
 
     def test_every_mutating_command_requires_toolchain_and_output(self) -> None:
         for command in ("build", "train", "qualify", "all"):
@@ -152,6 +153,39 @@ class PgsoCliTests(unittest.TestCase):
             return_value=result,
         ):
             with self.assertRaisesRegex(PgsoError, "requires Bun 1.3.14"):
+                _runtime_versions(arguments, paths)
+
+    def test_runtime_validation_rejects_the_wrong_hyperfine_version(self) -> None:
+        arguments = parse_args(self.required_arguments())
+        paths = PipelinePaths.create(self.root / "runtime-output")
+        executables = {
+            name: self.root / name for name in ("bun", "hyperfine", "tmux")
+        }
+        for executable in executables.values():
+            executable.write_bytes(b"fake")
+            executable.chmod(0o755)
+
+        def resolve(_command, label):
+            return executables[label.lower()]
+
+        def fake_run(argv, **_kwargs):
+            command = tuple(str(argument) for argument in argv)
+            if command[0] == str(executables["bun"]):
+                stdout = "1.3.14\n"
+            elif command[0] == str(executables["hyperfine"]):
+                stdout = "hyperfine 1.19.0\n"
+            else:
+                stdout = "tmux 3.6a\n"
+            return CommandResult(command, 0, stdout, "", 0.01)
+
+        with mock.patch(
+            "scripts.pgso.__main__._resolve_runtime_executable",
+            side_effect=resolve,
+        ), mock.patch(
+            "scripts.pgso.__main__.run_checked",
+            side_effect=fake_run,
+        ):
+            with self.assertRaisesRegex(PgsoError, "requires Hyperfine 1.20.0"):
                 _runtime_versions(arguments, paths)
 
 

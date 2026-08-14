@@ -5,6 +5,7 @@ import json
 import math
 import os
 import pathlib
+import shlex
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 
@@ -26,6 +27,8 @@ from scripts.pgso.toolchain import Toolchain
 
 
 MINIMUM_SAMPLES = 50
+STARTUP_MINIMUM_SAMPLES = 100
+STARTUP_WARMUP_RUNS = 10
 MAXIMUM_REGRESSION = 0.10
 REQUIRED_EVIDENCE = (
     "identity",
@@ -277,6 +280,55 @@ def compare_samples(
     )
 
 
+def _read_hyperfine_samples(
+    path: pathlib.Path,
+    *,
+    expected_samples: int,
+) -> dict[str, tuple[float, ...]]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise PgsoError(f"could not read Hyperfine export: {path}: {error}") from error
+    if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
+        raise PgsoError("Hyperfine export is missing its results list")
+
+    parsed: dict[str, tuple[float, ...]] = {}
+    for entry in payload["results"]:
+        if not isinstance(entry, dict):
+            raise PgsoError("Hyperfine result must be an object")
+        label = entry.get("command")
+        if label not in ("control", "candidate"):
+            raise PgsoError(f"Hyperfine round contains unexpected label: {label!r}")
+        if label in parsed:
+            raise PgsoError(f"Hyperfine round contains duplicate label: {label}")
+        raw_samples = entry.get("times")
+        if not isinstance(raw_samples, list):
+            raise PgsoError(f"Hyperfine {label} result is missing its samples")
+        if len(raw_samples) != expected_samples:
+            raise PgsoError(
+                f"Hyperfine round returned {len(raw_samples)} {label} samples; "
+                f"expected {expected_samples}"
+            )
+        samples: list[float] = []
+        for index, sample in enumerate(raw_samples):
+            if (
+                isinstance(sample, bool)
+                or not isinstance(sample, (int, float))
+                or not math.isfinite(sample)
+                or sample <= 0
+            ):
+                raise PgsoError(
+                    f"Hyperfine {label} sample {index} must be finite and positive"
+                )
+            samples.append(float(sample))
+        parsed[label] = tuple(samples)
+
+    missing = tuple(label for label in ("control", "candidate") if label not in parsed)
+    if missing:
+        raise PgsoError(f"Hyperfine round is missing label: {', '.join(missing)}")
+    return parsed
+
+
 def measure_alternating(
     *,
     name: str,
@@ -506,6 +558,7 @@ def measure_startup(
     repo_root: pathlib.Path,
     control_binary: pathlib.Path,
     candidate_binary: pathlib.Path,
+    hyperfine_binary: pathlib.Path,
     output_dir: pathlib.Path,
     samples: int,
     timeout_s: float,
@@ -515,34 +568,102 @@ def measure_startup(
     home.mkdir(parents=True, exist_ok=True)
     logs.mkdir(parents=True, exist_ok=True)
     results: list[MeasurementResult] = []
+    startup_samples = max(samples, STARTUP_MINIMUM_SAMPLES)
+    first_round_samples = startup_samples // 2
+    round_samples = (
+        first_round_samples,
+        startup_samples - first_round_samples,
+    )
 
     for command_name, command_argv in STARTUP_COMMANDS:
-        def sample_runner(
-            label: str,
-            binary: pathlib.Path,
-            argv: tuple[str, ...],
-            sample_index: int,
-        ) -> float:
+        for label, binary in (
+            ("control", control_binary),
+            ("candidate", candidate_binary),
+        ):
             result = run_checked(
-                (str(binary), *argv),
+                (str(binary), *command_argv),
                 cwd=repo_root,
                 env=_measurement_environment(home),
                 timeout_s=timeout_s,
-                log_path=logs / f"{command_name}-{sample_index:03d}-{label}.json",
+                log_path=logs / f"{command_name}-preflight-{label}.json",
                 require_empty_stderr=True,
             )
             if not result.stdout.strip():
                 raise PgsoError(f"startup command produced empty stdout: {command_name}")
-            return result.elapsed_seconds
 
+        samples_by_label: dict[str, list[float]] = {
+            "control": [],
+            "candidate": [],
+        }
+        for round_index, (count, order) in enumerate(
+            zip(
+                round_samples,
+                (
+                    (
+                        ("control", control_binary),
+                        ("candidate", candidate_binary),
+                    ),
+                    (
+                        ("candidate", candidate_binary),
+                        ("control", control_binary),
+                    ),
+                ),
+            ),
+            start=1,
+        ):
+            export_path = logs / f"{command_name}-round-{round_index}-samples.json"
+            benchmark_argv: list[str] = [
+                str(hyperfine_binary),
+                "--shell=none",
+                "--style",
+                "none",
+                "--warmup",
+                str(STARTUP_WARMUP_RUNS),
+                "--runs",
+                str(count),
+                "--export-json",
+                str(export_path),
+            ]
+            for label, binary in order:
+                benchmark_argv.extend(
+                    (
+                        "--command-name",
+                        label,
+                        shlex.join((str(binary), *command_argv)),
+                    )
+                )
+            run_checked(
+                benchmark_argv,
+                cwd=repo_root,
+                env=_measurement_environment(home),
+                timeout_s=timeout_s,
+                log_path=logs / f"{command_name}-round-{round_index}.json",
+                require_empty_stderr=False,
+            )
+            round_results = _read_hyperfine_samples(
+                export_path,
+                expected_samples=count,
+            )
+            for label, measured in round_results.items():
+                samples_by_label[label].extend(measured)
+
+        comparison = compare_samples(
+            samples_by_label["control"],
+            samples_by_label["candidate"],
+            minimum_samples=startup_samples,
+        )
         results.append(
-            measure_alternating(
+            MeasurementResult(
                 name=f"startup-{command_name}",
-                control_binary=control_binary,
-                candidate_binary=candidate_binary,
                 argv=command_argv,
-                samples=samples,
-                sample_runner=sample_runner,
+                requested_samples=startup_samples,
+                control_samples=tuple(samples_by_label["control"]),
+                candidate_samples=tuple(samples_by_label["candidate"]),
+                control_failures=0,
+                candidate_failures=0,
+                errors=(),
+                comparison=comparison,
+                passed=comparison.passed,
             )
         )
     return tuple(results)
