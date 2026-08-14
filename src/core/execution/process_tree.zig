@@ -130,8 +130,10 @@ pub const Tracker = struct {
         };
         defer file.close(io_mod.getIo());
         var buffer: [64 * 1024]u8 = undefined;
-        var reader = file.readerStreaming(io_mod.getIo(), &.{});
-        const read_len = try reader.interface.readSliceShort(&buffer);
+        const read_len = readLinuxChildrenFile(file, &buffer) catch |err| switch (err) {
+            error.ProcessNotFound => return,
+            else => return err,
+        };
         var children = std.mem.tokenizeAny(u8, buffer[0..read_len], " \t\r\n");
         while (children.next()) |pid_text| {
             const pid = std.fmt.parseInt(std.posix.pid_t, pid_text, 10) catch continue;
@@ -175,6 +177,19 @@ pub const Tracker = struct {
         });
     }
 };
+
+fn readLinuxChildrenFile(file: std.Io.File, buffer: []u8) !usize {
+    if (comptime builtin.os.tag != .linux) return error.ProcessTreeUnsupported;
+    while (true) {
+        const result = std.posix.system.read(file.handle, buffer.ptr, buffer.len);
+        switch (std.posix.errno(result)) {
+            .SUCCESS => return @intCast(result),
+            .INTR => continue,
+            .SRCH, .NOENT => return error.ProcessNotFound,
+            else => return error.ProcessTreeInspectionFailed,
+        }
+    }
+}
 
 fn captureIdentity(alloc: Allocator, pid: std.posix.pid_t) !Identity {
     return switch (builtin.os.tag) {
