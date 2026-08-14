@@ -82,6 +82,15 @@ pub const Runtime = struct {
         try self.writeTerminalBytes(prepare_terminal_sequence);
         try self.shell.initViewport(&self.metrics, start.row);
 
+        const welcome = try ui_render.welcomeMessage(alloc);
+        defer alloc.free(welcome);
+        try self.shell.writeTranscriptClassified(
+            alloc,
+            &self.metrics,
+            welcome,
+            true,
+            .welcome,
+        );
         const owned_user = try types.dupeUserTurn(alloc, user);
         _ = try self.shell.appendUserTurnOwned(alloc, owned_user);
         try self.render();
@@ -434,7 +443,13 @@ test "ask presentation paints Minimal prompt and assistant into a footerless fra
     try runtime.finish();
 
     try std.testing.expectEqual(presentation_mode.MaxxingMode.minimal, runtime.shell.maxxing_mode);
-    try std.testing.expect(runtime.shell.entries.items.len >= 2);
+    try std.testing.expect(runtime.shell.entries.items.len >= 3);
+    try std.testing.expect(runtime.shell.entries.items[0] == .raw_bytes);
+    try std.testing.expectEqual(
+        transcript_runtime.RawEntryClass.welcome,
+        runtime.shell.entries.items[0].raw_bytes.class,
+    );
+    try std.testing.expect(runtime.shell.entries.items[1] == .user_turn);
     try std.testing.expect(runtime.shell.committed_frame_layout.footer_area.isEmpty());
     try std.testing.expect(runtime.shell.shadow_vt.?.cellAt(1, 1) != null);
     const length = try output.length(io_mod.getIo());
