@@ -46,7 +46,7 @@ python3 -m scripts.pgso all \
 
 [`corpus.json`](corpus.json) references existing test owners instead of copying their behavior. It contains six direct CLI commands and thirty deterministic E2E files covering CLI, configuration, tools, Gateway lifecycle, fake web and vision routes, ACP, modern and legacy MCP, sessions, terminal hosting, TUI startup, resizing, rendering, permissions, interruption, subagents, and recovery.
 
-Sound-bearing `notifications.test.ts` and `tui-command-permissions.test.ts` are explicitly excluded. Live-model and live-network files are forbidden. Corpus processes receive per-scenario homes and isolated tmux sockets and cannot inherit model credentials, the caller's tmux session, or an external LLVM profile destination. The CLI suite explicitly links the host Keychains directory into only its scenario home so its uniquely named fake macOS Keychain assertions can run; no other scenario receives that access.
+Sound-bearing `notifications.test.ts` and `tui-command-permissions.test.ts` are explicitly excluded. Live-model and live-network files are forbidden. Corpus processes receive per-scenario homes and isolated tmux sockets and cannot inherit model credentials, the caller's tmux session, or an external LLVM profile destination. The CLI and MCP authentication suites explicitly link the host Keychains directory into only their scenario homes so their uniquely named fake macOS Keychain assertions can run; no other scenario receives that access.
 
 Each training scenario must create a new nonempty raw profile. The driver merges that batch into the accumulator atomically, deletes only the successfully merged raw files, and stops before profile use on any missing scenario, timeout, warning, merge failure, or cleanup failure.
 

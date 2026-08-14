@@ -216,7 +216,7 @@ class PgsoCorpusTests(unittest.TestCase):
         self.assertNotIn("tui-command-permissions.test.ts", corpus.test_files)
         self.assertEqual(36, len(corpus.scenarios))
         self.assertEqual(
-            ("e2e-cli",),
+            ("e2e-cli", "e2e-mcp-auth"),
             tuple(
                 scenario.name
                 for scenario in corpus.scenarios
