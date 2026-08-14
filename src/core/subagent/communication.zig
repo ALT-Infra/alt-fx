@@ -4996,11 +4996,11 @@ test "escape-heavy approval projects as one bounded marked envelope" {
     var target_id: [255]u8 = undefined;
     @memset(&target_id, 't');
     var delivery_id: [domain.max_operation_id_bytes]u8 = undefined;
-    @memset(&delivery_id, 'd');
+    @memset(&delivery_id, '"');
     var work_id: [domain.max_operation_id_bytes]u8 = undefined;
-    @memset(&work_id, 'w');
+    @memset(&work_id, '"');
     var operation_id: [domain.max_operation_id_bytes]u8 = undefined;
-    @memset(&operation_id, 'o');
+    @memset(&operation_id, '"');
     var ledger = try Ledger.init(alloc, &source_id);
     defer ledger.deinit(alloc);
     const label = try alloc.alloc(u8, 4 * 1024);
@@ -5013,11 +5013,14 @@ test "escape-heavy approval projects as one bounded marked envelope" {
         .target_id = &target_id,
         .work_id = &work_id,
         .operation_id = &operation_id,
-        .timestamp_ms = std.math.maxInt(i64),
+        .timestamp_ms = std.math.minInt(i64),
         .payload = .{ .approval = label },
     });
+    var max_metadata_delivery = ledger.deliveries[0];
+    max_metadata_delivery.sequence = std.math.maxInt(u64);
+    max_metadata_delivery.revision = std.math.maxInt(u64);
     try std.testing.expect(parentDeliveryPartFits(
-        borrowedParentApprovalPart(ledger.deliveries[0], 0, true),
+        borrowedParentApprovalPart(max_metadata_delivery, 0, true),
     ));
 
     var parent = try pageForParentTurn(
