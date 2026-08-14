@@ -27,6 +27,7 @@ REQUIRED_DIRECT_COMMANDS = (
 
 REQUIRED_EXCLUSIONS = (
     "notifications.test.ts",
+    "tui-agent.test.ts",
     "tui-command-permissions.test.ts",
 )
 

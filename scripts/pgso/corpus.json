@@ -2,6 +2,7 @@
   "version": 1,
   "intentional_exclusions": {
     "notifications.test.ts": "Sound-related tests are prohibited on the production training host.",
+    "tui-agent.test.ts": "The suite requires a real model credential and is not deterministic.",
     "tui-command-permissions.test.ts": "The file contains a sound scenario and cannot be run safely as a whole."
   },
   "defaults": {
@@ -86,7 +87,7 @@
     {"name": "e2e-session-recovery", "argv": ["bun", "test", "--max-concurrency", "1", "./session-recovery.test.ts"], "test_file": "session-recovery.test.ts"},
     {"name": "e2e-terminal-host", "argv": ["bun", "test", "--max-concurrency", "1", "./terminal-host.test.ts"], "test_file": "terminal-host.test.ts"},
     {"name": "e2e-tui-startup", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-startup.test.ts"], "test_file": "tui-startup.test.ts"},
-    {"name": "e2e-tui-agent", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-agent.test.ts"], "test_file": "tui-agent.test.ts"},
+    {"name": "e2e-tui-decision-prompts", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-decision-prompts.test.ts"], "test_file": "tui-decision-prompts.test.ts"},
     {"name": "e2e-tui-resize", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-resize.test.ts"], "test_file": "tui-resize.test.ts"},
     {"name": "e2e-tui-render-stress", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-render-stress.test.ts"], "test_file": "tui-render-stress.test.ts"},
     {"name": "e2e-tui-full-transcript-brutal", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-full-transcript-brutal.test.ts"], "test_file": "tui-full-transcript-brutal.test.ts"},

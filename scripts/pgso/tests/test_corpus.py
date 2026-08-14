@@ -39,7 +39,7 @@ ACCEPTED_E2E_TESTS = (
     "session-recovery.test.ts",
     "terminal-host.test.ts",
     "tui-startup.test.ts",
-    "tui-agent.test.ts",
+    "tui-decision-prompts.test.ts",
     "tui-resize.test.ts",
     "tui-render-stress.test.ts",
     "tui-full-transcript-brutal.test.ts",
@@ -92,6 +92,7 @@ class PgsoCorpusTests(unittest.TestCase):
             "version": 1,
             "intentional_exclusions": {
                 "notifications.test.ts": "sound-related",
+                "tui-agent.test.ts": "requires a real model credential",
                 "tui-command-permissions.test.ts": "contains a sound scenario",
             },
             "scenarios": self.direct_scenarios(),
@@ -164,9 +165,10 @@ class PgsoCorpusTests(unittest.TestCase):
                 with self.assertRaises(PgsoError):
                     load_corpus(self.write_manifest(payload), repo_root=self.root)
 
-    def test_load_rejects_sound_and_live_test_files(self) -> None:
+    def test_load_rejects_sound_and_nondeterministic_test_files(self) -> None:
         for test_file in (
             "notifications.test.ts",
+            "tui-agent.test.ts",
             "tui-command-permissions.test.ts",
             "web-search-live.test.ts",
         ):
@@ -213,6 +215,7 @@ class PgsoCorpusTests(unittest.TestCase):
 
         self.assertEqual(ACCEPTED_E2E_TESTS, corpus.test_files)
         self.assertNotIn("notifications.test.ts", corpus.test_files)
+        self.assertNotIn("tui-agent.test.ts", corpus.test_files)
         self.assertNotIn("tui-command-permissions.test.ts", corpus.test_files)
         self.assertEqual(36, len(corpus.scenarios))
         self.assertEqual(
@@ -252,6 +255,7 @@ class PgsoCorpusTests(unittest.TestCase):
             scenarios=tuple(scenarios),
             intentional_exclusions=(
                 ("notifications.test.ts", "sound-related"),
+                ("tui-agent.test.ts", "requires a real model credential"),
                 ("tui-command-permissions.test.ts", "contains sound"),
             ),
         )
