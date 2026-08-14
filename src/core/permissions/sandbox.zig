@@ -179,6 +179,8 @@ const foreground_session_token = "__fx_foreground_session__";
 const foreground_session_ready_byte: u8 = 0x1e;
 const foreground_session_release_byte: u8 = 0x06;
 const foreground_session_setup_timeout_ms: i64 = 5000;
+const foreground_target_termination_grace_ms: i64 = 700;
+const foreground_target_cleanup_wait_ms: i64 = 250;
 const foreground_session_replace_failure_exit_code: u8 = 125;
 const foreground_session_failure_nonce_bytes: usize = 16;
 const foreground_session_failure_nonce_hex_bytes: usize = foreground_session_failure_nonce_bytes * 2;
@@ -291,29 +293,39 @@ fn waitForForegroundTarget(
         const now_ms = io_mod.milliTimestamp();
         if (foregroundSessionTerminationRequested()) {
             if (termination_started_ms == null) {
-                termination_started_ms = now_ms;
-                const count = descendants.signalOutsideProcessGroup(
-                    std.posix.SIG.TERM,
-                    std.c.getpid(),
+                beginForegroundTargetTermination(
+                    &descendants,
+                    now_ms,
+                    &termination_started_ms,
                 );
-                debug_trace.logf(
-                    "core",
-                    "captured command termination reached tracked descendants count={d}",
-                    .{count},
-                );
-            } else if (!forced and now_ms - termination_started_ms.? >= 700) {
+            } else if (!forced and
+                now_ms - termination_started_ms.? >= foreground_target_termination_grace_ms)
+            {
                 forced = true;
-                const count = descendants.signalAll(std.posix.SIG.KILL);
-                debug_trace.logf(
-                    "core",
-                    "captured command force-killed tracked descendants count={d}",
-                    .{count},
-                );
+                forceKillForegroundTargetDescendants(&descendants);
             }
         }
 
         if (try pollProcessLeader(target)) |term| {
             try descendants.refresh(target_pid);
+            if (termination_started_ms == null and
+                foregroundSessionTerminationRequested())
+            {
+                beginForegroundTargetTermination(
+                    &descendants,
+                    io_mod.milliTimestamp(),
+                    &termination_started_ms,
+                );
+            }
+            if (termination_started_ms) |started_ms| {
+                try waitForForegroundTargetDescendants(
+                    &descendants,
+                    target_pid,
+                    started_ms,
+                    &forced,
+                );
+                return term;
+            }
             const count = descendants.signalAll(std.posix.SIG.KILL);
             if (count > 0) {
                 const started_ms = io_mod.milliTimestamp();
@@ -332,6 +344,61 @@ fn waitForForegroundTarget(
         }
         io_mod.sleep(std.time.ns_per_ms);
     }
+}
+
+fn beginForegroundTargetTermination(
+    descendants: *process_tree.Tracker,
+    now_ms: i64,
+    termination_started_ms: *?i64,
+) void {
+    termination_started_ms.* = now_ms;
+    const count = descendants.signalOutsideProcessGroup(
+        std.posix.SIG.TERM,
+        std.c.getpid(),
+    );
+    debug_trace.logf(
+        "core",
+        "captured command termination reached tracked descendants count={d}",
+        .{count},
+    );
+}
+
+fn waitForForegroundTargetDescendants(
+    descendants: *process_tree.Tracker,
+    target_pid: std.posix.pid_t,
+    termination_started_ms: i64,
+    forced: *bool,
+) !void {
+    while (true) {
+        try descendants.refresh(target_pid);
+        if (!descendants.anyAlive()) return;
+
+        const now_ms = io_mod.milliTimestamp();
+        if (!forced.* and
+            now_ms - termination_started_ms >= foreground_target_termination_grace_ms)
+        {
+            forced.* = true;
+            forceKillForegroundTargetDescendants(descendants);
+        }
+        if (forced.* and
+            now_ms - termination_started_ms >=
+                foreground_target_termination_grace_ms + foreground_target_cleanup_wait_ms)
+        {
+            return;
+        }
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+}
+
+fn forceKillForegroundTargetDescendants(
+    descendants: *process_tree.Tracker,
+) void {
+    const count = descendants.signalAll(std.posix.SIG.KILL);
+    debug_trace.logf(
+        "core",
+        "captured command force-killed tracked descendants count={d}",
+        .{count},
+    );
 }
 
 fn writeForegroundSessionReplaceFailure(
@@ -3903,6 +3970,56 @@ test "cancellation preserves the termination grace beneath the session superviso
         .on_output_chunk = CancelAfterOutput.onChunk,
     }, std.testing.allocator, "trap 'sleep 3; exit 130' TERM; printf 'GRACE-READY\\n'; while :; do sleep 1; done", "/tmp");
     defer std.testing.allocator.free(result.output);
+
+    try std.testing.expect(trigger.seen);
+    try std.testing.expect(result.cancelled);
+    try std.testing.expect(io_mod.milliTimestamp() - started_ms >= 500);
+}
+
+test "cancellation preserves the termination grace in an invoked script" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    {
+        var script = try tmp.dir.createFile(
+            io_mod.getIo(),
+            "workspace/grace-script.sh",
+            .{ .truncate = true },
+        );
+        defer script.close(io_mod.getIo());
+        try script.writeStreamingAll(
+            io_mod.getIo(),
+            "#!/bin/sh\n" ++
+                "trap 'sleep 3; exit 130' TERM\n" ++
+                "printf 'GRACE-READY\\n'\n" ++
+                "while :; do sleep 1; done\n",
+        );
+        try script.setPermissions(
+            io_mod.getIo(),
+            std.Io.File.Permissions.fromMode(0o700),
+        );
+    }
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var trigger = CancelAfterOutput{
+        .flag = &cancel,
+        .needle = "GRACE-READY",
+    };
+    const started_ms = io_mod.milliTimestamp();
+    const result = try executeCommand(.{
+        .backend = .none,
+        .workspace_root = workspace,
+        .max_command_output_bytes = 4096,
+        .cancel_flag = &cancel,
+        .output_chunk_ctx = @ptrCast(&trigger),
+        .on_output_chunk = CancelAfterOutput.onChunk,
+    }, alloc, "./grace-script.sh", workspace);
+    defer alloc.free(result.output);
 
     try std.testing.expect(trigger.seen);
     try std.testing.expect(result.cancelled);
