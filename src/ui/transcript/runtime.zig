@@ -650,7 +650,7 @@ test "appendTurnSummaryEntry leaves terminal route status visible" {
     });
 
     switch (runtime.activityProjection()) {
-        .turn_thinking => |thinking| try std.testing.expectEqualStrings("▲ blocked · content filter", thinking.label),
+        .turn_thinking => |thinking| try std.testing.expectEqualStrings("⚠ blocked · content filter", thinking.label),
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
     try std.testing.expect(std.mem.find(u8, runtime.entries.items[0].raw_bytes.bytes, "  2m 10s (↑10k ↓5k)") != null);

@@ -1630,19 +1630,19 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session!.sendText("Trigger restricted provider.");
       await session!.waitForText(
-        "▲ API access denied · HTTP 403 · Provider: wafer",
+        "⚠ API access denied · HTTP 403 · Provider: wafer",
         TIMEOUT,
       );
       const scrollback = await session!.captureFullScrollback();
 
       expect(queuedGateway.requests.length).toBe(1);
       expect(scrollback).toContain(
-        "▲ API access denied · HTTP 403 · Provider: wafer",
+        "⚠ API access denied · HTTP 403 · Provider: wafer",
       );
       expect(scrollback).toContain(
-        "  restricted access to this provider. Contact the owner of the account",
+        "RestrictedProvidersError: Your team has restricted access to this",
       );
-      expect(scrollback).not.toContain("RestrictedProvidersError");
+      expect(scrollback).toContain("RestrictedProvidersError");
       expect(scrollback).not.toContain('{"error"');
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
@@ -1818,7 +1818,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.waitForComposer(TIMEOUT);
       const retryVisible = session.waitForText(
-        "▲ Provider unavailable · retrying request · attempt 1/10",
+        "provider_error: tui route failed once",
         TIMEOUT,
       );
       await session.sendText("Recover from provider route failure.");
@@ -1857,7 +1857,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session!.sendKeys("Down");
       await session!.sendKeys("Enter");
       await session!.waitForComposer(TIMEOUT);
-      await session!.waitForText("▲ blocked · content filter", TIMEOUT);
+      await session!.waitForText("⚠ blocked · content_filter · content filter", TIMEOUT);
       const scrollback = await session!.captureFullScrollback();
 
       expect(queuedGateway.requests.length).toBe(1);
@@ -1865,7 +1865,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(pane).toContain("Change model");
       expect(pane).toContain("Try again later");
       expect(pane).toContain("Response blocked by content filter");
-      expect(scrollback).toContain("▲ blocked · content filter");
+      expect(scrollback).toContain("⚠ blocked · content_filter · content filter");
       expect(pane).not.toContain("Disable Fast");
       expect(pane).not.toContain("Retry same route");
       expect(scrollback).not.toContain("System");
@@ -2061,7 +2061,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session!.sendText("Keep the canonical fallback through restart.");
       await session!.waitForText(
-        "Provider unavailable · retrying request in 5s",
+        "HTTP 503",
         TIMEOUT,
       );
       expect(queuedGateway.requests).toHaveLength(1);
@@ -2121,7 +2121,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session!.sendText("Cancel during provider recovery backoff.");
       await session!.waitForText(
-        "Provider unavailable · retrying request in 2s",
+        "provider_error: route failed three times",
         TIMEOUT,
       );
       await session!.sendKeys("Escape");

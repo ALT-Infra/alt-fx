@@ -6,7 +6,7 @@ const recovered_status_visible_ms: i64 = 1_500;
 
 const RouteRecoveryStatus = struct {
     status: types.RouteRecoveryStatus,
-    label: [192]u8 = undefined,
+    label: [types.RouteRecoveryStatus.label_max_bytes + 64]u8 = undefined,
     label_len: usize = 0,
     expires_at_ms: i64 = 0,
 
@@ -18,7 +18,7 @@ const RouteRecoveryStatus = struct {
             else
                 0,
         };
-        var base_buf: [128]u8 = undefined;
+        var base_buf: [types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
         const label = if (status.isRecovered())
             format_recovered_label(&result.label, status)
         else if (status.action == .waiting_for_connectivity)
@@ -197,7 +197,7 @@ test "worker status projects route recovery and expires recovered state" {
     switch (state.projection().?) {
         .turn_thinking => |projection| {
             try std.testing.expectEqual(activity_runtime.ActivityProjection.Tone.warning, projection.tone);
-            try std.testing.expectEqualStrings("▲ Provider unavailable · retrying request · attempt 1/3", projection.label);
+            try std.testing.expectEqualStrings("⚠ Provider unavailable · retrying request · attempt 1/3", projection.label);
         },
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
@@ -214,13 +214,13 @@ test "worker status projects route recovery and expires recovered state" {
 
 test "worker status API state is sticky until explicitly cleared" {
     var state: State = .none;
-    state.set_api("▲ API access denied · HTTP 403 · Provider: wafer", .danger);
+    state.set_api("⚠ API access denied · HTTP 403 · Provider: wafer", .danger);
 
     try std.testing.expect(!state.expire_transient(std.math.maxInt(i64)));
     switch (state.projection().?) {
         .turn_thinking => |projection| {
             try std.testing.expectEqual(activity_runtime.ActivityProjection.Tone.danger, projection.tone);
-            try std.testing.expectEqualStrings("▲ API access denied · HTTP 403 · Provider: wafer", projection.label);
+            try std.testing.expectEqualStrings("⚠ API access denied · HTTP 403 · Provider: wafer", projection.label);
         },
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
@@ -239,7 +239,7 @@ test "worker status route recovery labels expose required controls" {
     }, 0);
     switch (state.projection().?) {
         .turn_thinking => |projection| try std.testing.expectEqualStrings(
-            "▲ Mac woke from sleep · waiting for connection · attempt 2/10 · Esc to try later",
+            "⚠ Mac woke from sleep · waiting for connection · attempt 2/10 · Esc to try later",
             projection.label,
         ),
         .none, .tool_slot => return error.TestUnexpectedResult,
@@ -255,7 +255,7 @@ test "worker status route recovery labels expose required controls" {
     }, 0);
     switch (state.projection().?) {
         .turn_thinking => |projection| try std.testing.expectEqualStrings(
-            "▲ Mac woke from sleep · connection still unavailable · recovery paused · attempt 2/10 · /continue to resume",
+            "⚠ Mac woke from sleep · connection still unavailable · recovery paused · attempt 2/10 · /continue to resume",
             projection.label,
         ),
         .none, .tool_slot => return error.TestUnexpectedResult,
@@ -271,7 +271,7 @@ test "worker status route recovery labels expose required controls" {
     }, 0);
     switch (state.projection().?) {
         .turn_thinking => |projection| try std.testing.expectEqualStrings(
-            "▲ Response ended early · recovery paused after 10/10 attempts · inspect tool state before /continue",
+            "⚠ Response ended early · recovery paused after 10/10 attempts · inspect tool state before /continue",
             projection.label,
         ),
         .none, .tool_slot => return error.TestUnexpectedResult,

@@ -1671,7 +1671,7 @@ pub const FakeAgentRuntimeDeps = struct {
         if (self.pause_on_auto_retry_status and status.kind == .auto_retry) {
             if (self.recovery_pause_flag) |flag| flag.store(true, .seq_cst);
         }
-        var label_buf: [128]u8 = undefined;
+        var label_buf: [types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
         try self.record("route_recovery_status:{s}", .{status.label(&label_buf)});
     }
 

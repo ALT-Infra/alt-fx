@@ -1,4 +1,5 @@
 const std = @import("std");
+const text_utils = @import("text_utils.zig");
 
 pub const Layout = struct {
     rows: u16,
@@ -236,7 +237,52 @@ pub const ModelRecoveryRequiredAction = enum {
     change_request,
 };
 
+pub const ModelFailureDiagnostic = struct {
+    pub const max_bytes: usize = 256;
+
+    bytes: [max_bytes]u8 = [_]u8{0} ** max_bytes,
+    len: u16 = 0,
+
+    pub fn defaultTextForCause(cause: ModelRecoveryCause) []const u8 {
+        return switch (cause) {
+            .network_interrupted => "NetworkInterrupted",
+            .response_interrupted => "StreamInterrupted",
+            .provider_unavailable => "provider_error",
+            .rate_limited => "HTTP 429",
+            .system_resumed => "SystemResumed",
+            .authentication => "AuthenticationExpired",
+            .request_limit_reached => "ProviderRequestLimitReached",
+        };
+    }
+
+    pub fn forCause(cause: ModelRecoveryCause) ModelFailureDiagnostic {
+        return init(defaultTextForCause(cause));
+    }
+
+    pub fn init(text: []const u8) ModelFailureDiagnostic {
+        var diagnostic: ModelFailureDiagnostic = .{};
+        if (text.len <= max_bytes) {
+            @memcpy(diagnostic.bytes[0..text.len], text);
+            diagnostic.len = @intCast(text.len);
+            return diagnostic;
+        }
+
+        const marker = "...";
+        const prefix = text_utils.utf8PrefixByBytes(text, max_bytes - marker.len);
+        @memcpy(diagnostic.bytes[0..prefix.len], prefix);
+        @memcpy(diagnostic.bytes[prefix.len .. prefix.len + marker.len], marker);
+        diagnostic.len = @intCast(prefix.len + marker.len);
+        return diagnostic;
+    }
+
+    pub fn view(self: *const ModelFailureDiagnostic) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
 pub const RouteRecoveryStatus = struct {
+    pub const label_max_bytes: usize = 512;
+
     pub const Kind = enum {
         auto_retry,
         auto_recovered,
@@ -256,6 +302,7 @@ pub const RouteRecoveryStatus = struct {
     action: ?ModelRecoveryAction = null,
     required_action: ModelRecoveryRequiredAction = .none,
     delay_seconds: u64 = 0,
+    diagnostic: ?ModelFailureDiagnostic = null,
 
     pub fn tone(self: RouteRecoveryStatus) RouteRecoveryStatusTone {
         return switch (self.kind) {
@@ -297,13 +344,48 @@ pub const RouteRecoveryStatus = struct {
                 "✓ recovered · succeeded on attempt {d}/{d}",
                 .{ self.succeeded_attempt, self.attempt_limit },
             ) catch "✓ recovered",
-            .manual_retry_without_fast => "▲ Provider route unavailable · continuing without Fast",
+            .manual_retry_without_fast => self.manualRetryLabel(buf),
             .manual_recovered_without_fast => "✓ recovered · Fast disabled",
             .terminal_provider_error => self.pausedLabel(buf),
-            .unsafe_assistant_output => "▲ Response interrupted · partial output preserved",
-            .unsafe_tool_start => "▲ Tool state needs review · context preserved",
-            .content_filter => "▲ blocked · content filter",
+            .unsafe_assistant_output => self.fixedFailureLabel(
+                buf,
+                "Response interrupted",
+                "partial output preserved",
+            ),
+            .unsafe_tool_start => self.fixedFailureLabel(
+                buf,
+                "Tool state needs review",
+                "context preserved",
+            ),
+            .content_filter => self.fixedFailureLabel(buf, "blocked", "content filter"),
         };
+    }
+
+    fn manualRetryLabel(self: RouteRecoveryStatus, buf: []u8) []const u8 {
+        if (self.diagnostic) |diagnostic| {
+            return std.fmt.bufPrint(
+                buf,
+                "⚠ Provider route unavailable · {s} · continuing without Fast",
+                .{diagnostic.view()},
+            ) catch "⚠ Provider route unavailable · continuing without Fast";
+        }
+        return "⚠ Provider route unavailable · continuing without Fast";
+    }
+
+    fn fixedFailureLabel(
+        self: RouteRecoveryStatus,
+        buf: []u8,
+        cause: []const u8,
+        action: []const u8,
+    ) []const u8 {
+        if (self.diagnostic) |diagnostic| {
+            return std.fmt.bufPrint(
+                buf,
+                "⚠ {s} · {s} · {s}",
+                .{ cause, diagnostic.view(), action },
+            ) catch "⚠ Model response failed";
+        }
+        return std.fmt.bufPrint(buf, "⚠ {s} · {s}", .{ cause, action }) catch "⚠ Model response failed";
     }
 
     fn recoveryLabel(self: RouteRecoveryStatus, buf: []u8) []const u8 {
@@ -326,45 +408,76 @@ pub const RouteRecoveryStatus = struct {
             .paused => "recovery paused",
         };
         if (self.delay_seconds > 0) {
+            if (self.diagnostic) |diagnostic| {
+                return std.fmt.bufPrint(
+                    buf,
+                    "⚠ {s} · {s} · {s} in {d}s · attempt {d}/{d}",
+                    .{ cause, diagnostic.view(), action, self.delay_seconds, self.failed_attempt, self.attempt_limit },
+                ) catch "⚠ Recovering model response";
+            }
             return std.fmt.bufPrint(
                 buf,
-                "▲ {s} · {s} in {d}s · attempt {d}/{d}",
+                "⚠ {s} · {s} in {d}s · attempt {d}/{d}",
                 .{ cause, action, self.delay_seconds, self.failed_attempt, self.attempt_limit },
-            ) catch "▲ Recovering model response";
+            ) catch "⚠ Recovering model response";
+        }
+        if (self.diagnostic) |diagnostic| {
+            return std.fmt.bufPrint(
+                buf,
+                "⚠ {s} · {s} · {s} · attempt {d}/{d}",
+                .{ cause, diagnostic.view(), action, self.failed_attempt, self.attempt_limit },
+            ) catch "⚠ Recovering model response";
         }
         return std.fmt.bufPrint(
             buf,
-            "▲ {s} · {s} · attempt {d}/{d}",
+            "⚠ {s} · {s} · attempt {d}/{d}",
             .{ cause, action, self.failed_attempt, self.attempt_limit },
-        ) catch "▲ Recovering model response";
+        ) catch "⚠ Recovering model response";
     }
 
     fn pausedLabel(self: RouteRecoveryStatus, buf: []u8) []const u8 {
-        const cause = self.cause orelse return std.fmt.bufPrint(
-            buf,
-            "▲ Provider unavailable · recovery paused after {d}/{d} attempts",
-            .{ self.failed_attempt, self.attempt_limit },
-        ) catch "▲ Provider unavailable · recovery paused";
+        const cause = self.cause orelse return self.pausedCauseLabel(buf, "Provider unavailable");
         if (cause == .rate_limited and self.failed_attempt < self.attempt_limit) {
+            if (self.diagnostic) |diagnostic| {
+                return std.fmt.bufPrint(
+                    buf,
+                    "⚠ Rate limited · {s} · server requested a longer wait · recovery paused · attempt {d}/{d}",
+                    .{ diagnostic.view(), self.failed_attempt, self.attempt_limit },
+                ) catch "⚠ Rate limited · recovery paused";
+            }
             return std.fmt.bufPrint(
                 buf,
-                "▲ Rate limited · server requested a longer wait · recovery paused · attempt {d}/{d}",
+                "⚠ Rate limited · server requested a longer wait · recovery paused · attempt {d}/{d}",
                 .{ self.failed_attempt, self.attempt_limit },
-            ) catch "▲ Rate limited · recovery paused";
+            ) catch "⚠ Rate limited · recovery paused";
         }
         if (cause == .system_resumed and self.failed_attempt < self.attempt_limit) {
+            if (self.diagnostic) |diagnostic| {
+                return std.fmt.bufPrint(
+                    buf,
+                    "⚠ Mac woke from sleep · {s} · connection still unavailable · recovery paused · attempt {d}/{d}",
+                    .{ diagnostic.view(), self.failed_attempt, self.attempt_limit },
+                ) catch "⚠ Connection unavailable · recovery paused";
+            }
             return std.fmt.bufPrint(
                 buf,
-                "▲ Mac woke from sleep · connection still unavailable · recovery paused · attempt {d}/{d}",
+                "⚠ Mac woke from sleep · connection still unavailable · recovery paused · attempt {d}/{d}",
                 .{ self.failed_attempt, self.attempt_limit },
-            ) catch "▲ Connection unavailable · recovery paused";
+            ) catch "⚠ Connection unavailable · recovery paused";
         }
         if (cause == .request_limit_reached) {
+            if (self.diagnostic) |diagnostic| {
+                return std.fmt.bufPrint(
+                    buf,
+                    "⚠ Response paused · {s} · {d}/{d} provider-request safety limit reached",
+                    .{ diagnostic.view(), self.failed_attempt, self.attempt_limit },
+                ) catch "⚠ Response paused · provider-request safety limit reached";
+            }
             return std.fmt.bufPrint(
                 buf,
-                "▲ Response paused · {d}/{d} provider-request safety limit reached",
+                "⚠ Response paused · {d}/{d} provider-request safety limit reached",
                 .{ self.failed_attempt, self.attempt_limit },
-            ) catch "▲ Response paused · provider-request safety limit reached";
+            ) catch "⚠ Response paused · provider-request safety limit reached";
         }
         const name = switch (cause) {
             .network_interrupted => "Network interrupted",
@@ -375,11 +488,26 @@ pub const RouteRecoveryStatus = struct {
             .authentication => "Authentication expired",
             .request_limit_reached => unreachable,
         };
+        return self.pausedCauseLabel(buf, name);
+    }
+
+    fn pausedCauseLabel(
+        self: RouteRecoveryStatus,
+        buf: []u8,
+        name: []const u8,
+    ) []const u8 {
+        if (self.diagnostic) |diagnostic| {
+            return std.fmt.bufPrint(
+                buf,
+                "⚠ {s} · {s} · recovery paused after {d}/{d} attempts",
+                .{ name, diagnostic.view(), self.failed_attempt, self.attempt_limit },
+            ) catch "⚠ Model response recovery paused";
+        }
         return std.fmt.bufPrint(
             buf,
-            "▲ {s} · recovery paused after {d}/{d} attempts",
+            "⚠ {s} · recovery paused after {d}/{d} attempts",
             .{ name, self.failed_attempt, self.attempt_limit },
-        ) catch "▲ Model response recovery paused";
+        ) catch "⚠ Model response recovery paused";
     }
 };
 
@@ -395,6 +523,37 @@ test "route recovery reports the attempt owned by its state" {
         .succeeded_attempt = 4,
         .attempt_limit = 10,
     }).reportedAttempt());
+}
+
+test "route recovery label includes a value-owned diagnostic" {
+    var status = RouteRecoveryStatus{
+        .kind = .auto_retry,
+        .failed_attempt = 4,
+        .attempt_limit = 10,
+        .cause = .provider_unavailable,
+        .action = .retrying_request,
+        .delay_seconds = 4,
+        .diagnostic = ModelFailureDiagnostic.init(
+            "HTTP 503 · no_available_providers: No providers are currently available",
+        ),
+    };
+    const copied = status;
+    status.diagnostic = null;
+
+    var label_buf: [RouteRecoveryStatus.label_max_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "⚠ Provider unavailable · HTTP 503 · no_available_providers: No providers are currently available · retrying request in 4s · attempt 4/10",
+        copied.label(&label_buf),
+    );
+}
+
+test "model failure diagnostic truncation is bounded and utf8 safe" {
+    const long = "provider_error: " ++ ("é" ** 200);
+    const diagnostic = ModelFailureDiagnostic.init(long);
+
+    try std.testing.expect(diagnostic.view().len <= ModelFailureDiagnostic.max_bytes);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(diagnostic.view()));
+    try std.testing.expect(std.mem.endsWith(u8, diagnostic.view(), "..."));
 }
 
 pub const ChatRole = enum {

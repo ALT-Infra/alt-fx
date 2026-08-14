@@ -1447,7 +1447,7 @@ test "surface footer measurement preserves route recovery status tone" {
         .selected_subagent_label = null,
         .selected_subagent_status = null,
         .activity = .{ .turn_thinking = .{
-            .label = "▲ blocked · content filter",
+            .label = "⚠ blocked · content filter",
             .tone = .danger,
         } },
         .input = &input,
@@ -1460,7 +1460,7 @@ test "surface footer measurement preserves route recovery status tone" {
     switch (measurement.activity_projection) {
         .turn_thinking => |thinking| {
             try std.testing.expectEqual(ActivityProjection.Tone.danger, thinking.tone);
-            try std.testing.expectEqualStrings("▲ blocked · content filter", thinking.label);
+            try std.testing.expectEqualStrings("⚠ blocked · content filter", thinking.label);
         },
         .none, .tool_slot => return error.TestUnexpectedResult,
     }

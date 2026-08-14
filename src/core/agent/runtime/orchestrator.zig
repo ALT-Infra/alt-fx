@@ -7,7 +7,9 @@ const worker_runtime = @import("../worker_runtime.zig");
 const session_runtime = @import("../../session/session.zig");
 const session_codec = @import("../../session/session_codec.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
+const gateway_error_format = @import("../../shared/gateway_error_format.zig");
 const mem_utils = @import("../../shared/mem_utils.zig");
+const text_utils = @import("../../shared/text_utils.zig");
 const file_mutation_contract = @import("../../tooling/file_mutation_contract.zig");
 const io_mod = @import("../../shared/io.zig");
 const host_target = @import("../../hosts/target.zig");
@@ -1289,12 +1291,14 @@ fn pushTerminalAutoRetryStatusIfNeeded(
     recovery_active: bool,
     semantic_attempt: usize,
     semantic_limit: usize,
+    diagnostic: types.ModelFailureDiagnostic,
 ) !void {
     if (!recovery_active) return;
     try pushRouteRecoveryStatus(deps, .{
         .kind = .terminal_provider_error,
         .failed_attempt = semantic_attempt + 1,
         .attempt_limit = semantic_limit,
+        .diagnostic = diagnostic,
     });
 }
 
@@ -1379,6 +1383,7 @@ fn pushAutoRetryStatus(
     attempt_limit: usize,
     cause: model_response_recovery.FailureCause,
     decision: model_response_recovery.Decision,
+    diagnostic: types.ModelFailureDiagnostic,
 ) !void {
     try pushRouteRecoveryStatus(deps, .{
         .kind = .auto_retry,
@@ -1404,6 +1409,7 @@ fn pushAutoRetryStatus(
             .stop => null,
         },
         .delay_seconds = decision.delay_ns / std.time.ns_per_s,
+        .diagnostic = diagnostic,
     });
 }
 
@@ -1424,12 +1430,14 @@ fn pushTerminalProviderFailureStatus(
     attempts: usize,
     attempt_limit: usize,
     completion: types.GatewayCompletion,
+    diagnostic: types.ModelFailureDiagnostic,
 ) !void {
     const reason = completion.finish_reason orelse return;
     if (reason == .content_filter) {
         try pushRouteRecoveryStatus(deps, .{
             .kind = .content_filter,
             .required_action = .change_request,
+            .diagnostic = diagnostic,
         });
         return;
     }
@@ -1437,6 +1445,7 @@ fn pushTerminalProviderFailureStatus(
         .kind = .terminal_provider_error,
         .failed_attempt = attempts,
         .attempt_limit = attempt_limit,
+        .diagnostic = diagnostic,
     });
 }
 
@@ -1448,6 +1457,7 @@ fn finishRecoveryPaused(
     consumed_attempts: usize,
     attempt_limit: usize,
     required_action: types.ModelRecoveryRequiredAction,
+    diagnostic: ?types.ModelFailureDiagnostic,
 ) !void {
     try pushRouteRecoveryStatus(deps, .{
         .kind = .terminal_provider_error,
@@ -1456,6 +1466,7 @@ fn finishRecoveryPaused(
         .cause = checkpointCause(cause),
         .action = .paused,
         .required_action = required_action,
+        .diagnostic = diagnostic orelse defaultRecoveryDiagnostic(cause),
     });
     try finalization.finish(.paused, null, null);
     finish_trace.finish("recovery_paused");
@@ -1464,13 +1475,83 @@ fn finishRecoveryPaused(
 fn pushUnsafeNoRetryStatus(
     deps: *const AgentRuntimeDeps,
     reason: types.RouteRecoveryUnsafeReason,
+    diagnostic: types.ModelFailureDiagnostic,
 ) !void {
     try pushRouteRecoveryStatus(deps, .{
         .kind = switch (reason) {
             .assistant_output => .unsafe_assistant_output,
             .tool_start => .unsafe_tool_start,
         },
+        .diagnostic = diagnostic,
     });
+}
+
+fn defaultRecoveryDiagnostic(cause: model_response_recovery.FailureCause) types.ModelFailureDiagnostic {
+    if (cause == .content_filter) return types.ModelFailureDiagnostic.init("content_filter");
+    return types.ModelFailureDiagnostic.forCause(checkpointCause(cause));
+}
+
+fn defaultRecoveryDiagnosticText(cause: model_response_recovery.FailureCause) []const u8 {
+    if (cause == .content_filter) return "content_filter";
+    return types.ModelFailureDiagnostic.defaultTextForCause(checkpointCause(cause));
+}
+
+fn prepareExternalFailureDiagnostic(
+    alloc: Allocator,
+    raw: []const u8,
+    fallback: []const u8,
+) !types.ModelFailureDiagnostic {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    const owned_source = if (trimmed.len > 0 and !hasDiagnosticIdentifier(trimmed))
+        try std.fmt.allocPrint(alloc, "{s}: {s}", .{ fallback, trimmed })
+    else
+        null;
+    defer if (owned_source) |source| alloc.free(source);
+    const source = owned_source orelse if (trimmed.len > 0) trimmed else fallback;
+    const masked = try text_utils.maskSecrets(alloc, source);
+    defer if (masked.ptr != source.ptr) alloc.free(masked);
+
+    var encoded = try text_utils.encodeTerminalSafe(
+        alloc,
+        masked,
+        types.ModelFailureDiagnostic.max_bytes,
+    );
+    defer encoded.deinit(alloc);
+    if (encoded.bytes.len == 0) return types.ModelFailureDiagnostic.init(fallback);
+    return types.ModelFailureDiagnostic.init(encoded.bytes);
+}
+
+fn hasDiagnosticIdentifier(text: []const u8) bool {
+    if (std.mem.indexOf(u8, text, ": ")) |separator| {
+        if (separator == 0) return false;
+        return std.mem.indexOfAny(u8, text[0..separator], " \t\r\n") == null;
+    }
+    for (text) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-' and byte != '.') return false;
+    }
+    return text.len > 0;
+}
+
+fn providerCompletionDiagnostic(
+    alloc: Allocator,
+    completion: types.GatewayCompletion,
+    fallback: []const u8,
+) !types.ModelFailureDiagnostic {
+    return prepareExternalFailureDiagnostic(
+        alloc,
+        completion.provider_failure_detail orelse "",
+        fallback,
+    );
+}
+
+fn httpFailureDiagnostic(
+    alloc: Allocator,
+    status: std.http.Status,
+    detail: []const u8,
+) !types.ModelFailureDiagnostic {
+    const formatted = try gateway_error_format.formatHttpRecoveryDiagnostic(alloc, status, detail);
+    defer alloc.free(formatted);
+    return types.ModelFailureDiagnostic.init(formatted);
 }
 
 fn traceRouteFailure(
@@ -2193,6 +2274,7 @@ fn processQueuedPromptLoop(
         restoredRecoveryCause(checkpoint.cause)
     else
         .transport_interrupted;
+    var latest_recovery_diagnostic: ?types.ModelFailureDiagnostic = null;
     var preserved_tool_evidence: model_response_recovery.ToolEvidence = if (job.recovery_checkpoint) |checkpoint|
         restoredRecoveryToolEvidence(checkpoint.tool_state)
     else
@@ -2331,6 +2413,7 @@ fn processQueuedPromptLoop(
                     semantic_attempt,
                     semantic_limit,
                     pausedRequiredAction(preserved_tool_evidence),
+                    latest_recovery_diagnostic,
                 );
                 return;
             }
@@ -2366,6 +2449,7 @@ fn processQueuedPromptLoop(
                     semantic_attempt,
                     semantic_limit,
                     pausedRequiredAction(preserved_tool_evidence),
+                    defaultRecoveryDiagnostic(.request_limit_reached),
                 );
                 return;
             }
@@ -2552,6 +2636,8 @@ fn processQueuedPromptLoop(
                     }
                 else
                     recovery_cause;
+                const failure_diagnostic = types.ModelFailureDiagnostic.init(@errorName(err));
+                latest_recovery_diagnostic = failure_diagnostic;
                 if (recoveryPauseRequested(config)) {
                     try persistRecoveryCheckpoint(
                         deps,
@@ -2591,6 +2677,7 @@ fn processQueuedPromptLoop(
                             null,
                             &stream_ctx,
                         )),
+                        failure_diagnostic,
                     );
                     return;
                 }
@@ -2680,6 +2767,7 @@ fn processQueuedPromptLoop(
                         semantic_limit,
                         failure_cause,
                         recovery_decision,
+                        failure_diagnostic,
                     );
                 }
                 const delay_completed = !will_auto_retry or waitForRecoveryDelay(
@@ -2725,6 +2813,7 @@ fn processQueuedPromptLoop(
                             null,
                             &stream_ctx,
                         )),
+                        failure_diagnostic,
                     );
                     return;
                 }
@@ -2769,6 +2858,7 @@ fn processQueuedPromptLoop(
                         consumed_attempts,
                         semantic_limit,
                         recoveryRequiredAction(recovery_decision.required_action),
+                        failure_diagnostic,
                     );
                     return;
                 }
@@ -2782,6 +2872,7 @@ fn processQueuedPromptLoop(
                             .kind = .terminal_provider_error,
                             .failed_attempt = semantic_attempt + 1,
                             .attempt_limit = semantic_limit,
+                            .diagnostic = failure_diagnostic,
                         });
                     } else {
                         try pushUnsafeNoRetryStatus(
@@ -2790,6 +2881,7 @@ fn processQueuedPromptLoop(
                                 .tool_start
                             else
                                 .assistant_output,
+                            failure_diagnostic,
                         );
                     }
                 } else if (semantic_attempt > 0) {
@@ -2797,6 +2889,7 @@ fn processQueuedPromptLoop(
                         .kind = .terminal_provider_error,
                         .failed_attempt = semantic_attempt + 1,
                         .attempt_limit = semantic_limit,
+                        .diagnostic = failure_diagnostic,
                     });
                 }
                 try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
@@ -2884,6 +2977,7 @@ fn processQueuedPromptLoop(
                     semantic_attempt + 1,
                     semantic_limit,
                     .inspect_uncertain_tool,
+                    types.ModelFailureDiagnostic.init("UnexpectedToolCallDuringReconciliation"),
                 );
                 return;
             }
@@ -2970,6 +3064,12 @@ fn processQueuedPromptLoop(
                     .rate_limited
                 else
                     .provider_unavailable;
+                const diagnostic = try httpFailureDiagnostic(
+                    arena,
+                    stream_result.status,
+                    stream_result.err_body orelse "",
+                );
+                latest_recovery_diagnostic = diagnostic;
                 const route_changed = disableFastRouteAfterFailure(
                     &route_fast_mode,
                     &gateway_model,
@@ -3026,6 +3126,7 @@ fn processQueuedPromptLoop(
                         semantic_attempt + 1,
                         semantic_limit,
                         recoveryRequiredAction(decision.required_action),
+                        diagnostic,
                     );
                     return;
                 }
@@ -3063,6 +3164,7 @@ fn processQueuedPromptLoop(
                         semantic_limit,
                         cause,
                         decision,
+                        diagnostic,
                     );
                     if (waitForRecoveryDelay(config.cancel_flag, decision.delay_ns)) {
                         preserved_tool_evidence = effectiveRecoveryToolEvidence(
@@ -3132,6 +3234,7 @@ fn processQueuedPromptLoop(
             }
 
             const attempt_disposition = settled_disposition;
+            var attempt_failure_diagnostic: ?types.ModelFailureDiagnostic = null;
             if (stream_result.status == .ok and
                 (attempt_disposition == .interrupted or
                     attempt_disposition == .provider_failure))
@@ -3143,6 +3246,13 @@ fn processQueuedPromptLoop(
                     .content_filter
                 else
                     .provider_unavailable;
+                const diagnostic = try providerCompletionDiagnostic(
+                    arena,
+                    attempt_completion,
+                    defaultRecoveryDiagnosticText(cause),
+                );
+                attempt_failure_diagnostic = diagnostic;
+                latest_recovery_diagnostic = diagnostic;
                 const decision = model_response_recovery.decide(.{
                     .cause = cause,
                     .delivery = .possibly_sent,
@@ -3210,6 +3320,7 @@ fn processQueuedPromptLoop(
                         semantic_attempt + 1,
                         semantic_limit,
                         recoveryRequiredAction(decision.required_action),
+                        diagnostic,
                     );
                     return;
                 }
@@ -3247,6 +3358,7 @@ fn processQueuedPromptLoop(
                         semantic_limit,
                         cause,
                         decision,
+                        diagnostic,
                     );
                     if (waitForRecoveryDelay(config.cancel_flag, decision.delay_ns)) {
                         preserved_tool_evidence = effectiveRecoveryToolEvidence(
@@ -3284,6 +3396,8 @@ fn processQueuedPromptLoop(
             }
             if (stream_result.status == .ok and attempt_disposition == .provider_failure) {
                 const finish_reason = attempt_completion.finish_reason.?;
+                const diagnostic = attempt_failure_diagnostic orelse
+                    try providerCompletionDiagnostic(arena, attempt_completion, finish_reason.label());
                 const replay_safe = providerFailureReplaySafe(attempt_completion, &stream_ctx);
                 debug_trace.eventf("agent", "provider_completion_failed", step_ctx, "finish_reason={s} content_bytes={d} tool_call_count={d}", .{
                     finish_reason.label(),
@@ -3292,14 +3406,30 @@ fn processQueuedPromptLoop(
                 });
                 if (finish_reason == .provider_error) {
                     if (replay_safe) {
-                        try pushTerminalProviderFailureStatus(deps, semantic_attempt + 1, semantic_limit, attempt_completion);
+                        try pushTerminalProviderFailureStatus(
+                            deps,
+                            semantic_attempt + 1,
+                            semantic_limit,
+                            attempt_completion,
+                            diagnostic,
+                        );
                     } else {
-                        try pushUnsafeNoRetryStatus(deps, unsafeNoRetryReason(attempt_completion, &stream_ctx));
+                        try pushUnsafeNoRetryStatus(
+                            deps,
+                            unsafeNoRetryReason(attempt_completion, &stream_ctx),
+                            diagnostic,
+                        );
                     }
                 }
 
                 if (finish_reason == .content_filter) {
-                    try pushTerminalProviderFailureStatus(deps, semantic_attempt + 1, semantic_limit, attempt_completion);
+                    try pushTerminalProviderFailureStatus(
+                        deps,
+                        semantic_attempt + 1,
+                        semantic_limit,
+                        attempt_completion,
+                        diagnostic,
+                    );
                     if (deps.request_route_recovery) |recover| {
                         const decision = try recover(deps.ctx, arena, .{
                             .selected_model = job.model,
@@ -3364,6 +3494,7 @@ fn processQueuedPromptLoop(
                     if (successful_recovery_strategy != null) {
                         try pushAutoRecoveredStatus(deps, semantic_attempt, semantic_limit);
                     }
+                    latest_recovery_diagnostic = null;
                     recovery_strategy = null;
                     recovery_cause = .transport_interrupted;
                     preserved_tool_evidence = .none;
@@ -3455,6 +3586,7 @@ fn processQueuedPromptLoop(
                     successful_recovery_strategy != null,
                     semantic_attempt,
                     semantic_limit,
+                    types.ModelFailureDiagnostic.init("StreamInterrupted"),
                 );
                 debug_trace.eventf("agent", "provider_finish_missing", step_ctx, "content_bytes={d} tool_call_count={d}", .{
                     if (completion.content) |content| content.len else 0,
@@ -3479,6 +3611,7 @@ fn processQueuedPromptLoop(
                     successful_recovery_strategy != null,
                     semantic_attempt,
                     semantic_limit,
+                    types.ModelFailureDiagnostic.init("InvalidProviderCompletion"),
                 );
                 const finish_reason = completion.finish_reason.?;
                 if (completion.tool_calls.len > 0) {
@@ -3499,6 +3632,7 @@ fn processQueuedPromptLoop(
                 successful_recovery_strategy != null,
                 semantic_attempt,
                 semantic_limit,
+                types.ModelFailureDiagnostic.init("RequiredVisionToolCallMissing"),
             );
             debug_trace.eventf(
                 "agent",
@@ -3524,6 +3658,7 @@ fn processQueuedPromptLoop(
         if (successful_recovery_strategy != null) {
             try pushAutoRecoveredStatus(deps, semantic_attempt, semantic_limit);
         }
+        latest_recovery_diagnostic = null;
         recovery_strategy = null;
         recovery_cause = .transport_interrupted;
         preserved_tool_evidence = .none;

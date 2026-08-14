@@ -621,6 +621,7 @@ fn sendPendingRecoveryUpdate(
             .inspect_uncertain_tool
         else
             .continue_later,
+        .diagnostic = types.ModelFailureDiagnostic.forCause(recovery.cause),
     }, true);
     try out.writer.writeByte('}');
     try state.writer.writeNotification(

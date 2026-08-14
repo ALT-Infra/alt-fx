@@ -317,11 +317,11 @@ fn writeStaticStyledText(out: []u8, label: []const u8, style: []const u8) []cons
 
 test "activity status styles paint static colored text" {
     var buf: [128]u8 = undefined;
-    const result = writeStaticStyledText(&buf, "▲ API error", ui_render.warning_style);
+    const result = writeStaticStyledText(&buf, "⚠ API error", ui_render.warning_style);
     var expected_buf: [128]u8 = undefined;
     const expected = std.fmt.bufPrint(
         &expected_buf,
-        "{s}▲ API error{s}",
+        "{s}⚠ API error{s}",
         .{ ui_render.warning_style, ui_render.reset_style },
     ) catch return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings(expected, result);
@@ -524,14 +524,14 @@ test "activity surface painter wraps static status labels under marker" {
     defer fixtures.shadow.deinit();
 
     const result = try paintActivityIntoSurface(&fixtures.surface, .{
-        .label = "▲ API access denied · HTTP 403 · Provider: wafer · Your team has restricted access to this provider. Contact the owner of the account.",
+        .label = "⚠ API access denied · HTTP 403 · Provider: wafer · Your team has restricted access to this provider. Contact the owner of the account.",
         .shimmer_pos = -8,
         .style = .danger,
     });
 
     try std.testing.expect(result.painted);
     try std.testing.expectEqual(@as(u16, 3), result.row);
-    try std.testing.expectEqual(@as(u21, '▲'), fixtures.surface.cellAt(3, 1).?.codepoint);
+    try std.testing.expectEqual(@as(u21, '⚠'), fixtures.surface.cellAt(3, 1).?.codepoint);
     try std.testing.expectEqual(@as(u21, ' '), fixtures.surface.cellAt(4, 1).?.codepoint);
     try std.testing.expectEqual(@as(u21, ' '), fixtures.surface.cellAt(4, 2).?.codepoint);
     try std.testing.expect(fixtures.surface.cellAt(4, 3).?.codepoint != ' ');
@@ -551,13 +551,13 @@ test "activity surface painter breaks static status rows at word boundaries" {
     defer fixtures.shadow.deinit();
 
     const result = try paintActivityIntoSurface(&fixtures.surface, .{
-        .label = "▲ aaaaaa bbbb",
+        .label = "⚠ aaaaaa bbbb",
         .shimmer_pos = -8,
         .style = .danger,
     });
 
     try std.testing.expect(result.painted);
-    try std.testing.expectEqual(@as(u21, '▲'), fixtures.surface.cellAt(3, 1).?.codepoint);
+    try std.testing.expectEqual(@as(u21, '⚠'), fixtures.surface.cellAt(3, 1).?.codepoint);
     try std.testing.expectEqual(@as(u21, 'a'), fixtures.surface.cellAt(3, 8).?.codepoint);
     try std.testing.expectEqual(@as(u21, ' '), fixtures.surface.cellAt(3, 10).?.codepoint);
     try std.testing.expectEqual(@as(u21, ' '), fixtures.surface.cellAt(4, 2).?.codepoint);

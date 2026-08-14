@@ -1109,12 +1109,18 @@ describe("acp: model-independent", () => {
         expect(pausedUpdates).toContain("modelResponseRecovery");
         expect(pausedUpdates).toContain('"state":"paused"');
         expect(pausedUpdates).toContain('"durable":true');
+        expect(pausedUpdates).toContain(
+          "HTTP 503 · provider temporarily unavailable",
+        );
         expect(pausedUpdates).toContain(partialText);
 
         const resumed = await continueRecovery(client, TIMEOUT);
         expect(resumed.promptResult.error).toBeUndefined();
         expect(resumed.promptResult.result.stopReason).toBe("end_turn");
         expect(gateway.requests).toHaveLength(11);
+        const resumedUpdates = JSON.stringify(resumed.messages);
+        expect(resumedUpdates).toContain('"state":"recovered"');
+        expect(resumedUpdates).not.toContain("provider temporarily unavailable");
         expect(gateway.requests[10]!.body).toContain(
           "Preserve this ACP prompt through recovery.",
         );
