@@ -239,6 +239,15 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
         return error.InvalidForegroundSessionRelease;
     }
 
+    // The group receives TERM together. Keep the supervisor alive while the
+    // target uses the cooperative shutdown window.
+    const supervisor_action: std.posix.Sigaction = .{
+        .handler = .{ .handler = retainForegroundSessionOnTermination },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.TERM, &supervisor_action, null);
+
     var target = std.process.spawn(zio, .{
         .argv = args[2..],
         .stdin = .inherit,
@@ -254,6 +263,8 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
     };
     exitForegroundSessionSupervisor(term);
 }
+
+fn retainForegroundSessionOnTermination(_: std.posix.SIG) callconv(.c) void {}
 
 fn writeForegroundSessionReplaceFailure(
     nonce: []const u8,
@@ -3757,6 +3768,30 @@ test "cancellation requested by a failing output callback dominates its error" {
         .on_output_chunk = FailOutput.onChunk,
     }, std.testing.allocator, "printf 'CANCEL-AND-FAIL\\n'; sleep 5", "/tmp"));
     try std.testing.expect(trigger.seen);
+}
+
+test "cancellation preserves the termination grace beneath the session supervisor" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var trigger = CancelAfterOutput{
+        .flag = &cancel,
+        .needle = "GRACE-READY",
+    };
+    const started_ms = io_mod.milliTimestamp();
+    const result = try executeCommand(.{
+        .backend = .none,
+        .workspace_root = "/tmp",
+        .max_command_output_bytes = 4096,
+        .cancel_flag = &cancel,
+        .output_chunk_ctx = @ptrCast(&trigger),
+        .on_output_chunk = CancelAfterOutput.onChunk,
+    }, std.testing.allocator, "trap 'sleep 3; exit 130' TERM; printf 'GRACE-READY\\n'; while :; do sleep 1; done", "/tmp");
+    defer std.testing.allocator.free(result.output);
+
+    try std.testing.expect(trigger.seen);
+    try std.testing.expect(result.cancelled);
+    try std.testing.expect(io_mod.milliTimestamp() - started_ms >= 500);
 }
 
 test "cap-crossing cancellation returns a synchronized bounded result" {
