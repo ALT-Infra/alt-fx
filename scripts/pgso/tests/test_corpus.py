@@ -39,7 +39,7 @@ ACCEPTED_E2E_TESTS = (
     "session-recovery.test.ts",
     "terminal-host.test.ts",
     "tui-startup.test.ts",
-    "tui-decision-prompts.test.ts",
+    "permission-errors.test.ts",
     "tui-resize.test.ts",
     "tui-render-stress.test.ts",
     "tui-full-transcript-brutal.test.ts",
