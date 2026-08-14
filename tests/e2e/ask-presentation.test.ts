@@ -19,6 +19,7 @@ import {
   fakeGatewaySse,
   fakeGatewaySerializedToolCall,
   fakeGatewayToolCall,
+  startDynamicFakeGateway,
   startFakeGateway,
   terminalFixtureShell,
   TmuxSession,
@@ -101,6 +102,38 @@ function terminalCommand(args: string[]): string {
   const fx = [FX_BIN, ...args].map(shellQuote).join(" ");
   const script = `${fx}; code=$?; printf '\\n__FX_EXIT_%s__\\n' "$code"; exit "$code"`;
   return `/bin/sh -c ${shellQuote(script)}`;
+}
+
+function fakeGatewayStreamingText(lines: string[], delayMs: number) {
+  const encoder = new TextEncoder();
+  return new Response(
+    new ReadableStream<Uint8Array>({
+      async start(controller) {
+        for (const line of lines) {
+          controller.enqueue(encoder.encode(
+            `data: ${JSON.stringify({
+              type: "text-delta",
+              id: "answer_1",
+              delta: `${line}\n`,
+            })}\n\n`,
+          ));
+          if (delayMs > 0) await Bun.sleep(delayMs);
+        }
+        controller.enqueue(encoder.encode(
+          `data: ${JSON.stringify({
+            type: "finish",
+            finishReason: { unified: "stop", raw: "stop" },
+            usage: {
+              inputTokens: { total: 3 },
+              outputTokens: { total: lines.length },
+            },
+          })}\n\ndata: [DONE]\n\n`,
+        ));
+        controller.close();
+      },
+    }),
+    { headers: { "content-type": "text/event-stream" } },
+  );
 }
 
 describe("fx ask presentation", () => {
@@ -336,6 +369,147 @@ describe("fx ask presentation", () => {
       for (const line of answerLines) {
         const index = scrollback.indexOf(line);
         expect(index, line).toBeGreaterThan(previousIndex);
+        previousIndex = index;
+      }
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TTY output enters native scrollback before the response finishes",
+    async () => {
+      const root = createRoot();
+      const answerLines = Array.from(
+        { length: 40 },
+        (_, index) => `OPEN_STREAM_LINE_${String(index + 1).padStart(2, "0")}`,
+      );
+      let releaseResponse = () => {};
+      const responseGate = new Promise<void>((resolve) => {
+        releaseResponse = resolve;
+      });
+      const gateway = startDynamicFakeGateway(() => {
+        const encoder = new TextEncoder();
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              for (const line of answerLines) {
+                controller.enqueue(encoder.encode(
+                  `data: ${JSON.stringify({
+                    type: "text-delta",
+                    id: "answer_1",
+                    delta: `${line}\n`,
+                  })}\n\n`,
+                ));
+              }
+              void responseGate.then(() => {
+                controller.enqueue(encoder.encode(
+                  `data: ${JSON.stringify({
+                    type: "finish",
+                    finishReason: { unified: "stop", raw: "stop" },
+                    usage: {
+                      inputTokens: { total: 3 },
+                      outputTokens: { total: answerLines.length },
+                    },
+                  })}\n\ndata: [DONE]\n\n`,
+                ));
+                controller.close();
+              });
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      });
+      gateways.push(gateway);
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+
+      const session = await TmuxSession.create({
+        cmd: terminalCommand([
+          "ask",
+          "--no-save",
+          "Stream every answer line.",
+        ]),
+        cwd: root.workspace,
+        env: gatewayEnv(root.home, gateway),
+        width: 80,
+        height: 12,
+        minimumHistoryLines: 200,
+        remainOnExit: true,
+        stderrPath,
+      });
+      sessions.push(session);
+
+      try {
+        const requestDeadline = Date.now() + 5_000;
+        while (gateway.requestCount() === 0 && Date.now() < requestDeadline) {
+          await Bun.sleep(25);
+        }
+        expect(gateway.requestCount()).toBe(1);
+
+        const releaseDeadline = Date.now() + 5_000;
+        let openScrollback = "";
+        while (Date.now() < releaseDeadline) {
+          openScrollback = await session.captureFullScrollback();
+          if (openScrollback.includes(answerLines[0]!)) break;
+          await Bun.sleep(25);
+        }
+        expect(openScrollback).toContain(answerLines[0]!);
+      } finally {
+        releaseResponse();
+      }
+
+      await session.waitForText("__FX_EXIT_0__", TIMEOUT);
+      const finalScrollback = await session.captureFullScrollback();
+      for (const line of answerLines) {
+        expect(finalScrollback.split(line)).toHaveLength(2);
+      }
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TTY wrapped output stays ordered and appears exactly once",
+    async () => {
+      const root = createRoot();
+      const answerLines = Array.from(
+        { length: 7 },
+        (_, index) =>
+          `WRAPPED_LINE_${String(index + 1).padStart(2, "0")} ${"x".repeat(190)}`,
+      );
+      const gateway = startFakeGateway([
+        () => fakeGatewayStreamingText(answerLines, 3),
+      ]);
+      gateways.push(gateway);
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+
+      const session = await TmuxSession.create({
+        cmd: terminalCommand([
+          "ask",
+          "--no-save",
+          "Render every wrapped answer line.",
+        ]),
+        cwd: root.workspace,
+        env: gatewayEnv(root.home, gateway),
+        width: 100,
+        height: 20,
+        minimumHistoryLines: 100,
+        remainOnExit: true,
+        stderrPath,
+      });
+      sessions.push(session);
+
+      await session.waitForText(/__FX_EXIT_[0-9]+__/, TIMEOUT);
+      const scrollback = await session.captureFullScrollback();
+      expect(scrollback).toContain("__FX_EXIT_0__");
+      let previousIndex = -1;
+      for (const line of answerLines) {
+        const marker = line.slice(0, "WRAPPED_LINE_00".length);
+        const index = scrollback.indexOf(marker);
+        expect(index, marker).toBeGreaterThan(previousIndex);
+        expect(scrollback.split(marker)).toHaveLength(2);
         previousIndex = index;
       }
       expect(readFileSync(stderrPath, "utf8")).toBe("");

@@ -78,6 +78,7 @@ type FxLaunchOptions = {
   gatewayApiKey?: string;
   gatewayChatUrl?: string;
   gatewayModelsUrl?: string;
+  permissionMode?: "ask" | "auto" | "yolo";
 };
 
 type LocalGatewayFixture = {
@@ -121,7 +122,14 @@ const STARTUP_SCROLLBACK_DISABLED_OVERFLOW = "startup-scrollback-disabled-overfl
 const STARTUP_SCROLLBACK_ENABLED_OVERFLOW = "startup-scrollback-enabled-overflow";
 const ACTIVE_TOOL_PLACEMENT = "active-tool-placement";
 const USER_CARD_RESIZE_REPLAY_SCROLLBACK = "user-card-resize-replay-scrollback";
+const TUI_OBSERVABILITY_GAUNTLET = "tui-observability-gauntlet";
 const LOCAL_GATEWAY_COMPLETION = "RENDER_LAB_LOCAL_GATEWAY_OK";
+const OBSERVABILITY_TRANSCRIPT_HEAD = "OBSERVABILITY_TRANSCRIPT_HEAD";
+const OBSERVABILITY_TRANSCRIPT_TAIL = "OBSERVABILITY_TRANSCRIPT_TAIL";
+const OBSERVABILITY_FINAL_MARKER = "OBSERVABILITY_FINAL_RESPONSE";
+const OBSERVABILITY_PERMISSION_PROMPT = "Would you like to run the following command?";
+const OBSERVABILITY_PERMISSION_REVIEW = "Permission needed";
+const OBSERVABILITY_TOOL_COMMAND = "touch render-lab-observability-approved.txt";
 const LOCAL_GATEWAY_CHAT_PATH = "/v3/ai/language-model";
 const LOCAL_GATEWAY_MODELS_PATH = "/v1/models";
 const DEFAULT_BENCH_SIZES: RenderLabTerminalSize[] = [
@@ -133,7 +141,7 @@ const BENCHMARK_COMBINED_P95_LIMIT_MS = 8;
 const BENCHMARK_P95_MIN_RUNS = 20;
 const PROMPT_TEXT = "FX_RENDER_LAB%";
 const TRACE_SCOPES =
-  "render,paint,resize,scroll,footer.clean,input,frame_layout,frame_plan,frame_diff,frame_commit,frame_owner_violation,frame_schedule,ui_activity";
+  "render,paint,resize,scroll,footer.clean,input,permission,frame_layout,frame_plan,frame_diff,frame_commit,frame_owner_violation,frame_schedule,ui_activity";
 const QUIESCENCE_INTERVAL_MS = 300;
 const ACTIVE_TOOL_RESIZE_CAPTURE_TIMEOUT_MS = 30_000;
 
@@ -174,6 +182,8 @@ export async function runRenderLab(rawOptions: Partial<Options> = {}): Promise<R
       results.push(await runActiveToolPlacement(options.out, i + 1));
     } else if (options.scenario === USER_CARD_RESIZE_REPLAY_SCROLLBACK) {
       results.push(await runUserCardResizeReplayScrollback(options.out, i + 1));
+    } else if (options.scenario === TUI_OBSERVABILITY_GAUNTLET) {
+      results.push(await runTuiObservabilityGauntlet(options.out, i + 1));
     } else if (
       options.scenario === STARTUP_SCROLLBACK_DISABLED_OVERFLOW ||
       options.scenario === STARTUP_SCROLLBACK_ENABLED_OVERFLOW
@@ -194,6 +204,7 @@ export async function runRenderLab(rawOptions: Partial<Options> = {}): Promise<R
           BUFFER_SYSTEM_FRAME_BENCH,
           ACTIVE_TOOL_PLACEMENT,
           USER_CARD_RESIZE_REPLAY_SCROLLBACK,
+          TUI_OBSERVABILITY_GAUNTLET,
           STARTUP_SCROLLBACK_DISABLED_OVERFLOW,
           STARTUP_SCROLLBACK_ENABLED_OVERFLOW,
           ...nativeScenarioNames(),
@@ -756,6 +767,216 @@ async function runUserCardResizeReplayScrollback(
     gateway.releaseResponse();
     gateway.stop();
     writeFileSync(join(artifactDir, "gateway-requests.log"), `${gateway.requests.join("\n")}\n`);
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}
+
+async function runTuiObservabilityGauntlet(
+  outRoot: string,
+  runNumber: number,
+): Promise<RenderLabManifest> {
+  preflight();
+
+  const scenario = TUI_OBSERVABILITY_GAUNTLET;
+  const startedAt = new Date();
+  const markerSuffix = randomBytes(4).toString("hex");
+  const runId = `${scenario}-${timestampForPath(startedAt)}-${runNumber}-${markerSuffix}`;
+  const artifactDir = join(outRoot, `run-${timestampForPath(startedAt)}-${runNumber}`);
+  mkdirSync(join(artifactDir, "replay", "frames"), { recursive: true });
+
+  const binarySha256 = sha256(FX_BIN);
+  const shellMarker = `OBSERVABILITY_SHELL_HISTORY_${markerSuffix}`;
+  const promptHead = `OBSERVABILITY_PROMPT_HEAD_${markerSuffix}`;
+  const promptTail = `OBSERVABILITY_PROMPT_TAIL_${markerSuffix}`;
+  const prompt = [
+    promptHead,
+    "exercise transcript, permission UI, tmux resize, scrollback, and final composer recovery",
+    promptTail,
+  ].join(" ");
+  const manifest: RenderLabManifest = {
+    version: 1,
+    scenario,
+    runId,
+    startedAt: startedAt.toISOString(),
+    completedAt: null,
+    repoRoot: REPO_ROOT,
+    artifactDir,
+    binaryPath: FX_BIN,
+    binarySha256,
+    traceLogPath: join(artifactDir, "trace.log"),
+    tapePath: join(artifactDir, "render.fxtape"),
+    finalGridPath: join(artifactDir, "final-grid.txt"),
+    replaySummaryPath: join(artifactDir, "replay-summary.json"),
+    runtimeEvidencePath: join(artifactDir, "runtime-evidence.json"),
+    reportPath: join(artifactDir, "report.html"),
+    failurePath: join(artifactDir, "failure.md"),
+    finalFrameIndex: null,
+    evidence: runtimeEvidenceDefaults(),
+    markers: {
+      shell: [shellMarker],
+      clearedShell: [shellMarker],
+      submitted: [promptHead, promptTail],
+      history: [
+        "Run /help for commands",
+        OBSERVABILITY_TRANSCRIPT_HEAD,
+        OBSERVABILITY_TRANSCRIPT_TAIL,
+        "OBSERVABILITY_TOOL_OUTPUT",
+        OBSERVABILITY_FINAL_MARKER,
+      ],
+    },
+    frames: [],
+    failures: [],
+  };
+  writeManifest(manifest);
+  writeReproScript(manifest);
+
+  const fixture = createFixture(runId);
+  const gateway = startObservabilityGatewayFixture(promptTail);
+  let session: RenderLabTmux | null = null;
+  try {
+    session = await RenderLabTmux.create({
+      fixture,
+      manifest,
+      width: 120,
+      height: 36,
+    });
+    const context = { fixture, manifest, binarySha256 };
+
+    await runShellCommand(
+      context,
+      session,
+      `printf '%s\\n' ${shQuote(shellMarker)}`,
+      shellMarker,
+      "observability-shell-seed",
+    );
+
+    await launchFx(context, session, "observability", {
+      stderrPath: join(artifactDir, "stderr.log"),
+      gatewayApiKey: "render-lab-local-gateway-key",
+      gatewayChatUrl: gateway.chatUrl,
+      gatewayModelsUrl: gateway.modelsUrl,
+      permissionMode: "ask",
+    });
+    await session.sendText(prompt);
+    await waitForLocalGatewayRequest(
+      gateway.requests,
+      `POST ${LOCAL_GATEWAY_CHAT_PATH}`,
+      10_000,
+    );
+    await session.waitForPane(
+      (pane) =>
+        pane.includes(OBSERVABILITY_PERMISSION_PROMPT) &&
+        pane.includes(OBSERVABILITY_TRANSCRIPT_TAIL),
+      15_000,
+    );
+    await capture(context, session, "observability-permission-inline");
+
+    await session.resize(40, 13);
+    await session.waitForPane(
+      (pane) => pane.includes(OBSERVABILITY_PERMISSION_REVIEW),
+      10_000,
+    );
+    await capture(context, session, "observability-permission-review");
+
+    await session.resize(120, 36);
+    await session.waitForPane(
+      (pane) => pane.includes(OBSERVABILITY_PERMISSION_PROMPT),
+      10_000,
+    );
+    await capture(context, session, "observability-permission-restored");
+
+    await session.sendLiteral("1");
+    await waitForLocalGatewayRequestCount(
+      gateway.requests,
+      `POST ${LOCAL_GATEWAY_CHAT_PATH}`,
+      2,
+      20_000,
+    );
+    await session.waitForPane(
+      (pane) => pane.includes("OBSERVABILITY_TOOL_OUTPUT"),
+      10_000,
+    );
+    await capture(context, session, "observability-tool-completed");
+    if (!existsSync(join(fixture.work, "render-lab-observability-approved.txt"))) {
+      throw new Error("approved observability command did not execute");
+    }
+
+    gateway.releaseResponse();
+    await session.waitForPane(
+      (pane) => pane.includes(OBSERVABILITY_FINAL_MARKER),
+      15_000,
+    );
+    await capture(context, session, "observability-final-wide");
+
+    await session.resize(76, 24);
+    await session.waitForPane(
+      (pane) => pane.includes(OBSERVABILITY_FINAL_MARKER),
+      10_000,
+    );
+    await capture(context, session, "observability-final-narrow");
+
+    await session.resize(132, 42);
+    await session.waitForPane(
+      (pane) => pane.includes(OBSERVABILITY_FINAL_MARKER),
+      10_000,
+    );
+    const finalFrame = await capture(
+      context,
+      session,
+      "observability-final-restored",
+    );
+    manifest.finalFrameIndex = finalFrame.index;
+    await recordQuiescentInterval(
+      manifest,
+      "observability-final-quiescent",
+      QUIESCENCE_INTERVAL_MS,
+    );
+
+    await quitFx(context, session, "observability-cleanup");
+    await session.sendText("exit");
+    await session.waitForEnd(10_000);
+    session = null;
+
+    const postRequests = gateway.requests.filter(
+      (request) => request === `POST ${LOCAL_GATEWAY_CHAT_PATH}`,
+    );
+    if (postRequests.length !== 2) {
+      throw new Error(`expected two gateway chat requests, found ${postRequests.length}`);
+    }
+
+    await writeReplaySummary(manifest);
+    writeRuntimeEvidence(manifest);
+    const analysis = analyzeRun(manifest);
+    manifest.failures = analysis.failures;
+    manifest.completedAt = new Date().toISOString();
+    writeManifest(manifest);
+    writeFailureFile(manifest);
+    writeReport(manifest);
+    return manifest;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const failure: RenderLabFailure = {
+      invariant: "scenario-error",
+      frameIndex: manifest.frames.at(-1)?.index ?? 0,
+      event: manifest.frames.at(-1)?.event ?? "startup",
+      message,
+    };
+    manifest.failures = [...manifest.failures, failure];
+    manifest.completedAt = new Date().toISOString();
+    writeManifest(manifest);
+    writeFailureFile(manifest);
+    try {
+      writeReport(manifest);
+    } catch {}
+    throw error;
+  } finally {
+    if (session) await session.kill();
+    gateway.releaseResponse();
+    gateway.stop();
+    writeFileSync(
+      join(artifactDir, "gateway-requests.log"),
+      `${gateway.requests.join("\n")}\n`,
+    );
     rmSync(fixture.root, { recursive: true, force: true });
   }
 }
@@ -1418,6 +1639,7 @@ async function launchFx(
     options.gatewayApiKey ? `AI_GATEWAY_API_KEY=${shQuote(options.gatewayApiKey)}` : null,
     options.gatewayChatUrl ? `FX_E2E_GATEWAY_CHAT_URL=${shQuote(options.gatewayChatUrl)}` : null,
     options.gatewayModelsUrl ? `FX_E2E_GATEWAY_MODELS_URL=${shQuote(options.gatewayModelsUrl)}` : null,
+    options.permissionMode ? `FX_PERMISSION_MODE=${shQuote(options.permissionMode)}` : null,
   ].filter((entry): entry is string => entry !== null).join(" ");
   const environmentPrefix = environment.length > 0 ? `${environment} ` : "";
   const stderrRedirect = options.stderrPath ? ` 2>${shQuote(options.stderrPath)}` : "";
@@ -1564,6 +1786,117 @@ function startActiveToolGatewayFixture(): LocalGatewayFixture {
       releaseResponseGate();
     },
     stop() { server.stop(true); },
+  };
+}
+
+function startObservabilityGatewayFixture(
+  expectedPromptTail: string,
+): LocalGatewayFixture {
+  const requests: string[] = [];
+  let chatRequestCount = 0;
+  let responseReleased = false;
+  let releaseResponseGate!: () => void;
+  const responseGate = new Promise<void>((resolve) => {
+    releaseResponseGate = resolve;
+  });
+  const transcript = [
+    OBSERVABILITY_TRANSCRIPT_HEAD,
+    ...Array.from(
+      { length: 28 },
+      (_, index) =>
+        `OBSERVABILITY_TRANSCRIPT_LINE_${String(index + 1).padStart(2, "0")}`,
+    ),
+    OBSERVABILITY_TRANSCRIPT_TAIL,
+  ].join("\n");
+  const command =
+    `printf '\\117\\102\\123\\105\\122\\126\\101\\102\\111\\114\\111\\124\\131\\137\\124\\117\\117\\114\\137\\117\\125\\124\\120\\125\\124\\n'; ${OBSERVABILITY_TOOL_COMMAND}`;
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    idleTimeout: 0,
+    async fetch(request) {
+      const url = new URL(request.url);
+      if (request.method === "GET" && url.pathname === LOCAL_GATEWAY_MODELS_PATH) {
+        requests.push(`${request.method} ${url.pathname}`);
+        return Response.json({
+          data: [
+            {
+              id: "anthropic/claude-opus-4.7",
+              type: "language",
+              released: 1,
+              tags: ["tool-use"],
+            },
+          ],
+        });
+      }
+      if (request.method === "POST" && url.pathname === LOCAL_GATEWAY_CHAT_PATH) {
+        const body = await request.text();
+        requests.push(`${request.method} ${url.pathname}`);
+        chatRequestCount += 1;
+        if (chatRequestCount === 1 && !body.includes(expectedPromptTail)) {
+          return new Response("prompt tail missing", { status: 422 });
+        }
+        if (chatRequestCount === 2) await responseGate;
+        const events = chatRequestCount === 1
+          ? [
+              {
+                type: "text-delta",
+                id: "observability-transcript",
+                delta: transcript,
+              },
+              {
+                type: "tool-input-start",
+                id: "observability-tool-1",
+                toolName: "run_command",
+              },
+              {
+                type: "tool-call",
+                toolCallId: "observability-tool-1",
+                toolName: "run_command",
+                input: { command },
+              },
+              {
+                type: "finish",
+                finishReason: { unified: "tool-calls", raw: "tool-calls" },
+                usage: {
+                  inputTokens: { total: 1 },
+                  outputTokens: { total: 1 },
+                },
+              },
+            ]
+          : [
+              {
+                type: "text-delta",
+                id: "observability-final",
+                delta: OBSERVABILITY_FINAL_MARKER,
+              },
+              {
+                type: "finish",
+                finishReason: { unified: "stop", raw: "stop" },
+                usage: {
+                  inputTokens: { total: 1 },
+                  outputTokens: { total: 1 },
+                },
+              },
+            ];
+        return gatewaySse(events);
+      }
+      return new Response("not found", { status: 404 });
+    },
+  });
+  const baseUrl = `http://127.0.0.1:${server.port}`;
+  return {
+    chatUrl: `${baseUrl}${LOCAL_GATEWAY_CHAT_PATH}`,
+    modelsUrl: `${baseUrl}${LOCAL_GATEWAY_MODELS_PATH}`,
+    requests,
+    releaseResponse() {
+      if (responseReleased) return;
+      responseReleased = true;
+      releaseResponseGate();
+    },
+    stop() {
+      server.stop(true);
+    },
   };
 }
 
@@ -2158,6 +2491,9 @@ function printHelp(): void {
       "user-card scenarios:",
       `  ${USER_CARD_RESIZE_REPLAY_SCROLLBACK}`,
       "",
+      "observability scenarios:",
+      `  ${TUI_OBSERVABILITY_GAUNTLET}`,
+      "",
       ...nativeScenarioHelpLines(),
     ].join("\n"),
   );
@@ -2181,6 +2517,9 @@ function printScenarioList(): void {
       "",
       "user-card scenarios:",
       `  ${USER_CARD_RESIZE_REPLAY_SCROLLBACK}`,
+      "",
+      "observability scenarios:",
+      `  ${TUI_OBSERVABILITY_GAUNTLET}`,
       "",
       ...nativeScenarioHelpLines(),
     ].join("\n"),

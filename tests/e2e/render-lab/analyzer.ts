@@ -10,6 +10,8 @@ import type {
 export const ACTIVE_TOOL_MARKER = "Running sleep 1; i=1";
 export const TERMINAL_TOOL_MARKER = "Ran sleep 1; i=1";
 const ACTIVE_TOOL_FINAL_MARKER = "RENDER_LAB_LOCAL_GATEWAY_OK";
+const OBSERVABILITY_PERMISSION_PROMPT = "Would you like to run the following command?";
+const OBSERVABILITY_PERMISSION_REVIEW = "Permission needed";
 
 export function commandMoreCount(text: string): number | null {
   const match = text.match(/│ … (\d+) (?:(?:line|lines) more \(ctrl(?:\+| )o to view\)|more \(ctrl(?:\+| )o\)|more)/);
@@ -76,6 +78,7 @@ export function analyzeRun(manifest: RenderLabManifest) {
 
     assertActiveToolPlacementScenario(failures, frame, manifest);
     assertUserCardResizeScenario(failures, frame, manifest);
+    assertTuiObservabilityFrame(failures, frame, manifest);
 
     if (countLogoBlocks(frame.grid, logoRows) > 1) {
       push(failures, "single-active-logo", frame, "more than one active Fx logo block is visible");
@@ -173,6 +176,7 @@ export function analyzeRun(manifest: RenderLabManifest) {
 
   const trace = readOptional(manifest.traceLogPath);
   assertActiveToolScenarioSequence(failures, frames, manifest);
+  assertTuiObservabilitySequence(failures, frames, manifest);
   const finalFrame = frames.find((frame) => frame.index === manifest.finalFrameIndex) ?? frames.at(-1);
   if (finalFrame) {
     const clearedShellMarkers = new Set(manifest.markers.clearedShell ?? []);
@@ -212,7 +216,12 @@ export function analyzeRun(manifest: RenderLabManifest) {
     if (traceFrame && footerCleanCount > 1500) {
       push(failures, "footer-clean-spam", traceFrame, `trace contains ${footerCleanCount} footer clean lines`);
     }
-    if (traceFrame && repaintCount > 500 && manifest.scenario !== "active-tool-placement") {
+    if (
+      traceFrame &&
+      repaintCount > 500 &&
+      manifest.scenario !== "active-tool-placement" &&
+      manifest.scenario !== "tui-observability-gauntlet"
+    ) {
       push(failures, "repaint-spam", traceFrame, `trace contains ${repaintCount} repaint/render lines`);
     }
     if (
@@ -227,12 +236,16 @@ export function analyzeRun(manifest: RenderLabManifest) {
     assertStartupOverflowTrace(failures, traceFrame, manifest, trace);
     assertStartupOverflowTape(failures, traceFrame, manifest);
   }
+  if (traceFrame && manifest.scenario === "tui-observability-gauntlet") {
+    assertTuiObservabilityTape(failures, traceFrame, manifest);
+  }
   if (
     traceFrame &&
     (
       isStartupOverflowScenario(manifest.scenario) ||
       manifest.scenario === "user-card-resize-replay-scrollback" ||
-      manifest.scenario === "active-tool-placement"
+      manifest.scenario === "active-tool-placement" ||
+      manifest.scenario === "tui-observability-gauntlet"
     )
   ) {
     const stderr = readOptional(join(manifest.artifactDir, "stderr.log"));
@@ -785,6 +798,209 @@ function assertUserCardResizeScenario(
   }
 }
 
+function assertTuiObservabilityFrame(
+  failures: RenderLabFailure[],
+  frame: RenderLabFrame,
+  manifest: RenderLabManifest,
+): void {
+  if (manifest.scenario !== "tui-observability-gauntlet") return;
+
+  const grid = frame.grid.join("\n");
+  if (
+    frame.event === "observability-permission-inline" ||
+    frame.event === "observability-permission-restored"
+  ) {
+    assertObservabilityCount(
+      failures,
+      frame,
+      grid,
+      OBSERVABILITY_PERMISSION_PROMPT,
+      1,
+      "observability-permission-singleton",
+      "active grid",
+    );
+  }
+  if (frame.event === "observability-permission-review") {
+    assertObservabilityCount(
+      failures,
+      frame,
+      grid,
+      OBSERVABILITY_PERMISSION_REVIEW,
+      1,
+      "observability-permission-review-singleton",
+      "active grid",
+    );
+  }
+
+  if (
+    frame.event === "observability-permission-inline" ||
+    frame.event === "observability-permission-restored" ||
+    frame.event === "observability-tool-completed"
+  ) {
+    assertObservabilityScrollbackMarkers(
+      failures,
+      frame,
+      [
+        ...manifest.markers.submitted,
+        "OBSERVABILITY_TRANSCRIPT_HEAD",
+        "OBSERVABILITY_TRANSCRIPT_TAIL",
+        ...(frame.event === "observability-tool-completed"
+          ? ["OBSERVABILITY_TOOL_OUTPUT"]
+          : []),
+      ],
+    );
+  }
+
+  if (frame.event.startsWith("observability-final-")) {
+    if (
+      grid.includes(OBSERVABILITY_PERMISSION_PROMPT) ||
+      grid.includes(OBSERVABILITY_PERMISSION_REVIEW)
+    ) {
+      push(
+        failures,
+        "observability-permission-dismissed",
+        frame,
+        "permission UI remained visible after approval",
+      );
+    }
+    const orderedMarkers = [
+      ...manifest.markers.submitted,
+      "OBSERVABILITY_TRANSCRIPT_HEAD",
+      "OBSERVABILITY_TRANSCRIPT_TAIL",
+      "OBSERVABILITY_TOOL_OUTPUT",
+      "OBSERVABILITY_FINAL_RESPONSE",
+    ];
+    assertObservabilityScrollbackMarkers(failures, frame, orderedMarkers);
+    assertObservabilityMarkerOrder(failures, frame, orderedMarkers);
+  }
+}
+
+function assertObservabilityScrollbackMarkers(
+  failures: RenderLabFailure[],
+  frame: RenderLabFrame,
+  markers: string[],
+): void {
+  for (const marker of markers) {
+    assertObservabilityCount(
+      failures,
+      frame,
+      frame.scrollback,
+      marker,
+      1,
+      "observability-scrollback-once",
+      "full scrollback",
+    );
+  }
+}
+
+function assertObservabilityMarkerOrder(
+  failures: RenderLabFailure[],
+  frame: RenderLabFrame,
+  markers: string[],
+): void {
+  let previous = -1;
+  for (const marker of markers) {
+    const index = frame.scrollback.indexOf(marker);
+    if (index < 0) return;
+    if (index <= previous) {
+      push(
+        failures,
+        "observability-scrollback-order",
+        frame,
+        `marker ${JSON.stringify(marker)} is out of transcript order`,
+      );
+      return;
+    }
+    previous = index;
+  }
+}
+
+function assertObservabilityCount(
+  failures: RenderLabFailure[],
+  frame: RenderLabFrame,
+  text: string,
+  marker: string,
+  expected: number,
+  invariant: string,
+  source: string,
+): void {
+  const actual = countOccurrences(text, marker);
+  if (actual === expected) return;
+  push(
+    failures,
+    invariant,
+    frame,
+    `expected ${JSON.stringify(marker)} ${expected} time(s) in ${source}, found ${actual}`,
+  );
+}
+
+function assertTuiObservabilitySequence(
+  failures: RenderLabFailure[],
+  frames: RenderLabFrame[],
+  manifest: RenderLabManifest,
+): void {
+  if (manifest.scenario !== "tui-observability-gauntlet") return;
+  const required = [
+    "observability-permission-inline",
+    "observability-permission-review",
+    "observability-permission-restored",
+    "observability-tool-completed",
+    "observability-final-wide",
+    "observability-final-narrow",
+    "observability-final-restored",
+  ];
+  const anchor = frames.at(-1);
+  if (!anchor) return;
+  const indices = required.map((event) =>
+    frames.findIndex((frame) => frame.event === event)
+  );
+  for (const [offset, event] of required.entries()) {
+    if (indices[offset] < 0) {
+      push(failures, "observability-stage-missing", anchor, `missing ${event}`);
+    }
+  }
+  const present = indices.filter((index) => index >= 0);
+  if (present.some((index, offset) => offset > 0 && index <= present[offset - 1]!)) {
+    push(
+      failures,
+      "observability-stage-order",
+      anchor,
+      `stages are out of order: ${required.join(", ")}`,
+    );
+  }
+}
+
+function assertTuiObservabilityTape(
+  failures: RenderLabFailure[],
+  frame: RenderLabFrame,
+  manifest: RenderLabManifest,
+): void {
+  let tape: string;
+  try {
+    tape = Buffer.concat(
+      stdoutFrames(manifest.tapePath).map((entry) => entry.payload),
+    ).toString("binary");
+  } catch (error) {
+    push(
+      failures,
+      "observability-tape-parse",
+      frame,
+      error instanceof Error ? error.message : String(error),
+    );
+    return;
+  }
+  const enters = countOccurrences(tape, "\x1b[?1049h");
+  const exits = countOccurrences(tape, "\x1b[?1049l");
+  if (enters < 1 || exits < 1 || enters !== exits) {
+    push(
+      failures,
+      "observability-alternate-screen-lifecycle",
+      frame,
+      `expected balanced alternate-screen ownership, found ${enters} enter(s) and ${exits} exit(s)`,
+    );
+  }
+}
+
 function assertMarkerCount(
   failures: RenderLabFailure[],
   frame: RenderLabFrame,
@@ -842,6 +1058,7 @@ function expectsFxChrome(
   if (
     frame.event.startsWith("shell-") ||
     frame.event.startsWith("native-shell-") ||
+    frame.event.startsWith("observability-permission-") ||
     frame.event.includes("fx-quit-requested") ||
     frame.event.includes("post-quit-shell-prompt")
   ) {

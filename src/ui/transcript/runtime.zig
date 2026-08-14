@@ -60,6 +60,11 @@ pub const ResizeObservationPhase = enum {
     reset_queued,
 };
 
+pub const HistoryReleasePolicy = enum {
+    finality_gated,
+    append_only,
+};
+
 pub const ResizeObservationResult = union(enum) {
     awaiting,
     measured: i32,
@@ -4391,6 +4396,10 @@ pub const TranscriptRuntime = struct {
     /// a writable tail as non-final. Defaults to writable so a driver that
     /// never reports closure over-holds instead of releasing mutable rows.
     assistant_tail_writable: bool = true,
+    /// Interactive transcripts gate native-history release on producer
+    /// finality. One-shot presenters use append-only release because they do
+    /// not revisit rows after writing them.
+    history_release_policy: HistoryReleasePolicy = .finality_gated,
     /// Sorted by entry id so exact lookup stays bounded as history grows.
     tool_details: std.ArrayList(ToolDetailRecord) = .empty,
     /// Monotonically increasing id stamped onto each new entry by the
@@ -6932,6 +6941,7 @@ pub const TranscriptRuntime = struct {
         self: *const TranscriptRuntime,
         prepared: *const transcript_painter.PreparedTranscriptSurfacePaint,
     ) ?usize {
+        if (self.history_release_policy == .append_only) return null;
         const candidates = prepared.finality_candidates;
         var floor: ?usize = null;
         if (candidates.mutation_pin_start) |start| {
@@ -8348,15 +8358,31 @@ pub const TranscriptRuntime = struct {
         else
             null;
         const held_projected_flow_end: ?usize = if (target.hold_staged)
-            if (append_base) |base|
-                transcript_painter.preparedTranscriptFlowOffsetForVisualOffset(
+            if (append_base) |base| held: {
+                const base_visual_end = base.visual_offset + base.visual_rows;
+                const target_base_flow_end =
+                    transcript_painter.preparedTranscriptFlowOffsetForVisualOffset(
+                        prepared,
+                        self.layout.cols,
+                        base_visual_end,
+                    ) orelse break :held null;
+                if (target_base_flow_end < base.flow_len) break :held null;
+                // Target growth can terminate the committed line at its byte
+                // endpoint. Charge that cursor movement before advancing into
+                // the final rows this frame may release.
+                const drift = walkText(
+                    1,
+                    base.cursor_col,
+                    target_flow[base.flow_len..target_base_flow_end],
+                    self.layout.cols,
+                ).end_row - 1;
+                if (drift > accepted.semantic_progress_rows) break :held base.flow_len;
+                break :held transcript_painter.preparedTranscriptFlowOffsetForVisualOffset(
                     prepared,
                     self.layout.cols,
-                    base.visual_offset + base.visual_rows +
-                        accepted.semantic_progress_rows,
-                )
-            else
-                null
+                    base_visual_end + accepted.semantic_progress_rows - drift,
+                );
+            } else null
         else
             null;
         const projected_flow_end: ?usize = if (append_base) |base|

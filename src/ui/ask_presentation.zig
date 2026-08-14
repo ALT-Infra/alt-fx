@@ -64,6 +64,7 @@ pub const Runtime = struct {
                 .history_reset_uses_ris = shell_runtime.detectHistoryResetUsesRis(alloc),
                 .layout = layout,
                 .maxxing_mode = presentation_mode.MaxxingMode.minimal,
+                .history_release_policy = .append_only,
             },
             .no_color = no_color,
         };
@@ -105,7 +106,6 @@ pub const Runtime = struct {
     pub fn pushText(self: *Runtime, text: []const u8) !void {
         try self.checkPendingError();
         errdefer |err| self.rememberFailure(err);
-        self.shell.setAssistantTailWritable(true);
         _ = try self.shell.streamAssistantChunk(self.alloc, &self.metrics, text);
         try self.render();
     }
@@ -114,10 +114,6 @@ pub const Runtime = struct {
         try self.checkPendingError();
         errdefer |err| self.rememberFailure(err);
         _ = try self.shell.applyToolLifecycle(self.alloc, event);
-        switch (event) {
-            .turn_finished => self.shell.setAssistantTailWritable(false),
-            else => {},
-        }
         try self.render();
         switch (event) {
             .turn_finished => try self.shell.finishLifecycleBatch(self.alloc),
@@ -147,8 +143,7 @@ pub const Runtime = struct {
     pub fn finish(self: *Runtime) !void {
         try self.checkPendingError();
         if (self.finished) return;
-        self.shell.setAssistantTailWritable(false);
-        try self.render();
+        if (self.shell.render_requests.hasPending()) try self.render();
         try self.restoreTerminal();
         self.finished = true;
     }
@@ -479,36 +474,4 @@ test "ask presentation retains a streaming write failure until finish" {
     };
     const write_err = observed orelse return error.TestExpectedError;
     try std.testing.expectError(write_err, runtime.finish());
-}
-
-test "ask presentation finish closes the assistant producer" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var output = try tmp.dir.createFile(std.testing.io, "ask-finish.log", .{ .read = true });
-    defer output.close(io_mod.getIo());
-
-    var runtime = try Runtime.initConfigured(
-        alloc,
-        .{ .text = @constCast("show output") },
-        false,
-        output,
-        zeroFooterLayout(.{
-            .rows = 12,
-            .cols = 48,
-            .content_bottom = 12,
-            .divider_top_row = 12,
-            .input_row = 12,
-            .divider_bottom_row = 12,
-            .hint_row = 12,
-        }),
-        .{ .row = 1, .col = 1 },
-        true,
-    );
-    defer runtime.deinit();
-
-    try runtime.pushText("answer\n");
-    try std.testing.expect(runtime.shell.assistant_tail_writable);
-    try runtime.finish();
-    try std.testing.expect(!runtime.shell.assistant_tail_writable);
 }
