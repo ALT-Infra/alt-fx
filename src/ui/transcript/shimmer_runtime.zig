@@ -113,18 +113,12 @@ fn wrappedStaticActivityLabel(
         const available = if (safe_cols > indent_width) safe_cols - indent_width else 1;
         const last_row = row_count + 1 == max_rows;
         var chunk: []const u8 = undefined;
-        if (last_row) {
+        if (last_row and display_width.visibleWidthIgnoringAnsi(remaining) > available) {
             const marker = omissionMarker(@intCast(@min(available, std.math.maxInt(u16))));
-            const chunk_width = if (available > marker.len) available - marker.len else 0;
-            chunk = display_width.wrapCutIgnoringAnsi(remaining, chunk_width);
-            if (chunk.len == 0 and remaining.len > 0 and chunk_width > 0) {
-                const unit = display_width.displayUnitAt(remaining, 0);
-                chunk = remaining[0..unit.byte_len];
-            }
-            try appendStaticActivityLine(alloc, &out, prefix, continuation_indent_width, chunk, first);
-            if (display_width.trimBreakWhitespace(remaining[chunk.len..]).len > 0 and marker.len > 0) {
-                try out.appendSlice(alloc, marker);
-            }
+            const suffix_width = available -| marker.len;
+            const suffix = display_width.suffixByWidthIgnoringAnsi(remaining, suffix_width);
+            try appendStaticActivityLine(alloc, &out, prefix, continuation_indent_width, marker, first);
+            try out.appendSlice(alloc, suffix);
             remaining = "";
         } else {
             chunk = display_width.wrapCutIgnoringAnsi(remaining, available);
@@ -538,6 +532,29 @@ test "activity surface painter wraps static status labels under marker" {
     try std.testing.expectEqual(paint_plan.CellOwner.activity, fixtures.surface.cellAt(5, 1).?.owner);
     try std.testing.expectEqual(paint_plan.CellOwner.footer, fixtures.surface.cellAt(6, 1).?.owner);
     try fixtures.surface.validate();
+}
+
+test "static status truncation preserves recovery action and attempt suffix" {
+    const preview = try wrappedStaticActivityLabel(
+        std.testing.allocator,
+        "⚠ Provider unavailable · no_available_providers: No providers are currently available · retrying request in 4s · attempt 4/10",
+        32,
+        3,
+    );
+    defer preview.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.startsWith(u8, preview.bytes, "⚠ Provider unavailable ·"));
+    try std.testing.expect(std.mem.indexOf(u8, preview.bytes, "no_available_providers:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, preview.bytes, "...") != null);
+    try std.testing.expect(std.mem.endsWith(u8, preview.bytes, "attempt 4/10"));
+
+    var lines = std.mem.splitScalar(u8, preview.bytes, '\n');
+    var line_count: usize = 0;
+    while (lines.next()) |line| {
+        line_count += 1;
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 32);
+    }
+    try std.testing.expectEqual(@as(usize, 3), line_count);
 }
 
 test "activity surface painter breaks static status rows at word boundaries" {

@@ -1830,6 +1830,15 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           "second route recovery request",
         ),
       ]);
+
+      await session.resizeWindow(32, 24);
+      const narrowPane = await session.capturePane();
+      expect(narrowPane).toContain("⚠ Provider unavailable");
+      expect(narrowPane).toContain("provider_error:");
+      expect(narrowPane).toContain("attempt 1/10");
+      expect(narrowPane).not.toContain("▲");
+
+      await session.resizeWindow(72, 24);
       releaseFinalResponse?.();
       await session.waitForText(finalText, TIMEOUT);
       const scrollback = await session.captureFullScrollback();
