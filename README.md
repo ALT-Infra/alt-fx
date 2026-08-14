@@ -74,7 +74,7 @@ The WebAssembly SDK is experimental. See the [WebAssembly SDK](sdk/README.md) an
 
 ## Extend fx
 
-Add reusable instructions with [skills](https://fx.sh/docs/capabilities/skills), connect external tools through [MCP](https://fx.sh/docs/capabilities/mcp), or delegate independent work to [subagents](https://fx.sh/docs/capabilities/subagents).
+Add reusable instructions with [skills](https://fx.sh/docs/capabilities/skills), connect external tools through [MCP](https://fx.sh/docs/capabilities/mcp), or delegate independent work to [subagents](https://fx.sh/docs/capabilities/subagents). `fx status` and `fx doctor` report an invalid trusted MCP profile without starting its servers.
 
 ## Documentation
 

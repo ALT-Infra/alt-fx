@@ -38,6 +38,7 @@ else
     struct {};
 const context_contract = @import("../workspace/context_contract.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
+const mcp_contract = @import("../mcp/mcp_contract.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
@@ -183,6 +184,7 @@ pub const Config = struct {
     context_registry: context_contract.Registry,
     mode_registry: mode_registry.Registry,
     tool_set: tool_set_contract.ToolSet,
+    inspect_mcp_profile_config: mcp_contract.InspectProfileConfigFn,
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
     acp_runner: acp_runner.Runner,
     devbox_provider: ?devbox_executor.Provider = null,
@@ -789,12 +791,13 @@ fn runNonInteractiveWithDeps(
             );
             defer startup.deinit(alloc);
             try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
+            const mcp_config_diagnostic = try cfg.inspect_mcp_profile_config(alloc);
 
             const snapshot = statusSnapshotFromStartupWithBuild(startup, .{
                 .channel = cfg.build_channel,
                 .version = cfg.version,
                 .revision = cfg.revision,
-            });
+            }, mcp_config_diagnostic);
             if (opts.format == .json) {
                 try writeStatusJsonLine(alloc, deps, snapshot);
                 return .handled_success;
@@ -890,11 +893,13 @@ fn runNonInteractiveWithDeps(
                 return .handled_failure;
             };
 
+            const mcp_config_diagnostic = try cfg.inspect_mcp_profile_config(alloc);
             var snapshot = try doctor_runtime.collect(
                 alloc,
                 cfg.secret_store,
                 cfg.default_model,
                 cfg.default_agent_step_limit,
+                mcp_config_diagnostic,
             );
             defer snapshot.deinit(alloc);
 
@@ -1673,12 +1678,13 @@ fn statusSnapshotFromStartup(startup: app_lifecycle.StartupStatus) output_contra
         .channel = .stable,
         .version = "",
         .revision = "",
-    });
+    }, .clear);
 }
 
 fn statusSnapshotFromStartupWithBuild(
     startup: app_lifecycle.StartupStatus,
     build: update_target.CurrentBuild,
+    mcp_config_diagnostic: mcp_contract.ProfileConfigDiagnostic,
 ) output_contracts.StatusSnapshot {
     return .{
         .model = startup.selected_model,
@@ -1696,6 +1702,10 @@ fn statusSnapshotFromStartupWithBuild(
         .update_channel = startup.update_channel.label(),
         .build_channel = build.channel.label(),
         .build_revision = build.revision,
+        .mcp_config_error = switch (mcp_config_diagnostic) {
+            .clear => null,
+            .failed => |err| @errorName(err),
+        },
     };
 }
 
@@ -4595,6 +4605,73 @@ test "runIfRequested local json success appends exactly one newline" {
     try std.testing.expect(!std.mem.endsWith(u8, capture.stdout.written(), "\n\n"));
 }
 
+test "status and doctor inspect the supplied MCP profile diagnostic once" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    var environ = std.process.Environ.Map.init(alloc);
+    defer environ.deinit();
+    try environ.put("HOME", home);
+    try environ.put("PATH", "");
+    const stable_environ = try stableCliTestEnviron();
+    io_mod.setEnvironMap(&environ);
+    defer io_mod.setEnvironMap(stable_environ);
+
+    mcp_config_inspection_calls_for_test = 0;
+    mcp_runtime_load_calls_for_test = 0;
+    var cfg = testConfig();
+    cfg.inspect_mcp_profile_config = failingMcpConfigInspectionForTest;
+    cfg.load_mcp_runtime = countingMcpRuntimeForTest;
+
+    var status_capture = CaptureOutput.init(alloc);
+    defer status_capture.deinit();
+    var status_deps = status_capture.deps();
+    status_deps.load_startup_status = stubLoadStartupStatus;
+    const status_result = try runIfRequestedWithDeps(
+        alloc,
+        &.{ @constCast("status"), @constCast("--json") },
+        cfg,
+        status_deps,
+    );
+    try std.testing.expectEqual(RunResult.handled_success, status_result);
+    try std.testing.expectEqual(@as(usize, 1), mcp_config_inspection_calls_for_test);
+    try std.testing.expectEqual(@as(usize, 0), mcp_runtime_load_calls_for_test);
+    try std.testing.expect(std.mem.find(
+        u8,
+        status_capture.stdout.written(),
+        "\"mcp_config_error\":\"McpConfigInvalidJson\"",
+    ) != null);
+
+    mcp_config_inspection_calls_for_test = 0;
+    var doctor_capture = CaptureOutput.init(alloc);
+    defer doctor_capture.deinit();
+    const doctor_result = try runIfRequestedWithDeps(
+        alloc,
+        &.{ @constCast("doctor"), @constCast("--json") },
+        cfg,
+        doctor_capture.deps(),
+    );
+    try std.testing.expectEqual(RunResult.handled_success, doctor_result);
+    try std.testing.expectEqual(@as(usize, 1), mcp_config_inspection_calls_for_test);
+    try std.testing.expectEqual(@as(usize, 0), mcp_runtime_load_calls_for_test);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(
+            u8,
+            doctor_capture.stdout.written(),
+            "\"name\":\"mcp_config\"",
+        ),
+    );
+    try std.testing.expect(std.mem.find(
+        u8,
+        doctor_capture.stdout.written(),
+        "\"detail\":\"failed to load ~/.fx/mcp.json: McpConfigInvalidJson\"",
+    ) != null);
+}
+
 test "writeRenderedJsonLine falls back to heap and appends exactly one newline" {
     var capture = CaptureOutput.init(std.testing.allocator);
     defer capture.deinit();
@@ -4797,6 +4874,42 @@ fn noMcpRuntimeForTest(_: Allocator, _: @import("../mcp/elicitation.zig").Capabi
     return null;
 }
 
+fn clearMcpConfigInspectionForTest(
+    _: Allocator,
+) error{OutOfMemory}!mcp_contract.ProfileConfigDiagnostic {
+    return .clear;
+}
+
+var mcp_config_inspection_calls_for_test: usize = 0;
+var mcp_runtime_load_calls_for_test: usize = 0;
+
+fn failingMcpConfigInspectionForTest(
+    _: Allocator,
+) error{OutOfMemory}!mcp_contract.ProfileConfigDiagnostic {
+    mcp_config_inspection_calls_for_test += 1;
+    return .{ .failed = error.McpConfigInvalidJson };
+}
+
+fn countingMcpRuntimeForTest(
+    _: Allocator,
+    _: @import("../mcp/elicitation.zig").Capabilities,
+) !?*mcp_runtime.McpRuntime {
+    mcp_runtime_load_calls_for_test += 1;
+    return null;
+}
+
+var stable_cli_test_environ: ?*std.process.Environ.Map = null;
+
+fn stableCliTestEnviron() !*const std.process.Environ.Map {
+    if (stable_cli_test_environ) |map| return map;
+
+    const alloc = std.heap.page_allocator;
+    const map = try alloc.create(std.process.Environ.Map);
+    map.* = std.process.Environ.Map.init(alloc);
+    stable_cli_test_environ = map;
+    return map;
+}
+
 fn unexpectedAcpRunForTest(_: ?*anyopaque, _: Allocator, _: acp_runner.Config) anyerror!void {
     return error.TestUnexpectedAcpRun;
 }
@@ -4825,6 +4938,7 @@ fn testConfig() Config {
         .max_history_turns = 8,
         .context_registry = test_surface_context_registry,
         .mode_registry = .{ .default_mode_id = "surface" },
+        .inspect_mcp_profile_config = clearMcpConfigInspectionForTest,
         .load_mcp_runtime = noMcpRuntimeForTest,
         .acp_runner = .{ .run_fn = unexpectedAcpRunForTest },
         .devbox_provider = .{ .execute_fn = unavailableDevboxForTest },

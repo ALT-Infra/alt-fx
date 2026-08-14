@@ -7,6 +7,15 @@ pub const default_operation_timeout_ms: u32 = 60_000;
 pub const default_elicitation_timeout_ms: u32 = 30 * 60_000;
 pub const default_restart_limit: u8 = 1;
 
+pub const ProfileConfigDiagnostic = union(enum) {
+    clear,
+    failed: anyerror,
+};
+
+pub const InspectProfileConfigFn = *const fn (
+    Allocator,
+) error{OutOfMemory}!ProfileConfigDiagnostic;
+
 pub const McpEnvVar = struct {
     key: []u8,
     value: []u8,

@@ -322,6 +322,21 @@ pub fn loadRuntime(
     return runtimeFromConfigs(alloc, &configs, elicitation_capabilities);
 }
 
+pub fn inspectProfileConfig(
+    alloc: Allocator,
+) error{OutOfMemory}!mcp_contract.ProfileConfigDiagnostic {
+    const home = io_mod.getenv("HOME") orelse return .clear;
+    const config_path = try configPathFromHome(alloc, home);
+    defer alloc.free(config_path);
+
+    var configs = loadConfigFromPath(alloc, config_path) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return .{ .failed = err };
+    };
+    defer freeConfigs(alloc, &configs);
+    return .clear;
+}
+
 fn runtimeFromConfigs(
     alloc: Allocator,
     configs: *std.ArrayList(McpServerConfig),
@@ -410,6 +425,7 @@ fn loadConfigFromJson(alloc: Allocator, json_text: []const u8) !std.ArrayList(Mc
 
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, json_text, .{}) catch |err| {
         debug_trace.logf("mcp", "failed to parse config json: {s}", .{@errorName(err)});
+        if (err == error.OutOfMemory) return error.OutOfMemory;
         return error.McpConfigInvalidJson;
     };
     defer parsed.deinit();
@@ -1219,6 +1235,91 @@ test "built-in MCP runtime returns null when HOME is missing" {
     defer home.deinit();
 
     try std.testing.expect(try loadRuntime(alloc, .{}) == null);
+}
+
+test "MCP config diagnostic treats nonblocking profile states as clear" {
+    const alloc = std.testing.allocator;
+
+    {
+        const test_home = try TestHome.install(alloc, null);
+        defer test_home.deinit();
+
+        switch (try inspectProfileConfig(alloc)) {
+            .clear => {},
+            .failed => return error.TestUnexpectedResult,
+        }
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    const home_path = try tmpDirPath(alloc, tmp.dir, "home");
+    defer alloc.free(home_path);
+
+    {
+        const test_home = try TestHome.install(alloc, home_path);
+        defer test_home.deinit();
+
+        switch (try inspectProfileConfig(alloc)) {
+            .clear => {},
+            .failed => return error.TestUnexpectedResult,
+        }
+    }
+
+    try writeTempFile(&tmp, "home/.fx/mcp.json", "{\"mcp\":{}}");
+    {
+        const test_home = try TestHome.install(alloc, home_path);
+        defer test_home.deinit();
+
+        switch (try inspectProfileConfig(alloc)) {
+            .clear => {},
+            .failed => return error.TestUnexpectedResult,
+        }
+    }
+}
+
+test "MCP config diagnostic preserves the startup parser error" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTempFile(&tmp, "home/.fx/mcp.json", "{invalid json");
+    const home_path = try tmpDirPath(alloc, tmp.dir, "home");
+    defer alloc.free(home_path);
+
+    const test_home = try TestHome.install(alloc, home_path);
+    defer test_home.deinit();
+
+    switch (try inspectProfileConfig(alloc)) {
+        .clear => return error.TestUnexpectedResult,
+        .failed => |err| try std.testing.expectEqual(error.McpConfigInvalidJson, err),
+    }
+    try std.testing.expectError(error.McpConfigInvalidJson, loadRuntime(alloc, .{}));
+}
+
+test "MCP config diagnostic propagates allocation failure" {
+    const alloc = std.testing.allocator;
+    const test_home = try TestHome.install(alloc, "/tmp");
+    defer test_home.deinit();
+
+    var failing = std.testing.FailingAllocator.init(
+        alloc,
+        .{ .fail_index = 0 },
+    );
+    try std.testing.expectError(
+        error.OutOfMemory,
+        inspectProfileConfig(failing.allocator()),
+    );
+}
+
+test "MCP config diagnostic preserves parser allocation failure" {
+    var failing = std.testing.FailingAllocator.init(
+        std.testing.allocator,
+        .{ .fail_index = 0 },
+    );
+    try std.testing.expectError(
+        error.OutOfMemory,
+        loadConfigFromJson(failing.allocator(), "{\"mcp\":{}}"),
+    );
 }
 
 test "built-in MCP runtime loads disabled configured servers without spawning" {
