@@ -6213,7 +6213,7 @@ describe("acp: model-independent", () => {
         if (parentPhase === "inspect_result" &&
             body.includes('"toolCallId":"acp_delivery_inspect_1"') &&
             body.includes('"type":"tool-result"')) {
-          expectAcpParentDeliveries(body, childId, intervalEventIds, intervalPayload);
+          expectNoAcpParentDeliveries(body);
           secondContinuationChecked = true;
           parentPhase = "third_prompt";
           return finalText("ACP_PARENT_DELIVERY_CONSUMED");
