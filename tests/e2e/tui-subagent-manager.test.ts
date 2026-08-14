@@ -3773,7 +3773,8 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         );
         expect(childApproval).toContain("Command");
         expect(childApproval).toContain("printf approved");
-        expect(childApproval).toContain("$ printf approved > child-approval-effect.txt");
+        expect(childApproval).toContain("$ # terminal.exec profile=omitted (legacy)");
+        expect(childApproval).toContain("printf approved > child-approval-effect.txt");
         expect(childApproval).toContain("1. Yes");
         expect(childApproval).toContain("2. Yes, and don't ask again");
         expect(childApproval).toContain("3. No");
@@ -3794,12 +3795,14 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           (pane) =>
             pane.includes("Subagent approval-child needs permission") &&
             pane.includes("Command") &&
-            pane.includes("$ printf approved > child-approval-effect.txt") &&
+            pane.includes("$ # terminal.exec profile=omitted (legacy)") &&
+            pane.includes("printf approved > child-approval-effect.txt") &&
             !pane.includes(childPrompt),
           TIMEOUT,
         );
         expect(mainApproval).toContain("Command");
-        expect(mainApproval).toContain("$ printf approved > child-approval-effect.txt");
+        expect(mainApproval).toContain("$ # terminal.exec profile=omitted (legacy)");
+        expect(mainApproval).toContain("printf approved > child-approval-effect.txt");
         expect(mainApproval).not.toContain(childPrompt);
 
         const inlineApprovalToggleStart = (
@@ -3828,7 +3831,8 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
             pane.includes("Subagent approval-child needs permission") &&
             pane.includes("status: approval") &&
             pane.includes("Command") &&
-            pane.includes("$ printf approved > child-approval-effect.txt") &&
+            pane.includes("$ # terminal.exec profile=omitted (legacy)") &&
+            pane.includes("printf approved > child-approval-effect.txt") &&
             pane.includes("❯ 1. Yes"),
           TIMEOUT,
         );
@@ -5921,7 +5925,8 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           TIMEOUT,
         );
         expect(firstMain).toContain("Command");
-        expect(firstMain).toContain("$ printf first >");
+        expect(firstMain).toContain("$ # terminal.exec profile=omitted (legacy)");
+        expect(firstMain).toContain("printf first >");
 
         await active.sendKeys("C-x");
         await active.waitForText("Agents & processes", TIMEOUT);
@@ -5981,7 +5986,8 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           TIMEOUT,
         );
         expect(secondMain).toContain("Command");
-        expect(secondMain).toContain("$ printf second >");
+        expect(secondMain).toContain("$ # terminal.exec profile=omitted (legacy)");
+        expect(secondMain).toContain("printf second >");
 
         await active.sendKeys("C-x");
         await active.waitForText(
@@ -6448,7 +6454,8 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
             pane.includes("status: approval") &&
             pane.includes("Subagent approval-cancel-child needs permission") &&
             pane.includes("Command") &&
-            pane.includes("$ printf denied > cancelled-approval-effect.txt") &&
+            pane.includes("$ # terminal.exec profile=omitted (legacy)") &&
+            pane.includes("printf denied > cancelled-approval-effect.txt") &&
             pane.includes("❯ 1. Yes"),
           TIMEOUT,
         );

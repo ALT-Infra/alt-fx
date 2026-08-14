@@ -1495,7 +1495,7 @@ fn requestSandboxWideningOutcomeInternal(
         input.permission_rules,
         input.workspace_root,
         "sandbox",
-        command_ctx.command,
+        command_identity,
         .none,
     );
     switch (sandbox_rule) {
@@ -1513,11 +1513,11 @@ fn requestSandboxWideningOutcomeInternal(
         .ask => if (!permissions.sessionGrantAllowed(
             local_grants,
             "sandbox",
-            command_ctx.command,
+            command_identity,
         ) and !permissions.sessionGrantAllowed(
             input.permission_grants,
             "sandbox",
-            command_ctx.command,
+            command_identity,
         )) {
             configured_ask = true;
         },
@@ -1553,11 +1553,11 @@ fn requestSandboxWideningOutcomeInternal(
     if (permissions.sessionGrantAllowed(
         local_grants,
         "sandbox",
-        command_ctx.command,
+        command_identity,
     ) or permissions.sessionGrantAllowed(
         input.permission_grants,
         "sandbox",
-        command_ctx.command,
+        command_identity,
     )) {
         return shellPermissionOutcome(
             command_ctx,
@@ -1571,7 +1571,7 @@ fn requestSandboxWideningOutcomeInternal(
         review_targets[0] = command_target;
         review_targets[1] = .{
             .role = "sandbox_scope",
-            .path = try arena.dupe(u8, command_ctx.command),
+            .path = try arena.dupe(u8, command_identity),
         };
         const review = try runAutomaticReview(input, arena, call, .{
             .workspace_root = input.workspace_root,
@@ -1641,20 +1641,35 @@ fn promptSandboxWideningOutcome(
         .requirement = unavailable_requirement,
     };
     const prompter = input.permission_prompter orelse return unavailable;
+    const display_command = try command_environment.formatApprovalCommand(
+        arena,
+        command_ctx.environment,
+        command_ctx.command,
+    );
     const label = try tool_presentation.formatSandboxWideningPermissionLabel(
         arena,
         widening.phase == .reactive,
+        display_command,
+    );
+    const command_identity = try command_environment.permissionCommandIdentity(
+        arena,
+        command_ctx.environment,
         command_ctx.command,
     );
+    const grant_offer = [_]PermissionGrant{.{
+        .tool_name = @constCast("sandbox"),
+        .target_path = @constCast(command_identity),
+    }};
     var response = prompter.request(
         std.heap.c_allocator,
         .{
             .label = label,
+            .command = display_command,
             .amendment_allowed = !command_ctx.background,
         },
         call,
         null,
-        null,
+        &grant_offer,
     ) catch |err| switch (err) {
         error.PermissionPromptUnavailable => return unavailable,
         else => return err,
@@ -1969,12 +1984,16 @@ fn promptPermissionOutcome(
         .auto_review_result = auto_review_result,
     };
     const prompter = input.permission_prompter orelse return unavailable;
+    const grant_offer = if (try isRunCommandCall(input, arena, call))
+        try exactApprovalLocalGrants(input, arena, call, &.{}, .ordinary)
+    else
+        null;
     var response = prompter.request(
         std.heap.c_allocator,
         request,
         call,
         null,
-        null,
+        grant_offer,
     ) catch |err| switch (err) {
         error.PermissionPromptUnavailable => return unavailable,
         else => return err,
@@ -2460,6 +2479,105 @@ test "terminal exec session grants do not cross explicit profiles" {
         approval_command,
         "\nprintf scoped",
     ));
+}
+
+test "interactive command and sandbox grant offers retain explicit environment identity" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var background: BackgroundRuntime = .{};
+    defer background.deinit(std.testing.allocator);
+    var recording = RecordingPrompter{};
+    var input = testInputWithClassifier(
+        &worker,
+        &background,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    input.permission_prompter = recording.prompter();
+
+    const clean_call: ToolCall = .{
+        .id = "clean-profile",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf scoped\",\"profile\":\"clean\"}",
+    };
+    const clean_ctx = runCommandContext(input, arena, clean_call) catch |err| switch (err) {
+        error.MissingLoginShell, error.UnsupportedShell => return error.SkipZigTest,
+        else => return err,
+    };
+    const clean_outcome = try requestPermissionOutcome(input, arena, clean_call, .ask, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.once, clean_outcome.decision);
+    const clean_command_grant = recording.last_grant_offer.?[0];
+    try std.testing.expectEqualStrings("bash", clean_command_grant.tool_name);
+    try std.testing.expect(command_environment.isExplicitPermissionCommandIdentity(
+        clean_command_grant.target_path,
+    ));
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        recording.last_command.?,
+        "# terminal.exec profile=clean shell=",
+    ));
+
+    _ = try requestSandboxWideningOutcome(input, arena, clean_call, .ask, &.{}, .{
+        .phase = .preflight,
+        .restricted_fingerprint = .init(clean_ctx),
+    });
+    const clean_sandbox_grant = recording.last_grant_offer.?[0];
+    try std.testing.expectEqualStrings("sandbox", clean_sandbox_grant.tool_name);
+    try std.testing.expect(command_environment.isExplicitPermissionCommandIdentity(
+        clean_sandbox_grant.target_path,
+    ));
+
+    const user_call: ToolCall = .{
+        .id = "user-profile",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf scoped\",\"profile\":\"user\"}",
+    };
+    const user_ctx = try runCommandContext(input, arena, user_call);
+    const calls_before_user = recording.calls;
+    _ = try requestSandboxWideningOutcome(
+        input,
+        arena,
+        user_call,
+        .ask,
+        &.{clean_sandbox_grant},
+        .{
+            .phase = .preflight,
+            .restricted_fingerprint = .init(user_ctx),
+        },
+    );
+    try std.testing.expectEqual(calls_before_user + 1, recording.calls);
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        clean_sandbox_grant.target_path,
+        recording.last_grant_offer.?[0].target_path,
+    ));
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        recording.last_command.?,
+        "# terminal.exec profile=user shell=",
+    ));
+
+    const legacy_call: ToolCall = .{
+        .id = "legacy-profile",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf scoped\"}",
+    };
+    const legacy_ctx = try runCommandContext(input, arena, legacy_call);
+    const calls_before_legacy = recording.calls;
+    _ = try requestSandboxWideningOutcome(
+        input,
+        arena,
+        legacy_call,
+        .ask,
+        &.{clean_sandbox_grant},
+        .{
+            .phase = .preflight,
+            .restricted_fingerprint = .init(legacy_ctx),
+        },
+    );
+    try std.testing.expectEqual(calls_before_legacy + 1, recording.calls);
 }
 
 test "interactive command approval keeps dangerous-command guidance" {
@@ -3485,6 +3603,7 @@ const RecordingPrompter = struct {
     last_call_id: ?[]const u8 = null,
     last_label_len: usize = 0,
     last_label: ?[]const u8 = null,
+    last_command: ?[]const u8 = null,
     last_grant_offer: ?[]const PermissionGrant = null,
 
     fn request(
@@ -3500,6 +3619,7 @@ const RecordingPrompter = struct {
         self.last_call_id = call.id;
         self.last_label_len = request_view.label.len;
         self.last_label = request_view.label;
+        self.last_command = request_view.command;
         self.last_grant_offer = grant_offer;
         return permission_request.OwnedPermissionResponse.init(alloc, self.decision, null);
     }
@@ -3532,7 +3652,10 @@ test "interactive admission routes prompts through the supplied prompter" {
     const outcome = try requestPermissionOutcome(input, arena_state.allocator(), call, .ask, &.{});
     try std.testing.expectEqual(@as(usize, 1), recording.calls);
     try std.testing.expectEqualStrings(call.id, recording.last_call_id.?);
-    try std.testing.expect(recording.last_grant_offer == null);
+    const grant_offer = recording.last_grant_offer orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 1), grant_offer.len);
+    try std.testing.expectEqualStrings("bash", grant_offer[0].tool_name);
+    try std.testing.expectEqualStrings("touch generated.txt", grant_offer[0].target_path);
     try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
     const authority = outcome.execution_authority.?.run_command;
     try std.testing.expectEqual(

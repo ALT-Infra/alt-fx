@@ -56,12 +56,14 @@ pub const Approval = struct {
     status: communication.ApprovalStatus,
     label: []u8,
     explanation: ?[]u8,
+    command: ?[]u8 = null,
     file: ?permission_request.FileApprovalRequest = null,
 
     pub fn deinit(self: *Approval, alloc: Allocator) void {
         alloc.free(self.id);
         alloc.free(self.label);
         if (self.explanation) |value| alloc.free(value);
+        if (self.command) |value| alloc.free(value);
         if (self.file) |value| {
             permission_request.deinitFileApprovalRequest(alloc, value);
         }
@@ -1480,6 +1482,11 @@ fn projectApproval(alloc: Allocator, approval: communication.Approval) !Approval
     else
         null;
     errdefer if (explanation) |value| alloc.free(value);
+    const command = if (approval.command) |value|
+        try dupeBounded(alloc, value)
+    else
+        null;
+    errdefer if (command) |value| alloc.free(value);
     const file = if (approval.file) |value|
         try permission_request.dupeFileApprovalRequest(alloc, value)
     else
@@ -1493,6 +1500,7 @@ fn projectApproval(alloc: Allocator, approval: communication.Approval) !Approval
         .status = approval.status,
         .label = label,
         .explanation = explanation,
+        .command = command,
         .file = file,
     };
 }
@@ -1601,6 +1609,7 @@ fn snapshotContentHash(
             hashValue(&hash, approval.status);
             hash.update(approval.label);
             if (approval.explanation) |explanation| hash.update(explanation);
+            if (approval.command) |command| hash.update(command);
         }
     }
     for (pending_approvals) |approval| {
@@ -1611,6 +1620,7 @@ fn snapshotContentHash(
         hashValue(&hash, approval.request.status);
         hash.update(approval.request.label);
         if (approval.request.explanation) |explanation| hash.update(explanation);
+        if (approval.request.command) |command| hash.update(command);
         if (approval.tool_arguments_preview) |preview| hash.update(preview);
     }
     for (tree.diagnostics) |diagnostic| {

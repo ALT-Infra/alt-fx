@@ -369,6 +369,7 @@ const MainApprovalCard = struct {
     label: []u8,
     explanation: ?[]u8,
     tool_arguments_preview: ?[]u8 = null,
+    command: ?[]u8 = null,
     file: ?permission_request.FileApprovalRequest = null,
 
     fn deinit(self: *MainApprovalCard, alloc: Allocator) void {
@@ -378,6 +379,7 @@ const MainApprovalCard = struct {
         alloc.free(self.label);
         if (self.explanation) |value| alloc.free(value);
         if (self.tool_arguments_preview) |value| alloc.free(value);
+        if (self.command) |value| alloc.free(value);
         if (self.file) |value| {
             permission_request.deinitFileApprovalRequest(alloc, value);
         }
@@ -652,6 +654,11 @@ fn buildMainApprovalCardFor(
     else
         null;
     errdefer if (tool_arguments_preview_copy) |value| alloc.free(value);
+    const command = if (approval.command) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    errdefer if (command) |value| alloc.free(value);
     const file = if (approval.file) |value|
         try permission_request.dupeFileApprovalRequest(alloc, value)
     else
@@ -667,6 +674,7 @@ fn buildMainApprovalCardFor(
         .label = label,
         .explanation = explanation,
         .tool_arguments_preview = tool_arguments_preview_copy,
+        .command = command,
         .file = file,
     };
 }
@@ -913,6 +921,7 @@ pub const Runtime = struct {
             .origin = .{ .subagent = card.child_name },
             .explanation = card.explanation,
             .tool_arguments_preview = card.tool_arguments_preview,
+            .command = card.command,
             .file = card.file,
             .amendment_allowed = false,
         };
@@ -6433,6 +6442,8 @@ test "child approval card preserves the semantic label and live preview" {
     alloc.free(snapshot.pending_approvals[0].request.label);
     snapshot.pending_approvals[0].request.label =
         try alloc.dupe(u8, "terminal.exec touch child-marker");
+    snapshot.pending_approvals[0].request.command =
+        try alloc.dupe(u8, "# terminal.exec profile=user shell=/bin/zsh\ntouch child-marker");
     snapshot.pending_approvals[0].tool_arguments_preview =
         try alloc.dupe(u8, "{\"text\":\"child sentinel\"}");
     try std.testing.expect(try runtime.replaceSnapshot(alloc, snapshot));
@@ -6452,6 +6463,10 @@ test "child approval card preserves the semantic label and live preview" {
     try std.testing.expectEqualStrings(
         "{\"text\":\"child sentinel\"}",
         card.tool_arguments_preview.?,
+    );
+    try std.testing.expectEqualStrings(
+        "# terminal.exec profile=user shell=/bin/zsh\ntouch child-marker",
+        card.command.?,
     );
 }
 

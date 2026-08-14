@@ -34,6 +34,10 @@ pub const Environment = union(enum) {
 
 const permission_identity_prefix = "@fx-terminal-env:";
 
+pub fn isExplicitPermissionCommandIdentity(value: []const u8) bool {
+    return std.mem.startsWith(u8, value, permission_identity_prefix);
+}
+
 /// Binds explicit shell startup to a retained command grant while preserving
 /// the shipped plain-command identity for omitted-profile compatibility.
 pub fn permissionCommandIdentity(
@@ -64,7 +68,7 @@ fn formatPermissionCommandIdentity(
 /// Removes the opaque environment prefix only for configured permission-rule
 /// matching and human-facing policy display. Session grants retain it.
 pub fn commandFromPermissionIdentity(identity: []const u8) []const u8 {
-    if (!std.mem.startsWith(u8, identity, permission_identity_prefix)) return identity;
+    if (!isExplicitPermissionCommandIdentity(identity)) return identity;
     var rest = identity[permission_identity_prefix.len..];
     const profile_end = std.mem.findScalar(u8, rest, ':') orelse return identity;
     rest = rest[profile_end + 1 ..];

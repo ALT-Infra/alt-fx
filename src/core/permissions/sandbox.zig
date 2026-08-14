@@ -239,14 +239,25 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
         return error.InvalidForegroundSessionRelease;
     }
 
-    const replace_err = std.process.replace(zio, .{ .argv = args[2..] });
-    writeForegroundSessionReplaceFailure(args[1], replace_err);
-    std.process.exit(foreground_session_replace_failure_exit_code);
+    var target = std.process.spawn(zio, .{
+        .argv = args[2..],
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    }) catch |err| {
+        writeForegroundSessionReplaceFailure(args[1], err);
+        std.process.exit(foreground_session_replace_failure_exit_code);
+    };
+    const term = target.wait(zio) catch |err| {
+        writeForegroundSessionReplaceFailure(args[1], err);
+        std.process.exit(foreground_session_replace_failure_exit_code);
+    };
+    exitForegroundSessionSupervisor(term);
 }
 
 fn writeForegroundSessionReplaceFailure(
     nonce: []const u8,
-    err: std.process.ReplaceError,
+    err: anyerror,
 ) void {
     var buffer: [256]u8 = undefined;
     const message = std.fmt.bufPrint(
@@ -255,6 +266,26 @@ fn writeForegroundSessionReplaceFailure(
         .{ nonce, @errorName(err) },
     ) catch foreground_session_replace_failure_prefix ++ "unknown\n";
     std.Io.File.stderr().writeStreamingAll(io_mod.getIo(), message) catch {};
+}
+
+fn exitForegroundSessionSupervisor(term: std.process.Child.Term) noreturn {
+    switch (term) {
+        .exited => |code| std.process.exit(code),
+        .signal => |signal| {
+            const default_action: std.posix.Sigaction = .{
+                .handler = .{ .handler = std.posix.SIG.DFL },
+                .mask = std.posix.sigemptyset(),
+                .flags = 0,
+            };
+            std.posix.sigaction(signal, &default_action, null);
+            var signal_mask = std.posix.sigemptyset();
+            std.posix.sigaddset(&signal_mask, signal);
+            std.posix.sigprocmask(std.posix.SIG.UNBLOCK, &signal_mask, null);
+            std.posix.raise(signal) catch {};
+            std.process.exit(128 + @as(u8, @truncate(@intFromEnum(signal))));
+        },
+        .stopped, .unknown => std.process.exit(127),
+    }
 }
 
 /// Resolves auto backend selection from host OS and locally available tools.
@@ -1239,8 +1270,27 @@ fn executeProcessWithInput(
     var child_needs_cleanup = true;
     errdefer if (child_needs_cleanup) cleanupChild(&child);
 
-    const source = try collectOutputForProcess(scratch, &child, &output, cfg, null);
-    const term = try waitForCollectedProcess(&child, source);
+    const process_group_id = if (isolate_process_group and
+        builtin.os.tag != .windows and builtin.os.tag != .wasi)
+        child.id
+    else
+        null;
+    var leader_term: ?std.process.Child.Term = null;
+    const source = try collectOutputForProcess(
+        scratch,
+        &child,
+        &output,
+        cfg,
+        null,
+        process_group_id,
+        &leader_term,
+    );
+    const term = try waitForCollectedProcess(
+        &child,
+        source,
+        process_group_id,
+        leader_term,
+    );
     const duration_ms = elapsedMs(started_ms, io_mod.milliTimestamp());
     child_needs_cleanup = false;
 
@@ -1348,14 +1398,23 @@ fn executeProcessWithDetachedSession(
     script_write_open = false;
 
     var launch_failure_probe = ForegroundLaunchFailureProbe.init(&failure_marker);
+    const process_group_id = child.id;
+    var leader_term: ?std.process.Child.Term = null;
     const source = try collectOutputForProcess(
         scratch,
         &child,
         &output,
         cfg,
         &launch_failure_probe,
+        process_group_id,
+        &leader_term,
     );
-    const term = try waitForCollectedProcess(&child, source);
+    const term = try waitForCollectedProcess(
+        &child,
+        source,
+        process_group_id,
+        leader_term,
+    );
     const duration_ms = elapsedMs(started_ms, io_mod.milliTimestamp());
     child_needs_cleanup = false;
 
@@ -1490,8 +1549,23 @@ fn executeProcessWithScriptUnisolated(
     script_write.close(io_mod.getIo());
     script_write_open = false;
 
-    const source = try collectOutputForProcess(scratch, &child, &output, cfg, null);
-    const term = try waitForCollectedProcess(&child, source);
+    const process_group_id = child.id;
+    var leader_term: ?std.process.Child.Term = null;
+    const source = try collectOutputForProcess(
+        scratch,
+        &child,
+        &output,
+        cfg,
+        null,
+        process_group_id,
+        &leader_term,
+    );
+    const term = try waitForCollectedProcess(
+        &child,
+        source,
+        process_group_id,
+        leader_term,
+    );
     const duration_ms = elapsedMs(started_ms, io_mod.milliTimestamp());
     child_needs_cleanup = false;
 
@@ -1723,7 +1797,13 @@ fn executeRawInvocation(
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
         return error.InvalidCommandEnvironment;
     }
-    const result = try executeProcessWithClosedInput(scratch, cfg, invocation.argv(), cwd);
+    const result = try executeProcessWithScript(
+        scratch,
+        cfg,
+        invocation.argv(),
+        cwd,
+        "",
+    );
     return formatCollectedOutput(alloc, command, cwd, result);
 }
 
@@ -1762,6 +1842,11 @@ test "explicit captured profiles execute exact shells without filtering stderr" 
     );
     try std.testing.expect(std.mem.find(u8, user.output, "profile-stdout") != null);
     try std.testing.expect(std.mem.find(u8, user.output, "profile-stderr") != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        user.output,
+        "bash: no job control in this shell\n",
+    ) != null);
     if (std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{})) {
         const zsh_user = try executeCommandInEnvironment(
             cfg,
@@ -1775,19 +1860,6 @@ test "explicit captured profiles execute exact shells without filtering stderr" 
             zsh_user.output,
         );
     } else |_| {}
-
-    const bash_user = try shell_resolver.capturedInvocation(.{ .user = shell_path }, command);
-    const no_tty = try executeProcessWithInput(
-        arena,
-        cfg,
-        bash_user.argv(),
-        "/tmp",
-        true,
-        false,
-    );
-    const no_tty_output = try formatCollectedOutput(arena, command, "/tmp", no_tty);
-    try std.testing.expect(std.mem.find(u8, no_tty_output.output, "bash: no job control in this shell\n") != null);
-    try std.testing.expect(std.mem.find(u8, no_tty_output.output, "profile-stderr") != null);
 }
 
 fn parseJustBashJson(alloc: Allocator, scratch: Allocator, cfg: Config, stdout_raw: []const u8, stderr_raw: []const u8, term: std.process.Child.Term, command: []const u8, cwd: []const u8, duration_ms: ?u64) !command_contract.RunCommandResult {
@@ -2160,6 +2232,8 @@ fn collectOutput(
     cfg: Config,
     source: *TerminationSource,
     launch_failure_probe: ?*ForegroundLaunchFailureProbe,
+    process_group_id: ?std.posix.pid_t,
+    leader_term: *?std.process.Child.Term,
 ) !TerminationSource {
     const zio = io_mod.getIo();
     var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
@@ -2186,6 +2260,19 @@ fn collectOutput(
             &signal_started_ms,
             &force_kill_sent,
         );
+        if (leader_term.* == null) {
+            if (try pollProcessLeader(child)) |term| {
+                leader_term.* = term;
+                if (process_group_id) |pid| {
+                    terminateRemainingProcessGroup(pid);
+                    debug_trace.logf(
+                        "core",
+                        "captured command leader completed; remaining process group terminated",
+                        .{},
+                    );
+                }
+            }
+        }
 
         const keep_reading = if (multi_reader.fill(4096, .{ .duration = .{ .raw = .{ .nanoseconds = 100_000_000 }, .clock = .awake } }))
             true
@@ -2226,6 +2313,8 @@ fn collectOutputForProcess(
     output: *OutputCollector,
     cfg: Config,
     launch_failure_probe: ?*ForegroundLaunchFailureProbe,
+    process_group_id: ?std.posix.pid_t,
+    leader_term: *?std.process.Child.Term,
 ) !TerminationSource {
     var source: TerminationSource = .natural;
     return collectOutput(
@@ -2235,13 +2324,59 @@ fn collectOutputForProcess(
         cfg,
         &source,
         launch_failure_probe,
+        process_group_id,
+        leader_term,
     ) catch |err|
         return mapTerminationError(source, cfg.cancel_flag, "output collection", err);
 }
 
-fn waitForCollectedProcess(child: *std.process.Child, source: TerminationSource) !std.process.Child.Term {
-    return child.wait(io_mod.getIo()) catch |err|
+fn waitForCollectedProcess(
+    child: *std.process.Child,
+    source: TerminationSource,
+    process_group_id: ?std.posix.pid_t,
+    leader_term: ?std.process.Child.Term,
+) !std.process.Child.Term {
+    if (leader_term) |term| {
+        closeChildPipes(child);
+        return term;
+    }
+    const term = child.wait(io_mod.getIo()) catch |err|
         return mapTerminationError(source, null, "process wait", err);
+    if (process_group_id) |pid| {
+        terminateRemainingProcessGroup(pid);
+    }
+    return term;
+}
+
+fn pollProcessLeader(child: *std.process.Child) !?std.process.Child.Term {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return null;
+    const pid = child.id orelse return null;
+    var status: if (builtin.link_libc) c_int else u32 = undefined;
+    while (true) {
+        const result = std.posix.system.waitpid(pid, &status, std.posix.W.NOHANG);
+        switch (std.posix.errno(result)) {
+            .SUCCESS => {
+                if (result == 0) return null;
+                if (result != pid) return error.Unexpected;
+                child.id = null;
+                return childTermFromStatus(@bitCast(status));
+            },
+            .INTR => continue,
+            .CHILD => return error.Unexpected,
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
+    }
+}
+
+fn childTermFromStatus(status: u32) std.process.Child.Term {
+    return if (std.posix.W.IFEXITED(status))
+        .{ .exited = std.posix.W.EXITSTATUS(status) }
+    else if (std.posix.W.IFSIGNALED(status))
+        .{ .signal = std.posix.W.TERMSIG(status) }
+    else if (std.posix.W.IFSTOPPED(status))
+        .{ .stopped = std.posix.W.STOPSIG(status) }
+    else
+        .{ .unknown = status };
 }
 
 fn mapTerminationError(
@@ -2326,14 +2461,31 @@ fn signalChild(child: *std.process.Child, force: bool) !void {
     }
 
     const pid = child.id orelse return;
+    return signalProcessGroup(pid, force);
+}
+
+fn signalProcessGroup(pid: std.posix.pid_t, force: bool) !void {
     std.posix.kill(-pid, if (force) std.posix.SIG.KILL else std.posix.SIG.TERM) catch |err| switch (err) {
         error.ProcessNotFound => {},
         else => return err,
     };
 }
 
+fn terminateRemainingProcessGroup(pid: std.posix.pid_t) void {
+    signalProcessGroup(pid, true) catch |err| {
+        debug_trace.logf(
+            "core",
+            "remaining captured process group cleanup failed err={s}",
+            .{@errorName(err)},
+        );
+    };
+}
+
 fn cleanupChild(child: *std.process.Child) void {
-    if (child.id == null) return;
+    if (child.id == null) {
+        closeChildPipes(child);
+        return;
+    }
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
         child.kill(io_mod.getIo());
         _ = child.wait(io_mod.getIo()) catch |err| {
@@ -2349,6 +2501,21 @@ fn cleanupChild(child: *std.process.Child) void {
     _ = child.wait(io_mod.getIo()) catch |err| {
         debug_trace.logf("core", "command cleanup wait failed err={s}", .{@errorName(err)});
     };
+}
+
+fn closeChildPipes(child: *std.process.Child) void {
+    if (child.stdin) |input| {
+        input.close(io_mod.getIo());
+        child.stdin = null;
+    }
+    if (child.stdout) |output| {
+        output.close(io_mod.getIo());
+        child.stdout = null;
+    }
+    if (child.stderr) |output| {
+        output.close(io_mod.getIo());
+        child.stderr = null;
+    }
 }
 
 fn shellQuote(arena: Allocator, input: []const u8) ![]const u8 {
@@ -2876,14 +3043,14 @@ fn expectReapedChildForTest(child: *std.process.Child, pid: std.posix.pid_t) !vo
     try std.testing.expectError(error.ProcessNotFound, std.posix.kill(pid, @enumFromInt(0)));
 }
 
-test "captured foreground command runs as a detached session leader" {
+test "captured foreground command runs beneath a detached session supervisor" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
 
     const command =
         "exec python3 -c 'import os,sys; " ++
         "pid=os.getpid(); pgid=os.getpgid(0); sid=os.getsid(0); " ++
         "print(f\"pid={pid} pgid={pgid} sid={sid}\"); " ++
-        "sys.exit(0 if pid == pgid == sid else 1)'";
+        "sys.exit(0 if pid != pgid and pgid == sid else 1)'";
     const result = try executeCommand(.{
         .backend = .none,
         .workspace_root = "/tmp",
@@ -3870,7 +4037,17 @@ test "artifact write failure after cancellation remains a bare error" {
     const watcher = try std.Thread.spawn(.{}, Watcher.run, .{ ready_path, &cancel, &ready_seen });
     defer watcher.join();
 
-    try std.testing.expectError(error.Cancelled, collectOutputForProcess(alloc, &child, &output, cfg, null));
+    const process_group_id = child.id;
+    var leader_term: ?std.process.Child.Term = null;
+    try std.testing.expectError(error.Cancelled, collectOutputForProcess(
+        alloc,
+        &child,
+        &output,
+        cfg,
+        null,
+        process_group_id,
+        &leader_term,
+    ));
     try std.testing.expect(ready_seen.load(.seq_cst));
 }
 
@@ -3945,6 +4122,97 @@ test "timeout terminates foreground process group descendants" {
         }
         io_mod.sleep(10 * std.time.ns_per_ms);
     }
+}
+
+fn expectProcessGone(pid: std.posix.pid_t) !void {
+    const started_ms = io_mod.milliTimestamp();
+    while (true) {
+        std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
+            error.ProcessNotFound => return,
+            else => return err,
+        };
+        if (io_mod.milliTimestamp() - started_ms > 1000) {
+            std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+            return error.TestUnexpectedResult;
+        }
+        io_mod.sleep(10 * std.time.ns_per_ms);
+    }
+}
+
+test "natural command completion terminates background child inheriting pipes" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "inherited-child.pid" });
+    defer alloc.free(pid_path);
+    const quoted_pid_path = try shellQuote(alloc, pid_path);
+    defer alloc.free(quoted_pid_path);
+    const command = try std.fmt.allocPrint(
+        alloc,
+        "sleep 30 & child=$!; printf '%s' \"$child\" > {s}",
+        .{quoted_pid_path},
+    );
+    defer alloc.free(command);
+
+    const result = try executeCommand(.{
+        .backend = .none,
+        .workspace_root = workspace,
+        .max_command_output_bytes = 1024,
+        .timeout_ms = 2000,
+    }, alloc, command, workspace);
+    defer alloc.free(result.output);
+    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.foreground.exit_code);
+
+    const pid_text = try readAbsoluteFile(alloc, pid_path, 64);
+    defer alloc.free(pid_text);
+    const pid = try std.fmt.parseInt(
+        std.posix.pid_t,
+        std.mem.trim(u8, pid_text, " \t\r\n"),
+        10,
+    );
+    try expectProcessGone(pid);
+}
+
+test "natural command completion terminates background child with redirected streams" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "redirected-child.pid" });
+    defer alloc.free(pid_path);
+    const quoted_pid_path = try shellQuote(alloc, pid_path);
+    defer alloc.free(quoted_pid_path);
+    const command = try std.fmt.allocPrint(
+        alloc,
+        "sleep 30 >/dev/null 2>&1 & child=$!; printf '%s' \"$child\" > {s}",
+        .{quoted_pid_path},
+    );
+    defer alloc.free(command);
+
+    const result = try executeCommand(.{
+        .backend = .none,
+        .workspace_root = workspace,
+        .max_command_output_bytes = 1024,
+        .timeout_ms = 2000,
+    }, alloc, command, workspace);
+    defer alloc.free(result.output);
+    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.foreground.exit_code);
+
+    const pid_text = try readAbsoluteFile(alloc, pid_path, 64);
+    defer alloc.free(pid_text);
+    const pid = try std.fmt.parseInt(
+        std.posix.pid_t,
+        std.mem.trim(u8, pid_text, " \t\r\n"),
+        10,
+    );
+    try expectProcessGone(pid);
 }
 
 test "backend control reuses configured timeout start time" {

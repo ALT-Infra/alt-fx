@@ -19,6 +19,7 @@ const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
 const tooling_tool_admission = @import("../../tooling/tool_admission.zig");
 const hooks = @import("../../hooks/hooks.zig");
 const command_contract = @import("../../execution/command_contract.zig");
+const command_environment = @import("../../execution/command_environment.zig");
 const context_contract = @import("../../workspace/context_contract.zig");
 const tool_preparation = @import("../tool_preparation.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
@@ -6424,12 +6425,17 @@ fn processQueuedPromptLoop(
                         },
                     }
                     if (widening_outcome.decision == .always and live_authority == null) {
+                        const sandbox_identity = try command_environment.permissionCommandIdentity(
+                            arena,
+                            required.restricted_fingerprint.environment,
+                            required.restricted_fingerprint.command,
+                        );
                         try runtime_tool_admission.retainSessionGrant(
                             deps,
                             arena,
                             &local_grants,
                             "sandbox",
-                            required.restricted_fingerprint.command,
+                            sandbox_identity,
                         );
                     }
                     sandbox_widening_feedback = widening_outcome.feedback;

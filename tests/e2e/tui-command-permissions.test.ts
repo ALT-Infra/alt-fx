@@ -2379,7 +2379,7 @@ describe("effect-aware command permissions", () => {
         const fixture = await waitForTerminalFixture(statePath);
 
         try {
-          expect(fixture.pid).toBe(fixture.pgid);
+          expect(fixture.pid).not.toBe(fixture.pgid);
           expect(fixture.pgid).toBe(fixture.sid);
           expect(fixture.sid).not.toBe(baselineFx.sid);
           expect(fixture.tty_opened).toBe(false);

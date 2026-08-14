@@ -2658,13 +2658,13 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         fakeGatewaySerializedToolCall(
           "first_turn_command",
           "terminal",
-          '{"command":"printf preflight-failed > preflight.txt"}',
+          '{"action":"exec","command":"printf preflight-failed > preflight.txt"}',
         ),
         () => heldGatewayResponse(hold),
         fakeGatewaySerializedToolCall(
           "queued_grep_command",
           "terminal",
-          '{"command":"grep -R \\"preflight\\" -n . | head"}',
+          '{"action":"exec","command":"grep -R \\"preflight\\" -n . | head"}',
         ),
         duplicateKeyToolResponse(),
         fakeGatewayFinalText(finalText),

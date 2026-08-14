@@ -8180,7 +8180,7 @@ test "production child sandbox grant revocation requires a separate widening app
             widening_approval_id,
         ) orelse return error.TestApprovalNotRegistered;
         try std.testing.expectEqualStrings(
-            "broader file access: npm test",
+            "broader file access: # terminal.exec profile=omitted (legacy)\\x0anpm test",
             widening.label,
         );
         try std.testing.expectEqual(

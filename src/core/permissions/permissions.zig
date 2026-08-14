@@ -1515,18 +1515,13 @@ pub fn permissionRulePatternForGrant(alloc: std.mem.Allocator, workspace_root: [
     if (isWebSearchToolName(permission)) return alloc.dupe(u8, "*");
     if (std.mem.eql(u8, permission, web_fetch_permission)) return canonicalWebFetchDomainPattern(alloc, pattern);
     if (std.mem.eql(u8, permission, "bash")) {
-        if (std.mem.find(u8, pattern, "::")) |separator| {
-            return alloc.dupe(
-                u8,
-                command_environment.commandFromPermissionIdentity(
-                    pattern[separator + 2 ..],
-                ),
-            );
+        if (command_environment.isExplicitPermissionCommandIdentity(pattern)) {
+            return alloc.dupe(u8, pattern);
         }
-        return alloc.dupe(
-            u8,
-            command_environment.commandFromPermissionIdentity(pattern),
-        );
+        if (std.mem.find(u8, pattern, "::")) |separator| {
+            return alloc.dupe(u8, pattern[separator + 2 ..]);
+        }
+        return alloc.dupe(u8, pattern);
     }
 
     if (std.mem.eql(u8, permission, "url") or
@@ -1556,18 +1551,13 @@ fn patternForRuleMatch(alloc: std.mem.Allocator, workspace_root: []const u8, too
         return alloc.dupe(u8, target_path);
     }
     if (std.mem.eql(u8, permission, "bash")) {
-        if (std.mem.find(u8, target_path, "::")) |separator| {
-            return alloc.dupe(
-                u8,
-                command_environment.commandFromPermissionIdentity(
-                    target_path[separator + 2 ..],
-                ),
-            );
+        if (command_environment.isExplicitPermissionCommandIdentity(target_path)) {
+            return alloc.dupe(u8, target_path);
         }
-        return alloc.dupe(
-            u8,
-            command_environment.commandFromPermissionIdentity(target_path),
-        );
+        if (std.mem.find(u8, target_path, "::")) |separator| {
+            return alloc.dupe(u8, target_path[separator + 2 ..]);
+        }
+        return alloc.dupe(u8, target_path);
     }
 
     return displayTargetForPolicy(alloc, workspace_root, tool_name, target_path, target_kind);
@@ -1576,6 +1566,9 @@ fn patternForRuleMatch(alloc: std.mem.Allocator, workspace_root: []const u8, too
 pub fn patternForSessionGrantMatch(tool_name: []const u8, target_path: []const u8) []const u8 {
     const permission = permissionNameForTool(tool_name);
     if (std.mem.eql(u8, permission, "bash")) {
+        if (command_environment.isExplicitPermissionCommandIdentity(target_path)) {
+            return target_path;
+        }
         if (std.mem.find(u8, target_path, "::")) |separator| return target_path[separator + 2 ..];
     }
     return target_path;
@@ -2612,7 +2605,7 @@ test "web_fetch malformed hand edited rules warn without disabling unrelated per
     try std.testing.expectEqual(@as(usize, 1), webFetchRuleWarningCount(rules.rules));
 }
 
-test "permissionRulePatternForGrant normalizes command url and workspace path grants" {
+test "permissionRulePatternForGrant preserves explicit command environment identity" {
     const alloc = std.testing.allocator;
 
     const command = try permissionRulePatternForGrant(alloc, "/tmp/workspace", "bash", "/tmp/workspace::zig build");
@@ -2629,7 +2622,15 @@ test "permissionRulePatternForGrant normalizes command url and workspace path gr
     defer alloc.free(explicit_target);
     const explicit_command = try permissionRulePatternForGrant(alloc, "/tmp/workspace", "bash", explicit_target);
     defer alloc.free(explicit_command);
-    try std.testing.expectEqualStrings("zig build", explicit_command);
+    try std.testing.expectEqualStrings(explicit_identity, explicit_command);
+    const bare_explicit_command = try permissionRulePatternForGrant(
+        alloc,
+        "/tmp/workspace",
+        "bash",
+        explicit_identity,
+    );
+    defer alloc.free(bare_explicit_command);
+    try std.testing.expectEqualStrings(explicit_identity, bare_explicit_command);
 
     const path = try permissionRulePatternForGrant(alloc, "/tmp/workspace", "edit", "/tmp/workspace/src/*");
     defer alloc.free(path);
@@ -2644,7 +2645,7 @@ test "permissionRulePatternForGrant normalizes command url and workspace path gr
     try std.testing.expectEqualStrings("/tmp/external/**", external);
 }
 
-test "configured command rules ignore explicit environment identity" {
+test "configured legacy command rules do not authorize explicit environments" {
     const alloc = std.testing.allocator;
     var rules_buf = [_]types.PermissionRule{
         .{ .permission = @constCast("bash"), .pattern = @constCast("zig *"), .action = .allow },
@@ -2661,8 +2662,17 @@ test "configured command rules ignore explicit environment identity" {
     defer alloc.free(target);
 
     try std.testing.expectEqual(
-        RuleDecision.allow,
+        RuleDecision.none,
         try ruleDecisionFor(alloc, rules, "/tmp/workspace", "run_command", target, .command_cwd),
+    );
+
+    var explicit_rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("bash"), .pattern = identity, .action = .allow },
+    };
+    const explicit_rules: types.PermissionRuleSet = .{ .rules = &explicit_rules_buf };
+    try std.testing.expectEqual(
+        RuleDecision.allow,
+        try ruleDecisionFor(alloc, explicit_rules, "/tmp/workspace", "run_command", target, .command_cwd),
     );
 }
 

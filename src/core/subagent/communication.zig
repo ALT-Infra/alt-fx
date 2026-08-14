@@ -268,7 +268,8 @@ pub const RelationshipApproval = struct {
 
 /// Durable projection of one canonical prepared request. The executable
 /// payload is represented by its canonical digest; human surfaces receive only
-/// the bounded label, explanation, and optional file review exposed by fx.
+/// the bounded label, explanation, command projection, and optional file review
+/// exposed by fx.
 pub const Approval = struct {
     id: []u8,
     kind: ApprovalKind,
@@ -280,6 +281,7 @@ pub const Approval = struct {
     identity_fingerprint: [32]u8 = [_]u8{0} ** 32,
     label: []u8,
     explanation: ?[]u8,
+    command: ?[]u8 = null,
     file: ?permission_request.FileApprovalRequest = null,
     grants: []types.PermissionGrant,
     status: ApprovalStatus,
@@ -295,6 +297,7 @@ pub const Approval = struct {
         if (self.relationship) |*value| value.deinit(alloc);
         alloc.free(self.label);
         if (self.explanation) |value| alloc.free(value);
+        if (self.command) |value| alloc.free(value);
         if (self.file) |value| {
             permission_request.deinitFileApprovalRequest(alloc, value);
         }
@@ -317,6 +320,8 @@ pub const Approval = struct {
         errdefer alloc.free(label);
         const explanation = if (self.explanation) |value| try alloc.dupe(u8, value) else null;
         errdefer if (explanation) |value| alloc.free(value);
+        const command = if (self.command) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (command) |value| alloc.free(value);
         const file = if (self.file) |value|
             try permission_request.dupeFileApprovalRequest(alloc, value)
         else
@@ -335,6 +340,7 @@ pub const Approval = struct {
             .identity_fingerprint = self.identity_fingerprint,
             .label = label,
             .explanation = explanation,
+            .command = command,
             .file = file,
             .grants = try types.dupePermissionGrantSlice(alloc, self.grants),
             .status = self.status,
@@ -620,6 +626,8 @@ pub fn validateLedger(ledger: Ledger) ValidationError!void {
         validateContent(approval.label) catch return error.InvalidLedger;
         if (approval.explanation) |value| validateContent(value) catch
             return error.InvalidLedger;
+        if (approval.command) |value| validateContent(value) catch
+            return error.InvalidLedger;
         if (approval.file) |file| {
             _ = permission_request.fileRequestFootprint(.{
                 .label = approval.label,
@@ -643,7 +651,7 @@ pub fn validateLedger(ledger: Ledger) ValidationError!void {
             },
             .relationship => if (approval.work_id != null or
                 approval.relationship == null or approval.file != null or
-                approval.grants.len != 0)
+                approval.command != null or approval.grants.len != 0)
             {
                 return error.InvalidLedger;
             },
@@ -2475,6 +2483,7 @@ pub const ApprovalInput = struct {
     prepared_fingerprint: [32]u8,
     label: []const u8,
     explanation: ?[]const u8,
+    command: ?[]const u8 = null,
     file: ?permission_request.FileApprovalRequest = null,
     grants: []const types.PermissionGrant,
     created_at_ms: i64,
@@ -2502,6 +2511,10 @@ pub fn approvalIdentityFingerprint(input: ApprovalInput) [32]u8 {
     hash.update(&input.prepared_fingerprint);
     hashString(&hash, input.label);
     hashOptionalString(&hash, input.explanation);
+    if (input.command) |command| {
+        hash.update("command-projection\x00");
+        hashString(&hash, command);
+    }
     hashNormalizedGrants(&hash, input.grants);
     if (input.file) |file| {
         hash.update("file-projection\x00");
@@ -2536,6 +2549,8 @@ pub fn registerApproval(
     validateContent(input.label) catch return error.InvalidApproval;
     if (input.explanation) |value| validateContent(value) catch
         return error.InvalidApproval;
+    if (input.command) |value| validateContent(value) catch
+        return error.InvalidApproval;
     if (input.file) |file| {
         _ = permission_request.fileRequestFootprint(.{
             .label = input.label,
@@ -2551,7 +2566,7 @@ pub fn registerApproval(
         },
         .relationship => if (input.work_id != null or
             input.relationship == null or input.file != null or
-            input.grants.len != 0)
+            input.command != null or input.grants.len != 0)
         {
             return error.InvalidApproval;
         },
@@ -2594,6 +2609,8 @@ pub fn registerApproval(
     errdefer alloc.free(label);
     const explanation = if (input.explanation) |value| try alloc.dupe(u8, value) else null;
     errdefer if (explanation) |value| alloc.free(value);
+    const command = if (input.command) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (command) |value| alloc.free(value);
     const file = if (input.file) |value|
         permission_request.dupeFileApprovalRequest(alloc, value) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -2617,6 +2634,7 @@ pub fn registerApproval(
         .identity_fingerprint = identity_fingerprint,
         .label = label,
         .explanation = explanation,
+        .command = command,
         .file = file,
         .grants = grants,
         .status = .pending,
@@ -3042,6 +3060,7 @@ fn approvalAsInput(approval: Approval) ApprovalInput {
         .prepared_fingerprint = approval.prepared_fingerprint,
         .label = approval.label,
         .explanation = approval.explanation,
+        .command = approval.command,
         .file = approval.file,
         .grants = approval.grants,
         .created_at_ms = approval.created_at_ms,
@@ -4632,10 +4651,12 @@ test "approval replay identity includes work label explanation and normalized gr
         .prepared_fingerprint = [_]u8{9} ** 32,
         .label = "prepared action",
         .explanation = "bounded explanation",
+        .command = "# terminal.exec profile=user shell=/bin/zsh\nzig build test",
         .grants = &grants,
         .created_at_ms = 1,
     };
     try std.testing.expectEqual(RegisterApprovalResult.registered, try registerApproval(alloc, &ledger, base));
+    try std.testing.expectEqualStrings(base.command.?, ledger.approvals[0].command.?);
     var same = base;
     same.grants = &reordered;
     same.created_at_ms = 2;
@@ -4648,6 +4669,9 @@ test "approval replay identity includes work label explanation and normalized gr
     try std.testing.expectError(error.ApprovalConflict, registerApproval(alloc, &ledger, changed));
     changed = base;
     changed.explanation = null;
+    try std.testing.expectError(error.ApprovalConflict, registerApproval(alloc, &ledger, changed));
+    changed = base;
+    changed.command = "# terminal.exec profile=clean shell=/bin/zsh\nzig build test";
     try std.testing.expectError(error.ApprovalConflict, registerApproval(alloc, &ledger, changed));
     const changed_grants = [_]types.PermissionGrant{.{
         .tool_name = @constCast("read_file"),
@@ -5487,7 +5511,10 @@ test "approval response is exact once and always grants precede wake effect" {
     var grants = try alloc.alloc(types.PermissionGrant, 1);
     grants[0] = .{
         .tool_name = try alloc.dupe(u8, "bash"),
-        .target_path = try alloc.dupe(u8, "git status"),
+        .target_path = try alloc.dupe(
+            u8,
+            "@fx-terminal-env:user:8:/bin/zsh::git status",
+        ),
     };
     var approval = Approval{
         .id = try alloc.dupe(u8, "11111111111111111111111111111111"),
@@ -5519,6 +5546,10 @@ test "approval response is exact once and always grants precede wake effect" {
     defer root.deinit(alloc);
     try std.testing.expect(try applyAlwaysGrants(alloc, &root, approval.grants));
     try std.testing.expectEqual(@as(u64, 1), root.authority_generation);
+    try std.testing.expectEqualStrings(
+        approval.grants[0].target_path,
+        root.authority_grants[0].target_path,
+    );
     try applyApprovalDecision(&approval, decision, 2, 1);
     try std.testing.expectEqual(ApprovalStatus.allowed_always, approval.status);
     try std.testing.expect(decideApprovalResponse(approval, response, .{
