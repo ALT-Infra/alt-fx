@@ -78,6 +78,22 @@ pub const Tracker = struct {
     }
 
     pub fn signalAll(self: *Tracker, signal: std.posix.SIG) usize {
+        return self.signalProcesses(signal, null);
+    }
+
+    pub fn signalOutsideProcessGroup(
+        self: *Tracker,
+        signal: std.posix.SIG,
+        preserved_group: std.posix.pid_t,
+    ) usize {
+        return self.signalProcesses(signal, preserved_group);
+    }
+
+    fn signalProcesses(
+        self: *Tracker,
+        signal: std.posix.SIG,
+        preserved_group: ?std.posix.pid_t,
+    ) usize {
         var signaled: usize = 0;
         var index = self.processes.items.len;
         while (index > 0) {
@@ -85,6 +101,10 @@ pub const Tracker = struct {
             const process = self.processes.items[index];
             const actual = captureIdentity(self.alloc, process.pid) catch continue;
             if (!process.identity.eql(actual)) continue;
+            if (!shouldSignalProcess(
+                processGroupId(process.pid),
+                preserved_group,
+            )) continue;
             std.posix.kill(process.pid, signal) catch |err| switch (err) {
                 error.ProcessNotFound => continue,
                 else => continue,
@@ -178,6 +198,23 @@ pub const Tracker = struct {
     }
 };
 
+fn shouldSignalProcess(
+    process_group: ?std.posix.pid_t,
+    preserved_group: ?std.posix.pid_t,
+) bool {
+    const preserved = preserved_group orelse return true;
+    const actual = process_group orelse return false;
+    return actual != preserved;
+}
+
+fn processGroupId(pid: std.posix.pid_t) ?std.posix.pid_t {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return null;
+    const process_group = getpgid(pid);
+    return if (process_group >= 0) process_group else null;
+}
+
+extern "c" fn getpgid(pid: std.posix.pid_t) std.posix.pid_t;
+
 fn readLinuxChildrenFile(file: std.Io.File, buffer: []u8) !usize {
     if (comptime builtin.os.tag != .linux) return error.ProcessTreeUnsupported;
     while (true) {
@@ -189,6 +226,13 @@ fn readLinuxChildrenFile(file: std.Io.File, buffer: []u8) !usize {
             else => return error.ProcessTreeInspectionFailed,
         }
     }
+}
+
+test "process-group exclusion preserves the captured command grace" {
+    try std.testing.expect(shouldSignalProcess(41, null));
+    try std.testing.expect(!shouldSignalProcess(41, 41));
+    try std.testing.expect(shouldSignalProcess(42, 41));
+    try std.testing.expect(!shouldSignalProcess(null, 41));
 }
 
 fn captureIdentity(alloc: Allocator, pid: std.posix.pid_t) !Identity {

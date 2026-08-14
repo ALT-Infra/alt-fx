@@ -292,7 +292,10 @@ fn waitForForegroundTarget(
         if (foregroundSessionTerminationRequested()) {
             if (termination_started_ms == null) {
                 termination_started_ms = now_ms;
-                const count = descendants.signalAll(std.posix.SIG.TERM);
+                const count = descendants.signalOutsideProcessGroup(
+                    std.posix.SIG.TERM,
+                    std.c.getpid(),
+                );
                 debug_trace.logf(
                     "core",
                     "captured command termination reached tracked descendants count={d}",
