@@ -948,8 +948,7 @@ pub fn Runtime(comptime App: type) type {
                             app_session_runtime.Runtime(App).recordToolTerminal(
                                 app,
                                 lifecycle,
-                                record.tool_name,
-                                record.activity_kind,
+                                record.captured_command,
                             );
                         }
                     },

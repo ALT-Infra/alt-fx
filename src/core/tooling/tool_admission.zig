@@ -1453,12 +1453,17 @@ fn requestSandboxWideningOutcomeInternal(
     }
 
     var configured_ask = false;
+    const command_identity = try command_environment.permissionCommandIdentity(
+        arena,
+        command_ctx.environment,
+        command_ctx.command,
+    );
     const command_target: permissions.PermissionCallTarget = .{
         .role = "target",
         .path = try std.fmt.allocPrint(
             arena,
             "{s}::{s}",
-            .{ command_ctx.resolved_cwd, command_ctx.command },
+            .{ command_ctx.resolved_cwd, command_identity },
         ),
     };
     const permission_name = try permissionNameForCall(input, arena, call);
@@ -2093,7 +2098,11 @@ fn interactivePermissionRequest(
                 arena,
                 context.command,
             ),
-            .command = context.command,
+            .command = try command_environment.formatApprovalCommand(
+                arena,
+                context.environment,
+                context.command,
+            ),
             .amendment_allowed = true,
         };
     }
@@ -2192,14 +2201,38 @@ fn permissionTargetsForCall(input: Input, arena: Allocator, call: ToolCall) !per
         return .{ .items = items };
     }
     const tool = registeredTool(input, call.name) orelse return error.UnsupportedTool;
+    if (try isRunCommandCall(input, arena, call)) {
+        const items = try arena.alloc(permissions.PermissionCallTarget, 1);
+        errdefer arena.free(items);
+        items[0] = .{
+            .role = "target",
+            .path = try commandPermissionTarget(input, arena, call),
+        };
+        return .{ .items = items };
+    }
     return permissions.permissionTargetsForCallInScope(
         arena,
         accessScope(input),
         call,
-        if (try isRunCommandCall(input, arena, call))
-            .command_cwd
-        else
-            tool.permission_target_kind,
+        tool.permission_target_kind,
+    );
+}
+
+fn commandPermissionTarget(
+    input: Input,
+    arena: Allocator,
+    call: ToolCall,
+) ![]u8 {
+    const context = try runCommandContext(input, arena, call);
+    const identity = try command_environment.permissionCommandIdentity(
+        arena,
+        context.environment,
+        context.command,
+    );
+    return std.fmt.allocPrint(
+        arena,
+        "{s}::{s}",
+        .{ context.resolved_cwd, identity },
     );
 }
 
@@ -2214,14 +2247,14 @@ pub fn permissionTargetForCall(input: Input, arena: Allocator, call: ToolCall) !
     if (isAvailableDynamicTool(input, call.name)) return arena.dupe(u8, call.name);
     if (registeredWebSearchTarget(input, call.name)) |target_name| return arena.dupe(u8, target_name);
     const tool = registeredTool(input, call.name) orelse return error.UnsupportedTool;
+    if (try isRunCommandCall(input, arena, call)) {
+        return commandPermissionTarget(input, arena, call);
+    }
     return permissions.permissionTargetForCallInScope(
         arena,
         accessScope(input),
         call,
-        if (try isRunCommandCall(input, arena, call))
-            .command_cwd
-        else
-            tool.permission_target_kind,
+        tool.permission_target_kind,
     );
 }
 
@@ -2360,9 +2393,73 @@ test "interactive command approval keeps activity projection out of permission r
         request.label,
     );
     try std.testing.expectEqualStrings(
-        raw_command,
+        "# terminal.exec profile=omitted (legacy)\n" ++ raw_command,
         request.command orelse return error.TestExpectedEqual,
     );
+}
+
+test "terminal exec session grants do not cross explicit profiles" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var background: BackgroundRuntime = .{};
+    defer background.deinit(std.testing.allocator);
+    const input = testInputWithClassifier(
+        &worker,
+        &background,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+
+    const legacy = try permissionTargetForCall(input, arena, .{
+        .id = "legacy",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf scoped\"}",
+    });
+    const clean = permissionTargetForCall(input, arena, .{
+        .id = "clean",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf scoped\",\"profile\":\"clean\"}",
+    }) catch |err| switch (err) {
+        error.MissingLoginShell, error.UnsupportedShell => return error.SkipZigTest,
+        else => return err,
+    };
+    const user = try permissionTargetForCall(input, arena, .{
+        .id = "user",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf scoped\",\"profile\":\"user\"}",
+    });
+
+    try std.testing.expect(!std.mem.eql(u8, legacy, clean));
+    try std.testing.expect(!std.mem.eql(u8, clean, user));
+    const grants = try permissions.suggestedSessionGrants(
+        arena,
+        input.workspace_root,
+        "run_command",
+        clean,
+        .command_cwd,
+    );
+    try std.testing.expect(permissions.sessionGrantAllowed(grants, "run_command", clean));
+    try std.testing.expect(!permissions.sessionGrantAllowed(grants, "run_command", user));
+    try std.testing.expect(!permissions.sessionGrantAllowed(grants, "run_command", legacy));
+
+    const request = try interactivePermissionRequest(input, arena, .{
+        .id = "user-prompt",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf scoped\",\"profile\":\"user\"}",
+    }, null);
+    const approval_command = request.command orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        approval_command,
+        "# terminal.exec profile=user shell=",
+    ));
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        approval_command,
+        "\nprintf scoped",
+    ));
 }
 
 test "interactive command approval keeps dangerous-command guidance" {

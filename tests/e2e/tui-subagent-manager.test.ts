@@ -882,6 +882,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         }
         if (body.includes(childPrompt)) {
           return fakeGatewayToolCall(callId, "terminal", {
+            action: "exec",
             command: `printf yolo > ${JSON.stringify(marker)}`,
           });
         }
@@ -1625,12 +1626,14 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
             return fakeGatewayFinalText("COMMAND_STREAM_CHILD_COMPLETE");
           }
           return fakeGatewayToolCall(`command_stream_${next}`, "terminal", {
+            action: "exec",
             command:
               `printf COMMAND_${next}_START; sleep 0.35; printf COMMAND_${next}_END`,
           });
         }
         if (body.includes(childPrompt)) {
           return fakeGatewayToolCall("command_stream_1", "terminal", {
+            action: "exec",
             command:
               "printf COMMAND_1_START; sleep 0.35; printf COMMAND_1_END",
           });
@@ -3757,6 +3760,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await active.sendKeys("Right");
         await active.waitForText("Full detail · ←/→ switch · ctrl o close", TIMEOUT);
         releaseChildApproval(fakeGatewayToolCall(callId, "terminal", {
+          action: "exec",
           command: "printf approved > child-approval-effect.txt",
         }));
         const childApproval = await active.waitForPane(
@@ -5836,11 +5840,13 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         }
         if (body.includes(firstPrompt)) {
           return fakeGatewayToolCall(firstCallId, "terminal", {
+            action: "exec",
             command: `printf first > ${JSON.stringify(firstMarker)}`,
           });
         }
         if (body.includes(secondPrompt)) {
           return fakeGatewayToolCall(secondCallId, "terminal", {
+            action: "exec",
             command: `printf second > ${JSON.stringify(secondMarker)}`,
           });
         }
@@ -6384,6 +6390,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         }
         if (body.includes(childPrompt)) {
           return fakeGatewayToolCall(childCallId, "terminal", {
+            action: "exec",
             command: "printf denied > cancelled-approval-effect.txt",
           });
         }

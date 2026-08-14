@@ -493,6 +493,7 @@ pub fn dispatchRunCommandCompatibility(
     registry: Registry,
     request: RunCommandRequest,
 ) (DispatchError || RunCommandCompatibilityMatchError)!?ToolResult {
+    if (std.meta.activeTag(request.environment) != .legacy) return null;
     const matched = (try matchRunCommandCompatibility(
         registry,
         request.command,

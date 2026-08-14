@@ -2544,7 +2544,7 @@ describe("gateway stream lifecycle", () => {
     const command = `cat <<'FX_LONG_COMMAND' > long-command-output.txt\n${payload}\nFX_LONG_COMMAND\n`;
     expect(Buffer.byteLength(command)).toBeGreaterThan(20 * 1024);
     const responses = [
-      fakeGatewayToolCall(callId, "terminal", { command }),
+      fakeGatewayToolCall(callId, "terminal", { action: "exec", command }),
       fakeGatewayFinalText("Long command fixture written."),
     ];
     const gateway = startGateway(() =>
@@ -3300,6 +3300,7 @@ describe("gateway stream lifecycle", () => {
     const gateway = startGateway(() => {
       if (responseIndex++ === 0) {
         return fakeGatewayToolCall("prompt_too_long_tool_1", "terminal", {
+          action: "exec",
           command: `printf 'once\\n' >> '${sideEffectPath}'`,
         });
       }

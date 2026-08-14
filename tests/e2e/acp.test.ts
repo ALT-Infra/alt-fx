@@ -5868,6 +5868,7 @@ describe("acp: model-independent", () => {
       );
       const gateway = startFakeGateway([
         fakeGatewayToolCall("approved_command_1", "terminal", {
+          action: "exec",
           command: `printf approved > '${marker}'`,
         }),
         finalText("command approval complete"),
@@ -6594,6 +6595,7 @@ describe("acp: model-independent", () => {
       const gateway = startFakeGateway(
         [
           fakeGatewayToolCall("cancelled_review_command", "terminal", {
+            action: "exec",
             command: `printf cancelled > ${JSON.stringify(marker)}`,
           }),
           finalText("follow-up after ACP review cancellation"),

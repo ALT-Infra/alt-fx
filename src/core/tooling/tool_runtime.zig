@@ -4,6 +4,7 @@ const agent_stream_provider = @import("../agent/stream_provider.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const command_contract = @import("../execution/command_contract.zig");
+const command_environment = @import("../execution/command_environment.zig");
 const background_process_provider = @import(
     "../execution/background_process_provider.zig",
 );
@@ -1134,11 +1135,12 @@ fn toolRunCommand(
     var route = try execution_router.prepareAuthorizedRoute(arena, command_ctx, authority);
     defer route.deinit(arena);
 
-    if (try tool_dispatch.dispatchRunCommandCompatibility(
+    const compatibility_result = try tool_dispatch.dispatchRunCommandCompatibility(
         typedDispatchContext(ctx, arena),
         ctx.tool_registry,
         request,
-    )) |compatibility_result| {
+    );
+    if (compatibility_result) |compatibility| {
         if (route != .approved_shell) return error.CommandAdmissionChanged;
         const intercepted_replay = initCommandReplayCapture(
             arena,
@@ -1158,11 +1160,11 @@ fn toolRunCommand(
             .alloc = arena,
             .capture = capture,
         };
-        const output = switch (compatibility_result) {
+        const output = switch (compatibility) {
             .success => |body| body,
             .failure => |body| body,
         };
-        if (compatibility_result == .success and ctx.interactive and output.len > 0) {
+        if (compatibility == .success and ctx.interactive and output.len > 0) {
             try callback.accept(
                 ctx.output_chunk_lifecycle_id,
                 .stdout,
@@ -1182,7 +1184,7 @@ fn toolRunCommand(
             &transferred,
             null,
             .{
-                .status = switch (compatibility_result) {
+                .status = switch (compatibility) {
                     .success => .success,
                     .failure => .failure,
                 },
@@ -3318,6 +3320,21 @@ test "captured command compatibility bypasses compound commands" {
         .resolved_cwd = "/tmp",
         .environment = .legacy,
     })) == null);
+
+    for ([_]command_environment.Environment{
+        .{ .clean = "/bin/zsh" },
+        .{ .user = "/bin/zsh" },
+    }) |environment| {
+        try std.testing.expect((try tool_dispatch.dispatchRunCommandCompatibility(
+            typedDispatchContext(rt.context(), arena),
+            rt.tool_registry,
+            .{
+                .command = "fx-compatibility-probe",
+                .resolved_cwd = "/tmp",
+                .environment = environment,
+            },
+        )) == null);
+    }
 }
 
 test "run command compatibility returns installer failure without shell fallback" {

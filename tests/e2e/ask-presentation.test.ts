@@ -161,13 +161,16 @@ describe("fx ask presentation", () => {
       "if command -v fx_profile_function >/dev/null; then fx_profile_function; else printf no-function; fi";
     const gateway = startFakeGateway([
       fakeGatewayToolCall("terminal-omitted", "terminal", {
+        action: "exec",
         command: "printf 'omitted=%s' \"${FX_OMITTED_PROFILE-unset}\"",
       }),
       fakeGatewayToolCall("terminal-clean", "terminal", {
+        action: "exec",
         command: profileCommand,
         profile: "clean",
       }),
       fakeGatewayToolCall("terminal-user", "terminal", {
+        action: "exec",
         command: profileCommand,
         profile: "user",
       }),
@@ -643,6 +646,7 @@ describe("fx ask presentation", () => {
       const gateway = startFakeGateway(
         [
           fakeGatewayToolCall("write_fixture", "terminal", {
+            action: "exec",
             command: "printf notice-test > ask-notice.txt",
           }),
           fakeGatewayFinalText("Notice filtering complete.\n"),

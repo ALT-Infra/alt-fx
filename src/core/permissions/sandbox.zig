@@ -345,8 +345,23 @@ pub fn executeCommandInEnvironment(
         .vercel, .just_bash => blk: {
             const projected = try shell_resolver.formatInvocationCommand(scratch, &invocation);
             break :blk switch (backend) {
-                .vercel => executeVercel(arena, scratch, effective_cfg, projected, cwd),
-                .just_bash => executeJustBash(arena, scratch, effective_cfg, "just-bash", projected, cwd),
+                .vercel => executeVercelWithResultCommand(
+                    arena,
+                    scratch,
+                    effective_cfg,
+                    projected,
+                    command,
+                    cwd,
+                ),
+                .just_bash => executeJustBashWithResultCommand(
+                    arena,
+                    scratch,
+                    effective_cfg,
+                    "just-bash",
+                    projected,
+                    command,
+                    cwd,
+                ),
                 else => unreachable,
             };
         },
@@ -657,13 +672,38 @@ fn executeVercel(
     command: []const u8,
     cwd: []const u8,
 ) !command_contract.RunCommandResult {
+    return executeVercelWithResultCommand(
+        alloc,
+        scratch,
+        cfg,
+        command,
+        command,
+        cwd,
+    );
+}
+
+fn executeVercelWithResultCommand(
+    alloc: Allocator,
+    scratch: Allocator,
+    cfg: Config,
+    execution_command: []const u8,
+    result_command: []const u8,
+    cwd: []const u8,
+) !command_contract.RunCommandResult {
     const provider = cfg.devbox_provider orelse {
         debug_trace.logf("core", "vercel sandbox unavailable: no devbox provider, falling back to raw bash", .{});
-        return executeRawBash(alloc, scratch, cfg, command, cwd);
+        return executeRawBashWithResultCommand(
+            alloc,
+            scratch,
+            cfg,
+            execution_command,
+            result_command,
+            cwd,
+        );
     };
     return switch (try provider.execute(
         alloc,
-        command,
+        execution_command,
         cwd,
         devboxControl(cfg),
     )) {
@@ -674,7 +714,7 @@ fn executeVercel(
             try emitProviderOutput(cfg, .stderr, owned.stderr);
             break :blk try formatExitOutput(
                 alloc,
-                command,
+                result_command,
                 cwd,
                 owned.exit_code,
                 owned.stdout,
@@ -684,11 +724,25 @@ fn executeVercel(
         },
         .unavailable => blk: {
             debug_trace.logf("core", "vercel sandbox unavailable: no auth token, falling back to raw bash", .{});
-            break :blk try executeRawBash(alloc, scratch, cfg, command, cwd);
+            break :blk try executeRawBashWithResultCommand(
+                alloc,
+                scratch,
+                cfg,
+                execution_command,
+                result_command,
+                cwd,
+            );
         },
         .request_failed => blk: {
             debug_trace.logf("core", "vercel sandbox request failed, falling back to raw bash", .{});
-            break :blk try executeRawBash(alloc, scratch, cfg, command, cwd);
+            break :blk try executeRawBashWithResultCommand(
+                alloc,
+                scratch,
+                cfg,
+                execution_command,
+                result_command,
+                cwd,
+            );
         },
     };
 }
@@ -746,7 +800,27 @@ fn executeJustBash(
     command: []const u8,
     cwd: []const u8,
 ) !command_contract.RunCommandResult {
-    const argv = [_][]const u8{ executable_path, "-c", command, "--root", cfg.workspace_root, "--cwd", cwd, "--json" };
+    return executeJustBashWithResultCommand(
+        alloc,
+        scratch,
+        cfg,
+        executable_path,
+        command,
+        command,
+        cwd,
+    );
+}
+
+fn executeJustBashWithResultCommand(
+    alloc: Allocator,
+    scratch: Allocator,
+    cfg: Config,
+    executable_path: []const u8,
+    execution_command: []const u8,
+    result_command: []const u8,
+    cwd: []const u8,
+) !command_contract.RunCommandResult {
+    const argv = [_][]const u8{ executable_path, "-c", execution_command, "--root", cfg.workspace_root, "--cwd", cwd, "--json" };
     var transport_cfg = cfg;
     if (cfg.callback_projection == .raw or cfg.on_accepted_output_chunk != null) {
         transport_cfg.output_chunk_ctx = null;
@@ -761,15 +835,29 @@ fn executeJustBash(
         => return err,
         else => {
             debug_trace.logf("core", "just-bash execution failed err={s}, falling back to raw bash", .{@errorName(err)});
-            return executeRawBash(alloc, scratch, cfg, command, cwd);
+            return executeRawBashWithResultCommand(
+                alloc,
+                scratch,
+                cfg,
+                execution_command,
+                result_command,
+                cwd,
+            );
         },
     };
-    if (result.cancelled) return formatCollectedOutput(alloc, command, cwd, result);
+    if (result.cancelled) return formatCollectedOutput(alloc, result_command, cwd, result);
 
-    return parseJustBashJson(alloc, scratch, cfg, result.stdout, result.stderr, result.term, command, cwd, result.duration_ms) catch |err| switch (err) {
+    return parseJustBashJson(alloc, scratch, cfg, result.stdout, result.stderr, result.term, result_command, cwd, result.duration_ms) catch |err| switch (err) {
         error.JustBashParseError, error.JustBashExecutionFailed => {
             debug_trace.logf("core", "just-bash response parse failed err={s}, falling back to raw bash", .{@errorName(err)});
-            return executeRawBash(alloc, scratch, cfg, command, cwd);
+            return executeRawBashWithResultCommand(
+                alloc,
+                scratch,
+                cfg,
+                execution_command,
+                result_command,
+                cwd,
+            );
         },
         else => return err,
     };
@@ -1585,10 +1673,28 @@ fn executeRawBash(
     command: []const u8,
     cwd: []const u8,
 ) !command_contract.RunCommandResult {
+    return executeRawBashWithResultCommand(
+        alloc,
+        scratch,
+        cfg,
+        command,
+        command,
+        cwd,
+    );
+}
+
+fn executeRawBashWithResultCommand(
+    alloc: Allocator,
+    scratch: Allocator,
+    cfg: Config,
+    execution_command: []const u8,
+    result_command: []const u8,
+    cwd: []const u8,
+) !command_contract.RunCommandResult {
     if (builtin.os.tag == .windows) {
-        const argv = [_][]const u8{ "cmd", "/C", command };
+        const argv = [_][]const u8{ "cmd", "/C", execution_command };
         const result = try executeProcess(scratch, cfg, &argv, cwd);
-        return formatCollectedOutput(alloc, command, cwd, result);
+        return formatCollectedOutput(alloc, result_command, cwd, result);
     }
 
     const argv = [_][]const u8{
@@ -1601,9 +1707,9 @@ fn executeRawBash(
         cfg,
         &argv,
         cwd,
-        command,
+        execution_command,
     );
-    return formatCollectedOutput(alloc, command, cwd, result);
+    return formatCollectedOutput(alloc, result_command, cwd, result);
 }
 
 fn executeRawInvocation(
@@ -4227,7 +4333,9 @@ test "just_bash raw callback emits parsed inner streams without wrapper JSON" {
     defer capture.deinit();
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
     defer scratch_state.deinit();
-    const result = try executeJustBash(
+    const submitted_command = "ignored command";
+    const projected_command = "/bin/zsh -f -c 'ignored command'";
+    const result = try executeJustBashWithResultCommand(
         alloc,
         scratch_state.allocator(),
         .{
@@ -4239,10 +4347,16 @@ test "just_bash raw callback emits parsed inner streams without wrapper JSON" {
             .callback_projection = .raw,
         },
         fake_path,
-        "ignored command",
+        projected_command,
+        submitted_command,
         workspace,
     );
     defer alloc.free(result.output);
+
+    try std.testing.expectEqualStrings(
+        submitted_command,
+        result.command_result.?.foreground.command,
+    );
 
     try std.testing.expectEqual(@as(usize, 2), capture.chunks.items.len);
     try std.testing.expectEqual(.stdout, capture.streams.items[0]);

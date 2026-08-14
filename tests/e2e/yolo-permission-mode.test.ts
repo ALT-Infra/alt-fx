@@ -77,6 +77,7 @@ describe("yolo permission mode", () => {
 
       const fake = startFakeGateway([
         fakeGatewayToolCall("yolo_command", "terminal", {
+          action: "exec",
           command: `printf 'YOLO_COMMAND_OK\\n' > ${JSON.stringify(markerPath)}`,
         }),
         fakeGatewayFinalText("YOLO_HEADLESS_DONE"),

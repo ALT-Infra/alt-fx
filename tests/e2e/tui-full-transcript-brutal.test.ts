@@ -390,6 +390,7 @@ done
   }
   responses.push(fakeGatewayFinalText(`${HISTORY_DONE}\n${TAIL_SENTINEL}`));
   responses.push(fakeGatewayToolCall("ctrl-o-brutal-live", "terminal", {
+    action: "exec",
     command: "./ctrl-o-live.sh",
   }));
   responses.push(fakeGatewayFinalText(LIVE_DONE));

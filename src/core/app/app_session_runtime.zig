@@ -2100,8 +2100,7 @@ pub fn Runtime(comptime App: type) type {
         pub fn recordToolTerminal(
             app: *App,
             event: types.ToolLifecycleEvent,
-            tool_name: ?[]const u8,
-            activity_kind: types.ToolActivityKind,
+            captured_command_call: bool,
         ) void {
             const terminal = switch (event) {
                 .terminal => |value| value,
@@ -2114,11 +2113,7 @@ pub fn Runtime(comptime App: type) type {
             if (capture_disabled) {
                 app.session_persistence.disabled_cancelled_command_capture = null;
             }
-            if (activity_kind != .command or
-                tool_name == null or
-                (!std.mem.eql(u8, tool_name.?, "terminal") and
-                    !std.mem.eql(u8, tool_name.?, "run_command")))
-            {
+            if (!captured_command_call) {
                 discardPendingCancelledCommand(app, terminal.id, "non_command_terminal");
                 return;
             }
@@ -7686,8 +7681,7 @@ test "cancelled command presentation survives a persisted session restart" {
                 .outcome = .{ .kind = .cancelled, .summary = "Cancelled slow" },
                 .command_artifact_handle = "fx-command-cancelled.log",
             } },
-            "terminal",
-            .command,
+            true,
         );
         Runtime(TestApp).recordCommandOutputComplete(&app, lifecycle_id);
 
@@ -7756,8 +7750,7 @@ test "cancelled command capture creation failure preserves the row" {
             .id = lifecycle_id,
             .outcome = .{ .kind = .cancelled, .summary = "Cancelled" },
         } },
-        "run_command",
-        .command,
+        true,
     );
     Runtime(TestApp).recordCommandOutputComplete(&app, lifecycle_id);
     try Runtime(TestApp).appendHistoryTurn(&app, .{ .interrupted = .{
@@ -7806,8 +7799,7 @@ test "cancelled command identity failure never persists a replay suffix" {
             .id = lifecycle_id,
             .outcome = .{ .kind = .cancelled, .summary = "Cancelled" },
         } },
-        "run_command",
-        .command,
+        true,
     );
     Runtime(TestApp).recordCommandOutputComplete(&app, lifecycle_id);
     try Runtime(TestApp).appendHistoryTurn(&app, .{ .interrupted = .{
@@ -7850,8 +7842,7 @@ test "cancelled command spill failure degrades without losing the row" {
             .id = lifecycle_id,
             .outcome = .{ .kind = .cancelled, .summary = "Cancelled" },
         } },
-        "run_command",
-        .command,
+        true,
     );
     Runtime(TestApp).recordCommandOutputComplete(&app, lifecycle_id);
     try Runtime(TestApp).appendHistoryTurn(&app, .{ .interrupted = .{
@@ -7900,8 +7891,7 @@ test "reactive interrupted history discards the app replay candidate" {
             .id = lifecycle_id,
             .outcome = .{ .kind = .cancelled, .summary = "Cancelled" },
         } },
-        "run_command",
-        .command,
+        true,
     );
     Runtime(TestApp).recordCommandOutputComplete(&app, lifecycle_id);
     var before = try Runtime(TestApp).childCapability(&app).?.iterate(
@@ -7961,10 +7951,54 @@ test "ordinary command terminal discards the app replay candidate" {
             .id = lifecycle_id,
             .outcome = .{ .kind = .completed, .summary = "Completed" },
         } },
-        "run_command",
-        .command,
+        true,
     );
     try std.testing.expect(app.session_persistence.pending_cancelled_command == null);
+}
+
+test "cancelled durable terminal action preserves the exec replay candidate" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+    const exec_id = types.ToolLifecycleId{
+        .turn_id = 11,
+        .call_id = "cancelled-exec",
+    };
+    const durable_id = types.ToolLifecycleId{
+        .turn_id = 11,
+        .call_id = "cancelled-read",
+    };
+
+    Runtime(TestApp).recordAppliedCommandOutput(
+        &app,
+        exec_id,
+        .stdout,
+        "captured before cancellation\n",
+    );
+    Runtime(TestApp).recordToolTerminal(
+        &app,
+        .{ .terminal = .{
+            .id = exec_id,
+            .outcome = .{ .kind = .cancelled, .summary = "Cancelled exec" },
+        } },
+        true,
+    );
+    Runtime(TestApp).recordCommandOutputComplete(&app, exec_id);
+
+    Runtime(TestApp).recordToolTerminal(
+        &app,
+        .{ .terminal = .{
+            .id = durable_id,
+            .outcome = .{ .kind = .cancelled, .summary = "Cancelled read" },
+        } },
+        false,
+    );
+
+    const pending = app.session_persistence.pending_cancelled_command orelse
+        return error.TestExpectedEqual;
+    try std.testing.expect(pending.matches(exec_id));
+    try std.testing.expect(pending.cancelled);
+    try std.testing.expect(pending.completed);
 }
 
 test "zero-output cancelled command restores detail without an output block" {

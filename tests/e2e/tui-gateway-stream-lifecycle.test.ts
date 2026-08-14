@@ -6137,6 +6137,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       const cancelledGateway = startFakeGateway([
         fakeGatewayToolCall("minimal_cancelled_command", "terminal", {
+          action: "exec",
           command: "sleep 30",
         }),
       ]);
@@ -6687,7 +6688,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       writeFileSync(stderrPath, "");
 
       const commandGateway = startFakeGateway([
-        fakeGatewayToolCall("multiline_command", "terminal", { command }),
+        fakeGatewayToolCall("multiline_command", "terminal", { action: "exec", command }),
         fakeGatewayFinalText(finalText),
       ]);
       gateway = commandGateway;
@@ -6811,14 +6812,14 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           {
             type: "tool-input-delta",
             id: "stream_cmd_one",
-            delta: JSON.stringify({ command: firstCommand }),
+            delta: JSON.stringify({ action: "exec", command: firstCommand }),
           },
           { type: "tool-input-end", id: "stream_cmd_one" },
           { type: "tool-input-start", id: "stream_cmd_two", toolName: "terminal" },
           {
             type: "tool-input-delta",
             id: "stream_cmd_two",
-            delta: JSON.stringify({ command: secondCommand }),
+            delta: JSON.stringify({ action: "exec", command: secondCommand }),
           },
           { type: "tool-input-end", id: "stream_cmd_two" },
           {
@@ -6980,7 +6981,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
 
       const followupGateway = startFakeGateway([
-        fakeGatewayToolCall("first_command", "terminal", { command: firstCommand }),
+        fakeGatewayToolCall("first_command", "terminal", { action: "exec", command: firstCommand }),
         fakeGatewayFinalText(firstFinal),
         fakeGatewaySse([
           {

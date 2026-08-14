@@ -261,6 +261,7 @@ test.skipIf(!tmuxAvailable())(
     const marker = join(fixture.workspace, "ask-permission-marker.txt");
     const gateway = startFakeGateway([
       fakeGatewayToolCall("ask_permission_1", "terminal", {
+        action: "exec",
         command: "touch ask-permission-marker.txt",
       }),
       fakeGatewayFinalText("NOTIFICATION_ASK_PERMISSION_COMPLETE"),
@@ -307,6 +308,7 @@ test.skipIf(!tmuxAvailable())(
     const marker = join(fixture.workspace, "permission-marker.txt");
     const gateway = startFakeGateway([
       fakeGatewayToolCall("permission_1", "terminal", {
+        action: "exec",
         command: "touch permission-marker.txt",
       }),
       fakeGatewayFinalText("NOTIFICATION_PERMISSION_COMPLETE"),

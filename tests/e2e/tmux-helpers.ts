@@ -122,57 +122,9 @@ export function hasEmptyComposer(pane: string): boolean {
   return pane.split("\n").some(isEmptyComposerLine);
 }
 
-function normalizeTerminalExecEvents(events: object[]): object[] {
-  const streamedTerminalCalls = new Set<string>();
-  const initializedTerminalCalls = new Set<string>();
-
-  return events.map((rawEvent) => {
-    const event = { ...rawEvent } as Record<string, any>;
-    if (
-      event.type === "tool-input-start" &&
-      event.toolName === "terminal" &&
-      typeof event.id === "string"
-    ) {
-      streamedTerminalCalls.add(event.id);
-    }
-
-    if (
-      event.type === "tool-input-delta" &&
-      typeof event.id === "string" &&
-      streamedTerminalCalls.has(event.id) &&
-      !initializedTerminalCalls.has(event.id) &&
-      typeof event.delta === "string"
-    ) {
-      event.delta = event.delta.replace(/^\s*\{/, '{"action":"exec",');
-      initializedTerminalCalls.add(event.id);
-    }
-
-    if (event.toolName === "terminal" && event.input != null) {
-      if (typeof event.input === "string") {
-        try {
-          const input = JSON.parse(event.input);
-          if (input?.action == null && typeof input?.command === "string") {
-            event.input = JSON.stringify({ action: "exec", ...input });
-          }
-        } catch {
-          // Malformed-input fixtures must remain malformed.
-        }
-      } else if (
-        typeof event.input === "object" &&
-        event.input.action == null &&
-        typeof event.input.command === "string"
-      ) {
-        event.input = { action: "exec", ...event.input };
-      }
-    }
-    return event;
-  });
-}
-
 export function fakeGatewaySse(events: object[]) {
-  const normalized = normalizeTerminalExecEvents(events);
   return new Response(
-    `${normalized.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`,
+    `${events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`,
     { headers: { "content-type": "text/event-stream" } },
   );
 }

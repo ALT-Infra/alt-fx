@@ -73,6 +73,7 @@ describe("generic permission typed errors", () => {
       const toolCallId = "permission_denied_call";
       const gateway = startFakeGateway([
         fakeGatewayToolCall(toolCallId, "terminal", {
+          action: "exec",
           command: `touch ${JSON.stringify(marker)}`,
         }),
         fakeGatewayFinalText("permission error observed"),

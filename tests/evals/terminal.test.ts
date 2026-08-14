@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
-  assertToolUsed,
+  assertTerminalExecMatches,
   cleanupWorkDir,
   createWorkDir,
   runEval,
@@ -25,7 +25,7 @@ describe("eval: terminal exec", () => {
           timeoutSec: 60,
         },
       );
-      assertToolUsed(result, "terminal");
+      assertTerminalExecMatches(result, /^echo HELLO_FROM_FX$/);
       expect(result.json.output).toContain("HELLO_FROM_FX");
       expect(result.json.exit_code).toBe(0);
     },

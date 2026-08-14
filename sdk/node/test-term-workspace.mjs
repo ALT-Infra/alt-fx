@@ -77,6 +77,35 @@ function toolCall(id, command) {
   ]);
 }
 
+function terminalToolCalls(calls) {
+  const events = calls.flatMap(({ id, input }) => {
+    const serialized = JSON.stringify(input);
+    const deltas = [];
+    for (let offset = 0; offset < serialized.length; offset += 4096) {
+      deltas.push({ type: "tool-input-delta", id, delta: serialized.slice(offset, offset + 4096) });
+    }
+    return [
+      { type: "tool-input-start", id, toolName: "terminal" },
+      ...deltas,
+      { type: "tool-input-end", id },
+      { type: "tool-call", toolCallId: id, toolName: "terminal" },
+    ];
+  });
+  const responseEvents = [
+    ...events,
+    { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+  ];
+  return new Response(new ReadableStream({
+    start(controller) {
+      for (const event of responseEvents) {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+      }
+      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+      controller.close();
+    },
+  }), { headers: { "content-type": "text/event-stream" } });
+}
+
 function textResponse(value) {
   return sse([
     { type: "text-delta", delta: value },
@@ -128,6 +157,7 @@ const fetch = async (_url, init = {}) => {
     const schema = body.tools[0]?.inputSchema;
     if (JSON.stringify(schema?.required) !== JSON.stringify(["action", "command"]) ||
         schema?.properties?.action?.enum?.[0] !== "exec" ||
+        schema?.properties?.command?.maxLength !== 65_536 ||
         Object.keys(schema?.properties || {}).join(",") !== "action,command" ||
         schema?.additionalProperties !== false) {
       throw new Error(`workspace advertised unexpected terminal schema: ${JSON.stringify(schema)}`);
@@ -153,11 +183,26 @@ const fetch = async (_url, init = {}) => {
     requireResult(body, "workspace-abort", ["cancelled"]);
     return textResponse("abort mapping checked");
   }
+  if (toolResult(body, "workspace-oversized")) {
+    requireResult(body, "workspace-oversized", ["exceeds 65536 bytes"]);
+    requireResult(body, "workspace-profile", ["accepts only the", "action", "command", "fields"]);
+    requireResult(body, "workspace-durable", ["action must be", "exec"]);
+    requireResult(body, "workspace-unknown", ["accepts only the", "action", "command", "fields"]);
+    return textResponse("invalid boundaries checked");
+  }
   const prompt = latestUserText(body);
   if (prompt.includes("workspace success")) return toolCall("workspace-success", "printf adapter-success");
   if (prompt.includes("workspace truncation")) return toolCall("workspace-truncated", "generate-truncated-output");
   if (prompt.includes("workspace timeout")) return toolCall("workspace-timeout", "timeout-command");
   if (prompt.includes("workspace abort")) return toolCall("workspace-abort", "hold-command");
+  if (prompt.includes("workspace invalid boundaries")) {
+    return terminalToolCalls([
+      { id: "workspace-oversized", input: { action: "exec", command: "x".repeat(65_537) } },
+      { id: "workspace-profile", input: { action: "exec", command: "must-not-run", profile: "clean" } },
+      { id: "workspace-durable", input: { action: "start", command: "must-not-run" } },
+      { id: "workspace-unknown", input: { action: "exec", command: "must-not-run", unexpected: true } },
+    ]);
+  }
   if (prompt.includes("workspace recovery")) return textResponse("session stayed alive");
   throw new Error(`unexpected gateway request: ${JSON.stringify(body)}`);
 };
@@ -203,6 +248,7 @@ await waitFor(() => abortStarted, "workspace exec start");
 runtime.write("\x03");
 await waitFor(() => abortObserved, "workspace exec abort signal");
 await waitFor(() => grid().includes("abort mapping checked"), "workspace abort mapping");
+await prompt("workspace invalid boundaries", "invalid boundaries checked");
 await prompt("workspace recovery", "session stayed alive");
 
 runtime.write("/exit\r");
@@ -215,4 +261,4 @@ if (!checkedToolProjection) throw new Error("workspace tool projection was not c
 if (execCalls.join(",") !== "printf adapter-success,generate-truncated-output,timeout-command,hold-command") {
   throw new Error(`unexpected workspace exec calls: ${execCalls.join(",")}`);
 }
-console.log("headless workspace passed: success, truncation, timeout, and Ctrl-C abort mapped through the host adapter");
+console.log("headless workspace passed: success, truncation, timeout, Ctrl-C abort, and strict invalid boundaries mapped through the host adapter");

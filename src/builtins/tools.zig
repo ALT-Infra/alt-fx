@@ -200,9 +200,16 @@ const terminal_properties = [_]gateway_schema.Property{
     .{ .name = "close_policy", .json_type = .string, .enum_values = &.{ "graceful", "force" } },
 };
 
-const terminal_gateway_properties = [_]gateway_schema.Property{
-    .{ .name = "action", .json_type = .string, .enum_values = &.{ "start", "read", "screen", "write", "wait", "monitor", "inspect", "list", "resize", "signal", "close" } },
-} ++ terminal_properties;
+const terminal_actions = [_][]const u8{
+    "exec",    "start",   "read", "screen", "write",  "wait",
+    "monitor", "inspect", "list", "resize", "signal", "close",
+};
+
+const terminal_gateway_properties = [_]gateway_schema.Property{.{
+    .name = "action",
+    .json_type = .string,
+    .enum_values = &terminal_actions,
+}} ++ terminal_properties;
 
 fn terminalProperty(comptime name: []const u8) gateway_schema.Property {
     inline for (terminal_properties) |property| {
@@ -1413,13 +1420,16 @@ test "terminal tool schema exposes a compatible object and exact internal action
         .{ .action = "close", .properties = &.{ "action", "session_id", "close_policy" }, .required = &.{ "action", "session_id", "close_policy" } },
     };
 
-    const gateway_input = terminal.gateway_schema.input_schema;
-    try std.testing.expectEqual(@as(usize, 0), gateway_input.one_of.len);
-    try std.testing.expectEqual(terminal_gateway_properties.len, gateway_input.properties.len);
-    try std.testing.expectEqualSlices([]const u8, &.{"action"}, gateway_input.required);
-    try std.testing.expectEqual(@as(?bool, false), gateway_input.additional_properties);
-    const gateway_action = schemaProperty(gateway_input, "action").?;
-    try std.testing.expectEqual(std.meta.tags(terminal_contracts.Action).len, gateway_action.enum_values.len);
+    const input_schema = terminal.gateway_schema.input_schema;
+    try std.testing.expectEqual(terminal_gateway_properties.len, input_schema.properties.len);
+    try std.testing.expectEqual(@as(usize, 0), input_schema.one_of.len);
+    try std.testing.expectEqualSlices([]const u8, &.{"action"}, input_schema.required);
+    try std.testing.expectEqual(@as(?bool, false), input_schema.additional_properties);
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &terminal_actions,
+        schemaProperty(input_schema, "action").?.enum_values,
+    );
 
     try std.testing.expectEqual(expected.len, terminal_action_schemas.len);
     for (expected, terminal_action_schemas) |want, branch| {
@@ -1434,9 +1444,9 @@ test "terminal tool schema exposes a compatible object and exact internal action
         try std.testing.expectEqual(@as(?bool, false), branch.additional_properties);
     }
 
-    const start_branch = terminal_action_schemas[0];
-    const read_branch = terminal_action_schemas[1];
-    const list_branch = terminal_action_schemas[7];
+    const start_branch = terminal_action_schemas[1];
+    const read_branch = terminal_action_schemas[3];
+    const list_branch = terminal_action_schemas[9];
     try std.testing.expectEqualSlices(
         []const u8,
         &.{ "native", "tmux" },
@@ -1479,9 +1489,9 @@ test "terminal tool schema exposes a compatible object and exact internal action
     );
 }
 
-test "terminal action contracts and admission agree on every action field" {
-    const branches = &terminal_action_schemas;
-    try std.testing.expectEqual(std.meta.tags(terminal_contracts.Action).len, branches.len);
+test "terminal action metadata and admission agree on every field" {
+    const branches = terminal_action_schemas;
+    try std.testing.expectEqual(std.meta.tags(terminal_impl.Action).len + 1, branches.len);
 
     for (branches) |branch| {
         const action_property = schemaProperty(branch, "action").?;
@@ -1528,7 +1538,7 @@ test "terminal gateway advertisement projects a provider-compatible object schem
     const properties = input_schema.get("properties").?.object;
     try std.testing.expectEqual(terminal_gateway_properties.len, properties.count());
     try std.testing.expectEqual(
-        std.meta.tags(terminal_contracts.Action).len,
+        terminal_actions.len,
         properties.get("action").?.object.get("enum").?.array.items.len,
     );
     const required = input_schema.get("required").?.array.items;

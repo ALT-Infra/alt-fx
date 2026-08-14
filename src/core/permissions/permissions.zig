@@ -1,4 +1,5 @@
 const std = @import("std");
+const command_environment = @import("../execution/command_environment.zig");
 
 const io_mod = @import("../shared/io.zig");
 const pathing = @import("../workspace/pathing.zig");
@@ -1515,9 +1516,17 @@ pub fn permissionRulePatternForGrant(alloc: std.mem.Allocator, workspace_root: [
     if (std.mem.eql(u8, permission, web_fetch_permission)) return canonicalWebFetchDomainPattern(alloc, pattern);
     if (std.mem.eql(u8, permission, "bash")) {
         if (std.mem.find(u8, pattern, "::")) |separator| {
-            return alloc.dupe(u8, pattern[separator + 2 ..]);
+            return alloc.dupe(
+                u8,
+                command_environment.commandFromPermissionIdentity(
+                    pattern[separator + 2 ..],
+                ),
+            );
         }
-        return alloc.dupe(u8, pattern);
+        return alloc.dupe(
+            u8,
+            command_environment.commandFromPermissionIdentity(pattern),
+        );
     }
 
     if (std.mem.eql(u8, permission, "url") or
@@ -1548,9 +1557,17 @@ fn patternForRuleMatch(alloc: std.mem.Allocator, workspace_root: []const u8, too
     }
     if (std.mem.eql(u8, permission, "bash")) {
         if (std.mem.find(u8, target_path, "::")) |separator| {
-            return alloc.dupe(u8, target_path[separator + 2 ..]);
+            return alloc.dupe(
+                u8,
+                command_environment.commandFromPermissionIdentity(
+                    target_path[separator + 2 ..],
+                ),
+            );
         }
-        return alloc.dupe(u8, target_path);
+        return alloc.dupe(
+            u8,
+            command_environment.commandFromPermissionIdentity(target_path),
+        );
     }
 
     return displayTargetForPolicy(alloc, workspace_root, tool_name, target_path, target_kind);
@@ -1815,7 +1832,9 @@ fn displayPathTarget(alloc: std.mem.Allocator, workspace_root: []const u8, targe
 fn displayCommandTarget(alloc: std.mem.Allocator, workspace_root: []const u8, target_path: []const u8) ![]u8 {
     const separator = std.mem.find(u8, target_path, "::") orelse return alloc.dupe(u8, target_path);
     const cwd = target_path[0..separator];
-    const command = target_path[separator + 2 ..];
+    const command = command_environment.commandFromPermissionIdentity(
+        target_path[separator + 2 ..],
+    );
 
     const display_cwd = try (if (std.mem.eql(u8, cwd, workspace_root))
         alloc.dupe(u8, ".")
@@ -2600,6 +2619,18 @@ test "permissionRulePatternForGrant normalizes command url and workspace path gr
     defer alloc.free(command);
     try std.testing.expectEqualStrings("zig build", command);
 
+    const explicit_identity = try command_environment.permissionCommandIdentity(
+        alloc,
+        .{ .user = "/opt/bin::zsh" },
+        "zig build",
+    );
+    defer alloc.free(explicit_identity);
+    const explicit_target = try std.fmt.allocPrint(alloc, "/tmp/workspace::{s}", .{explicit_identity});
+    defer alloc.free(explicit_target);
+    const explicit_command = try permissionRulePatternForGrant(alloc, "/tmp/workspace", "bash", explicit_target);
+    defer alloc.free(explicit_command);
+    try std.testing.expectEqualStrings("zig build", explicit_command);
+
     const path = try permissionRulePatternForGrant(alloc, "/tmp/workspace", "edit", "/tmp/workspace/src/*");
     defer alloc.free(path);
     try std.testing.expectEqualStrings("src/*", path);
@@ -2611,6 +2642,28 @@ test "permissionRulePatternForGrant normalizes command url and workspace path gr
     const external = try permissionRulePatternForGrant(alloc, "/tmp/workspace", "read", "/tmp/external/**");
     defer alloc.free(external);
     try std.testing.expectEqualStrings("/tmp/external/**", external);
+}
+
+test "configured command rules ignore explicit environment identity" {
+    const alloc = std.testing.allocator;
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("bash"), .pattern = @constCast("zig *"), .action = .allow },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    const identity = try command_environment.permissionCommandIdentity(
+        alloc,
+        .{ .clean = "/bin/zsh" },
+        "zig build test",
+    );
+    defer alloc.free(identity);
+    const target = try std.fmt.allocPrint(alloc, "/tmp/workspace::{s}", .{identity});
+    defer alloc.free(target);
+
+    try std.testing.expectEqual(
+        RuleDecision.allow,
+        try ruleDecisionFor(alloc, rules, "/tmp/workspace", "run_command", target, .command_cwd),
+    );
 }
 
 test "directory tree permission patterns match directory and descendants only" {

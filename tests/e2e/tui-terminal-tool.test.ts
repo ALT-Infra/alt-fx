@@ -1211,6 +1211,7 @@ test.skipIf(!tmuxAvailable())(
       "session_id",
       "cwd",
       "command",
+      "profile",
       "shell",
       "backend",
       "return_when",
@@ -1233,8 +1234,8 @@ test.skipIf(!tmuxAvailable())(
       "close_policy",
     ]);
     expect(properties.action!.enum).toEqual([
-      "start", "read", "screen", "write", "wait", "monitor", "inspect",
-      "list", "resize", "signal", "close",
+      "exec", "start", "read", "screen", "write", "wait",
+      "monitor", "inspect", "list", "resize", "signal", "close",
     ]);
     expect(properties.action!.type).toBe("string");
     expect(properties.wait_ceiling_ms!.type).toBe("integer");
@@ -1613,7 +1614,10 @@ test.skipIf(!tmuxAvailable())(
       tools: Array<{
         name?: string;
         inputSchema?: {
+          type?: string;
           properties?: Record<string, { enum?: string[] }>;
+          required?: string[];
+          additionalProperties?: boolean;
           oneOf?: unknown[];
         };
       }>;
@@ -1622,7 +1626,10 @@ test.skipIf(!tmuxAvailable())(
       (tool) => tool.name === "terminal",
     )?.inputSchema;
     expect(terminalSchema).toBeDefined();
+    expect(terminalSchema!.type).toBe("object");
     expect(terminalSchema!.oneOf).toBeUndefined();
+    expect(terminalSchema!.required).toEqual(["action"]);
+    expect(terminalSchema!.additionalProperties).toBe(false);
     expect(terminalSchema!.properties?.action?.enum).toContain("wait");
     const terminalProperties = Object.keys(terminalSchema!.properties ?? {});
     expect(

@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const command_admission = @import("../permissions/command_admission.zig");
+const command_environment = @import("command_environment.zig");
 const command_effect = @import("../shell_command/command_effect.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const local_executor = @import("local_executor.zig");
@@ -57,7 +58,14 @@ pub fn prepareAuthorizedRoute(
                 return error.CommandAuthorityContextMismatch;
             }
             if (command_ctx.environment.requiresShellRoute()) {
-                debug_trace.logf("core", "terminal.exec authority=shell_allowed source={s} route=approved_shell environment=user", .{@tagName(shell.source)});
+                debug_trace.logf(
+                    "core",
+                    "terminal.exec authority=shell_allowed source={s} route=approved_shell environment={s}",
+                    .{
+                        @tagName(shell.source),
+                        @tagName(std.meta.activeTag(command_ctx.environment)),
+                    },
+                );
                 break :blk .{ .approved_shell = .{
                     .command_ctx = command_ctx,
                     .reason = .dynamic_shell,
@@ -188,17 +196,25 @@ test "router keeps direct grammar on the safer route for every shell source" {
     }
 }
 
-test "router never sends explicit user profile through direct execution" {
-    var ctx = context("pwd", false);
-    ctx.environment = .{ .user = "/bin/zsh" };
-    var route = try prepareAuthorizedRoute(
-        std.testing.allocator,
-        ctx,
-        shellAuthority(ctx, .interactive_once),
-    );
-    defer route.deinit(std.testing.allocator);
-    try std.testing.expect(route == .approved_shell);
-    try std.testing.expectEqual(command_effect.ApprovalReason.dynamic_shell, route.approved_shell.reason);
+test "router never sends explicit profiles through direct execution" {
+    for ([_]command_environment.Environment{
+        .{ .clean = "/bin/zsh" },
+        .{ .user = "/bin/zsh" },
+    }) |environment| {
+        var ctx = context("ls -l", false);
+        ctx.environment = environment;
+        var route = try prepareAuthorizedRoute(
+            std.testing.allocator,
+            ctx,
+            shellAuthority(ctx, .interactive_once),
+        );
+        defer route.deinit(std.testing.allocator);
+        try std.testing.expect(route == .approved_shell);
+        try std.testing.expectEqual(
+            command_effect.ApprovalReason.dynamic_shell,
+            route.approved_shell.reason,
+        );
+    }
 }
 
 test "router permits approval-bearing grammar only with sourced shell authority" {
