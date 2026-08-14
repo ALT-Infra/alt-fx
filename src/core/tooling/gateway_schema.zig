@@ -335,6 +335,100 @@ test "builtinFunctionSchemaJsonAlloc serializes strings and object schema" {
     try std.testing.expect(std.mem.find(u8, json, "\\\"with quotes\\\"") != null);
 }
 
+test "builtinFunctionSchemaJsonAlloc serializes every supported property shape" {
+    const alloc = std.testing.allocator;
+    const object_value_schema = ObjectSchema{
+        .properties = &.{.{ .name = "name", .json_type = .string }},
+        .required = &.{"name"},
+        .additional_properties = false,
+    };
+    const array_item_schema = ObjectSchema{
+        .properties = &.{.{ .name = "id", .json_type = .integer }},
+        .required = &.{"id"},
+        .additional_properties = false,
+    };
+    const schema = FunctionSchema{
+        .name = "schema_matrix",
+        .description = "schema matrix",
+        .input_schema = .{
+            .properties = &.{
+                .{
+                    .name = "text",
+                    .json_type = .string,
+                    .description = "bounded choice",
+                    .enum_values = &.{ "alpha", "beta" },
+                    .min_length = 1,
+                    .max_length = 8,
+                },
+                .{ .name = "count", .json_type = .integer, .minimum = 2, .maximum = 9 },
+                .{ .name = "enabled", .json_type = .boolean },
+                .{ .name = "config", .json_type = .object, .object_schema = &object_value_schema },
+                .{
+                    .name = "tags",
+                    .json_type = .array,
+                    .min_items = 1,
+                    .max_items = 3,
+                    .item_json_type = .string,
+                    .item_enum_values = &.{ "red", "blue" },
+                },
+                .{ .name = "records", .json_type = .array, .items = &array_item_schema },
+            },
+            .required = &.{ "text", "count", "enabled", "config", "tags", "records" },
+            .additional_properties = false,
+            .min_properties = 6,
+            .max_properties = 6,
+        },
+    };
+
+    const json = try builtinFunctionSchemaJsonAlloc(alloc, schema);
+    defer alloc.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+
+    const input_schema = parsed.value.object.get("inputSchema").?.object;
+    try std.testing.expectEqualStrings("object", input_schema.get("type").?.string);
+    try std.testing.expectEqual(false, input_schema.get("additionalProperties").?.bool);
+    try std.testing.expectEqual(@as(i64, 6), input_schema.get("minProperties").?.integer);
+    try std.testing.expectEqual(@as(i64, 6), input_schema.get("maxProperties").?.integer);
+    try std.testing.expectEqual(@as(usize, 6), input_schema.get("required").?.array.items.len);
+
+    const properties = input_schema.get("properties").?.object;
+    const text_property = properties.get("text").?.object;
+    try std.testing.expectEqualStrings("string", text_property.get("type").?.string);
+    try std.testing.expectEqualStrings("bounded choice", text_property.get("description").?.string);
+    try std.testing.expectEqual(@as(usize, 2), text_property.get("enum").?.array.items.len);
+    try std.testing.expectEqual(@as(i64, 1), text_property.get("minLength").?.integer);
+    try std.testing.expectEqual(@as(i64, 8), text_property.get("maxLength").?.integer);
+
+    const count_property = properties.get("count").?.object;
+    try std.testing.expectEqualStrings("integer", count_property.get("type").?.string);
+    try std.testing.expectEqual(@as(i64, 2), count_property.get("minimum").?.integer);
+    try std.testing.expectEqual(@as(i64, 9), count_property.get("maximum").?.integer);
+    try std.testing.expectEqualStrings("boolean", properties.get("enabled").?.object.get("type").?.string);
+
+    const config_property = properties.get("config").?.object;
+    try std.testing.expectEqualStrings("object", config_property.get("type").?.string);
+    try std.testing.expectEqual(false, config_property.get("additionalProperties").?.bool);
+    try std.testing.expectEqualStrings(
+        "string",
+        config_property.get("properties").?.object.get("name").?.object.get("type").?.string,
+    );
+
+    const tags_property = properties.get("tags").?.object;
+    try std.testing.expectEqualStrings("array", tags_property.get("type").?.string);
+    try std.testing.expectEqual(@as(i64, 1), tags_property.get("minItems").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), tags_property.get("maxItems").?.integer);
+    try std.testing.expectEqualStrings("string", tags_property.get("items").?.object.get("type").?.string);
+    try std.testing.expectEqual(@as(usize, 2), tags_property.get("items").?.object.get("enum").?.array.items.len);
+
+    const record_items = properties.get("records").?.object.get("items").?.object;
+    try std.testing.expectEqualStrings("object", record_items.get("type").?.string);
+    try std.testing.expectEqualStrings(
+        "integer",
+        record_items.get("properties").?.object.get("id").?.object.get("type").?.string,
+    );
+}
+
 test "dynamicFunctionSchemaJsonAlloc wraps rendered input schema in the flattened envelope" {
     const alloc = std.testing.allocator;
     const description = ("d" ** (description_max_bytes + 1)) ++ "tail";

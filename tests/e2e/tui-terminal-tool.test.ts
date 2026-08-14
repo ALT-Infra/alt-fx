@@ -1169,12 +1169,11 @@ test.skipIf(!tmuxAvailable())(
       tools: Array<{
         name?: string;
         inputSchema?: {
-          properties?: Record<string, unknown>;
-          oneOf?: Array<{
-            properties?: Record<string, { enum?: string[] }>;
-            required?: string[];
-            additionalProperties?: boolean;
-          }>;
+          type?: string;
+          properties?: Record<string, { type?: string; enum?: string[] }>;
+          required?: string[];
+          additionalProperties?: boolean;
+          oneOf?: unknown[];
         };
       }>;
     };
@@ -1182,32 +1181,45 @@ test.skipIf(!tmuxAvailable())(
       (tool) => tool.name === "terminal",
     )?.inputSchema;
     expect(terminalSchema).toBeDefined();
-    expect(terminalSchema!.properties).toBeUndefined();
-    const branches = terminalSchema!.oneOf ?? [];
-    const expectedBranches = [
-      { action: "start", properties: ["action", "cwd", "command", "shell", "backend", "return_when", "wait_ceiling_ms", "dimensions", "initial_monitors"], required: ["action"] },
-      { action: "read", properties: ["action", "session_id", "cursor_segment", "cursor_offset"], required: ["action", "session_id", "cursor_segment"] },
-      { action: "screen", properties: ["action", "session_id"], required: ["action", "session_id"] },
-      { action: "write", properties: ["action", "session_id", "write", "lease"], required: ["action", "session_id"] },
-      { action: "wait", properties: ["action", "session_id", "return_when", "wait_ceiling_ms"], required: ["action", "session_id", "return_when", "wait_ceiling_ms"] },
-      { action: "monitor", properties: ["action", "session_id", "monitor"], required: ["action", "session_id", "monitor"] },
-      { action: "inspect", properties: ["action", "session_id", "after_event_id", "acknowledge_event_id", "max_events"], required: ["action", "session_id"] },
-      { action: "list", properties: ["action", "task_id", "workspace_root", "backend"], required: ["action"] },
-      { action: "resize", properties: ["action", "session_id", "rows", "columns"], required: ["action", "session_id", "rows", "columns"] },
-      { action: "signal", properties: ["action", "session_id", "signal"], required: ["action", "session_id", "signal"] },
-      { action: "close", properties: ["action", "session_id", "close_policy"], required: ["action", "session_id", "close_policy"] },
-    ];
-    expect(branches).toHaveLength(expectedBranches.length);
-    for (const expected of expectedBranches) {
-      const branch = branches.find((candidate) =>
-        candidate.properties?.action?.enum?.[0] === expected.action
-      );
-      expect(branch).toBeDefined();
-      expect(branch!.properties!.action!.enum).toEqual([expected.action]);
-      expect(Object.keys(branch!.properties!)).toEqual(expected.properties);
-      expect(branch!.required).toEqual(expected.required);
-      expect(branch!.additionalProperties).toBe(false);
-    }
+    expect(terminalSchema!.type).toBe("object");
+    expect(terminalSchema!.oneOf).toBeUndefined();
+    expect(terminalSchema!.required).toEqual(["action"]);
+    expect(terminalSchema!.additionalProperties).toBe(false);
+    const properties = terminalSchema!.properties ?? {};
+    expect(Object.keys(properties)).toEqual([
+      "action",
+      "session_id",
+      "cwd",
+      "command",
+      "shell",
+      "backend",
+      "return_when",
+      "wait_ceiling_ms",
+      "dimensions",
+      "initial_monitors",
+      "cursor_segment",
+      "cursor_offset",
+      "after_event_id",
+      "acknowledge_event_id",
+      "max_events",
+      "write",
+      "lease",
+      "monitor",
+      "task_id",
+      "workspace_root",
+      "rows",
+      "columns",
+      "signal",
+      "close_policy",
+    ]);
+    expect(properties.action!.enum).toEqual([
+      "start", "read", "screen", "write", "wait", "monitor", "inspect",
+      "list", "resize", "signal", "close",
+    ]);
+    expect(properties.action!.type).toBe("string");
+    expect(properties.wait_ceiling_ms!.type).toBe("integer");
+    expect(properties.shell!.type).toBe("object");
+    expect(properties.initial_monitors!.type).toBe("array");
 
     const scrollback = await active.captureFullScrollback();
     expect(countOccurrences(scrollback, "Used terminal start")).toBe(1);
@@ -1581,12 +1593,8 @@ test.skipIf(!tmuxAvailable())(
       tools: Array<{
         name?: string;
         inputSchema?: {
-          properties?: Record<string, unknown>;
-          oneOf?: Array<{
-            properties?: Record<string, {
-              enum?: string[];
-            }>;
-          }>;
+          properties?: Record<string, { enum?: string[] }>;
+          oneOf?: unknown[];
         };
       }>;
     };
@@ -1594,13 +1602,9 @@ test.skipIf(!tmuxAvailable())(
       (tool) => tool.name === "terminal",
     )?.inputSchema;
     expect(terminalSchema).toBeDefined();
-    expect(terminalSchema!.properties).toBeUndefined();
-    expect(terminalSchema!.oneOf).toHaveLength(11);
-    const waitBranch = terminalSchema!.oneOf!.find((branch) =>
-      branch.properties?.action?.enum?.[0] === "wait"
-    );
-    expect(waitBranch).toBeDefined();
-    const terminalProperties = Object.keys(waitBranch!.properties ?? {});
+    expect(terminalSchema!.oneOf).toBeUndefined();
+    expect(terminalSchema!.properties?.action?.enum).toContain("wait");
+    const terminalProperties = Object.keys(terminalSchema!.properties ?? {});
     expect(
       terminalProperties.filter((name) => name === "wait_ceiling_ms"),
     ).toHaveLength(1);

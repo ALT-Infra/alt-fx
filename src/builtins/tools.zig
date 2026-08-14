@@ -202,6 +202,10 @@ const terminal_properties = [_]gateway_schema.Property{
     .{ .name = "close_policy", .json_type = .string, .enum_values = &.{ "graceful", "force" } },
 };
 
+const terminal_gateway_properties = [_]gateway_schema.Property{
+    .{ .name = "action", .json_type = .string, .enum_values = &.{ "start", "read", "screen", "write", "wait", "monitor", "inspect", "list", "resize", "signal", "close" } },
+} ++ terminal_properties;
+
 fn terminalProperty(comptime name: []const u8) gateway_schema.Property {
     inline for (terminal_properties) |property| {
         if (std.mem.eql(u8, property.name, name)) return property;
@@ -1014,7 +1018,9 @@ pub const terminal = ToolSpec{
         .name = "terminal",
         .description = terminal_description,
         .input_schema = .{
-            .one_of = &terminal_action_schemas,
+            .properties = &terminal_gateway_properties,
+            .required = &.{"action"},
+            .additional_properties = false,
         },
     },
     .executor_kind = .terminal,
@@ -1387,7 +1393,7 @@ fn schemaProperty(schema: gateway_schema.ObjectSchema, name: []const u8) ?gatewa
     return null;
 }
 
-test "terminal tool schema exposes one exact object branch per action" {
+test "terminal tool schema exposes a compatible object and exact internal action branches" {
     try std.testing.expect(terminal.requires_approval);
     try std.testing.expectEqual(tool_dispatch.ExecutorKind.terminal, terminal.executor_kind);
     try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.none, terminal.permission_target_kind);
@@ -1411,9 +1417,16 @@ test "terminal tool schema exposes one exact object branch per action" {
         .{ .action = "close", .properties = &.{ "action", "session_id", "close_policy" }, .required = &.{ "action", "session_id", "close_policy" } },
     };
 
-    try std.testing.expectEqual(expected.len, terminal.gateway_schema.input_schema.one_of.len);
-    try std.testing.expectEqual(@as(usize, 0), terminal.gateway_schema.input_schema.properties.len);
-    for (expected, terminal.gateway_schema.input_schema.one_of) |want, branch| {
+    const gateway_input = terminal.gateway_schema.input_schema;
+    try std.testing.expectEqual(@as(usize, 0), gateway_input.one_of.len);
+    try std.testing.expectEqual(terminal_gateway_properties.len, gateway_input.properties.len);
+    try std.testing.expectEqualSlices([]const u8, &.{"action"}, gateway_input.required);
+    try std.testing.expectEqual(@as(?bool, false), gateway_input.additional_properties);
+    const gateway_action = schemaProperty(gateway_input, "action").?;
+    try std.testing.expectEqual(std.meta.tags(terminal_contracts.Action).len, gateway_action.enum_values.len);
+
+    try std.testing.expectEqual(expected.len, terminal_action_schemas.len);
+    for (expected, terminal_action_schemas) |want, branch| {
         try std.testing.expectEqual(want.properties.len, branch.properties.len);
         for (want.properties, branch.properties) |want_name, property| {
             try std.testing.expectEqualStrings(want_name, property.name);
@@ -1425,9 +1438,9 @@ test "terminal tool schema exposes one exact object branch per action" {
         try std.testing.expectEqual(@as(?bool, false), branch.additional_properties);
     }
 
-    const start_branch = terminal.gateway_schema.input_schema.one_of[0];
-    const read_branch = terminal.gateway_schema.input_schema.one_of[1];
-    const list_branch = terminal.gateway_schema.input_schema.one_of[7];
+    const start_branch = terminal_action_schemas[0];
+    const read_branch = terminal_action_schemas[1];
+    const list_branch = terminal_action_schemas[7];
     try std.testing.expectEqualSlices(
         []const u8,
         &.{ "native", "tmux" },
@@ -1473,8 +1486,8 @@ test "terminal tool schema exposes one exact object branch per action" {
     );
 }
 
-test "terminal advertisement and admission agree on every action field" {
-    const branches = terminal.gateway_schema.input_schema.one_of;
+test "terminal action contracts and admission agree on every action field" {
+    const branches = &terminal_action_schemas;
     try std.testing.expectEqual(std.meta.tags(terminal_contracts.Action).len, branches.len);
 
     for (branches) |branch| {
@@ -1492,7 +1505,7 @@ test "terminal advertisement and admission agree on every action field" {
     }
 }
 
-test "terminal gateway advertisement projects action-specific alternatives" {
+test "terminal gateway advertisement projects a provider-compatible object schema" {
     const alloc = std.testing.allocator;
     var projection = try tool_advertisement.buildGatewayToolProjectionForSet(
         alloc,
@@ -1513,11 +1526,18 @@ test "terminal gateway advertisement projects action-specific alternatives" {
     }
 
     const input_schema = terminal_schema orelse return error.TestExpectedEqual;
-    try std.testing.expect(input_schema.get("properties") == null);
+    try std.testing.expectEqualStrings("object", input_schema.get("type").?.string);
+    try std.testing.expect(input_schema.get("oneOf") == null);
+    try std.testing.expectEqual(false, input_schema.get("additionalProperties").?.bool);
+    const properties = input_schema.get("properties").?.object;
+    try std.testing.expectEqual(terminal_gateway_properties.len, properties.count());
     try std.testing.expectEqual(
-        @as(usize, 11),
-        input_schema.get("oneOf").?.array.items.len,
+        std.meta.tags(terminal_contracts.Action).len,
+        properties.get("action").?.object.get("enum").?.array.items.len,
     );
+    const required = input_schema.get("required").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), required.len);
+    try std.testing.expectEqualStrings("action", required[0].string);
 }
 
 fn allowTerminalTool(
