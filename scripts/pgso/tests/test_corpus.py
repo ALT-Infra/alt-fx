@@ -340,6 +340,16 @@ class PgsoCorpusTests(unittest.TestCase):
             str(self.root / "output" / "profiles" / "home"),
             calls[0]["env"]["HOME"],
         )
+        self.assertEqual(
+            "set-option -g history-limit 100000\n",
+            (
+                self.root
+                / "output"
+                / "profiles"
+                / "home"
+                / ".tmux.conf"
+            ).read_text(),
+        )
         patterns = [call["env"]["LLVM_PROFILE_FILE"] for call in calls]
         self.assertNotEqual(patterns[0], patterns[1])
         self.assertTrue(all("%m-%p-%c.profraw" in pattern for pattern in patterns))
@@ -442,6 +452,15 @@ class PgsoCorpusTests(unittest.TestCase):
                 == str(self.root / "behavior-output" / "home")
                 for call in calls
             )
+        )
+        self.assertEqual(
+            "set-option -g history-limit 100000\n",
+            (
+                self.root
+                / "behavior-output"
+                / "home"
+                / ".tmux.conf"
+            ).read_text(),
         )
 
 

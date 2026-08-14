@@ -332,6 +332,17 @@ def _scenario_environment(runtime_home: pathlib.Path) -> dict[str, str]:
     return environment
 
 
+def _prepare_runtime_home(runtime_home: pathlib.Path) -> None:
+    runtime_home.mkdir(parents=True, exist_ok=True)
+    tmux_config = runtime_home / ".tmux.conf"
+    if tmux_config.is_symlink():
+        raise PgsoError(f"isolated tmux config cannot be a symlink: {tmux_config}")
+    tmux_config.write_text(
+        "set-option -g history-limit 100000\n",
+        encoding="utf-8",
+    )
+
+
 def _result(
     results: Sequence[ScenarioResult],
     merged_raw_profiles: int,
@@ -360,7 +371,7 @@ def run_corpus(
     log_dir = profile_dir.parent.parent / "logs" / "corpus"
     log_dir.mkdir(parents=True, exist_ok=True)
     runtime_home = profile_dir.parent / "home"
-    runtime_home.mkdir(parents=True, exist_ok=True)
+    _prepare_runtime_home(runtime_home)
     tmux_root = profile_dir.parent / "tmux"
     tmux_root.mkdir(parents=True, exist_ok=True)
 
@@ -499,7 +510,7 @@ def run_behavior_corpus(
     log_dir = output_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     runtime_home = output_dir / "home"
-    runtime_home.mkdir(parents=True, exist_ok=True)
+    _prepare_runtime_home(runtime_home)
     tmux_root = output_dir / "tmux"
     tmux_root.mkdir(parents=True, exist_ok=True)
 

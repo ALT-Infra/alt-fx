@@ -43,6 +43,8 @@ Once the focused checks pass, create a clean checkpoint commit, push the non-`ma
 
 Standard PR CI labels Debug and ReleaseSafe Build & Test and deterministic E2E results separately. Do not mark the draft PR ready until all four Full CI jobs and the final ship gate have succeeded for the exact current commit. Each platform aggregate requires both optimization modes. A result from an older commit does not count. Live model evals are separate from this gate because they require credentials and are not deterministic.
 
+Changes to `build.zig` or `scripts/pgso/` also run the native macOS arm64 PGSO candidate workflow. That lane produces retained size, behavior, and performance evidence but does not alter any release artifact or update channel. Its pinned toolchain, local reproduction command, corpus exclusions, and failure rules are documented in [`scripts/pgso/README.md`](scripts/pgso/README.md).
+
 ## Pull Requests
 
 Every PR must carry exactly one label that describes its primary intent:
