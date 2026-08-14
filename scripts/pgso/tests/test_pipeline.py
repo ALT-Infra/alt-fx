@@ -17,6 +17,7 @@ from scripts.pgso.pipeline import (
     apply_profile,
     candidate_link_argv,
     instrumentation_argv,
+    instrumented_run_argv,
     instrumented_link_argv,
     merge_profile_batch,
     parse_compiler_runtime,
@@ -119,6 +120,14 @@ class PgsoPipelineTests(unittest.TestCase):
             ),
             profile_use_argv(self.toolchain, self.paths),
         )
+        self.assertEqual(
+            (str(self.paths.instrumented_binary), "help"),
+            instrumented_run_argv(self.paths, ("help",)),
+        )
+        self.assertEqual(
+            (str(self.paths.instrumented_binary),),
+            instrumented_run_argv(self.paths, ()),
+        )
 
     def test_zig_build_arguments_pin_release_safe_target_and_caches(self) -> None:
         control = zig_build_argv(
@@ -141,7 +150,52 @@ class PgsoPipelineTests(unittest.TestCase):
         self.assertIn("-Dupdate-channel=stable", control)
         self.assertIn("pgso-ir", ir)
         self.assertIn("-Dpgso-artifact=fx", ir)
-        self.assertNotEqual(control[control.index("--cache-dir") + 1], ir[ir.index("--cache-dir") + 1])
+        self.assertNotEqual(
+            control[control.index("--cache-dir") + 1],
+            ir[ir.index("--cache-dir") + 1],
+        )
+
+    def test_benchmark_artifacts_use_their_existing_build_owners_and_names(self) -> None:
+        cases = (
+            ("file_index", "bench-file-index", "file-index-bench", "file-index.bc"),
+            (
+                "ui_activity",
+                "bench-ui-activity",
+                "ui-activity-progress-bench",
+                "ui-activity.bc",
+            ),
+            (
+                "approval_review",
+                "bench-approval-review",
+                "approval-review-bench",
+                "approval-review.bc",
+            ),
+        )
+        for selector, build_step, binary_name, bitcode_name in cases:
+            with self.subTest(selector=selector):
+                spec = ArtifactSpec(repo_root=self.root / "repo", selector=selector)
+                paths = PipelinePaths.create(
+                    self.root / f"run-{selector}",
+                    selector=selector,
+                )
+                control = zig_build_argv(
+                    self.toolchain,
+                    spec,
+                    paths,
+                    emit_ir=False,
+                )
+                ir = zig_build_argv(
+                    self.toolchain,
+                    spec,
+                    paths,
+                    emit_ir=True,
+                )
+
+                self.assertIn(build_step, control)
+                self.assertIn(f"-Dpgso-artifact={selector}", ir)
+                self.assertEqual(binary_name, paths.control_binary.name)
+                self.assertEqual(bitcode_name, paths.bitcode.name)
+                self.assertEqual(binary_name, paths.candidate_binary.name)
 
     def test_link_arguments_preserve_alignment_and_candidate_contract(self) -> None:
         compiler_runtime_object = self.root / "libcompiler_rt_zcu.o"

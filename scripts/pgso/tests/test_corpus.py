@@ -12,6 +12,7 @@ from scripts.pgso.corpus import (
     CorpusRunError,
     Scenario,
     load_corpus,
+    run_behavior_corpus,
     run_corpus,
 )
 from scripts.pgso.model import PgsoError
@@ -187,6 +188,16 @@ class PgsoCorpusTests(unittest.TestCase):
         with self.assertRaisesRegex(PgsoError, "missing required direct command"):
             load_corpus(self.write_manifest(payload), repo_root=self.root)
 
+    def test_load_rejects_environment_keys_owned_by_the_runner(self) -> None:
+        for key in ("HOME", "LLVM_PROFILE_FILE", "TMUX", "AI_GATEWAY_API_KEY"):
+            with self.subTest(key=key):
+                payload = self.manifest()
+                scenarios = payload["scenarios"]
+                assert isinstance(scenarios, list)
+                scenarios[0]["env_set"] = {key: "unsafe"}
+                with self.assertRaisesRegex(PgsoError, "reserved environment key"):
+                    load_corpus(self.write_manifest(payload), repo_root=self.root)
+
     def test_production_manifest_has_the_accepted_files_and_sound_exclusions(self) -> None:
         repo_root = pathlib.Path(__file__).resolve().parents[3]
         corpus = load_corpus(
@@ -299,7 +310,12 @@ class PgsoCorpusTests(unittest.TestCase):
         )
         with mock.patch.dict(
             os.environ,
-            {"PGSO_INHERITED": "yes", "PGSO_UNSET_ME": "remove"},
+            {
+                "PGSO_INHERITED": "yes",
+                "PGSO_UNSET_ME": "remove",
+                "TMUX": "/tmp/user-tmux,1,0",
+                "TMUX_PANE": "%1",
+            },
             clear=False,
         ):
             result, calls, merges, binary, merged = self.run_fixture(corpus)
@@ -308,11 +324,22 @@ class PgsoCorpusTests(unittest.TestCase):
         self.assertEqual(0, result.skipped)
         self.assertEqual(0, result.failed)
         self.assertEqual(2, result.merged_raw_profiles)
-        self.assertEqual(sha256_bytes(binary.read_bytes()), sha256_bytes((self.root / "zig-out" / "bin" / "fx").read_bytes()))
+        self.assertEqual(
+            sha256_bytes(binary.read_bytes()),
+            sha256_bytes(
+                (self.root / "zig-out" / "bin" / "fx").read_bytes()
+            ),
+        )
         self.assertTrue(merged.is_file())
         self.assertEqual(2, len(calls))
         self.assertEqual("yes", calls[0]["env"]["PGSO_INHERITED"])
         self.assertNotIn("PGSO_UNSET_ME", calls[0]["env"])
+        self.assertNotIn("TMUX", calls[0]["env"])
+        self.assertNotIn("TMUX_PANE", calls[0]["env"])
+        self.assertEqual(
+            str(self.root / "output" / "profiles" / "home"),
+            calls[0]["env"]["HOME"],
+        )
         patterns = [call["env"]["LLVM_PROFILE_FILE"] for call in calls]
         self.assertNotEqual(patterns[0], patterns[1])
         self.assertTrue(all("%m-%p-%c.profraw" in pattern for pattern in patterns))
@@ -376,6 +403,46 @@ class PgsoCorpusTests(unittest.TestCase):
         self.assertEqual(0, result.failed)
         self.assertEqual(1, len(calls))
         self.assertEqual(1, len(merges))
+
+    def test_behavior_corpus_runs_the_exact_binary_without_profile_output(self) -> None:
+        corpus = self.make_corpus(
+            self.make_scenario("first"),
+            self.make_scenario("second"),
+        )
+        binary = self.root / "candidate-fx"
+        binary.write_bytes(b"candidate")
+        calls: list[tuple[tuple[str, ...], dict[str, str]]] = []
+
+        def command_runner(argv, **kwargs):
+            calls.append((tuple(argv), dict(kwargs["env"])))
+            return CommandResult(
+                argv=tuple(argv),
+                returncode=0,
+                stdout="ok\n",
+                stderr="",
+                elapsed_seconds=0.2,
+            )
+
+        result = run_behavior_corpus(
+            corpus,
+            binary,
+            self.root / "behavior-output",
+            command_runner=command_runner,
+        )
+
+        canonical = self.root / "zig-out" / "bin" / "fx"
+        self.assertEqual(2, result.passed)
+        self.assertEqual(0, result.failed)
+        self.assertEqual(0, result.merged_raw_profiles)
+        self.assertTrue(all(call[0][0] == str(canonical) for call in calls))
+        self.assertTrue(all("LLVM_PROFILE_FILE" not in call[1] for call in calls))
+        self.assertTrue(
+            all(
+                call[1]["HOME"]
+                == str(self.root / "behavior-output" / "home")
+                for call in calls
+            )
+        )
 
 
 def sha256_bytes(contents: bytes) -> str:

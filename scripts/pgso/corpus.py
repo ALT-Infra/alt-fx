@@ -29,6 +29,14 @@ REQUIRED_EXCLUSIONS = (
     "tui-command-permissions.test.ts",
 )
 
+ISOLATED_ENVIRONMENT_KEYS = (
+    "AI_GATEWAY_API_KEY",
+    "VERCEL_OIDC_TOKEN",
+    "LLVM_PROFILE_FILE",
+    "TMUX",
+    "TMUX_PANE",
+)
+
 
 @dataclasses.dataclass(frozen=True)
 class Scenario:
@@ -162,6 +170,12 @@ def _parse_scenario(
         f"scenario {name} env_set",
     )
     env_set = {**default_env_set, **scenario_env_set}
+    reserved = set(env_set) & ({"HOME"} | set(ISOLATED_ENVIRONMENT_KEYS))
+    if reserved:
+        raise PgsoError(
+            f"scenario {name} sets reserved environment key: "
+            f"{', '.join(sorted(reserved))}"
+        )
     env_unset = _string_sequence(
         values.get("env_unset", []),
         f"scenario {name} env_unset",
@@ -310,6 +324,14 @@ def _cleanup_tmux(environment: Mapping[str, str]) -> None:
         raise PgsoError("tmux cleanup timed out") from error
 
 
+def _scenario_environment(runtime_home: pathlib.Path) -> dict[str, str]:
+    environment = os.environ.copy()
+    for key in ISOLATED_ENVIRONMENT_KEYS:
+        environment.pop(key, None)
+    environment["HOME"] = str(runtime_home)
+    return environment
+
+
 def _result(
     results: Sequence[ScenarioResult],
     merged_raw_profiles: int,
@@ -357,11 +379,11 @@ def run_corpus(
             )
             continue
 
-        environment = os.environ.copy()
+        environment = _scenario_environment(runtime_home)
         for key in scenario.env_unset:
             environment.pop(key, None)
         environment.update(dict(scenario.env_set))
-        environment.setdefault("HOME", str(runtime_home))
+        environment["HOME"] = str(runtime_home)
         environment["LLVM_PROFILE_FILE"] = str(
             profile_dir / f"{scenario.name}-%m-%p-%c.profraw"
         )
@@ -464,6 +486,100 @@ def run_corpus(
         )
 
     return _result(results, merged_raw_profiles)
+
+
+def run_behavior_corpus(
+    corpus: Corpus,
+    binary: pathlib.Path,
+    output_dir: pathlib.Path,
+    *,
+    command_runner: Callable[..., CommandResult] = run_checked,
+) -> CorpusResult:
+    canonical = _install_training_binary(corpus, binary)
+    log_dir = output_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    runtime_home = output_dir / "home"
+    runtime_home.mkdir(parents=True, exist_ok=True)
+    tmux_root = output_dir / "tmux"
+    tmux_root.mkdir(parents=True, exist_ok=True)
+
+    results: list[ScenarioResult] = []
+    for scenario in corpus.scenarios:
+        if scenario.skip_reason is not None:
+            results.append(
+                ScenarioResult(
+                    name=scenario.name,
+                    status="skipped",
+                    elapsed_seconds=0,
+                    raw_profiles=0,
+                    skip_reason=scenario.skip_reason,
+                )
+            )
+            continue
+
+        environment = _scenario_environment(runtime_home)
+        for key in scenario.env_unset:
+            environment.pop(key, None)
+        environment.update(dict(scenario.env_set))
+        environment["HOME"] = str(runtime_home)
+        if scenario.requires_tmux:
+            tmux_dir = tmux_root / scenario.name
+            tmux_dir.mkdir(parents=True, exist_ok=True)
+            environment["TMUX_TMPDIR"] = str(tmux_dir)
+
+        argv = tuple(
+            str(canonical) if argument == "{binary}" else argument
+            for argument in scenario.argv
+        )
+        command_result: CommandResult | None = None
+        scenario_error: Exception | None = None
+        try:
+            command_result = command_runner(
+                argv,
+                cwd=_resolve_cwd(corpus.repo_root, scenario.cwd),
+                env=environment,
+                timeout_s=scenario.timeout_seconds,
+                log_path=log_dir / f"{scenario.name}.json",
+            )
+        except Exception as error:
+            scenario_error = error
+
+        if scenario.requires_tmux:
+            try:
+                _cleanup_tmux(environment)
+            except Exception as error:
+                if scenario_error is None:
+                    scenario_error = error
+
+        if scenario_error is not None:
+            results.append(
+                ScenarioResult(
+                    name=scenario.name,
+                    status="failed",
+                    elapsed_seconds=0,
+                    raw_profiles=0,
+                    error=str(scenario_error),
+                )
+            )
+            result = _result(results, 0)
+            raise CorpusRunError(
+                f"behavior corpus scenario failed: {scenario.name}: "
+                f"{scenario_error}",
+                result,
+            ) from scenario_error
+
+        if command_result is None:
+            raise PgsoError(f"scenario completed without a result: {scenario.name}")
+        results.append(
+            ScenarioResult(
+                name=scenario.name,
+                status="passed",
+                elapsed_seconds=command_result.elapsed_seconds,
+                raw_profiles=0,
+            )
+        )
+
+    return _result(results, 0)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

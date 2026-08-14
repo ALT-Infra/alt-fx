@@ -47,6 +47,21 @@ PROFILE_SECTIONS = (
     "__llvm_prf_bits",
 )
 
+ARTIFACT_LAYOUTS = {
+    "fx": (None, "fx", "fx.bc"),
+    "file_index": ("bench-file-index", "file-index-bench", "file-index.bc"),
+    "ui_activity": (
+        "bench-ui-activity",
+        "ui-activity-progress-bench",
+        "ui-activity.bc",
+    ),
+    "approval_review": (
+        "bench-approval-review",
+        "approval-review-bench",
+        "approval-review.bc",
+    ),
+}
+
 
 @dataclasses.dataclass(frozen=True)
 class ArtifactSpec:
@@ -65,12 +80,14 @@ class ArtifactSpec:
             raise PgsoError(
                 f"unsupported update channel: {self.update_channel}"
             )
-        if self.selector != "fx":
+        if self.selector not in ARTIFACT_LAYOUTS:
             raise PgsoError(f"unsupported pipeline artifact: {self.selector}")
 
 
 @dataclasses.dataclass(frozen=True)
 class PipelinePaths:
+    selector: str
+    binary_name: str
     root: pathlib.Path
     control_prefix: pathlib.Path
     control_binary: pathlib.Path
@@ -99,7 +116,15 @@ class PipelinePaths:
     logs: pathlib.Path
 
     @classmethod
-    def create(cls, root: pathlib.Path) -> "PipelinePaths":
+    def create(
+        cls,
+        root: pathlib.Path,
+        *,
+        selector: str = "fx",
+    ) -> "PipelinePaths":
+        if selector not in ARTIFACT_LAYOUTS:
+            raise PgsoError(f"unsupported pipeline artifact: {selector}")
+        _, binary_name, bitcode_name = ARTIFACT_LAYOUTS[selector]
         root = root.resolve()
         if root.exists() and any(root.iterdir()):
             raise PgsoError(f"pipeline output directory is not empty: {root}")
@@ -137,25 +162,27 @@ class PipelinePaths:
             directory.mkdir(parents=True, exist_ok=True)
 
         return cls(
+            selector=selector,
+            binary_name=binary_name,
             root=root,
             control_prefix=control_prefix,
-            control_binary=control_prefix / "bin" / "fx",
+            control_binary=control_prefix / "bin" / binary_name,
             ir_prefix=ir_prefix,
-            bitcode=ir_prefix / "pgso" / "fx.bc",
+            bitcode=ir_prefix / "pgso" / bitcode_name,
             instrumented=instrumented,
-            instrumented_bitcode=instrumented / "fx.bc",
-            instrumented_object=instrumented / "fx.o",
-            instrumented_binary=instrumented / "fx",
+            instrumented_bitcode=instrumented / bitcode_name,
+            instrumented_object=instrumented / f"{binary_name}.o",
+            instrumented_binary=instrumented / binary_name,
             compiler_runtime=compiler_runtime,
             profiles=profiles,
             raw_profiles=raw_profiles,
             raw_profile_pattern=raw_profiles / "train-%m-%p-%c.profraw",
             merged_profile=profiles / "merged.profdata",
             candidate=candidate,
-            profile_use_bitcode=candidate / "fx.bc",
-            profile_use_ir=candidate / "fx.ll",
-            profile_use_object=candidate / "fx.o",
-            candidate_binary=candidate / "fx",
+            profile_use_bitcode=candidate / bitcode_name,
+            profile_use_ir=candidate / f"{binary_name}.ll",
+            profile_use_object=candidate / f"{binary_name}.o",
+            candidate_binary=candidate / binary_name,
             candidate_profiles=candidate_profiles,
             runtime_home=runtime_home,
             cache=cache,
@@ -216,6 +243,10 @@ def zig_build_argv(
     if emit_ir:
         argv.append("pgso-ir")
         argv.append(f"-Dpgso-artifact={spec.selector}")
+    else:
+        build_step = ARTIFACT_LAYOUTS[spec.selector][0]
+        if build_step is not None:
+            argv.append(build_step)
     argv.extend(
         (
             f"-Dtarget={spec.target}",
@@ -258,6 +289,13 @@ def profile_use_argv(
         "-o",
         str(paths.profile_use_bitcode),
     )
+
+
+def instrumented_run_argv(
+    paths: PipelinePaths,
+    arguments: Sequence[str],
+) -> tuple[str, ...]:
+    return (str(paths.instrumented_binary), *arguments)
 
 
 def instrumented_link_argv(
@@ -467,10 +505,45 @@ def validate_profile_section_alignment(load_commands: str) -> None:
             )
 
 
+def collect_instrumented_profile(
+    toolchain: Toolchain,
+    paths: PipelinePaths,
+    *,
+    training_argv: Sequence[str],
+    training_name: str,
+    timeout_s: float = 60,
+) -> tuple[pathlib.Path, ...]:
+    if re.fullmatch(r"[a-z0-9][a-z0-9-]*", training_name) is None:
+        raise PgsoError(f"invalid instrumented training name: {training_name}")
+    _require_nonempty_file(paths.instrumented_binary, "instrumented executable")
+    before = set(paths.raw_profiles.glob("*.profraw"))
+    environment = _runtime_environment(paths)
+    environment["LLVM_PROFILE_FILE"] = str(paths.raw_profile_pattern)
+    run_checked(
+        instrumented_run_argv(paths, training_argv),
+        cwd=paths.root,
+        env=environment,
+        timeout_s=timeout_s,
+        log_path=paths.logs / f"instrumented-{training_name}.json",
+        require_empty_stderr=True,
+    )
+    generated = tuple(sorted(set(paths.raw_profiles.glob("*.profraw")) - before))
+    if len(generated) != 1:
+        raise PgsoError(
+            f"instrumented {training_name} must create one raw profile; "
+            f"found {len(generated)}"
+        )
+    _require_nonempty_file(generated[0], "instrumented smoke raw profile")
+    return generated
+
+
 def build_instrumented(
     toolchain: Toolchain,
     paths: PipelinePaths,
     min_macos: str,
+    *,
+    training_argv: Sequence[str] = ("help",),
+    training_name: str = "help",
 ) -> tuple[pathlib.Path, ...]:
     _require_nonempty_file(paths.bitcode, "ReleaseSafe LLVM bitcode")
     run_checked(
@@ -543,24 +616,12 @@ def build_instrumented(
         require_empty_stderr=True,
     )
 
-    before = set(paths.raw_profiles.glob("*.profraw"))
-    environment = _runtime_environment(paths)
-    environment["LLVM_PROFILE_FILE"] = str(paths.raw_profile_pattern)
-    run_checked(
-        (str(paths.instrumented_binary), "help"),
-        cwd=paths.root,
-        env=environment,
-        timeout_s=60,
-        log_path=paths.logs / "instrumented-help.json",
-        require_empty_stderr=True,
+    return collect_instrumented_profile(
+        toolchain,
+        paths,
+        training_argv=training_argv,
+        training_name=training_name,
     )
-    generated = tuple(sorted(set(paths.raw_profiles.glob("*.profraw")) - before))
-    if len(generated) != 1:
-        raise PgsoError(
-            f"instrumented help must create one raw profile; found {len(generated)}"
-        )
-    _require_nonempty_file(generated[0], "instrumented smoke raw profile")
-    return generated
 
 
 def merge_profile_batch(
@@ -652,6 +713,8 @@ def verify_release_safe_ir(ir_path: pathlib.Path) -> None:
 def link_candidate(
     toolchain: Toolchain,
     paths: PipelinePaths,
+    *,
+    require_release_safe_evidence: bool = True,
 ) -> pathlib.Path:
     _require_nonempty_file(paths.profile_use_bitcode, "profile-use bitcode")
     run_checked(
@@ -669,7 +732,8 @@ def link_candidate(
         require_empty_stderr=True,
     )
     _require_nonempty_file(paths.profile_use_ir, "profile-use textual IR")
-    verify_release_safe_ir(paths.profile_use_ir)
+    if require_release_safe_evidence:
+        verify_release_safe_ir(paths.profile_use_ir)
 
     run_checked(
         (
