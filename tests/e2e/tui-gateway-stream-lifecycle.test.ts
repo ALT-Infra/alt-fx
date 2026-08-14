@@ -198,13 +198,14 @@ function hasEmptyStandaloneAssistant(body: string): boolean {
 }
 
 function restrictedProviderResponse(): Response {
+  const message =
+    "Your team has restricted access to this provider. Contact the owner of the account for more details. Providers considered: wafer";
   return new Response(
     JSON.stringify({
       error: {
-        code: "RestrictedProvidersError",
-        message:
-          "Your team has restricted access to this provider. Contact the owner of the account for more details. Providers considered: wafer",
-        provider: "wafer",
+        message,
+        type: "no_providers_available",
+        param: { name: "RestrictedProvidersError", message },
       },
     }),
     {
@@ -1640,9 +1641,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         "⚠ API access denied · HTTP 403 · Provider: wafer",
       );
       expect(scrollback).toContain(
-        "RestrictedProvidersError: Your team has restricted access to this",
+        "no_providers_available: Your team has restricted access to this",
       );
-      expect(scrollback).toContain("RestrictedProvidersError");
+      expect(scrollback).toContain("no_providers_available");
       expect(scrollback).not.toContain('{"error"');
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },

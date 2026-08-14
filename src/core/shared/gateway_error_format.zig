@@ -94,7 +94,9 @@ fn formatHttpDiagnostic(
     const error_object = objectValue(error_value) orelse
         return formatFallbackBounded(alloc, status, detail, max_bytes);
     const param_object = if (error_object.get("param")) |param_value| objectValue(param_value) else null;
-    const code = stringField(error_object, "code") orelse if (param_object) |param| stringField(param, "name") else null;
+    const code = stringField(error_object, "code") orelse
+        stringField(error_object, "type") orelse
+        if (param_object) |param| stringField(param, "name") else null;
     const message = stringField(error_object, "message") orelse if (param_object) |param| stringField(param, "message") else null;
     const provider = stringField(error_object, "provider") orelse providerFromGatewayMessage(message);
 
@@ -371,7 +373,7 @@ test "formatHttpErrorMessage renders live restricted provider body shape" {
     defer std.testing.allocator.free(line);
 
     try std.testing.expectEqualStrings(
-        "API access denied · HTTP 403 · Provider: wafer · RestrictedProvidersError: Your team has restricted access to this provider. Contact the owner of the account for more details. Providers considered: wafer",
+        "API access denied · HTTP 403 · Provider: wafer · no_providers_available: Your team has restricted access to this provider. Contact the owner of the account for more details. Providers considered: wafer",
         line,
     );
 }

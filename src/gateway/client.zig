@@ -2272,8 +2272,14 @@ fn captureProviderFailureObject(
     alloc: std.mem.Allocator,
     current: *?[]u8,
     object: std.json.ObjectMap,
+    include_type: bool,
 ) !bool {
-    const code = if (object.get("code")) |value| jsonValueString(value) else null;
+    const code = if (object.get("code")) |value|
+        jsonValueString(value)
+    else if (include_type)
+        if (object.get("type")) |value| jsonValueString(value) else null
+    else
+        null;
     const message = if (object.get("message")) |value| jsonValueString(value) else null;
     if (code) |code_text| {
         if (message) |message_text| {
@@ -2302,14 +2308,14 @@ fn captureProviderFailureObject(
 
 fn captureProviderFailureDetail(alloc: std.mem.Allocator, current: *?[]u8, root: std.json.Value) !void {
     if (root != .object or current.* != null) return;
-    if (try captureProviderFailureObject(alloc, current, root.object)) return;
+    if (try captureProviderFailureObject(alloc, current, root.object, false)) return;
     if (root.object.get("error")) |value| {
         if (jsonValueString(value)) |text| {
             try replaceProviderFailureMessage(alloc, current, text);
             return;
         }
         if (value == .object) {
-            if (try captureProviderFailureObject(alloc, current, value.object)) return;
+            if (try captureProviderFailureObject(alloc, current, value.object, true)) return;
             const rendered = try stringifyJsonValueOwned(alloc, value);
             defer alloc.free(rendered);
             try replaceProviderFailureDetail(alloc, current, rendered);
@@ -2320,6 +2326,9 @@ fn captureProviderFailureDetail(alloc: std.mem.Allocator, current: *?[]u8, root:
         if (jsonValueString(value)) |text| {
             try replaceProviderFailureMessage(alloc, current, text);
             return;
+        }
+        if (value == .object) {
+            if (try captureProviderFailureObject(alloc, current, value.object, true)) return;
         }
         const rendered = try stringifyJsonValueOwned(alloc, value);
         defer alloc.free(rendered);
@@ -3478,6 +3487,26 @@ test "captureProviderFailureDetail preserves top-level provider code and message
     try captureProviderFailureDetail(alloc, &detail, parsed.value);
 
     try std.testing.expectEqualStrings("provider_down: wafer route unavailable", detail.?);
+}
+
+test "captureProviderFailureDetail preserves nested provider type and message" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"type\":\"error\",\"error\":{\"type\":\"no_available_providers\",\"message\":\"No providers are currently available\"}}",
+        .{},
+    );
+    defer parsed.deinit();
+    var detail: ?[]u8 = null;
+    defer if (detail) |owned| alloc.free(owned);
+
+    try captureProviderFailureDetail(alloc, &detail, parsed.value);
+
+    try std.testing.expectEqualStrings(
+        "no_available_providers: No providers are currently available",
+        detail.?,
+    );
 }
 
 test "consumeSseStream returns immediately after valid finish without waiting for done" {
