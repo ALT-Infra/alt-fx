@@ -377,13 +377,17 @@ describe("fx ask presentation", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "TTY output enters native scrollback before the response finishes",
+    "TTY prints the header before output and releases while the response is open",
     async () => {
       const root = createRoot();
       const answerLines = Array.from(
         { length: 40 },
         (_, index) => `OPEN_STREAM_LINE_${String(index + 1).padStart(2, "0")}`,
       );
+      let releaseOutput = () => {};
+      const outputGate = new Promise<void>((resolve) => {
+        releaseOutput = resolve;
+      });
       let releaseResponse = () => {};
       const responseGate = new Promise<void>((resolve) => {
         releaseResponse = resolve;
@@ -392,7 +396,8 @@ describe("fx ask presentation", () => {
         const encoder = new TextEncoder();
         return new Response(
           new ReadableStream<Uint8Array>({
-            start(controller) {
+            async start(controller) {
+              await outputGate;
               for (const line of answerLines) {
                 controller.enqueue(encoder.encode(
                   `data: ${JSON.stringify({
@@ -402,19 +407,18 @@ describe("fx ask presentation", () => {
                   })}\n\n`,
                 ));
               }
-              void responseGate.then(() => {
-                controller.enqueue(encoder.encode(
-                  `data: ${JSON.stringify({
-                    type: "finish",
-                    finishReason: { unified: "stop", raw: "stop" },
-                    usage: {
-                      inputTokens: { total: 3 },
-                      outputTokens: { total: answerLines.length },
-                    },
-                  })}\n\ndata: [DONE]\n\n`,
-                ));
-                controller.close();
-              });
+              await responseGate;
+              controller.enqueue(encoder.encode(
+                `data: ${JSON.stringify({
+                  type: "finish",
+                  finishReason: { unified: "stop", raw: "stop" },
+                  usage: {
+                    inputTokens: { total: 3 },
+                    outputTokens: { total: answerLines.length },
+                  },
+                })}\n\ndata: [DONE]\n\n`,
+              ));
+              controller.close();
             },
           }),
           { headers: { "content-type": "text/event-stream" } },
@@ -447,6 +451,24 @@ describe("fx ask presentation", () => {
         }
         expect(gateway.requestCount()).toBe(1);
 
+        const headerDeadline = Date.now() + 5_000;
+        let initialScrollback = "";
+        while (Date.now() < headerDeadline) {
+          initialScrollback = await session.captureFullScrollback();
+          if (
+            initialScrollback.includes("Run /help for commands") &&
+            initialScrollback.includes("Stream every answer line.")
+          ) break;
+          await Bun.sleep(25);
+        }
+        expect(initialScrollback).toContain("Run /help for commands");
+        expect(initialScrollback).toContain("Stream every answer line.");
+        expect(initialScrollback).not.toContain(answerLines[0]!);
+        expect(initialScrollback.indexOf("Run /help for commands")).toBeLessThan(
+          initialScrollback.indexOf("Stream every answer line."),
+        );
+
+        releaseOutput();
         const releaseDeadline = Date.now() + 5_000;
         let openScrollback = "";
         while (Date.now() < releaseDeadline) {
@@ -456,11 +478,13 @@ describe("fx ask presentation", () => {
         }
         expect(openScrollback).toContain(answerLines[0]!);
       } finally {
+        releaseOutput();
         releaseResponse();
       }
 
       await session.waitForText("__FX_EXIT_0__", TIMEOUT);
       const finalScrollback = await session.captureFullScrollback();
+      expect(finalScrollback.split("Run /help for commands")).toHaveLength(2);
       for (const line of answerLines) {
         expect(finalScrollback.split(line)).toHaveLength(2);
       }
