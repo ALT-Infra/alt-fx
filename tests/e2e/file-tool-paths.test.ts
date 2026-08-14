@@ -609,6 +609,7 @@ describe("filesystem path handling", () => {
       writeFileSync(join(root.workspace, ".fx.json"), JSON.stringify({ sandbox: "os" }));
       const gateway = startFakeGateway([
         toolCall("added_sandbox_write_1", "terminal", {
+          action: "exec",
           command: "printf SANDBOX_ADDED_WRITE > sandbox-proof.txt",
           cwd: root.external,
         }),
@@ -760,6 +761,7 @@ describe("filesystem path handling", () => {
           const marker = join(scenario.canonical, `${scenario.id}.txt`);
           const gateway = startFakeGateway([
             toolCall(scenario.id, "terminal", {
+              action: "exec",
               command: `pwd; printf ${scenario.id} > ${scenario.id}.txt`,
               cwd: scenario.cwd,
             }),

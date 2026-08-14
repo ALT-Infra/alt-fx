@@ -1470,8 +1470,13 @@ test "full projection preserves semantic arguments clipped from a tool heading" 
     } }};
     var details = [_]ToolDetailRecord{.{
         .entry_id = 1,
-        .tool_name = try alloc.dupe(u8, "run_command"),
-        .arguments_json = try std.fmt.allocPrint(alloc, "{{\"command\":\"{s}\"}}", .{command}),
+        .tool_name = try alloc.dupe(u8, "terminal"),
+        .captured_command = true,
+        .arguments_json = try std.fmt.allocPrint(
+            alloc,
+            "{{\"action\":\"exec\",\"command\":\"{s}\",\"profile\":\"clean\"}}",
+            .{command},
+        ),
         .outcome = .completed,
     }};
     defer details[0].deinit(alloc);
@@ -1499,6 +1504,8 @@ test "full projection preserves semantic arguments clipped from a tool heading" 
 
     try std.testing.expect(std.mem.indexOf(u8, source, "command: printf") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "FULL_ARGUMENT_TAIL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "action: exec") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "profile: clean") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "{\"command\"") == null);
 }
 
@@ -7811,6 +7818,10 @@ fn appendFullSemanticArguments(
     var iterator = object.iterator();
     while (iterator.next()) |entry| {
         const value = entry.value_ptr.*;
+        if (isCapturedCommandDetail(detail) and
+            std.mem.eql(u8, entry.key_ptr.*, "action") and
+            value == .string and
+            std.mem.eql(u8, value.string, "exec")) continue;
         if (value == .string and argumentVisibleInToolHeading(
             entries,
             detail.entry_id,
