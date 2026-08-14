@@ -305,6 +305,15 @@ function latestPromptText(body: string): string {
   return contentText(request.prompt?.at(-1)?.content);
 }
 
+function currentUserText(body: string): string {
+  const request = JSON.parse(body) as {
+    prompt?: Array<{ role?: string; content?: unknown }>;
+  };
+  return contentText(
+    request.prompt?.findLast((message) => message.role === "user")?.content,
+  );
+}
+
 function occurrenceCount(text: string, needle: string): number {
   return text.split(needle).length - 1;
 }
@@ -390,6 +399,43 @@ async function waitForPersistedDeliveryIds(
     await Bun.sleep(20);
   }
   throw new Error(`Timed out waiting for persisted delivery child=${childId} payload=${payload}`);
+}
+
+type PendingSubagentApproval = {
+  id: string;
+  label: string;
+  rootId: string;
+  workId: string;
+};
+
+async function waitForPendingSubagentApproval(
+  root: IsolatedRoot,
+  childId: string,
+): Promise<PendingSubagentApproval> {
+  const id = await waitForPersistedDeliveryId(
+    root,
+    childId,
+    "run_command /usr/bin/touch",
+  );
+  const communicationPath = join(
+    root.home,
+    ".fx",
+    "sessions",
+    childId,
+    "subagent",
+    "communication.json",
+  );
+  const stored = JSON.parse(readFileSync(communicationPath, "utf8")) as {
+    ledger: { approvals: Array<Record<string, unknown>> };
+  };
+  const approval = stored.ledger.approvals.find((entry) => entry.id === id);
+  if (!approval) throw new Error(`Missing approval child=${childId} id=${id}`);
+  return {
+    id,
+    label: String(approval.label ?? ""),
+    rootId: String(approval.root_id ?? ""),
+    workId: String(approval.work_id ?? ""),
+  };
 }
 
 async function waitForTraceSlice(
@@ -4832,6 +4878,177 @@ describe("effect-aware command permissions", () => {
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "interactive fx delivers a child approval to the next same-turn parent step",
+    async () => {
+      const root = createIsolatedRoot();
+      const stderrPath = join(root.root, "interactive-child-approval-stderr.log");
+      const fixturePath = join(root.workspace, "approval-fixture.txt");
+      const markerPath = join(root.workspace, "approval-must-not-exist");
+      const rootPrompt = "INTERACTIVE_CREATE_APPROVAL_CHILD";
+      const childPrompt = "INTERACTIVE_CHILD_REQUEST_APPROVAL";
+      const rootCreateCallId = "interactive_approval_create";
+      const rootProbeCallId = "interactive_approval_probe";
+      const childCommandCallId = "interactive_approval_command";
+      let childId = "";
+      let approval: PendingSubagentApproval | null = null;
+      let sameTurnChecked = false;
+      let noRedeliveryChecked = false;
+      let releaseApprovalUi!: () => void;
+      const approvalUiObserved = new Promise<void>((resolve) => {
+        releaseApprovalUi = resolve;
+      });
+      writeFileSync(fixturePath, "approval parent projection fixture\n");
+      writeFileSync(stderrPath, "");
+
+      const checkApprovalDelivery = (body: string) => {
+        expect(approval).not.toBeNull();
+        expectParentDelivery(body, childId, approval!.id, approval!.label);
+        const envelope = parentDeliveryEnvelope(promptText(body));
+        expect(envelope).toContain(`"target_id":"${approval!.rootId}"`);
+        expect(envelope).toContain(`"work_id":"${approval!.workId}"`);
+        expect(envelope).toContain('"truncated":false');
+        expect(envelope).toContain(
+          `"total_bytes":${Buffer.byteLength(approval!.label, "utf8")}`,
+        );
+        sameTurnChecked = true;
+      };
+
+      const route = async (body: string): Promise<Response> => {
+        const userText = currentUserText(body);
+        if (userText.includes("INTERACTIVE_VERIFY_APPROVAL_NOT_REPEATED")) {
+          expect(promptText(body)).not.toContain(approval!.id);
+          expect(promptText(body)).not.toContain(approval!.label);
+          noRedeliveryChecked = true;
+          return finalText("INTERACTIVE_APPROVAL_NOT_REPEATED");
+        }
+        if (body.includes(`\"toolCallId\":\"${childCommandCallId}\"`) &&
+            body.includes('"type":"tool-result"')) {
+          return finalText("INTERACTIVE_CHILD_DENIED_COMPLETE");
+        }
+        if (userText.includes(childPrompt)) {
+          return gatewayToolCall("run_command", {
+            command: `/usr/bin/touch ${shellQuote(markerPath)}`,
+          }, childCommandCallId);
+        }
+        if (body.includes(`\"toolCallId\":\"${rootProbeCallId}\"`) &&
+            body.includes('"type":"tool-result"')) {
+          const text = promptText(body);
+          if (text.includes(`"id":"${approval!.id}"`)) {
+            checkApprovalDelivery(body);
+          } else {
+            expect(sameTurnChecked).toBe(true);
+            expect(text).not.toContain(approval!.id);
+            expect(text).not.toContain(approval!.label);
+          }
+          return finalText("INTERACTIVE_PARENT_SAW_CHILD_APPROVAL");
+        }
+        if (body.includes(`\"toolCallId\":\"${rootCreateCallId}\"`) &&
+            body.includes('"type":"tool-result"')) {
+          const created = JSON.parse(
+            toolResultText(body, rootCreateCallId),
+          ) as { child_id: string; status: string };
+          expect(created.status).toBe("created");
+          childId = created.child_id;
+          approval = await waitForPendingSubagentApproval(root, childId);
+          expect(subagentState(root, childId)).toBe("awaiting_approval");
+          await approvalUiObserved;
+          if (promptText(body).includes(`"id":"${approval.id}"`)) {
+            checkApprovalDelivery(body);
+          }
+          return gatewayToolCall(
+            "read_file",
+            { path: "approval-fixture.txt" },
+            rootProbeCallId,
+          );
+        }
+        if (userText.includes(rootPrompt)) {
+          return gatewayToolCall("subagent", {
+            command: {
+              create: {
+                name: "interactive-approval-child",
+                mode: "one_off",
+                prompt: childPrompt,
+              },
+            },
+          }, rootCreateCallId);
+        }
+        throw new Error(`Unexpected approval projection request: ${body}`);
+      };
+      const gateway = startDynamicFakeGateway(route, {
+        classifierDecision: "ask",
+      });
+      gateways.push(gateway);
+
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, {
+          FX_PERMISSION_MODE: "auto",
+          PATH: hostilePath(root),
+        }),
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText(rootPrompt);
+      const approvalPane = await activeSession.waitForText(
+        COMMAND_APPROVAL_PROMPT,
+        TIMEOUT,
+      );
+      expect(approvalPane).toContain("touch");
+      expect(approval).not.toBeNull();
+      expect(subagentState(root, childId)).toBe("awaiting_approval");
+      expect(gateway.classifierRequests).toHaveLength(1);
+      expect(existsSync(markerPath)).toBe(false);
+      releaseApprovalUi();
+
+      const sameTurnDeadline = Date.now() + TIMEOUT;
+      while (!sameTurnChecked && Date.now() < sameTurnDeadline) {
+        await Bun.sleep(20);
+      }
+      expect(sameTurnChecked).toBe(true);
+      expect(existsSync(markerPath)).toBe(false);
+      await activeSession.sendKeys("3");
+      await activeSession.waitForText(
+        "INTERACTIVE_PARENT_SAW_CHILD_APPROVAL",
+        TIMEOUT,
+      );
+      expect(existsSync(markerPath)).toBe(false);
+      const childDeadline = Date.now() + TIMEOUT;
+      while (subagentState(root, childId) !== "completed" &&
+             Date.now() < childDeadline) {
+        await Bun.sleep(20);
+      }
+      expect(subagentState(root, childId)).toBe("completed");
+      const stored = JSON.parse(readFileSync(
+        join(root.home, ".fx", "sessions", childId, "subagent", "communication.json"),
+        "utf8",
+      )) as { ledger: { approvals: Array<Record<string, unknown>> } };
+      expect(stored.ledger.approvals.find((item) => item.id === approval!.id)?.status)
+        .toBe("denied");
+
+      await activeSession.sendText("INTERACTIVE_VERIFY_APPROVAL_NOT_REPEATED");
+      await activeSession.waitForText("INTERACTIVE_APPROVAL_NOT_REPEATED", TIMEOUT);
+      expect(noRedeliveryChecked).toBe(true);
+
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd(5_000)).toBe(true);
+      activeSession = null;
+      expectHumanUnreadIndependent(root, childId, approval!.id);
+      const parentSessionId = onlyParentSessionId(root, [childId]);
+      expectParentHistoryClean(root, parentSessionId, [
+        "<subagent_deliveries",
+        approval!.label,
+      ]);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expectNoHostileExecutables(root);
+      expectNoCommandArtifacts(root);
+    },
+    60_000,
   );
 
   test.skipIf(!tmuxAvailable())(

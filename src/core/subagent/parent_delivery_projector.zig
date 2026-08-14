@@ -696,6 +696,95 @@ test "parent delivery projector prepares one trusted envelope and acknowledges a
     try std.testing.expectEqual(@as(usize, 0), loaded_parent.history.len);
 }
 
+test "parent delivery projector acknowledges bounded approval before later delivery" {
+    const alloc = std.testing.allocator;
+    var env = try TestEnvironment.init(alloc);
+    defer env.deinit(alloc);
+    try env.createSession(alloc, "parent");
+    try preparePersistentChild(alloc, &env, "parent", "child", "child");
+    const label = try alloc.alloc(u8, 4 * 1024);
+    defer alloc.free(label);
+    @memset(label, 0x01);
+
+    {
+        var capability = try env.store.openSubagentControlCapabilityWritable(
+            alloc,
+            "child",
+            .{},
+        );
+        defer capability.deinit();
+        const store = communication_store.Store{
+            .capability = &capability,
+            .expected_session_id = "child",
+        };
+        var lock = try store.acquireLock();
+        defer lock.release();
+        var ledger = try communication.Ledger.init(alloc, "child");
+        defer ledger.deinit(alloc);
+        _ = try communication.appendDelivery(alloc, &ledger, .{
+            .id = "escape-heavy-approval",
+            .source_id = "child",
+            .target_id = "parent",
+            .work_id = "approval-work",
+            .operation_id = "approval-operation",
+            .timestamp_ms = 1,
+            .payload = .{ .approval = label },
+        });
+        _ = try communication.appendDelivery(alloc, &ledger, .{
+            .id = "delivery-after-approval",
+            .source_id = "child",
+            .target_id = "parent",
+            .timestamp_ms = 2,
+            .payload = .{ .message = "progress after bounded approval" },
+        });
+        try store.save(alloc, ledger);
+    }
+
+    var approval = (try prepare(alloc, &env.store, "parent", .{})).?;
+    defer deinitPrepared(alloc, &approval);
+    try std.testing.expect(approval.content.len <= communication.max_trusted_context_bytes);
+    try std.testing.expectEqual(@as(usize, 1), approval.acknowledgements.len);
+    try std.testing.expectEqualStrings(
+        "escape-heavy-approval",
+        approval.acknowledgements[0].delivery_id,
+    );
+    try std.testing.expect(std.mem.find(u8, approval.content, "\"truncated\":true") != null);
+    try std.testing.expect(std.mem.find(u8, approval.content, "\"total_bytes\":4096") != null);
+    try std.testing.expect(std.mem.find(u8, approval.content, "\"source_id\":\"child\"") != null);
+    try std.testing.expect(std.mem.find(u8, approval.content, "\"target_id\":\"parent\"") != null);
+    try std.testing.expect(std.mem.find(u8, approval.content, "\"work_id\":\"approval-work\"") != null);
+    try std.testing.expect(std.mem.find(u8, approval.content, "\"operation_id\":\"approval-operation\"") != null);
+    try std.testing.expect(std.mem.find(u8, approval.content, "\"status\"") == null);
+    try std.testing.expect(std.mem.find(u8, approval.content, "\"grants\"") == null);
+    try std.testing.expect(std.mem.find(u8, approval.content, "delivery-after-approval") == null);
+    acknowledge(alloc, &env.store, .{}, approval.acknowledgements);
+
+    var query = communication_manager.Manager{
+        .sessions = &env.store,
+        .child_store_options = .{},
+    };
+    var human = try query.page(alloc, "child", "human", "parent", null, 1);
+    defer human.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), human.deliveries.len);
+    try std.testing.expectEqualStrings("escape-heavy-approval", human.deliveries[0].id);
+
+    var progress = (try prepare(alloc, &env.store, "parent", .{})).?;
+    defer deinitPrepared(alloc, &progress);
+    try std.testing.expectEqual(@as(usize, 1), progress.acknowledgements.len);
+    try std.testing.expectEqualStrings(
+        "delivery-after-approval",
+        progress.acknowledgements[0].delivery_id,
+    );
+    try std.testing.expect(
+        std.mem.find(u8, progress.content, "progress after bounded approval") != null,
+    );
+    try std.testing.expect(
+        std.mem.find(u8, progress.content, "escape-heavy-approval") == null,
+    );
+    acknowledge(alloc, &env.store, .{}, progress.acknowledgements);
+    try expectNoPrepared(alloc, &env, "parent");
+}
+
 test "parent delivery projector acknowledges retention gap then resumes after restart" {
     const alloc = std.testing.allocator;
     var env = try TestEnvironment.init(alloc);

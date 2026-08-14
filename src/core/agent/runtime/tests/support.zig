@@ -546,6 +546,8 @@ pub const FakeAgentRuntimeDeps = struct {
     parent_turn_prepare_count: usize = 0,
     parent_turn_ack_count: usize = 0,
     parent_turn_last_ack_sequence: u64 = 0,
+    parent_turn_last_ack_prepare_count: usize = 0,
+    parent_turn_ack_contract_valid: bool = true,
     runtime_context_text: ?[]const u8 = null,
     runtime_context_texts: []const []const u8 = &.{},
     runtime_context_index: usize = 0,
@@ -870,6 +872,15 @@ pub const FakeAgentRuntimeDeps = struct {
     ) void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         self.parent_turn_ack_count += acknowledgements.len;
+        self.parent_turn_ack_contract_valid = self.parent_turn_ack_contract_valid and
+            self.parent_turn_prepare_count == self.parent_turn_last_ack_prepare_count + 1;
+        self.parent_turn_last_ack_prepare_count = self.parent_turn_prepare_count;
+        for (acknowledgements) |ack| {
+            self.parent_turn_ack_contract_valid = self.parent_turn_ack_contract_valid and
+                std.mem.eql(u8, ack.child_id, "child") and
+                std.mem.eql(u8, ack.target_session_id, "parent") and
+                std.mem.eql(u8, ack.delivery_id, "delivery");
+        }
         if (acknowledgements.len != 0) {
             self.parent_turn_last_ack_sequence = acknowledgements[acknowledgements.len - 1].through_sequence;
         }

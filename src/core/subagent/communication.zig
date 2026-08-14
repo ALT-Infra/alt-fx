@@ -1146,7 +1146,11 @@ pub const ParentDeliveryPayload = union(ParentDeliveryKind) {
         state: domain.State,
         coalesced_ticks: u32,
     },
-    approval: []u8,
+    approval: struct {
+        label: []u8,
+        truncated: bool,
+        total_bytes: u64,
+    },
     tool_activity: ToolActivity,
     retention_gap: struct {
         evicted_through: u64,
@@ -1175,7 +1179,8 @@ pub const ParentDeliveryPart = struct {
         if (self.operation_id) |value| alloc.free(value);
         switch (self.payload) {
             .message => |value| alloc.free(value.content),
-            .milestone, .approval => |value| alloc.free(value),
+            .milestone => |value| alloc.free(value),
+            .approval => |value| alloc.free(value.label),
             .tool_activity => |value| alloc.free(value.tool_name),
             .terminal, .interval, .retention_gap => {},
         }
@@ -1217,7 +1222,11 @@ pub const ParentDeliveryPart = struct {
                     .state = value.state,
                     .coalesced_ticks = value.coalesced_ticks,
                 } },
-                .approval => |value| .{ .approval = try alloc.dupe(u8, value) },
+                .approval => |value| .{ .approval = .{
+                    .label = try alloc.dupe(u8, value.label),
+                    .truncated = value.truncated,
+                    .total_bytes = value.total_bytes,
+                } },
                 .tool_activity => |value| .{ .tool_activity = .{
                     .tool_name = try alloc.dupe(u8, value.tool_name),
                     .phase = value.phase,
@@ -1579,7 +1588,16 @@ fn ownParentDeliveryPart(
             .state = value.state,
             .coalesced_ticks = value.coalesced_ticks,
         } },
-        .approval, .tool_activity => return error.InvalidDelivery,
+        .approval => |value| blk: {
+            const end = selectApprovalPartEnd(delivery) orelse
+                return error.InvalidDelivery;
+            break :blk .{ .approval = .{
+                .label = try alloc.dupe(u8, value[0..end]),
+                .truncated = end != value.len,
+                .total_bytes = @intCast(value.len),
+            } };
+        },
+        .tool_activity => return error.InvalidDelivery,
     };
     return part;
 }
@@ -2011,8 +2029,8 @@ fn visibleInProjection(delivery: Delivery, projection: Projection) bool {
     return switch (projection) {
         .human => true,
         .parent_turn => switch (delivery.payload) {
-            .message, .milestone, .terminal, .interval => true,
-            .approval, .tool_activity => false,
+            .message, .milestone, .terminal, .interval, .approval => true,
+            .tool_activity => false,
         },
     };
 }
@@ -2081,6 +2099,55 @@ fn selectMessagePartEnd(delivery: Delivery, start: usize) ?usize {
         }
     }
     return if (low > start) low else null;
+}
+
+fn selectApprovalPartEnd(delivery: Delivery) ?usize {
+    const label = delivery.payload.approval;
+    const full = borrowedParentApprovalPart(delivery, label.len, false);
+    if (parentDeliveryPartFits(full)) return label.len;
+    if (!parentDeliveryPartFits(borrowedParentApprovalPart(delivery, 0, true))) {
+        return null;
+    }
+
+    var low: usize = 0;
+    var high = utf8BoundaryBefore(label, label.len) orelse return 0;
+    while (low < high) {
+        var candidate = low + (high - low + 1) / 2;
+        candidate = utf8BoundaryAtOrBefore(label, low, candidate);
+        if (candidate == low) {
+            candidate = utf8NextBoundary(label, low) orelse return low;
+        }
+        if (candidate > high) return low;
+        const probe = borrowedParentApprovalPart(delivery, candidate, true);
+        if (parentDeliveryPartFits(probe)) {
+            low = candidate;
+        } else {
+            high = utf8BoundaryBefore(label, candidate) orelse return low;
+        }
+    }
+    return low;
+}
+
+fn borrowedParentApprovalPart(
+    delivery: Delivery,
+    end: usize,
+    truncated: bool,
+) ParentDeliveryPart {
+    return .{
+        .sequence = delivery.sequence,
+        .revision = delivery.revision,
+        .id = delivery.id,
+        .source_id = delivery.source_id,
+        .target_id = delivery.target_id,
+        .work_id = delivery.work_id,
+        .operation_id = delivery.operation_id,
+        .timestamp_ms = delivery.timestamp_ms,
+        .payload = .{ .approval = .{
+            .label = delivery.payload.approval[0..end],
+            .truncated = truncated,
+            .total_bytes = @intCast(delivery.payload.approval.len),
+        } },
+    };
 }
 
 fn borrowedParentMessagePart(
@@ -3728,7 +3795,10 @@ test "human first read after target eviction exposes and recovers retention gap"
         .source_id = "child",
         .target_id = "parent-a",
         .timestamp_ms = 1,
-        .payload = .{ .approval = "human only" },
+        .payload = .{ .tool_activity = .{
+            .tool_name = "human-only-activity",
+            .phase = .started,
+        } },
     });
     for (0..max_deliveries) |index| {
         var id_buffer: [64]u8 = undefined;
@@ -4242,7 +4312,7 @@ test "approval correlation ids are not classified as replay operations" {
     try std.testing.expect(accepted == .appended);
 }
 
-test "parent turn projection excludes approval and tool activity with independent pagination" {
+test "parent turn projection includes approval and excludes tool activity with independent pagination" {
     const alloc = std.testing.allocator;
     var ledger = try Ledger.init(alloc, "child");
     defer ledger.deinit(alloc);
@@ -4287,12 +4357,21 @@ test "parent turn projection excludes approval and tool activity with independen
     var parent = try pageForParentTurn(alloc, ledger, "surface", "parent", null, 1);
     defer parent.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), parent.deliveries.len);
-    try std.testing.expect(parent.deliveries[0].payload == .message);
+    try std.testing.expect(parent.deliveries[0].payload == .approval);
+    try std.testing.expectEqualStrings(
+        "approval requested",
+        parent.deliveries[0].payload.approval.label,
+    );
+    try std.testing.expect(!parent.deliveries[0].payload.approval.truncated);
+    try std.testing.expectEqual(
+        @as(u64, "approval requested".len),
+        parent.deliveries[0].payload.approval.total_bytes,
+    );
     try std.testing.expect(parent.has_more);
     const context = try renderTrustedContext(alloc, parent.deliveries);
     defer alloc.free(context);
-    try std.testing.expect(std.mem.indexOf(u8, context, "explicit child message") != null);
-    try std.testing.expect(std.mem.indexOf(u8, context, "approval requested") == null);
+    try std.testing.expect(std.mem.indexOf(u8, context, "approval requested") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context, "explicit child message") == null);
     try std.testing.expect(std.mem.indexOf(u8, context, "read_file") == null);
 
     try acknowledgeParentTurn(
@@ -4302,10 +4381,10 @@ test "parent turn projection excludes approval and tool activity with independen
         "parent",
         acknowledgementForParentPart(parent.deliveries[0]),
     );
-    var terminal = try pageForParentTurn(alloc, ledger, "surface", "parent", null, 1);
-    defer terminal.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), terminal.deliveries.len);
-    try std.testing.expect(terminal.deliveries[0].payload == .terminal);
+    var message = try pageForParentTurn(alloc, ledger, "surface", "parent", null, 1);
+    defer message.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), message.deliveries.len);
+    try std.testing.expect(message.deliveries[0].payload == .message);
 
     try acknowledgeTarget(alloc, &ledger, "surface", "parent", human.through_sequence);
     var human_next = try pageForTarget(alloc, ledger, "surface", "parent", null, 1);
@@ -4326,31 +4405,24 @@ test "parent turn page honors limits replay and ordered acknowledgements" {
         .payload = .{ .message = "filtered by target" },
     });
     _ = try appendDelivery(alloc, &ledger, .{
-        .id = "approval-event",
-        .source_id = "child",
-        .target_id = "parent",
-        .timestamp_ms = 2,
-        .payload = .{ .approval = "filtered by projection" },
-    });
-    _ = try appendDelivery(alloc, &ledger, .{
         .id = "first-message",
         .source_id = "child",
         .target_id = "parent",
-        .timestamp_ms = 3,
+        .timestamp_ms = 2,
         .payload = .{ .message = "first" },
     });
     _ = try appendDelivery(alloc, &ledger, .{
         .id = "second-message",
         .source_id = "child",
         .target_id = "parent",
-        .timestamp_ms = 4,
+        .timestamp_ms = 3,
         .payload = .{ .message = "second" },
     });
     _ = try appendDelivery(alloc, &ledger, .{
         .id = "terminal-event",
         .source_id = "child",
         .target_id = "parent",
-        .timestamp_ms = 5,
+        .timestamp_ms = 4,
         .payload = .{ .terminal = .completed },
     });
 
@@ -4915,6 +4987,59 @@ test "parent message sizes around one trusted envelope remain admissible" {
         defer alloc.free(context);
         try std.testing.expect(context.len <= max_trusted_context_bytes);
     }
+}
+
+test "escape-heavy approval projects as one bounded marked envelope" {
+    const alloc = std.testing.allocator;
+    var source_id: [255]u8 = undefined;
+    @memset(&source_id, 's');
+    var target_id: [255]u8 = undefined;
+    @memset(&target_id, 't');
+    var delivery_id: [domain.max_operation_id_bytes]u8 = undefined;
+    @memset(&delivery_id, 'd');
+    var work_id: [domain.max_operation_id_bytes]u8 = undefined;
+    @memset(&work_id, 'w');
+    var operation_id: [domain.max_operation_id_bytes]u8 = undefined;
+    @memset(&operation_id, 'o');
+    var ledger = try Ledger.init(alloc, &source_id);
+    defer ledger.deinit(alloc);
+    const label = try alloc.alloc(u8, 4 * 1024);
+    defer alloc.free(label);
+    @memset(label, 0x01);
+
+    _ = try appendDelivery(alloc, &ledger, .{
+        .id = &delivery_id,
+        .source_id = &source_id,
+        .target_id = &target_id,
+        .work_id = &work_id,
+        .operation_id = &operation_id,
+        .timestamp_ms = std.math.maxInt(i64),
+        .payload = .{ .approval = label },
+    });
+    try std.testing.expect(parentDeliveryPartFits(
+        borrowedParentApprovalPart(ledger.deliveries[0], 0, true),
+    ));
+
+    var parent = try pageForParentTurn(
+        alloc,
+        ledger,
+        "parent-model",
+        &target_id,
+        null,
+        1,
+    );
+    defer parent.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), parent.deliveries.len);
+    const projected = parent.deliveries[0].payload.approval;
+    try std.testing.expect(projected.truncated);
+    try std.testing.expectEqual(@as(u64, label.len), projected.total_bytes);
+    try std.testing.expect(projected.label.len < label.len);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(projected.label));
+    const context = try renderTrustedContext(alloc, parent.deliveries);
+    defer alloc.free(context);
+    try std.testing.expect(context.len <= max_trusted_context_bytes);
+    try std.testing.expect(std.mem.find(u8, context, "\"truncated\":true") != null);
+    try std.testing.expect(std.mem.find(u8, context, "\"total_bytes\":4096") != null);
 }
 
 test "exact 64 KiB message projects as a bounded parent continuation" {
@@ -5661,7 +5786,7 @@ fn checkCommunicationAllocationFailures(alloc: Allocator) !void {
         .target_id = "root",
         .work_id = "work",
         .timestamp_ms = 2,
-        .payload = .{ .milestone = "halfway" },
+        .payload = .{ .approval = "prepared action" },
     });
     var page = try pageForParentTurn(alloc, ledger, "parent-model", "root", null, 2);
     defer page.deinit(alloc);

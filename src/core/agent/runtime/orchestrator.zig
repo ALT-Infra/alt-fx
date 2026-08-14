@@ -363,13 +363,13 @@ const ParentTurnDeliveryState = struct {
 fn appendPreparedParentTurnContext(
     deps: *const AgentRuntimeDeps,
     arena: Allocator,
-    stable_prefix: *std.ArrayList(ChatMessage),
+    messages: *std.ArrayList(ChatMessage),
 ) !ParentTurnDeliveryState {
     const prepare = deps.prepare_parent_turn_context orelse return .{};
     const prepared = try prepare(deps.ctx, arena) orelse return .{};
     if (prepared.content.len == 0) return .{};
-    try stable_prefix.ensureUnusedCapacity(arena, 1);
-    stable_prefix.appendAssumeCapacity(.{
+    try messages.ensureUnusedCapacity(arena, 1);
+    messages.appendAssumeCapacity(.{
         .role = .system,
         .content = prepared.content,
     });
@@ -1718,11 +1718,6 @@ fn processQueuedPromptInner(
     if (deps.append_static_context) |append_static_context| {
         try append_static_context(deps.ctx, arena, &stable_prefix);
     }
-    var parent_turn_delivery = try appendPreparedParentTurnContext(
-        deps,
-        arena,
-        &stable_prefix,
-    );
     var request_capabilities = deps.available_model_capabilities(deps.ctx, job.model);
     if (requiresResolvedRequestCapabilities(
         job.images.len > 0 or job.authorized_image_catalog.len > 0,
@@ -1821,7 +1816,6 @@ fn processQueuedPromptInner(
         &summary_accumulator,
         &finish_trace,
         &interrupted_persisted,
-        &parent_turn_delivery,
         current_user_message,
         &stop_state,
     ) catch |err| {
@@ -2179,7 +2173,6 @@ fn processQueuedPromptLoop(
     summary_accumulator_ptr: *runtime_telemetry.TurnSummaryAccumulator,
     finish_trace_ptr: *PromptFinishTrace,
     interrupted_persisted_ptr: *bool,
-    parent_turn_delivery: *ParentTurnDeliveryState,
     current_user_message: ChatMessage,
     stop_state: *CommonStopState,
 ) !void {
@@ -2304,6 +2297,11 @@ fn processQueuedPromptLoop(
             try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = config.explicit_skills_prompt_section });
         }
         try deps.append_runtime_context(deps.ctx, overlay_arena, &ephemeral_overlay);
+        var parent_turn_delivery = try appendPreparedParentTurnContext(
+            deps,
+            overlay_arena,
+            &ephemeral_overlay,
+        );
         var gateway_messages = try runtime_prompt_context.buildGatewayMessages(overlay_arena, stable_prefix.items, ephemeral_overlay.items, history_messages.items, current_user_effective, within_turn_suffix.items);
         last_gateway_message_count = gateway_messages.items.len;
         const history_start_index = stable_prefix.items.len + ephemeral_overlay.items.len;
@@ -2620,7 +2618,7 @@ fn processQueuedPromptLoop(
             ) catch |err| {
                 parent_turn_delivery.observeGatewayDelivery(
                     deps,
-                    arena,
+                    overlay_arena,
                     gateway_delivery.load(),
                 );
                 runtime_assistant_stream.pushTokenProgressUpdate(&stream_ctx, summary_accumulator.finishTokenRequestWithoutUsage(gateway_delivery.load() == .possibly_sent)) catch |progress_err| {
@@ -2934,7 +2932,7 @@ fn processQueuedPromptLoop(
             };
             parent_turn_delivery.observeGatewayDelivery(
                 deps,
-                arena,
+                overlay_arena,
                 gateway_delivery.load(),
             );
             stream_result_set = true;
