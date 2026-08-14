@@ -23,6 +23,7 @@ const ui_input = @import("../input/runtime.zig");
 const input_visual_layout = @import("../input/visual_layout.zig");
 const ui_render = @import("../render.zig");
 const render_request = @import("../render_request.zig");
+const approval_ui = @import("../footer/approval_ui.zig");
 const row_text = @import("../footer/row_text.zig");
 const full_transcript_screen = @import("../full_transcript_screen.zig");
 const transcript_runtime = @import("../transcript/runtime.zig");
@@ -1280,6 +1281,7 @@ pub const Runtime = struct {
         self.main_approval_dismissed = false;
         self.pending_approval_selection = next_index;
         self.replaceCurrentApprovalRoute(alloc, next_route);
+        self.detail_scroll = 0;
         return .redraw;
     }
 
@@ -2665,12 +2667,44 @@ pub const Runtime = struct {
             else => return self.handleChildAction(alloc, action),
         };
         if (self.currentRoute()) |route| switch (route.*) {
-            .approval => switch (action) {
-                .up, .left => return self.movePendingApprovalSelection(alloc, -1),
-                .down, .right => return self.movePendingApprovalSelection(alloc, 1),
-                .page_up, .previous_page => return self.previousPendingApprovalPage(),
-                .page_down, .next_page => return self.nextPendingApprovalPage(),
-                else => {},
+            .approval => |value| {
+                const command = if (approvalForRoute(
+                    self,
+                    value.child_id,
+                    value.approval_id,
+                )) |approval|
+                    approval.command
+                else
+                    null;
+                if (command != null) switch (action) {
+                    .up => {
+                        self.detail_scroll -|= 1;
+                        return .redraw;
+                    },
+                    .down => {
+                        self.detail_scroll +|= 1;
+                        return .redraw;
+                    },
+                    .page_up => {
+                        self.detail_scroll -|= 8;
+                        return .redraw;
+                    },
+                    .page_down => {
+                        self.detail_scroll +|= 8;
+                        return .redraw;
+                    },
+                    .left => return self.movePendingApprovalSelection(alloc, -1),
+                    .right => return self.movePendingApprovalSelection(alloc, 1),
+                    .previous_page => return self.previousPendingApprovalPage(),
+                    .next_page => return self.nextPendingApprovalPage(),
+                    else => {},
+                } else switch (action) {
+                    .up, .left => return self.movePendingApprovalSelection(alloc, -1),
+                    .down, .right => return self.movePendingApprovalSelection(alloc, 1),
+                    .page_up, .previous_page => return self.previousPendingApprovalPage(),
+                    .page_down, .next_page => return self.nextPendingApprovalPage(),
+                    else => {},
+                }
             },
             else => {},
         };
@@ -3900,7 +3934,7 @@ pub fn paint(
             .attach => "ctrl-x close  •  J/K select  •  Enter authorize action  •  Esc back",
             .actions => actionsFooter(runtime),
             .confirm_close => "ctrl-x close  •  Y/Enter cancel and archive  •  N/Esc back",
-            .approval => "ctrl-x close  •  J/K request  •  [/] page  •  1 once  •  2 always  •  3 deny  •  Esc back",
+            .approval => managerApprovalFooter(runtime),
             else => "ctrl-x close  •  Esc back  •  A activity  •  N notifications",
         };
         try writeLine(alloc, &screen.writer, layout.cols, &row, layout.rows, footer);
@@ -5103,6 +5137,9 @@ fn paintApproval(
         if (runtimeApprovalFailureLine(runtime, node, approval_id)) |failure| {
             try writeLine(alloc, writer, cols, row, limit, failure);
         }
+        if (approval.command) |command| {
+            try paintManagerCommandReview(alloc, writer, runtime, command, cols, row, limit);
+        }
         try writeLine(alloc, writer, cols, row, limit, "1 Allow once  •  2 Always allow  •  3 Deny");
         return;
     }
@@ -5145,7 +5182,65 @@ fn paintPendingApproval(
     if (runtimeApprovalFailureLine(runtime, null, approval.id)) |failure| {
         try writeLine(alloc, writer, cols, row, limit, failure);
     }
+    if (approval.command) |command| {
+        try paintManagerCommandReview(alloc, writer, runtime, command, cols, row, limit);
+    }
     try writeLine(alloc, writer, cols, row, limit, "1 Allow once  •  2 Always allow  •  3 Deny");
+}
+
+fn paintManagerCommandReview(
+    alloc: Allocator,
+    writer: *std.Io.Writer,
+    runtime: *const Runtime,
+    command: []const u8,
+    cols: u16,
+    row: *usize,
+    limit: usize,
+) !void {
+    if (limit -| row.* < 3) return;
+    var projected = try approval_ui.projectCommandText(alloc, command);
+    defer projected.deinit(alloc);
+
+    const content_width = @as(usize, cols) -|
+        display_width.visibleWidth("  $ ");
+    if (content_width == 0) return;
+
+    var counter = approval_ui.CommandSegmentIterator.initContentWidth(
+        projected.bytes,
+        content_width,
+    );
+    var total_rows: usize = 0;
+    while (try counter.next()) |_| total_rows += 1;
+
+    const command_rows = @max(@min(limit -| row.* -| 2, total_rows), 1);
+    const scroll = @min(runtime.detail_scroll, total_rows -| command_rows);
+    try writeFormattedLine(
+        alloc,
+        writer,
+        cols,
+        row,
+        limit,
+        "Command review — rows {d}–{d} of {d}",
+        .{ scroll + 1, @min(scroll + command_rows, total_rows), total_rows },
+    );
+
+    var segments = approval_ui.CommandSegmentIterator.initContentWidth(
+        projected.bytes,
+        content_width,
+    );
+    var visual_row: usize = 0;
+    var painted_rows: usize = 0;
+    while (try segments.next()) |segment| {
+        if (visual_row >= scroll and painted_rows < command_rows) {
+            var line: std.Io.Writer.Allocating = .init(alloc);
+            defer line.deinit();
+            try line.writer.writeAll(if (visual_row == 0) "  $ " else "    ");
+            try line.writer.writeAll(segment);
+            try writeLine(alloc, writer, cols, row, limit, line.written());
+            painted_rows += 1;
+        }
+        visual_row += 1;
+    }
 }
 
 fn nodeStateLabel(node: *const projection.Node) []const u8 {
@@ -5223,6 +5318,34 @@ fn findPendingApproval(
             std.mem.eql(u8, pending.request.id, approval_id)) return pending;
     }
     return null;
+}
+
+fn approvalForRoute(
+    runtime: *const Runtime,
+    child_id: []const u8,
+    approval_id: []const u8,
+) ?*const projection.Approval {
+    if (findPendingApproval(runtime.snapshot, child_id, approval_id)) |pending| {
+        return &pending.request;
+    }
+    const snapshot = runtime.snapshot orelse return null;
+    const node = findNodeIn(snapshot.nodes, child_id) orelse return null;
+    for (node.approvals) |*approval| {
+        if (std.mem.eql(u8, approval.id, approval_id)) return approval;
+    }
+    return null;
+}
+
+fn managerApprovalFooter(runtime: *const Runtime) []const u8 {
+    const route = runtime.currentRoute() orelse return "ctrl-x close  •  Esc back";
+    const approval = switch (route.*) {
+        .approval => |value| approvalForRoute(runtime, value.child_id, value.approval_id),
+        else => null,
+    };
+    if (approval != null and approval.?.command != null) {
+        return "ctrl-x close  •  ↑↓/Pg scroll  •  ←→ request  •  [/] page  •  1 once  •  2 always  •  3 deny";
+    }
+    return "ctrl-x close  •  J/K request  •  [/] page  •  1 once  •  2 always  •  3 deny  •  Esc back";
 }
 
 fn indexOfNode(nodes: []const projection.Node, id: []const u8) ?usize {
@@ -5966,6 +6089,86 @@ test "child approval route offers authoritative once always and deny responses" 
     try std.testing.expect(std.mem.find(u8, rendered, "1 Allow once") != null);
     try std.testing.expect(std.mem.find(u8, rendered, "2 Always allow") != null);
     try std.testing.expect(std.mem.find(u8, rendered, "3 Deny") != null);
+}
+
+test "child command approval route exposes complete scroll review and resolves" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime{};
+    defer runtime.deinit(alloc);
+    var snapshot = try testSnapshot(alloc, 1, &.{"child"});
+    alloc.free(snapshot.nodes[0].approvals);
+    snapshot.nodes[0].approvals = try alloc.alloc(projection.Approval, 1);
+    const command = try std.fmt.allocPrint(
+        alloc,
+        "# terminal.exec profile=user shell=/bin/zsh\n{s}COMMAND_TAIL_VISIBLE",
+        .{"printf review-line\\n\n" ** 20},
+    );
+    snapshot.nodes[0].approvals[0] = .{
+        .id = try alloc.dupe(u8, "command-approval-id"),
+        .kind = .tool,
+        .status = .pending,
+        .label = try alloc.dupe(u8, "terminal.exec printf ok"),
+        .explanation = null,
+        .command = command,
+    };
+    try std.testing.expect(try runtime.replaceSnapshot(alloc, snapshot));
+    try std.testing.expectEqual(Command.redraw, try runtime.handle(alloc, .notifications));
+
+    const rendered = try paint(
+        alloc,
+        &runtime,
+        .{ .rows = 18, .cols = 100, .content_bottom = 14, .divider_top_row = 15, .input_row = 16, .divider_bottom_row = 17, .hint_row = 18 },
+        null,
+    );
+    defer alloc.free(rendered);
+    try std.testing.expect(std.mem.find(u8, rendered, "profile=user shell=/bin/zsh") != null);
+    try std.testing.expect(std.mem.find(u8, rendered, "Command review — rows 1–") != null);
+    try std.testing.expect(std.mem.find(u8, rendered, "1 Allow once") != null);
+    try std.testing.expectEqual(Command.redraw, try runtime.handle(alloc, .page_down));
+    try std.testing.expectEqual(Command.redraw, try runtime.handle(alloc, .page_down));
+    try std.testing.expectEqual(Command.redraw, try runtime.handle(alloc, .page_down));
+    const scrolled = try paint(
+        alloc,
+        &runtime,
+        .{ .rows = 18, .cols = 100, .content_bottom = 14, .divider_top_row = 15, .input_row = 16, .divider_bottom_row = 17, .hint_row = 18 },
+        null,
+    );
+    defer alloc.free(scrolled);
+    try std.testing.expect(std.mem.find(u8, scrolled, "COMMAND_TAIL_VISIBLE") != null);
+    try std.testing.expectEqual(Command.resolve_child_approval, try runtime.handleByte(alloc, '2', null));
+    try std.testing.expectEqual(
+        types.ToolPermissionDecision.always,
+        runtime.prepareApprovalResolution().?.decision,
+    );
+}
+
+test "pending command approval route shows profile and keeps authoritative decisions" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime{};
+    defer runtime.deinit(alloc);
+    var snapshot = try pendingApprovalTestSnapshot(alloc, "pending-command-id");
+    snapshot.pending_approvals[0].request.command = try alloc.dupe(
+        u8,
+        "# terminal.exec profile=clean shell=/bin/bash\nprintf ok",
+    );
+    try std.testing.expect(try runtime.replaceSnapshot(alloc, snapshot));
+    try std.testing.expectEqual(Command.redraw, try runtime.handle(alloc, .notifications));
+
+    const rendered = try paint(
+        alloc,
+        &runtime,
+        .{ .rows = 18, .cols = 100, .content_bottom = 14, .divider_top_row = 15, .input_row = 16, .divider_bottom_row = 17, .hint_row = 18 },
+        null,
+    );
+    defer alloc.free(rendered);
+    try std.testing.expect(std.mem.find(u8, rendered, "profile=clean shell=/bin/bash") != null);
+    try std.testing.expect(std.mem.find(u8, rendered, "printf ok") != null);
+    try std.testing.expect(std.mem.find(u8, rendered, "1 Allow once") != null);
+    try std.testing.expectEqual(Command.resolve_child_approval, try runtime.handleByte(alloc, '1', null));
+    try std.testing.expectEqual(
+        types.ToolPermissionDecision.once,
+        runtime.prepareApprovalResolution().?.decision,
+    );
 }
 
 test "archived child advertises typed reopen instead of navigation side effects" {

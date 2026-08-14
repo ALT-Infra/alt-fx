@@ -176,7 +176,7 @@ const terminal_write_schema = gateway_schema.ObjectSchema{
 const terminal_properties = [_]gateway_schema.Property{
     .{ .name = "session_id", .json_type = .string, .description = "Required for session-targeted actions. Omit for start and list; owner-catalog authority is private." },
     .{ .name = "cwd", .json_type = .string, .description = "Working directory for exec or start; defaults to the workspace." },
-    .{ .name = "command", .json_type = .string, .description = "Command for exec, or optional command for start; omit on start for an interactive shell." },
+    .{ .name = "command", .json_type = .string, .max_length = terminal_contracts.max_command_bytes, .description = "Command for exec, or optional command for start; omit on start for an interactive shell." },
     .{ .name = "profile", .json_type = .string, .enum_values = &.{ "clean", "user" }, .description = "Startup profile. exec omission preserves legacy command behavior; start omission defaults to user. Mutually exclusive with shell." },
     .{ .name = "shell", .json_type = .object, .object_schema = &terminal_shell_schema },
     .{ .name = "backend", .json_type = .string, .enum_values = &.{ "native", "tmux" }, .description = "Start backend or optional list filter." },

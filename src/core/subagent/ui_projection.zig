@@ -1483,7 +1483,7 @@ fn projectApproval(alloc: Allocator, approval: communication.Approval) !Approval
         null;
     errdefer if (explanation) |value| alloc.free(value);
     const command = if (approval.command) |value|
-        try dupeBounded(alloc, value)
+        try alloc.dupe(u8, value)
     else
         null;
     errdefer if (command) |value| alloc.free(value);
@@ -1507,6 +1507,38 @@ fn projectApproval(alloc: Allocator, approval: communication.Approval) !Approval
 
 fn dupeBounded(alloc: Allocator, value: []const u8) ![]u8 {
     return alloc.dupe(u8, value[0..@min(value.len, max_summary_bytes)]);
+}
+
+test "approval command projection preserves content beyond summary bounds" {
+    const alloc = std.testing.allocator;
+    const tail = "COMMAND_TAIL_MUST_REMAIN_VISIBLE";
+    const command = try std.fmt.allocPrint(
+        alloc,
+        "# terminal.exec profile=user shell=/bin/zsh\n{s}{s}",
+        .{ "x" ** max_summary_bytes, tail },
+    );
+    defer alloc.free(command);
+
+    var ledger = try communication.Ledger.init(alloc, "child");
+    defer ledger.deinit(alloc);
+    _ = try communication.registerApproval(alloc, &ledger, .{
+        .id = "long-command-projection",
+        .kind = .tool,
+        .child_id = "child",
+        .root_id = "root",
+        .work_id = "work",
+        .prepared_fingerprint = [_]u8{7} ** 32,
+        .label = "terminal.exec long command",
+        .explanation = null,
+        .command = command,
+        .grants = &.{},
+        .created_at_ms = 1,
+    });
+
+    var projected = try projectApproval(alloc, ledger.approvals[0]);
+    defer projected.deinit(alloc);
+    try std.testing.expectEqualStrings(command, projected.command.?);
+    try std.testing.expect(std.mem.endsWith(u8, projected.command.?, tail));
 }
 
 fn cloneDiagnostics(

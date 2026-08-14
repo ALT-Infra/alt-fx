@@ -339,6 +339,9 @@ pub fn validate(
         if (input.command == null) {
             return try ctx.allocator.dupe(u8, "terminal exec arguments are invalid: MissingCommand");
         }
+        if (input.command.?.len > contracts.max_command_bytes) {
+            return try ctx.allocator.dupe(u8, "terminal exec arguments are invalid: InvalidCommand");
+        }
         _ = resolveCwd(arena, ctx, input.cwd) catch |err| {
             return try std.fmt.allocPrint(
                 ctx.allocator,
@@ -1437,6 +1440,34 @@ test "registered terminal validation enforces action-specific input before execu
         else => {},
     };
     try std.testing.expect(rejected == .failure);
+
+    const oversized_command = try std.testing.allocator.alloc(
+        u8,
+        contracts.max_command_bytes + 1,
+    );
+    defer std.testing.allocator.free(oversized_command);
+    @memset(oversized_command, 'x');
+    const oversized_json = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"action\":\"exec\",\"command\":\"{s}\"}}",
+        .{oversized_command},
+    );
+    defer std.testing.allocator.free(oversized_json);
+    const oversized = try tool_dispatch.validateRegisteredToolCall(ctx, registry, .{
+        .id = "terminal-oversized-exec",
+        .name = "terminal",
+        .arguments_json = oversized_json,
+    });
+    defer switch (oversized) {
+        .failure => |reason| std.testing.allocator.free(reason),
+        else => {},
+    };
+    switch (oversized) {
+        .failure => |reason| try std.testing.expect(
+            std.mem.find(u8, reason, "InvalidCommand") != null,
+        ),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "terminal result mapper adds detail only for workspace path failures" {

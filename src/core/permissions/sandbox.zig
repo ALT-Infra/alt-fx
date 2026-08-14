@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const command_contract = @import("../execution/command_contract.zig");
 const command_environment = @import("../execution/command_environment.zig");
+const process_tree = @import("../execution/process_tree.zig");
 const background_process_provider = @import(
     "../execution/background_process_provider.zig",
 );
@@ -185,6 +186,7 @@ const foreground_session_replace_failure_prefix = "\x00FX_FOREGROUND_EXEC_FAILED
 const foreground_session_replace_failure_marker_bytes =
     foreground_session_replace_failure_prefix.len +
     foreground_session_failure_nonce_hex_bytes + 1;
+var foreground_session_termination_requested: std.c.sig_atomic_t = 0;
 const foreground_session_replace_error_name_bytes = blk: {
     var max_len: usize = 0;
     for (std.meta.fields(std.process.ReplaceError)) |field| {
@@ -241,8 +243,9 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
 
     // The group receives TERM together. Keep the supervisor alive while the
     // target uses the cooperative shutdown window.
+    @as(*volatile std.c.sig_atomic_t, &foreground_session_termination_requested).* = 0;
     const supervisor_action: std.posix.Sigaction = .{
-        .handler = .{ .handler = retainForegroundSessionOnTermination },
+        .handler = .{ .handler = recordForegroundSessionTermination },
         .mask = std.posix.sigemptyset(),
         .flags = 0,
     };
@@ -257,14 +260,76 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
         writeForegroundSessionReplaceFailure(args[1], err);
         std.process.exit(foreground_session_replace_failure_exit_code);
     };
-    const term = target.wait(zio) catch |err| {
+    const term = waitForForegroundTarget(&target) catch |err| {
+        target.kill(zio);
+        _ = target.wait(zio) catch {};
         writeForegroundSessionReplaceFailure(args[1], err);
         std.process.exit(foreground_session_replace_failure_exit_code);
     };
     exitForegroundSessionSupervisor(term);
 }
 
-fn retainForegroundSessionOnTermination(_: std.posix.SIG) callconv(.c) void {}
+fn recordForegroundSessionTermination(_: std.posix.SIG) callconv(.c) void {
+    @as(*volatile std.c.sig_atomic_t, &foreground_session_termination_requested).* = 1;
+}
+
+fn foregroundSessionTerminationRequested() bool {
+    return @as(*volatile std.c.sig_atomic_t, &foreground_session_termination_requested).* != 0;
+}
+
+fn waitForForegroundTarget(
+    target: *std.process.Child,
+) !std.process.Child.Term {
+    const target_pid = target.id orelse return error.ForegroundTargetMissing;
+    var descendants = try process_tree.Tracker.init(std.heap.page_allocator);
+    defer descendants.deinit();
+    var termination_started_ms: ?i64 = null;
+    var forced = false;
+
+    while (true) {
+        try descendants.refresh(target_pid);
+        const now_ms = io_mod.milliTimestamp();
+        if (foregroundSessionTerminationRequested()) {
+            if (termination_started_ms == null) {
+                termination_started_ms = now_ms;
+                const count = descendants.signalAll(std.posix.SIG.TERM);
+                debug_trace.logf(
+                    "core",
+                    "captured command termination reached tracked descendants count={d}",
+                    .{count},
+                );
+            } else if (!forced and now_ms - termination_started_ms.? >= 700) {
+                forced = true;
+                const count = descendants.signalAll(std.posix.SIG.KILL);
+                debug_trace.logf(
+                    "core",
+                    "captured command force-killed tracked descendants count={d}",
+                    .{count},
+                );
+            }
+        }
+
+        if (try pollProcessLeader(target)) |term| {
+            try descendants.refresh(target_pid);
+            const count = descendants.signalAll(std.posix.SIG.KILL);
+            if (count > 0) {
+                const started_ms = io_mod.milliTimestamp();
+                while (descendants.anyAlive() and
+                    io_mod.milliTimestamp() - started_ms < 250)
+                {
+                    io_mod.sleep(std.time.ns_per_ms);
+                }
+                debug_trace.logf(
+                    "core",
+                    "captured command target completed; tracked descendants terminated count={d}",
+                    .{count},
+                );
+            }
+            return term;
+        }
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+}
 
 fn writeForegroundSessionReplaceFailure(
     nonce: []const u8,
@@ -4275,6 +4340,51 @@ test "natural command completion terminates background child with redirected str
         alloc,
         "sleep 30 >/dev/null 2>&1 & child=$!; printf '%s' \"$child\" > {s}",
         .{quoted_pid_path},
+    );
+    defer alloc.free(command);
+
+    const result = try executeCommand(.{
+        .backend = .none,
+        .workspace_root = workspace,
+        .max_command_output_bytes = 1024,
+        .timeout_ms = 2000,
+    }, alloc, command, workspace);
+    defer alloc.free(result.output);
+    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.foreground.exit_code);
+
+    const pid_text = try readAbsoluteFile(alloc, pid_path, 64);
+    defer alloc.free(pid_text);
+    const pid = try std.fmt.parseInt(
+        std.posix.pid_t,
+        std.mem.trim(u8, pid_text, " \t\r\n"),
+        10,
+    );
+    try expectProcessGone(pid);
+}
+
+test "natural command completion terminates redirected descendant after setsid" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "escaped-child.pid" });
+    defer alloc.free(pid_path);
+    const command = try std.fmt.allocPrint(
+        alloc,
+        "python3 -c 'import os,time\n" ++
+            "pid=os.fork()\n" ++
+            "if pid == 0:\n" ++
+            " os.setsid()\n" ++
+            " null=os.open(\"/dev/null\",os.O_RDWR)\n" ++
+            " os.dup2(null,0); os.dup2(null,1); os.dup2(null,2)\n" ++
+            " open(\"{s}\",\"w\").write(str(os.getpid()))\n" ++
+            " time.sleep(30)\n" ++
+            "else:\n" ++
+            " time.sleep(0.1)'",
+        .{pid_path},
     );
     defer alloc.free(command);
 
