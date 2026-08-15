@@ -467,6 +467,34 @@ class PgsoCorpusTests(unittest.TestCase):
         self.assertEqual(1, len(calls))
         self.assertEqual(1, len(merges))
 
+    def test_behavior_corpus_replaces_canonical_binary_with_fresh_inode(self) -> None:
+        corpus = self.make_corpus(self.make_scenario("first"))
+        canonical = self.root / "zig-out" / "bin" / "fx"
+        canonical.parent.mkdir(parents=True)
+        canonical.write_bytes(b"stale")
+        stale_inode = canonical.stat().st_ino
+        binary = self.root / "candidate-fx"
+        binary.write_bytes(b"candidate")
+
+        def command_runner(argv, **kwargs):
+            return CommandResult(
+                argv=tuple(argv),
+                returncode=0,
+                stdout="ok\n",
+                stderr="",
+                elapsed_seconds=0.2,
+            )
+
+        run_behavior_corpus(
+            corpus,
+            binary,
+            self.root / "behavior-output",
+            command_runner=command_runner,
+        )
+
+        self.assertEqual(b"candidate", canonical.read_bytes())
+        self.assertNotEqual(stale_inode, canonical.stat().st_ino)
+
     def test_behavior_corpus_runs_the_exact_binary_without_profile_output(self) -> None:
         corpus = self.make_corpus(
             self.make_scenario("first"),

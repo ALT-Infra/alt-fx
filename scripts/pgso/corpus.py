@@ -312,7 +312,18 @@ def _install_training_binary(corpus: Corpus, binary: pathlib.Path) -> pathlib.Pa
     if canonical.is_symlink():
         raise PgsoError(f"canonical training binary cannot be a symlink: {canonical}")
     if binary.resolve() != canonical.resolve():
-        shutil.copy2(binary, canonical)
+        with tempfile.NamedTemporaryFile(
+            dir=canonical.parent,
+            prefix=f".{canonical.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary_file:
+            temporary = pathlib.Path(temporary_file.name)
+        try:
+            shutil.copy2(binary, temporary)
+            os.replace(temporary, canonical)
+        finally:
+            temporary.unlink(missing_ok=True)
     if sha256_file(canonical) != sha256_file(binary):
         raise PgsoError("canonical training binary hash mismatch after installation")
     return canonical
