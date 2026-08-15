@@ -4153,13 +4153,14 @@ describe("effect-aware command permissions", () => {
   );
 
   test(
-    "fx ask resumes a 64 KiB child message through ordered parent turn continuations",
+    "fx ask resumes a 64 KiB child message through five bounded projections",
     async () => {
       const root = createIsolatedRoot();
       const childPrompt = "ASK_64K_DELIVERY_CHILD_PROMPT";
       const largeMessage = "ASK_64K_PARENT_MESSAGE:".padEnd(64 * 1024, "x");
       let childId = "";
       let messageEventId = "";
+      const parts: ParentMessagePart[] = [];
       const firstRoute = (body: string) => {
         const text = promptText(body);
         if (body.includes('"toolCallId":"ask_64k_send_1"') &&
@@ -4176,13 +4177,27 @@ describe("effect-aware command permissions", () => {
           ) as { child_id: string; status: string };
           expect(created.status).toBe("created");
           childId = created.child_id;
-          expectNoParentDeliveries(body);
+          const sameTurnEventIds = parentDeliveryIds(body);
+          expect(sameTurnEventIds.length).toBeLessThanOrEqual(1);
+          if (sameTurnEventIds.length === 1) {
+            messageEventId = sameTurnEventIds[0]!;
+            const part = parentMessagePart(body, childId, messageEventId);
+            expect(part.offset).toBe(0);
+            expect(part.total_bytes).toBe(largeMessage.length);
+            parts.push(part);
+          } else {
+            expectNoParentDeliveries(body);
+          }
           return waitForPersistedDeliveryId(
             root,
             childId,
             "ASK_64K_PARENT_MESSAGE:",
           ).then((eventId) => {
-            messageEventId = eventId;
+            if (messageEventId.length > 0) {
+              expect(eventId).toBe(messageEventId);
+            } else {
+              messageEventId = eventId;
+            }
             return waitForSubagentIdle(root, childId)
               .then(() => finalText("ASK_64K_PARENT_FIRST_DONE"));
           });
@@ -4238,7 +4253,7 @@ describe("effect-aware command permissions", () => {
       const parentSessionId = JSON.parse(first.stdout.trim()).session_id as string;
       await waitForSubagentIdleOrInterruptedAfterHostExit(root, childId);
 
-      const parts: ParentMessagePart[] = [];
+      const sameTurnPartCount = parts.length;
       let noRedeliveryChecked = false;
       const continuationRoute = (body: string) => {
         const text = promptText(body);
@@ -4260,7 +4275,7 @@ describe("effect-aware command permissions", () => {
       const continuationGateway = startFakeGateway(
         Array.from({ length: 6 }, () => continuationRoute),
       );
-      for (let index = 0; index < 5; index += 1) {
+      for (let index = parts.length; index < 5; index += 1) {
         const requestsBefore = continuationGateway.requests.length;
         const turn = await runFx(
           [
@@ -4308,7 +4323,7 @@ describe("effect-aware command permissions", () => {
       expect(final.code).toBe(0);
       expect(final.stderr).toBe("");
       expect(noRedeliveryChecked).toBe(true);
-      expect(continuationGateway.requests).toHaveLength(6);
+      expect(continuationGateway.requests).toHaveLength(6 - sameTurnPartCount);
       expectHumanUnreadIndependent(root, childId, messageEventId);
       expectParentHistoryClean(root, parentSessionId, [
         "<subagent_deliveries",
@@ -4680,7 +4695,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test(
-    "nested child receives a 64 KiB grandchild message in five bounded turns",
+    "nested child receives a 64 KiB grandchild message in five bounded projections",
     async () => {
       const root = createIsolatedRoot();
       const childPrompt = "NESTED_64K_DELIVERY_CHILD_PROMPT";
@@ -4689,6 +4704,7 @@ describe("effect-aware command permissions", () => {
       let childId = "";
       let grandchildId = "";
       let messageEventId = "";
+      const parts: ParentMessagePart[] = [];
       const firstRoute = (body: string) => {
         const text = promptText(body);
         if (body.includes('"toolCallId":"nested_64k_send_1"') &&
@@ -4705,13 +4721,27 @@ describe("effect-aware command permissions", () => {
           ) as { child_id: string; status: string };
           expect(created.status).toBe("created");
           grandchildId = created.child_id;
-          expectNoParentDeliveries(body);
+          const sameTurnEventIds = parentDeliveryIds(body);
+          expect(sameTurnEventIds.length).toBeLessThanOrEqual(1);
+          if (sameTurnEventIds.length === 1) {
+            messageEventId = sameTurnEventIds[0]!;
+            const part = parentMessagePart(body, grandchildId, messageEventId);
+            expect(part.offset).toBe(0);
+            expect(part.total_bytes).toBe(largeMessage.length);
+            parts.push(part);
+          } else {
+            expectNoParentDeliveries(body);
+          }
           return waitForPersistedDeliveryId(
             root,
             grandchildId,
             "NESTED_64K_CHILD_MESSAGE:",
           ).then((eventId) => {
-            messageEventId = eventId;
+            if (messageEventId.length > 0) {
+              expect(eventId).toBe(messageEventId);
+            } else {
+              messageEventId = eventId;
+            }
             return waitForSubagentIdle(root, grandchildId)
               .then(() => finalText("NESTED_64K_CHILD_FIRST_PRIVATE_DONE"));
           });
@@ -4790,8 +4820,7 @@ describe("effect-aware command permissions", () => {
       expect(messageEventId.length).toBeGreaterThan(0);
       const parentSessionId = JSON.parse(first.stdout.trim()).session_id as string;
 
-      const parts: ParentMessagePart[] = [];
-      for (let index = 0; index < 5; index += 1) {
+      for (let index = parts.length; index < 5; index += 1) {
         const childMessage = `NESTED_64K_CHILD_TURN_${index + 1}`;
         const sendCallId = `nested_64k_root_send_${index + 1}`;
         const route = (body: string) => {
@@ -5281,7 +5310,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "interactive Fx delivers a 64 KiB child message in five bounded turns",
+    "interactive Fx delivers a 64 KiB child message in five bounded projections",
     async () => {
       const root = createIsolatedRoot();
       const stderrPath = join(root.root, "interactive-64k-delivery-stderr.log");
@@ -5324,13 +5353,27 @@ describe("effect-aware command permissions", () => {
           ) as { child_id: string; status: string };
           expect(created.status).toBe("created");
           childId = created.child_id;
-          expectNoParentDeliveries(body);
+          const sameTurnEventIds = parentDeliveryIds(body);
+          expect(sameTurnEventIds.length).toBeLessThanOrEqual(1);
+          if (sameTurnEventIds.length === 1) {
+            messageEventId = sameTurnEventIds[0]!;
+            const part = parentMessagePart(body, childId, messageEventId);
+            expect(part.offset).toBe(0);
+            expect(part.total_bytes).toBe(largeMessage.length);
+            parts.push(part);
+          } else {
+            expectNoParentDeliveries(body);
+          }
           return waitForPersistedDeliveryId(
             root,
             childId,
             "INTERACTIVE_64K_PARENT_MESSAGE:",
           ).then((eventId) => {
-            messageEventId = eventId;
+            if (messageEventId.length > 0) {
+              expect(eventId).toBe(messageEventId);
+            } else {
+              messageEventId = eventId;
+            }
             return finalText("INTERACTIVE_64K_PARENT_FIRST_DONE");
           });
         }
@@ -5384,13 +5427,15 @@ describe("effect-aware command permissions", () => {
       expect(messageEventId.length).toBeGreaterThan(0);
       await waitForSubagentIdle(root, childId);
 
-      for (let index = 0; index < 5; index += 1) {
+      const sameTurnPartCount = parts.length;
+      for (let index = parts.length; index < 5; index += 1) {
+        const requestsBefore = gateway.requests.length;
         await activeSession.sendText(`INTERACTIVE_64K_PARENT_TURN_${index + 1}`);
         await activeSession.waitForText(
           `INTERACTIVE_64K_PART_${index + 1}_DONE`,
           TIMEOUT,
         );
-        expect(gateway.requests).toHaveLength(5 + index);
+        expect(gateway.requests).toHaveLength(requestsBefore + 1);
       }
       expect(parts).toHaveLength(5);
       expect(parts.map((part) => part.content).join("")).toBe(largeMessage);
@@ -5402,7 +5447,7 @@ describe("effect-aware command permissions", () => {
         TIMEOUT,
       );
       expect(noRedeliveryChecked).toBe(true);
-      expect(gateway.requests).toHaveLength(10);
+      expect(gateway.requests).toHaveLength(10 - sameTurnPartCount);
 
       await activeSession.sendText("/quit");
       expect(await activeSession.waitForSessionEnd(5_000)).toBe(true);
