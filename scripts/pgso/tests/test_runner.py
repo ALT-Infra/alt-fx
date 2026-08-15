@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import shlex
 import sys
 import tempfile
 import time
@@ -110,26 +111,25 @@ class PgsoRunnerTests(unittest.TestCase):
             root = pathlib.Path(tmp)
             marker = root / "child-survived"
             log_path = root / "stage.json"
-            child_code = (
-                "import pathlib,time; time.sleep(0.5); "
-                f"pathlib.Path({str(marker)!r}).write_text('survived')"
-            )
-            parent_code = (
-                "import subprocess,sys,time; "
-                f"subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
-                "print('started', flush=True); time.sleep(30)"
+            script = root / "timeout-fixture.sh"
+            script.write_text(
+                "#!/bin/sh\n"
+                f"(sleep 1; printf survived > {shlex.quote(str(marker))}) &\n"
+                "printf 'started\\n'\n"
+                "sleep 30\n",
+                encoding="utf-8",
             )
 
-            with self.assertRaisesRegex(PgsoError, "timed out after 0.1 seconds"):
+            with self.assertRaisesRegex(PgsoError, "timed out after 0.5 seconds"):
                 run_checked(
-                    [sys.executable, "-c", parent_code],
+                    ["/bin/sh", str(script)],
                     cwd=root,
                     env=os.environ.copy(),
-                    timeout_s=0.1,
+                    timeout_s=0.5,
                     log_path=log_path,
                 )
 
-            time.sleep(0.8)
+            time.sleep(1.2)
             self.assertFalse(marker.exists())
             log = json.loads(log_path.read_text())
             self.assertEqual("timed_out", log["status"])
