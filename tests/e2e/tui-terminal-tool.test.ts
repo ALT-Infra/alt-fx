@@ -481,6 +481,10 @@ test.skipIf(!tmuxAvailable())(
 
     await active.sendText(`!${scriptPath}`);
     await active.waitForText("Running ", TIMEOUT);
+    await waitForTerminalRecord(
+      fixture.home,
+      (record) => record.command === scriptPath && record.lifecycle === "running",
+    );
     await active.sendLiteralText("TAKEOVER_INLINE_DRAFT");
     await active.sendKeys("C-x");
     await active.waitForText("Background processes", TIMEOUT);

@@ -3248,12 +3248,12 @@ describe("gateway stream lifecycle", () => {
       expect(result.signal).toBeNull();
       expect(result.stdout).toContain(expectedOutput);
       expect(result.stderr).toContain(
-        "Provider unavailable · retrying request · attempt 5/10",
+        "Provider unavailable · HTTP 503 · provider temporarily unavailable · retrying request · attempt 5/10",
       );
-      expect(result.stderr).toContain(
-        "Network interrupted · retrying request · attempt 6/10",
+      expect(result.stderr).toMatch(
+        /Network interrupted · [^\r\n]+ · retrying request · attempt 6\/10/,
       );
-      expect(result.stderr).not.toContain("Network interrupted · retrying request in 16s");
+      expect(result.stderr).not.toContain("retrying request in 16s");
       expect(result.stderr).toContain("recovered · succeeded on attempt 7/10");
       expect(connections).toBe(7);
       expect(requests).toBe(6);

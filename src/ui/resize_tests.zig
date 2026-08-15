@@ -2907,6 +2907,55 @@ test "cancel notice keeps one blank row before idle footer" {
     try expectExactlyOneBlankRowBetween(&h, cancel_row, footer_row);
 }
 
+test "settled cancel projection keeps the retained transcript aligned with the footer" {
+    var h = try Harness.init(std.testing.allocator, 125, 37, 4);
+    defer h.deinit();
+
+    var input = InputRuntime{};
+    defer input.deinit(h.alloc);
+    var approval: approval_prompt.ApprovalPrompt = .{};
+    defer approval.deinit(h.alloc);
+
+    try h.shell.initViewport(&h.metrics, 1);
+    _ = try h.shell.appendRawTranscriptEntryClassified(
+        h.alloc,
+        "line 01\nline 02\nline 03\nline 04\nline 05\nline 06\nline 07\n" ++
+            "line 08\nline 09\nline 10\nline 11\nline 12\nline 13\nline 14\n" ++
+            "line 15\nline 16\nline 17\nline 18\nline 19\nline 20\nline 21\n" ++
+            "line 22\nline 23\nline 24\nline 25\nline 26\nline 27\nline 28\n" ++
+            "line 29\nline 30\nline 31\nline 32\nline 33\nline 34\n",
+        .subagent_status,
+    );
+    try input.textReplacementState().replace(h.alloc, "/");
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    _ = try h.shell.appendRawTranscriptEntryClassified(
+        h.alloc,
+        "cancelled\n",
+        .question_resolution,
+    );
+    input.picker.dismissInlinePicker(.slash);
+    input.inputResetState().clearCurrent(h.alloc);
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    const cancel_row = try findRowContaining(&h, "cancelled");
+    const initial_footer_row = try findFirstDividerRowAfter(&h, cancel_row);
+    try expectExactlyOneBlankRowBetween(&h, cancel_row, initial_footer_row);
+
+    h.shell.render_requests.request(.footer);
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    const settled_footer_row = try findFirstDividerRowAfter(&h, cancel_row);
+    try std.testing.expectEqual(TestBodyDisposition.retain, h.last_frame.body_disposition);
+    try std.testing.expectEqual(initial_footer_row, settled_footer_row);
+    try expectExactlyOneBlankRowBetween(&h, cancel_row, settled_footer_row);
+}
+
 test "question prompt footer state does not mutate transcript gaps" {
     var h = try Harness.init(std.testing.allocator, 80, 24, 4);
     defer h.deinit();
