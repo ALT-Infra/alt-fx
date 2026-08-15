@@ -4164,13 +4164,23 @@ describe("gateway stream lifecycle", () => {
         expect(gateway.classifierRequests[0]!.body).toContain("exact-");
         expect(gateway.classifierRequests[0]!.body).toContain("inputSchema");
         if (decision === "ask") {
-          // Noninteractive ask surfaces permission_required and exits 1 —
-          // never auto_denied, never executes the MCP tool.
-          expect(result.code).toBe(1);
-          expect(result.stdout).toContain("NonInteractivePermissionRequired");
+          // Headless automatic review returns a recoverable denial to the
+          // primary model without executing the MCP tool or asking the user.
+          expect(result.code).toBe(0);
+          expect(gateway.requests).toHaveLength(3);
+          expect(gateway.requests[2]!.body).toContain("tool_permission_denied");
+          expect(gateway.requests[2]!.body).toContain("auto_denied");
+          expect(gateway.requests[2]!.body).not.toContain("user_denied");
+          const json = parseAskJson(result.stdout);
+          expect(json.output).toContain("MCP ask handled.");
+          expect(json.tool_calls).toContainEqual({
+            name: DYNAMIC_MCP_TOOL_NAME,
+            status: "error",
+          });
+          expect(result.stdout).not.toContain("NonInteractivePermissionRequired");
           expect(trace).toContain("event=auto_review_result");
           expect(trace).toContain("decision=ask");
-          expect(trace).toContain("err=NonInteractivePermissionRequired");
+          expect(trace).not.toContain("err=NonInteractivePermissionRequired");
           expect(existsSync(mcp.callLogPath)).toBe(false);
         } else {
           expect(result.code).toBe(0);
