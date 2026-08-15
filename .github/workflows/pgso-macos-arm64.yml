@@ -33,7 +33,6 @@ jobs:
       AI_GATEWAY_API_KEY: ""
       VERCEL_OIDC_TOKEN: ""
       FX_SOUND: "0"
-      PGSO_OUTPUT: ${{ runner.temp }}/fx-pgso
     steps:
       - uses: actions/checkout@v4
         with:
@@ -85,7 +84,7 @@ jobs:
         run: |
           python3 -m scripts.pgso all \
             --llvm-bin "$(brew --prefix llvm@21)/bin" \
-            --output-dir "$PGSO_OUTPUT" \
+            --output-dir "$RUNNER_TEMP/fx-pgso" \
             --target aarch64-macos \
             --update-channel stable \
             --bun "$(which bun)" \
@@ -95,9 +94,9 @@ jobs:
       - name: Package stable release candidate
         if: inputs.package_release
         run: |
-          python3 -m scripts.pgso report --output-dir "$PGSO_OUTPUT" >/dev/null
+          python3 -m scripts.pgso report --output-dir "$RUNNER_TEMP/fx-pgso" >/dev/null
           archive="$RUNNER_TEMP/fx-macos-aarch64.tar.gz"
-          tar -czf "$archive" -C "$PGSO_OUTPUT/candidate" fx
+          tar -czf "$archive" -C "$RUNNER_TEMP/fx-pgso/candidate" fx
           cd "$RUNNER_TEMP"
           shasum -a 256 fx-macos-aarch64.tar.gz > fx-macos-aarch64.tar.gz.sha256
 
