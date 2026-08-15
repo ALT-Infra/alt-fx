@@ -197,6 +197,8 @@ class PgsoCorpusTests(unittest.TestCase):
             "TMUX",
             "TMUX_TMPDIR",
             "AI_GATEWAY_API_KEY",
+            "FX_TRACE_LOG",
+            "FX_TRACE_SCOPES",
         ):
             with self.subTest(key=key):
                 payload = self.manifest()
@@ -334,6 +336,8 @@ class PgsoCorpusTests(unittest.TestCase):
                 "PGSO_UNSET_ME": "remove",
                 "TMUX": "/tmp/user-tmux,1,0",
                 "TMUX_PANE": "%1",
+                "FX_TRACE_LOG": "/tmp/user-fx-trace.log",
+                "FX_TRACE_SCOPES": "user-scope",
             },
             clear=False,
         ):
@@ -355,6 +359,8 @@ class PgsoCorpusTests(unittest.TestCase):
         self.assertNotIn("PGSO_UNSET_ME", calls[0]["env"])
         self.assertNotIn("TMUX", calls[0]["env"])
         self.assertNotIn("TMUX_PANE", calls[0]["env"])
+        self.assertNotIn("FX_TRACE_LOG", calls[0]["env"])
+        self.assertNotIn("FX_TRACE_SCOPES", calls[0]["env"])
         self.assertEqual(
             str(self.root / "output" / "profiles" / "home" / "first"),
             calls[0]["env"]["HOME"],
@@ -493,6 +499,24 @@ class PgsoCorpusTests(unittest.TestCase):
         self.assertEqual(0, result.merged_raw_profiles)
         self.assertTrue(all(call[0][0] == str(canonical) for call in calls))
         self.assertTrue(all("LLVM_PROFILE_FILE" not in call[1] for call in calls))
+        self.assertTrue(all("FX_TRACE_SCOPES" not in call[1] for call in calls))
+        self.assertEqual(
+            {
+                str(
+                    self.root
+                    / "behavior-output"
+                    / "traces"
+                    / "first.log"
+                ),
+                str(
+                    self.root
+                    / "behavior-output"
+                    / "traces"
+                    / "second.log"
+                ),
+            },
+            {call[1]["FX_TRACE_LOG"] for call in calls},
+        )
         self.assertTrue(
             all(
                 call[1]["HOME"]

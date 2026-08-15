@@ -38,6 +38,8 @@ ISOLATED_ENVIRONMENT_KEYS = (
     "TMUX",
     "TMUX_PANE",
     "TMUX_TMPDIR",
+    "FX_TRACE_LOG",
+    "FX_TRACE_SCOPES",
 )
 
 
@@ -578,6 +580,8 @@ def run_behavior_corpus(
     canonical = _install_training_binary(corpus, binary)
     log_dir = output_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
+    trace_dir = output_dir / "traces"
+    trace_dir.mkdir(parents=True, exist_ok=True)
     runtime_home = output_dir / "home"
     runtime_home.mkdir(parents=True, exist_ok=True)
     results: list[ScenarioResult] = []
@@ -604,6 +608,9 @@ def run_behavior_corpus(
             environment.pop(key, None)
         environment.update(dict(scenario.env_set))
         environment["HOME"] = str(scenario_home)
+        trace_path = trace_dir / f"{scenario.name}.log"
+        trace_path.unlink(missing_ok=True)
+        environment["FX_TRACE_LOG"] = str(trace_path)
         if scenario.requires_tmux:
             tmux_dir = _new_tmux_dir()
             environment["TMUX_TMPDIR"] = str(tmux_dir)
