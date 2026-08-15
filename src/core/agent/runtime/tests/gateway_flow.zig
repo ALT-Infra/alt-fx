@@ -3218,10 +3218,11 @@ test "processQueuedPrompt refreshes runtime overlay each step and preserves turn
     try expectBodyContainsInOrder(&gateway, 1, &second_request_order);
 }
 
-test "processQueuedPrompt prepares parent deliveries once and reuses them across tool steps" {
+test "processQueuedPrompt refreshes and acknowledges parent deliveries for each tool step" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"a\"}")};
     const completions = [_]FakeCompletion{
+        .{ .finish_reason = .provider_error },
         .{ .content = "Checking.", .tool_calls = &calls },
         .{ .content = "Final" },
     };
@@ -3230,22 +3231,27 @@ test "processQueuedPrompt prepares parent deliveries once and reuses them across
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
     const prepared_contexts = [_][]const u8{
-        "prepared child delivery for this parent turn",
-        "must not be read during the same parent turn",
+        "prepared child delivery for step one",
+        "prepared child delivery for step two",
     };
     hooks.parent_turn_context_texts = &prepared_contexts;
     var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.max_provider_attempts = 2;
 
-    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
-    try std.testing.expectEqual(@as(usize, 1), hooks.parent_turn_prepare_count);
-    try std.testing.expectEqual(@as(usize, 1), hooks.parent_turn_ack_count);
-    try std.testing.expectEqual(@as(u64, 1), hooks.parent_turn_last_ack_sequence);
-    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
-    try expectBodyContains(&gateway, 0, "prepared child delivery for this parent turn");
-    try expectBodyContains(&gateway, 1, "prepared child delivery for this parent turn");
-    try expectBodyNotContains(&gateway, 0, "must not be read during the same parent turn");
-    try expectBodyNotContains(&gateway, 1, "must not be read during the same parent turn");
+    try std.testing.expectEqual(@as(usize, 2), hooks.parent_turn_prepare_count);
+    try std.testing.expectEqual(@as(usize, 2), hooks.parent_turn_ack_count);
+    try std.testing.expectEqual(@as(u64, 2), hooks.parent_turn_last_ack_sequence);
+    try std.testing.expect(hooks.parent_turn_ack_contract_valid);
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try expectBodyContains(&gateway, 0, "prepared child delivery for step one");
+    try expectBodyNotContains(&gateway, 0, "prepared child delivery for step two");
+    try expectBodyContains(&gateway, 1, "prepared child delivery for step one");
+    try expectBodyNotContains(&gateway, 1, "prepared child delivery for step two");
+    try expectBodyContains(&gateway, 2, "prepared child delivery for step two");
+    try expectBodyNotContains(&gateway, 2, "prepared child delivery for step one");
 }
 
 test "processQueuedPrompt leaves parent delivery pending after pre-dispatch cancellation" {
@@ -3262,7 +3268,7 @@ test "processQueuedPrompt leaves parent delivery pending after pre-dispatch canc
 
     try runFakePrompt(&first_gateway, &hooks, fixture.config(), fixture.job());
 
-    try std.testing.expectEqual(@as(usize, 1), hooks.parent_turn_prepare_count);
+    try std.testing.expectEqual(@as(usize, 0), hooks.parent_turn_prepare_count);
     try std.testing.expectEqual(@as(usize, 0), hooks.parent_turn_ack_count);
     try std.testing.expectEqual(@as(usize, 0), first_gateway.request_bodies.items.len);
 
@@ -3272,7 +3278,7 @@ test "processQueuedPrompt leaves parent delivery pending after pre-dispatch canc
     defer second_gateway.deinit();
     try runFakePrompt(&second_gateway, &hooks, fixture.config(), fixture.job());
 
-    try std.testing.expectEqual(@as(usize, 2), hooks.parent_turn_prepare_count);
+    try std.testing.expectEqual(@as(usize, 1), hooks.parent_turn_prepare_count);
     try std.testing.expectEqual(@as(usize, 1), hooks.parent_turn_ack_count);
     try std.testing.expectEqual(@as(u64, 41), hooks.parent_turn_last_ack_sequence);
     try expectBodyContains(
@@ -3345,7 +3351,7 @@ test "processQueuedPrompt acknowledges parent delivery after ambiguous send fail
     );
 }
 
-test "processQueuedPrompt defers parent deliveries created after step one to the next turn" {
+test "processQueuedPrompt delivers parent context created between tool steps" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"a\"}")};
     const first_completions = [_]FakeCompletion{
@@ -3361,19 +3367,10 @@ test "processQueuedPrompt defers parent deliveries created after step one to the
 
     try runFakePrompt(&first_gateway, &hooks, fixture.config(), fixture.job());
 
-    try std.testing.expectEqual(@as(usize, 1), hooks.parent_turn_prepare_count);
-    try std.testing.expectEqual(@as(usize, 0), hooks.parent_turn_ack_count);
-    try expectBodyNotContains(&first_gateway, 0, "late child delivery");
-    try expectBodyNotContains(&first_gateway, 1, "late child delivery");
-
-    const second_completions = [_]FakeCompletion{.{ .content = "Final after late delivery" }};
-    var second_gateway = FakeGateway.init(alloc, &second_completions);
-    defer second_gateway.deinit();
-    try runFakePrompt(&second_gateway, &hooks, fixture.config(), fixture.job());
-
     try std.testing.expectEqual(@as(usize, 2), hooks.parent_turn_prepare_count);
     try std.testing.expectEqual(@as(usize, 1), hooks.parent_turn_ack_count);
-    try expectBodyContains(&second_gateway, 0, "late child delivery");
+    try expectBodyNotContains(&first_gateway, 0, "late child delivery");
+    try expectBodyContains(&first_gateway, 1, "late child delivery");
 }
 
 test "processQueuedPrompt blocks accidental restart of non-live background history command" {

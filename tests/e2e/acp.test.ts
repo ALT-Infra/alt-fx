@@ -278,6 +278,17 @@ function acpParentDeliveryEnvelope(text: string): string {
   return text.slice(start, end + "</subagent_deliveries>".length);
 }
 
+function acpParentDeliveryIds(body: string): string[] {
+  const text = acpPromptText(body);
+  if (!text.includes("<subagent_deliveries")) return [];
+  return acpParentDeliveryEnvelope(text)
+    .split("\n")
+    .filter((line) => line.startsWith("- "))
+    .map((line) =>
+      String((JSON.parse(line.slice(2)) as { id?: unknown }).id ?? "")
+    );
+}
+
 function persistedAcpPayloadText(payload: unknown): string {
   if (!payload || typeof payload !== "object") return JSON.stringify(payload);
   const message = (payload as { message?: unknown }).message;
@@ -391,6 +402,19 @@ function expectAcpParentDeliveries(
   }
   expect(occurrenceCount(envelope, `"source_id":"${childId}"`)).toBe(eventIds.length);
   expect(occurrenceCount(envelope, payload)).toBe(eventIds.length);
+}
+
+function expectAcpParentDeliveriesOrNone(
+  body: string,
+  childId: string,
+  eventIds: string[],
+  payload: string,
+) {
+  if (eventIds.length > 0) {
+    expectAcpParentDeliveries(body, childId, eventIds, payload);
+  } else {
+    expectNoAcpParentDeliveries(body);
+  }
 }
 
 type AcpParentMessagePart = {
@@ -6168,13 +6192,14 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "ACP delivers periodic child notifications at the next parent turn boundary",
+    "ACP delivers periodic child notifications at the next available parent step",
     async () => {
       const root = createIsolatedRoot("fx-acp-parent-delivery-");
       const childPrompt = "ACP_PARENT_DELIVERY_CHILD_PROMPT";
       const intervalPayload = "coalesced_ticks";
       let intervalEventIds: string[] = [];
       let childId = "";
+      let sameTurnEventIds: string[] = [];
       let parentContinuationChecked = false;
       let secondInitialChecked = false;
       let secondContinuationChecked = false;
@@ -6213,13 +6238,21 @@ describe("acp: model-independent", () => {
         if (parentPhase === "inspect_result" &&
             body.includes('"toolCallId":"acp_delivery_inspect_1"') &&
             body.includes('"type":"tool-result"')) {
-          expectAcpParentDeliveries(body, childId, intervalEventIds, intervalPayload);
+          expectNoAcpParentDeliveries(body);
           secondContinuationChecked = true;
           parentPhase = "third_prompt";
           return finalText("ACP_PARENT_DELIVERY_CONSUMED");
         }
         if (parentPhase === "second_prompt" && text.includes("ACP_PARENT_SECOND_PROMPT")) {
-          expectAcpParentDeliveries(body, childId, intervalEventIds, intervalPayload);
+          const pendingEventIds = intervalEventIds.filter(
+            (eventId) => !sameTurnEventIds.includes(eventId),
+          );
+          expectAcpParentDeliveriesOrNone(
+            body,
+            childId,
+            pendingEventIds,
+            intervalPayload,
+          );
           secondInitialChecked = true;
           parentPhase = "inspect_result";
           return fakeGatewayToolCall("acp_delivery_inspect_1", "subagent", {
@@ -6240,7 +6273,13 @@ describe("acp: model-independent", () => {
             ) as { child_id: string; status: string };
             expect(created.status).toBe("created");
             childId = created.child_id;
-            expectNoAcpParentDeliveries(body);
+            sameTurnEventIds = acpParentDeliveryIds(body);
+            expectAcpParentDeliveriesOrNone(
+              body,
+              childId,
+              sameTurnEventIds,
+              intervalPayload,
+            );
             parentContinuationChecked = true;
             parentPhase = "second_prompt";
             parentCompletion = childStarted
@@ -6254,6 +6293,9 @@ describe("acp: model-independent", () => {
                 );
                 intervalEventIds = findPersistedAcpDeliveryIds(root, childId, intervalPayload);
                 expect(intervalEventIds.length).toBeGreaterThan(0);
+                for (const eventId of sameTurnEventIds) {
+                  expect(intervalEventIds).toContain(eventId);
+                }
                 return finalText("ACP_PARENT_FIRST_TURN_COMPLETE");
               });
           }
@@ -6331,7 +6373,7 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "ACP delivers a 64 KiB child message in five bounded parent prompts",
+    "ACP delivers a 64 KiB child message in five bounded projections",
     async () => {
       const root = createIsolatedRoot("fx-acp-64k-parent-delivery-");
       const childPrompt = "ACP_64K_DELIVERY_CHILD_PROMPT";
@@ -6371,13 +6413,27 @@ describe("acp: model-independent", () => {
           ) as { child_id: string; status: string };
           expect(created.status).toBe("created");
           childId = created.child_id;
-          expectNoAcpParentDeliveries(body);
+          const sameTurnEventIds = acpParentDeliveryIds(body);
+          expect(sameTurnEventIds.length).toBeLessThanOrEqual(1);
+          if (sameTurnEventIds.length === 1) {
+            messageEventId = sameTurnEventIds[0]!;
+            const part = acpParentMessagePart(body, childId, messageEventId);
+            expect(part.offset).toBe(0);
+            expect(part.total_bytes).toBe(largeMessage.length);
+            parts.push(part);
+          } else {
+            expectNoAcpParentDeliveries(body);
+          }
           return waitForPersistedAcpDeliveryId(
             root,
             childId,
             "ACP_64K_PARENT_MESSAGE:",
           ).then((eventId) => {
-            messageEventId = eventId;
+            if (messageEventId.length > 0) {
+              expect(eventId).toBe(messageEventId);
+            } else {
+              messageEventId = eventId;
+            }
             return finalText("ACP_64K_PARENT_FIRST_DONE");
           });
         }
@@ -6433,7 +6489,8 @@ describe("acp: model-independent", () => {
         );
         expect(gateway.requests).toHaveLength(4);
 
-        for (let index = 0; index < 5; index += 1) {
+        const sameTurnPartCount = parts.length;
+        for (let index = parts.length; index < 5; index += 1) {
           const requestsBefore = gateway.requests.length;
           const turn = await runPrompt(
             client,
@@ -6451,7 +6508,7 @@ describe("acp: model-independent", () => {
         expect(final.promptResult.result.stopReason).toBe("end_turn");
         expect(JSON.stringify(final)).toContain("ACP_64K_NO_REDELIVERY_DONE");
         expect(noRedeliveryChecked).toBe(true);
-        expect(gateway.requests).toHaveLength(10);
+        expect(gateway.requests).toHaveLength(10 - sameTurnPartCount);
         expectAcpHumanUnreadIndependent(root, childId, messageEventId);
         expectAcpParentHistoryClean(root, parentSessionId, [
           "<subagent_deliveries",

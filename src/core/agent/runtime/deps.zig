@@ -147,7 +147,9 @@ pub const ParentTurnDeliveryAck = struct {
 };
 
 /// Slices are owned by the allocator passed to `prepare_parent_turn_context`
-/// and remain valid for the whole agent turn.
+/// and remain valid until that allocator is reset or deinitialized. The caller
+/// must finish every acknowledgement callback before ending that lifetime;
+/// acknowledgement callbacks borrow these slices only for the callback.
 pub const PreparedParentTurnContext = struct {
     content: []const u8,
     acknowledgements: []const ParentTurnDeliveryAck,
