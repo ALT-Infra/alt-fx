@@ -51,6 +51,27 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn('          zig: "true"', behavior_job)
         self.assertNotIn('          llvm: "true"', behavior_job)
 
+    def test_heavy_workers_measure_candidate_built_profile_pairs(self) -> None:
+        repo_root = pathlib.Path(__file__).resolve().parents[3]
+        workflow = (
+            repo_root / ".github/workflows/pgso-macos-arm64.yml"
+        ).read_text()
+        candidate_job = workflow.split("\n  candidate:\n", 1)[1].split(
+            "\n  behavior:\n", 1
+        )[0]
+        heavy_job = workflow.split("\n  heavy:\n", 1)[1].split(
+            "\n  aggregate:\n", 1
+        )[0]
+
+        self.assertIn("profiles/merged.profdata", candidate_job)
+        self.assertIn("heavy/file_index/candidate/file-index-bench", candidate_job)
+        self.assertIn(
+            "heavy/approval_review/candidate/approval-review-bench",
+            candidate_job,
+        )
+        self.assertNotIn('          llvm: "true"', heavy_job)
+        self.assertNotIn("--llvm-bin", heavy_job)
+
 
 class ShardPlanningTests(unittest.TestCase):
     def test_plan_assigns_every_scenario_exactly_once(self) -> None:
@@ -330,6 +351,44 @@ class ShardAggregationTests(unittest.TestCase):
                 expected_names=("startup-help",),
                 expected_identity=self.identity,
                 expected_artifact_sha256="e" * 64,
+            )
+
+    def test_heavy_aggregate_requires_production_profile_linkage(self) -> None:
+        document = self.measurement("file-index-100k")
+        document["phase"] = "heavy"
+        measurement = dict(document["measurement"])
+        measurement["requested_samples"] = 50
+        measurement["control_samples"] = [1.0] * 50
+        measurement["candidate_samples"] = [0.9] * 50
+        document["measurement"] = measurement
+        linkage = {
+            "production_profile_sha256": "p" * 64,
+            "benchmark_profile_sha256": "b" * 64,
+            "supplement_sha256": "s" * 64,
+            "selector": "file_index",
+        }
+        document["profile_linkage"] = linkage
+
+        result = aggregate_measurement_shards(
+            (document,),
+            phase="heavy",
+            expected_names=("file-index-100k",),
+            expected_identity=self.identity,
+            expected_artifact_sha256="e" * 64,
+            expected_profile_linkage={"file-index-100k": linkage},
+        )
+
+        self.assertEqual("file-index-100k", result[0]["name"])
+
+        document["profile_linkage"] = {**linkage, "supplement_sha256": "x" * 64}
+        with self.assertRaisesRegex(PgsoError, "profile linkage mismatch"):
+            aggregate_measurement_shards(
+                (document,),
+                phase="heavy",
+                expected_names=("file-index-100k",),
+                expected_identity=self.identity,
+                expected_artifact_sha256="e" * 64,
+                expected_profile_linkage={"file-index-100k": linkage},
             )
 
     def test_measurement_aggregate_rejects_truncated_samples(self) -> None:

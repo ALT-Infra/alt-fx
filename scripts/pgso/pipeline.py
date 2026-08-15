@@ -302,11 +302,13 @@ def instrumentation_argv(
 def profile_use_argv(
     toolchain: Toolchain,
     paths: PipelinePaths,
+    profile_path: pathlib.Path | None = None,
 ) -> tuple[str, ...]:
+    profile = profile_path or paths.merged_profile
     return (
         str(toolchain.opt),
         *USE_FLAGS,
-        f"-profile-file={paths.merged_profile}",
+        f"-profile-file={profile}",
         str(paths.bitcode),
         "-o",
         str(paths.profile_use_bitcode),
@@ -700,11 +702,14 @@ def apply_profile(
     toolchain: Toolchain,
     paths: PipelinePaths,
     expected_bitcode_sha256: str,
+    *,
+    profile_path: pathlib.Path | None = None,
 ) -> pathlib.Path:
     validate_bitcode_hash(paths.bitcode, expected_bitcode_sha256)
-    _require_nonempty_file(paths.merged_profile, "merged profile")
+    profile = profile_path or paths.merged_profile
+    _require_nonempty_file(profile, "merged profile")
     run_checked(
-        profile_use_argv(toolchain, paths),
+        profile_use_argv(toolchain, paths, profile),
         cwd=paths.root,
         env=os.environ.copy(),
         timeout_s=900,

@@ -129,6 +129,15 @@ class PgsoPipelineTests(unittest.TestCase):
             ),
             profile_use_argv(self.toolchain, self.paths),
         )
+        mapped_profile = self.paths.profiles / "production.profdata"
+        self.assertEqual(
+            f"-profile-file={mapped_profile}",
+            profile_use_argv(
+                self.toolchain,
+                self.paths,
+                mapped_profile,
+            )[len(USE_FLAGS) + 1],
+        )
         self.assertEqual(
             (str(self.paths.instrumented_binary), "help"),
             instrumented_run_argv(self.paths, ("help",)),

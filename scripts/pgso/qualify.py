@@ -10,7 +10,7 @@ import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 
-from scripts.pgso.model import PgsoError
+from scripts.pgso.model import PgsoError, sha256_file
 from scripts.pgso.pipeline import (
     ArtifactSpec,
     PipelinePaths,
@@ -22,6 +22,14 @@ from scripts.pgso.pipeline import (
     link_candidate,
     merge_profile_batch,
     read_macos_minos,
+)
+from scripts.pgso.profile_supplement import (
+    MappedProfile,
+    ProfileSupplement,
+    create_mapped_benchmark_profile,
+    create_profile_supplement,
+    merge_profile_supplement,
+    verify_supplement_functions,
 )
 from scripts.pgso.runner import emit_progress, run_checked
 from scripts.pgso.toolchain import Toolchain
@@ -36,6 +44,7 @@ REQUIRED_EVIDENCE = (
     "identity",
     "runtime",
     "artifacts",
+    "profile",
     "corpus",
     "startup",
     "heavy_workloads",
@@ -60,6 +69,8 @@ class Workload:
 @dataclasses.dataclass(frozen=True)
 class BenchmarkPlan:
     selector: str
+    profile_module: str
+    function_prefixes: tuple[str, ...]
     training_argvs: tuple[tuple[str, ...], ...]
     workloads: tuple[Workload, ...]
 
@@ -71,21 +82,52 @@ class BenchmarkPair:
     candidate_binary: pathlib.Path
     bitcode_sha256: str
     merged_raw_profiles: int
+    merged_profile: pathlib.Path | None = None
+    profile_use_ir: pathlib.Path | None = None
+    candidate_profile: pathlib.Path | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class ProfileLinkedBenchmark:
+    pair: BenchmarkPair
+    supplement_path: pathlib.Path
+    supplement: ProfileSupplement
+    mapped_profile_text: pathlib.Path | None = None
+    mapped_profile: MappedProfile | None = None
 
 
 BENCHMARK_PLANS = (
     BenchmarkPlan(
         selector="file_index",
+        profile_module="file-index-bench",
+        function_prefixes=("core.workspace.file_index.",),
         training_argvs=(("100000", "500"),),
         workloads=(Workload("file-index-100k", ("100000", "500")),),
     ),
     BenchmarkPlan(
         selector="ui_activity",
+        profile_module="ui-activity-progress-bench",
+        function_prefixes=(
+            "core.output.activity_runtime.",
+            "core.output.worker_status.",
+            "ui.transcript.",
+            "ui.render_engine.",
+        ),
         training_argvs=((),),
         workloads=(Workload("ui-activity", ()),),
     ),
     BenchmarkPlan(
         selector="approval_review",
+        profile_module="approval-review-bench",
+        function_prefixes=(
+            "core.output.diff.",
+            "core.permissions.approval_prompt.",
+            "ui.approval_screen.",
+            "ui.footer.approval_ui.",
+            "ui.render_engine.transcript_blocks.",
+            "ui.render_engine.transcript_measure.",
+            "core.terminal.vt_emulator.",
+        ),
         training_argvs=(
             ("transcript", "3", "1"),
             ("diff", "3", "1"),
@@ -614,7 +656,194 @@ def build_benchmark_pair(
         candidate_binary=candidate,
         bitcode_sha256=bitcode_sha256,
         merged_raw_profiles=merged_count,
+        merged_profile=paths.merged_profile,
+        profile_use_ir=paths.profile_use_ir,
     )
+
+
+def build_profile_linked_benchmarks(
+    toolchain: Toolchain,
+    repo_root: pathlib.Path,
+    production_paths: PipelinePaths,
+) -> dict[str, ProfileLinkedBenchmark]:
+    supplement_dir = production_paths.profiles / "supplements"
+    supplement_dir.mkdir()
+    linked: dict[str, ProfileLinkedBenchmark] = {}
+    for plan in BENCHMARK_PLANS:
+        pair = build_benchmark_pair(
+            toolchain,
+            repo_root,
+            production_paths.root / "heavy" / plan.selector,
+            plan,
+        )
+        if pair.merged_profile is None or pair.profile_use_ir is None:
+            raise PgsoError(
+                f"benchmark profile evidence is incomplete: {plan.selector}"
+            )
+        supplement_path = supplement_dir / f"{plan.selector}.proftext"
+        supplement = create_profile_supplement(
+            toolchain,
+            production_profile=production_paths.merged_profile,
+            benchmark_profile=pair.merged_profile,
+            benchmark_ir=pair.profile_use_ir,
+            output_text=supplement_path,
+            source_module=plan.profile_module,
+            destination_module="fx",
+            allowed_prefixes=plan.function_prefixes,
+            log_dir=(
+                production_paths.logs / "supplements" / plan.selector
+            ),
+        )
+        merge_profile_supplement(
+            toolchain,
+            production_profile=production_paths.merged_profile,
+            supplement_text=supplement_path,
+            log_path=(
+                production_paths.logs
+                / "supplements"
+                / plan.selector
+                / "merge.json"
+            ),
+        )
+        linked[plan.selector] = ProfileLinkedBenchmark(
+            pair=pair,
+            supplement_path=supplement_path,
+            supplement=supplement,
+        )
+    return linked
+
+
+def relink_profile_linked_benchmarks(
+    toolchain: Toolchain,
+    production_paths: PipelinePaths,
+    linked_benchmarks: Mapping[str, ProfileLinkedBenchmark],
+) -> dict[str, ProfileLinkedBenchmark]:
+    expected = tuple(plan.selector for plan in BENCHMARK_PLANS)
+    if set(linked_benchmarks) != set(expected):
+        raise PgsoError("profile-linked benchmark set is incomplete")
+    relinked: dict[str, ProfileLinkedBenchmark] = {}
+    for plan in BENCHMARK_PLANS:
+        linked = linked_benchmarks[plan.selector]
+        pair = linked.pair
+        if pair.merged_profile is None:
+            raise PgsoError(
+                f"benchmark training profile is incomplete: {plan.selector}"
+            )
+        pair_paths = PipelinePaths.open(
+            production_paths.root / "heavy" / plan.selector,
+            selector=plan.selector,
+        )
+        mapped_text = pair_paths.profiles / "production.proftext"
+        mapped_profile_path = pair_paths.profiles / "production.profdata"
+        mapped = create_mapped_benchmark_profile(
+            toolchain,
+            production_profile=production_paths.merged_profile,
+            benchmark_profile=pair.merged_profile,
+            output_text=mapped_text,
+            output_profile=mapped_profile_path,
+            source_module="fx",
+            destination_module=plan.profile_module,
+            log_dir=pair_paths.logs / "production-profile-map",
+        )
+        supplemented_functions = {
+            name.removeprefix("fx;")
+            for name in linked.supplement.function_names
+        }
+        if not supplemented_functions.issubset(
+            set(mapped.compatible_function_names)
+        ):
+            raise PgsoError(
+                f"mapped benchmark omitted supplemented functions: "
+                f"{plan.selector}"
+            )
+        apply_profile(
+            toolchain,
+            pair_paths,
+            pair.bitcode_sha256,
+            profile_path=mapped_profile_path,
+        )
+        candidate = link_candidate(
+            toolchain,
+            pair_paths,
+            require_release_safe_evidence=False,
+        )
+        relinked[plan.selector] = dataclasses.replace(
+            linked,
+            pair=dataclasses.replace(
+                pair,
+                candidate_binary=candidate,
+                profile_use_ir=pair_paths.profile_use_ir,
+                candidate_profile=mapped_profile_path,
+            ),
+            mapped_profile_text=mapped_text,
+            mapped_profile=mapped,
+        )
+    return relinked
+
+
+def profile_linked_benchmark_evidence(
+    linked_benchmarks: Mapping[str, ProfileLinkedBenchmark],
+    production_ir: str,
+) -> dict[str, object]:
+    expected = tuple(plan.selector for plan in BENCHMARK_PLANS)
+    if set(linked_benchmarks) != set(expected):
+        raise PgsoError("profile-linked benchmark evidence is incomplete")
+    evidence: dict[str, object] = {}
+    for plan in BENCHMARK_PLANS:
+        linked = linked_benchmarks[plan.selector]
+        pair = linked.pair
+        if (
+            pair.merged_profile is None
+            or pair.profile_use_ir is None
+            or pair.candidate_profile is None
+            or linked.mapped_profile_text is None
+            or linked.mapped_profile is None
+        ):
+            raise PgsoError(
+                f"benchmark profile evidence is incomplete: {plan.selector}"
+            )
+        function_modes = verify_supplement_functions(
+            production_ir,
+            linked.supplement.function_names,
+            production_module="fx",
+        )
+        benchmark_profile_names = tuple(
+            f"{plan.profile_module};{name.removeprefix('fx;')}"
+            for name in linked.supplement.function_names
+        )
+        benchmark_modes = verify_supplement_functions(
+            pair.profile_use_ir.read_text(
+                encoding="utf-8",
+                errors="replace",
+            ),
+            benchmark_profile_names,
+            production_module=plan.profile_module,
+        )
+        evidence[plan.selector] = {
+            "profile_module": plan.profile_module,
+            "bitcode_sha256": pair.bitcode_sha256,
+            "merged_raw_profiles": pair.merged_raw_profiles,
+            "benchmark_profile_sha256": sha256_file(pair.merged_profile),
+            "candidate_profile_sha256": sha256_file(
+                pair.candidate_profile
+            ),
+            "mapped_profile_sha256": sha256_file(
+                linked.mapped_profile_text
+            ),
+            "mapped_compatible_functions": len(
+                linked.mapped_profile.compatible_function_names
+            ),
+            "mapped_counter_total": linked.mapped_profile.total_counter_value,
+            "control_sha256": sha256_file(pair.control_binary),
+            "candidate_sha256": sha256_file(pair.candidate_binary),
+            "supplement_sha256": sha256_file(linked.supplement_path),
+            "normalized_counter_total": (
+                linked.supplement.total_counter_value
+            ),
+            "functions": function_modes,
+            "benchmark_functions": benchmark_modes,
+        }
+    return evidence
 
 
 def _measurement_environment(home: pathlib.Path) -> dict[str, str]:
@@ -749,12 +978,13 @@ def measure_startup(
 
 def measure_heavy_workloads(
     *,
-    toolchain: Toolchain,
+    toolchain: Toolchain | None,
     repo_root: pathlib.Path,
     output_dir: pathlib.Path,
     samples: int,
     timeout_s: float,
     workload_names: Sequence[str] | None = None,
+    prebuilt_pairs: Mapping[str, BenchmarkPair] | None = None,
 ) -> tuple[MeasurementResult, ...]:
     output_dir.mkdir(parents=True, exist_ok=False)
     home = output_dir / "home"
@@ -764,12 +994,33 @@ def measure_heavy_workloads(
     results: list[MeasurementResult] = []
 
     for plan in select_benchmark_plans(workload_names):
-        pair = build_benchmark_pair(
-            toolchain,
-            repo_root,
-            output_dir / plan.selector,
-            plan,
-        )
+        if prebuilt_pairs is None:
+            if toolchain is None:
+                raise PgsoError("heavy workload build requires an LLVM toolchain")
+            pair = build_benchmark_pair(
+                toolchain,
+                repo_root,
+                output_dir / plan.selector,
+                plan,
+            )
+        else:
+            pair = prebuilt_pairs.get(plan.selector)
+            if pair is None:
+                raise PgsoError(
+                    f"missing prebuilt benchmark pair: {plan.selector}"
+                )
+            if pair.selector != plan.selector:
+                raise PgsoError(
+                    f"prebuilt benchmark selector mismatch: {plan.selector}"
+                )
+            for label, binary in (
+                ("control", pair.control_binary),
+                ("candidate", pair.candidate_binary),
+            ):
+                if not binary.is_file() or binary.stat().st_size == 0:
+                    raise PgsoError(
+                        f"prebuilt benchmark {label} is missing: {binary}"
+                    )
         for workload in plan.workloads:
             workload_logs = logs / workload.name
 

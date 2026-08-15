@@ -10,15 +10,22 @@ import unittest
 from unittest import mock
 
 from scripts.pgso.model import PgsoError
+from scripts.pgso.pipeline import PipelinePaths
+from scripts.pgso.profile_supplement import MappedProfile, ProfileSupplement
 from scripts.pgso.qualify import (
     BENCHMARK_PLANS,
     STARTUP_COMMANDS,
+    BenchmarkPair,
     EvidenceRecorder,
     _read_hyperfine_samples,
+    build_profile_linked_benchmarks,
     compare_samples,
     measure_alternating,
+    measure_heavy_workloads,
     measure_startup,
     percentile,
+    profile_linked_benchmark_evidence,
+    relink_profile_linked_benchmarks,
     select_benchmark_plans,
     select_startup_commands,
 )
@@ -107,6 +114,15 @@ class PgsoQualificationTests(unittest.TestCase):
             ("file_index", "ui_activity", "approval_review"),
             tuple(plan.selector for plan in BENCHMARK_PLANS),
         )
+        self.assertEqual(
+            (
+                "file-index-bench",
+                "ui-activity-progress-bench",
+                "approval-review-bench",
+            ),
+            tuple(plan.profile_module for plan in BENCHMARK_PLANS),
+        )
+        self.assertTrue(all(plan.function_prefixes for plan in BENCHMARK_PLANS))
 
     def test_startup_selection_returns_only_the_assigned_command(self) -> None:
         selected = select_startup_commands(("doctor",))
@@ -427,6 +443,159 @@ class PgsoQualificationTests(unittest.TestCase):
             )
 
         self.assertTrue(all(result.passed for result in results))
+
+    def test_heavy_measurement_uses_the_prebuilt_profiled_pair(self) -> None:
+        control = self.root / "heavy" / "control"
+        candidate = self.root / "heavy" / "candidate"
+        for path in (control, candidate):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"executable")
+        pair = BenchmarkPair(
+            selector="file_index",
+            control_binary=control,
+            candidate_binary=candidate,
+            bitcode_sha256="b" * 64,
+            merged_raw_profiles=1,
+        )
+        calls: list[tuple[str, ...]] = []
+
+        def fake_run(argv, **_kwargs):
+            command = tuple(str(argument) for argument in argv)
+            calls.append(command)
+            elapsed = 1.0 if command[0] == str(control) else 0.9
+            return CommandResult(command, 0, "measured\n", "", elapsed)
+
+        with (
+            mock.patch(
+                "scripts.pgso.qualify.build_benchmark_pair",
+                side_effect=AssertionError("must use immutable prebuilt pair"),
+            ),
+            mock.patch("scripts.pgso.qualify.run_checked", side_effect=fake_run),
+        ):
+            results = measure_heavy_workloads(
+                toolchain=None,
+                repo_root=self.root,
+                output_dir=self.root / "measurements",
+                samples=50,
+                timeout_s=10,
+                workload_names=("file-index-100k",),
+                prebuilt_pairs={"file_index": pair},
+            )
+
+        self.assertEqual(("file-index-100k",), tuple(item.name for item in results))
+        self.assertEqual(100, len(calls))
+        self.assertEqual(str(control), calls[0][0])
+        self.assertEqual(str(candidate), calls[1][0])
+        self.assertTrue(results[0].passed)
+
+    def test_builds_all_profile_linked_benchmarks_before_candidate_link(self) -> None:
+        paths = PipelinePaths.create(self.root / "run")
+        paths.merged_profile.write_bytes(b"production profile")
+        built_selectors: list[str] = []
+
+        def fake_build(_toolchain, _repo_root, output_dir, plan):
+            built_selectors.append(plan.selector)
+            control = output_dir / "external-control" / plan.profile_module
+            candidate = output_dir / "candidate" / plan.profile_module
+            profile = output_dir / "profiles" / "merged.profdata"
+            ir = output_dir / "ir" / "profile-use.ll"
+            for path in (control, candidate, profile, ir):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"evidence")
+            return BenchmarkPair(
+                selector=plan.selector,
+                control_binary=control,
+                candidate_binary=candidate,
+                bitcode_sha256="b" * 64,
+                merged_raw_profiles=1,
+                merged_profile=profile,
+                profile_use_ir=ir,
+            )
+
+        def fake_create(_toolchain, **kwargs):
+            output_text = kwargs["output_text"]
+            output_text.write_text("supplement\n")
+            return ProfileSupplement(
+                text="supplement\n",
+                function_names=("fx;core.output.diff.compute",),
+                total_counter_value=8,
+            )
+
+        with (
+            mock.patch(
+                "scripts.pgso.qualify.build_benchmark_pair",
+                side_effect=fake_build,
+            ),
+            mock.patch(
+                "scripts.pgso.qualify.create_profile_supplement",
+                side_effect=fake_create,
+            ),
+            mock.patch(
+                "scripts.pgso.qualify.merge_profile_supplement"
+            ) as merge,
+        ):
+            linked = build_profile_linked_benchmarks(
+                object(),
+                self.root,
+                paths,
+            )
+
+        self.assertEqual(
+            tuple(plan.selector for plan in BENCHMARK_PLANS),
+            tuple(linked),
+        )
+        self.assertEqual(
+            tuple(plan.selector for plan in BENCHMARK_PLANS),
+            tuple(built_selectors),
+        )
+        self.assertEqual(len(BENCHMARK_PLANS), merge.call_count)
+
+        def fake_map(_toolchain, **kwargs):
+            kwargs["output_text"].write_text("mapped text\n")
+            kwargs["output_profile"].write_bytes(b"mapped profile")
+            return MappedProfile(
+                text="mapped text\n",
+                compatible_function_names=("core.output.diff.compute",),
+                total_counter_value=16,
+            )
+
+        def fake_link(_toolchain, pair_paths, **_kwargs):
+            pair_paths.profile_use_ir.write_text("profile-use IR\n")
+            return pair_paths.candidate_binary
+
+        with (
+            mock.patch(
+                "scripts.pgso.qualify.create_mapped_benchmark_profile",
+                side_effect=fake_map,
+            ),
+            mock.patch("scripts.pgso.qualify.apply_profile"),
+            mock.patch(
+                "scripts.pgso.qualify.link_candidate",
+                side_effect=fake_link,
+            ),
+        ):
+            linked = relink_profile_linked_benchmarks(
+                object(),
+                paths,
+                linked,
+            )
+
+        with mock.patch(
+            "scripts.pgso.qualify.verify_supplement_functions",
+            return_value={"core.output.diff.compute": "speed"},
+        ):
+            evidence = profile_linked_benchmark_evidence(
+                linked,
+                "production IR",
+            )
+        self.assertEqual(tuple(linked), tuple(evidence))
+        self.assertTrue(
+            all(
+                item["functions"]
+                == {"core.output.diff.compute": "speed"}
+                for item in evidence.values()
+            )
+        )
 
     def test_evidence_recorder_is_fail_closed_and_writes_atomically(self) -> None:
         manifest = self.root / "manifest.json"

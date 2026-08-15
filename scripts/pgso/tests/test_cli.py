@@ -84,6 +84,7 @@ class PgsoCliTests(unittest.TestCase):
                         "identity": {},
                         "runtime": {},
                         "artifacts": {},
+                        "profile": {},
                         "corpus": {},
                         "startup": [],
                         "heavy_workloads": [],

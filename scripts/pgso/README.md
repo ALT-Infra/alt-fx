@@ -46,10 +46,12 @@ python3 -m scripts.pgso all \
 The production workflow runs the same gate as a distributed DAG. One seed job
 builds the control, bitcode, and instrumented binary. Up to twenty training
 jobs execute non-overlapping corpus assignments, one coordinator validates and
-merges every shard profile and builds the candidate, and up to twenty behavior
-jobs verify non-overlapping candidate assignments. The six startup and six
-heavy-workload comparisons run on twelve fresh machines. Every performance job
-measures its control and candidate on the same machine.
+merges every shard profile, builds three dedicated heavy-workload benchmark
+pairs, adds their hash-compatible speed evidence to the production profile,
+and builds the candidate. Up to twenty behavior jobs then verify
+non-overlapping candidate assignments. The six startup and six heavy-workload
+comparisons run on twelve fresh machines. Every performance job measures its
+immutable control and candidate on the same machine.
 
 `python3 -m scripts.pgso.distributed plan` emits deterministic, non-empty
 GitHub Actions matrices. The remaining distributed subcommands are workflow
@@ -77,6 +79,23 @@ Startup compares `help`, `--version`, `status --json`, `background --json`, `doc
 
 Heavy comparisons use at least 50 measured samples for each artifact and alternate pair order AB then BA. Command failures and timeouts fail qualification and are never replaced. A candidate fails when either p50 or p95 is more than 10% slower than its matching control. The existing Linux startup workflow remains the authority for the repository's absolute 2 ms command budget.
 
+The heavy benchmarks are trained once by the candidate coordinator, not rebuilt
+by measurement jobs. For each benchmark, the coordinator selects only functions
+inside the workload's owned source families that remain speed-shaped in the
+benchmark's profile-use IR. Counts enter the production profile only when the
+production and benchmark records have the same LLVM function hash and counter
+layout. Counts are normalized against the production profile's cold cutoff so a
+synthetic benchmark cannot dominate ordinary product behavior. The final
+production IR must prove that every transferred function is speed-shaped or was
+optimized away. The coordinator then maps the complete final production profile
+into each benchmark module. Exact function-hash and counter-layout matches keep
+their real benchmark names; every unmatched record receives an inert name so
+LLVM sees the same global count distribution without applying unrelated counts.
+Each measured benchmark candidate is rebuilt from that mapped production
+profile, and the transferred functions must again be speed-shaped or optimized
+away. Heavy measurement manifests retain the production, training, mapped,
+supplement, and binary hashes, and aggregation rejects any mismatch.
+
 ## Output and failure behavior
 
 The output root contains:
@@ -86,6 +105,8 @@ control/bin/fx
 instrumented/fx
 candidate/fx
 profiles/merged.profdata
+profiles/supplements/
+heavy/
 candidate-behavior/traces/
 logs/
 measurements/
