@@ -48,8 +48,6 @@ jobs:
             target: aarch64-linux
           - name: macos-x86_64
             target: x86_64-macos
-          - name: macos-aarch64
-            target: aarch64-macos
     steps:
       - uses: actions/checkout@v4
 
@@ -75,8 +73,18 @@ jobs:
             fx-${{ matrix.name }}.tar.gz
             fx-${{ matrix.name }}.tar.gz.sha256
 
+  build-macos-arm64:
+    needs: check-version
+    if: needs.check-version.outputs.needed == 'true'
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/pgso-macos-arm64.yml
+    with:
+      package_release: true
+
   release:
-    needs: [check-version, build]
+    needs: [check-version, build, build-macos-arm64]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -84,6 +92,7 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: fx-*
           merge-multiple: true
 
       - name: Create git tag

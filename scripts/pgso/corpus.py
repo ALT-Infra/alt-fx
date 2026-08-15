@@ -64,14 +64,31 @@ class Corpus:
     manifest_sha256: str
     scenarios: tuple[Scenario, ...]
     intentional_exclusions: tuple[tuple[str, str], ...]
+    verification_scenarios: tuple[Scenario, ...] = ()
 
     @property
-    def test_files(self) -> tuple[str, ...]:
+    def training_test_files(self) -> tuple[str, ...]:
         return tuple(
             scenario.test_file
             for scenario in self.scenarios
             if scenario.test_file is not None
         )
+
+    @property
+    def verification_test_files(self) -> tuple[str, ...]:
+        return tuple(
+            scenario.test_file
+            for scenario in self.verification_scenarios
+            if scenario.test_file is not None
+        )
+
+    @property
+    def test_files(self) -> tuple[str, ...]:
+        return (*self.training_test_files, *self.verification_test_files)
+
+    @property
+    def candidate_scenarios(self) -> tuple[Scenario, ...]:
+        return (*self.scenarios, *self.verification_scenarios)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -124,7 +141,7 @@ def _string_sequence(
         not isinstance(value, list)
         or (not value and not allow_empty)
         or not all(
-        isinstance(item, str) and item for item in value
+            isinstance(item, str) and item for item in value
         )
     ):
         raise PgsoError(f"{label} must be a list of nonempty strings")
@@ -280,9 +297,51 @@ def load_corpus(
         _parse_scenario(raw, defaults=defaults, repo_root=root)
         for raw in raw_scenarios
     )
-    names = [scenario.name for scenario in scenarios]
+    raw_verification_scenarios = document.get("verification_scenarios", [])
+    if not isinstance(raw_verification_scenarios, list):
+        raise PgsoError("verification_scenarios must be a list")
+    verification_scenarios = tuple(
+        _parse_scenario(raw, defaults=defaults, repo_root=root)
+        for raw in raw_verification_scenarios
+    )
+    candidate_scenarios = (*scenarios, *verification_scenarios)
+    names = [scenario.name for scenario in candidate_scenarios]
     if len(set(names)) != len(names):
         raise PgsoError("duplicate scenario name in corpus manifest")
+
+    test_files = [
+        scenario.test_file
+        for scenario in candidate_scenarios
+        if scenario.test_file is not None
+    ]
+    if len(set(test_files)) != len(test_files):
+        raise PgsoError("duplicate corpus test file")
+    duplicated_exclusions = set(test_files) & set(exclusions)
+    if duplicated_exclusions:
+        raise PgsoError(
+            "E2E test file has multiple corpus classifications: "
+            + ", ".join(sorted(duplicated_exclusions))
+        )
+
+    discovered_test_files = {
+        test_file.name
+        for test_file in (root / "tests" / "e2e").glob("*.test.ts")
+    }
+    classified_test_files = set(test_files) | set(exclusions)
+    unclassified = sorted(discovered_test_files - classified_test_files)
+    if unclassified:
+        label = "file" if len(unclassified) == 1 else "files"
+        raise PgsoError(
+            f"unclassified E2E test {label}: " + ", ".join(unclassified)
+        )
+    stale_exclusions = sorted(set(exclusions) - discovered_test_files)
+    if stale_exclusions:
+        label = "file" if len(stale_exclusions) == 1 else "files"
+        verb = "does" if len(stale_exclusions) == 1 else "do"
+        raise PgsoError(
+            f"excluded E2E test {label} {verb} not exist: "
+            + ", ".join(stale_exclusions)
+        )
 
     direct_commands = {
         scenario.argv[1:]
@@ -301,6 +360,7 @@ def load_corpus(
         manifest_sha256=sha256_file(path),
         scenarios=scenarios,
         intentional_exclusions=tuple(sorted(exclusions.items())),
+        verification_scenarios=verification_scenarios,
     )
 
 
@@ -596,7 +656,7 @@ def run_behavior_corpus(
     runtime_home = output_dir / "home"
     runtime_home.mkdir(parents=True, exist_ok=True)
     results: list[ScenarioResult] = []
-    for scenario in corpus.scenarios:
+    for scenario in corpus.candidate_scenarios:
         if scenario.skip_reason is not None:
             results.append(
                 ScenarioResult(
@@ -692,7 +752,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("only --list is supported by this module")
     for scenario in corpus.scenarios:
         source = scenario.test_file or "direct"
-        print(f"{scenario.name}\t{source}")
+        print(f"training\t{scenario.name}\t{source}")
+    for scenario in corpus.verification_scenarios:
+        source = scenario.test_file or "direct"
+        print(f"verification\t{scenario.name}\t{source}")
     print("intentional exclusions:")
     for test_file, reason in corpus.intentional_exclusions:
         print(f"{test_file}\t{reason}")

@@ -45,7 +45,9 @@ python3 -m scripts.pgso all \
 
 ## Corpus
 
-[`corpus.json`](corpus.json) references existing test owners instead of copying their behavior. It contains six direct CLI commands and thirty deterministic E2E files covering CLI, configuration, tools, Gateway lifecycle, fake web and vision routes, ACP, modern and legacy MCP, sessions, terminal hosting, TUI startup, resizing, rendering, permissions, interruption, subagents, and recovery.
+[`corpus.json`](corpus.json) references existing test owners instead of copying their behavior. Training contains six direct CLI commands and thirty deterministic E2E files covering CLI, configuration, tools, Gateway lifecycle, fake web and vision routes, ACP, modern and legacy MCP, sessions, terminal hosting, TUI startup, resizing, rendering, permissions, interruption, subagents, and recovery. Fifteen additional deterministic E2E files verify the final candidate without influencing LLVM's hot and cold classification.
+
+Every root `tests/e2e/*.test.ts` file must be classified as training, verification-only, or intentionally excluded. The corpus loader fails on missing, duplicate, stale, or unclassified files, so a new E2E owner cannot silently bypass release qualification. New tests added to an already classified file inherit that file's classification.
 
 Sound-bearing `notifications.test.ts` and `tui-command-permissions.test.ts` are explicitly excluded. The credential-dependent `tui-agent.test.ts` suite is replaced by deterministic fake-Gateway permission-error coverage. Live-model and live-network files are forbidden. Corpus processes receive per-scenario homes and isolated tmux sockets and cannot inherit model credentials, the caller's tmux session, an external LLVM profile destination, or caller-selected fx tracing. The CLI and MCP authentication suites explicitly link the host Keychains directory into only their scenario homes so their uniquely named fake macOS Keychain assertions can run; no other scenario receives that access.
 
@@ -76,4 +78,4 @@ manifest.json
 
 Generated binaries, bitcode, objects, profiles, caches, measurements, and logs are evidence artifacts and must not be committed. `manifest.json` is rewritten atomically after every stage. A failed manifest retains completed evidence, names the failing stage, records `eligible: false`, and never falls back to an unprofiled candidate.
 
-The native workflow uploads this directory for inspection. It has read-only repository permissions and does not change release, dev-channel, CDN, tag, or GitHub Release state.
+The native workflow uploads this directory for inspection. Pull requests and manual runs have read-only repository permissions and do not change release, dev-channel, CDN, tag, or GitHub Release state. The stable release workflow may call the same gate with release packaging enabled; only an eligible candidate is packaged as `fx-macos-aarch64.tar.gz`.
