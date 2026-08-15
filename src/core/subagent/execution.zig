@@ -7833,7 +7833,7 @@ fn runProductionSandboxGenerationCase(
         types.ReasoningEffort.literal("medium"),
         &.{"sandbox-work"},
     );
-    try env.setPermissionMode(alloc, "sandbox-child", .auto);
+    try env.setPermissionMode(alloc, "sandbox-child", .ask);
     {
         var capability = try env.store.openSubagentControlCapabilityWritable(
             alloc,
@@ -7935,7 +7935,9 @@ fn runProductionSandboxGenerationCase(
     defer gateway.deinit();
     var fixture = agent_test_support.PromptFixture{ .workspace_root = env.workspace };
     var job = fixture.job();
-    job.permission_mode = .auto;
+    // This fixture exercises human-approved sandbox revalidation. Keep it in
+    // ask mode so automatic recovery does not intentionally bypass the prompt.
+    job.permission_mode = .ask;
     var config = fixture.config();
     config.origin = .subagent;
     config.session_child_capability = try turn.childCapability();
