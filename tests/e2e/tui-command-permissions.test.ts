@@ -330,6 +330,17 @@ function parentDeliveryEnvelope(text: string): string {
   return text.slice(start, end + "</subagent_deliveries>".length);
 }
 
+function parentDeliveryIds(body: string): string[] {
+  const text = promptText(body);
+  if (!text.includes("<subagent_deliveries")) return [];
+  return parentDeliveryEnvelope(text)
+    .split("\n")
+    .filter((line) => line.startsWith("- "))
+    .map((line) =>
+      String((JSON.parse(line.slice(2)) as { id?: unknown }).id ?? "")
+    );
+}
+
 function persistedPayloadText(payload: unknown): string {
   if (!payload || typeof payload !== "object") return JSON.stringify(payload);
   const message = (payload as { message?: unknown }).message;
@@ -3947,6 +3958,7 @@ describe("effect-aware command permissions", () => {
       let configureContinuationChecked = false;
       let runningTurnChecked = false;
       let freshIntervalEventIds: string[] = [];
+      let sameTurnFreshEventIds: string[] = [];
       let releaseFreshChild!: (response: Response) => void;
       const freshChildCompletion = new Promise<Response>((resolve) => {
         releaseFreshChild = resolve;
@@ -3960,11 +3972,23 @@ describe("effect-aware command permissions", () => {
         if (text.includes(freshChildWork)) return freshChildCompletion;
         if (body.includes('"toolCallId":"multi_delivery_send_fresh"') &&
             body.includes('"type":"tool-result"')) {
-          expectNoParentDeliveries(body);
+          sameTurnFreshEventIds = parentDeliveryIds(body);
+          expect(text).not.toContain(firstEventId);
+          expect(text).not.toContain(secondEventId);
+          expect(text).not.toContain(firstPayload);
+          expect(text).not.toContain(secondPayload);
+          if (sameTurnFreshEventIds.length > 0) {
+            const envelope = parentDeliveryEnvelope(text);
+            expect(occurrenceCount(envelope, `"source_id":"${childId}"`)).toBe(
+              sameTurnFreshEventIds.length,
+            );
+            expect(occurrenceCount(envelope, "coalesced_ticks")).toBe(
+              sameTurnFreshEventIds.length,
+            );
+          }
           expect(toolResultText(body, "multi_delivery_send_fresh")).toContain(
             '"status":"message_queued"',
           );
-          expect(text).not.toContain("coalesced_ticks");
           runningTurnChecked = true;
           return waitForPersistedDeliveryIds(
             root,
@@ -3979,6 +4003,9 @@ describe("effect-aware command permissions", () => {
               "coalesced_ticks",
             );
             expect(freshIntervalEventIds.length).toBeGreaterThan(0);
+            for (const eventId of sameTurnFreshEventIds) {
+              expect(freshIntervalEventIds).toContain(eventId);
+            }
             return finalText("ASK_MULTI_DELIVERY_MESSAGES_CONSUMED");
           });
         }
@@ -4042,12 +4069,19 @@ describe("effect-aware command permissions", () => {
       const thirdGateway = startFakeGateway([
         (body) => {
           const text = promptText(body);
-          expectParentDeliveries(
-            body,
-            childId,
-            freshIntervalEventIds,
-            "coalesced_ticks",
+          const pendingFreshEventIds = freshIntervalEventIds.filter(
+            (eventId) => !sameTurnFreshEventIds.includes(eventId),
           );
+          if (pendingFreshEventIds.length > 0) {
+            expectParentDeliveries(
+              body,
+              childId,
+              pendingFreshEventIds,
+              "coalesced_ticks",
+            );
+          } else {
+            expectNoParentDeliveries(body);
+          }
           expect(text).not.toContain(firstEventId);
           expect(text).not.toContain(secondEventId);
           expect(text).not.toContain(firstPayload);
@@ -5052,7 +5086,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "interactive Fx delivers periodic child notifications at the next parent turn boundary",
+    "interactive Fx delivers periodic child notifications at the next available parent step",
     async () => {
       const root = createIsolatedRoot();
       const stderrPath = join(root.root, "interactive-parent-delivery-stderr.log");
@@ -5064,6 +5098,7 @@ describe("effect-aware command permissions", () => {
       let secondInitialChecked = false;
       let secondContinuationChecked = false;
       let thirdChecked = false;
+      let sameTurnEventIds: string[] = [];
       let parentPhase:
         | "create_prompt"
         | "create_result"
@@ -5095,7 +5130,14 @@ describe("effect-aware command permissions", () => {
         }
         if (parentPhase === "second_prompt" &&
             text.includes("INTERACTIVE_PARENT_SECOND_PROMPT")) {
-          expectParentDeliveries(body, childId, intervalEventIds, intervalPayload);
+          const pendingEventIds = intervalEventIds.filter(
+            (eventId) => !sameTurnEventIds.includes(eventId),
+          );
+          if (pendingEventIds.length > 0) {
+            expectParentDeliveries(body, childId, pendingEventIds, intervalPayload);
+          } else {
+            expectNoParentDeliveries(body);
+          }
           secondInitialChecked = true;
           parentPhase = "inspect_result";
           return subagentInspectCall("interactive_delivery_inspect_1", childId);
@@ -5108,7 +5150,16 @@ describe("effect-aware command permissions", () => {
           ) as { child_id: string; status: string };
           expect(created.status).toBe("created");
           childId = created.child_id;
-          expectNoParentDeliveries(body);
+          sameTurnEventIds = parentDeliveryIds(body);
+          if (sameTurnEventIds.length > 0) {
+            const envelope = parentDeliveryEnvelope(text);
+            expect(occurrenceCount(envelope, `"source_id":"${childId}"`)).toBe(
+              sameTurnEventIds.length,
+            );
+            expect(occurrenceCount(envelope, intervalPayload)).toBe(
+              sameTurnEventIds.length,
+            );
+          }
           parentContinuationChecked = true;
           parentPhase = "second_prompt";
           return waitForPersistedDeliveryIds(root, childId, intervalPayload)
@@ -5117,6 +5168,9 @@ describe("effect-aware command permissions", () => {
               await waitForSubagentIdle(root, childId);
               intervalEventIds = findPersistedDeliveryIds(root, childId, intervalPayload);
               expect(intervalEventIds.length).toBeGreaterThan(0);
+              for (const eventId of sameTurnEventIds) {
+                expect(intervalEventIds).toContain(eventId);
+              }
               return finalText("INTERACTIVE_PARENT_FIRST_TURN_COMPLETE");
             });
         }
