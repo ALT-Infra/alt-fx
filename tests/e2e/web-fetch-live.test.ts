@@ -18,7 +18,7 @@ const TIMEOUT = 60_000;
 const OUTER_MODEL = "anthropic/claude-sonnet-4.6";
 const LIVE_URL = "https://example.com/";
 const LIVE_ROBOTS_URL = "https://vercel.com/robots.txt";
-const LIVE_MODELS_URL = "https://ai-gateway.vercel.sh/v1/models";
+const LIVE_MODELS_URL = "https://ai-gateway.vercel.sh/coding-agent/v1/models";
 const LIVE_BINARY_URL =
   "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf";
 

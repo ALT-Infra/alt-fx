@@ -86,7 +86,7 @@ const stubFetch = async (input, init = {}) => {
     return json({ teams: [] });
   }
   if (url.href === "https://api.vercel.com/login/oauth/revoke") return json({});
-  if (url.href === "https://ai-gateway.vercel.sh/v1/models") {
+  if (url.href === "https://ai-gateway.vercel.sh/coding-agent/v1/models") {
     return json({
       object: "list",
       data: [{ id: "stub/login-model", type: "language", released: 1, tags: ["tool-use"] }],

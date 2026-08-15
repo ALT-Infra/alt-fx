@@ -40,8 +40,8 @@ const ProgressFn = web_search_contract.ProgressFn;
 pub const default_model = "zai/glm-5.2";
 pub const default_fast_mode = true;
 pub const default_chat_url = "https://ai-gateway.vercel.sh/v3/ai/language-model";
-pub const models_path = "/v1/models";
-const credits_path = "/v1/credits";
+pub const models_path = "/coding-agent/v1/models";
+const credits_path = "/coding-agent/v1/credits";
 pub const retry_count: usize = 3;
 pub const chat_url_env = "FX_GATEWAY_CHAT_URL";
 pub const default_model_catalog_base_url = "https://ai-gateway.vercel.sh";
@@ -1587,7 +1587,7 @@ test "built-in gateway defaults preserve active provider policy" {
     try std.testing.expectEqualStrings("zai/glm-5.2", default_model);
     try std.testing.expect(default_fast_mode);
     try std.testing.expectEqualStrings("https://ai-gateway.vercel.sh/v3/ai/language-model", default_chat_url);
-    try std.testing.expectEqualStrings("/v1/models", models_path);
+    try std.testing.expectEqualStrings("/coding-agent/v1/models", models_path);
     try std.testing.expectEqual(@as(usize, 3), retry_count);
     try std.testing.expectEqualStrings("FX_GATEWAY_CHAT_URL", chat_url_env);
 }
@@ -1654,11 +1654,11 @@ fn stubFetchForbiddenCredits(
 
 test "built-in credits provider names the team query only when valid" {
     const cases = [_]struct { team: ?[]const u8, want: []const u8 }{
-        .{ .team = null, .want = "/v1/credits" },
-        .{ .team = "team_ut02N41HAM44llPMehBfFdqY", .want = "/v1/credits?teamId=team_ut02N41HAM44llPMehBfFdqY" },
-        .{ .team = "pranit-2381s-projects", .want = "/v1/credits?teamId=pranit-2381s-projects" },
-        .{ .team = "team a/../b", .want = "/v1/credits" },
-        .{ .team = "", .want = "/v1/credits" },
+        .{ .team = null, .want = "/coding-agent/v1/credits" },
+        .{ .team = "team_ut02N41HAM44llPMehBfFdqY", .want = "/coding-agent/v1/credits?teamId=team_ut02N41HAM44llPMehBfFdqY" },
+        .{ .team = "pranit-2381s-projects", .want = "/coding-agent/v1/credits?teamId=pranit-2381s-projects" },
+        .{ .team = "team a/../b", .want = "/coding-agent/v1/credits" },
+        .{ .team = "", .want = "/coding-agent/v1/credits" },
     };
     for (cases) |case| {
         captured_credits_path_len = 0;
@@ -1786,15 +1786,15 @@ test "built-in credits provider ignores non-string fields" {
 test "built-in model catalog owns default and loopback target resolution" {
     const default_url = try modelCatalogUrl(std.testing.allocator, models_path, null);
     defer std.testing.allocator.free(default_url);
-    try std.testing.expectEqualStrings("https://ai-gateway.vercel.sh/v1/models", default_url);
+    try std.testing.expectEqualStrings("https://ai-gateway.vercel.sh/coding-agent/v1/models", default_url);
 
     const loopback_url = try modelCatalogUrl(std.testing.allocator, models_path, "http://127.0.0.1:43123");
     defer std.testing.allocator.free(loopback_url);
-    try std.testing.expectEqualStrings("http://127.0.0.1:43123/v1/models", loopback_url);
+    try std.testing.expectEqualStrings("http://127.0.0.1:43123/coding-agent/v1/models", loopback_url);
 
     const rejected_url = try modelCatalogUrl(std.testing.allocator, models_path, "https://gateway.example");
     defer std.testing.allocator.free(rejected_url);
-    try std.testing.expectEqualStrings("https://ai-gateway.vercel.sh/v1/models", rejected_url);
+    try std.testing.expectEqualStrings("https://ai-gateway.vercel.sh/coding-agent/v1/models", rejected_url);
 }
 
 test "built-in gateway owns the admitted web search provider policy" {
