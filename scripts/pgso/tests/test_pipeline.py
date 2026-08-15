@@ -342,6 +342,17 @@ sys.stderr.write('optimizer warning')""",
                 with self.assertRaisesRegex(PgsoError, "exactly one absolute"):
                     parse_compiler_runtime(output)
 
+    def test_compiler_runtime_probe_allows_cold_cache_archive_commands(self) -> None:
+        archive = self.root / "libcompiler_rt.a"
+
+        self.assertEqual(
+            archive,
+            parse_compiler_runtime(
+                "zig ar /tmp/libubsan_rt_zcu.o\n"
+                f"zig ld /tmp/input.o {archive}"
+            ),
+        )
+
     def test_compiler_runtime_probe_rejects_mixed_warning_output(self) -> None:
         archive = self.root / "libcompiler_rt.a"
 

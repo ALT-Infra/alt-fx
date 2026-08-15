@@ -392,13 +392,19 @@ def validate_bitcode_hash(path: pathlib.Path, expected_sha256: str) -> None:
 
 def parse_compiler_runtime(output: str) -> pathlib.Path:
     lines = tuple(line.strip() for line in output.splitlines() if line.strip())
-    if len(lines) != 1 or not lines[0].startswith("zig ld "):
+    link_lines = tuple(line for line in lines if line.startswith("zig ld "))
+    unknown_lines = tuple(
+        line
+        for line in lines
+        if not line.startswith(("zig ar ", "zig ld "))
+    )
+    if len(link_lines) != 1 or unknown_lines:
         raise PgsoError(
             "unexpected compiler runtime probe output; expected one zig ld line"
         )
     matches = re.findall(
         r"(?<![^\s\"'])(/[^\s\"']*libcompiler_rt\.a)(?![^\s\"'])",
-        lines[0],
+        link_lines[0],
     )
     unique = tuple(dict.fromkeys(matches))
     if len(unique) != 1:
