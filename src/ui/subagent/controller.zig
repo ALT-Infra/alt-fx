@@ -8,6 +8,7 @@ const execution = @import("../../core/subagent/execution.zig");
 const domain = @import("../../core/subagent/domain.zig");
 const input_action = @import("../../core/input/input_action.zig");
 const core_input_runtime = @import("../../core/input/runtime.zig");
+const transcript_presentation = @import("../../core/output/transcript_presentation.zig");
 const skill_contract = @import("../../core/skills/skill_contract.zig");
 const subagent_runtime = @import("runtime.zig");
 const render_request = @import("../render_request.zig");
@@ -370,7 +371,7 @@ pub const Controller = struct {
 
     pub fn childTranscriptPresentationDepth(
         self: Controller,
-    ) transcript_runtime.TranscriptPresentationDepth {
+    ) transcript_presentation.Depth {
         if (!self.view_active) return .inline_mode;
         return self.runtime.childTranscriptPresentationDepth();
     }
@@ -378,8 +379,8 @@ pub const Controller = struct {
     pub fn setChildTranscriptPresentationDepth(
         self: *Controller,
         alloc: Allocator,
-        requested: transcript_runtime.TranscriptPresentationDepth,
-    ) !transcript_runtime.TranscriptPresentationDepth {
+        requested: transcript_presentation.Depth,
+    ) !transcript_presentation.Depth {
         if (!self.view_active) return .inline_mode;
         return self.runtime.setChildTranscriptPresentationDepth(
             alloc,

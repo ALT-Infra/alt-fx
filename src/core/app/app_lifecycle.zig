@@ -18,6 +18,7 @@ const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const types = @import("../shared/types.zig");
 const ui_render = @import("../../ui/render.zig");
 const presentation_mode = @import("../config/presentation_mode.zig");
+const transcript_presentation = @import("../output/transcript_presentation.zig");
 const shell_runtime = @import("../../ui/shell_runtime.zig");
 const ui_terminal = @import("../../ui/terminal/terminal.zig");
 const terminal_diff = @import("../../ui/render_engine/terminal_diff.zig");
@@ -935,7 +936,7 @@ pub fn handoffFullTranscriptToApproval(
 fn setFullTranscriptProjection(
     alloc: Allocator,
     shell: *TranscriptRuntime,
-    depth: transcript_runtime.TranscriptPresentationDepth,
+    depth: transcript_presentation.Depth,
 ) !void {
     _ = try shell.setTranscriptPresentationDepth(alloc, depth);
 }

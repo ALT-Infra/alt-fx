@@ -9,6 +9,7 @@ const command_replay_store = @import("../core/session/command_replay_store.zig")
 const result_store = @import("../core/session/result_store.zig");
 const session_child_store = @import("../core/session/session_child_store.zig");
 const diff_mod = @import("../core/output/diff.zig");
+const transcript_presentation = @import("../core/output/transcript_presentation.zig");
 const assistant_wrap = @import("render_engine/assistant_wrap.zig");
 const build_checkpoint = @import("render_engine/build_checkpoint.zig");
 const transcript_blocks = @import("render_engine/transcript_blocks.zig");
@@ -402,7 +403,7 @@ pub const Projection = struct {
     segments: std.ArrayList(Segment) = .empty,
     anchor_segment_index: ?usize = null,
     item_boundaries: std.ArrayList(ItemBoundary) = .empty,
-    measured_item_rows: std.ArrayList(ItemRow) = .empty,
+    measured_item_rows: std.ArrayList(transcript_presentation.ItemRow) = .empty,
     measured_segment_checkpoints: std.ArrayList(ProjectionCheckpoint) = .empty,
     measurement_cols: ?u16 = null,
     measured_total_rows: u32 = 0,
@@ -627,15 +628,10 @@ test "projection applies actions by transcript position after lifecycle repositi
     try std.testing.expect(std.mem.find(u8, rendered, "old status") == null);
 }
 
-pub const ItemRow = struct {
-    entry_id: u32,
-    row: u32,
-};
-
 pub const ProjectionMeasurement = struct {
     total_rows: u32,
     anchor_row: ?u32,
-    item_rows: []const ItemRow = &.{},
+    item_rows: []const transcript_presentation.ItemRow = &.{},
 };
 
 /// Owns the in-progress static writer while composing a Projection, so every
@@ -4444,7 +4440,7 @@ pub fn measureProjectionInterruptible(
                 null
         else
             null;
-        var item_rows: std.ArrayList(ItemRow) = .empty;
+        var item_rows: std.ArrayList(transcript_presentation.ItemRow) = .empty;
         defer item_rows.deinit(alloc);
         var segment_checkpoints: std.ArrayList(ProjectionCheckpoint) = .empty;
         defer segment_checkpoints.deinit(alloc);
@@ -4513,7 +4509,7 @@ fn walkProjectionSegments(
     walker: *ProjectionRowWalker,
     start_segment_index: usize,
     start_item_index: usize,
-    item_rows: ?*std.ArrayList(ItemRow),
+    item_rows: ?*std.ArrayList(transcript_presentation.ItemRow),
     segment_checkpoints: ?*std.ArrayList(ProjectionCheckpoint),
 ) !?u32 {
     var anchor_row: ?u32 = null;

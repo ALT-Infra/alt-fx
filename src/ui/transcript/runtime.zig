@@ -5,6 +5,7 @@ const input_action = @import("../../core/input/input_action.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const activity_status = @import("../../core/output/activity_status.zig");
 const activity_runtime = @import("../../core/output/activity_runtime.zig");
+const transcript_presentation = @import("../../core/output/transcript_presentation.zig");
 const worker_status = @import("../../core/output/worker_status.zig");
 const footer_viewport_runtime = @import("../footer/viewport.zig");
 const render_request = @import("../render_request.zig");
@@ -903,7 +904,7 @@ test "full transcript projection cache survives navigation and invalidates on co
     try std.testing.expectEqual(@as(?u16, 40), review.measurement_cols);
     const same_review = try runtime.cachedFullTranscriptProjection(alloc, null);
     try std.testing.expectEqual(@as(?u16, 40), same_review.measurement_cols);
-    runtime.full_transcript.captureAnchor(1);
+    runtime.full_transcript = runtime.full_transcript.capture_anchor(1);
     const reanchored_review = try runtime.cachedFullTranscriptProjection(alloc, null);
     try std.testing.expectEqual(review, reanchored_review);
 
@@ -967,7 +968,7 @@ const CacheBuildProbe = struct {
     }
 };
 
-fn cacheTestRuntime(depth: TranscriptPresentationDepth, cols: u16) TranscriptRuntime {
+fn cacheTestRuntime(depth: transcript_presentation.Depth, cols: u16) TranscriptRuntime {
     var layout = testLayoutWithRows(8);
     layout.cols = cols;
     return .{
@@ -1020,7 +1021,7 @@ fn renderCacheTail(
 
 test "full transcript cache reuses retained entries across append and width changes" {
     const alloc = std.testing.allocator;
-    for ([_]TranscriptPresentationDepth{ .review, .full }) |depth| {
+    for ([_]transcript_presentation.Depth{ .review, .full }) |depth| {
         var runtime = cacheTestRuntime(depth, 40);
         defer runtime.deinit(alloc);
 
@@ -1240,7 +1241,7 @@ test "command and lifecycle updates reuse measured prefix and publish atomically
     try std.testing.expectEqual(baseline.total_rows, resumed.total_rows);
     try std.testing.expectEqual(baseline.anchor_row, resumed.anchor_row);
     try std.testing.expectEqualSlices(
-        full_transcript_screen.ItemRow,
+        transcript_presentation.ItemRow,
         baseline.item_rows,
         resumed.item_rows,
     );
@@ -1265,7 +1266,7 @@ test "command and lifecycle updates reuse measured prefix and publish atomically
     );
     try std.testing.expectEqual(closed_baseline.total_rows, closed_measurement.total_rows);
     try std.testing.expectEqualSlices(
-        full_transcript_screen.ItemRow,
+        transcript_presentation.ItemRow,
         closed_baseline.item_rows,
         closed_measurement.item_rows,
     );
@@ -1802,8 +1803,7 @@ test "full transcript opening follows the tail instead of consuming its compact 
         "anchor\n",
         .unknown_raw,
     );
-    runtime.full_transcript.captureAnchor(anchor_id);
-    runtime.full_transcript.openReview();
+    runtime.full_transcript = runtime.full_transcript.capture_anchor(anchor_id).with_depth(.review);
     _ = try runtime.appendRawTranscriptEntryClassified(
         alloc,
         "row-4\nrow-5\nrow-6\nrow-7\n",
@@ -1914,77 +1914,6 @@ test "full transcript recovery starts at closest visible entry before a hidden a
     try std.testing.expectEqual(
         @as(?usize, null),
         TranscriptRuntime.fullTranscriptRecoveryPredecessorStartLine(&provenance, 9),
-    );
-}
-
-test "full transcript depth changes preserve the semantic viewport item" {
-    var state = FullTranscriptState{
-        .depth = .full,
-        .scroll_rows = 8,
-        .follow_tail = false,
-        .bookmark_entry_id = 20,
-        .bookmark_intra_row = 2,
-        .bookmark_pending = true,
-    };
-    const item_rows = [_]full_transcript_screen.ItemRow{
-        .{ .entry_id = 10, .row = 4 },
-        .{ .entry_id = 20, .row = 40 },
-        .{ .entry_id = 30, .row = 70 },
-    };
-
-    try std.testing.expectEqual(
-        @as(u32, 42),
-        state.selectVisualOffset(100, 10, null, &item_rows),
-    );
-    try std.testing.expectEqual(@as(?u32, 20), state.bookmark_entry_id);
-    try std.testing.expectEqual(@as(u32, 2), state.bookmark_intra_row);
-    try std.testing.expect(!state.follow_tail);
-}
-
-test "semantic viewport bookmark clamps within its reflowed item" {
-    var state = FullTranscriptState{
-        .depth = .review,
-        .follow_tail = false,
-        .bookmark_entry_id = 20,
-        .bookmark_intra_row = 20,
-        .bookmark_pending = true,
-    };
-    const item_rows = [_]full_transcript_screen.ItemRow{
-        .{ .entry_id = 20, .row = 40 },
-        .{ .entry_id = 30, .row = 43 },
-    };
-
-    try std.testing.expectEqual(
-        @as(u32, 42),
-        state.selectVisualOffset(100, 10, null, &item_rows),
-    );
-    try std.testing.expectEqual(@as(?u32, 20), state.bookmark_entry_id);
-    try std.testing.expectEqual(@as(u32, 2), state.bookmark_intra_row);
-}
-
-test "missing semantic viewport item falls back to the nearest retained neighbor" {
-    const item_rows = [_]full_transcript_screen.ItemRow{
-        .{ .entry_id = 10, .row = 5 },
-        .{ .entry_id = 30, .row = 50 },
-    };
-    var preceding = FullTranscriptState{
-        .bookmark_entry_id = 20,
-        .bookmark_intra_row = 3,
-        .bookmark_pending = true,
-    };
-    try std.testing.expectEqual(
-        @as(u32, 8),
-        preceding.selectVisualOffset(100, 10, null, &item_rows),
-    );
-
-    var following = FullTranscriptState{
-        .bookmark_entry_id = 5,
-        .bookmark_intra_row = 1,
-        .bookmark_pending = true,
-    };
-    try std.testing.expectEqual(
-        @as(u32, 6),
-        following.selectVisualOffset(100, 10, null, &item_rows),
     );
 }
 
@@ -3791,219 +3720,11 @@ pub fn renderEntriesToBytes(
     return transcript_blocks.renderEntriesToBytes(alloc, entries, cols, styles);
 }
 
-pub const TranscriptPresentationEvent = enum {
-    toggle,
-    left,
-    right,
-};
-
-pub const TranscriptPresentationDepth = enum {
-    inline_mode,
-    review,
-    full,
-
-    pub fn transition(
-        self: TranscriptPresentationDepth,
-        event: TranscriptPresentationEvent,
-    ) TranscriptPresentationDepth {
-        return switch (event) {
-            .toggle => if (self == .inline_mode) .review else .inline_mode,
-            .left => if (self.active()) .review else .inline_mode,
-            .right => if (self.active()) .full else .inline_mode,
-        };
-    }
-
-    pub fn active(self: TranscriptPresentationDepth) bool {
-        return self != .inline_mode;
-    }
-};
-
-test "transcript presentation transition toggles viewer and selects detail with arrows" {
-    const Case = struct {
-        from: TranscriptPresentationDepth,
-        input: TranscriptPresentationEvent,
-        expected: TranscriptPresentationDepth,
-    };
-    const cases = [_]Case{
-        .{ .from = .inline_mode, .input = .toggle, .expected = .review },
-        .{ .from = .review, .input = .toggle, .expected = .inline_mode },
-        .{ .from = .full, .input = .toggle, .expected = .inline_mode },
-        .{ .from = .inline_mode, .input = .left, .expected = .inline_mode },
-        .{ .from = .review, .input = .left, .expected = .review },
-        .{ .from = .full, .input = .left, .expected = .review },
-        .{ .from = .inline_mode, .input = .right, .expected = .inline_mode },
-        .{ .from = .review, .input = .right, .expected = .full },
-        .{ .from = .full, .input = .right, .expected = .full },
-    };
-
-    for (cases) |case| {
-        try std.testing.expectEqual(
-            case.expected,
-            case.from.transition(case.input),
-        );
-    }
-}
-
 pub const FullTranscriptPrimaryRestore = enum {
     changed,
     changed_resized,
     exact,
     resized,
-};
-
-pub const FullTranscriptState = struct {
-    depth: TranscriptPresentationDepth = .inline_mode,
-    scroll_rows: u32 = 0,
-    follow_tail: bool = true,
-    anchor_entry_id: ?u32 = null,
-    anchor_pending: bool = false,
-    bookmark_entry_id: ?u32 = null,
-    bookmark_intra_row: u32 = 0,
-    bookmark_pending: bool = false,
-    projection_cols: ?u16 = null,
-
-    fn openReview(self: *FullTranscriptState) void {
-        self.depth = .review;
-        self.scroll_rows = 0;
-        self.follow_tail = true;
-        // Keep the compact source identity for retention retargeting, but an
-        // ordinary Ctrl-O open always starts at the latest full row.
-        self.anchor_pending = false;
-    }
-
-    fn close(self: *FullTranscriptState) void {
-        self.depth = .inline_mode;
-        self.resetViewport();
-        self.clearAnchor();
-    }
-
-    fn resetViewport(self: *FullTranscriptState) void {
-        self.scroll_rows = 0;
-        self.follow_tail = true;
-    }
-
-    fn clearAnchor(self: *FullTranscriptState) void {
-        self.anchor_entry_id = null;
-        self.anchor_pending = false;
-        self.bookmark_entry_id = null;
-        self.bookmark_intra_row = 0;
-        self.bookmark_pending = false;
-        self.projection_cols = null;
-    }
-
-    fn captureAnchor(self: *FullTranscriptState, entry_id: ?u32) void {
-        self.anchor_entry_id = entry_id;
-        self.anchor_pending = entry_id != null;
-    }
-
-    fn retargetAnchor(self: *FullTranscriptState, entry_id: u32) void {
-        self.anchor_entry_id = entry_id;
-    }
-
-    fn selectVisualOffset(
-        self: *FullTranscriptState,
-        total_rows: u32,
-        visible_rows: u16,
-        anchor_rows: ?u32,
-        item_rows: []const full_transcript_screen.ItemRow,
-    ) u32 {
-        const max_offset = total_rows -| visible_rows;
-        const offset = if (self.bookmark_pending) blk: {
-            self.bookmark_pending = false;
-            self.follow_tail = false;
-            const item_row = resolveBookmarkRow(item_rows, self.bookmark_entry_id) orelse
-                break :blk @min(self.scroll_rows, max_offset);
-            const item_end = nextBookmarkItemRow(item_rows, item_row) orelse total_rows;
-            const max_intra_row = item_end -| item_row -| 1;
-            break :blk @min(
-                item_row +| @min(self.bookmark_intra_row, max_intra_row),
-                max_offset,
-            );
-        } else if (self.anchor_pending and anchor_rows != null) blk: {
-            self.anchor_pending = false;
-            self.follow_tail = false;
-            break :blk @min(anchor_rows.?, max_offset);
-        } else if (self.follow_tail)
-            max_offset
-        else
-            @min(self.scroll_rows, max_offset);
-        self.scroll_rows = offset;
-        self.follow_tail = offset == max_offset;
-        self.refreshBookmark(item_rows, offset);
-        return offset;
-    }
-
-    fn queueBookmark(self: *FullTranscriptState) void {
-        self.bookmark_pending = self.bookmark_entry_id != null;
-    }
-
-    fn refreshBookmark(
-        self: *FullTranscriptState,
-        item_rows: []const full_transcript_screen.ItemRow,
-        offset: u32,
-    ) void {
-        var selected: ?full_transcript_screen.ItemRow = null;
-        for (item_rows) |item| {
-            if (item.row > offset) break;
-            selected = item;
-        }
-        const item = selected orelse if (item_rows.len > 0) item_rows[0] else return;
-        self.bookmark_entry_id = item.entry_id;
-        self.bookmark_intra_row = offset -| item.row;
-    }
-
-    fn scroll(
-        self: *FullTranscriptState,
-        direction: input_action.MouseWheel,
-        rows: u32,
-    ) void {
-        self.follow_tail = false;
-        self.bookmark_pending = false;
-        switch (direction) {
-            .up => self.scroll_rows -|= rows,
-            .down => self.scroll_rows +|= rows,
-        }
-    }
-};
-
-fn resolveBookmarkRow(
-    item_rows: []const full_transcript_screen.ItemRow,
-    entry_id: ?u32,
-) ?u32 {
-    const target = entry_id orelse return null;
-    var preceding: ?full_transcript_screen.ItemRow = null;
-    var following: ?full_transcript_screen.ItemRow = null;
-    for (item_rows) |item| {
-        if (item.entry_id == target) return item.row;
-        if (item.entry_id < target) {
-            if (preceding == null or item.entry_id > preceding.?.entry_id) preceding = item;
-        } else if (following == null or item.entry_id < following.?.entry_id) {
-            following = item;
-        }
-    }
-    return if (preceding) |item| item.row else if (following) |item| item.row else null;
-}
-
-fn nextBookmarkItemRow(
-    item_rows: []const full_transcript_screen.ItemRow,
-    current_row: u32,
-) ?u32 {
-    for (item_rows) |item| {
-        if (item.row > current_row) return item.row;
-    }
-    return null;
-}
-
-pub const FullTranscriptViewportSnapshot = struct {
-    depth: TranscriptPresentationDepth,
-    scroll_rows: u32,
-    follow_tail: bool,
-    anchor_entry_id: ?u32,
-    anchor_pending: bool,
-    bookmark_entry_id: ?u32,
-    bookmark_intra_row: u32,
-    bookmark_pending: bool,
-    projection_cols: ?u16,
 };
 
 const ProjectionCacheDirty = union(enum) {
@@ -4363,7 +4084,7 @@ pub const TranscriptRuntime = struct {
     command_output_blocks: std.ArrayList(CommandOutputBlock) = .empty,
     /// Viewer state used only while Ctrl-O owns the alternate screen.
     /// The compact transcript keeps its independent viewport selection.
-    full_transcript: FullTranscriptState = .{},
+    full_transcript: transcript_presentation.State = .{},
     full_transcript_open_content_revision: ?u64 = null,
     full_transcript_open_cols: u16 = 0,
     full_transcript_open_rows: u16 = 0,
@@ -5947,7 +5668,7 @@ pub const TranscriptRuntime = struct {
         self.compact_transcript_source_cache.deinit(alloc);
         self.full_transcript_projection_cache.deinit(alloc);
         self.clearToolDetails(alloc);
-        self.full_transcript.close();
+        self.full_transcript = self.full_transcript.closed();
     }
 
     pub fn resetCommandOutputDisplay(self: *TranscriptRuntime, alloc: Allocator, reason: []const u8) void {
@@ -6205,29 +5926,17 @@ pub const TranscriptRuntime = struct {
     pub fn setTranscriptPresentationDepth(
         self: *TranscriptRuntime,
         alloc: Allocator,
-        depth: TranscriptPresentationDepth,
+        depth: transcript_presentation.Depth,
     ) !bool {
         const current = self.full_transcript.depth;
         if (current == depth) return false;
-        if (current.active() and depth.active()) self.full_transcript.queueBookmark();
         if (current == .inline_mode and depth != .inline_mode) {
             self.full_transcript_open_content_revision = self.full_transcript_content_revision;
             self.full_transcript_open_cols = self.layout.cols;
             self.full_transcript_open_rows = self.layout.rows;
             try self.captureFullTranscriptAnchor(alloc);
         }
-        switch (depth) {
-            .inline_mode => self.full_transcript.close(),
-            .review => if (current == .inline_mode) {
-                self.full_transcript.openReview();
-            } else {
-                self.full_transcript.depth = .review;
-            },
-            .full => {
-                if (current == .inline_mode) self.full_transcript.openReview();
-                self.full_transcript.depth = .full;
-            },
-        }
+        self.full_transcript = self.full_transcript.with_depth(depth);
         if (depth == .inline_mode) {
             self.full_transcript_open_content_revision = null;
             self.full_transcript_open_cols = 0;
@@ -6346,7 +6055,7 @@ pub const TranscriptRuntime = struct {
 
     fn captureFullTranscriptAnchor(self: *TranscriptRuntime, alloc: Allocator) !void {
         _ = alloc;
-        self.full_transcript.clearAnchor();
+        self.full_transcript = self.full_transcript.clear_anchor();
         const fallback_recovery_entry_id = self.primaryRecoveryFallbackEntryId();
         self.full_transcript_primary_recovery_entry_id = fallback_recovery_entry_id;
         const selection = self.last_viewport_selection orelse return;
@@ -6368,7 +6077,7 @@ pub const TranscriptRuntime = struct {
             null;
         self.full_transcript_primary_recovery_entry_id =
             source_entry_id orelse fallback_recovery_entry_id;
-        self.full_transcript.captureAnchor(anchor_entry_id);
+        self.full_transcript = self.full_transcript.capture_anchor(anchor_entry_id);
     }
 
     fn primaryRecoveryFallbackEntryId(self: *const TranscriptRuntime) ?u32 {
@@ -6407,41 +6116,21 @@ pub const TranscriptRuntime = struct {
 
     pub fn transcriptPresentationDepth(
         self: *const TranscriptRuntime,
-    ) TranscriptPresentationDepth {
+    ) transcript_presentation.Depth {
         return self.full_transcript.depth;
     }
 
     pub fn snapshotFullTranscriptViewport(
         self: *const TranscriptRuntime,
-    ) FullTranscriptViewportSnapshot {
-        return .{
-            .depth = self.full_transcript.depth,
-            .scroll_rows = self.full_transcript.scroll_rows,
-            .follow_tail = self.full_transcript.follow_tail,
-            .anchor_entry_id = self.full_transcript.anchor_entry_id,
-            .anchor_pending = self.full_transcript.anchor_pending,
-            .bookmark_entry_id = self.full_transcript.bookmark_entry_id,
-            .bookmark_intra_row = self.full_transcript.bookmark_intra_row,
-            .bookmark_pending = self.full_transcript.bookmark_pending,
-            .projection_cols = self.full_transcript.projection_cols,
-        };
+    ) transcript_presentation.Snapshot {
+        return self.full_transcript.snapshot();
     }
 
     pub fn restoreFullTranscriptViewport(
         self: *TranscriptRuntime,
-        snapshot: FullTranscriptViewportSnapshot,
+        snapshot: transcript_presentation.Snapshot,
     ) void {
-        self.full_transcript = .{
-            .depth = snapshot.depth,
-            .scroll_rows = snapshot.scroll_rows,
-            .follow_tail = snapshot.follow_tail,
-            .anchor_entry_id = snapshot.anchor_entry_id,
-            .anchor_pending = snapshot.anchor_pending,
-            .bookmark_entry_id = snapshot.bookmark_entry_id,
-            .bookmark_intra_row = snapshot.bookmark_intra_row,
-            .bookmark_pending = snapshot.bookmark_pending,
-            .projection_cols = snapshot.projection_cols,
-        };
+        self.full_transcript = .from_snapshot(snapshot);
         self.markTranscriptDirty();
     }
 
@@ -6471,7 +6160,7 @@ pub const TranscriptRuntime = struct {
     }
 
     pub fn closeFullTranscriptState(self: *TranscriptRuntime) void {
-        self.full_transcript.close();
+        self.full_transcript = self.full_transcript.closed();
     }
 
     pub fn fullTranscriptAnchorEntryId(self: *const TranscriptRuntime) ?u32 {
@@ -6479,7 +6168,7 @@ pub const TranscriptRuntime = struct {
     }
 
     pub fn retargetFullTranscriptAnchor(self: *TranscriptRuntime, entry_id: u32) void {
-        self.full_transcript.retargetAnchor(entry_id);
+        self.full_transcript = self.full_transcript.retarget_anchor(entry_id);
     }
 
     pub fn scrollFullTranscript(
@@ -6492,7 +6181,10 @@ pub const TranscriptRuntime = struct {
             .page => self.fullTranscriptPageRows(),
         };
         const before = self.full_transcript.scroll_rows;
-        self.full_transcript.scroll(direction, rows);
+        self.full_transcript = self.full_transcript.scroll(switch (direction) {
+            .up => .up,
+            .down => .down,
+        }, rows);
         debug_trace.logf(
             "full_transcript_cache",
             "scroll depth={s} direction={s} unit={s} rows={d} before={d} after={d}",
@@ -9539,10 +9231,9 @@ pub const TranscriptRuntime = struct {
     }
 
     fn prepareFullTranscriptProjectionLayout(self: *TranscriptRuntime) void {
-        if (self.full_transcript.projection_cols) |previous_cols| {
-            if (previous_cols != self.layout.cols) self.full_transcript.queueBookmark();
-        }
-        self.full_transcript.projection_cols = self.layout.cols;
+        self.full_transcript = self.full_transcript.prepare_projection(
+            self.layout.cols,
+        );
     }
 
     fn buildFullTranscriptProjectionUncached(
@@ -9744,15 +9435,13 @@ pub const TranscriptRuntime = struct {
         visible_rows: u16,
     ) u32 {
         const self: *TranscriptRuntime = @ptrCast(@alignCast(context));
-        return self.full_transcript.selectVisualOffset(
+        const selection = self.full_transcript.select_visual_offset(
             measurement.total_rows,
             visible_rows,
-            resolveBookmarkRow(
-                measurement.item_rows,
-                self.fullTranscriptAnchorEntryId(),
-            ),
             measurement.item_rows,
         );
+        self.full_transcript = selection.state;
+        return selection.offset;
     }
 
     pub fn prepareTranscriptSurfacePaintFromSourceForArea(

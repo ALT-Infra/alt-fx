@@ -14,6 +14,7 @@ const composer_insertion = @import("../input/composer_insertion.zig");
 const gesture_state = @import("../input/gesture_state.zig");
 const horizontal_navigation = @import("../input/horizontal_navigation.zig");
 const input_action = @import("../input/input_action.zig");
+const transcript_presentation = @import("../output/transcript_presentation.zig");
 const core_input_runtime = @import("../input/runtime.zig");
 const input_limit_rejection = @import("../input/input_limit_rejection.zig");
 const input_reset = @import("../input/input_reset.zig");
@@ -2833,9 +2834,9 @@ const FakeApprovalCancelApp = struct {
 
     pub fn transitionFullTranscriptProjection(
         _: *FakeApprovalCancelApp,
-        event: transcript_runtime.TranscriptPresentationEvent,
-    ) !transcript_runtime.TranscriptPresentationDepth {
-        return transcript_runtime.TranscriptPresentationDepth.inline_mode.transition(
+        event: transcript_presentation.Event,
+    ) !transcript_presentation.Depth {
+        return transcript_presentation.Depth.inline_mode.transition(
             event,
         );
     }
@@ -3514,8 +3515,8 @@ const RoutingFakeApp = struct {
 
     pub fn transitionFullTranscriptProjection(
         self: *RoutingFakeApp,
-        event: transcript_runtime.TranscriptPresentationEvent,
-    ) !transcript_runtime.TranscriptPresentationDepth {
+        event: transcript_presentation.Event,
+    ) !transcript_presentation.Depth {
         self.shell.setCommandOutputRenderPolicy(
             routingFullTranscriptStyles(),
         );
@@ -9156,7 +9157,7 @@ test "app_input_runtime inline scroll actions do not open the transcript viewer"
         try feedRoutingBytes(&app, bytes);
         try std.testing.expect(!app.terminal.fullTranscriptScreenActive());
         try std.testing.expectEqual(
-            transcript_runtime.TranscriptPresentationDepth.inline_mode,
+            transcript_presentation.Depth.inline_mode,
             app.shell.transcriptPresentationDepth(),
         );
         try std.testing.expect(app.stream.active);
@@ -9186,20 +9187,20 @@ test "app_input_runtime ctrl-o toggles transcript viewer while arrows switch det
         try std.testing.expect(app.shell.full_transcript.follow_tail);
         try std.testing.expect(app.shell.render_requests.hasReason(.modal));
         try std.testing.expectEqual(
-            transcript_runtime.TranscriptPresentationDepth.review,
+            transcript_presentation.Depth.review,
             app.shell.transcriptPresentationDepth(),
         );
 
         try feedRoutingBytes(&app, "\x1b[C");
         try std.testing.expect(app.terminal.fullTranscriptScreenActive());
         try std.testing.expectEqual(
-            transcript_runtime.TranscriptPresentationDepth.full,
+            transcript_presentation.Depth.full,
             app.shell.transcriptPresentationDepth(),
         );
 
         try feedRoutingBytes(&app, "\x1b[D");
         try std.testing.expectEqual(
-            transcript_runtime.TranscriptPresentationDepth.review,
+            transcript_presentation.Depth.review,
             app.shell.transcriptPresentationDepth(),
         );
 
@@ -9220,13 +9221,13 @@ test "app_input_runtime ctrl-o toggles transcript viewer while arrows switch det
         try std.testing.expectEqualStrings("ab", app.input_runtime.edit_state.input.items);
         try std.testing.expectEqual(@as(usize, 2), app.input_runtime.edit_state.cursor);
         try std.testing.expectEqual(
-            transcript_runtime.TranscriptPresentationDepth.review,
+            transcript_presentation.Depth.review,
             app.shell.transcriptPresentationDepth(),
         );
         try feedRoutingBytes(&app, "\x1b[C");
         try std.testing.expectEqual(@as(usize, 2), app.input_runtime.edit_state.cursor);
         try std.testing.expectEqual(
-            transcript_runtime.TranscriptPresentationDepth.full,
+            transcript_presentation.Depth.full,
             app.shell.transcriptPresentationDepth(),
         );
         try std.testing.expect(app.terminal.fullTranscriptScreenActive());
@@ -9356,7 +9357,7 @@ test "app_input_runtime full transcript rejects ctrl-x manager entry without los
     try std.testing.expectEqualStrings("ab", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(usize, 2), app.input_runtime.edit_state.cursor);
     try std.testing.expectEqual(
-        transcript_runtime.TranscriptPresentationDepth.review,
+        transcript_presentation.Depth.review,
         app.shell.transcriptPresentationDepth(),
     );
 
@@ -9422,14 +9423,14 @@ test "app_input_runtime ctrl-o opens review and closes active transcript from ea
         try Runtime(RoutingFakeApp).handleByte(&app, 15, 4096, 100);
         try feedRoutingBytes(&app, "\x1b[C");
         try std.testing.expectEqual(
-            transcript_runtime.TranscriptPresentationDepth.full,
+            transcript_presentation.Depth.full,
             app.shell.transcriptPresentationDepth(),
         );
         try std.testing.expect(app.terminal.fullTranscriptScreenActive());
 
         try Runtime(RoutingFakeApp).handleByte(&app, 15, 4096, 100);
         try std.testing.expectEqual(
-            transcript_runtime.TranscriptPresentationDepth.inline_mode,
+            transcript_presentation.Depth.inline_mode,
             app.shell.transcriptPresentationDepth(),
         );
         try std.testing.expect(!app.terminal.fullTranscriptScreenActive());

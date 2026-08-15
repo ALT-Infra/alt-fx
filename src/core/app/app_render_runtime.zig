@@ -26,6 +26,7 @@ const subagent_domain = @import("../subagent/domain.zig");
 const subagent_projection = @import("../subagent/ui_projection.zig");
 const file_index = @import("../workspace/file_index.zig");
 const activity_runtime = @import("../output/activity_runtime.zig");
+const transcript_presentation = @import("../output/transcript_presentation.zig");
 const event_loop = @import("../../ui/event_loop.zig");
 const surface_frame = @import("../../ui/footer/surface_frame.zig");
 const interaction_state = @import("../../ui/footer/interaction_state.zig");
@@ -6149,7 +6150,7 @@ const ChildApprovalReconcileBinding = struct {
 };
 
 const ChildApprovalReconcileSubagents = struct {
-    depth: transcript_runtime.TranscriptPresentationDepth,
+    depth: transcript_presentation.Depth,
     close_calls: usize = 0,
 
     pub fn mainApprovalBinding(
@@ -6162,7 +6163,7 @@ const ChildApprovalReconcileSubagents = struct {
 
     pub fn childTranscriptPresentationDepth(
         self: *const ChildApprovalReconcileSubagents,
-    ) transcript_runtime.TranscriptPresentationDepth {
+    ) transcript_presentation.Depth {
         return self.depth;
     }
 
@@ -6200,8 +6201,8 @@ test "child approval arrival closes review and full transcript depths before ren
     try debug_trace.configureForTestWithScopes(alloc, trace_path, "full_transcript");
 
     inline for (.{
-        transcript_runtime.TranscriptPresentationDepth.review,
-        transcript_runtime.TranscriptPresentationDepth.full,
+        transcript_presentation.Depth.review,
+        transcript_presentation.Depth.full,
     }) |depth| {
         var app = ChildApprovalReconcileApp{
             .alloc = alloc,
@@ -6220,7 +6221,7 @@ test "child approval arrival closes review and full transcript depths before ren
         ));
 
         try std.testing.expectEqual(
-            transcript_runtime.TranscriptPresentationDepth.inline_mode,
+            transcript_presentation.Depth.inline_mode,
             app.subagents.depth,
         );
         try std.testing.expectEqual(@as(usize, 1), app.subagents.close_calls);
