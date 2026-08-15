@@ -906,7 +906,7 @@ describe("filesystem path handling", () => {
   );
 
   test(
-    "automatic review sends complete prepared writes across viewports and long lines",
+    "automatic review rejects an oversized prepared write before transport or execution",
     async () => {
       const root = createIsolatedRoot();
       const target = join(root.workspace, "large-review.txt");
@@ -919,14 +919,18 @@ describe("filesystem path handling", () => {
             ? longReviewRow
             : `review row ${String(index + 1).padStart(3, "0")}: deterministic permission evidence`,
       ).join("\n") + "\n";
-      const gateway = startFakeGateway(firstCallToolResponses({
-        id: "write_large_review",
-        name: "write_file",
-        input: { path: "large-review.txt", content },
-        expectedResultRequest: ["large-review.txt"],
-        expectedResultOutput: ["large-review.txt"],
-        finalMessage: "large reviewed write complete",
-      }));
+      const gateway = startFakeGateway([
+        toolCall("write_large_review", "write_file", {
+          path: "large-review.txt",
+          content,
+        }),
+        (body) => {
+          const resultOutput = toolResultOutput(body, "write_large_review");
+          expect(resultOutput).toContain('"reason":"auto_denied"');
+          expect(resultOutput).toContain("Permission denied by auto mode classifier");
+          return finalText("oversized reviewed write rejected");
+        },
+      ]);
       try {
         const result = await runFx(
           [
@@ -948,31 +952,20 @@ describe("filesystem path handling", () => {
         const json = parseFxJson(result);
 
         expect(gateway.requests).toHaveLength(2);
-        expect(gateway.classifierRequests).toHaveLength(1);
+        expect(gateway.classifierRequests).toHaveLength(0);
         expect(gateway.remainingResponseCount()).toBe(0);
-        const reviewBody = gateway.classifierRequests[0]!.body;
-        expect(reviewBody).toContain(
-          "review[addition]: review row 001: deterministic permission evidence",
-        );
-        expect(reviewBody).toContain(
-          "review[addition]: review row 192: deterministic permission evidence",
-        );
-        expect(reviewBody).toContain(`review[addition]: ${longReviewRow}`);
-        expect(reviewBody).not.toContain("review_omitted_rows");
         expect(json.tool_calls).toEqual([
-          { name: "write_file", status: "success" },
+          { name: "write_file", status: "error" },
         ]);
-        expect(result.stderr).toContain(
-          "[notice] Auto agent approved this request: Writing file.",
-        );
-        expect(readFileSync(target, "utf8")).toBe(content);
+        expect(json.output).toContain("oversized reviewed write rejected");
+        expect(result.stderr).not.toContain("Auto agent approved this request");
+        expect(existsSync(target)).toBe(false);
         const trace = readFileSync(tracePath, "utf8");
-        expect(trace).toContain("event=auto_review_compose_result result=ready");
-        expect(trace).toContain("event=auto_review_transport_start");
         expect(trace).toContain(
-          "event=auto_review_result tool_name=write_file decision=allow",
+          "event=auto_review_compose_result result=packet_too_large",
         );
-        expect(trace).not.toContain("fallback_reason=invalid_or_unavailable");
+        expect(trace).not.toContain("event=auto_review_transport_start");
+        expect(trace).toContain("fallback_reason=invalid_or_unavailable");
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
@@ -982,7 +975,7 @@ describe("filesystem path handling", () => {
   );
 
   test(
-    "headless automatic review ask reports permission required without writing",
+    "headless automatic review ask returns a recoverable denial without writing",
     async () => {
       const root = createIsolatedRoot();
       const target = join(root.external, "review-required.txt");
@@ -991,6 +984,10 @@ describe("filesystem path handling", () => {
           path: target,
           content: "MUST_NOT_WRITE",
         }),
+        (body) => {
+          expect(body).toContain("auto_denied");
+          return finalText("write safely skipped");
+        },
       ], { classifierDecision: "ask" });
       try {
         const result = await runFx(
@@ -1006,8 +1003,8 @@ describe("filesystem path handling", () => {
           tool_calls: Array<{ name: string; status: string }>;
         };
 
-        expect(result.code).toBe(1);
-        expect(gateway.requests).toHaveLength(1);
+        expect(result.code).toBe(0);
+        expect(gateway.requests).toHaveLength(2);
         expect(gateway.classifierRequests).toHaveLength(1);
         expect(gateway.remainingResponseCount()).toBe(0);
         expect(gateway.classifierRequests[0]!.body).toContain(
@@ -1019,16 +1016,12 @@ describe("filesystem path handling", () => {
         expect(gateway.classifierRequests[0]!.body).not.toContain(
           "external_file_mutation",
         );
-        expect(result.stdout).toContain("NonInteractivePermissionRequired");
+        expect(result.stdout).toContain("write safely skipped");
         expect(json.tool_calls).toEqual([
           { name: "write_file", status: "error" },
         ]);
-        expect(result.stdout).toContain(
-          '"error":"NonInteractivePermissionRequired"',
-        );
-        expect(result.stderr).toContain(
-          "fx ask: permission required for tool execution in noninteractive mode",
-        );
+        expect(result.stdout).not.toContain("NonInteractivePermissionRequired");
+        expect(result.stderr).not.toContain("permission required");
         expect(existsSync(target)).toBe(false);
       } finally {
         gateway.stop();

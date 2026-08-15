@@ -1087,6 +1087,7 @@ async function expectSavedRunCommand(
   sessionId: string,
   command: string,
   background = false,
+  status: "success" | "failure" = "success",
 ) {
   const result = await runFx(
     ["session", "--id", sessionId, "--json"],
@@ -1103,7 +1104,7 @@ async function expectSavedRunCommand(
     expect.objectContaining({ command, ...(background ? { background: true } : {}) }),
   );
   expect(step.tool_results).toContainEqual(
-    expect.objectContaining({ tool_call_id: call.id, tool_name: "run_command", status: "success" }),
+    expect.objectContaining({ tool_call_id: call.id, tool_name: "run_command", status }),
   );
 }
 
@@ -2691,14 +2692,26 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "TUI auto mode falls back to the approval prompt when the reviewer is invalid",
+    "TUI auto mode prompts after three invalid-review response groups",
     async () => {
       const root = createIsolatedRoot();
       const marker = join(root.workspace, "classifier-fallback-approved.txt");
       const command = `printf fallback > ${JSON.stringify(marker)}`;
       const gateway = startFakeGateway(
-        [toolCall(command), finalText("reviewer fallback complete")],
-        { classifierResponses: [finalText("accept"), finalText("accept")] },
+        [
+          toolCall(command, {}, "invalid_review_1"),
+          toolCall(command, {}, "invalid_review_2"),
+          toolCall(command, {}, "invalid_review_3"),
+          toolCall(command, {}, "human_approval_4"),
+          finalText("reviewer fallback complete"),
+        ],
+        {
+          classifierResponses: [
+            finalText("accept"),
+            finalText("accept"),
+            finalText("accept"),
+          ],
+        },
       );
       const tracePath = join(root.root, "trace.log");
       const stderrPath = join(root.root, "stderr.log");
@@ -2724,12 +2737,10 @@ describe("effect-aware command permissions", () => {
       await activeSession.waitForText("reviewer fallback complete", TIMEOUT);
 
       expect(readFileSync(marker, "utf8")).toBe("fallback");
-      expect(gateway.requests).toHaveLength(2);
-      expect(gateway.classifierRequests).toHaveLength(2);
+      expect(gateway.requests).toHaveLength(5);
+      expect(gateway.classifierRequests).toHaveLength(3);
       const trace = readFileSync(tracePath, "utf8");
-      expect(trace).toContain(
-        "decision=permission_required fallback_reason=invalid_or_unavailable",
-      );
+      expect(trace.match(/denial_reason=auto_denied/g)).toHaveLength(3);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,
@@ -5934,7 +5945,7 @@ describe("effect-aware command permissions", () => {
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.classifierRequests).toHaveLength(1);
       expect(gateway.classifierRequests[0]!.headers.get("ai-language-model-id")).toBe(
-        "openai/gpt-5.4",
+        "zai/glm-5.2",
       );
       expect(gateway.classifierRequests[0]!.body).toContain("\"permission_decision\"");
       expect(gateway.classifierRequests[0]!.body).toContain("\"toolChoice\":{\"type\":\"required\"}");
@@ -5944,7 +5955,9 @@ describe("effect-aware command permissions", () => {
       );
       expect(gateway.classifierRequests[0]!.body).toContain("\"role\":\"assistant\"");
       expect(gateway.classifierRequests[0]!.body).toContain("\"toolCallId\":\"command_1\"");
-      expect(gateway.classifierRequests[0]!.body).toContain("byte prefix");
+      expect(gateway.classifierRequests[0]!.body).toContain(
+        "exact ordered root-user text",
+      );
       expect(gateway.classifierRequests[0]!.body).toContain("action: command");
       expect(gateway.classifierRequests[0]!.body).toContain("command: printf");
       expect(gateway.classifierRequests[0]!.body).toContain(
@@ -5956,18 +5969,22 @@ describe("effect-aware command permissions", () => {
   );
 
   test(
-    "fx ask reissues one malformed classifier completion and executes once",
+    "fx ask does not retry a malformed classifier completion and safely replans",
     async () => {
       const root = createIsolatedRoot();
-      const marker = join(root.workspace, "classifier-recovered.txt");
-      const command = `printf 'recovered\\n' >> ${JSON.stringify(marker)}`;
+      const marker = join(root.workspace, "classifier-malformed-must-not-run.txt");
+      const command = `printf 'unsafe\\n' >> ${JSON.stringify(marker)}`;
       const gateway = startFakeGateway(
-        [toolCall(command), finalText("classifier recovery complete")],
+        [
+          toolCall(command),
+          (body) => {
+            expect(body).toContain("auto_denied");
+            return toolCall("pwd", "safe_after_malformed");
+          },
+          finalText("classifier recovery complete"),
+        ],
         {
-          classifierResponses: [
-            finalText("accept"),
-            permissionDecision("allow"),
-          ],
+          classifierResponses: [finalText("accept")],
         },
       );
       const tracePath = join(root.root, "trace.log");
@@ -5985,27 +6002,33 @@ describe("effect-aware command permissions", () => {
       );
 
       expect(result.code).toBe(0);
-      expect(readFileSync(marker, "utf8")).toBe("recovered\n");
-      expect(gateway.requests).toHaveLength(2);
-      expect(gateway.classifierRequests).toHaveLength(2);
+      expect(existsSync(marker)).toBe(false);
+      expect(gateway.requests).toHaveLength(3);
+      expect(gateway.classifierRequests).toHaveLength(1);
       const trace = readFileSync(tracePath, "utf8");
-      expect(trace.match(/event=auto_review_transport_start/g)).toHaveLength(2);
+      expect(trace.match(/event=auto_review_transport_start/g)).toHaveLength(1);
       expect(trace.match(/event=auto_review_result/g)).toHaveLength(1);
-      expect(trace).toContain("decision=allow");
-      expect(result.stderr).toContain("Auto agent approved this request:");
+      expect(trace).toContain("denial_reason=auto_denied");
+      expect(result.stderr).not.toContain("Auto agent approved this request:");
     },
     TIMEOUT,
   );
 
   test(
-    "fx ask falls back after two malformed classifier completions without execution",
+    "fx ask returns one malformed classifier completion to the agent without execution",
     async () => {
       const root = createIsolatedRoot();
       const marker = join(root.workspace, "classifier-fallback-must-not-exist.txt");
       const command = `printf fallback > ${JSON.stringify(marker)}`;
       const gateway = startFakeGateway(
-        [toolCall(command), finalText("classifier fallback handled")],
-        { classifierResponses: [finalText("accept"), finalText("accept")] },
+        [
+          toolCall(command),
+          (body) => {
+            expect(body).toContain("auto_denied");
+            return finalText("classifier fallback handled");
+          },
+        ],
+        { classifierResponses: [finalText("accept")] },
       );
       const tracePath = join(root.root, "trace.log");
 
@@ -6021,15 +6044,15 @@ describe("effect-aware command permissions", () => {
         },
       );
 
-      expect(result.code).toBe(1);
-      expect(result.stdout).toContain("NonInteractivePermissionRequired");
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain("classifier fallback handled");
       expect(existsSync(marker)).toBe(false);
-      expect(gateway.requests).toHaveLength(1);
-      expect(gateway.classifierRequests).toHaveLength(2);
+      expect(gateway.requests).toHaveLength(2);
+      expect(gateway.classifierRequests).toHaveLength(1);
       const trace = readFileSync(tracePath, "utf8");
-      expect(trace.match(/event=auto_review_transport_start/g)).toHaveLength(2);
+      expect(trace.match(/event=auto_review_transport_start/g)).toHaveLength(1);
       expect(trace.match(/event=auto_review_result/g)).toHaveLength(1);
-      expect(trace).toContain("decision=permission_required fallback_reason=invalid_or_unavailable");
+      expect(trace).toContain("denial_reason=auto_denied");
       expect(result.stderr).not.toContain(COMMAND_APPROVAL_PROMPT);
     },
     TIMEOUT,
@@ -6042,10 +6065,16 @@ describe("effect-aware command permissions", () => {
       const marker = join(root.workspace, "classifier-provider-must-not-exist.txt");
       const command = `printf provider > ${JSON.stringify(marker)}`;
       const gateway = startFakeGateway(
-        [toolCall(command), finalText("provider failure handled")],
+        [
+          toolCall(command),
+          (body) => {
+            expect(body).toContain("auto_denied");
+            return finalText("provider failure handled");
+          },
+        ],
         {
           classifierResponses: Array.from(
-            { length: 3 },
+            { length: 1 },
             () => new Response("provider unavailable", { status: 502 }),
           ),
         },
@@ -6064,15 +6093,15 @@ describe("effect-aware command permissions", () => {
         },
       );
 
-      expect(result.code).toBe(1);
-      expect(result.stdout).toContain("NonInteractivePermissionRequired");
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain("provider failure handled");
       expect(existsSync(marker)).toBe(false);
-      expect(gateway.requests).toHaveLength(1);
-      expect(gateway.classifierRequests).toHaveLength(2);
+      expect(gateway.requests).toHaveLength(2);
+      expect(gateway.classifierRequests).toHaveLength(1);
       const trace = readFileSync(tracePath, "utf8");
-      expect(trace.match(/event=auto_review_transport_start/g)).toHaveLength(2);
+      expect(trace.match(/event=auto_review_transport_start/g)).toHaveLength(1);
       expect(trace.match(/event=auto_review_result/g)).toHaveLength(1);
-      expect(trace).toContain("decision=permission_required fallback_reason=invalid_or_unavailable");
+      expect(trace).toContain("denial_reason=auto_denied");
     },
     TIMEOUT,
   );
@@ -6419,7 +6448,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test(
-    "fx ask and ACP complete large effectful run commands with automatic permission",
+    "fx ask and ACP reject oversized automatic review packets before transport or execution",
     async () => {
       const cliRoot = createIsolatedRoot();
       const cliMarker = "large-cli-marker";
@@ -6444,16 +6473,12 @@ describe("effect-aware command permissions", () => {
       expect(cliJson.output).toContain("large CLI complete");
       expect(cliJson.tool_calls).toHaveLength(1);
       expect(cliJson.tool_calls).toContainEqual(
-        expect.objectContaining({ name: "run_command", status: "success" }),
+        expect.objectContaining({ name: "run_command", status: "error" }),
       );
-      expect(existsSync(join(cliRoot.workspace, cliMarker))).toBe(true);
+      expect(existsSync(join(cliRoot.workspace, cliMarker))).toBe(false);
       expect(cliGateway.requests).toHaveLength(2);
-      expect(cliGateway.classifierRequests).toHaveLength(1);
-      const cliReview = classifierEvidenceFromRequest(cliGateway.classifierRequests[0]!.body);
-      expect(cliReview).toContain("FX_LARGE_RUN_COMMAND_DONE");
-      expect(cliReview).toContain("action_evidence_incomplete: false");
-      expect(cliReview).not.toContain("...[evidence omitted]...");
-      await expectSavedRunCommand(cliRoot, cliJson.session_id, cliCommand);
+      expect(cliGateway.classifierRequests).toHaveLength(0);
+      await expectSavedRunCommand(cliRoot, cliJson.session_id, cliCommand, false, "failure");
 
       const acpRoot = createIsolatedRoot();
       const acpMarker = "large-acp-marker";
@@ -6472,19 +6497,17 @@ describe("effect-aware command permissions", () => {
       expect(serialized).toContain("large ACP complete");
       expect(serialized).not.toContain("permission_required");
       expect(serialized).not.toContain("integer does not fit in destination type");
-      expect(serialized).not.toContain('"status":"failed"');
-      expect((serialized.match(/"status":"completed"/g) ?? [])).toHaveLength(1);
-      expect(existsSync(join(acpRoot.workspace, acpMarker))).toBe(true);
+      expect((serialized.match(/\"status\":\"failed\"/g) ?? [])).toHaveLength(1);
+      expect((serialized.match(/\"status\":\"completed\"/g) ?? [])).toHaveLength(0);
+      expect(existsSync(join(acpRoot.workspace, acpMarker))).toBe(false);
       expect(acpGateway.requests).toHaveLength(2);
-      expect(acpGateway.classifierRequests).toHaveLength(1);
-      const acpReview = classifierEvidenceFromRequest(acpGateway.classifierRequests[0]!.body);
-      expect(acpReview).toContain("FX_LARGE_RUN_COMMAND_DONE");
-      expect(acpReview).toContain("action_evidence_incomplete: false");
-      expect(acpReview).not.toContain("...[evidence omitted]...");
+      expect(acpGateway.classifierRequests).toHaveLength(0);
       await expectSavedRunCommand(
         acpRoot,
         sessionIdFromHome(acpRoot),
         acpCommand,
+        false,
+        "failure",
       );
     },
     90_000,

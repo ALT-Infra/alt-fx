@@ -4183,7 +4183,7 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "ACP automatic ask requests permission and returns user denial",
+    "ACP automatic ask returns to the agent before requesting permission",
     async () => {
       const acceptedRoot = createIsolatedRoot("fx-acp-auto-file-accepted-");
       const blockedRoot = createIsolatedRoot("fx-acp-auto-file-check-");
@@ -4251,9 +4251,9 @@ describe("acp: model-independent", () => {
           const serialized = JSON.stringify(blocked);
           expect(
             blocked.messages.some((message: any) => message.method === "session/request_permission"),
-          ).toBe(true);
-          expect(serialized).not.toContain("auto_denied");
-          expect(serialized).toContain("user_denied");
+          ).toBe(false);
+          expect(serialized).toContain("auto_denied");
+          expect(serialized).not.toContain("user_denied");
           expect(serialized).toContain('"status":"failed"');
           const failedUpdateIndex = blocked.messages.findIndex((message: any) =>
             message.method === "session/update" &&
