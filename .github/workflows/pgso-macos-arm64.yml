@@ -228,6 +228,7 @@ jobs:
         id: setup
         uses: ./.github/actions/setup-pgso
         with:
+          zig: "true"
           bun: "true"
 
       - name: Install E2E dependencies

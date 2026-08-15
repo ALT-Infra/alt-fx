@@ -32,6 +32,26 @@ def scenario(name: str, timeout_seconds: float) -> Scenario:
     )
 
 
+class WorkflowContractTests(unittest.TestCase):
+    def test_behavior_workers_install_pinned_zig_without_llvm(self) -> None:
+        repo_root = pathlib.Path(__file__).resolve().parents[3]
+        action = (repo_root / ".github/actions/setup-pgso/action.yml").read_text()
+        workflow = (
+            repo_root / ".github/workflows/pgso-macos-arm64.yml"
+        ).read_text()
+        behavior_job = workflow.split("\n  behavior:\n", 1)[1].split(
+            "\n  startup:\n", 1
+        )[0]
+
+        self.assertIn("  zig:\n", action)
+        self.assertIn(
+            "if: inputs.zig == 'true' || inputs.llvm == 'true'",
+            action,
+        )
+        self.assertIn('          zig: "true"', behavior_job)
+        self.assertNotIn('          llvm: "true"', behavior_job)
+
+
 class ShardPlanningTests(unittest.TestCase):
     def test_plan_assigns_every_scenario_exactly_once(self) -> None:
         scenarios = tuple(

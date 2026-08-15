@@ -2,8 +2,12 @@ name: Setup PGSO tools
 description: Install the pinned tools required by one distributed PGSO phase
 
 inputs:
+  zig:
+    description: Install pinned Zig
+    required: false
+    default: "false"
   llvm:
-    description: Install Zig and LLVM 21
+    description: Install LLVM 21
     required: false
     default: "false"
   bun:
@@ -30,7 +34,7 @@ runs:
   using: composite
   steps:
     - name: Setup Zig
-      if: inputs.llvm == 'true'
+      if: inputs.zig == 'true' || inputs.llvm == 'true'
       uses: mlugg/setup-zig@v2
       with:
         version: "0.16.0"
