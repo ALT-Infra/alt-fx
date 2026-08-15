@@ -43,6 +43,8 @@ Once the focused checks pass, create a clean checkpoint commit, push the non-`ma
 
 Standard PR CI labels Debug and ReleaseSafe Build & Test and deterministic E2E results separately. Do not mark the draft PR ready until all four Full CI jobs and the final ship gate have succeeded for the exact current commit. Each platform aggregate requires both optimization modes. A result from an older commit does not count. Live model evals are separate from this gate because they require credentials and are not deterministic.
 
+Changes to `build.zig` or `scripts/pgso/` also run the native macOS arm64 PGSO candidate workflow. That lane produces retained size, behavior, and performance evidence but does not alter any release artifact or update channel. Its pinned toolchain, local reproduction command, corpus exclusions, and failure rules are documented in [`scripts/pgso/README.md`](scripts/pgso/README.md).
+
 ## Pull Requests
 
 Every PR must carry exactly one label that describes its primary intent:
@@ -86,8 +88,22 @@ Before adding a new feature, answer these first:
 3. Does it need persistence?
 4. Does it need both text and JSON output?
 5. What docs and tests land with it?
+6. How is its deterministic E2E owner classified for macOS arm64 PGSO?
 
 If that is unclear, stop and define it first.
+
+### PGSO corpus ownership
+
+Classify every root `tests/e2e/*.test.ts` file in
+`scripts/pgso/corpus.json`. Put common or performance-sensitive behavior in
+training. Put important correctness, recovery, security, and rare behavior in
+verification-only. Exclude only nondeterministic, live-network, credentialed,
+sound-related, or harness-only coverage, and record the reason.
+
+Tests added to an existing file inherit its classification. Reconsider that
+classification when a feature changes the file's product role, and remove stale
+entries when deleting a feature or E2E owner. Normal PR CI rejects missing,
+duplicate, stale, and unclassified files without running the full PGSO gate.
 
 ## Configuration and State
 

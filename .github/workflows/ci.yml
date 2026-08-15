@@ -35,6 +35,10 @@ jobs:
         if: matrix.optimize == 'Debug'
         run: zig fmt --check src/
 
+      - name: Validate PGSO corpus classification
+        if: matrix.optimize == 'Debug'
+        run: python3 -m scripts.pgso.corpus --manifest scripts/pgso/corpus.json --list
+
       - name: Build
         run: zig build -Doptimize=${{ matrix.optimize }}
 
