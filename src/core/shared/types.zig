@@ -1434,6 +1434,9 @@ pub const CompactedSummaryHistoryTurn = struct {
     summary: []u8,
     removed_turn_count: usize,
     compaction_count: usize,
+    /// Exact root-user text retained by machine-owned compaction. This is
+    /// authority evidence; `summary` remains untrusted model context.
+    root_user_messages: [][]u8 = &.{},
 };
 
 pub const HistoryTurn = union(enum) {
@@ -1714,6 +1717,7 @@ pub fn freeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) void {
     switch (turn) {
         .compacted_summary => |entry| {
             alloc.free(entry.summary);
+            freeCompletedToolNames(alloc, entry.root_user_messages);
         },
         .assistant => |entry| {
             freeUserTurn(alloc, entry.user);
@@ -1754,11 +1758,16 @@ pub fn freeFinishedPrompt(alloc: std.mem.Allocator, finished: FinishedPrompt) vo
 
 pub fn dupeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) !HistoryTurn {
     return switch (turn) {
-        .compacted_summary => |entry| .{ .compacted_summary = .{
-            .summary = try alloc.dupe(u8, entry.summary),
-            .removed_turn_count = entry.removed_turn_count,
-            .compaction_count = entry.compaction_count,
-        } },
+        .compacted_summary => |entry| blk: {
+            const summary = try alloc.dupe(u8, entry.summary);
+            errdefer alloc.free(summary);
+            break :blk .{ .compacted_summary = .{
+                .summary = summary,
+                .removed_turn_count = entry.removed_turn_count,
+                .compaction_count = entry.compaction_count,
+                .root_user_messages = try dupeCompletedToolNames(alloc, entry.root_user_messages),
+            } };
+        },
         .assistant => |entry| blk: {
             const user = try dupeUserTurn(alloc, entry.user);
             errdefer freeUserTurn(alloc, user);

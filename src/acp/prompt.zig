@@ -3870,8 +3870,8 @@ test "ACP run_command admission preserves direct configured authority and falls 
         .name = "run_command",
         .arguments_json = "{\"command\":\"touch automatic.txt\"}",
     }, .auto, &.{}, &.{}));
-    try std.testing.expectEqual(ToolPermissionDecision.permission_required, automatic.decision);
-    try std.testing.expectEqual(types.ToolPermissionDenialReason.permission_required, automatic.denial_reason.?);
+    try std.testing.expectEqual(ToolPermissionDecision.deny, automatic.decision);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, automatic.denial_reason.?);
     try std.testing.expect(automatic.execution_authority == null);
 }
 
@@ -3954,8 +3954,8 @@ test "ACP auto mode uses automatic review allow and ask without prompting" {
     };
     var blocked_review = TestReviewTurn.init("Check whether this is allowed.", blocked_call);
     const blocked = try requestToolPermissionOutcomeWithRequest(&ctx, arena, blocked_call, blocked_review.context(), .auto, &.{}, null, null, &.{});
-    try std.testing.expectEqual(ToolPermissionDecision.permission_required, blocked.decision);
-    try std.testing.expectEqual(types.ToolPermissionDenialReason.permission_required, blocked.denial_reason.?);
+    try std.testing.expectEqual(ToolPermissionDecision.deny, blocked.decision);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, blocked.denial_reason.?);
     try std.testing.expect(blocked.execution_authority == null);
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
     const blocked_classifier = blocked.auto_review_result orelse return error.TestExpectedEqual;
@@ -4051,8 +4051,8 @@ test "ACP auto mode automatic review allows or asks prepared external file mutat
     var blocked_review = TestReviewTurn.init("Create desktop-test.txt with hello.", blocked_call);
     const blocked = try requestToolPermissionOutcomeWithRequest(&ctx, arena, blocked_call, blocked_review.context(), .auto, &.{}, null, null, &.{});
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
-    try std.testing.expectEqual(ToolPermissionDecision.permission_required, blocked.decision);
-    try std.testing.expectEqual(types.ToolPermissionDenialReason.permission_required, blocked.denial_reason.?);
+    try std.testing.expectEqual(ToolPermissionDecision.deny, blocked.decision);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, blocked.denial_reason.?);
     try std.testing.expect(blocked.execution_authority == null);
     const blocked_classifier = blocked.auto_review_result orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(permission_auto_classifier.Decision.ask, blocked_classifier.decision);
@@ -4124,7 +4124,7 @@ test "ACP auto mode requires review when only one copy target is configured" {
         .arguments_json = args,
     }, .auto, &.{}, &.{})).decision;
 
-    try std.testing.expectEqual(ToolPermissionDecision.permission_required, decision);
+    try std.testing.expectEqual(ToolPermissionDecision.deny, decision);
 }
 
 test "ACP permission rejects semantic_search outside workspace target" {

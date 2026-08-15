@@ -5082,11 +5082,13 @@ test "fx ask run_command admission preserves direct configured authority and blo
 
     ctx.permission_rules.deinit(alloc);
     ctx.permission_rules = .{};
-    try std.testing.expectError(error.NonInteractivePermissionRequired, requestToolPermissionOutcome(&ctx, arena, .{
+    const automatic = try requestToolPermissionOutcome(&ctx, arena, .{
         .id = "automatic",
         .name = "run_command",
         .arguments_json = "{\"command\":\"touch automatic.txt\"}",
-    }, .auto, &.{}, &.{}));
+    }, .auto, &.{}, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.deny, automatic.decision);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, automatic.denial_reason.?);
 }
 
 test "fx ask automatic review observes worker cancellation" {
@@ -5673,7 +5675,7 @@ test "fx ask auto mode applies automatic allow and ask without a prompt" {
         .arguments_json = "{\"command\":\"touch check.txt\"}",
     };
     var check_review = TestReviewTurn.init("Check this command.", check_call);
-    try std.testing.expectError(error.NonInteractivePermissionRequired, requestToolPermissionOutcomeWithRequest(
+    const blocked = try requestToolPermissionOutcomeWithRequest(
         &ctx,
         arena,
         check_call,
@@ -5683,9 +5685,11 @@ test "fx ask auto mode applies automatic allow and ask without a prompt" {
         null,
         null,
         &.{},
-    ));
+    );
+    try std.testing.expectEqual(ToolPermissionDecision.deny, blocked.decision);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, blocked.denial_reason.?);
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
-    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "noninteractive_permission_prompt_unavailable") != null);
+    try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
 }
 
 test "fx ask terminal permission prompt approves and denies run_command" {
@@ -6128,26 +6132,18 @@ test "fx ask preserves CLI headless blocker diagnostics" {
             .{ source, external_destination },
         ),
     };
-    const external_label = try tool_presentation.formatPlainAction(arena, .{ .tool_registry = ctx.toolRegistry(), .call = blocked_copy });
-    try std.testing.expectError(error.NonInteractivePermissionRequired, requestToolPermissionOutcome(
+    const external_outcome = try requestToolPermissionOutcome(
         &ctx,
         arena,
         blocked_copy,
         .auto,
         &.{},
         &.{},
-    ));
-    const expected_external_stderr = try std.fmt.allocPrint(
-        arena,
-        "[notice] Auto agent could not review this request safely.\n" ++
-            "fx ask: permission required for tool execution in noninteractive mode\n" ++
-            "fx ask: blocked action: {s}\n" ++
-            "fx ask: reason=noninteractive_permission_prompt_unavailable\n" ++
-            "fx ask: the automatic reviewer could not approve this action; use the interactive shell to approve it, or add a narrow matching permission rule\n",
-        .{external_label},
     );
+    try std.testing.expectEqual(ToolPermissionDecision.deny, external_outcome.decision);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, external_outcome.denial_reason.?);
     try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
-    try std.testing.expectEqualStrings(expected_external_stderr, stderr_capture.bytes.items);
+    try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
 
     stdout_capture.bytes.clearRetainingCapacity();
     stderr_capture.bytes.clearRetainingCapacity();
@@ -6180,25 +6176,18 @@ test "fx ask preserves CLI headless blocker diagnostics" {
     stdout_capture.bytes.clearRetainingCapacity();
     stderr_capture.bytes.clearRetainingCapacity();
 
-    try std.testing.expectError(error.NonInteractivePermissionRequired, requestToolPermissionOutcome(
+    const auto_approval = try requestToolPermissionOutcome(
         &ctx,
         arena,
         approval_required,
         .auto,
         &.{},
         &.{},
-    ));
-    const expected_auto_approval_stderr = try std.fmt.allocPrint(
-        arena,
-        "[notice] Auto agent could not review this request safely.\n" ++
-            "fx ask: permission required for tool execution in noninteractive mode\n" ++
-            "fx ask: blocked action: {s}\n" ++
-            "fx ask: reason=noninteractive_permission_prompt_unavailable\n" ++
-            "fx ask: the automatic reviewer could not approve this action; use the interactive shell to approve it, or add a narrow matching permission rule\n",
-        .{approval_label},
     );
+    try std.testing.expectEqual(ToolPermissionDecision.deny, auto_approval.decision);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, auto_approval.denial_reason.?);
     try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
-    try std.testing.expectEqualStrings(expected_auto_approval_stderr, stderr_capture.bytes.items);
+    try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
 
     stdout_capture.bytes.clearRetainingCapacity();
     stderr_capture.bytes.clearRetainingCapacity();
@@ -6374,14 +6363,13 @@ test "CLI ask auto mode requires review when only one copy or rename target is c
     for (cases, 0..) |case, index| {
         ctx.permission_rules.deinit(alloc);
         ctx.permission_rules = try testPermissionRuleSet(alloc, case.permission_name, external_pattern, .allow);
-        try std.testing.expectError(
-            error.NonInteractivePermissionRequired,
-            requestToolPermissionOutcome(&ctx, arena, .{
-                .id = try std.fmt.allocPrint(arena, "mixed-{d}", .{index}),
-                .name = case.tool_name,
-                .arguments_json = case.arguments_json,
-            }, .auto, &.{}, &.{}),
-        );
+        const outcome = try requestToolPermissionOutcome(&ctx, arena, .{
+            .id = try std.fmt.allocPrint(arena, "mixed-{d}", .{index}),
+            .name = case.tool_name,
+            .arguments_json = case.arguments_json,
+        }, .auto, &.{}, &.{});
+        try std.testing.expectEqual(ToolPermissionDecision.deny, outcome.decision);
+        try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, outcome.denial_reason.?);
         stdout_capture.bytes.clearRetainingCapacity();
         stderr_capture.bytes.clearRetainingCapacity();
     }

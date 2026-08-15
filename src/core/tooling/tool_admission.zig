@@ -653,14 +653,12 @@ fn reviewRequestForCall(
     };
 }
 
-/// An unavailable or invalid review never executes anything on its own;
-/// it falls back to the same interactive approval path ask mode uses.
-/// A valid reviewer ask uses that path unless the tool policy makes ask
-/// a final automatic denial.
+/// An unavailable or invalid automatic review never executes anything. It is
+/// returned to the primary model as the same recoverable auto denial as ASK.
 fn traceReviewerUnavailable(call: ToolCall) void {
     debug_trace.logf(
         "permission",
-        "event=auto_review_result tool_name={s} decision=permission_required reason=reviewer_unavailable fallback=interactive_approval call_id={s}",
+        "event=auto_review_result tool_name={s} decision=deny reason=reviewer_unavailable fallback=agent_replan call_id={s}",
         .{ call.name, call.id },
     );
 }
@@ -668,36 +666,27 @@ fn traceReviewerUnavailable(call: ToolCall) void {
 fn reviewerUnavailableOutcome(call: ToolCall) command_admission.PermissionOutcome {
     traceReviewerUnavailable(call);
     return .{
-        .decision = .permission_required,
-        .denial_reason = .permission_required,
+        .decision = .deny,
+        .denial_reason = .auto_denied,
     };
 }
 
-/// Maps a non-allow review to the policy's blocked outcome. Invalid reviews
-/// always fall back to interactive approval. Returns null when the review
-/// allows and the caller should mint the site-specific allow outcome.
+/// Maps every non-allow automatic review to one recoverable denial. Human
+/// approval is reserved for the orchestrator-derived recovery threshold.
 fn nonAllowAutoReviewOutcome(
     review: permission_auto_classifier.ParseOutcome,
-    approval_policy: tool_dispatch.ApprovalPolicy,
 ) ?command_admission.PermissionOutcome {
     return switch (review) {
         .invalid => .{
-            .decision = .permission_required,
-            .denial_reason = .permission_required,
+            .decision = .deny,
+            .denial_reason = .auto_denied,
         },
         .valid => |result| switch (result.decision) {
             .allow => null,
-            .ask => switch (approval_policy) {
-                .auto_deny_on_ask => .{
-                    .decision = .deny,
-                    .denial_reason = .auto_denied,
-                    .auto_review_result = result,
-                },
-                .standard, .ask_only => .{
-                    .decision = .permission_required,
-                    .denial_reason = .permission_required,
-                    .auto_review_result = result,
-                },
+            .ask => .{
+                .decision = .deny,
+                .denial_reason = .auto_denied,
+                .auto_review_result = result,
             },
         },
     };
@@ -711,6 +700,12 @@ fn automaticReviewOutcome(
     is_dynamic_tool: bool,
     file_authorization: ?file_mutation_contract.FileExecutionAuthorization,
 ) !command_admission.PermissionOutcome {
+    if (input.permission_review_turn) |turn| {
+        if (turn.auto_recovery_exhausted) return .{
+            .decision = .permission_required,
+            .denial_reason = .permission_required,
+        };
+    }
     if (!input.auto_classifier.enabled()) return reviewerUnavailableOutcome(call);
     if (input.permission_review_turn == null) return reviewerUnavailableOutcome(call);
 
@@ -723,10 +718,7 @@ fn automaticReviewOutcome(
         file_authorization,
     );
     const review = try runAutomaticReview(input, arena, call, request);
-    if (nonAllowAutoReviewOutcome(
-        review,
-        toolApprovalPolicy(input, call.name),
-    )) |blocked| return blocked;
+    if (nonAllowAutoReviewOutcome(review)) |blocked| return blocked;
     var outcome = if (file_authorization) |authorization|
         command_admission.PermissionOutcome{
             .decision = .once,
@@ -774,7 +766,7 @@ fn runAutomaticReview(
         ),
         .invalid => debug_trace.logf(
             "permission",
-            "event=auto_review_result tool_name={s} decision=permission_required fallback_reason=invalid_or_unavailable elapsed_ms={d} execution_started=false call_id={s}",
+            "event=auto_review_result tool_name={s} decision=deny denial_reason=auto_denied fallback_reason=invalid_or_unavailable recovery=agent_replan elapsed_ms={d} execution_started=false call_id={s}",
             .{ call.name, io_mod.milliTimestamp() - started_ms, call.id },
         ),
     }
@@ -1523,7 +1515,14 @@ fn requestSandboxWideningOutcomeInternal(
         );
     }
 
-    if (permission_mode == .auto and input.auto_classifier.enabled()) {
+    const auto_recovery_exhausted = if (input.permission_review_turn) |turn|
+        turn.auto_recovery_exhausted
+    else
+        false;
+    if (permission_mode == .auto and !auto_recovery_exhausted) {
+        if (!input.auto_classifier.enabled() or input.permission_review_turn == null) {
+            return reviewerUnavailableOutcome(call);
+        }
         const review_targets = try arena.alloc(permissions.PermissionCallTarget, 2);
         review_targets[0] = command_target;
         review_targets[1] = .{
@@ -1532,8 +1531,7 @@ fn requestSandboxWideningOutcomeInternal(
         };
         const review = try runAutomaticReview(input, arena, call, .{
             .workspace_root = input.workspace_root,
-            .review_turn = input.permission_review_turn orelse
-                return reviewerUnavailableOutcome(call),
+            .review_turn = input.permission_review_turn.?,
             .targets = review_targets,
             .action = .{ .sandbox_widening = .{
                 .command = command_ctx.command,
@@ -1553,17 +1551,13 @@ fn requestSandboxWideningOutcomeInternal(
             .escalation_reason = "sandbox_scope_widening",
             .phase = widening.phase,
         });
-        if (nonAllowAutoReviewOutcome(review, .standard)) |blocked| {
-            // Ask/invalid: prompt when a human is available; otherwise keep the
-            // reviewed permission_required outcome (with rationale).
-            if (input.permission_prompter == null) return blocked;
+        if (nonAllowAutoReviewOutcome(review)) |blocked| {
+            return blocked;
         } else {
             var outcome = shellPermissionOutcome(command_ctx, .once, .auto_classifier);
             outcome.auto_review_result = review.valid;
             return outcome;
         }
-    } else if (permission_mode == .auto) {
-        traceReviewerUnavailable(call);
     }
 
     return promptSandboxWideningOutcome(
@@ -3452,7 +3446,7 @@ test "interactive file admission passes its canonical grant offer to the prompte
     }
 }
 
-test "auto-deny-on-ask policy denies only a valid automatic ask" {
+test "automatic non-allow is recoverable regardless tool approval policy" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
@@ -3530,11 +3524,12 @@ test "auto-deny-on-ask policy denies only a valid automatic ask" {
         .auto,
         &.{},
     );
-    try std.testing.expectEqual(ToolPermissionDecision.once, invalid.decision);
-    try std.testing.expect(invalid.execution_authority != null);
+    try std.testing.expectEqual(ToolPermissionDecision.deny, invalid.decision);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, invalid.denial_reason.?);
+    try std.testing.expect(invalid.execution_authority == null);
     try std.testing.expect(invalid.auto_review_result == null);
     try std.testing.expectEqual(@as(usize, 3), fake.calls);
-    try std.testing.expectEqual(@as(usize, 1), recording.calls);
+    try std.testing.expectEqual(@as(usize, 0), recording.calls);
 
     fake.invalid = false;
     fake.decision = .ask;
@@ -3548,7 +3543,7 @@ test "auto-deny-on-ask policy denies only a valid automatic ask" {
     try std.testing.expectEqual(ToolPermissionDecision.once, interactive.decision);
     try std.testing.expect(interactive.execution_authority != null);
     try std.testing.expectEqual(@as(usize, 3), fake.calls);
-    try std.testing.expectEqual(@as(usize, 2), recording.calls);
+    try std.testing.expectEqual(@as(usize, 1), recording.calls);
 
     input.auto_classifier = permission_auto_classifier.Classifier.disabled();
     const unavailable = try requestPermissionOutcome(
@@ -3558,11 +3553,12 @@ test "auto-deny-on-ask policy denies only a valid automatic ask" {
         .auto,
         &.{},
     );
-    try std.testing.expectEqual(ToolPermissionDecision.once, unavailable.decision);
-    try std.testing.expect(unavailable.execution_authority != null);
+    try std.testing.expectEqual(ToolPermissionDecision.deny, unavailable.decision);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, unavailable.denial_reason.?);
+    try std.testing.expect(unavailable.execution_authority == null);
     try std.testing.expect(unavailable.auto_review_result == null);
     try std.testing.expectEqual(@as(usize, 3), fake.calls);
-    try std.testing.expectEqual(@as(usize, 3), recording.calls);
+    try std.testing.expectEqual(@as(usize, 1), recording.calls);
 }
 
 test "ask-only policy bypasses prompt and reviewer in auto and uses the ordinary prompt in ask" {
@@ -4195,7 +4191,7 @@ test "automatic review receives exact command and mints matching one-call author
     }
 }
 
-test "automatic ask falls through to the human prompter with review rationale" {
+test "automatic ask returns to the agent before using a human prompter" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
@@ -4232,16 +4228,17 @@ test "automatic ask falls through to the human prompter with review rationale" {
     );
 
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
-    try std.testing.expectEqual(@as(usize, 1), recording.calls);
-    try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
-    try std.testing.expect(outcome.execution_authority != null);
+    try std.testing.expectEqual(@as(usize, 0), recording.calls);
+    try std.testing.expectEqual(ToolPermissionDecision.deny, outcome.decision);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, outcome.denial_reason.?);
+    try std.testing.expect(outcome.execution_authority == null);
     try std.testing.expectEqualStrings(
         "The command exceeds the user's request.",
         outcome.auto_review_result.?.rationale,
     );
 }
 
-test "automatic ask blocks without a prompter" {
+test "automatic ask returns a recoverable denial without a prompter" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
@@ -4276,9 +4273,9 @@ test "automatic ask blocks without a prompter" {
     );
 
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
-    try std.testing.expectEqual(ToolPermissionDecision.permission_required, outcome.decision);
+    try std.testing.expectEqual(ToolPermissionDecision.deny, outcome.decision);
     try std.testing.expectEqual(
-        types.ToolPermissionDenialReason.permission_required,
+        types.ToolPermissionDenialReason.auto_denied,
         outcome.denial_reason.?,
     );
     try std.testing.expect(outcome.execution_authority == null);
@@ -4288,7 +4285,7 @@ test "automatic ask blocks without a prompter" {
     );
 }
 
-test "invalid automatic review falls back to the interactive prompt" {
+test "invalid automatic review returns to the agent before prompting" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
@@ -4320,12 +4317,14 @@ test "invalid automatic review falls back to the interactive prompt" {
     );
 
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
-    try std.testing.expectEqual(@as(usize, 1), recording.calls);
-    try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
+    try std.testing.expectEqual(@as(usize, 0), recording.calls);
+    try std.testing.expectEqual(ToolPermissionDecision.deny, outcome.decision);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, outcome.denial_reason.?);
+    try std.testing.expect(outcome.execution_authority == null);
     try std.testing.expect(outcome.auto_review_result == null);
 }
 
-test "invalid automatic review blocks without a prompter" {
+test "invalid automatic review returns a recoverable denial without a prompter" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
@@ -4355,9 +4354,61 @@ test "invalid automatic review blocks without a prompter" {
     );
 
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
-    try std.testing.expectEqual(ToolPermissionDecision.permission_required, outcome.decision);
+    try std.testing.expectEqual(ToolPermissionDecision.deny, outcome.decision);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, outcome.denial_reason.?);
     try std.testing.expect(outcome.execution_authority == null);
     try std.testing.expect(outcome.auto_review_result == null);
+}
+
+test "exhausted automatic recovery bypasses review and uses ordinary approval" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var background: BackgroundRuntime = .{};
+    defer background.deinit(std.testing.allocator);
+    var fake = FakeAutoClassifier{ .decision = .ask };
+    var recording = RecordingPrompter{};
+    var input = testInputWithClassifier(
+        &worker,
+        &background,
+        permission_auto_classifier.Classifier.withOverride(
+            @ptrCast(&fake),
+            FakeAutoClassifier.classify,
+        ),
+    );
+    var review_turn = testReviewTurn();
+    review_turn.auto_recovery_exhausted = true;
+    input.permission_review_turn = review_turn;
+    input.permission_prompter = recording.prompter();
+    const call = ToolCall{
+        .id = "exhausted",
+        .name = "run_command",
+        .arguments_json = "{\"command\":\"touch exhausted.txt\"}",
+    };
+
+    const approved = try requestPermissionOutcome(
+        input,
+        arena_state.allocator(),
+        call,
+        .auto,
+        &.{},
+    );
+    try std.testing.expectEqual(ToolPermissionDecision.once, approved.decision);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectEqual(@as(usize, 1), recording.calls);
+
+    input.permission_prompter = null;
+    const headless = try requestPermissionOutcome(
+        input,
+        arena_state.allocator(),
+        call,
+        .auto,
+        &.{},
+    );
+    try std.testing.expectEqual(ToolPermissionDecision.permission_required, headless.decision);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.permission_required, headless.denial_reason.?);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
 }
 
 test "automatic review is skipped for deterministic command authorities" {
@@ -4499,7 +4550,8 @@ test "js host workspace sandbox default is lowest priority and prompt disables i
         .auto,
         &.{},
     );
-    try std.testing.expectEqual(ToolPermissionDecision.permission_required, prompted.decision);
+    try std.testing.expectEqual(ToolPermissionDecision.deny, prompted.decision);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, prompted.denial_reason.?);
     try std.testing.expect(prompted.execution_authority == null);
 }
 
@@ -4569,6 +4621,61 @@ test "sandbox widening review carries the full broader command context" {
     );
     const authority = outcome.execution_authority.?.run_command.shell_allowed;
     try std.testing.expectEqual(permission_auto_classifier.SandboxScope.broader, authority.fingerprint.scope);
+}
+
+test "unavailable sandbox reviewer returns to the agent until recovery is exhausted" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var background: BackgroundRuntime = .{};
+    defer background.deinit(std.testing.allocator);
+    var recording = RecordingPrompter{};
+    var input = testInputWithClassifier(
+        &worker,
+        &background,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    input.sandbox_backend = .macos;
+    input.permission_prompter = recording.prompter();
+    const call = ToolCall{
+        .id = "sandbox-review-unavailable",
+        .name = "run_command",
+        .arguments_json = "{\"command\":\"npm install left-pad\"}",
+    };
+    const restricted_fingerprint = command_admission.AdmissionFingerprint.init(
+        try runCommandContext(input, arena_state.allocator(), call),
+    );
+    const widening: SandboxWideningInput = .{
+        .phase = .preflight,
+        .restricted_fingerprint = restricted_fingerprint,
+    };
+
+    const recoverable = try requestSandboxWideningOutcome(
+        input,
+        arena_state.allocator(),
+        call,
+        .auto,
+        &.{},
+        widening,
+    );
+    try std.testing.expectEqual(ToolPermissionDecision.deny, recoverable.decision);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, recoverable.denial_reason.?);
+    try std.testing.expectEqual(@as(usize, 0), recording.calls);
+
+    var exhausted_turn = input.permission_review_turn.?;
+    exhausted_turn.auto_recovery_exhausted = true;
+    input.permission_review_turn = exhausted_turn;
+    const escalated = try requestSandboxWideningOutcome(
+        input,
+        arena_state.allocator(),
+        call,
+        .auto,
+        &.{},
+        widening,
+    );
+    try std.testing.expectEqual(ToolPermissionDecision.once, escalated.decision);
+    try std.testing.expectEqual(@as(usize, 1), recording.calls);
 }
 
 test "reactive sandbox widening without the restricted result fails closed" {

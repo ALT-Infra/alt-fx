@@ -7633,7 +7633,7 @@ fn runProductionActionGenerationCase(
         types.ReasoningEffort.literal("medium"),
         &.{"permission-work"},
     );
-    try env.setPermissionMode(alloc, "permission-child", .auto);
+    try env.setPermissionMode(alloc, "permission-child", .ask);
     {
         var capability = try env.store.openSubagentControlCapabilityWritable(
             alloc,
@@ -7746,7 +7746,9 @@ fn runProductionActionGenerationCase(
     defer gateway.deinit();
     var fixture = agent_test_support.PromptFixture{ .workspace_root = env.workspace };
     var job = fixture.job();
-    job.permission_mode = .auto;
+    // This fixture exercises live human-approval revalidation, not automatic
+    // recovery. Start it in ask mode so the initial approval is intentional.
+    job.permission_mode = .ask;
     var config = fixture.config();
     config.origin = .subagent;
     config.session_child_capability = try turn.childCapability();

@@ -1919,8 +1919,15 @@ fn containsImageId(image_ids: []const usize, candidate: usize) bool {
 }
 
 const ReviewAuthority = struct {
+    root_user_messages: []const []const u8,
     root_text_bindings: []const permission_auto_classifier.RootTextBinding,
     trusted_permission_feedback: []const []const u8,
+
+    fn deinit(self: ReviewAuthority, alloc: Allocator) void {
+        alloc.free(self.root_user_messages);
+        alloc.free(self.root_text_bindings);
+        alloc.free(self.trusted_permission_feedback);
+    }
 };
 
 /// Length-changing projections copy retained messages, so borrowed content
@@ -1971,10 +1978,27 @@ noinline fn buildReviewAuthority(
     current_root_prompt: []const u8,
     pending_user_suffix: []const ChatMessage,
 ) !ReviewAuthority {
+    var root_user_messages: std.ArrayList([]const u8) = .empty;
+    errdefer root_user_messages.deinit(alloc);
     var bindings: std.ArrayList(permission_auto_classifier.RootTextBinding) = .empty;
     errdefer bindings.deinit(alloc);
     var trusted_permission_feedback: std.ArrayList([]const u8) = .empty;
     errdefer trusted_permission_feedback.deinit(alloc);
+
+    if (origin == .root) {
+        for (history) |turn| switch (turn) {
+            .compacted_summary => |entry| try root_user_messages.appendSlice(
+                alloc,
+                entry.root_user_messages,
+            ),
+            .assistant => |entry| try root_user_messages.append(alloc, entry.user.text),
+            .background_command => |entry| try root_user_messages.append(alloc, entry.user.text),
+            .interrupted => |entry| try root_user_messages.append(alloc, entry.user.text),
+        };
+        if (current_root_prompt.len > 0) {
+            try root_user_messages.append(alloc, current_root_prompt);
+        }
+    }
 
     const projected_current_user_index = projectedSourceUserIndex(
         projected_messages,
@@ -2041,9 +2065,14 @@ noinline fn buildReviewAuthority(
 
     const owned_bindings = try bindings.toOwnedSlice(alloc);
     errdefer alloc.free(owned_bindings);
+    const owned_root_user_messages = try root_user_messages.toOwnedSlice(alloc);
+    errdefer alloc.free(owned_root_user_messages);
+    const owned_permission_feedback = try trusted_permission_feedback.toOwnedSlice(alloc);
+    errdefer alloc.free(owned_permission_feedback);
     return .{
+        .root_user_messages = owned_root_user_messages,
         .root_text_bindings = owned_bindings,
-        .trusted_permission_feedback = try trusted_permission_feedback.toOwnedSlice(alloc),
+        .trusted_permission_feedback = owned_permission_feedback,
     };
 }
 
@@ -2095,6 +2124,7 @@ fn buildReviewTurnContext(
     pending_user_suffix: []const ChatMessage,
     pending_assistant: ChatMessage,
     target_call_id: []const u8,
+    auto_recovery_exhausted: bool,
 ) !permission_auto_classifier.ReviewTurnContext {
     const authority = try buildReviewAuthority(
         alloc,
@@ -2116,13 +2146,125 @@ fn buildReviewTurnContext(
             .root => .root,
             .subagent => .subagent,
         },
+        .root_user_messages = authority.root_user_messages,
         .root_text_bindings = authority.root_text_bindings,
         .inherited_root_context = if (config.origin == .subagent)
             inherited_root_context
         else
             "",
         .trusted_permission_feedback = authority.trusted_permission_feedback,
+        .auto_recovery_exhausted = auto_recovery_exhausted,
     };
+}
+
+const max_automatic_non_allow_response_groups: usize = 3;
+
+fn automaticRecoveryExhausted(messages: []const ChatMessage) bool {
+    var blocked_groups: usize = 0;
+    var group_open = false;
+    var group_has_auto_denial = false;
+    var group_has_success = false;
+
+    for (messages) |message| switch (message.role) {
+        .assistant => {
+            if (group_open) {
+                if (group_has_auto_denial) {
+                    blocked_groups +|= 1;
+                } else if (group_has_success) {
+                    blocked_groups = 0;
+                }
+            }
+            group_open = message.tool_calls.len > 0;
+            group_has_auto_denial = false;
+            group_has_success = false;
+        },
+        .tool => {
+            if (!group_open) continue;
+            if (message.tool_result_status == .success) {
+                group_has_success = true;
+                continue;
+            }
+            const output = message.content orelse continue;
+            if (tool_result_errors.toolPermissionDenialReason(output) == .auto_denied) {
+                group_has_auto_denial = true;
+            }
+        },
+        else => {},
+    };
+
+    // The trailing group is the action currently being admitted, so it is not
+    // complete and must not count toward escalation yet.
+    return blocked_groups >= max_automatic_non_allow_response_groups;
+}
+
+test "automatic recovery counts completed response groups and resets after success" {
+    const denied = "{\"error\":{\"type\":\"tool_permission_denied\",\"reason\":\"auto_denied\"}}";
+    const blocked_group = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &.{.{ .id = "blocked", .name = "run_command", .arguments_json = "{}" }} },
+        .{ .role = .tool, .content = denied, .tool_call_id = "blocked", .tool_result_status = .failure },
+    };
+    var three_then_current: [7]ChatMessage = undefined;
+    @memcpy(three_then_current[0..2], &blocked_group);
+    @memcpy(three_then_current[2..4], &blocked_group);
+    @memcpy(three_then_current[4..6], &blocked_group);
+    three_then_current[6] = .{ .role = .assistant, .tool_calls = &.{.{ .id = "current", .name = "run_command", .arguments_json = "{}" }} };
+    try std.testing.expect(automaticRecoveryExhausted(&three_then_current));
+
+    const success = ChatMessage{
+        .role = .tool,
+        .content = "ok",
+        .tool_call_id = "safe",
+        .tool_result_status = .success,
+    };
+    var reset: [10]ChatMessage = undefined;
+    @memcpy(reset[0..6], three_then_current[0..6]);
+    reset[6] = .{ .role = .assistant, .tool_calls = &.{.{ .id = "safe", .name = "run_command", .arguments_json = "{}" }} };
+    reset[7] = success;
+    reset[8] = blocked_group[0];
+    reset[9] = blocked_group[1];
+    try std.testing.expect(!automaticRecoveryExhausted(&reset));
+}
+
+test "parallel automatic denials count as one response group" {
+    const denied = "{\"error\":{\"type\":\"tool_permission_denied\",\"reason\":\"auto_denied\"}}";
+    const calls = [_]ToolCall{
+        .{ .id = "one", .name = "run_command", .arguments_json = "{}" },
+        .{ .id = "two", .name = "run_command", .arguments_json = "{}" },
+    };
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .content = denied, .tool_call_id = "one", .tool_result_status = .failure },
+        .{ .role = .tool, .content = denied, .tool_call_id = "two", .tool_result_status = .failure },
+        .{ .role = .assistant, .tool_calls = &calls },
+    };
+    try std.testing.expect(!automaticRecoveryExhausted(&messages));
+}
+
+test "a mixed parallel response group is blocked regardless result order" {
+    const denied = "{\"error\":{\"type\":\"tool_permission_denied\",\"reason\":\"auto_denied\"}}";
+    const calls = [_]ToolCall{
+        .{ .id = "safe", .name = "run_command", .arguments_json = "{}" },
+        .{ .id = "blocked", .name = "run_command", .arguments_json = "{}" },
+    };
+    const current = ChatMessage{
+        .role = .assistant,
+        .tool_calls = &.{.{ .id = "current", .name = "run_command", .arguments_json = "{}" }},
+    };
+    var success_first: [10]ChatMessage = undefined;
+    var denial_first: [10]ChatMessage = undefined;
+    for (0..3) |group_index| {
+        const start = group_index * 3;
+        success_first[start] = .{ .role = .assistant, .tool_calls = &calls };
+        success_first[start + 1] = .{ .role = .tool, .content = "ok", .tool_call_id = "safe", .tool_result_status = .success };
+        success_first[start + 2] = .{ .role = .tool, .content = denied, .tool_call_id = "blocked", .tool_result_status = .failure };
+        denial_first[start] = success_first[start];
+        denial_first[start + 1] = success_first[start + 2];
+        denial_first[start + 2] = success_first[start + 1];
+    }
+    success_first[9] = current;
+    denial_first[9] = current;
+    try std.testing.expect(automaticRecoveryExhausted(&success_first));
+    try std.testing.expect(automaticRecoveryExhausted(&denial_first));
 }
 
 fn appendTrustedPermissionFeedback(
@@ -4423,6 +4565,7 @@ fn processQueuedPromptLoop(
                         step_batch.pending_user_suffix.items,
                         pending_assistant,
                         parallel_call.id,
+                        automaticRecoveryExhausted(within_turn_suffix.items),
                     );
                     const maybe_parallel_permission: ?command_admission.PermissionOutcome = runtime_tool_admission.requestToolPermissionTraced(deps, arena, parallel_call, parallel_review_context, job.permission_mode, local_grants.items, null, null, advertised_dynamic_tool_names, config.workspace_root, step_ctx) catch |err| blk: {
                         if (err != error.Cancelled or !config.cancel_flag.load(.seq_cst)) return err;
@@ -5368,6 +5511,7 @@ fn processQueuedPromptLoop(
                 step_batch.pending_user_suffix.items,
                 pending_assistant,
                 execution_call.id,
+                automaticRecoveryExhausted(within_turn_suffix.items),
             );
             const tool_execution_root_user_context = try buildToolExecutionRootUserContext(
                 call_allocator,
@@ -7097,7 +7241,55 @@ test "review authority binds current root across a shorter native projection" {
     );
 }
 
-test "review authority fails closed when a shorter projection omits current root identity" {
+test "review authority preserves exact root-user order across compacted and live history" {
+    const alloc = std.testing.allocator;
+    var compacted_root_messages = [_][]u8{
+        @constCast("first exact request"),
+        @constCast("second exact request"),
+    };
+    const history = [_]HistoryTurn{
+        .{ .compacted_summary = .{
+            .summary = @constCast("untrusted compacted summary"),
+            .removed_turn_count = 2,
+            .compaction_count = 1,
+            .root_user_messages = &compacted_root_messages,
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("third exact request") },
+            .assistant = @constCast("response"),
+        } },
+        .{ .interrupted = .{
+            .user = .{ .text = @constCast("fourth exact request") },
+        } },
+    };
+    const source = [_]ChatMessage{.{ .role = .user, .content = "fifth exact request" }};
+    const authority = try buildReviewAuthority(
+        alloc,
+        .root,
+        &source,
+        &source,
+        0,
+        0,
+        &history,
+        "fifth exact request",
+        &.{},
+    );
+    defer authority.deinit(alloc);
+
+    const expected = [_][]const u8{
+        "first exact request",
+        "second exact request",
+        "third exact request",
+        "fourth exact request",
+        "fifth exact request",
+    };
+    try std.testing.expectEqual(expected.len, authority.root_user_messages.len);
+    for (expected, authority.root_user_messages) |expected_message, actual_message| {
+        try std.testing.expectEqualStrings(expected_message, actual_message);
+    }
+}
+
+test "review authority omits an unproven projection binding but retains canonical root text" {
     const alloc = std.testing.allocator;
     const source_text = try alloc.dupe(u8, "Repeated request text.");
     defer alloc.free(source_text);
@@ -7123,14 +7315,15 @@ test "review authority fails closed when a shorter projection omits current root
         source_text,
         &.{},
     );
-    defer alloc.free(authority.root_text_bindings);
-    defer alloc.free(authority.trusted_permission_feedback);
+    defer authority.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 0), authority.root_text_bindings.len);
+    try std.testing.expectEqual(@as(usize, 1), authority.root_user_messages.len);
+    try std.testing.expectEqualStrings(source_text, authority.root_user_messages[0]);
     try std.testing.expectEqual(@as(usize, 0), authority.trusted_permission_feedback.len);
 }
 
-test "review authority fails closed when current root identity is ambiguous" {
+test "review authority omits an ambiguous projection binding but retains canonical root text" {
     const alloc = std.testing.allocator;
     const source = [_]ChatMessage{
         .{ .role = .assistant, .content = "historical response" },
@@ -7152,10 +7345,11 @@ test "review authority fails closed when current root identity is ambiguous" {
         "Repeated borrowed request.",
         &.{},
     );
-    defer alloc.free(authority.root_text_bindings);
-    defer alloc.free(authority.trusted_permission_feedback);
+    defer authority.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 0), authority.root_text_bindings.len);
+    try std.testing.expectEqual(@as(usize, 1), authority.root_user_messages.len);
+    try std.testing.expectEqualStrings("Repeated borrowed request.", authority.root_user_messages[0]);
     try std.testing.expectEqual(@as(usize, 0), authority.trusted_permission_feedback.len);
 }
 
@@ -7179,8 +7373,7 @@ test "review authority rejects projected feedback without source proof" {
         "Inspect only.",
         &.{},
     );
-    defer alloc.free(authority.root_text_bindings);
-    defer alloc.free(authority.trusted_permission_feedback);
+    defer authority.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), authority.root_text_bindings.len);
     try std.testing.expectEqual(@as(usize, 0), authority.root_text_bindings[0].message_index);
@@ -7213,8 +7406,7 @@ test "review authority trusts source feedback retained after a shorter projectio
         "Investigate only.",
         &.{},
     );
-    defer alloc.free(authority.root_text_bindings);
-    defer alloc.free(authority.trusted_permission_feedback);
+    defer authority.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), authority.root_text_bindings.len);
     try std.testing.expectEqual(@as(usize, 1), authority.root_text_bindings[0].message_index);
@@ -7247,8 +7439,7 @@ test "review authority aligns current root across a projection drop sweep" {
             "Current root request.",
             &.{},
         );
-        defer alloc.free(authority.root_text_bindings);
-        defer alloc.free(authority.trusted_permission_feedback);
+        defer authority.deinit(alloc);
 
         try std.testing.expectEqual(@as(usize, 1), authority.root_text_bindings.len);
         try std.testing.expectEqual(
@@ -7281,8 +7472,7 @@ test "review authority binds only root text before projected image references" {
         "Inspect this image.",
         &.{},
     );
-    defer alloc.free(authority.root_text_bindings);
-    defer alloc.free(authority.trusted_permission_feedback);
+    defer authority.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), authority.root_text_bindings.len);
     try std.testing.expectEqual(@as(usize, 0), authority.root_text_bindings[0].message_index);
@@ -7306,8 +7496,7 @@ test "review authority rejects arbitrary projection suffixes" {
         "Inspect this image.",
         &.{},
     );
-    defer alloc.free(authority.root_text_bindings);
-    defer alloc.free(authority.trusted_permission_feedback);
+    defer authority.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 0), authority.root_text_bindings.len);
 }

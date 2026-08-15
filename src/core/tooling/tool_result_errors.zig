@@ -96,6 +96,30 @@ pub fn isToolPermissionDeniedOutput(output: []const u8) bool {
     return isToolErrorOutputType(output, "tool_permission_denied");
 }
 
+pub fn toolPermissionDenialReason(output: []const u8) ?types.ToolPermissionDenialReason {
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.c_allocator, output, .{}) catch return null;
+    defer parsed.deinit();
+
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return null,
+    };
+    const error_value = switch (root.get("error") orelse return null) {
+        .object => |object| object,
+        else => return null,
+    };
+    const type_value = switch (error_value.get("type") orelse return null) {
+        .string => |value| value,
+        else => return null,
+    };
+    if (!std.mem.eql(u8, type_value, "tool_permission_denied")) return null;
+    const reason_value = switch (error_value.get("reason") orelse return null) {
+        .string => |value| value,
+        else => return null,
+    };
+    return std.meta.stringToEnum(types.ToolPermissionDenialReason, reason_value);
+}
+
 pub fn toolExecutionFailureJson(alloc: Allocator, failure: ExecutionFailure) Allocator.Error![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
@@ -317,6 +341,12 @@ test "tool permission denied JSON explains policy and headless blockers" {
     try std.testing.expectEqualStrings("Permission denied by auto mode classifier", auto_error.get("message").?.string);
     try std.testing.expectEqualStrings("auto_denied", auto_error.get("reason").?.string);
     try std.testing.expect(std.mem.find(u8, auto_error.get("suggestion").?.string, "The tool did not run.") != null);
+    try std.testing.expectEqual(
+        types.ToolPermissionDenialReason.auto_denied,
+        toolPermissionDenialReason(auto_payload).?,
+    );
+    try std.testing.expect(toolPermissionDenialReason("not json") == null);
+    try std.testing.expect(toolPermissionDenialReason("{\"error\":{\"type\":\"different\",\"reason\":\"auto_denied\"}}") == null);
 
     const policy_error = policy.value.object.get("error").?.object;
     try std.testing.expectEqualStrings("Network or browser access was denied by configured policy", policy_error.get("message").?.string);

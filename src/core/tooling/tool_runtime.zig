@@ -4826,7 +4826,7 @@ test "request tool permission keeps safe defaults while unresolved local writes 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    try std.testing.expectEqual(ToolPermissionDecision.permission_required, (try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena, .{
+    try std.testing.expectEqual(ToolPermissionDecision.deny, (try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena, .{
         .id = "1",
         .name = "write_file",
         .arguments_json = "{\"path\":\"fx-permission-test.txt\",\"content\":\"hello\"}",
@@ -5743,7 +5743,7 @@ test "request tool permission combines configured external copy target with work
     try std.testing.expect(rt.worker.pending_permission_request_shared == null);
 }
 
-test "disabled automatic reviewer blocks for approval without a human prompt" {
+test "disabled automatic reviewer returns a recoverable denial without a human prompt" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5768,9 +5768,9 @@ test "disabled automatic reviewer blocks for approval without a human prompt" {
         .name = "write_file",
         .arguments_json = args,
     }, .auto, &.{});
-    try std.testing.expectEqual(ToolPermissionDecision.permission_required, outcome.decision);
-    try std.testing.expectEqual(types.ToolPermissionDenialReason.permission_required, outcome.denial_reason.?);
-    try std.testing.expectEqual(command_admission.PermissionRequirement.approval_required, outcome.requirement.?);
+    try std.testing.expectEqual(ToolPermissionDecision.deny, outcome.decision);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, outcome.denial_reason.?);
+    try std.testing.expect(outcome.requirement == null);
     try std.testing.expect(outcome.execution_authority == null);
     try std.testing.expect(outcome.auto_review_result == null);
     try std.testing.expect(rt.worker.pending_permission_request_shared == null);
