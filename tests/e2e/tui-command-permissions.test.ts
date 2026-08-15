@@ -2505,7 +2505,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "TUI automatic ask routes to the human prompt",
+    "TUI automatic ask returns a recoverable denial without prompting",
     async () => {
       const root = createIsolatedRoot();
       const marker = join(root.workspace, "classifier-user-check.txt");
@@ -2536,25 +2536,22 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Run the classifier ask fixture.");
-      await activeSession.waitForPane(
-        (value) => value.includes(COMMAND_APPROVAL_PROMPT) || value.includes("3. No"),
-        TIMEOUT,
-      );
-      expect(existsSync(marker)).toBe(false);
-      expect(gateway.classifierRequests).toHaveLength(1);
-      // Deny the interactive prompt that ask fell through to.
-      await activeSession.sendKeys("3");
       const pane = await activeSession.waitForPane(
         (value) => value.includes("classifier automatic ask complete") && value.includes("❯"),
         TIMEOUT,
       );
-      expect(pane).not.toContain("Auto agent denied");
+      expect(pane).not.toContain(COMMAND_APPROVAL_PROMPT);
       expect(existsSync(marker)).toBe(false);
+      expect(gateway.classifierRequests).toHaveLength(1);
+      expect(pane).not.toContain("Auto agent denied");
       expect(gateway.requests).toHaveLength(2);
       const permissionResultRequest = gateway.requests[1]!.body;
       expect(permissionResultRequest).toContain("tool_permission_denied");
-      expect(permissionResultRequest).toContain("user_denied");
-      expect(permissionResultRequest).not.toContain("auto_denied");
+      expect(permissionResultRequest).toContain("auto_denied");
+      expect(permissionResultRequest).not.toContain("user_denied");
+      const trace = readFileSync(tracePath, "utf8");
+      expect(trace).toContain("auto_review_result tool_name=run_command decision=ask");
+      expect(trace).toContain("decision=deny approval_source=denied");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       await activeSession.sendText("/quit");
@@ -2747,7 +2744,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable() || process.platform !== "darwin")(
-    "auto sandbox widening requires fresh scoped review",
+    "auto sandbox widening ask returns a recoverable denial without prompting",
     async () => {
       const root = createIsolatedRoot("/Users/Shared");
       writeFileSync(
@@ -2787,17 +2784,13 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Install dependencies for this workspace.");
-      await activeSession.waitForPane(
-        (value) => value.includes("broader file access") || value.includes("3. No") || value.includes(COMMAND_APPROVAL_PROMPT),
-        TIMEOUT,
-      );
-      await activeSession.sendKeys("3");
       const pane = await activeSession.waitForPane(
         (value) => value.includes("preflight sandbox widening denied") && value.includes("❯"),
         TIMEOUT,
       );
 
       expect(pane).toContain("preflight sandbox widening denied");
+      expect(pane).not.toContain(COMMAND_APPROVAL_PROMPT);
       expect(existsSync(marker)).toBe(false);
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.classifierRequests).toHaveLength(2);
@@ -2819,7 +2812,7 @@ describe("effect-aware command permissions", () => {
       expect(wideningReview).not.toContain("restricted_result:");
       const denied = JSON.parse(toolResultText(gateway.requests[1]!.body, "command_1"));
       expect(denied.error.type).toBe("tool_permission_denied");
-      expect(denied.error.reason).toBe("user_denied");
+      expect(denied.error.reason).toBe("auto_denied");
       expect(denied.error.suggestion).toContain("The tool did not run.");
       expect(denied.error.details).toBeUndefined();
       const trace = readFileSync(tracePath, "utf8");
@@ -2839,7 +2832,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable() || process.platform !== "darwin")(
-    "reactive sandbox denial preserves restricted result and partial effect",
+    "reactive sandbox auto denial preserves restricted result and partial effect",
     async () => {
       const root = createIsolatedRoot("/Users/Shared");
       writeFileSync(
@@ -2891,17 +2884,13 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Run the reactive sandbox denial fixture.");
-      await activeSession.waitForPane(
-        (value) => value.includes("broader file access") || value.includes("3. No") || value.includes(COMMAND_APPROVAL_PROMPT),
-        TIMEOUT,
-      );
-      await activeSession.sendKeys("3");
       const pane = await activeSession.waitForPane(
         (value) => value.includes("reactive sandbox denial complete") && value.includes("❯"),
         TIMEOUT,
       );
 
       expect(pane).toContain("reactive sandbox denial complete");
+      expect(pane).not.toContain(COMMAND_APPROVAL_PROMPT);
       expect(readFileSync(workspaceMarker, "utf8")).toBe("workspace-effect");
       expect(existsSync(outsideMarker)).toBe(false);
       expect(gateway.requests).toHaveLength(2);
@@ -5087,6 +5076,7 @@ describe("effect-aware command permissions", () => {
                 name: "interactive-approval-child",
                 mode: "one_off",
                 prompt: childPrompt,
+                permission_mode: "ask",
               },
             },
           }, rootCreateCallId);
@@ -5118,7 +5108,7 @@ describe("effect-aware command permissions", () => {
       expect(approvalPane).toContain("touch");
       expect(approval).not.toBeNull();
       expect(subagentState(root, childId)).toBe("awaiting_approval");
-      expect(gateway.classifierRequests).toHaveLength(1);
+      expect(gateway.classifierRequests).toHaveLength(0);
       expect(existsSync(markerPath)).toBe(false);
       releaseApprovalUi();
 
@@ -6238,7 +6228,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "fx ask terminal automatic ask opens a human prompt instead of hard-denying",
+    "fx ask terminal automatic ask returns a recoverable denial without prompting",
     async () => {
       const root = createIsolatedRoot();
       const marker = join(root.workspace, "fx-ask-prompt-approved.txt");
@@ -6264,21 +6254,17 @@ describe("effect-aware command permissions", () => {
         height: 40,
         remainOnExit: true,
       });
-      const promptPane = await activeSession.waitForText("Approve? [y/N]", TIMEOUT);
-      expect(promptPane).toContain("Approve? [y/N]");
-      expect(promptPane).not.toContain("Auto agent denied");
+      const finalPane = await activeSession.waitForText("fx ask prompt complete", TIMEOUT);
+      expect(finalPane).not.toContain("Approve? [y/N]");
+      expect(finalPane).not.toContain("Auto agent denied");
       expect(existsSync(marker)).toBe(false);
       expect(gateway.classifierRequests).toHaveLength(1);
       expect(readFileSync(tracePath, "utf8")).toContain("event=auto_review_result");
       expect(readFileSync(tracePath, "utf8")).toContain("decision=ask");
-
-      // Decline the interactive ask; the turn continues without executing the command.
-      await activeSession.sendText("n");
-      const finalPane = await activeSession.waitForText("fx ask prompt complete", TIMEOUT);
-      expect(finalPane).toContain("fx ask prompt complete");
-      expect(finalPane).not.toContain("Auto agent denied");
       expect(existsSync(marker)).toBe(false);
       expect(gateway.requests).toHaveLength(2);
+      expect(gateway.requests[1]!.body).toContain("auto_denied");
+      expect(gateway.requests[1]!.body).not.toContain("user_denied");
       expect(readFileSync(tracePath, "utf8")).not.toContain("approval_source=interactive_once");
 
       await activeSession.kill();
