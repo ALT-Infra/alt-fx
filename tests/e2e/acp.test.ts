@@ -6780,6 +6780,48 @@ describe("acp: model catalog authentication", () => {
       TIMEOUT,
     );
   }
+
+  test(
+    "--model flag overrides selected model without inheriting the default Fast mode",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-model-override-");
+      const gateway = startFakeGateway([finalText("override complete")], {
+        models: [
+          { id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] },
+          {
+            id: "provider/fast-override",
+            type: "language",
+            tags: ["tool-use"],
+            fast_options: [{ type: "toggle" }],
+          },
+        ],
+      });
+      try {
+        client = await AcpClient.create({
+          args: ["acp", "--model", "provider/fast-override"],
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_MODEL: undefined },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const resp = await client.request("session/new", { mcpServers: [] }, 2) as any;
+        const modelOpt = resp.result.configOptions.find((o: any) => o.id === "model");
+        expect(modelOpt).toBeDefined();
+        expect(modelOpt.currentValue).toBe("provider/fast-override");
+
+        await client.readLine(); // consume session/update notification
+        const prompt = await runPrompt(client, "Confirm the model override.");
+        expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(1);
+        const request = JSON.parse(gateway.requests[0]!.body);
+        expect(request).not.toHaveProperty("providerOptions.gateway.speed");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
 });
 
 describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
@@ -7070,36 +7112,6 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
         const modelOpt = resp.result.configOptions.find((o: any) => o.id === "model");
         expect(modelOpt).toBeDefined();
         expect(modelOpt.options.length).toBeGreaterThan(1);
-      } finally {
-        await client?.close();
-        gateway.stop();
-        rmSync(root.root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "--model flag overrides selected model",
-    async () => {
-      const root = createIsolatedRoot("fx-acp-model-override-");
-      const gateway = startFakeGateway([], {
-        models: [
-          { id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] },
-          { id: "openai/gpt-4o", type: "language", tags: ["tool-use"] },
-        ],
-      });
-      try {
-        client = await AcpClient.create({
-          args: ["acp", "--model", "openai/gpt-4o"],
-          cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
-        });
-        await client.request("initialize", { protocolVersion: 1 }, 1);
-        const resp = await client.request("session/new", { mcpServers: [] }, 2) as any;
-        const modelOpt = resp.result.configOptions.find((o: any) => o.id === "model");
-        expect(modelOpt).toBeDefined();
-        expect(modelOpt.currentValue).toBe("openai/gpt-4o");
       } finally {
         await client?.close();
         gateway.stop();

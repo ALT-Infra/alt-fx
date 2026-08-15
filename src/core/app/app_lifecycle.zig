@@ -250,6 +250,7 @@ pub const BootstrapConfig = struct {
     footer_rows: u16,
     startup_min_body_rows: u16 = 0,
     default_model: []const u8,
+    default_fast_mode: bool = false,
     default_agent_step_limit: usize,
     secret_store: host.SecretStore,
     resize_handler: ResizeHandler,
@@ -262,25 +263,27 @@ pub fn loadStartupState(
     transport: oauth_transport.Provider,
     secret_store: host.SecretStore,
     default_model: []const u8,
+    default_fast_mode: bool,
     default_agent_step_limit: usize,
 ) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateFromOwnedWorkspace(alloc, transport, secret_store, workspace_root, default_model, default_agent_step_limit, .refresh_if_needed);
+    return loadStartupStateFromOwnedWorkspace(alloc, transport, secret_store, workspace_root, default_model, default_fast_mode, default_agent_step_limit, .refresh_if_needed);
 }
 
-pub fn loadStartupStateWithoutCredentials(alloc: Allocator, default_model: []const u8, default_agent_step_limit: usize) !StartupState {
+pub fn loadStartupStateWithoutCredentials(alloc: Allocator, default_model: []const u8, default_fast_mode: bool, default_agent_step_limit: usize) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, workspace_root, default_model, default_agent_step_limit, null);
+    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, workspace_root, default_model, default_fast_mode, default_agent_step_limit, null);
 }
 
 pub fn loadCatalogStartupState(
     alloc: Allocator,
     secret_store: host.SecretStore,
     default_model: []const u8,
+    default_fast_mode: bool,
     default_agent_step_limit: usize,
 ) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, secret_store, workspace_root, default_model, default_agent_step_limit, .stored);
+    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, secret_store, workspace_root, default_model, default_fast_mode, default_agent_step_limit, .stored);
 }
 
 pub fn loadStartupStatus(
@@ -335,7 +338,12 @@ pub fn applyWorkspaceLaunch(
 
 fn loadStartupStateForWorkspace(alloc: Allocator, workspace_root: []const u8, default_model: []const u8, default_agent_step_limit: usize) !StartupState {
     const owned_workspace_root = try alloc.dupe(u8, workspace_root);
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, owned_workspace_root, default_model, default_agent_step_limit, null);
+    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, owned_workspace_root, default_model, false, default_agent_step_limit, null);
+}
+
+fn loadStartupStateForWorkspaceWithFastDefault(alloc: Allocator, workspace_root: []const u8, default_model: []const u8, default_agent_step_limit: usize) !StartupState {
+    const owned_workspace_root = try alloc.dupe(u8, workspace_root);
+    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, owned_workspace_root, default_model, true, default_agent_step_limit, null);
 }
 
 const CredentialLoadMode = credentials.LoadMode;
@@ -346,6 +354,7 @@ fn loadStartupStateFromOwnedWorkspace(
     secret_store: host.SecretStore,
     owned_workspace_root: []u8,
     default_model: []const u8,
+    default_fast_mode: bool,
     default_agent_step_limit: usize,
     credential_mode: ?CredentialLoadMode,
 ) !StartupState {
@@ -386,7 +395,8 @@ fn loadStartupStateFromOwnedWorkspace(
     state.max_tool_result_bytes = tool_result_limits.resolveMaxToolResultBytes(settings.max_tool_result_bytes, tool_result_limits.default_max_tool_result_bytes);
     state.context_limits = config_runtime.resolveContextLimits(settings, &.{});
     state.context_enabled = settings.context orelse true;
-    state.fast_mode = settings.fast_mode orelse false;
+    state.fast_mode = settings.fast_mode orelse
+        (default_fast_mode and state.model_source == .compiled_default);
     state.input_appearance = initialInputAppearance(settings.input_appearance);
     state.maxxing_mode = initialMaxxingMode(settings.maxxing_mode);
     state.slash_menu_categories = settings.slash_menu_categories orelse true;
@@ -422,6 +432,7 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
         cfg.alloc,
         cfg.secret_store,
         cfg.default_model,
+        cfg.default_fast_mode,
         cfg.default_agent_step_limit,
     );
     errdefer state.deinit(cfg.alloc);
@@ -1942,6 +1953,7 @@ test "loadStartupState applies core env overrides" {
         oauth_transport.unavailable_provider,
         host.unavailable_secret_store,
         "default-model",
+        true,
         12,
     );
     defer state.deinit(std.testing.allocator);
@@ -1950,6 +1962,7 @@ test "loadStartupState applies core env overrides" {
     try std.testing.expectEqualStrings("env-model", state.selected_model);
     try std.testing.expectEqualStrings("default-model", state.configured_model);
     try std.testing.expectEqual(config_runtime.ModelSource.process_override, state.model_source);
+    try std.testing.expect(!state.fast_mode);
     try std.testing.expectEqualStrings("gateway-key", state.apiKey().?);
     try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, state.credential.?.source);
     try std.testing.expectEqual(PermissionMode.auto, state.permission_mode);
@@ -1957,13 +1970,14 @@ test "loadStartupState applies core env overrides" {
     try std.testing.expectEqual(sandbox.BackendKind.none, state.sandbox_backend);
 }
 
-test "loadStartupState preserves exact fast model defaults" {
+test "loadStartupState enables fast mode only for the compiled model default" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
     try tmp.dir.createDirPath(io_mod.getIo(), "absent");
     try tmp.dir.createDirPath(io_mod.getIo(), "configured");
+    try tmp.dir.createDirPath(io_mod.getIo(), "disabled");
 
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
     defer std.testing.allocator.free(home_root);
@@ -1971,11 +1985,13 @@ test "loadStartupState preserves exact fast model defaults" {
     defer std.testing.allocator.free(absent_root);
     const configured_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "configured");
     defer std.testing.allocator.free(configured_root);
+    const disabled_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "disabled");
+    defer std.testing.allocator.free(disabled_root);
 
     const fixture = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{{\"workspaces\":{{\"{s}\":{{\"model\":\"openai/gpt-5\"}}}}}}\n",
-        .{configured_root},
+        "{{\"workspaces\":{{\"{s}\":{{\"model\":\"openai/gpt-5\"}},\"{s}\":{{\"fast_mode\":false}}}}}}\n",
+        .{ configured_root, disabled_root },
     );
     defer std.testing.allocator.free(fixture);
     try writeFixtureFile(tmp.dir, "home/.fx/settings.json", fixture);
@@ -1983,17 +1999,23 @@ test "loadStartupState preserves exact fast model defaults" {
     var env = try TestEnv.install(std.testing.allocator, &.{.{ .key = "HOME", .value = home_root }});
     defer env.deinit();
 
-    var absent = try loadStartupStateForWorkspace(std.testing.allocator, absent_root, "zai/glm-5.2-fast", 25);
+    var absent = try loadStartupStateForWorkspaceWithFastDefault(std.testing.allocator, absent_root, "zai/glm-5.2", 25);
     defer absent.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("zai/glm-5.2-fast", absent.selected_model);
-    try std.testing.expectEqualStrings("zai/glm-5.2-fast", absent.configured_model);
-    try std.testing.expect(!absent.fast_mode);
+    try std.testing.expectEqualStrings("zai/glm-5.2", absent.selected_model);
+    try std.testing.expectEqualStrings("zai/glm-5.2", absent.configured_model);
+    try std.testing.expect(absent.fast_mode);
 
-    var configured = try loadStartupStateForWorkspace(std.testing.allocator, configured_root, "zai/glm-5.2-fast", 25);
+    var configured = try loadStartupStateForWorkspaceWithFastDefault(std.testing.allocator, configured_root, "zai/glm-5.2", 25);
     defer configured.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("openai/gpt-5", configured.selected_model);
     try std.testing.expectEqualStrings("openai/gpt-5", configured.configured_model);
     try std.testing.expect(!configured.fast_mode);
+
+    var disabled = try loadStartupStateForWorkspaceWithFastDefault(std.testing.allocator, disabled_root, "zai/glm-5.2", 25);
+    defer disabled.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("zai/glm-5.2", disabled.selected_model);
+    try std.testing.expectEqualStrings("zai/glm-5.2", disabled.configured_model);
+    try std.testing.expect(!disabled.fast_mode);
 }
 
 test "loadStartupState resolves startup scrollback default and explicit false" {

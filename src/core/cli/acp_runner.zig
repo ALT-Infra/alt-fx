@@ -15,6 +15,7 @@ const Allocator = std.mem.Allocator;
 
 pub const Config = struct {
     default_model: []const u8,
+    default_fast_mode: bool = false,
     default_agent_step_limit: usize,
     gateway_retry_count: usize,
     gateway_chat_url: []const u8,

@@ -40,6 +40,7 @@ import {
 } from "./tmux-helpers";
 
 const MODEL = "openai/gpt-5.5";
+const DEFAULT_MODEL = "zai/glm-5.2";
 const DELAY_MS = 32_500;
 const MALFORMED_ARGUMENTS = '{"depth":1,"depth":2}';
 const MALFORMED_CALL_ID = "malformed_ask_1";
@@ -738,6 +739,55 @@ describe("gateway stream lifecycle", () => {
       expect(gateway.requests[0]!.body).not.toContain(
         "Continue from the latest meaningful state",
       );
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("ask keeps the GLM default model identity while enabling fast mode", async () => {
+    const root = createFixtureRoot("default-model-fast");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startDynamicFakeGateway(
+      () => fakeGatewayFinalText("DEFAULT_MODEL_FAST_COMPLETE"),
+      {
+        models: [{
+          id: DEFAULT_MODEL,
+          type: "language",
+          tags: ["tool-use"],
+          fast_options: [{ type: "toggle" }],
+        }],
+      },
+    );
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Use the default model."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_MODEL: undefined,
+            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/v1/models`,
+          },
+          timeoutMs: 30_000,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      expect(parseAskJson(result.stdout).output).toContain(
+        "DEFAULT_MODEL_FAST_COMPLETE",
+      );
+      expect(result.stderr).toBe("");
+      expect(gateway.requests).toHaveLength(1);
+      expect(gateway.requests[0]!.headers.get("ai-language-model-id")).toBe(
+        DEFAULT_MODEL,
+      );
+      const request = JSON.parse(gateway.requests[0]!.body);
+      expect(request).not.toHaveProperty("fast");
+      expect(request).toMatchObject({
+        providerOptions: { gateway: { speed: "fast" } },
+      });
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });

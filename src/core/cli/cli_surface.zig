@@ -162,6 +162,7 @@ pub const Config = struct {
     build_channel: update_target.Channel = .stable,
     command_catalog: CommandCatalog,
     default_model: []const u8,
+    default_fast_mode: bool = false,
     default_agent_step_limit: usize,
     models_path: []const u8,
     gateway_retry_count: usize,
@@ -289,9 +290,9 @@ const WorkflowOptions = struct {
 };
 
 const WriteFn = *const fn (?*anyopaque, []const u8) anyerror!void;
-const LoadStartupStateFn = *const fn (Allocator, oauth_transport.Provider, host.SecretStore, []const u8, usize) anyerror!app_lifecycle.StartupState;
-const LoadCatalogStartupStateFn = *const fn (Allocator, host.SecretStore, []const u8, usize) anyerror!app_lifecycle.StartupState;
-const LoadStartupStateWithoutCredentialsFn = *const fn (Allocator, []const u8, usize) anyerror!app_lifecycle.StartupState;
+const LoadStartupStateFn = *const fn (Allocator, oauth_transport.Provider, host.SecretStore, []const u8, bool, usize) anyerror!app_lifecycle.StartupState;
+const LoadCatalogStartupStateFn = *const fn (Allocator, host.SecretStore, []const u8, bool, usize) anyerror!app_lifecycle.StartupState;
+const LoadStartupStateWithoutCredentialsFn = *const fn (Allocator, []const u8, bool, usize) anyerror!app_lifecycle.StartupState;
 const LoadStartupStatusFn = *const fn (Allocator, host.SecretStore, []const u8, usize) anyerror!app_lifecycle.StartupStatus;
 const GetenvFn = *const fn (?*anyopaque, []const u8) ?[]const u8;
 const EnvironMapFn = *const fn (?*anyopaque) ?*const std.process.Environ.Map;
@@ -676,6 +677,7 @@ fn runNonInteractiveWithDeps(
             };
             try cfg.acp_runner.run(alloc, .{
                 .default_model = cfg.default_model,
+                .default_fast_mode = cfg.default_fast_mode,
                 .default_agent_step_limit = cfg.default_agent_step_limit,
                 .gateway_retry_count = cfg.gateway_retry_count,
                 .gateway_chat_url = cfg.gateway_provider.chat_url.resolve(cfg.gateway_chat_url),
@@ -813,7 +815,7 @@ fn runNonInteractiveWithDeps(
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .permissions, "permissions", err, rest);
                 return .handled_failure;
             };
-            var startup = try deps.load_startup_state_without_credentials(alloc, cfg.default_model, cfg.default_agent_step_limit);
+            var startup = try deps.load_startup_state_without_credentials(alloc, cfg.default_model, cfg.default_fast_mode, cfg.default_agent_step_limit);
             defer startup.deinit(alloc);
             try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
             const rules = try permissionRulesForSnapshot(alloc, startup.permission_rules);
@@ -840,6 +842,7 @@ fn runNonInteractiveWithDeps(
                 alloc,
                 cfg.secret_store,
                 cfg.default_model,
+                cfg.default_fast_mode,
                 cfg.default_agent_step_limit,
             );
             defer startup.deinit(alloc);
@@ -1186,6 +1189,7 @@ fn runNonInteractiveWithDeps(
             var startup = deps.load_startup_state_without_credentials(
                 alloc,
                 cfg.default_model,
+                cfg.default_fast_mode,
                 cfg.default_agent_step_limit,
             ) catch |err| {
                 try writeWorkspaceCommandError(alloc, cfg.command_catalog, deps, rest, err);
@@ -1243,6 +1247,7 @@ fn runNonInteractiveWithDeps(
                 cfg.gateway_provider.oauth_transport,
                 cfg.secret_store,
                 cfg.default_model,
+                cfg.default_fast_mode,
                 cfg.default_agent_step_limit,
             );
             defer startup.deinit(alloc);
@@ -1307,6 +1312,7 @@ fn runNonInteractiveWithDeps(
             var startup = deps.load_startup_state_without_credentials(
                 alloc,
                 cfg.default_model,
+                cfg.default_fast_mode,
                 cfg.default_agent_step_limit,
             ) catch |err| {
                 if (opts.format == .json) {
@@ -2651,6 +2657,7 @@ fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
     return .{
         .command_usage = command_specs.topLevelUsage(cfg.command_catalog, .ask),
         .default_model = cfg.default_model,
+        .default_fast_mode = cfg.default_fast_mode,
         .default_agent_step_limit = cfg.default_agent_step_limit,
         .gateway_retry_count = cfg.gateway_retry_count,
         .gateway_chat_url = cfg.gateway_provider.chat_url.resolve(cfg.gateway_chat_url),
@@ -4955,12 +4962,14 @@ fn stubLoadStartupState(
     _: oauth_transport.Provider,
     _: host.SecretStore,
     default_model: []const u8,
+    default_fast_mode: bool,
     default_agent_step_limit: usize,
 ) !app_lifecycle.StartupState {
     var state = app_lifecycle.StartupState{ .agent_step_limit = default_agent_step_limit };
     errdefer state.deinit(alloc);
     state.workspace_root = try alloc.dupe(u8, "/tmp/fx");
     state.selected_model = try alloc.dupe(u8, default_model);
+    state.fast_mode = default_fast_mode;
     state.credential = .{
         .token = try alloc.dupe(u8, "test-key"),
         .source = .ai_gateway_api_key,
@@ -4973,9 +4982,10 @@ fn stubLoadCatalogStartupState(
     alloc: Allocator,
     secret_store: host.SecretStore,
     default_model: []const u8,
+    default_fast_mode: bool,
     default_agent_step_limit: usize,
 ) !app_lifecycle.StartupState {
-    return stubLoadStartupState(alloc, oauth_transport.unavailable_provider, secret_store, default_model, default_agent_step_limit);
+    return stubLoadStartupState(alloc, oauth_transport.unavailable_provider, secret_store, default_model, default_fast_mode, default_agent_step_limit);
 }
 
 fn stubLoadStartupStatus(
@@ -5002,6 +5012,7 @@ fn failingStartupState(
     _: oauth_transport.Provider,
     _: host.SecretStore,
     _: []const u8,
+    _: bool,
     _: usize,
 ) !app_lifecycle.StartupState {
     return error.StartupShouldNotRun;
