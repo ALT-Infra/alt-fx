@@ -1,8 +1,30 @@
 # fx
 
-## 0.4.1
+## 0.4.2
 
 <!-- release:start -->
+
+### New Features
+
+- **MCP configuration diagnostics:** `fx status`, `fx status --json`, and `fx doctor` report invalid `~/.fx/mcp.json` profiles without starting MCP servers
+
+### Improvements
+
+- **Default model:** New sessions use `zai/glm-5.2` with Fast mode enabled when neither preference is configured and preserve any explicit choice
+- **Update and resume notices:** Show the installed version after a Ctrl+G update relaunch and include the session title when restoring a saved session
+- **Terminal ask output:** Terminal `fx ask` sessions show the shared fx startup header before the prompt, while redirected and JSON output remain unchanged
+- **Recovery diagnostics:** Retry and paused recovery statuses show available HTTP, provider, or transport error details after redacting secrets and terminal control bytes
+- **Child approvals:** Parent agents receive child approval requests during the same turn while the child remains blocked for a decision
+
+### Bug Fixes
+
+- **Transcript scrollback:** Keep mutable streaming rows out of native scrollback until they are final, while continuing to update the live viewport and preserving aligned cancellation frames after resize
+- **Recovery continuation:** Accept one `/continue` as soon as a recovery pause appears, even while the previous worker finishes cleanup
+- **Recovery pacing:** Keep one recovery attempt budget across failure causes and reset backoff after the cause changes, an explicit retry delay, authentication refresh, or a successful request
+- **Terminal tool compatibility:** Keep the `terminal` tool available when providers apply stricter schema validation while continuing to reject fields unsupported by the selected action
+<!-- release:end -->
+
+## 0.4.1
 
 ### New Features
 
@@ -21,7 +43,6 @@
 - **Terminal monitor paths:** Show `Failed start: path is outside the workspace` when a start monitor resolves beyond its terminal workspace
 - **Terminal titles:** Restore `fx · <model>` on startup, keep it current after resume and model selection, and clear it after startup failures or shutdown
 - **Resumed subagents:** Prevent Ctrl+X manager refreshes from restarting incomplete recovery while allowing later explicit subagent operations to retry it
-<!-- release:end -->
 
 ## 0.4.0
 
