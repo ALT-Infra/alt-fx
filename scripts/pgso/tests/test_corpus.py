@@ -25,6 +25,7 @@ TRAINING_E2E_TESTS = (
     "config-persistence.test.ts",
     "prompt-history.test.ts",
     "auth-refresh.test.ts",
+    "auto-mode-reliability.test.ts",
     "file-tool-paths.test.ts",
     "file-tool-permissions.test.ts",
     "gateway-stream-lifecycle.test.ts",
@@ -330,8 +331,8 @@ class PgsoCorpusTests(unittest.TestCase):
             EXCLUDED_E2E_TESTS,
             tuple(test_file for test_file, _ in corpus.intentional_exclusions),
         )
-        self.assertEqual(36, len(corpus.scenarios))
-        self.assertEqual(51, len(corpus.candidate_scenarios))
+        self.assertEqual(37, len(corpus.scenarios))
+        self.assertEqual(52, len(corpus.candidate_scenarios))
         self.assertEqual(
             ("e2e-cli", "e2e-mcp-auth"),
             tuple(
