@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { buildEvalProcessEnv } from "./eval-helpers";
+import { buildEvalProcessEnv, shouldLoadDotEnv } from "./eval-helpers";
 
 describe("eval helpers", () => {
   test("passes the selected eval model to fx through FX_MODEL", () => {
@@ -19,5 +19,10 @@ describe("eval helpers", () => {
         process.env.FX_MODEL = previous;
       }
     }
+  });
+
+  test("does not load repository dotenv files in a hermetic run", () => {
+    expect(shouldLoadDotEnv({ FX_E2E_DISABLE_DOTENV: "1" })).toBe(false);
+    expect(shouldLoadDotEnv({})).toBe(true);
   });
 });

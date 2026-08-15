@@ -41,7 +41,7 @@ python3 -m scripts.pgso all \
 
 `build` verifies the control, bitcode, instrumented link, profile-section alignment, signature, and one profile-producing smoke. `train` additionally runs the versioned corpus and creates a checked candidate. Both are useful diagnostics but finish with `eligible: false` because they do not run the complete release-safety gate.
 
-`qualify` and `all` run the complete fresh-build path: training, profile use, candidate verification, the candidate behavior corpus, six startup comparisons, and six heavy-workload comparisons. `all` is the canonical CI entry point. `report --output-dir <path>` is the only command that may reuse an existing directory, and it only reads a complete eligible manifest.
+`all` runs the complete fresh-build path: training, profile use, candidate verification, the candidate behavior corpus, six startup comparisons, and six heavy-workload comparisons. It is the canonical CI entry point. `report --output-dir <path>` is the only command that may reuse an existing directory, and it only reads a complete eligible manifest.
 
 The production workflow runs the same gate as a distributed DAG. One seed job
 builds the control, bitcode, and instrumented binary. Up to twenty training
@@ -115,7 +115,9 @@ manifest.json
 
 Generated binaries, bitcode, objects, profiles, caches, measurements, and logs are evidence artifacts and must not be committed. `manifest.json` is rewritten atomically after every stage. A failed manifest retains completed evidence, names the failing stage, records `eligible: false`, and never falls back to an unprofiled candidate.
 
-The driver also streams operational progress to the invoking terminal or GitHub Actions log. Every stage announces its start and terminal status with elapsed time, every child command announces its start and terminal status, and child stdout and stderr remain visible while the process runs. A silent child emits a heartbeat every 30 seconds. Full stdout and stderr continue to be retained in the command's JSON log, and no environment variables are printed.
+The driver also streams operational progress to the invoking terminal or GitHub Actions log. Every stage announces its start and terminal status with elapsed time, every child command announces its start and terminal status, and child stdout and stderr remain visible while the process runs. A silent child emits a heartbeat every 30 seconds. JSON evidence retains at most the last 1,048,576 characters from each output stream per command and records the total character counts and truncation status; no environment variables are printed.
+
+Corpus scenarios inherit only a small operating-system environment allowlist. Credentials, live-test flags, tracing settings, and repository dotenv files are excluded unless a value is explicitly declared in the versioned corpus. The runner temporarily installs the assigned artifact at `zig-out/bin/fx` for E2E compatibility, then restores the prior file (or prior absence) after success, failure, timeout, or cancellation.
 
 The native workflow uploads bounded phase evidence rather than caches or
 intermediate compiler objects. Pull requests and manual runs have read-only

@@ -8,14 +8,12 @@ import unittest
 from scripts.pgso.model import (
     BuildIdentity,
     PgsoError,
-    RunManifest,
     bytes_to_mib,
     profile_evidence,
     require_empty_stderr,
     sha256_file,
     size_gate,
     verify_identity,
-    write_manifest,
 )
 
 
@@ -124,49 +122,6 @@ class PgsoModelTests(unittest.TestCase):
             "profile use wrote unexpected stderr: optimizer warning",
         ):
             require_empty_stderr("profile use", "optimizer warning")
-
-    def test_write_manifest_uses_canonical_sorted_json(self) -> None:
-        manifest = RunManifest(
-            identity=self.identity(),
-            status="running",
-            stage="control",
-            artifact=size_gate(7_837_920),
-            warnings=(),
-        )
-        expected = """{
-  "artifact": {
-    "ceiling_mib": 7.8,
-    "headroom_mib": 0.3251770019531248,
-    "preferred_headroom_met": true,
-    "preferred_headroom_mib": 0.25,
-    "size_bytes": 7837920,
-    "size_mib": 7.474822998046875
-  },
-  "identity": {
-    "bitcode_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    "corpus_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-    "generation_flags": [
-      "--disable-vp"
-    ],
-    "host_arch": "arm64",
-    "llvm_version": "21.1.8",
-    "source_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "target": "aarch64-macos",
-    "update_channel": "stable",
-    "zig_version": "0.16.0"
-  },
-  "stage": "control",
-  "status": "running",
-  "warnings": []
-}
-"""
-
-        with tempfile.TemporaryDirectory(prefix="fx-pgso-model-") as tmp:
-            path = pathlib.Path(tmp) / "manifest.json"
-            write_manifest(path, manifest)
-
-            self.assertEqual(expected, path.read_text())
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -50,16 +50,20 @@ class PgsoCliTests(unittest.TestCase):
         self.assertEqual("hyperfine", arguments.hyperfine)
 
     def test_every_mutating_command_requires_toolchain_and_output(self) -> None:
-        for command in ("build", "train", "qualify", "all"):
+        for command in ("build", "train", "all"):
             with self.subTest(command=command):
                 with self.assertRaises(SystemExit):
                     parse_args([command])
 
     def test_qualification_rejects_fewer_than_fifty_samples(self) -> None:
-        for command in ("qualify", "all"):
+        for command in ("all",):
             with self.subTest(command=command):
                 with self.assertRaises(SystemExit):
                     parse_args([*self.required_arguments(command), "--samples", "49"])
+
+    def test_redundant_qualify_alias_is_not_exposed(self) -> None:
+        with self.assertRaises(SystemExit):
+            parse_args(self.required_arguments("qualify"))
 
     def test_fresh_output_rejects_nonempty_state(self) -> None:
         output = self.root / "output"
@@ -131,6 +135,22 @@ class PgsoCliTests(unittest.TestCase):
         self.assertEqual("validate", payload["stage"])
         self.assertFalse(payload["eligible"])
         self.assertEqual("wrong LLVM version", payload["error"])
+
+    def test_driver_marks_the_manifest_failed_when_interrupted(self) -> None:
+        arguments = parse_args(self.required_arguments())
+        with mock.patch(
+            "scripts.pgso.__main__.Toolchain.discover",
+            side_effect=KeyboardInterrupt(),
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                run_command(arguments)
+
+        payload = json.loads(
+            (arguments.output_dir / "manifest.json").read_text()
+        )
+        self.assertEqual("failed", payload["status"])
+        self.assertEqual("validate", payload["stage"])
+        self.assertFalse(payload["eligible"])
 
     def test_runtime_validation_rejects_the_wrong_bun_version(self) -> None:
         arguments = parse_args(self.required_arguments())

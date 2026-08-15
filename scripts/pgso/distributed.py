@@ -49,7 +49,7 @@ from scripts.pgso.qualify import (
     relink_profile_linked_benchmarks,
     require_measurements_passed,
 )
-from scripts.pgso.runner import run_checked
+from scripts.pgso.runner import cancellation_guard, run_checked
 from scripts.pgso.toolchain import SUPPORTED_TARGET, Toolchain
 
 
@@ -714,6 +714,16 @@ def _load_documents(
 
 
 def run_plan(phase: str, corpus_path: pathlib.Path, maximum_shards: int) -> dict[str, object]:
+    if phase == "startup":
+        return {"include": [{"name": name} for name, _argv in STARTUP_COMMANDS]}
+    if phase == "heavy":
+        return {
+            "include": [
+                {"name": workload.name}
+                for plan in BENCHMARK_PLANS
+                for workload in plan.workloads
+            ]
+        }
     corpus = load_corpus(corpus_path, repo_root=REPO_ROOT)
     if phase == "training":
         scenarios = corpus.scenarios
@@ -1170,7 +1180,11 @@ def _parser() -> argparse.ArgumentParser:
 
     plan = subparsers.add_parser("plan")
     _add_common(plan)
-    plan.add_argument("--phase", choices=("training", "behavior"), required=True)
+    plan.add_argument(
+        "--phase",
+        choices=("training", "behavior", "startup", "heavy"),
+        required=True,
+    )
     plan.add_argument("--maximum-shards", type=int, default=20)
 
     training = subparsers.add_parser("train-shard")
@@ -1222,24 +1236,29 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     try:
-        if arguments.command == "plan":
-            payload = run_plan(arguments.phase, arguments.corpus, arguments.maximum_shards)
-            print(json.dumps(payload, separators=(",", ":"), sort_keys=True))
+        with cancellation_guard():
+            if arguments.command == "plan":
+                payload = run_plan(
+                    arguments.phase,
+                    arguments.corpus,
+                    arguments.maximum_shards,
+                )
+                print(json.dumps(payload, separators=(",", ":"), sort_keys=True))
+                return 0
+            if arguments.command == "train-shard":
+                manifest = run_training_shard(arguments)
+            elif arguments.command == "candidate":
+                manifest = run_candidate(arguments)
+            elif arguments.command == "behavior-shard":
+                manifest = run_behavior_shard(arguments)
+            elif arguments.command == "measure":
+                if arguments.samples < 50:
+                    raise PgsoError("measurement requires at least 50 samples")
+                manifest = run_measurement_shard(arguments)
+            else:
+                manifest = run_aggregate(arguments)
+            print(manifest)
             return 0
-        if arguments.command == "train-shard":
-            manifest = run_training_shard(arguments)
-        elif arguments.command == "candidate":
-            manifest = run_candidate(arguments)
-        elif arguments.command == "behavior-shard":
-            manifest = run_behavior_shard(arguments)
-        elif arguments.command == "measure":
-            if arguments.samples < 50:
-                raise PgsoError("measurement requires at least 50 samples")
-            manifest = run_measurement_shard(arguments)
-        else:
-            manifest = run_aggregate(arguments)
-        print(manifest)
-        return 0
     except PgsoError as error:
         output = getattr(arguments, "output_dir", None)
         if isinstance(output, pathlib.Path):

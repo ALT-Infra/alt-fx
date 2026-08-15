@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
-import json
 import pathlib
 
 
@@ -34,15 +33,6 @@ class ArtifactEvidence:
     headroom_mib: float
     preferred_headroom_mib: float
     preferred_headroom_met: bool
-
-
-@dataclasses.dataclass(frozen=True)
-class RunManifest:
-    identity: BuildIdentity
-    status: str
-    stage: str
-    artifact: ArtifactEvidence | None = None
-    warnings: tuple[str, ...] = ()
 
 
 def sha256_file(path: pathlib.Path) -> str:
@@ -113,12 +103,3 @@ def size_gate(
 def require_empty_stderr(stage: str, stderr: str) -> None:
     if stderr:
         raise PgsoError(f"{stage} wrote unexpected stderr: {stderr}")
-
-
-def write_manifest(path: pathlib.Path, manifest: RunManifest) -> None:
-    payload = json.dumps(
-        dataclasses.asdict(manifest),
-        indent=2,
-        sort_keys=True,
-    )
-    path.write_text(payload + "\n", encoding="utf-8")

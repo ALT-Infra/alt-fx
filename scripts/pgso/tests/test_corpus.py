@@ -317,6 +317,15 @@ class PgsoCorpusTests(unittest.TestCase):
                 with self.assertRaisesRegex(PgsoError, "reserved environment key"):
                     load_corpus(self.write_manifest(payload), repo_root=self.root)
 
+    def test_load_rejects_skipped_scenarios(self) -> None:
+        payload = self.manifest()
+        scenarios = payload["scenarios"]
+        assert isinstance(scenarios, list)
+        scenarios[0]["skip_reason"] = "not applicable"
+
+        with self.assertRaisesRegex(PgsoError, "cannot be skipped"):
+            load_corpus(self.write_manifest(payload), repo_root=self.root)
+
     def test_production_manifest_classifies_every_e2e_file(self) -> None:
         repo_root = pathlib.Path(__file__).resolve().parents[3]
         corpus = load_corpus(
@@ -417,7 +426,6 @@ class PgsoCorpusTests(unittest.TestCase):
         name: str,
         *,
         requires_tmux: bool = False,
-        skip_reason: str | None = None,
     ) -> Scenario:
         return Scenario(
             name=name,
@@ -429,7 +437,6 @@ class PgsoCorpusTests(unittest.TestCase):
             requires_tmux=requires_tmux,
             allow_keychain=False,
             test_file=None,
-            skip_reason=skip_reason,
         )
 
     def make_corpus(self, *scenarios: Scenario) -> Corpus:
@@ -507,7 +514,7 @@ class PgsoCorpusTests(unittest.TestCase):
         )
         return result, calls, merges, binary, merged_profile
 
-    def test_run_inherits_environment_and_owns_per_scenario_profiles(self) -> None:
+    def test_run_uses_a_hermetic_environment_and_owns_per_scenario_profiles(self) -> None:
         corpus = self.make_corpus(
             self.make_scenario("first"),
             self.make_scenario("second"),
@@ -530,20 +537,17 @@ class PgsoCorpusTests(unittest.TestCase):
         self.assertEqual(0, result.skipped)
         self.assertEqual(0, result.failed)
         self.assertEqual(2, result.merged_raw_profiles)
-        self.assertEqual(
-            sha256_bytes(binary.read_bytes()),
-            sha256_bytes(
-                (self.root / "zig-out" / "bin" / "fx").read_bytes()
-            ),
-        )
+        self.assertFalse((self.root / "zig-out" / "bin" / "fx").exists())
         self.assertTrue(merged.is_file())
         self.assertEqual(2, len(calls))
-        self.assertEqual("yes", calls[0]["env"]["PGSO_INHERITED"])
+        self.assertNotIn("PGSO_INHERITED", calls[0]["env"])
         self.assertNotIn("PGSO_UNSET_ME", calls[0]["env"])
         self.assertNotIn("TMUX", calls[0]["env"])
         self.assertNotIn("TMUX_PANE", calls[0]["env"])
         self.assertNotIn("FX_TRACE_LOG", calls[0]["env"])
         self.assertNotIn("FX_TRACE_SCOPES", calls[0]["env"])
+        self.assertEqual("1", calls[0]["env"]["FX_E2E_DISABLE_DOTENV"])
+        self.assertEqual(os.environ["PATH"], calls[0]["env"]["PATH"])
         self.assertEqual(
             str(self.root / "output" / "profiles" / "home" / "first"),
             calls[0]["env"]["HOME"],
@@ -636,21 +640,7 @@ class PgsoCorpusTests(unittest.TestCase):
         with self.assertRaisesRegex(CorpusRunError, "produced no raw profile"):
             self.run_fixture(corpus, omit_profile_for="missing-profile")
 
-    def test_run_records_only_explicit_manifest_skips(self) -> None:
-        corpus = self.make_corpus(
-            self.make_scenario("skip", skip_reason="not applicable in smoke"),
-            self.make_scenario("run"),
-        )
-
-        result, calls, merges, _, _ = self.run_fixture(corpus)
-
-        self.assertEqual(1, result.passed)
-        self.assertEqual(1, result.skipped)
-        self.assertEqual(0, result.failed)
-        self.assertEqual(1, len(calls))
-        self.assertEqual(1, len(merges))
-
-    def test_behavior_corpus_replaces_canonical_binary_with_fresh_inode(self) -> None:
+    def test_behavior_corpus_restores_the_previous_canonical_binary(self) -> None:
         corpus = self.make_corpus(self.make_scenario("first"))
         canonical = self.root / "zig-out" / "bin" / "fx"
         canonical.parent.mkdir(parents=True)
@@ -675,8 +665,33 @@ class PgsoCorpusTests(unittest.TestCase):
             command_runner=command_runner,
         )
 
-        self.assertEqual(b"candidate", canonical.read_bytes())
-        self.assertNotEqual(stale_inode, canonical.stat().st_ino)
+        self.assertEqual(b"stale", canonical.read_bytes())
+        self.assertEqual(stale_inode, canonical.stat().st_ino)
+
+    def test_interruption_cleans_tmux_and_restores_the_canonical_binary(self) -> None:
+        corpus = self.make_corpus(self.make_scenario("first", requires_tmux=True))
+        canonical = self.root / "zig-out" / "bin" / "fx"
+        canonical.parent.mkdir(parents=True)
+        canonical.write_bytes(b"original")
+        binary = self.root / "candidate-fx"
+        binary.write_bytes(b"candidate")
+
+        def interrupted_runner(*_args, **_kwargs):
+            raise KeyboardInterrupt()
+
+        with (
+            mock.patch("scripts.pgso.corpus._cleanup_tmux") as cleanup,
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            run_behavior_corpus(
+                corpus,
+                binary,
+                self.root / "behavior-output",
+                command_runner=interrupted_runner,
+            )
+
+        cleanup.assert_called_once()
+        self.assertEqual(b"original", canonical.read_bytes())
 
     def test_behavior_corpus_runs_the_exact_binary_without_profile_output(self) -> None:
         corpus = self.make_corpus(
@@ -745,12 +760,6 @@ class PgsoCorpusTests(unittest.TestCase):
                 / ".tmux.conf"
             ).read_text(),
         )
-
-
-def sha256_bytes(contents: bytes) -> str:
-    import hashlib
-
-    return hashlib.sha256(contents).hexdigest()
 
 
 def dataclasses_replace_env(
