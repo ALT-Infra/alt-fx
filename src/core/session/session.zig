@@ -2016,10 +2016,16 @@ pub fn dupeHistoryTurn(alloc: Allocator, turn: HistoryTurn) !HistoryTurn {
     switch (turn) {
         .compacted_summary => |entry| {
             const summary = try alloc.dupe(u8, entry.summary);
+            errdefer alloc.free(summary);
+            const root_user_messages = try core_types.dupeCompletedToolNames(
+                alloc,
+                entry.root_user_messages,
+            );
             return .{ .compacted_summary = .{
                 .summary = summary,
                 .removed_turn_count = entry.removed_turn_count,
                 .compaction_count = entry.compaction_count,
+                .root_user_messages = root_user_messages,
             } };
         },
         .assistant => |entry| {
@@ -2922,11 +2928,88 @@ fn buildCompactedSummaryTurn(
     existing: ?CompactedSummaryHistoryTurn,
     removed: []const HistoryTurn,
 ) !CompactedSummaryHistoryTurn {
+    const root_user_messages = try buildCompactedRootUserMessages(alloc, existing, removed);
+    errdefer core_types.freeCompletedToolNames(alloc, root_user_messages);
     return .{
         .summary = try buildCompactedSummaryText(alloc, existing, removed),
         .removed_turn_count = (if (existing) |entry| entry.removed_turn_count else 0) + removed.len,
         .compaction_count = (if (existing) |entry| entry.compaction_count else 0) + 1,
+        .root_user_messages = root_user_messages,
     };
+}
+
+fn buildCompactedRootUserMessages(
+    alloc: Allocator,
+    existing: ?CompactedSummaryHistoryTurn,
+    removed: []const HistoryTurn,
+) ![][]u8 {
+    var count: usize = if (existing) |entry| entry.root_user_messages.len else 0;
+    for (removed) |turn| switch (turn) {
+        .assistant, .background_command, .interrupted => count += 1,
+        .compacted_summary => |entry| count += entry.root_user_messages.len,
+    };
+    if (count == 0) return &.{};
+
+    const messages = try alloc.alloc([]u8, count);
+    errdefer alloc.free(messages);
+    var copied: usize = 0;
+    errdefer for (messages[0..copied]) |root_message| alloc.free(root_message);
+
+    if (existing) |entry| {
+        for (entry.root_user_messages) |root_message| {
+            messages[copied] = try alloc.dupe(u8, root_message);
+            copied += 1;
+        }
+    }
+    for (removed) |turn| switch (turn) {
+        .assistant => |entry| {
+            messages[copied] = try alloc.dupe(u8, entry.user.text);
+            copied += 1;
+        },
+        .background_command => |entry| {
+            messages[copied] = try alloc.dupe(u8, entry.user.text);
+            copied += 1;
+        },
+        .interrupted => |entry| {
+            messages[copied] = try alloc.dupe(u8, entry.user.text);
+            copied += 1;
+        },
+        .compacted_summary => |entry| for (entry.root_user_messages) |root_message| {
+            messages[copied] = try alloc.dupe(u8, root_message);
+            copied += 1;
+        },
+    };
+    std.debug.assert(copied == messages.len);
+    return messages;
+}
+
+test "history compaction preserves exact ordered root-user text separately from summary" {
+    const alloc = std.testing.allocator;
+    const removed = [_]HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("first exact request") },
+            .assistant = @constCast("first response"),
+        } },
+        .{ .interrupted = .{
+            .user = .{ .text = @constCast("second exact request") },
+        } },
+    };
+    const first = try buildCompactedSummaryTurn(alloc, null, &removed);
+    defer freeHistoryTurn(alloc, .{ .compacted_summary = first });
+    try std.testing.expectEqual(@as(usize, 2), first.root_user_messages.len);
+    try std.testing.expectEqualStrings("first exact request", first.root_user_messages[0]);
+    try std.testing.expectEqualStrings("second exact request", first.root_user_messages[1]);
+
+    const later = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("third exact request") },
+        .assistant = @constCast("third response"),
+    } }};
+    const second = try buildCompactedSummaryTurn(alloc, first, &later);
+    defer freeHistoryTurn(alloc, .{ .compacted_summary = second });
+    try std.testing.expectEqual(@as(usize, 3), second.root_user_messages.len);
+    try std.testing.expectEqualStrings("first exact request", second.root_user_messages[0]);
+    try std.testing.expectEqualStrings("second exact request", second.root_user_messages[1]);
+    try std.testing.expectEqualStrings("third exact request", second.root_user_messages[2]);
 }
 
 fn buildCompactedSummaryText(

@@ -82,6 +82,12 @@ fn writeHistoryTurnJson(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
             try writer.writeAll("{\"kind\":\"compacted_summary\",\"summary\":");
             try std.json.Stringify.value(entry.summary, .{}, writer);
             try writer.print(",\"removed_turn_count\":{d},\"compaction_count\":{d}", .{ entry.removed_turn_count, entry.compaction_count });
+            try writer.writeAll(",\"root_user_messages\":[");
+            for (entry.root_user_messages, 0..) |message, index| {
+                if (index > 0) try writer.writeByte(',');
+                try std.json.Stringify.value(message, .{}, writer);
+            }
+            try writer.writeByte(']');
             try writer.writeByte('}');
         },
         .assistant => |entry| {
@@ -607,10 +613,25 @@ fn parseLegacyHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Hist
     const kind = try requireString(object, "kind");
 
     if (std.mem.eql(u8, kind, "compacted_summary")) {
+        const root_user_messages: [][]u8 = if (object.get("root_user_messages")) |messages_value| blk: {
+            if (messages_value != .array) return error.InvalidSessionFormat;
+            const messages = try alloc.alloc([]u8, messages_value.array.items.len);
+            errdefer alloc.free(messages);
+            var copied: usize = 0;
+            errdefer for (messages[0..copied]) |message| alloc.free(message);
+            for (messages_value.array.items, 0..) |item, index| {
+                if (item != .string) return error.InvalidSessionFormat;
+                messages[index] = try alloc.dupe(u8, item.string);
+                copied += 1;
+            }
+            break :blk messages;
+        } else &.{};
+        errdefer session.freeCompletedToolNames(alloc, root_user_messages);
         return .{ .compacted_summary = .{
             .summary = try alloc.dupe(u8, try requireString(object, "summary")),
             .removed_turn_count = try requireUsize(object, "removed_turn_count"),
             .compaction_count = try requireUsize(object, "compaction_count"),
+            .root_user_messages = root_user_messages,
         } };
     }
     if (std.mem.eql(u8, kind, "assistant")) {
@@ -1392,6 +1413,7 @@ test "session JSON round-trips images summaries and background commands" {
         .snapshot_sha256 = @constCast("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
     }};
     var completed_tool_names = [_][]u8{ @constCast("list_files"), @constCast("glob_files") };
+    var root_user_messages = [_][]u8{ @constCast("first exact request"), @constCast("second exact request") };
     const history = [_]session.HistoryTurn{
         .{ .assistant = .{
             .user = .{ .text = @constCast("hello"), .images = &images },
@@ -1401,6 +1423,7 @@ test "session JSON round-trips images summaries and background commands" {
             .summary = @constCast("summary text"),
             .removed_turn_count = 5,
             .compaction_count = 2,
+            .root_user_messages = &root_user_messages,
         } },
         .{ .background_command = .{
             .user = .{ .text = @constCast("run dev") },
@@ -1461,6 +1484,9 @@ test "session JSON round-trips images summaries and background commands" {
     try std.testing.expectEqualStrings("summary text", loaded.history[1].compacted_summary.summary);
     try std.testing.expectEqual(@as(usize, 5), loaded.history[1].compacted_summary.removed_turn_count);
     try std.testing.expectEqual(@as(usize, 2), loaded.history[1].compacted_summary.compaction_count);
+    try std.testing.expectEqual(@as(usize, 2), loaded.history[1].compacted_summary.root_user_messages.len);
+    try std.testing.expectEqualStrings("first exact request", loaded.history[1].compacted_summary.root_user_messages[0]);
+    try std.testing.expectEqualStrings("second exact request", loaded.history[1].compacted_summary.root_user_messages[1]);
     try std.testing.expectEqualStrings("run dev", loaded.history[2].background_command.user.text);
     try std.testing.expectEqualStrings("/tmp/server.log", loaded.history[2].background_command.log_path);
     try std.testing.expect(loaded.history[2].background_command.expect_url);

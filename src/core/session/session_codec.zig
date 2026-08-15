@@ -266,6 +266,12 @@ pub fn writeHistoryTurn(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
                 entry.removed_turn_count,
                 entry.compaction_count,
             });
+            try writer.writeAll(",\"root_user_messages\":[");
+            for (entry.root_user_messages, 0..) |message, index| {
+                if (index > 0) try writer.writeByte(',');
+                try writeDurableBytes(writer, message);
+            }
+            try writer.writeByte(']');
             try writer.writeByte('}');
         },
         .assistant => |entry| {
@@ -336,18 +342,27 @@ pub fn writeHistoryTurn(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
 pub fn parseHistoryTurn(alloc: Allocator, value: std.json.Value) !session.HistoryTurn {
     const kind = try requireString(try requireObject(value), "kind");
     if (std.mem.eql(u8, kind, "compacted_summary")) {
-        const object = try exactObject(value, &.{
-            "kind",
-            "summary",
-            "removed_turn_count",
-            "compaction_count",
-        });
+        const shape = try exactVariantObject(
+            value,
+            &.{ "kind", "summary", "removed_turn_count", "compaction_count" },
+            &.{ "kind", "summary", "removed_turn_count", "compaction_count", "root_user_messages" },
+        );
+        const object = shape.object;
         const summary = try parseRequiredDurableBytes(alloc, object, "summary");
         errdefer alloc.free(summary);
+        const root_user_messages: [][]u8 = if (shape.extended)
+            try parseDurableBytesArray(
+                alloc,
+                object.get("root_user_messages") orelse return error.InvalidSessionFormat,
+            )
+        else
+            &.{};
+        errdefer types.freeCompletedToolNames(alloc, root_user_messages);
         return .{ .compacted_summary = .{
             .summary = summary,
             .removed_turn_count = try requireUsize(object, "removed_turn_count"),
             .compaction_count = try requireUsize(object, "compaction_count"),
+            .root_user_messages = root_user_messages,
         } };
     }
     if (std.mem.eql(u8, kind, "assistant")) {
@@ -2066,6 +2081,7 @@ test "durable state round trips every live history byte field exactly" {
             .summary = @constCast(invalid_b[0..]),
             .removed_turn_count = 3,
             .compaction_count = 2,
+            .root_user_messages = completed_tool_names[0..],
         } },
     };
     var usage_runtime = session_usage.Usage.initFresh();
@@ -2781,6 +2797,10 @@ fn expectHistoryTurnEqual(expected: session.HistoryTurn, actual: session.History
             try std.testing.expectEqualSlices(u8, entry.summary, actual.compacted_summary.summary);
             try std.testing.expectEqual(entry.removed_turn_count, actual.compacted_summary.removed_turn_count);
             try std.testing.expectEqual(entry.compaction_count, actual.compacted_summary.compaction_count);
+            try std.testing.expectEqual(entry.root_user_messages.len, actual.compacted_summary.root_user_messages.len);
+            for (entry.root_user_messages, actual.compacted_summary.root_user_messages) |expected_message, actual_message| {
+                try std.testing.expectEqualSlices(u8, expected_message, actual_message);
+            }
         },
         .assistant => |entry| {
             const got = actual.assistant;
