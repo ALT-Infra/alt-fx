@@ -2614,7 +2614,7 @@ describe("gateway stream lifecycle", () => {
     );
     try {
       const result = await runFx(
-        ["ask", "--json", "--auto", "Write the long command fixture."],
+        ["ask", "--json", "--yolo", "Write the long command fixture."],
         {
           cwd: root.workspace,
           env: fixtureEnv(root, gateway, tracePath),
