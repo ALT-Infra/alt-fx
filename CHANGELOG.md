@@ -1,8 +1,15 @@
 # fx
 
-## 0.4.2
+## 0.4.3
 
 <!-- release:start -->
+
+### Improvements
+
+- **Smaller macOS arm64 binary:** Reduce the native binary size with profile-guided optimization tuned to common fx workloads
+<!-- release:end -->
+
+## 0.4.2
 
 ### New Features
 
@@ -22,7 +29,6 @@
 - **Recovery continuation:** Accept one `/continue` as soon as a recovery pause appears, even while the previous worker finishes cleanup
 - **Recovery pacing:** Keep one recovery attempt budget across failure causes and reset backoff after the cause changes, an explicit retry delay, authentication refresh, or a successful request
 - **Terminal tool compatibility:** Keep the `terminal` tool available when providers apply stricter schema validation while continuing to reject fields unsupported by the selected action
-<!-- release:end -->
 
 ## 0.4.1
 
