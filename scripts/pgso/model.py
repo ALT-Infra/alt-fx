@@ -53,6 +53,22 @@ def sha256_file(path: pathlib.Path) -> str:
     return digest.hexdigest()
 
 
+def profile_evidence(
+    path: pathlib.Path,
+    *,
+    merged_raw_profiles: int,
+) -> dict[str, object]:
+    if not path.is_file() or path.stat().st_size == 0:
+        raise PgsoError(f"profile is missing or empty: {path}")
+    if merged_raw_profiles <= 0:
+        raise PgsoError("merged raw profile count must be positive")
+    return {
+        "sha256": sha256_file(path),
+        "size_bytes": path.stat().st_size,
+        "merged_raw_profiles": merged_raw_profiles,
+    }
+
+
 def verify_identity(expected: BuildIdentity, actual: BuildIdentity) -> None:
     for field in dataclasses.fields(BuildIdentity):
         expected_value = getattr(expected, field.name)

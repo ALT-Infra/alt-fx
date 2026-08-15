@@ -1,19 +1,157 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import pathlib
 import shlex
 import sys
 import tempfile
+import threading
 import time
 import unittest
+from unittest import mock
 
 from scripts.pgso.model import PgsoError
 from scripts.pgso.runner import run_checked
 
 
 class PgsoRunnerTests(unittest.TestCase):
+    def test_child_output_is_visible_before_the_command_finishes(self) -> None:
+        class LiveOutput(io.StringIO):
+            def __init__(self) -> None:
+                super().__init__()
+                self.marker_seen = threading.Event()
+
+            def write(self, value: str) -> int:
+                written = super().write(value)
+                if "early output" in value:
+                    self.marker_seen.set()
+                return written
+
+        with tempfile.TemporaryDirectory(prefix="fx-pgso-runner-") as tmp:
+            root = pathlib.Path(tmp)
+            stdout = LiveOutput()
+            errors: list[Exception] = []
+
+            def invoke() -> None:
+                try:
+                    run_checked(
+                        [
+                            sys.executable,
+                            "-c",
+                            (
+                                "import time; "
+                                "print('early output', flush=True); "
+                                "time.sleep(1)"
+                            ),
+                        ],
+                        cwd=root,
+                        env=os.environ.copy(),
+                        timeout_s=5,
+                        log_path=root / "live-before-exit.json",
+                    )
+                except Exception as error:
+                    errors.append(error)
+
+            with contextlib.redirect_stdout(stdout):
+                worker = threading.Thread(target=invoke, daemon=True)
+                worker.start()
+                observed_while_running = stdout.marker_seen.wait(timeout=0.5)
+                command_still_running = worker.is_alive()
+                worker.join(timeout=3)
+
+            self.assertTrue(observed_while_running)
+            self.assertTrue(command_still_running)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual([], errors)
+
+    def test_silent_command_emits_periodic_heartbeats(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="fx-pgso-runner-") as tmp:
+            root = pathlib.Path(tmp)
+            stdout = io.StringIO()
+
+            with (
+                contextlib.redirect_stdout(stdout),
+                mock.patch(
+                    "scripts.pgso.runner.COMMAND_HEARTBEAT_SECONDS",
+                    0.05,
+                    create=True,
+                ),
+            ):
+                run_checked(
+                    [sys.executable, "-c", "import time; time.sleep(0.2)"],
+                    cwd=root,
+                    env=os.environ.copy(),
+                    timeout_s=5,
+                    log_path=root / "heartbeat.json",
+                )
+
+            output = stdout.getvalue()
+            self.assertRegex(
+                output,
+                r"\[pgso\] command still running after \d+\.\d+s",
+            )
+            self.assertIn("heartbeat.json", output)
+
+    def test_success_streams_command_lifecycle_and_child_output(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="fx-pgso-runner-") as tmp:
+            root = pathlib.Path(tmp)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                run_checked(
+                    [
+                        sys.executable,
+                        "-c",
+                        (
+                            "import sys; "
+                            "print('live stdout', flush=True); "
+                            "print('live stderr', file=sys.stderr, flush=True)"
+                        ),
+                    ],
+                    cwd=root,
+                    env=os.environ.copy(),
+                    timeout_s=5,
+                    log_path=root / "live.json",
+                )
+
+            output = stdout.getvalue()
+            self.assertIn("[pgso] command started", output)
+            self.assertIn("live stdout\n", output)
+            self.assertRegex(output, r"\[pgso\] command passed in \d+\.\d{3}s")
+            self.assertLess(output.index("command started"), output.index("live stdout"))
+            self.assertLess(output.index("live stdout"), output.index("command passed"))
+            self.assertIn("live stderr\n", stderr.getvalue())
+
+    def test_failure_streams_terminal_status_after_child_output(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="fx-pgso-runner-") as tmp:
+            root = pathlib.Path(tmp)
+            stdout = io.StringIO()
+
+            with (
+                contextlib.redirect_stdout(stdout),
+                self.assertRaisesRegex(PgsoError, "command failed with exit code 7"),
+            ):
+                run_checked(
+                    [
+                        sys.executable,
+                        "-c",
+                        "print('failure detail', flush=True); raise SystemExit(7)",
+                    ],
+                    cwd=root,
+                    env=os.environ.copy(),
+                    timeout_s=5,
+                    log_path=root / "failure.json",
+                )
+
+            output = stdout.getvalue()
+            self.assertIn("failure detail\n", output)
+            self.assertRegex(output, r"\[pgso\] command failed in \d+\.\d{3}s")
+            self.assertLess(output.index("failure detail"), output.index("command failed"))
+
     def test_success_captures_output_and_writes_a_bounded_log(self) -> None:
         with tempfile.TemporaryDirectory(prefix="fx-pgso-runner-") as tmp:
             log_path = pathlib.Path(tmp) / "stage.json"

@@ -6,6 +6,7 @@ import math
 import os
 import pathlib
 import shlex
+import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 
@@ -22,7 +23,7 @@ from scripts.pgso.pipeline import (
     merge_profile_batch,
     read_macos_minos,
 )
-from scripts.pgso.runner import run_checked
+from scripts.pgso.runner import emit_progress, run_checked
 from scripts.pgso.toolchain import Toolchain
 
 
@@ -101,6 +102,55 @@ BENCHMARK_PLANS = (
 )
 
 
+def select_startup_commands(
+    names: Sequence[str] | None,
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    if names is None:
+        return STARTUP_COMMANDS
+    if not names:
+        raise PgsoError("startup assignment cannot be empty")
+    if len(names) != len(set(names)):
+        raise PgsoError("duplicate startup command")
+    available = {name: argv for name, argv in STARTUP_COMMANDS}
+    unknown = sorted(set(names) - set(available))
+    if unknown:
+        raise PgsoError("unknown startup command: " + ", ".join(unknown))
+    requested = set(names)
+    return tuple(item for item in STARTUP_COMMANDS if item[0] in requested)
+
+
+def select_benchmark_plans(
+    workload_names: Sequence[str] | None,
+) -> tuple[BenchmarkPlan, ...]:
+    if workload_names is None:
+        return BENCHMARK_PLANS
+    if not workload_names:
+        raise PgsoError("heavy workload assignment cannot be empty")
+    if len(workload_names) != len(set(workload_names)):
+        raise PgsoError("duplicate heavy workload")
+    available = {
+        workload.name
+        for plan in BENCHMARK_PLANS
+        for workload in plan.workloads
+    }
+    unknown = sorted(set(workload_names) - available)
+    if unknown:
+        raise PgsoError("unknown heavy workload: " + ", ".join(unknown))
+    requested = set(workload_names)
+    return tuple(
+        dataclasses.replace(
+            plan,
+            workloads=tuple(
+                workload
+                for workload in plan.workloads
+                if workload.name in requested
+            ),
+        )
+        for plan in BENCHMARK_PLANS
+        if any(workload.name in requested for workload in plan.workloads)
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class Comparison:
     control_samples: tuple[float, ...]
@@ -148,7 +198,13 @@ class EvidenceRecorder:
             "evidence": {},
             "stages": [],
         }
+        self._active_stage: tuple[str, float] | None = None
         self._write()
+
+    def _stage_elapsed(self, name: str) -> float:
+        if self._active_stage is None or self._active_stage[0] != name:
+            return 0.0
+        return time.monotonic() - self._active_stage[1]
 
     def _write(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -176,23 +232,46 @@ class EvidenceRecorder:
         stages = self.payload["stages"]
         if not isinstance(stages, list):
             raise PgsoError("invalid in-memory evidence stage list")
-        stages.append({"name": name, "status": status})
+        elapsed_seconds = self._stage_elapsed(name) if status == "passed" else None
+        stage_entry: dict[str, object] = {"name": name, "status": status}
+        if elapsed_seconds is not None:
+            stage_entry["elapsed_seconds"] = elapsed_seconds
+        stages.append(stage_entry)
         if evidence:
             recorded = self.payload["evidence"]
             if not isinstance(recorded, dict):
                 raise PgsoError("invalid in-memory evidence mapping")
             recorded.update(evidence)
         self._write()
+        if status == "running":
+            self._active_stage = (name, time.monotonic())
+            emit_progress(f"stage started: {name}")
+        else:
+            self._active_stage = None
+            if elapsed_seconds is None:
+                raise PgsoError("passed stage is missing elapsed time")
+            emit_progress(f"stage passed in {elapsed_seconds:.3f}s: {name}")
 
     def fail(self, stage: str, error: Exception) -> None:
+        elapsed_seconds = self._stage_elapsed(stage)
         self.payload["stage"] = stage
         self.payload["status"] = "failed"
         self.payload["eligible"] = False
         self.payload["error"] = str(error)
         stages = self.payload["stages"]
         if isinstance(stages, list):
-            stages.append({"name": stage, "status": "failed"})
+            stages.append(
+                {
+                    "name": stage,
+                    "status": "failed",
+                    "elapsed_seconds": elapsed_seconds,
+                }
+            )
         self._write()
+        self._active_stage = None
+        emit_progress(
+            f"stage failed in {elapsed_seconds:.3f}s: {stage}: {error}"
+        )
 
     def complete(self) -> None:
         evidence = self.payload["evidence"]
@@ -564,6 +643,7 @@ def measure_startup(
     output_dir: pathlib.Path,
     samples: int,
     timeout_s: float,
+    command_names: Sequence[str] | None = None,
 ) -> tuple[MeasurementResult, ...]:
     home = output_dir / "home"
     logs = output_dir / "logs"
@@ -577,7 +657,7 @@ def measure_startup(
         for round_index in range(STARTUP_ROUNDS)
     )
 
-    for command_name, command_argv in STARTUP_COMMANDS:
+    for command_name, command_argv in select_startup_commands(command_names):
         for label, binary in (
             ("control", control_binary),
             ("candidate", candidate_binary),
@@ -674,6 +754,7 @@ def measure_heavy_workloads(
     output_dir: pathlib.Path,
     samples: int,
     timeout_s: float,
+    workload_names: Sequence[str] | None = None,
 ) -> tuple[MeasurementResult, ...]:
     output_dir.mkdir(parents=True, exist_ok=False)
     home = output_dir / "home"
@@ -682,7 +763,7 @@ def measure_heavy_workloads(
     logs.mkdir()
     results: list[MeasurementResult] = []
 
-    for plan in BENCHMARK_PLANS:
+    for plan in select_benchmark_plans(workload_names):
         pair = build_benchmark_pair(
             toolchain,
             repo_root,

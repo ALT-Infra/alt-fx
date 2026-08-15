@@ -10,6 +10,7 @@ from scripts.pgso.model import (
     PgsoError,
     RunManifest,
     bytes_to_mib,
+    profile_evidence,
     require_empty_stderr,
     sha256_file,
     size_gate,
@@ -75,6 +76,17 @@ class PgsoModelTests(unittest.TestCase):
                 "b00361a396177a9cb410ff61f20015ad",
                 sha256_file(path),
             )
+
+    def test_profile_evidence_binds_hash_size_and_merged_count(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="fx-pgso-model-") as tmp:
+            path = pathlib.Path(tmp) / "profile.profdata"
+            path.write_bytes(b"profile")
+
+            evidence = profile_evidence(path, merged_raw_profiles=7)
+
+            self.assertEqual(7, evidence["merged_raw_profiles"])
+            self.assertEqual(7, evidence["size_bytes"])
+            self.assertEqual(sha256_file(path), evidence["sha256"])
 
     def test_size_gate_reports_exact_mib_and_preferred_headroom(self) -> None:
         evidence = size_gate(7_837_920)

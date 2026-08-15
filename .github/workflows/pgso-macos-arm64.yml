@@ -13,6 +13,7 @@ on:
     paths:
       - build.zig
       - scripts/pgso/**
+      - .github/actions/setup-pgso/**
       - .github/workflows/pgso-macos-arm64.yml
       - .github/workflows/release.yml
 
@@ -24,15 +25,19 @@ permissions:
   actions: read
   contents: read
 
+env:
+  AI_GATEWAY_API_KEY: ""
+  VERCEL_OIDC_TOKEN: ""
+  FX_SOUND: "0"
+
 jobs:
-  candidate:
-    name: Build and qualify candidate
+  seed:
+    name: Build seed and plan shards
     runs-on: macos-15
-    timeout-minutes: 360
-    env:
-      AI_GATEWAY_API_KEY: ""
-      VERCEL_OIDC_TOKEN: ""
-      FX_SOUND: "0"
+    timeout-minutes: 60
+    outputs:
+      training: ${{ steps.plan.outputs.training }}
+      behavior: ${{ steps.plan.outputs.behavior }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -41,62 +46,399 @@ jobs:
       - name: Require native arm64 host
         run: test "$(uname -m)" = arm64
 
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+      - name: Setup pinned tools
+        id: setup
+        uses: ./.github/actions/setup-pgso
         with:
-          version: "0.16.0"
-          cache-key: pgso-macos-arm64
+          llvm: "true"
+          bun: "true"
+          hyperfine: "true"
 
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+      - name: Test the PGSO driver
+        run: python3 -m unittest discover -s scripts/pgso/tests -v
+
+      - name: Build immutable seed artifacts
+        run: |
+          python3 -m scripts.pgso build \
+            --llvm-bin "${{ steps.setup.outputs.llvm-bin }}" \
+            --output-dir "$RUNNER_TEMP/fx-pgso-seed" \
+            --target aarch64-macos \
+            --update-channel stable \
+            --bun "${{ steps.setup.outputs.bun-bin }}" \
+            --hyperfine "${{ steps.setup.outputs.hyperfine-bin }}"
+
+      - name: Plan non-empty shards
+        id: plan
+        run: |
+          training="$(python3 -m scripts.pgso.distributed plan --phase training --maximum-shards 20)"
+          behavior="$(python3 -m scripts.pgso.distributed plan --phase behavior --maximum-shards 20)"
+          echo "training=$training" >> "$GITHUB_OUTPUT"
+          echo "behavior=$behavior" >> "$GITHUB_OUTPUT"
+          echo "Training matrix: $training"
+          echo "Behavior matrix: $behavior"
+
+      - name: Upload immutable seed
+        uses: actions/upload-artifact@v4
         with:
-          bun-version: "1.3.14"
+          name: pgso-seed-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/fx-pgso-seed/manifest.json
+            ${{ runner.temp }}/fx-pgso-seed/control/bin/fx
+            ${{ runner.temp }}/fx-pgso-seed/ir/pgso/fx.bc
+            ${{ runner.temp }}/fx-pgso-seed/instrumented/fx
+            ${{ runner.temp }}/fx-pgso-seed/profiles/merged.profdata
+            ${{ runner.temp }}/fx-pgso-seed/logs
+          if-no-files-found: error
+          retention-days: 14
 
-      - name: Install pinned native tools
-        run: |
-          brew install llvm@21 tmux
-          llvm_bin="$(brew --prefix llvm@21)/bin"
-          "$llvm_bin/opt" --version | grep -F "version 21.1.8"
-          tmux -V
+  train:
+    name: Train ${{ matrix.id }}
+    needs: seed
+    runs-on: macos-15
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJSON(needs.seed.outputs.training) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Install pinned Hyperfine
-        run: |
-          archive="$RUNNER_TEMP/hyperfine-v1.20.0-aarch64-apple-darwin.tar.gz"
-          curl -fsSL \
-            https://github.com/sharkdp/hyperfine/releases/download/v1.20.0/hyperfine-v1.20.0-aarch64-apple-darwin.tar.gz \
-            -o "$archive"
-          printf '%s  %s\n' \
-            8ee7067016620447c9d2d6234ec9a4680f958b7ad983549b56334668f63075b5 \
-            "$archive" | shasum -a 256 -c -
-          tar -xzf "$archive" -C "$RUNNER_TEMP"
-          hyperfine_bin="$RUNNER_TEMP/hyperfine-v1.20.0-aarch64-apple-darwin/hyperfine"
-          test "$("$hyperfine_bin" --version)" = "hyperfine 1.20.0"
-          echo "PGSO_HYPERFINE=$hyperfine_bin" >> "$GITHUB_ENV"
+      - name: Require native arm64 host
+        run: test "$(uname -m)" = arm64
+
+      - name: Setup pinned tools
+        id: setup
+        uses: ./.github/actions/setup-pgso
+        with:
+          llvm: "true"
+          bun: "true"
 
       - name: Install E2E dependencies
         run: bun install --frozen-lockfile
         working-directory: tests/e2e
 
-      - name: Test the PGSO driver
-        run: python3 -m unittest discover -s scripts/pgso/tests -v
+      - name: Download immutable seed
+        uses: actions/download-artifact@v4
+        with:
+          name: pgso-seed-${{ github.sha }}
+          path: ${{ runner.temp }}/fx-pgso-seed
 
-      - name: Run complete Stage 1 gate
+      - name: Restore executable mode
+        run: chmod +x "$RUNNER_TEMP/fx-pgso-seed/instrumented/fx" "$RUNNER_TEMP/fx-pgso-seed/control/bin/fx"
+
+      - name: Run assigned training scenarios
         run: |
-          python3 -m scripts.pgso all \
-            --llvm-bin "$(brew --prefix llvm@21)/bin" \
-            --output-dir "$RUNNER_TEMP/fx-pgso" \
-            --target aarch64-macos \
-            --update-channel stable \
-            --bun "$(which bun)" \
-            --hyperfine "$PGSO_HYPERFINE" \
+          python3 -m scripts.pgso.distributed train-shard \
+            --seed-dir "$RUNNER_TEMP/fx-pgso-seed" \
+            --output-dir "$RUNNER_TEMP/fx-pgso-training-${{ matrix.id }}" \
+            --shard-id "${{ matrix.id }}" \
+            --scenarios "${{ matrix.scenarios }}" \
+            --llvm-bin "${{ steps.setup.outputs.llvm-bin }}" \
+            --bun "${{ steps.setup.outputs.bun-bin }}"
+
+      - name: Upload training evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgso-training-${{ github.sha }}-${{ matrix.id }}
+          path: |
+            ${{ runner.temp }}/fx-pgso-training-${{ matrix.id }}/manifest.json
+            ${{ runner.temp }}/fx-pgso-training-${{ matrix.id }}/failure.json
+            ${{ runner.temp }}/fx-pgso-training-${{ matrix.id }}/profile.profdata
+            ${{ runner.temp }}/fx-pgso-training-${{ matrix.id }}/logs
+          if-no-files-found: error
+          retention-days: 14
+
+  candidate:
+    name: Merge profiles and build candidate
+    needs: [seed, train]
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require native arm64 host
+        run: test "$(uname -m)" = arm64
+
+      - name: Setup pinned tools
+        id: setup
+        uses: ./.github/actions/setup-pgso
+        with:
+          llvm: "true"
+
+      - name: Download immutable seed
+        uses: actions/download-artifact@v4
+        with:
+          name: pgso-seed-${{ github.sha }}
+          path: ${{ runner.temp }}/fx-pgso-seed
+
+      - name: Download all training shards
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pgso-training-${{ github.sha }}-*
+          path: ${{ runner.temp }}/fx-pgso-training
+
+      - name: Restore executable mode
+        run: chmod +x "$RUNNER_TEMP/fx-pgso-seed/instrumented/fx" "$RUNNER_TEMP/fx-pgso-seed/control/bin/fx"
+
+      - name: Build the one production candidate
+        run: |
+          python3 -m scripts.pgso.distributed candidate \
+            --seed-dir "$RUNNER_TEMP/fx-pgso-seed" \
+            --shards-dir "$RUNNER_TEMP/fx-pgso-training" \
+            --output-dir "$RUNNER_TEMP/fx-pgso-candidate" \
+            --llvm-bin "${{ steps.setup.outputs.llvm-bin }}"
+
+      - name: Upload candidate and build evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgso-candidate-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/fx-pgso-candidate/manifest.json
+            ${{ runner.temp }}/fx-pgso-candidate/failure.json
+            ${{ runner.temp }}/fx-pgso-candidate/control/bin/fx
+            ${{ runner.temp }}/fx-pgso-candidate/candidate/fx
+            ${{ runner.temp }}/fx-pgso-candidate/logs
+          if-no-files-found: error
+          retention-days: 14
+
+  behavior:
+    name: Verify ${{ matrix.id }}
+    needs: [seed, candidate]
+    runs-on: macos-15
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJSON(needs.seed.outputs.behavior) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require native arm64 host
+        run: test "$(uname -m)" = arm64
+
+      - name: Setup pinned tools
+        id: setup
+        uses: ./.github/actions/setup-pgso
+        with:
+          bun: "true"
+
+      - name: Install E2E dependencies
+        run: bun install --frozen-lockfile
+        working-directory: tests/e2e
+
+      - name: Download candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: pgso-candidate-${{ github.sha }}
+          path: ${{ runner.temp }}/fx-pgso-candidate
+
+      - name: Restore executable mode
+        run: chmod +x "$RUNNER_TEMP/fx-pgso-candidate/candidate/fx" "$RUNNER_TEMP/fx-pgso-candidate/control/bin/fx"
+
+      - name: Run assigned behavior scenarios
+        run: |
+          python3 -m scripts.pgso.distributed behavior-shard \
+            --candidate-dir "$RUNNER_TEMP/fx-pgso-candidate" \
+            --output-dir "$RUNNER_TEMP/fx-pgso-behavior-${{ matrix.id }}" \
+            --shard-id "${{ matrix.id }}" \
+            --scenarios "${{ matrix.scenarios }}" \
+            --bun "${{ steps.setup.outputs.bun-bin }}"
+
+      - name: Upload behavior evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgso-behavior-${{ github.sha }}-${{ matrix.id }}
+          path: |
+            ${{ runner.temp }}/fx-pgso-behavior-${{ matrix.id }}/manifest.json
+            ${{ runner.temp }}/fx-pgso-behavior-${{ matrix.id }}/failure.json
+            ${{ runner.temp }}/fx-pgso-behavior-${{ matrix.id }}/behavior/logs
+            ${{ runner.temp }}/fx-pgso-behavior-${{ matrix.id }}/behavior/traces
+            ${{ runner.temp }}/fx-pgso-behavior-${{ matrix.id }}/driver-logs
+          if-no-files-found: error
+          retention-days: 14
+
+  startup:
+    name: Startup ${{ matrix.name }}
+    needs: candidate
+    runs-on: macos-15
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        name: [help, version, status, background, doctor, sessions]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require native arm64 host
+        run: test "$(uname -m)" = arm64
+
+      - name: Setup pinned Hyperfine
+        id: setup
+        uses: ./.github/actions/setup-pgso
+        with:
+          hyperfine: "true"
+
+      - name: Download candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: pgso-candidate-${{ github.sha }}
+          path: ${{ runner.temp }}/fx-pgso-candidate
+
+      - name: Restore executable mode
+        run: chmod +x "$RUNNER_TEMP/fx-pgso-candidate/candidate/fx" "$RUNNER_TEMP/fx-pgso-candidate/control/bin/fx"
+
+      - name: Measure same-runner control and candidate
+        run: |
+          python3 -m scripts.pgso.distributed measure \
+            --kind startup \
+            --name "${{ matrix.name }}" \
+            --candidate-dir "$RUNNER_TEMP/fx-pgso-candidate" \
+            --output-dir "$RUNNER_TEMP/fx-pgso-startup-${{ matrix.name }}" \
+            --hyperfine "${{ steps.setup.outputs.hyperfine-bin }}" \
             --samples 50
+
+      - name: Upload startup evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgso-startup-${{ github.sha }}-${{ matrix.name }}
+          path: |
+            ${{ runner.temp }}/fx-pgso-startup-${{ matrix.name }}/manifest.json
+            ${{ runner.temp }}/fx-pgso-startup-${{ matrix.name }}/failure.json
+            ${{ runner.temp }}/fx-pgso-startup-${{ matrix.name }}/measurements/logs
+            ${{ runner.temp }}/fx-pgso-startup-${{ matrix.name }}/driver-logs
+          if-no-files-found: error
+          retention-days: 14
+
+  heavy:
+    name: Heavy ${{ matrix.name }}
+    needs: candidate
+    runs-on: macos-15
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        name:
+          - file-index-100k
+          - ui-activity
+          - approval-transcript
+          - approval-diff
+          - approval-combined
+          - approval-payload
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require native arm64 host
+        run: test "$(uname -m)" = arm64
+
+      - name: Setup pinned tools
+        id: setup
+        uses: ./.github/actions/setup-pgso
+        with:
+          llvm: "true"
+
+      - name: Download candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: pgso-candidate-${{ github.sha }}
+          path: ${{ runner.temp }}/fx-pgso-candidate
+
+      - name: Restore executable mode
+        run: chmod +x "$RUNNER_TEMP/fx-pgso-candidate/candidate/fx" "$RUNNER_TEMP/fx-pgso-candidate/control/bin/fx"
+
+      - name: Measure same-runner control and candidate
+        run: |
+          python3 -m scripts.pgso.distributed measure \
+            --kind heavy \
+            --name "${{ matrix.name }}" \
+            --candidate-dir "$RUNNER_TEMP/fx-pgso-candidate" \
+            --output-dir "$RUNNER_TEMP/fx-pgso-heavy-${{ matrix.name }}" \
+            --llvm-bin "${{ steps.setup.outputs.llvm-bin }}" \
+            --samples 50
+
+      - name: Upload heavy-workload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgso-heavy-${{ github.sha }}-${{ matrix.name }}
+          path: |
+            ${{ runner.temp }}/fx-pgso-heavy-${{ matrix.name }}/manifest.json
+            ${{ runner.temp }}/fx-pgso-heavy-${{ matrix.name }}/failure.json
+            ${{ runner.temp }}/fx-pgso-heavy-${{ matrix.name }}/measurements/logs
+            ${{ runner.temp }}/fx-pgso-heavy-${{ matrix.name }}/driver-logs
+          if-no-files-found: error
+          retention-days: 14
+
+  aggregate:
+    name: Aggregate release eligibility
+    needs: [candidate, behavior, startup, heavy]
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require native arm64 host
+        run: test "$(uname -m)" = arm64
+
+      - name: Download candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: pgso-candidate-${{ github.sha }}
+          path: ${{ runner.temp }}/fx-pgso-candidate
+
+      - name: Download behavior evidence
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pgso-behavior-${{ github.sha }}-*
+          path: ${{ runner.temp }}/fx-pgso-behavior
+
+      - name: Download startup evidence
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pgso-startup-${{ github.sha }}-*
+          path: ${{ runner.temp }}/fx-pgso-startup
+
+      - name: Download heavy-workload evidence
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pgso-heavy-${{ github.sha }}-*
+          path: ${{ runner.temp }}/fx-pgso-heavy
+
+      - name: Restore executable mode
+        run: chmod +x "$RUNNER_TEMP/fx-pgso-candidate/candidate/fx" "$RUNNER_TEMP/fx-pgso-candidate/control/bin/fx"
+
+      - name: Aggregate fail-closed evidence
+        run: |
+          python3 -m scripts.pgso.distributed aggregate \
+            --candidate-dir "$RUNNER_TEMP/fx-pgso-candidate" \
+            --behavior-dir "$RUNNER_TEMP/fx-pgso-behavior" \
+            --startup-dir "$RUNNER_TEMP/fx-pgso-startup" \
+            --heavy-dir "$RUNNER_TEMP/fx-pgso-heavy" \
+            --output-dir "$RUNNER_TEMP/fx-pgso-aggregate"
 
       - name: Package stable release candidate
         if: inputs.package_release
         run: |
-          python3 -m scripts.pgso report --output-dir "$RUNNER_TEMP/fx-pgso" >/dev/null
+          python3 -m scripts.pgso report --output-dir "$RUNNER_TEMP/fx-pgso-aggregate" >/dev/null
           archive="$RUNNER_TEMP/fx-macos-aarch64.tar.gz"
-          tar -czf "$archive" -C "$RUNNER_TEMP/fx-pgso/candidate" fx
+          tar -czf "$archive" -C "$RUNNER_TEMP/fx-pgso-aggregate/candidate" fx
           cd "$RUNNER_TEMP"
           shasum -a 256 fx-macos-aarch64.tar.gz > fx-macos-aarch64.tar.gz.sha256
 
@@ -110,11 +452,11 @@ jobs:
             ${{ runner.temp }}/fx-macos-aarch64.tar.gz.sha256
           if-no-files-found: error
 
-      - name: Upload candidate evidence
+      - name: Upload aggregate evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: pgso-evidence-macos-arm64-${{ github.sha }}
-          path: ${{ runner.temp }}/fx-pgso
+          path: ${{ runner.temp }}/fx-pgso-aggregate
           if-no-files-found: error
           retention-days: 14

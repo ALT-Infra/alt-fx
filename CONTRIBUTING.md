@@ -88,8 +88,22 @@ Before adding a new feature, answer these first:
 3. Does it need persistence?
 4. Does it need both text and JSON output?
 5. What docs and tests land with it?
+6. How is its deterministic E2E owner classified for macOS arm64 PGSO?
 
 If that is unclear, stop and define it first.
+
+### PGSO corpus ownership
+
+Classify every root `tests/e2e/*.test.ts` file in
+`scripts/pgso/corpus.json`. Put common or performance-sensitive behavior in
+training. Put important correctness, recovery, security, and rare behavior in
+verification-only. Exclude only nondeterministic, live-network, credentialed,
+sound-related, or harness-only coverage, and record the reason.
+
+Tests added to an existing file inherit its classification. Reconsider that
+classification when a feature changes the file's product role, and remove stale
+entries when deleting a feature or E2E owner. Normal PR CI rejects missing,
+duplicate, stale, and unclassified files without running the full PGSO gate.
 
 ## Configuration and State
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import pathlib
@@ -17,6 +19,8 @@ from scripts.pgso.qualify import (
     measure_alternating,
     measure_startup,
     percentile,
+    select_benchmark_plans,
+    select_startup_commands,
 )
 from scripts.pgso.runner import CommandResult
 
@@ -103,6 +107,26 @@ class PgsoQualificationTests(unittest.TestCase):
             ("file_index", "ui_activity", "approval_review"),
             tuple(plan.selector for plan in BENCHMARK_PLANS),
         )
+
+    def test_startup_selection_returns_only_the_assigned_command(self) -> None:
+        selected = select_startup_commands(("doctor",))
+
+        self.assertEqual((("doctor", ("doctor", "--json")),), selected)
+
+    def test_startup_selection_rejects_an_unknown_command(self) -> None:
+        with self.assertRaisesRegex(PgsoError, "unknown startup command: missing"):
+            select_startup_commands(("missing",))
+
+    def test_heavy_selection_keeps_only_the_assigned_workload(self) -> None:
+        selected = select_benchmark_plans(("approval-diff",))
+
+        self.assertEqual(1, len(selected))
+        self.assertEqual("approval_review", selected[0].selector)
+        self.assertEqual(("approval-diff",), tuple(item.name for item in selected[0].workloads))
+
+    def test_heavy_selection_rejects_duplicate_assignments(self) -> None:
+        with self.assertRaisesRegex(PgsoError, "duplicate heavy workload"):
+            select_benchmark_plans(("ui-activity", "ui-activity"))
 
     def test_comparison_requires_fifty_samples_per_artifact(self) -> None:
         with self.assertRaisesRegex(PgsoError, "at least 50"):
@@ -211,6 +235,34 @@ class PgsoQualificationTests(unittest.TestCase):
             calls[:2],
         )
         self.assertNotIn(str(canonical), {command[0] for command in calls})
+
+    def test_startup_measurement_runs_only_the_assigned_command(self) -> None:
+        control = self.root / "control" / "fx"
+        candidate = self.root / "candidate" / "fx"
+        hyperfine = self.root / "tools" / "hyperfine"
+        for path in (control, candidate, hyperfine):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"executable")
+        calls, fake_run = self.fake_startup_runner(
+            hyperfine=hyperfine,
+            control=control,
+            candidate=candidate,
+        )
+
+        with mock.patch("scripts.pgso.qualify.run_checked", side_effect=fake_run):
+            results = measure_startup(
+                repo_root=self.root,
+                control_binary=control,
+                candidate_binary=candidate,
+                hyperfine_binary=hyperfine,
+                output_dir=self.root / "measurements",
+                samples=50,
+                timeout_s=10,
+                command_names=("doctor",),
+            )
+
+        self.assertEqual(("startup-doctor",), tuple(item.name for item in results))
+        self.assertEqual(10, sum(command[0] == str(hyperfine) for command in calls))
 
     def test_startup_measurement_balances_warmed_hyperfine_rounds(self) -> None:
         control = self.root / "control" / "fx"
@@ -393,6 +445,42 @@ class PgsoQualificationTests(unittest.TestCase):
         self.assertFalse(payload["eligible"])
         self.assertEqual("optimizer warning", payload["error"])
         self.assertFalse(any(self.root.glob(".manifest.json.*.tmp")))
+
+    def test_evidence_recorder_streams_stage_lifecycle_and_duration(self) -> None:
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout):
+            recorder = EvidenceRecorder(
+                self.root / "manifest.json",
+                command="all",
+                configuration={"target": "aarch64-macos", "samples": 50},
+            )
+            recorder.stage("validate", "running")
+            recorder.stage("validate", "passed")
+            recorder.stage("profile-use", "running")
+            recorder.fail("profile-use", PgsoError("optimizer warning"))
+
+        output = stdout.getvalue()
+        self.assertIn("[pgso] stage started: validate", output)
+        self.assertRegex(
+            output,
+            r"\[pgso\] stage passed in \d+\.\d{3}s: validate",
+        )
+        self.assertIn("[pgso] stage started: profile-use", output)
+        self.assertRegex(
+            output,
+            (
+                r"\[pgso\] stage failed in \d+\.\d{3}s: "
+                r"profile-use: optimizer warning"
+            ),
+        )
+        payload = json.loads((self.root / "manifest.json").read_text())
+        passed_stage = payload["stages"][1]
+        failed_stage = payload["stages"][3]
+        self.assertIn("elapsed_seconds", passed_stage)
+        self.assertIn("elapsed_seconds", failed_stage)
+        self.assertGreaterEqual(passed_stage["elapsed_seconds"], 0)
+        self.assertGreaterEqual(failed_stage["elapsed_seconds"], 0)
 
     def test_evidence_recorder_cannot_mark_incomplete_work_eligible(self) -> None:
         recorder = EvidenceRecorder(

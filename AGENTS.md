@@ -82,8 +82,28 @@ Before implementing, answer in order:
 3. Does it need persistence?
 4. Does it need both text and JSON output?
 5. What docs and tests land with it?
+6. How is its deterministic E2E owner classified in the macOS arm64 PGSO corpus?
 
 If unclear, define the contract first.
+
+Every root `tests/e2e/*.test.ts` file must have exactly one classification in
+`scripts/pgso/corpus.json`:
+
+* **Training:** common or performance-sensitive product behavior that should
+  influence LLVM's hot and cold decisions
+
+* **Verification-only:** important correctness, recovery, security, or rare
+  behavior that the final candidate must pass without making it hot
+
+* **Intentional exclusion:** nondeterministic, live-network, credentialed,
+  sound-related, or harness-only coverage, with a concrete reason
+
+New tests inside an already classified file inherit that file's classification,
+but feature work must reconsider whether the existing classification still
+matches the file's product role. When removing a feature or E2E owner, remove
+its stale corpus entry. Normal PR CI loads the corpus and rejects missing,
+duplicate, stale, or unclassified files without running the expensive PGSO
+qualification.
 
 ### Adding a Command
 

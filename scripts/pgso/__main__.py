@@ -10,7 +10,7 @@ import sys
 from collections.abc import Mapping, Sequence
 
 from scripts.pgso.corpus import load_corpus, run_behavior_corpus, run_corpus
-from scripts.pgso.model import BuildIdentity, PgsoError, sha256_file
+from scripts.pgso.model import BuildIdentity, PgsoError, profile_evidence, sha256_file
 from scripts.pgso.pipeline import (
     GENERATION_FLAGS,
     ArtifactSpec,
@@ -379,6 +379,10 @@ def run_command(arguments: argparse.Namespace) -> pathlib.Path:
                     "path": str(paths.instrumented_binary),
                     "sha256": sha256_file(paths.instrumented_binary),
                     "smoke_profiles": merged_raw_profiles,
+                    "smoke_profile": profile_evidence(
+                        paths.merged_profile,
+                        merged_raw_profiles=merged_raw_profiles,
+                    ),
                 }
             },
         )

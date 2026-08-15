@@ -47,6 +47,15 @@ class PgsoPipelineTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
 
+    def test_open_reconstructs_an_existing_artifact_layout(self) -> None:
+        marker = self.paths.bitcode
+        marker.write_bytes(b"bitcode")
+
+        reopened = PipelinePaths.open(self.paths.root)
+
+        self.assertEqual(self.paths, reopened)
+        self.assertEqual(b"bitcode", reopened.bitcode.read_bytes())
+
     def make_toolchain(self, **changes: pathlib.Path) -> Toolchain:
         tool_root = self.root / "tools"
         tool_root.mkdir(exist_ok=True)

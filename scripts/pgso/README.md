@@ -43,6 +43,22 @@ python3 -m scripts.pgso all \
 
 `qualify` and `all` run the complete fresh-build path: training, profile use, candidate verification, the candidate behavior corpus, six startup comparisons, and six heavy-workload comparisons. `all` is the canonical CI entry point. `report --output-dir <path>` is the only command that may reuse an existing directory, and it only reads a complete eligible manifest.
 
+The production workflow runs the same gate as a distributed DAG. One seed job
+builds the control, bitcode, and instrumented binary. Up to twenty training
+jobs execute non-overlapping corpus assignments, one coordinator validates and
+merges every shard profile and builds the candidate, and up to twenty behavior
+jobs verify non-overlapping candidate assignments. The six startup and six
+heavy-workload comparisons run on twelve fresh machines. Every performance job
+measures its control and candidate on the same machine.
+
+`python3 -m scripts.pgso.distributed plan` emits deterministic, non-empty
+GitHub Actions matrices. The remaining distributed subcommands are workflow
+phase interfaces: `train-shard`, `candidate`, `behavior-shard`, `measure`, and
+`aggregate`. They reject a source, corpus, toolchain, bitcode, instrumented
+binary, candidate, assignment, or shard identity mismatch. The aggregate
+command requires all 36 training scenarios, all 51 behavior scenarios, and all
+12 performance gates exactly once before it emits `eligible: true`.
+
 ## Corpus
 
 [`corpus.json`](corpus.json) references existing test owners instead of copying their behavior. Training contains six direct CLI commands and thirty deterministic E2E files covering CLI, configuration, tools, Gateway lifecycle, fake web and vision routes, ACP, modern and legacy MCP, sessions, terminal hosting, TUI startup, resizing, rendering, permissions, interruption, subagents, and recovery. Fifteen additional deterministic E2E files verify the final candidate without influencing LLVM's hot and cold classification.
@@ -78,4 +94,11 @@ manifest.json
 
 Generated binaries, bitcode, objects, profiles, caches, measurements, and logs are evidence artifacts and must not be committed. `manifest.json` is rewritten atomically after every stage. A failed manifest retains completed evidence, names the failing stage, records `eligible: false`, and never falls back to an unprofiled candidate.
 
-The native workflow uploads this directory for inspection. Pull requests and manual runs have read-only repository permissions and do not change release, dev-channel, CDN, tag, or GitHub Release state. The stable release workflow may call the same gate with release packaging enabled; only an eligible candidate is packaged as `fx-macos-aarch64.tar.gz`.
+The driver also streams operational progress to the invoking terminal or GitHub Actions log. Every stage announces its start and terminal status with elapsed time, every child command announces its start and terminal status, and child stdout and stderr remain visible while the process runs. A silent child emits a heartbeat every 30 seconds. Full stdout and stderr continue to be retained in the command's JSON log, and no environment variables are printed.
+
+The native workflow uploads bounded phase evidence rather than caches or
+intermediate compiler objects. Pull requests and manual runs have read-only
+repository permissions and do not change release, dev-channel, CDN, tag, or
+GitHub Release state. The stable release workflow may call the same gate with
+release packaging enabled; only the candidate copied by the successful final
+aggregate is packaged as `fx-macos-aarch64.tar.gz`.

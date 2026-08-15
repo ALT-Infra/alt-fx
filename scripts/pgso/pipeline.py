@@ -122,11 +122,33 @@ class PipelinePaths:
         *,
         selector: str = "fx",
     ) -> "PipelinePaths":
+        return cls._initialize(root, selector=selector, require_empty=True)
+
+    @classmethod
+    def open(
+        cls,
+        root: pathlib.Path,
+        *,
+        selector: str = "fx",
+    ) -> "PipelinePaths":
+        root = root.resolve()
+        if not root.is_dir():
+            raise PgsoError(f"pipeline output directory does not exist: {root}")
+        return cls._initialize(root, selector=selector, require_empty=False)
+
+    @classmethod
+    def _initialize(
+        cls,
+        root: pathlib.Path,
+        *,
+        selector: str,
+        require_empty: bool,
+    ) -> "PipelinePaths":
         if selector not in ARTIFACT_LAYOUTS:
             raise PgsoError(f"unsupported pipeline artifact: {selector}")
         _, binary_name, bitcode_name = ARTIFACT_LAYOUTS[selector]
         root = root.resolve()
-        if root.exists() and any(root.iterdir()):
+        if require_empty and root.exists() and any(root.iterdir()):
             raise PgsoError(f"pipeline output directory is not empty: {root}")
         root.mkdir(parents=True, exist_ok=True)
 
