@@ -1126,12 +1126,13 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         });
     };
 
+    const effective_default_fast_mode = state.cfg.default_fast_mode and state.cfg.model_override == null;
     var startup = app_lifecycle.loadStartupState(
         alloc,
         state.cfg.gateway_provider.oauth_transport,
         state.cfg.secret_store,
         state.cfg.default_model,
-        state.cfg.default_fast_mode,
+        effective_default_fast_mode,
         state.cfg.default_agent_step_limit,
     ) catch |err| {
         return state.writer.writeError(alloc, msg.id, .{
