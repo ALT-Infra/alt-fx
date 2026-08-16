@@ -960,7 +960,7 @@ describe("filesystem path handling", () => {
         expect(existsSync(target)).toBe(false);
         const trace = readFileSync(tracePath, "utf8");
         expect(trace).toContain(
-          "event=auto_review_compose_result result=packet_too_large",
+          "event=auto_review_compose_result result=required_packet_too_large",
         );
         expect(trace).not.toContain("event=auto_review_transport_start");
         expect(trace).toContain("fallback_reason=invalid_or_unavailable");
