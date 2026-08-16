@@ -1847,13 +1847,13 @@ function startObservabilityGatewayFixture(
               {
                 type: "tool-input-start",
                 id: "observability-tool-1",
-                toolName: "run_command",
+                toolName: "terminal",
               },
               {
                 type: "tool-call",
                 toolCallId: "observability-tool-1",
-                toolName: "run_command",
-                input: { command },
+                toolName: "terminal",
+                input: { action: "exec", command },
               },
               {
                 type: "finish",

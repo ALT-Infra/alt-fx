@@ -426,7 +426,7 @@ async function waitForPendingSubagentApproval(
   const id = await waitForPersistedDeliveryId(
     root,
     childId,
-    "run_command /usr/bin/touch",
+    "terminal.exec /usr/bin/touch",
   );
   const communicationPath = join(
     root.home,
@@ -5022,7 +5022,8 @@ describe("effect-aware command permissions", () => {
           return finalText("INTERACTIVE_CHILD_DENIED_COMPLETE");
         }
         if (userText.includes(childPrompt)) {
-          return gatewayToolCall("run_command", {
+          return gatewayToolCall("terminal", {
+            action: "exec",
             command: `/usr/bin/touch ${shellQuote(markerPath)}`,
           }, childCommandCallId);
         }
