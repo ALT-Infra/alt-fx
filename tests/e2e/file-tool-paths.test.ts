@@ -149,7 +149,7 @@ function startFakeGateway(
     port: 0,
     async fetch(req) {
       const url = new URL(req.url);
-      if (url.pathname === "/v1/models") {
+      if (url.pathname === "/coding-agent/v1/models") {
         return Response.json({
           data: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
         });
@@ -213,7 +213,7 @@ function gatewayEnv(
     FX_GATEWAY_BASE_URL: gateway.baseUrl,
     FX_GATEWAY_CHAT_URL: gateway.chatUrl,
     FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/v1/models`,
+    FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
     FX_MODEL: MODEL,
     FX_AUTO_UPGRADE: "0",
     ...extra,

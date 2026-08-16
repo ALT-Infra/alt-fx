@@ -483,6 +483,15 @@ fn flushActiveSessionUsage(state: *ServerState) !void {
 }
 
 pub fn run(alloc: Allocator, cfg: Config) !void {
+    return runWithTransport(alloc, cfg, jsonrpc.Reader.init(), jsonrpc.Writer.init());
+}
+
+pub fn runWithTransport(
+    alloc: Allocator,
+    cfg: Config,
+    reader_value: jsonrpc.Reader,
+    writer_value: jsonrpc.Writer,
+) !void {
     if (cfg.log_file) |path| {
         try debug_trace.configure(.{ .file_path = path });
     }
@@ -492,7 +501,7 @@ pub fn run(alloc: Allocator, cfg: Config) !void {
     var state = ServerState{
         .alloc = alloc,
         .cfg = cfg,
-        .writer = jsonrpc.Writer.init(),
+        .writer = writer_value,
         .web_search_runtime = web_search_runtime.Runtime.init(.{
             .provider = cfg.gateway_provider.web_search,
         }),
@@ -507,7 +516,7 @@ pub fn run(alloc: Allocator, cfg: Config) !void {
     };
     defer state.deinit();
 
-    var reader = jsonrpc.Reader.init();
+    var reader = reader_value;
     while (!state.terminate_connection) {
         reapActivePrompt(&state, false);
         const line_result = reader.readLine(alloc) catch break;
@@ -1111,6 +1120,29 @@ fn parseInitializeRequest(
     return request;
 }
 
+fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator, default_fast_mode: bool) !app_lifecycle.StartupState {
+    if (state.cfg.home_override) |home_dir| {
+        if (state.cfg.workspace_root_override) |workspace_root| {
+            return app_lifecycle.loadEmbeddedStartupState(
+                alloc,
+                home_dir,
+                workspace_root,
+                state.cfg.default_model,
+                default_fast_mode,
+                state.cfg.default_agent_step_limit,
+            );
+        }
+    }
+    return app_lifecycle.loadStartupState(
+        alloc,
+        state.cfg.gateway_provider.oauth_transport,
+        state.cfg.secret_store,
+        state.cfg.default_model,
+        default_fast_mode,
+        state.cfg.default_agent_step_limit,
+    );
+}
+
 fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
     if (state.initialized) {
         return state.writer.writeError(alloc, msg.id, .{
@@ -1127,14 +1159,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     };
 
     const effective_default_fast_mode = state.cfg.default_fast_mode and state.cfg.model_override == null;
-    var startup = app_lifecycle.loadStartupState(
-        alloc,
-        state.cfg.gateway_provider.oauth_transport,
-        state.cfg.secret_store,
-        state.cfg.default_model,
-        effective_default_fast_mode,
-        state.cfg.default_agent_step_limit,
-    ) catch |err| {
+    var startup = loadConfiguredStartupState(state, alloc, effective_default_fast_mode) catch |err| {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.internal_error,
             .message = sandbox.configErrorMessage(err) orelse "Failed to load startup state",
@@ -1163,7 +1188,10 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
 
     state.workspace_root = startup.takeWorkspaceRoot();
     state.workspace_access = startup.takeWorkspaceAccess();
-    var credential = startup.takeCredential() orelse {
+    var credential = if (state.cfg.credential_override) |override| credentials.Credential{
+        .token = try alloc.dupe(u8, override),
+        .source = .ai_gateway_api_key,
+    } else startup.takeCredential() orelse {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
             .message = credentials.missing_credential_message,

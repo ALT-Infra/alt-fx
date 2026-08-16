@@ -126,6 +126,12 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         }),
     };
     defer mcp_configs.deinit(alloc);
+    if (!state.cfg.allow_acp_mcp and mcp_configs.items.items.len > 0) {
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "MCP servers are unavailable in this runtime",
+        });
+    }
     var mcp_preparation = try mcp_servers.prepare(
         alloc,
         &mcp_configs,
@@ -149,7 +155,10 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         }
     };
 
-    var store = session_store.Store.init(alloc, state.workspace_root) catch
+    var store = (if (state.cfg.home_override) |home|
+        session_store.Store.initFromHome(alloc, home, state.workspace_root)
+    else
+        session_store.Store.init(alloc, state.workspace_root)) catch
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.internal_error,
             .message = "Session store not available",
@@ -488,7 +497,10 @@ fn handleRestoreSession(
         }
     }
 
-    var store = session_store.Store.init(alloc, state.workspace_root) catch
+    var store = (if (state.cfg.home_override) |home|
+        session_store.Store.initFromHome(alloc, home, state.workspace_root)
+    else
+        session_store.Store.init(alloc, state.workspace_root)) catch
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.internal_error,
             .message = "Session store not available",

@@ -262,7 +262,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         const catalogEnv = {
           ...NO_AUTH,
           HOME: home,
-          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/v1/models`,
+          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
         };
 
         session = await TmuxSession.create({
@@ -641,7 +641,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           env: {
             ...NO_AUTH,
             HOME: home,
-            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/v1/models`,
+            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           },
           stderrPath,
         });
@@ -714,7 +714,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
             ...NO_AUTH,
             AI_GATEWAY_API_KEY: "fake-standard-key",
             HOME: home,
-            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/v1/models`,
+            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           },
           stderrPath,
         });
@@ -810,7 +810,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           HOME: home,
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/v1/models`,
+          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
         };
 
         session = await TmuxSession.create({
@@ -944,7 +944,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           HOME: home,
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/v1/models`,
+          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
         };
 
         const staleResult = await runFx(
@@ -1056,7 +1056,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           env: {
             ...NO_AUTH,
             HOME: home,
-            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/v1/models`,
+            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           },
           stderrPath,
         });
@@ -1118,7 +1118,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           env: {
             ...NO_AUTH,
             HOME: home,
-            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/v1/models`,
+            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           },
           stderrPath,
         });
@@ -1201,7 +1201,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
             HOME: home,
             FX_GATEWAY_BASE_URL: gateway.baseUrl,
             FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/v1/models`,
+            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           },
           stderrPath,
         });

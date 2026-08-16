@@ -15,7 +15,6 @@ from scripts.pgso.pipeline import (
     ArtifactSpec,
     PipelinePaths,
     apply_profile,
-    build_control,
     build_instrumented,
     collect_instrumented_profile,
     emit_bitcode,
@@ -31,7 +30,7 @@ from scripts.pgso.profile_supplement import (
     merge_profile_supplement,
     verify_supplement_functions,
 )
-from scripts.pgso.runner import emit_progress, run_checked
+from scripts.pgso.runner import emit_progress, hermetic_environment, run_checked
 from scripts.pgso.toolchain import Toolchain
 
 
@@ -294,7 +293,7 @@ class EvidenceRecorder:
                 raise PgsoError("passed stage is missing elapsed time")
             emit_progress(f"stage passed in {elapsed_seconds:.3f}s: {name}")
 
-    def fail(self, stage: str, error: Exception) -> None:
+    def fail(self, stage: str, error: BaseException) -> None:
         elapsed_seconds = self._stage_elapsed(stage)
         self.payload["stage"] = stage
         self.payload["status"] = "failed"
@@ -603,14 +602,13 @@ def build_benchmark_pair(
 ) -> BenchmarkPair:
     paths = PipelinePaths.create(output_root, selector=plan.selector)
     spec = ArtifactSpec(repo_root=repo_root, selector=plan.selector)
-    ordinary_control = build_control(toolchain, spec, paths)
-    minimum_macos = read_macos_minos(
-        toolchain,
-        ordinary_control,
-        paths.logs / "control-load-commands.json",
-    )
     bitcode_sha256 = emit_bitcode(toolchain, spec, paths)
     external_control = build_external_o2_control(toolchain, paths)
+    minimum_macos = read_macos_minos(
+        toolchain,
+        external_control,
+        paths.logs / "control-load-commands.json",
+    )
 
     first_training = plan.training_argvs[0]
     raw_profiles = list(
@@ -847,9 +845,7 @@ def profile_linked_benchmark_evidence(
 
 
 def _measurement_environment(home: pathlib.Path) -> dict[str, str]:
-    environment = os.environ.copy()
-    for key in ("AI_GATEWAY_API_KEY", "VERCEL_OIDC_TOKEN", "LLVM_PROFILE_FILE"):
-        environment.pop(key, None)
+    environment = hermetic_environment(home)
     environment.update(
         {
             "FX_AUTO_UPGRADE": "0",

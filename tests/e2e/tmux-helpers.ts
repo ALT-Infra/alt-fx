@@ -334,7 +334,7 @@ function serveFakeGateway(
     port: 0,
     idleTimeout: 0,
     async fetch(req) {
-      if (new URL(req.url).pathname === "/v1/models") {
+      if (new URL(req.url).pathname === "/coding-agent/v1/models") {
         modelRequests.push({ headers: new Headers(req.headers), url: req.url });
         const models = typeof options.models === "function"
           ? await options.models(req)

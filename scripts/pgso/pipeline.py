@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import argparse
 import dataclasses
-import json
 import os
 import pathlib
 import re
@@ -16,7 +14,7 @@ from scripts.pgso.model import (
     sha256_file,
     size_gate,
 )
-from scripts.pgso.runner import run_checked
+from scripts.pgso.runner import hermetic_environment, run_checked
 from scripts.pgso.toolchain import SUPPORTED_TARGET, Toolchain
 
 
@@ -229,7 +227,6 @@ class CandidateEvidence:
     artifact: ArtifactEvidence
     sha256: str
     metadata: CandidateMetadata
-    help_output: str
     version_output: str
 
 
@@ -239,7 +236,7 @@ def _require_nonempty_file(path: pathlib.Path, label: str) -> None:
 
 
 def _runtime_environment(paths: PipelinePaths) -> dict[str, str]:
-    environment = os.environ.copy()
+    environment = hermetic_environment(paths.runtime_home)
     environment.update(
         {
             "FX_AUTO_UPGRADE": "0",
@@ -964,76 +961,5 @@ def verify_candidate(
         artifact=artifact,
         sha256=sha256_file(paths.candidate_binary),
         metadata=metadata,
-        help_output=help_result.stdout,
         version_output=version_result.stdout.strip(),
     )
-
-
-def _smoke(llvm_bin: str, output_dir: pathlib.Path, zig: str) -> None:
-    toolchain = Toolchain.discover(zig, llvm_bin, SUPPORTED_TARGET)
-    paths = PipelinePaths.create(output_dir)
-    spec = ArtifactSpec(repo_root=pathlib.Path.cwd())
-
-    control = build_control(toolchain, spec, paths)
-    control_minos = read_macos_minos(
-        toolchain,
-        control,
-        paths.logs / "control-load-commands.json",
-    )
-    bitcode_sha256 = emit_bitcode(toolchain, spec, paths)
-    raw_profiles = build_instrumented(toolchain, paths, control_minos)
-    merged_count = merge_profile_batch(
-        toolchain,
-        raw_profiles,
-        paths.merged_profile,
-        paths.logs / "merge-smoke.json",
-    )
-    emit_bitcode(
-        toolchain,
-        spec,
-        paths,
-        expected_sha256=bitcode_sha256,
-    )
-    apply_profile(toolchain, paths, bitcode_sha256)
-    link_candidate(toolchain, paths)
-    candidate = verify_candidate(
-        toolchain,
-        paths,
-        expected_minos=control_minos,
-    )
-    report = {
-        "bitcode_sha256": bitcode_sha256,
-        "candidate_sha256": candidate.sha256,
-        "candidate_size_bytes": candidate.artifact.size_bytes,
-        "candidate_size_mib": candidate.artifact.size_mib,
-        "control_minos": control_minos,
-        "control_sha256": sha256_file(control),
-        "control_size_bytes": control.stat().st_size,
-        "merged_profile_count": merged_count,
-        "status": "passed",
-        "version": candidate.version_output,
-    }
-    (paths.root / "smoke.json").write_text(
-        json.dumps(report, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    print(json.dumps(report, indent=2, sort_keys=True))
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="Build and validate the macOS arm64 fx PGSO pipeline",
-    )
-    parser.add_argument("--smoke", action="store_true")
-    parser.add_argument("--llvm-bin", required=True)
-    parser.add_argument("--output-dir", required=True, type=pathlib.Path)
-    parser.add_argument("--zig", default="zig")
-    arguments = parser.parse_args(argv)
-    if not arguments.smoke:
-        parser.error("only --smoke is supported by this module")
-    _smoke(arguments.llvm_bin, arguments.output_dir, arguments.zig)
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

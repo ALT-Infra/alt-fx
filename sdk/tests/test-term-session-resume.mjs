@@ -2,7 +2,7 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createFxTerminal, supportsJspi } from "../fx-sdk.js";
+import { createFxTerminal, supportsJspi } from "../node.js";
 
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
 const defaultWasm = resolve(scriptDir, "../../zig-out/bin/fx-term.wasm");
@@ -91,6 +91,7 @@ async function waitFor(predicate, label, diagnostics = () => "") {
 async function start(args = []) {
   const capture = createTerminalCapture();
   const runtime = await createFxTerminal({
+  backend: "wasm",
     wasm,
     args,
     terminal: capture.terminal,
@@ -99,7 +100,7 @@ async function start(args = []) {
     sessionStore,
   });
   await waitFor(
-    () => capture.text().includes(args.length ? "Session: resumed" : "Run /help for commands"),
+    () => capture.text().includes(args.length ? "Session resumed" : "Run /help for commands"),
     "fx-term startup",
     () => `output=${JSON.stringify(capture.text().slice(-1000))}`,
   );

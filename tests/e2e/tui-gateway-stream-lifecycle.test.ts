@@ -1391,7 +1391,7 @@ async function launchRouteRecoveryTui(
       FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
       FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
       FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-      FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/v1/models`,
+      FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
       FX_MODEL: model,
     },
   });
@@ -2101,7 +2101,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
           FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/v1/models`,
+          FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
           FX_MODEL: directFastModel,
         },
       });
@@ -2842,7 +2842,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
           FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/v1/models`,
+          FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
           FX_MODEL: MODEL,
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
@@ -3581,7 +3581,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
           FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/v1/models`,
+          FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
         },
       });
 
@@ -3678,7 +3678,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
           FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/v1/models`,
+          FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
           FX_MODEL: MODEL,
         },
       });
@@ -4055,7 +4055,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
           FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/v1/models`,
+          FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
           FX_MODEL: MODEL,
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "agent,gateway,stream,worker,input,prompt,interrupt",

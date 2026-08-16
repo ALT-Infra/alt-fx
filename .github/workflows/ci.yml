@@ -58,8 +58,57 @@ jobs:
           MATRIX_RESULT: ${{ needs.zig_mode.result }}
         run: test "$MATRIX_RESULT" = success
 
-  wasm-core:
-    name: WASM core SDK
+  sdk-node-wasm:
+    name: SDK (Node + WASM)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Build WASM surfaces (ReleaseSmall)
+        run: |
+          zig build -Dwasm-surface=core -Doptimize=ReleaseSmall
+          zig build -Dwasm-surface=term -Doptimize=ReleaseSmall
+
+      - name: Install terminal test dependencies
+        run: npm ci --prefix sdk/node
+
+      - name: Test Node + WASM
+        run: npm run --prefix sdk test:node-wasm
+
+  sdk-node-napi:
+    name: SDK (Node + N-API)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Build N-API addon (ReleaseSafe)
+        run: zig build -Dnapi-surface=core -Doptimize=ReleaseSafe
+
+      - name: Test Node + N-API
+        run: npm run --prefix sdk test:node-napi
+
+  sdk-browser-wasm:
+    name: SDK (Browser + WASM)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -78,43 +127,15 @@ jobs:
         id: setup-chrome
         uses: browser-actions/setup-chrome@v2
 
-      - name: Build fx-core.wasm
-        run: zig build -Dwasm-surface=core
-
-      - name: Run Node SDK tests
+      - name: Build WASM surfaces (ReleaseSmall)
         run: |
-          node --experimental-wasm-jspi sdk/scripts/test-core.mjs
-          node --experimental-wasm-jspi sdk/scripts/test-core-cancel.mjs
+          zig build -Dwasm-surface=core -Doptimize=ReleaseSmall
+          zig build -Dwasm-surface=term -Doptimize=ReleaseSmall
 
-      - name: Run Chrome SDK tests
+      - name: Test Browser + WASM
         env:
           CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
-        run: node sdk/scripts/test-core-browser.mjs
-
-  wasm-term:
-    name: WASM terminal SDK
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: "0.16.0"
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "24"
-
-      - name: Build fx-term.wasm
-        run: zig build -Dwasm-surface=term
-
-      - name: Install terminal SDK dependencies
-        run: npm ci --prefix sdk/node
-
-      - name: Run terminal SDK tests
-        run: npm run --prefix sdk/node test:term
+        run: npm run --prefix sdk test:browser-wasm
 
   e2e_mode:
     name: E2E (deterministic, ${{ matrix.optimize }})

@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("core/shared/io.zig");
 
-pub const version = "0.4.3";
+pub const version = "0.4.4";
 
 const app_lifecycle = @import("core/app/app_lifecycle.zig");
 const auth_runtime = @import("core/auth/auth_runtime.zig");
@@ -427,7 +427,7 @@ const App = struct {
 
     pub fn agentStreamProvider(_: *const Self) agent_stream_provider.Provider {
         return if (comptime host_target.is_wasm)
-            js_host_stream_provider.provider(builtin_gateway.buildAgentRequest)
+            js_host_stream_provider.provider()
         else
             builtin_gateway.agent_stream_provider;
     }

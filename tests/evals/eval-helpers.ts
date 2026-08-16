@@ -47,7 +47,13 @@ function loadDotEnv(): Record<string, string> {
   return vars;
 }
 
-const dotEnvVars = loadDotEnv();
+export function shouldLoadDotEnv(
+  environment: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return environment.FX_E2E_DISABLE_DOTENV !== "1";
+}
+
+const dotEnvVars = shouldLoadDotEnv() ? loadDotEnv() : {};
 
 for (const [k, v] of Object.entries(dotEnvVars)) {
   if (!process.env[k]) process.env[k] = v;

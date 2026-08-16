@@ -199,7 +199,7 @@ function startImageGateway(
     port: 0,
     async fetch(req) {
       const url = new URL(req.url);
-      if (url.pathname === "/v1/models") {
+      if (url.pathname === "/coding-agent/v1/models") {
         catalogRequests += 1;
         return Response.json({
           data: [

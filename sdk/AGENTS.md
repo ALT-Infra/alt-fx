@@ -2,7 +2,7 @@
 
 These instructions apply to work under `sdk/` and supplement the repository-level `AGENTS.md`.
 
-This file is maintainer guidance, not consumer documentation. Keep setup and the supported public surface in `sdk/README.md`. Keep exact API shapes in `sdk/fx-sdk.js` and its tests. Add details here only when they help an agent choose the right owner, preserve a non-obvious invariant, or run the right proof.
+This file is maintainer guidance, not consumer documentation. Keep setup and the supported public surface in `sdk/README.md`. Keep exact API shapes in `sdk/fx-sdk.js` and its tests. Add details here only when they help an agent choose the right owner, preserve a non-obvious invariant, or run the right proof. The native Node-API architecture and security model are documented in `sdk/NAPI.md`.
 
 ## Start from the correct owner
 
@@ -18,7 +18,7 @@ The SDK has two WebAssembly surfaces and one shared JavaScript host layer:
 | Browser workspace contract and `run_command` bridge | `src/core/hosts/js_host_workspace.zig` and `src/tools/shell/browser_run_command.zig` |
 | Browser device login, OAuth session persistence, and URL opening | `src/core/auth/js_host_auth.zig`, `src/core/auth/oauth_session.zig`, and `src/core/hosts/js_host_url_opener.zig` |
 | WASI target, optimization mode, threading, and artifact names | `build.zig` |
-| Core browser fixture and its automation contract | `sdk/index.html` and `sdk/scripts/test-core-browser.mjs` |
+| Core browser fixture and its automation contract | `sdk/index.html` and `sdk/tests/test-core-browser.mjs` |
 | Terminal fixture and static packaging contract | `sdk/term-demo.html` and `sdk/scripts/package-term-demo.mjs` |
 | Commands required by CI | `.github/workflows/ci.yml` |
 
@@ -44,10 +44,10 @@ Do not treat the demos or this file as the implementation contract. When prose a
 | `createFxAgent()`, ACP translation, core session persistence, streaming, or cancellation | Core build, core Node tests, and the browser test when browser behavior is involved |
 | Live Gateway request or model-catalog translation | Core tests plus the opt-in live smoke test when a credential is available |
 | Terminal adapter, input encoding, resize, cleanup, config, or prompt history | Terminal build and the headless terminal suite |
-| Terminal session persistence or browser device login | Terminal build plus `sdk/scripts/test-term-session-resume.mjs` or `sdk/scripts/test-term-login.mjs` |
+| Terminal session persistence or browser device login | Terminal build plus `sdk/tests/test-term-session-resume.mjs` or `sdk/tests/test-term-login.mjs` |
 | Browser workspace metadata, permissions, execution, limits, or cancellation | Terminal build plus `sdk/node/test-term-workspace.mjs` |
 | `encodeXtermKeyEvent()` or `xtermAdapter()` only | `sdk/node/test-xterm-adapter.mjs` |
-| Core debugger query behavior or automation state | `sdk/scripts/test-core-browser.mjs` |
+| Core debugger query behavior or automation state | `sdk/tests/test-core-browser.mjs` |
 | Terminal demo asset references, integrity, or cache policy | Package into a fresh temporary directory and inspect the generated HTML, manifest, and headers |
 | Supported public behavior or setup | Update `sdk/README.md` in the same change |
 
@@ -57,9 +57,9 @@ Core validation from the repository root:
 
 ```sh
 zig build -Dwasm-surface=core
-node --experimental-wasm-jspi sdk/scripts/test-core.mjs
-node --experimental-wasm-jspi sdk/scripts/test-core-cancel.mjs
-node sdk/scripts/test-core-browser.mjs
+node --experimental-wasm-jspi sdk/tests/test-core.mjs
+node --experimental-wasm-jspi sdk/tests/test-core-cancel.mjs
+node sdk/tests/test-core-browser.mjs
 ```
 
 Set `CHROME_PATH` for the browser test only when Chrome or Chromium is outside the paths searched by the script.
@@ -70,14 +70,14 @@ Terminal validation from the repository root:
 zig build -Dwasm-surface=term
 npm ci --prefix sdk/node
 npm run --prefix sdk/node test:term
-node --experimental-wasm-jspi sdk/scripts/test-term-session-resume.mjs
-node --experimental-wasm-jspi sdk/scripts/test-term-login.mjs
+node --experimental-wasm-jspi sdk/tests/test-term-session-resume.mjs
+node --experimental-wasm-jspi sdk/tests/test-term-login.mjs
 ```
 
 For a live Gateway transport change, `AI_GATEWAY_API_KEY` must already be present in the environment before running the opt-in smoke test:
 
 ```sh
-node --experimental-wasm-jspi sdk/scripts/test-core-live.mjs
+node --experimental-wasm-jspi sdk/tests/test-core-live.mjs
 ```
 
 For behavior changes, also follow `sdk/README.md` to serve the repository and drive one real interaction in the affected browser demo. Automated tests do not replace this runtime exercise.
