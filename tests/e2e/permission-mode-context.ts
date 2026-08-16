@@ -2,7 +2,7 @@ import { expect } from "bun:test";
 
 const permissionModeContext = {
   ask: "Runtime context: permission mode is ask. Sensitive tool calls may require user approval unless configured rules or session grants already decide them. Tool admission remains authoritative.",
-  auto: "Runtime context: permission mode is auto. After configured rules, session grants, and deterministic direct-command authority, Fx reviews each unresolved sensitive tool call once. The reviewer either allows that exact action or sends it to the user for approval. Tool admission remains authoritative.",
+  auto: "Runtime context: permission mode is auto. After configured rules, session grants, and deterministic direct-command authority, Fx reviews each unresolved sensitive tool call once. A non-allow becomes a failed tool result so the agent can materially replan; repeated blocked rounds eventually use ordinary user approval. Tool admission remains authoritative.",
   yolo: "Runtime context: permission mode is yolo. Fx permission policy and sandboxing are disabled. Tool lookup, argument validation, execution authority, cancellation, limits, operating-system permissions, and remote authentication remain authoritative.",
 } as const;
 

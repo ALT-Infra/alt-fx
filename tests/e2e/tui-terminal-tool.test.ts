@@ -489,17 +489,27 @@ test.skipIf(!tmuxAvailable())(
     await active.sendKeys("C-x");
     await active.waitForText("Background processes", TIMEOUT);
     await active.sendKeys("Enter");
-    let pane = await active.waitForText("Ctrl-] d detach", TIMEOUT);
+    let pane = await active.waitForPane(
+      (current) =>
+        current.includes("Ctrl-] d detach") &&
+        current.includes("TAKEOVER_TOP"),
+      TIMEOUT,
+    );
     expect(pane).toContain("TAKEOVER_TOP");
-    expect(pane).toContain("TAKEOVER_BOTTOM");
     expect(pane).not.toContain("Agents & processes");
     expect(pane).not.toContain("Background processes");
     expect(pane).not.toContain("ctrl-x close");
 
     await active.sendText("RAW_KEYBOARD");
-    expect(await active.waitForText("ECHO:RAW_KEYBOARD", TIMEOUT)).toContain(
-      "TAKEOVER_TOP",
+    pane = await active.waitForPane(
+      (current) =>
+        current.includes("ECHO:RAW_KEYBOARD") &&
+        current.includes("TAKEOVER_TOP") &&
+        current.includes("TAKEOVER_BOTTOM"),
+      TIMEOUT,
     );
+    expect(pane).toContain("TAKEOVER_TOP");
+    expect(pane).toContain("TAKEOVER_BOTTOM");
     await active.pasteText("RAW_PASTE\n");
     await active.waitForText("RAW_PASTE", TIMEOUT);
     await active.sendHexBytes(["1b", "5b", "49"]);

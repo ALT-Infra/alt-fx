@@ -6632,10 +6632,14 @@ describe("effect-aware command permissions", () => {
   );
 
   test(
-    "fx ask blocks hostile git before any executable or repository access",
+    "fx ask executes hardened git without consulting hostile PATH or profiles",
     async () => {
       const root = createIsolatedRoot();
-      const gateway = startFakeGateway([toolCall("git status")]);
+      const gateway = startFakeGateway([
+        toolCall("git status"),
+        finalText("git inspection complete"),
+      ]);
+      const tracePath = join(root.root, "trace.log");
       const result = await runFx(
         ["ask", "--json", "--no-save", "Inspect repository status."],
         {
@@ -6643,14 +6647,20 @@ describe("effect-aware command permissions", () => {
           env: gatewayEnv(root, gateway, {
             PATH: hostilePath(root),
             FX_PERMISSION_MODE: "ask",
+            FX_TRACE_LOG: tracePath,
+            FX_TRACE_SCOPES: "core",
           }),
           timeoutMs: TIMEOUT,
         },
       );
 
-      expect(result.code).toBe(1);
-      expect(result.stderr).toContain("permission required");
-      expect(result.stderr).toContain("noninteractive_permission_prompt_unavailable");
+      expect(result.code).toBe(0);
+      expect(result.stderr).not.toContain("permission required");
+      expect(gateway.requests).toHaveLength(2);
+      expect(toolResultValue(gateway.requests[1]!.body, "command_1")).toContain(
+        "not a git repository",
+      );
+      expectDirectTrace(tracePath);
       expect(existsSync(root.profileMarker)).toBe(false);
       expectNoHostileExecutables(root);
       expectNoCommandArtifacts(root);

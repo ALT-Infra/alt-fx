@@ -1510,9 +1510,13 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       await ctx.session.resizeWindow(120, 36);
 
       await ctx.session.sendText("Seed the approval scrollback fixture.");
-      await ctx.session.waitForText(markers.at(-1)!, 90_000);
-      const beforeApproval = visibleText(
-        await ctx.session.captureFullScrollbackEscapes(),
+      const beforeApproval = await waitForVisibleScrollback(
+        ctx.session,
+        "complete approval scrollback seed",
+        (scrollback) => markers.every((marker) =>
+          scrollback.split(marker).length - 1 === 1
+        ),
+        90_000,
       );
       for (const marker of markers) {
         expect(beforeApproval.split(marker).length - 1).toBe(1);
@@ -1535,8 +1539,13 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       expect(pane).toContain("$ touch generic-preview-accepted.txt");
       expectApprovalSelection(pane, 1, COMMAND_YES_CHOICE);
 
-      const activeApproval = visibleText(
-        await ctx.session.captureFullScrollbackEscapes(),
+      const activeApproval = await waitForVisibleScrollback(
+        ctx.session,
+        "complete approval scrollback replay",
+        (scrollback) => markers.every((marker) =>
+          scrollback.split(marker).length - 1 === 1
+        ),
+        TIMEOUT,
       );
       for (const marker of markers) {
         expect(activeApproval.split(marker).length - 1).toBe(1);
@@ -1578,8 +1587,13 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       expect(await ctx.session.capturePane()).not.toContain(APPROVAL_PROMPT);
       expect(ctx.gateway.requests).toHaveLength(4);
 
-      const afterApproval = visibleText(
-        await ctx.session.captureFullScrollbackEscapes(),
+      const afterApproval = await waitForVisibleScrollback(
+        ctx.session,
+        "complete post-approval scrollback",
+        (scrollback) => markers.every((marker) =>
+          scrollback.split(marker).length - 1 === 1
+        ),
+        TIMEOUT,
       );
       for (const marker of markers) {
         expect(afterApproval.split(marker).length - 1).toBe(1);
