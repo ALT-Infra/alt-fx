@@ -306,13 +306,14 @@ const AcpContext = struct {
         return self.state.context_snapshot.modelVisibleBytes();
     }
 
-    fn toolRegistry(_: *const AcpContext) tool_dispatch.Registry {
-        return if (comptime host_target.is_wasm) tool_set_contract.empty.registry else builtin_tools.registry;
+    fn toolRegistry(self: *const AcpContext) tool_dispatch.Registry {
+        return activeToolSet(self.state).registry;
     }
 };
 
-fn activeToolSet() tool_set_contract.ToolSet {
-    return if (comptime host_target.is_wasm) tool_set_contract.empty else builtin_tools.advertisement_set;
+fn activeToolSet(state: *const server.ServerState) tool_set_contract.ToolSet {
+    if (comptime host_target.is_wasm) return tool_set_contract.empty;
+    return if (state.cfg.allow_native_tools) builtin_tools.advertisement_set else tool_set_contract.empty;
 }
 
 const AcpElicitationResponderContext = struct {
@@ -509,7 +510,7 @@ pub fn handlePrompt(
         recovery_checkpoint = try checkpoint.dupe(alloc);
     }
 
-    var tool_projection = try state.cfg.mode_registry.buildGatewayToolProjection(alloc, activeToolSet(), captured_mode, .{
+    var tool_projection = try state.cfg.mode_registry.buildGatewayToolProjection(alloc, activeToolSet(state), captured_mode, .{
         .permission_mode = captured_permission_mode,
         .permission_rules = session.permission_rules,
         .mcp_runtime = session.mcp,
@@ -1122,7 +1123,7 @@ fn validateToolCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !agen
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     if (ctx.state.active_session) |session| {
         const mode = ctx.captured_mode orelse session.mode;
-        if (try ctx.state.cfg.mode_registry.toolPolicyDeniedJson(arena, activeToolSet(), mode, call.name)) |reason| {
+        if (try ctx.state.cfg.mode_registry.toolPolicyDeniedJson(arena, activeToolSet(ctx.state), mode, call.name)) |reason| {
             return .{ .failure = reason };
         }
     }

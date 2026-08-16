@@ -8,11 +8,13 @@ const scriptDir = fileURLToPath(new URL(".", import.meta.url));
 const repoRoot = resolve(scriptDir, "../..");
 const outputDir = resolve(process.argv[2] || resolve(repoRoot, "sdk/dist/term-demo"));
 const htmlPath = resolve(repoRoot, "sdk/term-demo.html");
+const browserPath = resolve(repoRoot, "sdk/browser.js");
 const sdkPath = resolve(repoRoot, "sdk/fx-sdk.js");
 const wasmPath = resolve(repoRoot, "zig-out/bin/fx-term.wasm");
 
-const [htmlSource, sdkBytes, wasmBytes] = await Promise.all([
+const [htmlSource, browserBytes, sdkBytes, wasmBytes] = await Promise.all([
   readFile(htmlPath, "utf8"),
+  readFile(browserPath),
   readFile(sdkPath),
   readFile(wasmPath),
 ]);
@@ -23,11 +25,16 @@ const sdkHash = digest(sdkBytes);
 const wasmHash = digest(wasmBytes);
 const sdkName = `fx-sdk.${sdkHash}.js`;
 const wasmName = `fx-term.${wasmHash}.wasm`;
+const packagedBrowser = Buffer.from(
+  browserBytes.toString().replace('from "./fx-sdk.js";', `from "./${sdkName}";`),
+);
+const browserHash = digest(packagedBrowser);
+const browserName = `browser.${browserHash}.js`;
 
 const replacements = [
   ['const fxWasmAsset = "./fx-term.wasm";', `const fxWasmAsset = "./${wasmName}";`],
   ['const fxWasmIntegrity = "";', `const fxWasmIntegrity = "${integrity(wasmBytes)}";`],
-  ['from "./fx-sdk.js";', `from "./${sdkName}";`],
+  ['from "./browser.js";', `from "./${browserName}";`],
 ];
 let html = htmlSource;
 for (const [source, replacement] of replacements) {
@@ -51,6 +58,10 @@ const vercelConfig = {
       headers: [{ key: "Cache-Control", value: "public, max-age=0, must-revalidate" }],
     },
     {
+      source: `/${browserName}`,
+      headers: [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }],
+    },
+    {
       source: `/${sdkName}`,
       headers: [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }],
     },
@@ -66,6 +77,7 @@ const vercelConfig = {
 };
 await Promise.all([
   writeFile(resolve(outputDir, "index.html"), html),
+  writeFile(resolve(outputDir, browserName), packagedBrowser),
   writeFile(resolve(outputDir, sdkName), sdkBytes),
   writeFile(resolve(outputDir, wasmName), wasmBytes),
   writeFile(resolve(outputDir, "vercel.json"), `${JSON.stringify(vercelConfig, null, 2)}\n`),
@@ -73,11 +85,13 @@ await Promise.all([
 
 const manifest = {
   html: "index.html",
+  browser: { file: browserName, sha256: digest(packagedBrowser), bytes: packagedBrowser.byteLength },
   sdk: { file: sdkName, sha256: sdkHash, bytes: sdkBytes.byteLength },
   wasm: { file: wasmName, sha256: wasmHash, integrity: integrity(wasmBytes), bytes: wasmBytes.byteLength },
 };
 await writeFile(resolve(outputDir, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
 
 console.log(`packaged ${basename(outputDir)}`);
+console.log(`  ${browserName}`);
 console.log(`  ${sdkName}`);
 console.log(`  ${wasmName}`);

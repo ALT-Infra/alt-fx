@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import xtermHeadless from "@xterm/headless";
-import { createFxTerminal, supportsJspi, xtermAdapter } from "../fx-sdk.js";
+import { createFxTerminal, supportsJspi, xtermAdapter } from "../node.js";
 
 const { Terminal } = xtermHeadless;
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
@@ -57,6 +57,7 @@ const fetch = async (_url, init) => {
   });
 };
 const runtime = await createFxTerminal({
+  backend: "wasm",
   wasm: await readFile(wasmPath),
   terminal: instrumentedTerminalHost,
   env: { AI_GATEWAY_API_KEY: "term-lifecycle-key" },
@@ -137,6 +138,7 @@ if (disposals.data !== 1 || disposals.resize !== 1) {
 const abortTerminal = new Terminal({ cols: 80, rows: 24, allowProposedApi: true, scrollback: 1000 });
 const abortDisposals = { data: 0, resize: 0 };
 const abortRuntime = await createFxTerminal({
+  backend: "wasm",
   wasm: await readFile(wasmPath),
   terminal: instrumentTerminal(abortTerminal, abortDisposals),
   env: { AI_GATEWAY_API_KEY: "term-lifecycle-key" },

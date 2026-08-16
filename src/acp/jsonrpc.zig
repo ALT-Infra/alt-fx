@@ -126,8 +126,16 @@ pub fn freeMessage(alloc: Allocator, msg: *Message) void {
 }
 
 pub const Writer = struct {
+    pub const WriteFn = *const fn (?*anyopaque, []const u8) anyerror!void;
+
+    const Callback = struct {
+        context: ?*anyopaque,
+        write_fn: WriteFn,
+    };
+
     mutex: std.Io.Mutex = .init,
     stdout: std.Io.File,
+    callback: ?Callback = null,
 
     const Frame = union(enum) {
         response: struct {
@@ -190,6 +198,16 @@ pub const Writer = struct {
         return .{ .stdout = std.Io.File.stdout() };
     }
 
+    pub fn initCallback(context: ?*anyopaque, write_fn: WriteFn) Writer {
+        return .{
+            .stdout = std.Io.File.stdout(),
+            .callback = .{
+                .context = context,
+                .write_fn = write_fn,
+            },
+        };
+    }
+
     pub fn writeResponse(self: *Writer, alloc: Allocator, id: ?RequestId, result_json: []const u8) !void {
         try self.writeFrame(alloc, .{ .response = .{
             .id = id,
@@ -231,7 +249,11 @@ pub const Writer = struct {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        try self.stdout.writeStreamingAll(io, slice);
+        if (self.callback) |callback| {
+            try callback.write_fn(callback.context, slice);
+        } else {
+            try self.stdout.writeStreamingAll(io, slice);
+        }
     }
 
     fn writeId(w: *std.Io.Writer, id: ?RequestId) !void {
@@ -248,7 +270,7 @@ pub const Writer = struct {
 };
 
 pub const Reader = struct {
-    const ReadFn = *const fn (?*anyopaque, []u8) usize;
+    pub const ReadFn = *const fn (?*anyopaque, []u8) usize;
 
     pub const frame_resource_byte_limit: usize = 8 * 1024 * 1024;
     pub const LineRead = union(enum) {
@@ -266,11 +288,15 @@ pub const Reader = struct {
         return .{ .read_fn = readStdin };
     }
 
-    fn initForTesting(context: *anyopaque, read_fn: ReadFn) Reader {
+    pub fn initCallback(context: ?*anyopaque, read_fn: ReadFn) Reader {
         return .{
             .read_context = context,
             .read_fn = read_fn,
         };
+    }
+
+    fn initForTesting(context: *anyopaque, read_fn: ReadFn) Reader {
+        return initCallback(context, read_fn);
     }
 
     // Native ACP uses raw read(2) because Linux may pass socket-based stdin to

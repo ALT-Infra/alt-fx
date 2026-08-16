@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import xtermHeadless from "@xterm/headless";
-import { createFxTerminal, supportsJspi, xtermAdapter } from "../fx-sdk.js";
+import { createFxTerminal, supportsJspi, xtermAdapter } from "../node.js";
 
 const { Terminal } = xtermHeadless;
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
@@ -42,6 +42,7 @@ const fetch = async (url, init = {}) => {
 const stderrDecoder = new TextDecoder();
 let stderrText = "";
 const runtime = await createFxTerminal({
+  backend: "wasm",
   wasm: await readFile(wasmPath),
   terminal: xtermAdapter(terminal),
   env: {

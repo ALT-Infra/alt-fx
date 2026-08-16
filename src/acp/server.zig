@@ -483,6 +483,15 @@ fn flushActiveSessionUsage(state: *ServerState) !void {
 }
 
 pub fn run(alloc: Allocator, cfg: Config) !void {
+    return runWithTransport(alloc, cfg, jsonrpc.Reader.init(), jsonrpc.Writer.init());
+}
+
+pub fn runWithTransport(
+    alloc: Allocator,
+    cfg: Config,
+    reader_value: jsonrpc.Reader,
+    writer_value: jsonrpc.Writer,
+) !void {
     if (cfg.log_file) |path| {
         try debug_trace.configure(.{ .file_path = path });
     }
@@ -492,7 +501,7 @@ pub fn run(alloc: Allocator, cfg: Config) !void {
     var state = ServerState{
         .alloc = alloc,
         .cfg = cfg,
-        .writer = jsonrpc.Writer.init(),
+        .writer = writer_value,
         .web_search_runtime = web_search_runtime.Runtime.init(.{
             .provider = cfg.gateway_provider.web_search,
         }),
@@ -507,7 +516,7 @@ pub fn run(alloc: Allocator, cfg: Config) !void {
     };
     defer state.deinit();
 
-    var reader = jsonrpc.Reader.init();
+    var reader = reader_value;
     while (!state.terminate_connection) {
         reapActivePrompt(&state, false);
         const line_result = reader.readLine(alloc) catch break;
@@ -1161,9 +1170,16 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         }
     }
 
-    state.workspace_root = startup.takeWorkspaceRoot();
+    state.workspace_root = if (state.cfg.workspace_root_override) |root|
+        try alloc.dupe(u8, root)
+    else
+        startup.takeWorkspaceRoot();
+    if (state.cfg.workspace_root_override != null) alloc.free(startup.takeWorkspaceRoot());
     state.workspace_access = startup.takeWorkspaceAccess();
-    var credential = startup.takeCredential() orelse {
+    var credential = if (state.cfg.credential_override) |override| credentials.Credential{
+        .token = try alloc.dupe(u8, override),
+        .source = .ai_gateway_api_key,
+    } else startup.takeCredential() orelse {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
             .message = credentials.missing_credential_message,

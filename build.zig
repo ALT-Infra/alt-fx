@@ -15,6 +15,11 @@ const PgsoArtifact = enum {
     approval_review,
 };
 
+const NapiSurface = enum {
+    none,
+    core,
+};
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -27,6 +32,11 @@ pub fn build(b: *std.Build) void {
         WasmSurface,
         "wasm-surface",
         "Build a WASI WebAssembly surface for JavaScript hosts (core or term)",
+    ) orelse .none;
+    const napi_surface = b.option(
+        NapiSurface,
+        "napi-surface",
+        "Build a Node-API addon surface (core)",
     ) orelse .none;
 
     const git_commit = readGitCommit(b);
@@ -82,6 +92,9 @@ pub fn build(b: *std.Build) void {
 
     if (wasm_surface != .none) {
         addWasmArtifact(b, wasm_surface, git_commit, app_version, update_channel);
+    }
+    if (napi_surface != .none) {
+        addNapiArtifact(b, napi_surface, target, git_commit, app_version, update_channel);
     }
 
     const mcp_test_exports = b.createModule(.{
@@ -305,10 +318,6 @@ fn addWasmArtifact(
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .wasi,
-        // ReleaseSafe keeps thread-join paths alive that ReleaseFast dead-code
-        // eliminated. They can never run (`single_threaded` makes spawning a
-        // compile error) but their futex instructions must still assemble.
-        .cpu_features_add = std.Target.wasm.featureSet(&.{.atomics}),
     });
     const name = switch (surface) {
         .core => "fx-core",
@@ -337,7 +346,7 @@ fn addWasmArtifact(
         .root_module = b.createModule(.{
             .root_source_file = b.path(wasm_root),
             .target = wasm_target,
-            .optimize = .ReleaseSafe,
+            .optimize = .ReleaseSmall,
             .single_threaded = true,
             .link_libc = true,
             .stack_check = false,
@@ -354,6 +363,62 @@ fn addWasmArtifact(
     const wasm_step = b.step(name ++ "-wasm", description);
     wasm_step.dependOn(&install_wasm.step);
     b.getInstallStep().dependOn(&install_wasm.step);
+}
+
+fn addNapiArtifact(
+    b: *std.Build,
+    surface: NapiSurface,
+    target: std.Build.ResolvedTarget,
+    git_commit: []const u8,
+    app_version: []const u8,
+    update_channel: UpdateChannel,
+) void {
+    const napi_options = b.addOptions();
+    napi_options.addOption([]const u8, "git_commit", git_commit);
+    napi_options.addOption([]const u8, "app_version", app_version);
+    napi_options.addOption([]const u8, "update_channel", @tagName(update_channel));
+    napi_options.addOption(NapiSurface, "napi_surface", surface);
+
+    const root = switch (surface) {
+        .core => "src/napi_core_main.zig",
+        .none => unreachable,
+    };
+    const lib = b.addLibrary(.{
+        .name = "libfx",
+        .linkage = .dynamic,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(root),
+            .target = target,
+            .optimize = .ReleaseSafe,
+            .link_libc = true,
+            .strip = true,
+        }),
+    });
+    lib.root_module.addImport("build_options", napi_options.createModule());
+    const node_include = b.option(
+        []const u8,
+        "node-include-dir",
+        "Directory containing node_api.h for the N-API addon",
+    ) orelse discoverNodeIncludeDir(b);
+    lib.root_module.addSystemIncludePath(.{ .cwd_relative = node_include });
+    lib.linker_allow_shlib_undefined = true;
+
+    const install = b.addInstallArtifact(lib, .{ .dest_sub_path = "libfx.node" });
+    const step = b.step("libfx-napi", "Build the libfx Node-API core addon");
+    step.dependOn(&install.step);
+    b.getInstallStep().dependOn(&install.step);
+}
+
+fn discoverNodeIncludeDir(b: *std.Build) []const u8 {
+    var code: u8 = 0;
+    const out = b.runAllowFail(
+        &.{ "node", "-p", "require('node:path').join(require('node:path').dirname(process.execPath), '..', 'include', 'node')" },
+        &code,
+        .ignore,
+    ) catch @panic("Node.js is required to locate node_api.h; pass -Dnode-include-dir=<path>");
+    if (code != 0) @panic("could not locate node_api.h; pass -Dnode-include-dir=<path>");
+    const trimmed = std.mem.trim(u8, out, " \t\r\n");
+    return b.allocator.dupe(u8, trimmed) catch @panic("could not allocate Node include path");
 }
 
 fn readGitCommit(b: *std.Build) []const u8 {

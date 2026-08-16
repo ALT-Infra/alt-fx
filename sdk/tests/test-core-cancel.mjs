@@ -2,7 +2,7 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createFxAgent, supportsJspi } from "../fx-sdk.js";
+import { createFxAgent, supportsJspi } from "../node.js";
 
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
 const defaultWasm = resolve(scriptDir, "../../zig-out/bin/fx-core.wasm");
@@ -36,6 +36,7 @@ const timeout = (label, ms = 5000) => new Promise((_, reject) => {
 
 const agent = await Promise.race([
   createFxAgent({
+  backend: "wasm",
     wasm: await readFile(wasmPath),
     fetch: stalledFetch,
     env: { AI_GATEWAY_API_KEY: "sdk-test-key" },

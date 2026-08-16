@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { strict as assert } from "node:assert";
-import { encodeXtermKeyEvent, fxSdkApiVersion, xtermAdapter } from "../fx-sdk.js";
+import { encodeXtermKeyEvent, fxSdkApiVersion, xtermAdapter } from "../node.js";
 
 const superBackspace = "\x1b[127;9u";
 

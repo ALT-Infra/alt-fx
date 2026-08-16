@@ -2,7 +2,7 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createFxTerminal, supportsJspi } from "../fx-sdk.js";
+import { createFxTerminal, supportsJspi } from "../node.js";
 
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
 const defaultWasm = resolve(scriptDir, "../../zig-out/bin/fx-term.wasm");
@@ -76,6 +76,7 @@ const mockFetch = async (_url, init) => {
   }), { status: 200, headers: { "content-type": "text/event-stream" } });
 };
 const runtime = await createFxTerminal({
+  backend: "wasm",
   wasm: await readFile(wasmPath),
   terminal,
   env: { AI_GATEWAY_API_KEY: "term-test-key" },
@@ -92,7 +93,11 @@ await Promise.race([
   runtime.interactive,
   new Promise((_, reject) => setTimeout(() => reject(new Error("timed out waiting for fx-term to become interactive")), 5000)),
 ]);
-if (!streamedText.includes("Run /help for commands")) throw new Error("interactive resolved before startup output was written");
+const startupDeadline = performance.now() + 5000;
+while (!streamedText.includes("Run /help for commands")) {
+  if (performance.now() >= startupDeadline) throw new Error("timed out waiting for startup output");
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
 if (drainCalls !== 1 || !drainCompleted) throw new Error("interactive resolved before the terminal adapter drained");
 runtime.write("hello");
 runtime.write("\x1b[D");

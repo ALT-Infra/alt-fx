@@ -1,0 +1,26 @@
+#!/usr/bin/env node
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
+const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
+const scripts = [
+  "test-native-core-misuse.mjs",
+  "test-native-core-workers.mjs",
+  "test-native-core-worker-termination.mjs",
+  "test-native-core-security.mjs",
+  "test-native-core.mjs",
+  "test-native-core-stream.mjs",
+  "test-native-core-cancel.mjs",
+  "test-libfx-loader.mjs",
+];
+for (const script of scripts) {
+  const args = [fileURLToPath(new URL(script, import.meta.url))];
+  if (script === "test-native-core-workers.mjs") args.unshift("--expose-gc");
+  const result = spawnSync(process.execPath, args, {
+    cwd: repoRoot,
+    stdio: "inherit",
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) process.exit(result.status ?? 1);
+}
+console.log("Node + N-API SDK lane passed");
