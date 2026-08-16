@@ -137,6 +137,8 @@ pub const Context = struct {
     model: []const u8,
     permission_review_turn: ?permission_auto_classifier.ReviewTurnContext = null,
     root_user_intent_context: []const u8 = "",
+    root_user_messages: []const []const u8 = &.{},
+    root_user_evidence_complete: bool = false,
     current_turn_messages: []const ChatMessage = &.{},
     gateway_retry_count: usize,
     gateway_chat_url: []const u8,
@@ -1887,6 +1889,8 @@ fn executeSubagentProvider(
         .invocation_id = invocation_id,
         .parent_permission_mode = ctx.permission_mode,
         .root_user_intent_context = ctx.root_user_intent_context,
+        .root_user_messages = ctx.root_user_messages,
+        .root_user_evidence_complete = ctx.root_user_evidence_complete,
         .defaults = .{
             .model = ctx.model,
             .effort = ctx.effort,
@@ -2241,9 +2245,7 @@ const test_review_messages = [_]types.ChatMessage{
 const test_review_calls = [_]ToolCall{
     .{ .id = "test-review", .name = "run_command", .arguments_json = "{}" },
 };
-const test_review_bindings = [_]permission_auto_classifier.RootTextBinding{
-    .{ .message_index = 0, .text = "test root request" },
-};
+const test_review_root_messages = [_][]const u8{"test root request"};
 
 fn testReviewTurn() permission_auto_classifier.ReviewTurnContext {
     return .{
@@ -2252,7 +2254,7 @@ fn testReviewTurn() permission_auto_classifier.ReviewTurnContext {
         .pending_assistant = .{ .role = .assistant, .tool_calls = &test_review_calls },
         .target_call_id = "test-review",
         .origin = .root,
-        .root_text_bindings = &test_review_bindings,
+        .root_user_messages = &test_review_root_messages,
     };
 }
 

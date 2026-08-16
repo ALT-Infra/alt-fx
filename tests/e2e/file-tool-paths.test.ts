@@ -864,9 +864,7 @@ describe("filesystem path handling", () => {
               { name: "write_file", status: "success" },
             ]);
             expect(classified.stderr.match(/^Writing /gm)).toHaveLength(1);
-            expect(classified.stderr).toContain(
-              "[notice] Auto agent approved this request: Writing file.",
-            );
+            expect(classified.stderr).not.toContain("Auto agent approved this request");
             expect(readFileSync(scenario.target, "utf8")).toBe("CLASSIFIED_CONTENT");
           } finally {
             classifierGateway.stop();
@@ -1096,9 +1094,7 @@ describe("filesystem path handling", () => {
             "committed file read tracker refresh failed",
           );
           expect(result.stderr).toBe(
-            "[notice] Auto agent approved this request: Writing file.\n" +
-              "Writing typed.txt\n" +
-              "[notice] Auto agent approved this request: Editing file.\n" +
+            "Writing typed.txt\n" +
               "Editing typed.txt\n",
           );
         } finally {

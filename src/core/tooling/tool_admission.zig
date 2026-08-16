@@ -3180,7 +3180,7 @@ const FakeAutoClassifier = struct {
         const self: *@This() = @ptrCast(@alignCast(raw_ctx));
         self.calls += 1;
         self.review_model = request.review_turn.model;
-        self.review_root_text = request.review_turn.root_text_bindings[0].text;
+        self.review_root_text = request.review_turn.root_user_messages[0];
         self.review_target_call_id = request.review_turn.target_call_id;
         self.action_tag = std.meta.activeTag(request.action);
         switch (request.action) {
@@ -3303,9 +3303,7 @@ const test_review_request_messages = [_]types.ChatMessage{
 const test_review_tool_calls = [_]ToolCall{
     .{ .id = "test-review", .name = "run_command", .arguments_json = "{}" },
 };
-const test_review_root_bindings = [_]permission_auto_classifier.RootTextBinding{
-    .{ .message_index = 0, .text = "test root request" },
-};
+const test_review_root_messages = [_][]const u8{"test root request"};
 
 fn testReviewTurn() permission_auto_classifier.ReviewTurnContext {
     return .{
@@ -3314,7 +3312,7 @@ fn testReviewTurn() permission_auto_classifier.ReviewTurnContext {
         .pending_assistant = .{ .role = .assistant, .tool_calls = &test_review_tool_calls },
         .target_call_id = "test-review",
         .origin = .root,
-        .root_text_bindings = &test_review_root_bindings,
+        .root_user_messages = &test_review_root_messages,
     };
 }
 
@@ -3559,6 +3557,99 @@ test "automatic non-allow is recoverable regardless tool approval policy" {
     try std.testing.expect(unavailable.auto_review_result == null);
     try std.testing.expectEqual(@as(usize, 3), fake.calls);
     try std.testing.expectEqual(@as(usize, 1), recording.calls);
+}
+
+test "incomplete review authority maps to auto denial without reviewer transport" {
+    const State = struct {
+        review_calls: usize = 0,
+        transport_calls: usize = 0,
+
+        fn send(
+            raw_ctx: *anyopaque,
+            _: Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: std.Io.Clock.Timestamp,
+            _: *std.atomic.Value(bool),
+        ) anyerror!permission_auto_classifier.TransportOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx));
+            self.transport_calls += 1;
+            return .permanent_failure;
+        }
+
+        fn review(
+            raw_ctx: *anyopaque,
+            alloc: Allocator,
+            request: permission_auto_classifier.ReviewRequest,
+        ) anyerror!permission_auto_classifier.ParseOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx));
+            self.review_calls += 1;
+            return permission_auto_classifier.Reviewer.withTransport(.{
+                .context = raw_ctx,
+                .send_fn = send,
+            }, null, 1000).review(alloc, request);
+        }
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var background: BackgroundRuntime = .{};
+    defer background.deinit(std.testing.allocator);
+    var state = State{};
+    var input = testInputWithClassifier(
+        &worker,
+        &background,
+        permission_auto_classifier.Classifier.withOverride(
+            @ptrCast(&state),
+            State.review,
+        ),
+    );
+    var review_turn = testReviewTurn();
+    review_turn.root_user_evidence_complete = false;
+    input.permission_review_turn = review_turn;
+
+    const outcome = try requestPermissionOutcome(
+        input,
+        arena_state.allocator(),
+        .{
+            .id = "test-review",
+            .name = "run_command",
+            .arguments_json = "{\"command\":\"touch incomplete.txt\"}",
+        },
+        .auto,
+        &.{},
+    );
+
+    try std.testing.expectEqual(ToolPermissionDecision.deny, outcome.decision);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, outcome.denial_reason.?);
+    try std.testing.expect(outcome.execution_authority == null);
+    try std.testing.expectEqual(@as(usize, 1), state.review_calls);
+    try std.testing.expectEqual(@as(usize, 0), state.transport_calls);
+
+    review_turn.root_user_evidence_complete = true;
+    review_turn.trusted_permission_feedback_complete = false;
+    input.permission_review_turn = review_turn;
+    const incomplete_feedback = try requestPermissionOutcome(
+        input,
+        arena_state.allocator(),
+        .{
+            .id = "test-feedback-review",
+            .name = "run_command",
+            .arguments_json = "{\"command\":\"touch feedback-incomplete.txt\"}",
+        },
+        .auto,
+        &.{},
+    );
+    try std.testing.expectEqual(ToolPermissionDecision.deny, incomplete_feedback.decision);
+    try std.testing.expectEqual(
+        types.ToolPermissionDenialReason.auto_denied,
+        incomplete_feedback.denial_reason.?,
+    );
+    try std.testing.expect(incomplete_feedback.execution_authority == null);
+    try std.testing.expectEqual(@as(usize, 2), state.review_calls);
+    try std.testing.expectEqual(@as(usize, 0), state.transport_calls);
 }
 
 test "ask-only policy bypasses prompt and reviewer in auto and uses the ordinary prompt in ask" {

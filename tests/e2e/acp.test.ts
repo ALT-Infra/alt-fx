@@ -4209,7 +4209,7 @@ describe("acp: model-independent", () => {
           await startCodeSession(client);
           const accepted = await runPrompt(client, acceptedPrompt, TIMEOUT);
           expect(JSON.stringify(accepted)).toContain("ACP external write accepted");
-          expect(JSON.stringify(accepted.messages)).toContain(
+          expect(JSON.stringify(accepted.messages)).not.toContain(
             "Auto agent approved this request: Writing file.",
           );
           expect(readFileSync(acceptedTarget, "utf-8")).toBe("FX_ACP_AUTO_ACCEPTED");

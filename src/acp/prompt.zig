@@ -30,6 +30,7 @@ const session_usage = @import("../core/session/session_usage.zig");
 const subagent_agent_adapter = @import("../core/subagent/agent_adapter.zig");
 const subagent_domain = @import("../core/subagent/domain.zig");
 const subagent_execution = @import("../core/subagent/execution.zig");
+const subagent_resume_admission = @import("../core/subagent/resume_admission.zig");
 const parent_delivery_projector = @import("../core/subagent/parent_delivery_projector.zig");
 const usage_recovery = @import("../core/session/usage_recovery.zig");
 const skill_runtime = @import("../core/skills/skill_runtime.zig");
@@ -741,6 +742,22 @@ fn buildAgentConfig(state: *server.ServerState, session: *server.ActiveSessionSt
         .first_call_tool_choice = session.first_call_tool_choice,
         .workspace_root = state.workspace_root,
         .access_scope = state.workspace_access.scope(state.workspace_root),
+        .origin = if (session.writable) |writable|
+            if (writable.external_prompt_origin == .persistent_child) .subagent else .root
+        else
+            .root,
+        .root_user_messages = if (session.writable) |writable|
+            writable.external_root_user_messages
+        else
+            &.{},
+        .root_user_evidence_complete = if (session.writable) |writable|
+            writable.external_root_user_evidence_complete
+        else
+            false,
+        .current_prompt_is_root_authority = if (session.writable) |writable|
+            writable.external_prompt_origin == .persistent_child
+        else
+            false,
         .context_limits = state.context_limits,
     };
 }
@@ -1226,13 +1243,13 @@ fn requestToolPermissionOutcomeWithRequest(raw_ctx: *anyopaque, arena: Allocator
 const TestReviewTurn = struct {
     request_messages: [1]ChatMessage,
     tool_calls: [1]ToolCall,
-    root_bindings: [1]permission_auto_classifier.RootTextBinding,
+    root_messages: [1][]const u8,
 
     fn init(root_text: []const u8, call: ToolCall) TestReviewTurn {
         return .{
             .request_messages = .{.{ .role = .user, .content = root_text }},
             .tool_calls = .{call},
-            .root_bindings = .{.{ .message_index = 0, .text = root_text }},
+            .root_messages = .{root_text},
         };
     }
 
@@ -1243,7 +1260,7 @@ const TestReviewTurn = struct {
             .pending_assistant = .{ .role = .assistant, .tool_calls = &self.tool_calls },
             .target_call_id = self.tool_calls[0].id,
             .origin = .root,
-            .root_text_bindings = &self.root_bindings,
+            .root_user_messages = &self.root_messages,
         };
     }
 };
@@ -1389,6 +1406,8 @@ fn executeToolCall(
     defer elicitation_responder.deinit();
     tool_ctx.mcp_input_responder = elicitation_responder.responder();
     tool_ctx.root_user_intent_context = request.root_user_intent_context;
+    tool_ctx.root_user_messages = request.root_user_messages;
+    tool_ctx.root_user_evidence_complete = request.root_user_evidence_complete;
     var progress_ctx = AcpWebSearchProgressContext{ .ctx = ctx, .tool_call_id = acp_id };
     var fetch_progress_ctx = AcpWebFetchProgressContext{ .ctx = ctx, .tool_call_id = acp_id };
     tool_ctx.web_search_progress_ctx = @ptrCast(&progress_ctx);
@@ -1583,6 +1602,11 @@ fn persistAcpHistoryTurn(
         return;
     }
     const writable = if (session.writable) |*value| value else return;
+    try subagent_resume_admission.retainExternalRootUserTurn(
+        alloc,
+        writable,
+        turn,
+    );
     if (writable.degradedTail() != null) {
         const now_ms = io_mod.milliTimestamp();
         var current = try currentAcpState(alloc, session, writable, now_ms);
@@ -3889,7 +3913,7 @@ test "ACP auto mode uses automatic review allow and ask without prompting" {
         ) anyerror!permission_auto_classifier.ParseOutcome {
             const self: *@This() = @ptrCast(@alignCast(raw_ctx));
             self.calls += 1;
-            self.root_text = request.review_turn.root_text_bindings[0].text;
+            self.root_text = request.review_turn.root_user_messages[0];
             return .{ .valid = .{
                 .risk = if (self.decision == .allow) .low else .high,
                 .authorization = if (self.decision == .allow) .medium else .low,
@@ -3978,7 +4002,7 @@ test "ACP auto mode automatic review allows or asks prepared external file mutat
         ) anyerror!permission_auto_classifier.ParseOutcome {
             const self: *@This() = @ptrCast(@alignCast(raw_ctx));
             self.calls += 1;
-            self.root_text = request.review_turn.root_text_bindings[0].text;
+            self.root_text = request.review_turn.root_user_messages[0];
             self.saw_file_mutation_context = std.meta.activeTag(request.action) == .file_mutation;
             return .{ .valid = .{
                 .risk = if (self.decision == .allow) .low else .high,

@@ -1920,19 +1920,20 @@ fn containsImageId(image_ids: []const usize, candidate: usize) bool {
 
 const ReviewAuthority = struct {
     root_user_messages: []const []const u8,
-    root_text_bindings: []const permission_auto_classifier.RootTextBinding,
+    root_user_evidence_complete: bool,
     trusted_permission_feedback: []const []const u8,
+    trusted_permission_feedback_complete: bool,
 
     fn deinit(self: ReviewAuthority, alloc: Allocator) void {
         alloc.free(self.root_user_messages);
-        alloc.free(self.root_text_bindings);
         alloc.free(self.trusted_permission_feedback);
     }
 };
 
-/// Length-changing projections copy retained messages, so borrowed content
-/// identity proves which projected user message came from the canonical source.
-fn projectedSourceUserIndex(
+/// Finds the canonical current user message after a length-changing request
+/// projection so native image parts can be removed from reviewer context. This
+/// mapping does not establish permission authority.
+fn projectedUserMessageIndex(
     projected_messages: []const ChatMessage,
     source_messages: []const ChatMessage,
     source_index: usize,
@@ -1941,7 +1942,9 @@ fn projectedSourceUserIndex(
     const source = source_messages[source_index];
     if (source.role != .user) return null;
     if (projected_messages.len == source_messages.len) {
-        if (source_index >= projected_messages.len or projected_messages[source_index].role != .user) {
+        if (source_index >= projected_messages.len or
+            projected_messages[source_index].role != .user)
+        {
             return null;
         }
         return source_index;
@@ -1979,19 +1982,50 @@ noinline fn buildReviewAuthority(
     current_root_prompt: []const u8,
     pending_user_suffix: []const ChatMessage,
 ) !ReviewAuthority {
+    _ = projected_messages;
+    _ = history_start_index;
+    _ = projected_current_user_message_index;
     var root_user_messages: std.ArrayList([]const u8) = .empty;
     errdefer root_user_messages.deinit(alloc);
-    var bindings: std.ArrayList(permission_auto_classifier.RootTextBinding) = .empty;
-    errdefer bindings.deinit(alloc);
     var trusted_permission_feedback: std.ArrayList([]const u8) = .empty;
     errdefer trusted_permission_feedback.deinit(alloc);
+    var root_user_evidence_complete = true;
+    var trusted_permission_feedback_complete = true;
+
+    for (history) |turn| switch (turn) {
+        .compacted_summary => |entry| {
+            trusted_permission_feedback_complete =
+                trusted_permission_feedback_complete and
+                entry.permission_feedback_complete;
+            try trusted_permission_feedback.appendSlice(
+                alloc,
+                entry.permission_feedback,
+            );
+        },
+        .assistant => |entry| try appendExecutionPermissionFeedback(
+            alloc,
+            &trusted_permission_feedback,
+            entry.execution,
+        ),
+        .background_command => |entry| try appendExecutionPermissionFeedback(
+            alloc,
+            &trusted_permission_feedback,
+            entry.execution,
+        ),
+        .interrupted => |entry| try appendExecutionPermissionFeedback(
+            alloc,
+            &trusted_permission_feedback,
+            entry.execution,
+        ),
+    };
 
     if (origin == .root) {
         for (history) |turn| switch (turn) {
-            .compacted_summary => |entry| try root_user_messages.appendSlice(
-                alloc,
-                entry.root_user_messages,
-            ),
+            .compacted_summary => |entry| {
+                root_user_evidence_complete = root_user_evidence_complete and
+                    entry.root_user_messages_complete;
+                try root_user_messages.appendSlice(alloc, entry.root_user_messages);
+            },
             .assistant => |entry| try root_user_messages.append(alloc, entry.user.text),
             .background_command => |entry| try root_user_messages.append(alloc, entry.user.text),
             .interrupted => |entry| try root_user_messages.append(alloc, entry.user.text),
@@ -2001,120 +2035,23 @@ noinline fn buildReviewAuthority(
         }
     }
 
-    const projected_current_user_index = if (projected_current_user_message_index) |index|
-        if (index < projected_messages.len and projected_messages[index].role == .user)
-            index
-        else
-            null
-    else
-        projectedSourceUserIndex(
-            projected_messages,
-            source_messages,
-            current_user_message_index,
-        );
-    if (projected_current_user_index) |projected_current| {
-        const projected_history_start = if (projected_messages.len <= source_messages.len)
-            @min(history_start_index, projected_current)
-        else
-            projected_current;
-        var message_index = projected_history_start;
-        while (message_index < projected_current) : (message_index += 1) {
-            const projected = projected_messages[message_index];
-            if (projected.role != .user) continue;
-            const content = projected.content orelse continue;
-            if (findHistoryPermissionFeedback(content, history)) |feedback| {
-                try trusted_permission_feedback.append(alloc, feedback);
-                continue;
-            }
-            if (origin == .root) {
-                if (findHistoryRootText(content, history)) |root_text| {
-                    try bindings.append(alloc, .{
-                        .message_index = message_index,
-                        .text = root_text,
-                    });
-                    continue;
-                }
-            }
-        }
-
-        if (origin == .root and current_root_prompt.len > 0) {
-            const current = projected_messages[projected_current];
-            if (current.role == .user and
-                permission_auto_classifier.rootTextAligned(current.content orelse "", current_root_prompt))
-            {
-                try bindings.append(alloc, .{
-                    .message_index = projected_current,
-                    .text = current_root_prompt,
-                });
-            }
-        }
-
-        for (source_messages, 0..) |source, source_index| {
-            if (source_index <= current_user_message_index or
-                source.role != .user or
-                !source.permission_feedback)
-            {
-                continue;
-            }
-            const feedback = source.content orelse continue;
-            if (feedback.len == 0) continue;
-            const projected_index = projectedSourceUserIndex(
-                projected_messages,
-                source_messages,
-                source_index,
-            ) orelse continue;
-            if (projected_index <= projected_current) continue;
-            if (!std.mem.eql(u8, projected_messages[projected_index].content orelse "", feedback)) continue;
-            try trusted_permission_feedback.append(alloc, feedback);
-        }
+    for (source_messages[current_user_message_index + 1 ..]) |source| {
+        if (source.role != .user or !source.permission_feedback) continue;
+        const feedback = source.content orelse continue;
+        if (feedback.len > 0) try trusted_permission_feedback.append(alloc, feedback);
     }
     try appendTrustedPermissionFeedback(alloc, &trusted_permission_feedback, pending_user_suffix);
 
-    const owned_bindings = try bindings.toOwnedSlice(alloc);
-    errdefer alloc.free(owned_bindings);
     const owned_root_user_messages = try root_user_messages.toOwnedSlice(alloc);
     errdefer alloc.free(owned_root_user_messages);
     const owned_permission_feedback = try trusted_permission_feedback.toOwnedSlice(alloc);
     errdefer alloc.free(owned_permission_feedback);
     return .{
         .root_user_messages = owned_root_user_messages,
-        .root_text_bindings = owned_bindings,
+        .root_user_evidence_complete = root_user_evidence_complete,
         .trusted_permission_feedback = owned_permission_feedback,
+        .trusted_permission_feedback_complete = trusted_permission_feedback_complete,
     };
-}
-
-fn findHistoryRootText(content: []const u8, history: []const HistoryTurn) ?[]const u8 {
-    for (history) |turn| {
-        const root_text = switch (turn) {
-            .assistant => |entry| entry.user.text,
-            .background_command => |entry| entry.user.text,
-            .interrupted => |entry| entry.user.text,
-            .compacted_summary => continue,
-        };
-        if (root_text.len > 0 and permission_auto_classifier.rootTextAligned(content, root_text)) {
-            return root_text;
-        }
-    }
-    return null;
-}
-
-fn findHistoryPermissionFeedback(content: []const u8, history: []const HistoryTurn) ?[]const u8 {
-    for (history) |turn| {
-        const execution = switch (turn) {
-            .assistant => |entry| entry.execution,
-            .background_command => |entry| entry.execution,
-            .interrupted => |entry| entry.execution,
-            .compacted_summary => continue,
-        };
-        for (execution.tool_steps) |step| {
-            for (step.tool_results) |result| {
-                for (result.permission_feedback) |feedback| {
-                    if (feedback.len > 0 and std.mem.eql(u8, content, feedback)) return feedback;
-                }
-            }
-        }
-    }
-    return null;
 }
 
 fn buildReviewTurnContext(
@@ -2128,7 +2065,7 @@ fn buildReviewTurnContext(
     projected_current_user_message_index: ?usize,
     history: []const HistoryTurn,
     current_prompt: []const u8,
-    inherited_root_context: []const u8,
+    _: []const u8,
     pending_user_suffix: []const ChatMessage,
     pending_assistant: ChatMessage,
     target_call_id: []const u8,
@@ -2146,6 +2083,17 @@ fn buildReviewTurnContext(
         current_prompt,
         pending_user_suffix,
     );
+    const child_root_user_messages = if (config.origin == .subagent and
+        config.current_prompt_is_root_authority)
+    blk: {
+        const combined = try alloc.alloc([]const u8, config.root_user_messages.len + 1);
+        @memcpy(combined[0..config.root_user_messages.len], config.root_user_messages);
+        combined[combined.len - 1] = current_prompt;
+        break :blk combined;
+    } else config.root_user_messages;
+    const child_root_user_evidence_complete =
+        config.root_user_evidence_complete and
+        (!config.current_prompt_is_root_authority or current_prompt.len > 0);
     return .{
         .model = model,
         .request_messages = projected_messages,
@@ -2155,15 +2103,33 @@ fn buildReviewTurnContext(
             .root => .root,
             .subagent => .subagent,
         },
-        .root_user_messages = authority.root_user_messages,
-        .root_text_bindings = authority.root_text_bindings,
-        .inherited_root_context = if (config.origin == .subagent)
-            inherited_root_context
+        .root_user_messages = if (config.origin == .subagent)
+            child_root_user_messages
         else
-            "",
+            authority.root_user_messages,
+        .root_user_evidence_complete = if (config.origin == .subagent)
+            child_root_user_evidence_complete
+        else
+            authority.root_user_evidence_complete,
+        .inherited_root_context = "",
         .trusted_permission_feedback = authority.trusted_permission_feedback,
+        .trusted_permission_feedback_complete = authority.trusted_permission_feedback_complete,
         .auto_recovery_exhausted = auto_recovery_exhausted,
     };
+}
+
+fn appendExecutionPermissionFeedback(
+    alloc: Allocator,
+    feedback: *std.ArrayList([]const u8),
+    execution: types.ExecutionMemory,
+) !void {
+    for (execution.tool_steps) |step| {
+        for (step.tool_results) |result| {
+            for (result.permission_feedback) |item| {
+                if (item.len > 0) try feedback.append(alloc, item);
+            }
+        }
+    }
 }
 
 const max_automatic_non_allow_response_groups: usize = 3;
@@ -3618,7 +3584,7 @@ fn processQueuedPromptLoop(
                 if (vision_route != .native_images) break :blk request_messages;
                 for (successful_request_messages) |message| {
                     if (message.images.len == 0) continue;
-                    const review_current_user_message_index = projectedSourceUserIndex(
+                    const review_current_user_message_index = projectedUserMessageIndex(
                         successful_request_messages,
                         recovery_source_messages,
                         current_user_message_index,
@@ -6052,6 +6018,8 @@ fn processQueuedPromptLoop(
                 .call = execution_call,
                 .authority = execution_authority,
                 .root_user_intent_context = tool_execution_root_user_context,
+                .root_user_messages = review_context.root_user_messages,
+                .root_user_evidence_complete = review_context.root_user_evidence_complete,
                 .authorized_image_catalog = job.authorized_image_catalog,
                 .current_turn_messages = within_turn_suffix.items,
                 .session_grants = execution_grants,
@@ -6492,6 +6460,8 @@ fn processQueuedPromptLoop(
                             .call = execution_call,
                             .authority = broader_authority,
                             .root_user_intent_context = tool_execution_root_user_context,
+                            .root_user_messages = review_context.root_user_messages,
+                            .root_user_evidence_complete = review_context.root_user_evidence_complete,
                             .authorized_image_catalog = job.authorized_image_catalog,
                             .current_turn_messages = within_turn_suffix.items,
                             .session_grants = if (live_authority) |resolved|
@@ -7283,11 +7253,10 @@ test "review authority binds current root across native-to-review projection" {
         &.{},
     );
 
-    try std.testing.expectEqual(@as(usize, 1), authority.root_text_bindings.len);
-    try std.testing.expectEqual(@as(usize, 70), authority.root_text_bindings[0].message_index);
+    try std.testing.expectEqual(@as(usize, 1), authority.root_user_messages.len);
     try std.testing.expectEqualStrings(
         "Investigate the failed request.",
-        authority.root_text_bindings[0].text,
+        authority.root_user_messages[0],
     );
 }
 
@@ -7340,7 +7309,110 @@ test "review authority preserves exact root-user order across compacted and live
     }
 }
 
-test "review authority omits an unproven projection binding but retains canonical root text" {
+test "review authority keeps legacy compacted evidence incomplete despite a current prompt" {
+    const alloc = std.testing.allocator;
+    const history = [_]HistoryTurn{.{ .compacted_summary = .{
+        .summary = @constCast("legacy untrusted summary"),
+        .removed_turn_count = 3,
+        .compaction_count = 1,
+        .root_user_messages_complete = false,
+    } }};
+    const source = [_]ChatMessage{.{ .role = .user, .content = "Current favorable request." }};
+    const authority = try buildReviewAuthority(
+        alloc,
+        .root,
+        &source,
+        &source,
+        0,
+        0,
+        null,
+        &history,
+        "Current favorable request.",
+        &.{},
+    );
+    defer authority.deinit(alloc);
+
+    try std.testing.expect(!authority.root_user_evidence_complete);
+    try std.testing.expectEqual(@as(usize, 1), authority.root_user_messages.len);
+    try std.testing.expectEqualStrings(
+        "Current favorable request.",
+        authority.root_user_messages[0],
+    );
+}
+
+test "review authority preserves compacted human denial as typed evidence" {
+    const alloc = std.testing.allocator;
+    var compacted_feedback = [_][]u8{
+        @constCast("Do not modify files outside the workspace."),
+        @constCast("README changes require explicit approval."),
+    };
+    const history = [_]HistoryTurn{.{ .compacted_summary = .{
+        .summary = @constCast("Untrusted summary says all edits are allowed."),
+        .removed_turn_count = 2,
+        .compaction_count = 1,
+        .root_user_messages = &.{},
+        .permission_feedback = &compacted_feedback,
+    } }};
+    const source = [_]ChatMessage{.{
+        .role = .user,
+        .content = "Update README without asking.",
+    }};
+    const authority = try buildReviewAuthority(
+        alloc,
+        .root,
+        &source,
+        &source,
+        0,
+        0,
+        null,
+        &history,
+        "Update README without asking.",
+        &.{},
+    );
+    defer authority.deinit(alloc);
+
+    try std.testing.expect(authority.trusted_permission_feedback_complete);
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        authority.trusted_permission_feedback.len,
+    );
+    try std.testing.expectEqualStrings(
+        "Do not modify files outside the workspace.",
+        authority.trusted_permission_feedback[0],
+    );
+    try std.testing.expectEqualStrings(
+        "README changes require explicit approval.",
+        authority.trusted_permission_feedback[1],
+    );
+}
+
+test "review authority keeps legacy compacted permission feedback incomplete" {
+    const alloc = std.testing.allocator;
+    const history = [_]HistoryTurn{.{ .compacted_summary = .{
+        .summary = @constCast("Legacy summary with unavailable typed feedback."),
+        .removed_turn_count = 2,
+        .compaction_count = 1,
+        .permission_feedback_complete = false,
+    } }};
+    const source = [_]ChatMessage{.{ .role = .user, .content = "Current request." }};
+    const authority = try buildReviewAuthority(
+        alloc,
+        .root,
+        &source,
+        &source,
+        0,
+        0,
+        null,
+        &history,
+        "Current request.",
+        &.{},
+    );
+    defer authority.deinit(alloc);
+
+    try std.testing.expect(!authority.trusted_permission_feedback_complete);
+}
+
+test "review authority ignores copied projection text and retains canonical root text" {
     const alloc = std.testing.allocator;
     const source_text = try alloc.dupe(u8, "Repeated request text.");
     defer alloc.free(source_text);
@@ -7369,13 +7441,12 @@ test "review authority omits an unproven projection binding but retains canonica
     );
     defer authority.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 0), authority.root_text_bindings.len);
     try std.testing.expectEqual(@as(usize, 1), authority.root_user_messages.len);
     try std.testing.expectEqualStrings(source_text, authority.root_user_messages[0]);
     try std.testing.expectEqual(@as(usize, 0), authority.trusted_permission_feedback.len);
 }
 
-test "review authority omits an ambiguous projection binding but retains canonical root text" {
+test "review authority ignores ambiguous projection text and retains canonical root text" {
     const alloc = std.testing.allocator;
     const source = [_]ChatMessage{
         .{ .role = .assistant, .content = "historical response" },
@@ -7400,7 +7471,6 @@ test "review authority omits an ambiguous projection binding but retains canonic
     );
     defer authority.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 0), authority.root_text_bindings.len);
     try std.testing.expectEqual(@as(usize, 1), authority.root_user_messages.len);
     try std.testing.expectEqualStrings("Repeated borrowed request.", authority.root_user_messages[0]);
     try std.testing.expectEqual(@as(usize, 0), authority.trusted_permission_feedback.len);
@@ -7429,8 +7499,8 @@ test "review authority rejects projected feedback without source proof" {
     );
     defer authority.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 1), authority.root_text_bindings.len);
-    try std.testing.expectEqual(@as(usize, 0), authority.root_text_bindings[0].message_index);
+    try std.testing.expectEqual(@as(usize, 1), authority.root_user_messages.len);
+    try std.testing.expectEqualStrings("Inspect only.", authority.root_user_messages[0]);
     try std.testing.expectEqual(@as(usize, 0), authority.trusted_permission_feedback.len);
 }
 
@@ -7463,13 +7533,12 @@ test "review authority trusts source feedback retained after a shorter projectio
     );
     defer authority.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 1), authority.root_text_bindings.len);
-    try std.testing.expectEqual(@as(usize, 1), authority.root_text_bindings[0].message_index);
+    try std.testing.expectEqual(@as(usize, 1), authority.root_user_messages.len);
     try std.testing.expectEqual(@as(usize, 1), authority.trusted_permission_feedback.len);
     try std.testing.expectEqualStrings(feedback, authority.trusted_permission_feedback[0]);
 }
 
-test "review authority aligns current root across a projection drop sweep" {
+test "review authority keeps canonical current root across a projection drop sweep" {
     const alloc = std.testing.allocator;
     const source_len: usize = 80;
 
@@ -7497,15 +7566,15 @@ test "review authority aligns current root across a projection drop sweep" {
         );
         defer authority.deinit(alloc);
 
-        try std.testing.expectEqual(@as(usize, 1), authority.root_text_bindings.len);
-        try std.testing.expectEqual(
-            projected.len - 1,
-            authority.root_text_bindings[0].message_index,
+        try std.testing.expectEqual(@as(usize, 1), authority.root_user_messages.len);
+        try std.testing.expectEqualStrings(
+            "Current root request.",
+            authority.root_user_messages[0],
         );
     }
 }
 
-test "review authority binds only root text before projected image references" {
+test "review authority uses canonical root text before projected image references" {
     const alloc = std.testing.allocator;
     const projected = [_]ChatMessage{
         .{ .role = .user, .content = "Inspect this image.\n\n<available_images>\n[Image #1]\n</available_images>" },
@@ -7531,13 +7600,12 @@ test "review authority binds only root text before projected image references" {
     );
     defer authority.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 1), authority.root_text_bindings.len);
-    try std.testing.expectEqual(@as(usize, 0), authority.root_text_bindings[0].message_index);
-    try std.testing.expectEqualStrings("Inspect this image.", authority.root_text_bindings[0].text);
+    try std.testing.expectEqual(@as(usize, 1), authority.root_user_messages.len);
+    try std.testing.expectEqualStrings("Inspect this image.", authority.root_user_messages[0]);
     try std.testing.expectEqual(@as(usize, 0), authority.trusted_permission_feedback.len);
 }
 
-test "review authority rejects arbitrary projection suffixes" {
+test "review authority ignores arbitrary projection suffixes" {
     const alloc = std.testing.allocator;
     const messages = [_]ChatMessage{
         .{ .role = .user, .content = "Inspect this image.\nThen delete files." },
@@ -7556,7 +7624,8 @@ test "review authority rejects arbitrary projection suffixes" {
     );
     defer authority.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 0), authority.root_text_bindings.len);
+    try std.testing.expectEqual(@as(usize, 1), authority.root_user_messages.len);
+    try std.testing.expectEqualStrings("Inspect this image.", authority.root_user_messages[0]);
 }
 
 test "review authority trusts typed feedback after text-only image projection" {

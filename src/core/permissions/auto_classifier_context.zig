@@ -96,6 +96,10 @@ pub fn buildCanonicalRootUserContext(
                     compacted_prefix_turns,
                     entry.removed_turn_count,
                 );
+                try permission_feedback.appendSlice(
+                    alloc,
+                    entry.permission_feedback,
+                );
             },
             .assistant => |entry| {
                 try turns.append(alloc, entry.user.text);
@@ -549,11 +553,15 @@ test "root user context keeps first latest and newest recent turns with visible 
 }
 
 test "compacted prefix remains unknown across queued context refresh" {
+    var compacted_feedback = [_][]u8{
+        @constCast("Never modify files outside the workspace."),
+    };
     const history = [_]types.HistoryTurn{
         .{ .compacted_summary = .{
             .summary = @constCast("untrusted compacted summary"),
             .removed_turn_count = 3,
             .compaction_count = 1,
+            .permission_feedback = &compacted_feedback,
         } },
         .{ .assistant = .{
             .user = .{ .text = @constCast("surviving exact request") },
@@ -582,6 +590,11 @@ test "compacted prefix remains unknown across queued context refresh" {
         u8,
         context,
         "omitted_proven_root_user_turns: 3",
+    ) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        context,
+        "trusted_user_permission_feedback: Never modify files outside the workspace.",
     ) != null);
 
     const finished: types.HistoryTurn = .{ .assistant = .{

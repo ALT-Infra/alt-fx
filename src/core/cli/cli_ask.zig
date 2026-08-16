@@ -1554,6 +1554,22 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .first_call_tool_choice = ctx.first_call_tool_choice,
         .workspace_root = ctx.workspace_root,
         .access_scope = ctx.workspace_access.scope(ctx.workspace_root),
+        .origin = if (ctx.writable) |writable|
+            if (writable.external_prompt_origin == .persistent_child) .subagent else .root
+        else
+            .root,
+        .root_user_messages = if (ctx.writable) |writable|
+            writable.external_root_user_messages
+        else
+            &.{},
+        .root_user_evidence_complete = if (ctx.writable) |writable|
+            writable.external_root_user_evidence_complete
+        else
+            false,
+        .current_prompt_is_root_authority = if (ctx.writable) |writable|
+            writable.external_prompt_origin == .persistent_child
+        else
+            false,
         .context_limits = ctx.context_limits,
         .session_child_capability = if (ctx.writable) |*writable|
             writable.childCapability() catch null
@@ -1931,13 +1947,20 @@ fn requestSandboxWideningForRuntime(
 ) !command_admission.PermissionOutcome {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     const tool_ctx = cliAdmissionContext(ctx, advertised_dynamic_tool_names, review_turn);
-    return tool_admission.requestSandboxWideningOutcome(
-        tool_ctx.admissionInputWithLiveAuthority(live_authority),
+    return finishCliPermissionOutcome(
+        ctx,
+        tool_ctx,
         arena,
         call,
         permission_mode,
-        local_grants,
-        required.wideningInput(),
+        try tool_admission.requestSandboxWideningOutcome(
+            tool_ctx.admissionInputWithLiveAuthority(live_authority),
+            arena,
+            call,
+            permission_mode,
+            local_grants,
+            required.wideningInput(),
+        ),
     );
 }
 
@@ -2055,7 +2078,7 @@ fn finishCliPermissionOutcome(
             label,
             "noninteractive_permission_prompt_unavailable",
             if (permission_mode == .auto)
-                "fx ask: the automatic reviewer could not approve this action; use the interactive shell to approve it, or add a narrow matching permission rule\n"
+                "fx ask: human approval is required for this action; use the interactive shell to approve it, or add a narrow matching permission rule\n"
             else
                 "fx ask: rerun with --auto to review this exact action automatically, or use the interactive shell to approve it\n",
         ),
@@ -2073,13 +2096,13 @@ fn finishCliPermissionOutcome(
 const TestReviewTurn = struct {
     request_messages: [1]ChatMessage,
     tool_calls: [1]ToolCall,
-    root_bindings: [1]permission_auto_classifier.RootTextBinding,
+    root_messages: [1][]const u8,
 
     fn init(root_text: []const u8, call: ToolCall) TestReviewTurn {
         return .{
             .request_messages = .{.{ .role = .user, .content = root_text }},
             .tool_calls = .{call},
-            .root_bindings = .{.{ .message_index = 0, .text = root_text }},
+            .root_messages = .{root_text},
         };
     }
 
@@ -2090,7 +2113,7 @@ const TestReviewTurn = struct {
             .pending_assistant = .{ .role = .assistant, .tool_calls = &self.tool_calls },
             .target_call_id = self.tool_calls[0].id,
             .origin = .root,
-            .root_text_bindings = &self.root_bindings,
+            .root_user_messages = &self.root_messages,
         };
     }
 };
@@ -2248,6 +2271,8 @@ fn executeToolCallAuthorized(
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     var tool_ctx = ctx.toolContext();
     tool_ctx.root_user_intent_context = request.root_user_intent_context;
+    tool_ctx.root_user_messages = request.root_user_messages;
+    tool_ctx.root_user_evidence_complete = request.root_user_evidence_complete;
     tool_ctx.session_grants = request.session_grants;
     tool_ctx.advertised_dynamic_tool_names = request.advertised_dynamic_tool_names;
     tool_ctx.max_tool_result_bytes = request.max_tool_result_bytes;
@@ -2399,6 +2424,11 @@ fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.session_write_mutex.unlock(io_mod.getIo());
     const writable = if (ctx.writable) |*value| value else return;
+    try subagent_resume_admission.retainExternalRootUserTurn(
+        ctx.alloc,
+        writable,
+        turn,
+    );
 
     if (writable.degradedTail() != null) {
         const now_ms = io_mod.milliTimestamp();
@@ -5979,6 +6009,66 @@ test "fx ask prepared file mutation callback preserves terminal permission promp
     try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
 }
 
+test "fx ask headless sandbox widening callback terminalizes exhausted recovery" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    var ctx = AskContext.init(
+        alloc,
+        testConfig(),
+        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+        "/tmp/workspace",
+    );
+    defer ctx.deinit();
+    ctx.sandbox_backend = .macos;
+
+    const call: ToolCall = .{
+        .id = "sandbox-widening",
+        .name = "run_command",
+        .arguments_json = "{\"command\":\"npm install\"}",
+    };
+    const required: agent_runtime.SandboxScopeRequired = .{
+        .phase = .preflight,
+        .restricted_fingerprint = .init(.{
+            .command = "npm install",
+            .resolved_cwd = "/tmp/workspace",
+            .background = false,
+            .resolved_backend = .macos,
+            .target_os = std_builtin.os.tag,
+        }),
+    };
+    var review_turn = TestReviewTurn.init("Install the workspace dependencies.", call);
+    var review_context = review_turn.context();
+    review_context.auto_recovery_exhausted = true;
+    const runtime_deps = agentRuntimeDeps(&ctx);
+
+    try std.testing.expectError(
+        error.NonInteractivePermissionRequired,
+        runtime_deps.request_sandbox_widening(
+            runtime_deps.ctx,
+            arena,
+            call,
+            review_context,
+            .auto,
+            &.{},
+            null,
+            &.{},
+            required,
+        ),
+    );
+    try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
+    try std.testing.expect(std.mem.find(
+        u8,
+        stderr_capture.bytes.items,
+        "permission required for tool execution in noninteractive mode",
+    ) != null);
+}
+
 test "fx ask auto mode uses automatic allow for external prepared file mutation" {
     const FakeClassifier = struct {
         calls: usize = 0,
@@ -5991,7 +6081,7 @@ test "fx ask auto mode uses automatic allow for external prepared file mutation"
         ) anyerror!permission_auto_classifier.ParseOutcome {
             const self: *@This() = @ptrCast(@alignCast(raw_ctx));
             self.calls += 1;
-            self.root_text = request.review_turn.root_text_bindings[0].text;
+            self.root_text = request.review_turn.root_user_messages[0];
             try std.testing.expect(request.targets.len >= 1);
             const file = switch (request.action) {
                 .file_mutation => |value| value,

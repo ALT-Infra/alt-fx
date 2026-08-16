@@ -18,9 +18,6 @@ const max_run_command_activity_bytes = 120;
 const max_run_command_activity_source_bytes = max_run_command_activity_bytes * max_run_command_activity_bytes;
 pub const max_auto_permission_reason_presentation_bytes: usize = 160;
 
-const auto_permission_approved_prefix = "Auto agent approved this request";
-const auto_permission_generic_explanation = "Auto agent could not review this request safely.";
-
 pub const ToolActionInput = struct {
     tool_registry: tool_dispatch.Registry,
     call: ToolCall,
@@ -263,8 +260,8 @@ pub fn formatPermissionLabel(alloc: Allocator, registry: tool_dispatch.Registry,
     return std.fmt.allocPrint(alloc, "{s} {s}", .{ call.name, value });
 }
 
-/// Formats the single auto-permission result already carried by `outcome`.
-/// The caller owns the returned allocation and must free it with `alloc`.
+/// Automatic-review routing remains internal. Users see only the ordinary
+/// tool lifecycle or the established human approval UI.
 pub fn formatAutoPermissionNotice(
     alloc: Allocator,
     registry: tool_dispatch.Registry,
@@ -272,28 +269,11 @@ pub fn formatAutoPermissionNotice(
     permission_mode: types.PermissionMode,
     outcome: command_admission.PermissionOutcome,
 ) !?[]const u8 {
-    if (permission_mode != .auto) return null;
-
-    if (outcome.auto_review_result) |result| {
-        switch (result.decision) {
-            .allow => {
-                if (outcome.decision.isDenied() or outcome.execution_authority == null) return null;
-                const spec = registry.lookup(call.name) orelse {
-                    return @as(?[]const u8, try std.fmt.allocPrint(alloc, "{s}: Using requested tool.", .{auto_permission_approved_prefix}));
-                };
-                return @as(?[]const u8, try std.fmt.allocPrint(
-                    alloc,
-                    "{s}: {s} {s}.",
-                    .{ auto_permission_approved_prefix, spec.action_label, spec.label_arg_default },
-                ));
-            },
-            .ask => return null,
-        }
-    }
-
-    if (outcome.decision == .permission_required) {
-        return try alloc.dupe(u8, auto_permission_generic_explanation);
-    }
+    _ = alloc;
+    _ = registry;
+    _ = call;
+    _ = permission_mode;
+    _ = outcome;
     return null;
 }
 
@@ -728,10 +708,10 @@ test "tool presentation formats permission labels" {
     try expectContains(risk, "safer: inspect git status first");
 }
 
-test "auto permission presentation uses safe actions for accepted requests" {
+test "auto permission presentation keeps reviewer routing internal" {
     const alloc = std.testing.allocator;
     const raw_secret = "AI_GATEWAY_API_KEY=should-never-be-presented";
-    const notice = (try formatAutoPermissionNotice(
+    try std.testing.expect((try formatAutoPermissionNotice(
         alloc,
         test_tool_registry,
         .{
@@ -750,39 +730,7 @@ test "auto permission presentation uses safe actions for accepted requests" {
                 .rationale = "safe",
             },
         },
-    )).?;
-    defer alloc.free(notice);
-
-    try std.testing.expectEqualStrings("Auto agent approved this request: Running command.", notice);
-    try std.testing.expect(std.mem.find(u8, notice, raw_secret) == null);
-}
-
-test "auto permission presentation propagates allocation failure" {
-    const alloc = std.testing.allocator;
-    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
-    try std.testing.expectError(
-        error.OutOfMemory,
-        formatAutoPermissionNotice(
-            failing.allocator(),
-            test_tool_registry,
-            .{
-                .id = "command",
-                .name = "run_command",
-                .arguments_json = "{\"command\":\"printf done\"}",
-            },
-            .auto,
-            .{
-                .decision = .once,
-                .execution_authority = .ordinary,
-                .auto_review_result = .{
-                    .risk = .low,
-                    .authorization = .high,
-                    .decision = .allow,
-                    .rationale = "safe",
-                },
-            },
-        ),
-    );
+    )) == null);
 }
 
 test "auto permission presentation omits notice for ask reviews" {
@@ -806,18 +754,15 @@ test "auto permission presentation omits notice for ask reviews" {
     )) == null);
 }
 
-test "auto permission presentation uses one resultless fallback" {
+test "auto permission presentation omits resultless fallback" {
     const alloc = std.testing.allocator;
-    const notice = (try formatAutoPermissionNotice(
+    try std.testing.expect((try formatAutoPermissionNotice(
         alloc,
         test_tool_registry,
         .{ .id = "command", .name = "run_command", .arguments_json = "{}" },
         .auto,
         .{ .decision = .permission_required },
-    )).?;
-    defer alloc.free(notice);
-
-    try std.testing.expectEqualStrings(auto_permission_generic_explanation, notice);
+    )) == null);
     try std.testing.expect((try formatAutoPermissionNotice(
         alloc,
         test_tool_registry,

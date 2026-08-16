@@ -2806,7 +2806,7 @@ fn appendStatic(input: StaticContextInput, arena: Allocator, messages: *std.Arra
 fn permissionModeContext(permission_mode: types.PermissionMode) []const u8 {
     return switch (permission_mode) {
         .ask => "Runtime context: permission mode is ask. Sensitive tool calls may require user approval unless configured rules or session grants already decide them. Tool admission remains authoritative.",
-        .auto => "Runtime context: permission mode is auto. After configured rules, session grants, and deterministic direct-command authority, Fx reviews each unresolved sensitive tool call once. A non-allow becomes a failed tool result so the agent can materially replan; repeated blocked rounds eventually use ordinary user approval. Tool admission remains authoritative.",
+        .auto => "Runtime context: permission mode is auto. After configured rules, session grants, and deterministic safe-tool authority, fx reviews each unresolved sensitive tool call once. An automatic non-allow first returns a failed tool result for autonomous replanning. Choose a materially different safe action or an existing deterministic safe tool; do not repeat the blocked action unchanged. After bounded recovery, fx uses its existing human approval channel. Do not fabricate approval or ask the user to approve prematurely. Tool admission remains authoritative.",
         .yolo => "Runtime context: permission mode is yolo. Fx permission policy and sandboxing are disabled. Tool lookup, argument validation, execution authority, cancellation, limits, operating-system permissions, and remote authentication remain authoritative.",
     };
 }
@@ -3272,7 +3272,7 @@ test "runtime context composes exact auto mode with noninteractive blockers and 
     try std.testing.expectEqual(@as(usize, 3), messages.items.len);
     try std.testing.expectEqual(types.ChatRole.system, messages.items[1].role);
     try std.testing.expectEqualStrings(
-        "Runtime context: permission mode is auto. After configured rules, session grants, and deterministic direct-command authority, Fx reviews each unresolved sensitive tool call once. A non-allow becomes a failed tool result so the agent can materially replan; repeated blocked rounds eventually use ordinary user approval. Tool admission remains authoritative.",
+        "Runtime context: permission mode is auto. After configured rules, session grants, and deterministic safe-tool authority, fx reviews each unresolved sensitive tool call once. An automatic non-allow first returns a failed tool result for autonomous replanning. Choose a materially different safe action or an existing deterministic safe tool; do not repeat the blocked action unchanged. After bounded recovery, fx uses its existing human approval channel. Do not fabricate approval or ask the user to approve prematurely. Tool admission remains authoritative.",
         messages.items[1].content.?,
     );
     try std.testing.expectEqual(types.ChatRole.system, messages.items[2].role);

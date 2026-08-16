@@ -187,6 +187,8 @@ pub fn run(
             .access_scope = config.tool_context.access_scope,
             .origin = .subagent,
             .root_user_intent_context = message.root_user_intent_context,
+            .root_user_messages = message.root_user_messages,
+            .root_user_evidence_complete = message.root_user_evidence_complete,
             .session_child_capability = turn.childCapability() catch null,
             .context_limits = config.tool_context.context_limits,
         },
@@ -450,6 +452,8 @@ fn executeToolCall(raw: *anyopaque, request: agent_runtime.ToolExecutionRequest)
     const context: *Context = @ptrCast(@alignCast(raw));
     var tool_ctx = context.toolContext();
     tool_ctx.root_user_intent_context = request.root_user_intent_context;
+    tool_ctx.root_user_messages = request.root_user_messages;
+    tool_ctx.root_user_evidence_complete = request.root_user_evidence_complete;
     return tool_runtime.executeToolCallAuthorized(tool_ctx, request);
 }
 

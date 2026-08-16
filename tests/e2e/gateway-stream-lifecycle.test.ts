@@ -1984,7 +1984,6 @@ describe("gateway stream lifecycle", () => {
         expect(occurrenceCount(result.stderr, progressLine)).toBe(1);
         expect(result.stderr).toBe(
           "Writing file\n" +
-            "[notice] Auto agent approved this request: Writing file.\n" +
             progressLine,
         );
         const assistantOutput = variant.json

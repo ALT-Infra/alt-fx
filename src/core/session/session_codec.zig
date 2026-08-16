@@ -272,6 +272,14 @@ pub fn writeHistoryTurn(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
                 try writeDurableBytes(writer, message);
             }
             try writer.writeByte(']');
+            try writer.print(",\"root_user_messages_complete\":{}", .{entry.root_user_messages_complete});
+            try writer.writeAll(",\"permission_feedback\":[");
+            for (entry.permission_feedback, 0..) |feedback, index| {
+                if (index > 0) try writer.writeByte(',');
+                try writeDurableBytes(writer, feedback);
+            }
+            try writer.writeByte(']');
+            try writer.print(",\"permission_feedback_complete\":{}", .{entry.permission_feedback_complete});
             try writer.writeByte('}');
         },
         .assistant => |entry| {
@@ -342,15 +350,25 @@ pub fn writeHistoryTurn(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
 pub fn parseHistoryTurn(alloc: Allocator, value: std.json.Value) !session.HistoryTurn {
     const kind = try requireString(try requireObject(value), "kind");
     if (std.mem.eql(u8, kind, "compacted_summary")) {
-        const shape = try exactVariantObject(
-            value,
-            &.{ "kind", "summary", "removed_turn_count", "compaction_count" },
-            &.{ "kind", "summary", "removed_turn_count", "compaction_count", "root_user_messages" },
-        );
-        const object = shape.object;
+        const raw_object = try requireObject(value);
+        const has_root_user_messages = raw_object.get("root_user_messages") != null;
+        const has_completeness = raw_object.get("root_user_messages_complete") != null;
+        const has_permission_feedback = raw_object.get("permission_feedback") != null;
+        const has_feedback_completeness = raw_object.get("permission_feedback_complete") != null;
+        if (has_permission_feedback != has_feedback_completeness) {
+            return error.InvalidSessionFormat;
+        }
+        const object = if (has_feedback_completeness)
+            try exactObject(value, &.{ "kind", "summary", "removed_turn_count", "compaction_count", "root_user_messages", "root_user_messages_complete", "permission_feedback", "permission_feedback_complete" })
+        else if (has_completeness)
+            try exactObject(value, &.{ "kind", "summary", "removed_turn_count", "compaction_count", "root_user_messages", "root_user_messages_complete" })
+        else if (has_root_user_messages)
+            try exactObject(value, &.{ "kind", "summary", "removed_turn_count", "compaction_count", "root_user_messages" })
+        else
+            try exactObject(value, &.{ "kind", "summary", "removed_turn_count", "compaction_count" });
         const summary = try parseRequiredDurableBytes(alloc, object, "summary");
         errdefer alloc.free(summary);
-        const root_user_messages: [][]u8 = if (shape.extended)
+        const root_user_messages: [][]u8 = if (has_root_user_messages)
             try parseDurableBytesArray(
                 alloc,
                 object.get("root_user_messages") orelse return error.InvalidSessionFormat,
@@ -358,11 +376,29 @@ pub fn parseHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Histor
         else
             &.{};
         errdefer types.freeCompletedToolNames(alloc, root_user_messages);
+        const permission_feedback: [][]u8 = if (has_permission_feedback)
+            try parseDurableBytesArray(
+                alloc,
+                object.get("permission_feedback") orelse return error.InvalidSessionFormat,
+            )
+        else
+            &.{};
+        errdefer types.freePermissionFeedback(alloc, permission_feedback);
+        const removed_turn_count = try requireUsize(object, "removed_turn_count");
         return .{ .compacted_summary = .{
             .summary = summary,
-            .removed_turn_count = try requireUsize(object, "removed_turn_count"),
+            .removed_turn_count = removed_turn_count,
             .compaction_count = try requireUsize(object, "compaction_count"),
             .root_user_messages = root_user_messages,
+            .root_user_messages_complete = if (has_completeness)
+                try requireBool(object, "root_user_messages_complete")
+            else
+                has_root_user_messages or removed_turn_count == 0,
+            .permission_feedback = permission_feedback,
+            .permission_feedback_complete = if (has_feedback_completeness)
+                try requireBool(object, "permission_feedback_complete")
+            else
+                removed_turn_count == 0,
         } };
     }
     if (std.mem.eql(u8, kind, "assistant")) {
@@ -2520,6 +2556,67 @@ test "durable history rejects unknown fields instead of silently dropping bytes"
     );
 }
 
+test "legacy compacted authority absence remains incomplete across durable reload" {
+    const alloc = std.testing.allocator;
+    var legacy_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"kind\":\"compacted_summary\",\"summary\":\"legacy\",\"removed_turn_count\":2,\"compaction_count\":1}",
+        .{},
+    );
+    defer legacy_parsed.deinit();
+    const legacy = try parseHistoryTurn(alloc, legacy_parsed.value);
+    defer session.freeHistoryTurn(alloc, legacy);
+    try std.testing.expect(!legacy.compacted_summary.root_user_messages_complete);
+    try std.testing.expect(!legacy.compacted_summary.permission_feedback_complete);
+
+    var known_messages = [_][]u8{@constCast("newer exact request")};
+    const incomplete: session.HistoryTurn = .{ .compacted_summary = .{
+        .summary = @constCast("legacy plus newer context"),
+        .removed_turn_count = 3,
+        .compaction_count = 2,
+        .root_user_messages = &known_messages,
+        .root_user_messages_complete = false,
+        .permission_feedback = &known_messages,
+        .permission_feedback_complete = false,
+    } };
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    try writeHistoryTurn(&encoded.writer, incomplete);
+    var reloaded_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        encoded.written(),
+        .{},
+    );
+    defer reloaded_parsed.deinit();
+    const reloaded = try parseHistoryTurn(alloc, reloaded_parsed.value);
+    defer session.freeHistoryTurn(alloc, reloaded);
+    try std.testing.expect(!reloaded.compacted_summary.root_user_messages_complete);
+    try std.testing.expect(!reloaded.compacted_summary.permission_feedback_complete);
+    try std.testing.expectEqual(@as(usize, 1), reloaded.compacted_summary.root_user_messages.len);
+    try std.testing.expectEqualStrings(
+        "newer exact request",
+        reloaded.compacted_summary.root_user_messages[0],
+    );
+
+    var first_generation_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"kind\":\"compacted_summary\",\"summary\":\"first generation\",\"removed_turn_count\":2,\"compaction_count\":1,\"root_user_messages\":[\"original request\"]}",
+        .{},
+    );
+    defer first_generation_parsed.deinit();
+    const first_generation = try parseHistoryTurn(alloc, first_generation_parsed.value);
+    defer session.freeHistoryTurn(alloc, first_generation);
+    try std.testing.expect(first_generation.compacted_summary.root_user_messages_complete);
+    try std.testing.expect(!first_generation.compacted_summary.permission_feedback_complete);
+    try std.testing.expectEqualStrings(
+        "original request",
+        first_generation.compacted_summary.root_user_messages[0],
+    );
+}
+
 fn persistedResultForTest(call_id: []const u8, tool_name: []const u8) session.PersistedToolResult {
     return .{
         .tool_call_id = @constCast(call_id),
@@ -2797,9 +2894,21 @@ fn expectHistoryTurnEqual(expected: session.HistoryTurn, actual: session.History
             try std.testing.expectEqualSlices(u8, entry.summary, actual.compacted_summary.summary);
             try std.testing.expectEqual(entry.removed_turn_count, actual.compacted_summary.removed_turn_count);
             try std.testing.expectEqual(entry.compaction_count, actual.compacted_summary.compaction_count);
+            try std.testing.expectEqual(entry.root_user_messages_complete, actual.compacted_summary.root_user_messages_complete);
             try std.testing.expectEqual(entry.root_user_messages.len, actual.compacted_summary.root_user_messages.len);
             for (entry.root_user_messages, actual.compacted_summary.root_user_messages) |expected_message, actual_message| {
                 try std.testing.expectEqualSlices(u8, expected_message, actual_message);
+            }
+            try std.testing.expectEqual(
+                entry.permission_feedback_complete,
+                actual.compacted_summary.permission_feedback_complete,
+            );
+            try std.testing.expectEqual(
+                entry.permission_feedback.len,
+                actual.compacted_summary.permission_feedback.len,
+            );
+            for (entry.permission_feedback, actual.compacted_summary.permission_feedback) |expected_feedback, actual_feedback| {
+                try std.testing.expectEqualSlices(u8, expected_feedback, actual_feedback);
             }
         },
         .assistant => |entry| {

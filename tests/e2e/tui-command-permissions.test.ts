@@ -2109,7 +2109,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "TUI shows auto approval only in the full transcript",
+    "TUI keeps automatic review internal in compact and full transcripts",
     async () => {
       const root = createIsolatedRoot();
       const marker = join(root.workspace, "classifier-approved.txt");
@@ -2151,23 +2151,16 @@ describe("effect-aware command permissions", () => {
       const compactGrid = await activeSession.capturePaneGrid();
 
       await activeSession.sendKeys("C-o");
-      await activeSession.waitForText(
-        "Auto agent approved this request: Running command.",
-        TIMEOUT,
-      );
-      const fullTranscript = await activeSession.capturePane();
-      const approvalIndex = fullTranscript.indexOf(
-        "Auto agent approved this request: Running command.",
-      );
-      const completedIndex = fullTranscript.indexOf("└ Ran");
-      expect(approvalIndex).toBeGreaterThanOrEqual(0);
-      expect(completedIndex).toBeGreaterThan(approvalIndex);
-      expect(
-        fullTranscript.split("Auto agent approved this request: Running command.").length - 1,
-      ).toBe(1);
+      await activeSession.waitForText("Review · ←/→ switch · ctrl o close", TIMEOUT);
+      const reviewTranscript = await activeSession.capturePane();
+      expect(reviewTranscript).not.toContain("Auto agent approved this request");
+      expect(reviewTranscript.indexOf("└ Ran")).toBeGreaterThanOrEqual(0);
 
       await activeSession.sendKeys("Right");
       await activeSession.waitForText("Full detail · ←/→ switch · ctrl o close", TIMEOUT);
+      const fullTranscript = await activeSession.capturePane();
+      expect(fullTranscript).not.toContain("Auto agent approved this request");
+      expect(fullTranscript.indexOf("└ Ran")).toBeGreaterThanOrEqual(0);
       await activeSession.sendKeys("C-o");
       await activeSession.waitForText("classifier approved complete", TIMEOUT);
       expect(normalizeVolatileStatusRows(await activeSession.capturePaneGrid())).toEqual(
@@ -5921,9 +5914,7 @@ describe("effect-aware command permissions", () => {
       );
 
       expect(result.code).toBe(0);
-      expect(result.stderr).toContain(
-        "Auto agent approved this request: Running command.",
-      );
+      expect(result.stderr).not.toContain("Auto agent approved this request");
       expect(result.stderr).not.toContain("permission required");
       expect(existsSync(marker)).toBe(true);
       expect(readFileSync(marker, "utf8")).toBe("classifier\n");

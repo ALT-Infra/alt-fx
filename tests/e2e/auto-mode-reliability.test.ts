@@ -45,8 +45,10 @@ afterEach(async () => {
   }
 });
 
-function createIsolatedRoot(): IsolatedRoot {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-auto-mode-reliability-e2e-")));
+function createIsolatedRoot(baseDir = tmpdir()): IsolatedRoot {
+  const root = realpathSync(
+    mkdtempSync(join(baseDir, "fx-auto-mode-reliability-e2e-")),
+  );
   const home = join(root, "home");
   const workspace = join(root, "workspace");
   mkdirSync(join(home, ".fx"), { recursive: true });
@@ -251,6 +253,57 @@ describe("lean auto mode reliability", () => {
       expect(gateway.requests).toHaveLength(4);
       expect(gateway.classifierRequests).toHaveLength(3);
       for (const marker of markers) expect(existsSync(marker)).toBe(false);
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(process.platform !== "darwin")(
+    "headless sandbox widening terminalizes after three recoverable blocks",
+    async () => {
+      const root = createIsolatedRoot("/Users/Shared");
+      const marker = join(root.workspace, "sandbox-widening-must-not-run");
+      const command = `npm install && printf blocked > ${JSON.stringify(marker)}`;
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        JSON.stringify({
+          sandbox: "os",
+          permission: { bash: { [command]: "allow" } },
+          maxxing_mode: "legacy",
+        }),
+      );
+      const gateway = startGateway(
+        Array.from({ length: 4 }, (_, index) => (body?: string) => {
+          if (index > 0) expect(body).toContain("auto_denied");
+          return commandCall(command, `sandbox_widening_${index + 1}`);
+        }),
+        [
+          fakeGatewayPermissionDecision("ask", "sandbox_review_1"),
+          fakeGatewayFinalText("malformed reviewer output"),
+          fakeGatewayPermissionDecision("ask", "sandbox_review_3"),
+        ],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Install the dependencies."],
+        {
+          cwd: root.workspace,
+          env: { ...gatewayEnv(root, gateway), TMPDIR: "/private/tmp" },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code).toBe(1);
+      expect(result.stdout).toContain("NonInteractivePermissionRequired");
+      expect(result.stderr).toContain(
+        "permission required for tool execution in noninteractive mode",
+      );
+      expect(gateway.requests).toHaveLength(4);
+      expect(gateway.classifierRequests).toHaveLength(3);
+      for (const request of gateway.classifierRequests) {
+        expect(request.body).toContain("phase: preflight");
+        expect(request.body).toContain("action: sandbox_widening");
+      }
+      expect(existsSync(marker)).toBe(false);
     },
     TIMEOUT,
   );

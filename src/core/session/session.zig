@@ -2021,11 +2021,19 @@ pub fn dupeHistoryTurn(alloc: Allocator, turn: HistoryTurn) !HistoryTurn {
                 alloc,
                 entry.root_user_messages,
             );
+            errdefer core_types.freeCompletedToolNames(alloc, root_user_messages);
+            const permission_feedback = try core_types.dupePermissionFeedback(
+                alloc,
+                entry.permission_feedback,
+            );
             return .{ .compacted_summary = .{
                 .summary = summary,
                 .removed_turn_count = entry.removed_turn_count,
                 .compaction_count = entry.compaction_count,
                 .root_user_messages = root_user_messages,
+                .root_user_messages_complete = entry.root_user_messages_complete,
+                .permission_feedback = permission_feedback,
+                .permission_feedback_complete = entry.permission_feedback_complete,
             } };
         },
         .assistant => |entry| {
@@ -2930,12 +2938,47 @@ fn buildCompactedSummaryTurn(
 ) !CompactedSummaryHistoryTurn {
     const root_user_messages = try buildCompactedRootUserMessages(alloc, existing, removed);
     errdefer core_types.freeCompletedToolNames(alloc, root_user_messages);
+    const permission_feedback = try buildCompactedPermissionFeedback(alloc, existing, removed);
+    errdefer core_types.freePermissionFeedback(alloc, permission_feedback);
     return .{
         .summary = try buildCompactedSummaryText(alloc, existing, removed),
         .removed_turn_count = (if (existing) |entry| entry.removed_turn_count else 0) + removed.len,
         .compaction_count = (if (existing) |entry| entry.compaction_count else 0) + 1,
         .root_user_messages = root_user_messages,
+        .root_user_messages_complete = compactedRootUserEvidenceComplete(
+            existing,
+            removed,
+        ),
+        .permission_feedback = permission_feedback,
+        .permission_feedback_complete = compactedPermissionFeedbackComplete(
+            existing,
+            removed,
+        ),
     };
+}
+
+fn compactedRootUserEvidenceComplete(
+    existing: ?CompactedSummaryHistoryTurn,
+    removed: []const HistoryTurn,
+) bool {
+    var complete = if (existing) |entry| entry.root_user_messages_complete else true;
+    for (removed) |turn| switch (turn) {
+        .compacted_summary => |entry| complete = complete and entry.root_user_messages_complete,
+        else => {},
+    };
+    return complete;
+}
+
+fn compactedPermissionFeedbackComplete(
+    existing: ?CompactedSummaryHistoryTurn,
+    removed: []const HistoryTurn,
+) bool {
+    var complete = if (existing) |entry| entry.permission_feedback_complete else true;
+    for (removed) |turn| switch (turn) {
+        .compacted_summary => |entry| complete = complete and entry.permission_feedback_complete,
+        else => {},
+    };
+    return complete;
 }
 
 fn buildCompactedRootUserMessages(
@@ -2983,6 +3026,96 @@ fn buildCompactedRootUserMessages(
     return messages;
 }
 
+fn buildCompactedPermissionFeedback(
+    alloc: Allocator,
+    existing: ?CompactedSummaryHistoryTurn,
+    removed: []const HistoryTurn,
+) ![][]u8 {
+    var count: usize = if (existing) |entry| entry.permission_feedback.len else 0;
+    for (removed) |turn| switch (turn) {
+        .compacted_summary => |entry| count += entry.permission_feedback.len,
+        .assistant => |entry| count += executionPermissionFeedbackCount(entry.execution),
+        .background_command => |entry| count += executionPermissionFeedbackCount(entry.execution),
+        .interrupted => |entry| count += executionPermissionFeedbackCount(entry.execution),
+    };
+    if (count == 0) return &.{};
+
+    const feedback = try alloc.alloc([]u8, count);
+    errdefer alloc.free(feedback);
+    var copied: usize = 0;
+    errdefer for (feedback[0..copied]) |item| alloc.free(item);
+
+    if (existing) |entry| {
+        try copyPermissionFeedback(alloc, feedback, &copied, entry.permission_feedback);
+    }
+    for (removed) |turn| switch (turn) {
+        .compacted_summary => |entry| try copyPermissionFeedback(
+            alloc,
+            feedback,
+            &copied,
+            entry.permission_feedback,
+        ),
+        .assistant => |entry| try copyExecutionPermissionFeedback(
+            alloc,
+            feedback,
+            &copied,
+            entry.execution,
+        ),
+        .background_command => |entry| try copyExecutionPermissionFeedback(
+            alloc,
+            feedback,
+            &copied,
+            entry.execution,
+        ),
+        .interrupted => |entry| try copyExecutionPermissionFeedback(
+            alloc,
+            feedback,
+            &copied,
+            entry.execution,
+        ),
+    };
+    std.debug.assert(copied == feedback.len);
+    return feedback;
+}
+
+fn executionPermissionFeedbackCount(execution: ExecutionMemory) usize {
+    var count: usize = 0;
+    for (execution.tool_steps) |step| {
+        for (step.tool_results) |result| count += result.permission_feedback.len;
+    }
+    return count;
+}
+
+fn copyExecutionPermissionFeedback(
+    alloc: Allocator,
+    destination: [][]u8,
+    copied: *usize,
+    execution: ExecutionMemory,
+) !void {
+    for (execution.tool_steps) |step| {
+        for (step.tool_results) |result| {
+            try copyPermissionFeedback(
+                alloc,
+                destination,
+                copied,
+                result.permission_feedback,
+            );
+        }
+    }
+}
+
+fn copyPermissionFeedback(
+    alloc: Allocator,
+    destination: [][]u8,
+    copied: *usize,
+    source: []const []const u8,
+) !void {
+    for (source) |item| {
+        destination[copied.*] = try alloc.dupe(u8, item);
+        copied.* += 1;
+    }
+}
+
 test "history compaction preserves exact ordered root-user text separately from summary" {
     const alloc = std.testing.allocator;
     const removed = [_]HistoryTurn{
@@ -3010,6 +3143,94 @@ test "history compaction preserves exact ordered root-user text separately from 
     try std.testing.expectEqualStrings("first exact request", second.root_user_messages[0]);
     try std.testing.expectEqualStrings("second exact request", second.root_user_messages[1]);
     try std.testing.expectEqualStrings("third exact request", second.root_user_messages[2]);
+}
+
+test "repeated compaction preserves incomplete root-user authority state" {
+    const alloc = std.testing.allocator;
+    const legacy: CompactedSummaryHistoryTurn = .{
+        .summary = @constCast("legacy summary without exact authority"),
+        .removed_turn_count = 4,
+        .compaction_count = 1,
+        .root_user_messages_complete = false,
+        .permission_feedback_complete = false,
+    };
+    const first_removed = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("newer exact request") },
+        .assistant = @constCast("response"),
+    } }};
+    const first = try buildCompactedSummaryTurn(alloc, legacy, &first_removed);
+    defer freeHistoryTurn(alloc, .{ .compacted_summary = first });
+    try std.testing.expect(!first.root_user_messages_complete);
+    try std.testing.expect(!first.permission_feedback_complete);
+    try std.testing.expectEqual(@as(usize, 1), first.root_user_messages.len);
+    try std.testing.expectEqualStrings("newer exact request", first.root_user_messages[0]);
+
+    const second_removed = [_]HistoryTurn{.{ .interrupted = .{
+        .user = .{ .text = @constCast("latest exact request") },
+    } }};
+    const second = try buildCompactedSummaryTurn(alloc, first, &second_removed);
+    defer freeHistoryTurn(alloc, .{ .compacted_summary = second });
+    try std.testing.expect(!second.root_user_messages_complete);
+    try std.testing.expect(!second.permission_feedback_complete);
+    try std.testing.expectEqual(@as(usize, 2), second.root_user_messages.len);
+    try std.testing.expectEqualStrings("newer exact request", second.root_user_messages[0]);
+    try std.testing.expectEqualStrings("latest exact request", second.root_user_messages[1]);
+}
+
+test "repeated compaction preserves typed permission feedback in chronological order" {
+    const alloc = std.testing.allocator;
+    var first_feedback = [_][]u8{@constCast("Do not write outside the workspace.")};
+    var first_results = [_]PersistedToolResult{.{
+        .tool_call_id = @constCast("first"),
+        .tool_name = @constCast("write_file"),
+        .status = .failure,
+        .output = @constCast("denied"),
+        .output_bytes = 6,
+        .stored_output_bytes = 6,
+        .permission_feedback = &first_feedback,
+    }};
+    var first_steps = [_]ToolExecutionStep{.{ .tool_results = &first_results }};
+    const first_removed = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("Prepare the report.") },
+        .assistant = @constCast("I need to write a file."),
+        .execution = .{ .tool_steps = &first_steps },
+    } }};
+    const first = try buildCompactedSummaryTurn(alloc, null, &first_removed);
+    defer freeHistoryTurn(alloc, .{ .compacted_summary = first });
+    try std.testing.expect(first.permission_feedback_complete);
+    try std.testing.expectEqual(@as(usize, 1), first.permission_feedback.len);
+    try std.testing.expectEqualStrings(
+        "Do not write outside the workspace.",
+        first.permission_feedback[0],
+    );
+
+    var second_feedback = [_][]u8{@constCast("README changes require approval.")};
+    var second_results = [_]PersistedToolResult{.{
+        .tool_call_id = @constCast("second"),
+        .tool_name = @constCast("edit_file"),
+        .status = .failure,
+        .output = @constCast("denied"),
+        .output_bytes = 6,
+        .stored_output_bytes = 6,
+        .permission_feedback = &second_feedback,
+    }};
+    var second_steps = [_]ToolExecutionStep{.{ .tool_results = &second_results }};
+    const later = [_]HistoryTurn{.{ .interrupted = .{
+        .user = .{ .text = @constCast("Continue with the report.") },
+        .execution = .{ .tool_steps = &second_steps },
+    } }};
+    const repeated = try buildCompactedSummaryTurn(alloc, first, &later);
+    defer freeHistoryTurn(alloc, .{ .compacted_summary = repeated });
+    try std.testing.expect(repeated.permission_feedback_complete);
+    try std.testing.expectEqual(@as(usize, 2), repeated.permission_feedback.len);
+    try std.testing.expectEqualStrings(
+        "Do not write outside the workspace.",
+        repeated.permission_feedback[0],
+    );
+    try std.testing.expectEqualStrings(
+        "README changes require approval.",
+        repeated.permission_feedback[1],
+    );
 }
 
 fn buildCompactedSummaryText(

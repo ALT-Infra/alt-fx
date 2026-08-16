@@ -82,7 +82,6 @@
     {"name": "e2e-config-persistence", "argv": ["bun", "test", "--max-concurrency", "1", "./config-persistence.test.ts"], "test_file": "config-persistence.test.ts"},
     {"name": "e2e-prompt-history", "argv": ["bun", "test", "--max-concurrency", "1", "./prompt-history.test.ts"], "test_file": "prompt-history.test.ts"},
     {"name": "e2e-auth-refresh", "argv": ["bun", "test", "--max-concurrency", "1", "./auth-refresh.test.ts"], "test_file": "auth-refresh.test.ts"},
-    {"name": "e2e-auto-mode-reliability", "argv": ["bun", "test", "--max-concurrency", "1", "./auto-mode-reliability.test.ts"], "test_file": "auto-mode-reliability.test.ts"},
     {"name": "e2e-file-tool-paths", "argv": ["bun", "test", "--max-concurrency", "1", "./file-tool-paths.test.ts"], "test_file": "file-tool-paths.test.ts"},
     {"name": "e2e-file-tool-permissions", "argv": ["bun", "test", "--max-concurrency", "1", "./file-tool-permissions.test.ts"], "test_file": "file-tool-permissions.test.ts"},
     {"name": "e2e-gateway-stream-lifecycle", "argv": ["bun", "test", "--max-concurrency", "1", "./gateway-stream-lifecycle.test.ts"], "test_file": "gateway-stream-lifecycle.test.ts"},
@@ -110,6 +109,7 @@
     {"name": "e2e-tui-gateway-stream-lifecycle", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-gateway-stream-lifecycle.test.ts"], "test_file": "tui-gateway-stream-lifecycle.test.ts"}
   ],
   "verification_scenarios": [
+    {"name": "verify-auto-mode-reliability", "argv": ["bun", "test", "--max-concurrency", "1", "./auto-mode-reliability.test.ts"], "test_file": "auto-mode-reliability.test.ts"},
     {"name": "verify-tui-auth-source-selection", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-auth-source-selection.test.ts"], "test_file": "tui-auth-source-selection.test.ts"},
     {"name": "verify-tui-composer-edit-contracts", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-composer-edit-contracts.test.ts"], "test_file": "tui-composer-edit-contracts.test.ts"},
     {"name": "verify-tui-cost", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-cost.test.ts"], "test_file": "tui-cost.test.ts"},

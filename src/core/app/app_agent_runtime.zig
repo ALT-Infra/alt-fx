@@ -723,6 +723,8 @@ pub fn Runtime(comptime App: type) type {
         ) !agent_runtime.ToolExecutionResult {
             var ctx = toolContext(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url);
             ctx.root_user_intent_context = request.root_user_intent_context;
+            ctx.root_user_messages = request.root_user_messages;
+            ctx.root_user_evidence_complete = request.root_user_evidence_complete;
             ctx.session_grants = request.session_grants;
             ctx.advertised_dynamic_tool_names = request.advertised_dynamic_tool_names;
             ctx.max_tool_result_bytes = request.max_tool_result_bytes;
@@ -1078,6 +1080,22 @@ pub fn Runtime(comptime App: type) type {
                 .first_call_tool_choice = job.agent_settings.first_call_tool_choice,
                 .workspace_root = app.workspace_root,
                 .access_scope = appAccessScope(app),
+                .origin = if (app.session_persistence.writable) |writable|
+                    if (writable.external_prompt_origin == .persistent_child) .subagent else .root
+                else
+                    .root,
+                .root_user_messages = if (app.session_persistence.writable) |writable|
+                    writable.external_root_user_messages
+                else
+                    &.{},
+                .root_user_evidence_complete = if (app.session_persistence.writable) |writable|
+                    writable.external_root_user_evidence_complete
+                else
+                    false,
+                .current_prompt_is_root_authority = if (app.session_persistence.writable) |writable|
+                    writable.external_prompt_origin == .persistent_child
+                else
+                    false,
                 .session_child_capability = session_child_capability,
                 .context_limits = if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
             };
@@ -1763,16 +1781,14 @@ test "interactive app prepared file mutation callback applies app permission pol
         .{ .role = .user, .content = "do not bypass policy" },
     };
     const review_calls = [_]ToolCall{call};
-    const review_bindings = [_]permission_auto_classifier.RootTextBinding{
-        .{ .message_index = 0, .text = "do not bypass policy" },
-    };
+    const review_root_messages = [_][]const u8{"do not bypass policy"};
     const review_turn: permission_auto_classifier.ReviewTurnContext = .{
         .model = "openai/gpt-5",
         .request_messages = &review_messages,
         .pending_assistant = .{ .role = .assistant, .tool_calls = &review_calls },
         .target_call_id = call.id,
         .origin = .root,
-        .root_text_bindings = &review_bindings,
+        .root_user_messages = &review_root_messages,
     };
     const outcome = try callback(
         deps.ctx,

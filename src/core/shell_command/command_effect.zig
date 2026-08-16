@@ -4,7 +4,7 @@ const sandbox = @import("../permissions/sandbox.zig");
 
 const max_command_bytes = 8 * 1024;
 const max_ls_operands = 64;
-const max_read_operands = 64;
+const max_git_pathspecs = 64;
 const max_line_count = 10_000;
 const max_git_log_count = 1_000;
 pub const max_direct_pipeline_stages = 8;
@@ -436,29 +436,11 @@ fn planCat(
     alloc: std.mem.Allocator,
     words: []const []const u8,
 ) std.mem.Allocator.Error!StageAdmission {
-    var argv: std.ArrayList([]const u8) = .empty;
-    try argv.append(alloc, "/bin/cat");
-
-    var operand_start: usize = 1;
-    var explicit_separator = false;
-    if (operand_start < words.len and std.mem.eql(u8, words[operand_start], "--")) {
-        explicit_separator = true;
-        operand_start += 1;
-    }
-    const operands = words[operand_start..];
-    if (operands.len > max_read_operands) {
-        return .{ .approval_required = .unsupported_argument };
-    }
-    for (operands) |operand| {
-        if (!explicit_separator and operand.len > 0 and operand[0] == '-') {
-            return .{ .approval_required = .unsupported_argument };
-        }
-    }
-    try argv.append(alloc, "--");
-    try argv.appendSlice(alloc, operands);
+    if (words.len != 1) return .{ .approval_required = .unsupported_argument };
+    const argv = try alloc.dupe([]const u8, &.{"/bin/cat"});
     return .{ .direct = .{
         .executable = "/bin/cat",
-        .argv = try argv.toOwnedSlice(alloc),
+        .argv = argv,
     } };
 }
 
@@ -477,24 +459,10 @@ fn planHeadOrTail(
         index += 2;
     }
 
-    var explicit_separator = false;
-    if (index < words.len and std.mem.eql(u8, words[index], "--")) {
-        explicit_separator = true;
-        index += 1;
-    }
-    const operands = words[index..];
-    if (operands.len > max_read_operands) {
-        return .{ .approval_required = .unsupported_argument };
-    }
-    for (operands) |operand| {
-        if (!explicit_separator and operand.len > 0 and operand[0] == '-') {
-            return .{ .approval_required = .unsupported_argument };
-        }
-    }
+    if (index != words.len) return .{ .approval_required = .unsupported_argument };
 
     var argv: std.ArrayList([]const u8) = .empty;
-    try argv.appendSlice(alloc, &.{ executable, "-n", count, "--" });
-    try argv.appendSlice(alloc, operands);
+    try argv.appendSlice(alloc, &.{ executable, "-n", count });
     return .{ .direct = .{
         .executable = executable,
         .argv = try argv.toOwnedSlice(alloc),
@@ -529,12 +497,11 @@ fn planGrep(
         }
     }
     if (index >= words.len) return .{ .approval_required = .unsupported_argument };
-    const pattern_and_operands = words[index..];
-    if (pattern_and_operands.len - 1 > max_read_operands) {
+    if (words.len - index != 1) {
         return .{ .approval_required = .unsupported_argument };
     }
     try argv.append(alloc, "--");
-    try argv.appendSlice(alloc, pattern_and_operands);
+    try argv.append(alloc, words[index]);
     return .{ .direct = .{
         .executable = "/usr/bin/grep",
         .argv = try argv.toOwnedSlice(alloc),
@@ -627,7 +594,7 @@ fn planGitDiff(
         try argv.append(alloc, argument);
     }
     const operands = if (index < arguments.len) arguments[index + 1 ..] else &.{};
-    if (operands.len > max_read_operands) {
+    if (operands.len > max_git_pathspecs) {
         return .{ .approval_required = .unsupported_argument };
     }
     try argv.append(alloc, "--");
@@ -676,7 +643,7 @@ fn planGitLog(
         try argv.append(alloc, argument);
     }
     const operands = if (index < arguments.len) arguments[index + 1 ..] else &.{};
-    if (operands.len > max_read_operands) {
+    if (operands.len > max_git_pathspecs) {
         return .{ .approval_required = .unsupported_argument };
     }
     try argv.append(alloc, "--");
@@ -933,13 +900,12 @@ test "planner admits the reviewed direct command matrix" {
         "ls -- -option-looking-path",
         "wc",
         "wc -Lclmw",
-        "cat README.md",
-        "cat -- -option-looking-path",
-        "head README.md",
-        "head -n 20 README.md",
-        "tail -n 20 -- -option-looking-path",
-        "grep -n TODO src/main.zig",
-        "grep -Fi -- '-needle' README.md",
+        "cat",
+        "head",
+        "head -n 20",
+        "tail -n 20",
+        "grep -n TODO",
+        "grep -Fi -- '-needle'",
         "git status",
         "git status --short --branch",
         "git diff --stat",
@@ -1006,9 +972,16 @@ test "planner returns stable reasons for approval-bearing forms" {
         .{ .command = "git log -n 1001", .reason = .unsupported_argument },
         .{ .command = "git log --format='%x00'", .reason = .unsupported_argument },
         .{ .command = "cat -n README.md", .reason = .unsupported_argument },
+        .{ .command = "cat README.md", .reason = .unsupported_argument },
+        .{ .command = "cat /tmp/.ssh/id_ed25519", .reason = .unsupported_argument },
+        .{ .command = "head README.md", .reason = .unsupported_argument },
+        .{ .command = "head -n 20 README.md", .reason = .unsupported_argument },
         .{ .command = "head -n -1 README.md", .reason = .unsupported_argument },
         .{ .command = "head -n 10001 README.md", .reason = .unsupported_argument },
+        .{ .command = "tail app.log", .reason = .unsupported_argument },
         .{ .command = "tail -f app.log", .reason = .unsupported_argument },
+        .{ .command = "grep TODO src", .reason = .unsupported_argument },
+        .{ .command = "grep token /tmp/.env", .reason = .unsupported_argument },
         .{ .command = "grep -r TODO src", .reason = .unsupported_argument },
         .{ .command = "grep -e TODO src", .reason = .unsupported_argument },
         .{ .command = "grep -n", .reason = .unsupported_argument },
@@ -1142,15 +1115,15 @@ test "planner pins read-only git inspection to hardened argv and environment" {
     try expectArgv(&expected, stage.argv);
 }
 
-test "planner canonicalizes bounded readers without preserving option ambiguity" {
+test "planner limits bounded readers to pipeline input" {
     const cases = [_]struct {
         command: []const u8,
         expected: []const []const u8,
     }{
-        .{ .command = "cat -- -input", .expected = &.{ "/bin/cat", "--", "-input" } },
-        .{ .command = "head -n 25 README.md", .expected = &.{ "/usr/bin/head", "-n", "25", "--", "README.md" } },
-        .{ .command = "tail app.log", .expected = &.{ "/usr/bin/tail", "-n", "10", "--", "app.log" } },
-        .{ .command = "grep -Fin needle src/main.zig", .expected = &.{ "/usr/bin/grep", "-F", "-i", "-n", "--", "needle", "src/main.zig" } },
+        .{ .command = "cat", .expected = &.{"/bin/cat"} },
+        .{ .command = "head -n 25", .expected = &.{ "/usr/bin/head", "-n", "25" } },
+        .{ .command = "tail", .expected = &.{ "/usr/bin/tail", "-n", "10" } },
+        .{ .command = "grep -Fin needle", .expected = &.{ "/usr/bin/grep", "-F", "-i", "-n", "--", "needle" } },
     };
     for (cases) |case| {
         var admission = try expectDirect(case.command, .macos);

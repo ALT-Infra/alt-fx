@@ -150,6 +150,8 @@ pub const ToolExecutionRequest = struct {
     /// Borrowed root-user evidence for subagent execution. This is never
     /// populated from an assistant-authored task prompt.
     root_user_intent_context: []const u8 = "",
+    root_user_messages: []const []const u8 = &.{},
+    root_user_evidence_complete: bool = false,
     /// Borrowed caller-owned catalog of images authorized for this call. The
     /// executor must not retain this slice or any attachment pointer.
     authorized_image_catalog: []const types.ImageAttachment = &.{},

@@ -637,23 +637,12 @@ pub fn presentAutoPermissionOutcome(
     permission_mode: types.PermissionMode,
     outcome: command_admission.PermissionOutcome,
 ) !bool {
-    const notice = try tooling_presentation.formatAutoPermissionNotice(
-        arena,
-        hooks.tool_registry,
-        call,
-        permission_mode,
-        outcome,
-    ) orelse return false;
-    if (outcome.auto_review_result) |result| {
-        if (result.decision == .allow) {
-            if (hooks.push_auto_permission_notice) |push_notice| {
-                try push_notice(hooks.ctx, notice);
-                return true;
-            }
-        }
-    }
-    try hooks.push_system_notice(hooks.ctx, notice);
-    return true;
+    _ = hooks;
+    _ = arena;
+    _ = call;
+    _ = permission_mode;
+    _ = outcome;
+    return false;
 }
 
 fn formatProvisionalProgressLabel(

@@ -2458,6 +2458,11 @@ pub fn Runtime(comptime App: type) type {
                 value
             else
                 return .committed;
+            try subagent_resume_admission.retainExternalRootUserTurn(
+                app.alloc,
+                loaded,
+                turn,
+            );
             convergeDegraded(app, loaded, .{}) catch |err| {
                 return switch (mode) {
                     .strict => err,

@@ -1437,6 +1437,16 @@ pub const CompactedSummaryHistoryTurn = struct {
     /// Exact root-user text retained by machine-owned compaction. This is
     /// authority evidence; `summary` remains untrusted model context.
     root_user_messages: [][]u8 = &.{},
+    /// False when an older compacted record proves turns were removed but did
+    /// not persist their exact root-user text.
+    root_user_messages_complete: bool = true,
+    /// Exact human permission feedback created by fx and retained from the
+    /// removed turns. This remains typed authority evidence; it is never
+    /// reconstructed from `summary` prose.
+    permission_feedback: [][]u8 = &.{},
+    /// False when removed turns may contain typed feedback that an older
+    /// compacted record did not preserve.
+    permission_feedback_complete: bool = true,
 };
 
 pub const HistoryTurn = union(enum) {
@@ -1718,6 +1728,7 @@ pub fn freeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) void {
         .compacted_summary => |entry| {
             alloc.free(entry.summary);
             freeCompletedToolNames(alloc, entry.root_user_messages);
+            freePermissionFeedback(alloc, entry.permission_feedback);
         },
         .assistant => |entry| {
             freeUserTurn(alloc, entry.user);
@@ -1761,11 +1772,23 @@ pub fn dupeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) !HistoryTurn
         .compacted_summary => |entry| blk: {
             const summary = try alloc.dupe(u8, entry.summary);
             errdefer alloc.free(summary);
+            const root_user_messages = try dupeCompletedToolNames(
+                alloc,
+                entry.root_user_messages,
+            );
+            errdefer freeCompletedToolNames(alloc, root_user_messages);
+            const permission_feedback = try dupePermissionFeedback(
+                alloc,
+                entry.permission_feedback,
+            );
             break :blk .{ .compacted_summary = .{
                 .summary = summary,
                 .removed_turn_count = entry.removed_turn_count,
                 .compaction_count = entry.compaction_count,
-                .root_user_messages = try dupeCompletedToolNames(alloc, entry.root_user_messages),
+                .root_user_messages = root_user_messages,
+                .root_user_messages_complete = entry.root_user_messages_complete,
+                .permission_feedback = permission_feedback,
+                .permission_feedback_complete = entry.permission_feedback_complete,
             } };
         },
         .assistant => |entry| blk: {
@@ -2531,14 +2554,32 @@ test "HistoryTurn helpers duplicate and free owned turns" {
     freeHistoryTurn(alloc, assistant_copy);
     freeHistoryTurn(alloc, assistant_original);
 
+    var summary_root_messages = try alloc.alloc([]u8, 1);
+    summary_root_messages[0] = try alloc.dupe(u8, "exact root request");
+    var summary_feedback = try alloc.alloc([]u8, 1);
+    summary_feedback[0] = try alloc.dupe(u8, "deny writes outside the workspace");
     const summary_original: HistoryTurn = .{ .compacted_summary = .{
         .summary = try alloc.dupe(u8, "summary"),
         .removed_turn_count = 3,
         .compaction_count = 2,
+        .root_user_messages = summary_root_messages,
+        .root_user_messages_complete = false,
+        .permission_feedback = summary_feedback,
+        .permission_feedback_complete = false,
     } };
     const summary_copy = try dupeHistoryTurn(alloc, summary_original);
     try std.testing.expectEqualStrings("summary", summary_copy.compacted_summary.summary);
     try std.testing.expectEqual(@as(usize, 3), summary_copy.compacted_summary.removed_turn_count);
+    try std.testing.expect(!summary_copy.compacted_summary.root_user_messages_complete);
+    try std.testing.expect(!summary_copy.compacted_summary.permission_feedback_complete);
+    try std.testing.expectEqualStrings(
+        "deny writes outside the workspace",
+        summary_copy.compacted_summary.permission_feedback[0],
+    );
+    try std.testing.expect(
+        summary_copy.compacted_summary.permission_feedback[0].ptr !=
+            summary_original.compacted_summary.permission_feedback[0].ptr,
+    );
     try std.testing.expect(summary_copy.compacted_summary.summary.ptr != summary_original.compacted_summary.summary.ptr);
     freeHistoryTurn(alloc, summary_copy);
     freeHistoryTurn(alloc, summary_original);

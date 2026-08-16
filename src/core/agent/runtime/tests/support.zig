@@ -439,12 +439,8 @@ fn captureReviewAuthority(
 ) ![]u8 {
     var captured: std.ArrayList(u8) = .empty;
     errdefer captured.deinit(alloc);
-    for (review_turn.root_text_bindings) |binding| {
-        try captured.appendSlice(alloc, binding.text);
-        try captured.append(alloc, '\n');
-    }
-    if (review_turn.inherited_root_context.len > 0) {
-        try captured.appendSlice(alloc, review_turn.inherited_root_context);
+    for (review_turn.root_user_messages) |message| {
+        try captured.appendSlice(alloc, message);
         try captured.append(alloc, '\n');
     }
     for (review_turn.trusted_permission_feedback) |feedback| {
@@ -476,7 +472,7 @@ pub const FakeAgentRuntimeDeps = struct {
     permission_review_models: std.ArrayList([]u8) = .empty,
     permission_review_target_call_ids: std.ArrayList([]u8) = .empty,
     permission_review_origins: std.ArrayList(permission_auto_classifier.ReviewOrigin) = .empty,
-    permission_review_root_binding_counts: std.ArrayList(usize) = .empty,
+    permission_review_root_authority_counts: std.ArrayList(usize) = .empty,
     permission_review_feedback_counts: std.ArrayList(usize) = .empty,
     permission_review_message_counts: std.ArrayList(usize) = .empty,
     permission_review_pending_call_counts: std.ArrayList(usize) = .empty,
@@ -493,6 +489,8 @@ pub const FakeAgentRuntimeDeps = struct {
     last_permission_arguments: ?[]u8 = null,
     last_executed_arguments: ?[]u8 = null,
     last_execute_root_user_intent_context: ?[]u8 = null,
+    last_execute_root_user_messages: std.ArrayList([]u8) = .empty,
+    last_execute_root_user_evidence_complete: bool = false,
     propagated_grants: std.ArrayList(PermissionGrant) = .empty,
     event_grants: std.ArrayList(PermissionGrant) = .empty,
     last_execute_grants: std.ArrayList(PermissionGrant) = .empty,
@@ -655,7 +653,7 @@ pub const FakeAgentRuntimeDeps = struct {
         freeStringList(self.alloc, &self.permission_review_models);
         freeStringList(self.alloc, &self.permission_review_target_call_ids);
         self.permission_review_origins.deinit(self.alloc);
-        self.permission_review_root_binding_counts.deinit(self.alloc);
+        self.permission_review_root_authority_counts.deinit(self.alloc);
         self.permission_review_feedback_counts.deinit(self.alloc);
         self.permission_review_message_counts.deinit(self.alloc);
         self.permission_review_pending_call_counts.deinit(self.alloc);
@@ -672,6 +670,7 @@ pub const FakeAgentRuntimeDeps = struct {
         if (self.last_permission_arguments) |value| self.alloc.free(value);
         if (self.last_executed_arguments) |value| self.alloc.free(value);
         if (self.last_execute_root_user_intent_context) |value| self.alloc.free(value);
+        freeStringList(self.alloc, &self.last_execute_root_user_messages);
         freeGrantList(self.alloc, &self.propagated_grants);
         freeGrantList(self.alloc, &self.event_grants);
         freeGrantList(self.alloc, &self.last_execute_grants);
@@ -984,9 +983,9 @@ pub const FakeAgentRuntimeDeps = struct {
             try self.alloc.dupe(u8, review_turn.target_call_id),
         );
         try self.permission_review_origins.append(self.alloc, review_turn.origin);
-        try self.permission_review_root_binding_counts.append(
+        try self.permission_review_root_authority_counts.append(
             self.alloc,
-            review_turn.root_text_bindings.len,
+            review_turn.root_user_messages.len,
         );
         try self.permission_review_feedback_counts.append(
             self.alloc,
@@ -1360,6 +1359,16 @@ pub const FakeAgentRuntimeDeps = struct {
                 u8,
                 request.root_user_intent_context,
             );
+            freeStringList(self.alloc, &self.last_execute_root_user_messages);
+            self.last_execute_root_user_messages = .empty;
+            for (request.root_user_messages) |message| {
+                try self.last_execute_root_user_messages.append(
+                    self.alloc,
+                    try self.alloc.dupe(u8, message),
+                );
+            }
+            self.last_execute_root_user_evidence_complete =
+                request.root_user_evidence_complete;
             try self.record("execute:{s}", .{call.name});
             self.last_execute_grant_count = request.session_grants.len;
             for (self.last_execute_grants.items) |grant| {
