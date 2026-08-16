@@ -26,6 +26,7 @@ pub const CurrentBuild = struct {
     channel: Channel,
     version: []const u8,
     revision: []const u8,
+    release_epoch: u32 = 0,
 };
 
 pub const Target = union(Channel) {
@@ -33,6 +34,7 @@ pub const Target = union(Channel) {
     dev: Dev,
 
     pub const Stable = struct {
+        release_epoch: u32,
         version: []u8,
         artifact_ref: []u8,
     };
@@ -44,6 +46,10 @@ pub const Target = union(Channel) {
     };
 
     pub fn initStable(alloc: Allocator, raw_version: []const u8) !Target {
+        return initStableAtEpoch(alloc, raw_version, 0);
+    }
+
+    pub fn initStableAtEpoch(alloc: Allocator, raw_version: []const u8, release_epoch: u32) !Target {
         const trimmed = std.mem.trim(u8, raw_version, " \t\r\n");
         const normalized_version = normalizeVersion(trimmed);
         if (!validVersion(normalized_version)) return error.InvalidVersion;
@@ -52,9 +58,43 @@ pub const Target = union(Channel) {
         errdefer alloc.free(owned_version);
         const artifact_ref = try alloc.dupe(u8, trimmed);
         return .{ .stable = .{
+            .release_epoch = release_epoch,
             .version = owned_version,
             .artifact_ref = artifact_ref,
         } };
+    }
+
+    pub fn parseStableManifest(alloc: Allocator, bytes: []const u8) !Target {
+        if (bytes.len > max_manifest_bytes) return error.ManifestTooLarge;
+
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{}) catch
+            return error.InvalidManifest;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidManifest;
+
+        const epoch_value = parsed.value.object.get("epoch") orelse
+            return error.InvalidManifest;
+        const version_value = parsed.value.object.get("version") orelse
+            return error.InvalidManifest;
+        if (epoch_value != .integer or version_value != .string) {
+            return error.InvalidManifest;
+        }
+        if (version_value.string.len == 0 or version_value.string[0] != 'v') {
+            return error.InvalidManifest;
+        }
+        if (!validStrictVersion(version_value.string[1..])) return error.InvalidManifest;
+        if (epoch_value.integer < 0 or epoch_value.integer > std.math.maxInt(u32)) {
+            return error.InvalidManifest;
+        }
+
+        return initStableAtEpoch(
+            alloc,
+            version_value.string,
+            @intCast(epoch_value.integer),
+        ) catch |err| switch (err) {
+            error.InvalidVersion => error.InvalidManifest,
+            else => |other| other,
+        };
     }
 
     pub fn parseDevManifest(alloc: Allocator, bytes: []const u8) !Target {
@@ -124,6 +164,13 @@ pub const Target = union(Channel) {
         };
     }
 
+    fn releaseEpoch(self: Target) ?u32 {
+        return switch (self) {
+            .stable => |stable| stable.release_epoch,
+            .dev => null,
+        };
+    }
+
     pub fn artifactRef(self: Target) []const u8 {
         return switch (self) {
             .stable => |stable| stable.artifact_ref,
@@ -134,15 +181,19 @@ pub const Target = union(Channel) {
     pub fn isCurrent(self: Target, current: CurrentBuild) bool {
         if (self.channel() != current.channel) return false;
         return switch (self) {
-            .stable => |stable| versionsEqual(stable.version, current.version),
+            .stable => |stable| stable.release_epoch == current.release_epoch and
+                versionsEqual(stable.version, current.version),
             .dev => |dev| revisionsEqual(dev.revision, current.revision),
         };
     }
 
-    pub fn shouldInstallAutomatically(self: Target, current: CurrentBuild) bool {
+    pub fn shouldInstall(self: Target, current: CurrentBuild) bool {
         if (self.channel() != current.channel) return true;
         return switch (self) {
-            .stable => |stable| compareVersions(stable.version, current.version) == .gt,
+            .stable => |stable| if (stable.release_epoch != current.release_epoch)
+                stable.release_epoch > current.release_epoch
+            else
+                compareVersions(stable.version, current.version) == .gt,
             .dev => |dev| !revisionsEqual(dev.revision, current.revision),
         };
     }
@@ -183,6 +234,15 @@ fn validVersion(raw: []const u8) bool {
         count += 1;
     }
     return count == 3;
+}
+
+fn validStrictVersion(raw: []const u8) bool {
+    if (!validVersion(raw)) return false;
+    var parts = std.mem.splitScalar(u8, raw, '.');
+    while (parts.next()) |part| {
+        if (part.len > 1 and part[0] == '0') return false;
+    }
+    return true;
 }
 
 fn validRevision(raw: []const u8) bool {
@@ -252,6 +312,93 @@ test "dev manifest rejects malformed and oversized external data" {
     );
 }
 
+test "stable manifest creates an epoch-aware target" {
+    const alloc = std.testing.allocator;
+    var target = try Target.parseStableManifest(
+        alloc,
+        "{\"epoch\":1,\"version\":\"v0.0.1\",\"ignored\":true}",
+    );
+    defer target.deinit(alloc);
+
+    try std.testing.expectEqual(Channel.stable, target.channel());
+    try std.testing.expectEqual(@as(u32, 1), target.releaseEpoch().?);
+    try std.testing.expectEqualStrings("0.0.1", target.version());
+    try std.testing.expectEqualStrings("v0.0.1", target.artifactRef());
+}
+
+test "stable manifest rejects invalid external data" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(
+        error.InvalidManifest,
+        Target.parseStableManifest(alloc, "{\"version\":\"v0.0.1\"}"),
+    );
+    try std.testing.expectError(
+        error.InvalidManifest,
+        Target.parseStableManifest(alloc, "{\"epoch\":-1,\"version\":\"v0.0.1\"}"),
+    );
+    try std.testing.expectError(
+        error.InvalidManifest,
+        Target.parseStableManifest(alloc, "{\"epoch\":1,\"version\":\"0.0\"}"),
+    );
+    try std.testing.expectError(
+        error.InvalidManifest,
+        Target.parseStableManifest(alloc, "{\"epoch\":1,\"version\":\"0.0.1\"}"),
+    );
+    try std.testing.expectError(
+        error.InvalidManifest,
+        Target.parseStableManifest(alloc, "{\"epoch\":1,\"version\":\"v01.0.1\"}"),
+    );
+    try std.testing.expectError(
+        error.ManifestTooLarge,
+        Target.parseStableManifest(alloc, " " ** (max_manifest_bytes + 1)),
+    );
+}
+
+test "stable release epoch orders the public series after the bridge" {
+    const alloc = std.testing.allocator;
+    var public = try Target.initStableAtEpoch(alloc, "v0.0.1", 1);
+    defer public.deinit(alloc);
+    var bridge = try Target.initStable(alloc, "v0.4.5");
+    defer bridge.deinit(alloc);
+
+    const bridge_current = CurrentBuild{
+        .channel = .stable,
+        .version = "0.4.5",
+        .revision = "0123456789ab",
+        .release_epoch = 0,
+    };
+    const public_current = CurrentBuild{
+        .channel = .stable,
+        .version = "0.0.1",
+        .revision = "0123456789ab",
+        .release_epoch = 1,
+    };
+
+    try std.testing.expect(public.shouldInstall(bridge_current));
+    try std.testing.expect(!bridge.shouldInstall(public_current));
+    try std.testing.expect(public.isCurrent(public_current));
+}
+
+test "stable release ordering rejects older targets and preserves channel switching" {
+    const alloc = std.testing.allocator;
+    var older = try Target.initStableAtEpoch(alloc, "v0.0.1", 1);
+    defer older.deinit(alloc);
+    const newer_current = CurrentBuild{
+        .channel = .stable,
+        .version = "0.0.2",
+        .revision = "0123456789ab",
+        .release_epoch = 1,
+    };
+
+    try std.testing.expect(!older.shouldInstall(newer_current));
+    try std.testing.expect(older.shouldInstall(.{
+        .channel = .dev,
+        .version = "0.0.2",
+        .revision = "abcdef012345",
+        .release_epoch = 1,
+    }));
+}
+
 test "target freshness uses version for stable and revision for dev" {
     const alloc = std.testing.allocator;
     var stable = try Target.initStable(alloc, "v0.3.63");
@@ -261,14 +408,14 @@ test "target freshness uses version for stable and revision for dev" {
         .version = "0.3.62",
         .revision = "0123456789ab",
     };
-    try std.testing.expect(stable.shouldInstallAutomatically(stable_current));
+    try std.testing.expect(stable.shouldInstall(stable_current));
 
     var dev = try Target.parseDevManifest(
         alloc,
         "{\"version\":\"0.3.62\",\"commit\":\"abcdef0123456789abcdef0123456789abcdef01\"}",
     );
     defer dev.deinit(alloc);
-    try std.testing.expect(dev.shouldInstallAutomatically(stable_current));
+    try std.testing.expect(dev.shouldInstall(stable_current));
     try std.testing.expect(dev.isCurrent(.{
         .channel = .dev,
         .version = "0.3.62",

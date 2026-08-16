@@ -3,7 +3,8 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("core/shared/io.zig");
 
-pub const version = "0.4.4";
+pub const version = "0.4.5";
+pub const release_epoch: u32 = 0;
 
 const app_lifecycle = @import("core/app/app_lifecycle.zig");
 const auth_runtime = @import("core/auth/auth_runtime.zig");
@@ -352,6 +353,7 @@ fn currentBuild() update_target.CurrentBuild {
         .channel = compiled_update_channel,
         .version = version,
         .revision = build_options.git_commit,
+        .release_epoch = release_epoch,
     };
 }
 
@@ -3137,6 +3139,7 @@ fn fullEntryConfig() app_entry_runtime.Config {
     return .{
         .version = version,
         .revision = build_options.git_commit,
+        .release_epoch = release_epoch,
         .build_channel = compiled_update_channel,
         .command_catalog = builtin_commands.top_level_registry,
         .default_model = builtin_gateway.default_model,
@@ -3174,6 +3177,7 @@ fn localEntryConfig() app_entry_runtime.Config {
     return .{
         .version = version,
         .revision = build_options.git_commit,
+        .release_epoch = release_epoch,
         .build_channel = compiled_update_channel,
         .command_catalog = builtin_commands.top_level_registry,
         .default_model = builtin_gateway.default_model,
@@ -3210,6 +3214,7 @@ fn emptyEntryConfig() app_entry_runtime.Config {
     return .{
         .version = version,
         .revision = build_options.git_commit,
+        .release_epoch = release_epoch,
         .build_channel = compiled_update_channel,
         .command_catalog = builtin_commands.top_level_registry,
         .default_model = "",

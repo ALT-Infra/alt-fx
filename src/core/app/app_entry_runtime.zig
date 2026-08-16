@@ -38,6 +38,7 @@ const Allocator = std.mem.Allocator;
 pub const Config = struct {
     version: []const u8 = "",
     revision: []const u8 = "",
+    release_epoch: u32 = 0,
     build_channel: update_target.Channel = .stable,
     command_catalog: command_specs.TopLevelRegistry,
     default_model: []const u8,
@@ -386,6 +387,7 @@ fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
     return .{
         .version = cfg.version,
         .revision = cfg.revision,
+        .release_epoch = cfg.release_epoch,
         .build_channel = cfg.build_channel,
         .command_catalog = cfg.command_catalog,
         .default_model = cfg.default_model,

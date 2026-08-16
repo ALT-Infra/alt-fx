@@ -9,41 +9,71 @@ permissions:
   contents: read
 
 concurrency:
-  group: stable-release
+  group: stable-publication
   cancel-in-progress: false
 
 jobs:
   check-version:
     runs-on: ubuntu-latest
+    environment: stable-publication
     outputs:
-      needed: ${{ steps.check.outputs.needed }}
-      version: ${{ steps.check.outputs.version }}
+      state: ${{ steps.check.outputs.state }}
+      tag: ${{ steps.check.outputs.tag }}
+      epoch: ${{ steps.check.outputs.epoch }}
+      source_sha: ${{ steps.check.outputs.source_sha }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
-      - name: Check if release needed
+      - name: Resolve exact publication identity
         id: check
+        env:
+          RELEASE_BUNDLE_PRIVATE_ORIGIN: ${{ vars.RELEASE_BUNDLE_PRIVATE_ORIGIN }}
+          RELEASE_BUNDLE_READ_WRITE_TOKEN: ${{ secrets.RELEASE_BUNDLE_READ_WRITE_TOKEN }}
         run: |
+          set -euo pipefail
           VERSION=$(grep 'pub const version' src/main.zig | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          EPOCH=$(grep 'pub const release_epoch' src/main.zig | head -1 | sed 's/.*= \([0-9][0-9]*\);/\1/')
           if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo "::error::src/main.zig version is not strict SemVer"
             exit 1
           fi
-          TAG="v${VERSION}"
-          echo "version=${TAG}" >> "$GITHUB_OUTPUT"
-          if git rev-parse "$TAG" >/dev/null 2>&1; then
-            echo "needed=false" >> "$GITHUB_OUTPUT"
-            echo "Tag ${TAG} exists, no release needed"
-          else
-            echo "needed=true" >> "$GITHUB_OUTPUT"
-            echo "Tag ${TAG} missing, release needed"
+          if ! [[ "$EPOCH" =~ ^(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::src/main.zig release epoch is invalid"
+            exit 1
           fi
+
+          TAG="v${VERSION}"
+          REMOTE_LINE=$(git ls-remote --refs origin "refs/tags/${TAG}")
+          TAG_EXISTS=false
+          SOURCE_SHA=$GITHUB_SHA
+          if [ -n "$REMOTE_LINE" ]; then
+            REMOTE_SHA=${REMOTE_LINE%%[[:space:]]*}
+            SOURCE_SHA=$REMOTE_SHA
+            TAG_EXISTS=true
+          fi
+
+          STATUS_ARGS=(
+            --tag "$TAG"
+            --source-sha "$SOURCE_SHA"
+            --epoch "$EPOCH"
+          )
+          if [ "$TAG_EXISTS" = true ]; then
+            STATUS_ARGS+=(--tag-exists)
+          fi
+          STATE=$(python3 -m scripts.release.publish bundle-status "${STATUS_ARGS[@]}")
+          {
+            echo "state=$STATE"
+            echo "tag=$TAG"
+            echo "epoch=$EPOCH"
+            echo "source_sha=$SOURCE_SHA"
+          } >> "$GITHUB_OUTPUT"
+          echo "Publication state: $STATE ($TAG, epoch $EPOCH, $SOURCE_SHA)"
 
   build:
     needs: check-version
-    if: needs.check-version.outputs.needed == 'true'
+    if: needs.check-version.outputs.state == 'build'
     name: Build ${{ matrix.name }}
     runs-on: ubuntu-latest
     strategy:
@@ -68,8 +98,8 @@ jobs:
         run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
 
       - name: Package
-        # sha256sum is available on all ubuntu runners used in this workflow
         run: |
+          set -euo pipefail
           tar -czf fx-${{ matrix.name }}.tar.gz -C zig-out/bin fx
           sha256sum fx-${{ matrix.name }}.tar.gz > fx-${{ matrix.name }}.tar.gz.sha256
 
@@ -80,10 +110,11 @@ jobs:
           path: |
             fx-${{ matrix.name }}.tar.gz
             fx-${{ matrix.name }}.tar.gz.sha256
+          if-no-files-found: error
 
   build-macos-arm64:
     needs: check-version
-    if: needs.check-version.outputs.needed == 'true'
+    if: needs.check-version.outputs.state == 'build'
     permissions:
       actions: read
       contents: read
@@ -91,85 +122,55 @@ jobs:
     with:
       package_release: true
 
-  release:
+  publish:
     needs: [check-version, build, build-macos-arm64]
+    if: >-
+      ${{ always()
+          && needs.check-version.result == 'success'
+          && needs.check-version.outputs.state != 'legacy-complete'
+          && (needs.build.result == 'success' || needs.build.result == 'skipped')
+          && (needs.build-macos-arm64.result == 'success' || needs.build-macos-arm64.result == 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: write
+    environment: stable-publication
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
 
-      - name: Download artifacts
+      - name: Download freshly built artifacts
+        if: needs.check-version.outputs.state == 'build'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: fx-*
           merge-multiple: true
+          path: release-assets
 
-      - name: Create git tag
+      - name: Seal and read-verify the private release bundle
+        if: needs.check-version.outputs.state == 'build'
         env:
-          RELEASE_TAG: ${{ needs.check-version.outputs.version }}
+          RELEASE_BUNDLE_PRIVATE_ORIGIN: ${{ vars.RELEASE_BUNDLE_PRIVATE_ORIGIN }}
+          RELEASE_BUNDLE_READ_WRITE_TOKEN: ${{ secrets.RELEASE_BUNDLE_READ_WRITE_TOKEN }}
         run: |
           set -euo pipefail
-          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
-          git tag -- "$RELEASE_TAG"
-          git push origin "refs/tags/${RELEASE_TAG}"
+          python3 -m scripts.release.publish seal \
+            --asset-dir release-assets \
+            --tag "${{ needs.check-version.outputs.tag }}" \
+            --source-sha "${{ needs.check-version.outputs.source_sha }}" \
+            --epoch "${{ needs.check-version.outputs.epoch }}"
 
-      - name: Extract changelog entry
-        run: |
-          awk '/<!-- release:start -->/{found=1; next} /<!-- release:end -->/{found=0} found{print}' CHANGELOG.md > /tmp/release-notes.md
-          LINES=$(wc -l < /tmp/release-notes.md | tr -d ' ')
-          if [ "$LINES" -lt 2 ]; then
-            echo "Error: No release notes found between <!-- release:start --> and <!-- release:end --> markers in CHANGELOG.md"
-            exit 1
-          fi
-          echo "Extracted release notes ($LINES lines)"
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
-        with:
-          tag_name: ${{ needs.check-version.outputs.version }}
-          body_path: /tmp/release-notes.md
-          files: |
-            fx-*.tar.gz
-            fx-*.tar.gz.sha256
-
-      - name: Publish to CDN
+      - name: Reconcile tag, Release, CDN objects, and pointers
         env:
           BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
-          VERSION: ${{ needs.check-version.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_BUNDLE_PRIVATE_ORIGIN: ${{ vars.RELEASE_BUNDLE_PRIVATE_ORIGIN }}
+          RELEASE_BUNDLE_READ_WRITE_TOKEN: ${{ secrets.RELEASE_BUNDLE_READ_WRITE_TOKEN }}
         run: |
           set -euo pipefail
-          [[ "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
-          CDN_BASE="cli"
-
-          for FILE in fx-*.tar.gz fx-*.tar.gz.sha256; do
-            [ -f "$FILE" ] || continue
-            CONTENT_TYPE="application/octet-stream"
-            [[ "$FILE" == *.sha256 ]] && CONTENT_TYPE="text/plain"
-            [[ "$FILE" == *.tar.gz ]] && [[ "$FILE" != *.sha256 ]] && CONTENT_TYPE="application/gzip"
-
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-              -X PUT "https://blob.vercel-storage.com/${CDN_BASE}/${VERSION}/${FILE}" \
-              -H "Authorization: Bearer ${BLOB_READ_WRITE_TOKEN}" \
-              -H "x-api-version: 7" \
-              -H "x-content-type: ${CONTENT_TYPE}" \
-              -H "x-add-random-suffix: 0" \
-              -H "x-cache-control-max-age: 31536000" \
-              --data-binary "@${FILE}")
-            echo "Uploaded ${FILE} -> ${CDN_BASE}/${VERSION}/${FILE} ($HTTP_CODE)"
-            if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-              echo "::error::Failed to upload ${FILE} to CDN ($HTTP_CODE)"
-              exit 1
-            fi
-          done
-
-          echo -n "$VERSION" > /tmp/latest.txt
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-            -X PUT "https://blob.vercel-storage.com/${CDN_BASE}/latest.txt" \
-            -H "Authorization: Bearer ${BLOB_READ_WRITE_TOKEN}" \
-            -H "x-api-version: 7" \
-            -H "x-content-type: text/plain" \
-            -H "x-add-random-suffix: 0" \
-            -H "x-cache-control-max-age: 60" \
-            --data-binary "@/tmp/latest.txt")
-          echo "Updated latest.txt to $VERSION ($HTTP_CODE)"
+          python3 -m scripts.release.publish reconcile \
+            --mode normal \
+            --tag "${{ needs.check-version.outputs.tag }}" \
+            --source-sha "${{ needs.check-version.outputs.source_sha }}" \
+            --epoch "${{ needs.check-version.outputs.epoch }}"

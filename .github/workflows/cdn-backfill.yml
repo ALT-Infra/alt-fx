@@ -1,162 +1,87 @@
-name: CDN Backfill
+name: Guarded Release Repair
 
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: 'Version to backfill (e.g. "v0.3.0") or "all" for every release'
+      mode:
+        description: Repair one live Release or the pinned post-cleanup bridge CDN lane
         required: true
-        default: "all"
-      update-latest:
-        description: "Update latest.txt to this version (ignored when version is 'all')"
-        type: boolean
-        default: false
-      dry-run:
-        description: "List what would be uploaded without actually uploading"
-        type: boolean
-        default: false
+        type: choice
+        options:
+          - release
+          - post-cleanup-bridge
+      version:
+        description: Exact live tag for release repair; ignored for post-cleanup bridge repair
+        required: false
+        type: string
 
 permissions:
   contents: read
 
-env:
-  CDN_BASE: cli
-  PLATFORMS: linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64
+concurrency:
+  group: stable-publication
+  cancel-in-progress: false
 
 jobs:
-  backfill:
+  repair-release:
+    if: inputs.mode == 'release'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    environment: release-repair
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
 
-      - name: Resolve versions
-        id: versions
+      - name: Resolve the authenticated bundle identity
+        id: identity
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if [ "${{ inputs.version }}" = "all" ]; then
-            VERSIONS=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName --jq '.[].tagName' | sort -V)
-          else
-            gh release view "${{ inputs.version }}" --repo "$GITHUB_REPOSITORY" --json tagName --jq '.tagName' >/dev/null
-            VERSIONS="${{ inputs.version }}"
-          fi
-          echo "Versions to backfill:"
-          echo "$VERSIONS"
-          {
-            echo "list<<EOF"
-            echo "$VERSIONS"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Backfill versions to CDN
-        env:
-          BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
-          GH_TOKEN: ${{ github.token }}
+          RELEASE_BUNDLE_PRIVATE_ORIGIN: ${{ vars.RELEASE_BUNDLE_PRIVATE_ORIGIN }}
+          RELEASE_BUNDLE_READ_WRITE_TOKEN: ${{ secrets.RELEASE_BUNDLE_READ_WRITE_TOKEN }}
+          VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-
-          DRY_RUN="${{ inputs.dry-run }}"
-          UPLOADED=0
-          SKIPPED=0
-          FAILED=0
-
-          upload_blob() {
-            local local_path="$1"
-            local blob_path="$2"
-            local content_type="${3:-application/octet-stream}"
-
-            if [ "$DRY_RUN" = "true" ]; then
-              echo "  [dry-run] would upload $blob_path"
-              return 0
-            fi
-
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-              -X PUT "https://blob.vercel-storage.com/${blob_path}" \
-              -H "Authorization: Bearer ${BLOB_READ_WRITE_TOKEN}" \
-              -H "x-api-version: 7" \
-              -H "x-content-type: ${content_type}" \
-              -H "x-add-random-suffix: 0" \
-              -H "x-cache-control-max-age: 31536000" \
-              --data-binary "@${local_path}")
-
-            if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
-              echo "  uploaded $blob_path ($HTTP_CODE)"
-              return 0
-            else
-              echo "  FAILED $blob_path ($HTTP_CODE)"
-              return 1
-            fi
-          }
-
-          while IFS= read -r VERSION; do
-            [ -z "$VERSION" ] && continue
-            echo ""
-            echo "=== $VERSION ==="
-
-            TMPDIR=$(mktemp -d)
-            trap "rm -rf $TMPDIR" EXIT
-
-            gh release download "$VERSION" \
-              --repo "$GITHUB_REPOSITORY" \
-              --dir "$TMPDIR" \
-              --pattern "fx-*.tar.gz" \
-              --pattern "fx-*.tar.gz.sha256" 2>/dev/null || {
-              echo "  no assets found, skipping"
-              SKIPPED=$((SKIPPED + 1))
-              rm -rf "$TMPDIR"
-              continue
-            }
-
-            for PLATFORM in $PLATFORMS; do
-              TARBALL="fx-${PLATFORM}.tar.gz"
-              CHECKSUM="${TARBALL}.sha256"
-
-              if [ -f "$TMPDIR/$TARBALL" ]; then
-                upload_blob "$TMPDIR/$TARBALL" "${CDN_BASE}/${VERSION}/${TARBALL}" "application/gzip" && \
-                  UPLOADED=$((UPLOADED + 1)) || FAILED=$((FAILED + 1))
-              else
-                echo "  missing $TARBALL"
-                SKIPPED=$((SKIPPED + 1))
-              fi
-
-              if [ -f "$TMPDIR/$CHECKSUM" ]; then
-                upload_blob "$TMPDIR/$CHECKSUM" "${CDN_BASE}/${VERSION}/${CHECKSUM}" "text/plain" && \
-                  UPLOADED=$((UPLOADED + 1)) || FAILED=$((FAILED + 1))
-              fi
-            done
-
-            rm -rf "$TMPDIR"
-            trap - EXIT
-          done <<< "${{ steps.versions.outputs.list }}"
-
-          echo ""
-          echo "--- Summary ---"
-          echo "Uploaded: $UPLOADED"
-          echo "Skipped:  $SKIPPED"
-          echo "Failed:   $FAILED"
-
-          if [ "$FAILED" -gt 0 ]; then
+          if ! [[ "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::release repair requires one exact strict-SemVer tag"
             exit 1
           fi
+          IDENTITY=$(python3 -m scripts.release.publish bundle-identity --tag "$VERSION")
+          {
+            echo "tag=$(jq -r .tag <<< "$IDENTITY")"
+            echo "source_sha=$(jq -r .source_sha <<< "$IDENTITY")"
+            echo "epoch=$(jq -r .epoch <<< "$IDENTITY")"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Update latest.txt
-        if: inputs.update-latest && inputs.version != 'all' && !inputs.dry-run
+      - name: Reconcile the exact live Release
         env:
           BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_BUNDLE_PRIVATE_ORIGIN: ${{ vars.RELEASE_BUNDLE_PRIVATE_ORIGIN }}
+          RELEASE_BUNDLE_READ_WRITE_TOKEN: ${{ secrets.RELEASE_BUNDLE_READ_WRITE_TOKEN }}
         run: |
-          VERSION="${{ inputs.version }}"
-          echo -n "$VERSION" > /tmp/latest.txt
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-            -X PUT "https://blob.vercel-storage.com/${CDN_BASE}/latest.txt" \
-            -H "Authorization: Bearer ${BLOB_READ_WRITE_TOKEN}" \
-            -H "x-api-version: 7" \
-            -H "x-content-type: text/plain" \
-            -H "x-add-random-suffix: 0" \
-            -H "x-cache-control-max-age: 60" \
-            --data-binary "@/tmp/latest.txt")
-          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
-            echo "Updated latest.txt to $VERSION ($HTTP_CODE)"
-          else
-            echo "Failed to update latest.txt ($HTTP_CODE)"
-            exit 1
-          fi
+          set -euo pipefail
+          python3 -m scripts.release.publish reconcile \
+            --mode repair \
+            --tag "${{ steps.identity.outputs.tag }}" \
+            --source-sha "${{ steps.identity.outputs.source_sha }}" \
+            --epoch "${{ steps.identity.outputs.epoch }}"
+
+  repair-post-cleanup-bridge:
+    if: inputs.mode == 'post-cleanup-bridge'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    environment: release-repair
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Restore only the pinned bridge CDN lane
+        env:
+          BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_BUNDLE_PRIVATE_ORIGIN: ${{ vars.RELEASE_BUNDLE_PRIVATE_ORIGIN }}
+          RELEASE_BUNDLE_READ_WRITE_TOKEN: ${{ secrets.RELEASE_BUNDLE_READ_WRITE_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 -m scripts.release.publish reconcile --mode post-cleanup-bridge

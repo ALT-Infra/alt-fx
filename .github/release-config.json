@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "legacy_terminal_tag": "v0.4.4",
+  "bridge_tag": "v0.4.5",
+  "private_bundle_prefix": "fx-release-bundles",
+  "post_cleanup_bridge": {
+    "enabled": false,
+    "tag": "v0.4.5",
+    "source_sha": "",
+    "index_sha256": ""
+  }
+}

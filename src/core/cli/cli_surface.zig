@@ -159,6 +159,7 @@ pub fn recordRequested(args: []const [:0]const u8) error{RecordModifierRequiresI
 pub const Config = struct {
     version: []const u8 = "",
     revision: []const u8 = "",
+    release_epoch: u32 = 0,
     build_channel: update_target.Channel = .stable,
     command_catalog: CommandCatalog,
     default_model: []const u8,
@@ -1342,6 +1343,7 @@ fn runNonInteractiveWithDeps(
                 .channel = cfg.build_channel,
                 .version = cfg.version,
                 .revision = cfg.revision,
+                .release_epoch = cfg.release_epoch,
             }, channel, switch (opts.format) {
                 .text => .text,
                 .json => .json,

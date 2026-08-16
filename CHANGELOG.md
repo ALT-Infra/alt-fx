@@ -1,8 +1,15 @@
 # fx
 
-## 0.4.4
+## 0.4.5
 
 <!-- release:start -->
+
+### Bug Fixes
+
+- **Stable upgrades:** Keep manual and background upgrades on the same forward-only release order across version-line transitions
+<!-- release:end -->
+
+## 0.4.4
 
 ### New Features
 
@@ -12,7 +19,6 @@
 ### Bug Fixes
 
 - **Signed-in account data:** Restore model catalog and credit balance loading for Vercel-authenticated sessions
-<!-- release:end -->
 
 ## 0.4.3
 
