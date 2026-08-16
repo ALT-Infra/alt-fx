@@ -63,7 +63,8 @@ fn set_transcript_assistant_tail_writable(
     runtime: *transcript_runtime.TranscriptRuntime,
     writable: bool,
 ) void {
-    if (!runtime.transcript_release.set_assistant_tail_writable(writable)) return;
+    if (runtime.transcript_release.assistant_tail_writable == writable) return;
+    runtime.transcript_release = runtime.transcript_release.with_assistant_tail_writable(writable);
     debug_trace.logf(
         "scroll",
         "assistant tail writability changed writable={s}",

@@ -39,10 +39,10 @@ pub const State = struct {
     policy: Policy = .finality_gated,
     assistant_tail_writable: bool = true,
 
-    pub fn set_assistant_tail_writable(self: *State, writable: bool) bool {
-        if (self.assistant_tail_writable == writable) return false;
-        self.assistant_tail_writable = writable;
-        return true;
+    pub fn with_assistant_tail_writable(self: State, writable: bool) State {
+        var next = self;
+        next.assistant_tail_writable = writable;
+        return next;
     }
 
     /// Returns the earliest byte that is not final, or null when the entire
@@ -114,10 +114,10 @@ test "transcript release ignores final producers and preserves append-only outpu
     );
 }
 
-test "assistant tail writability reports state changes" {
-    var state = State{};
-    try std.testing.expect(!state.set_assistant_tail_writable(true));
-    try std.testing.expect(state.set_assistant_tail_writable(false));
-    try std.testing.expect(!state.set_assistant_tail_writable(false));
-    try std.testing.expect(state.set_assistant_tail_writable(true));
+test "assistant tail writability returns a new state" {
+    const open = State{};
+    const closed = open.with_assistant_tail_writable(false);
+    try std.testing.expect(open.assistant_tail_writable);
+    try std.testing.expect(!closed.assistant_tail_writable);
+    try std.testing.expect(closed.with_assistant_tail_writable(true).assistant_tail_writable);
 }
