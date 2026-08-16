@@ -36,6 +36,7 @@ const LIVE_START = "CTRL_O_BRUTAL_LIVE_0001";
 const LIVE_DONE = "CTRL_O_BRUTAL_LIVE_DONE";
 const DRAFT = "CTRL_O_BRUTAL_UNSENT_DRAFT";
 const RESUME_DRAFT = "CTRL_O_BRUTAL_RESUME_DRAFT";
+const TAIL_SENTINEL = "CTRL_O_TAIL_SENTINEL";
 const CTRL_O = ["0f"] as const;
 const PAGE_UP = ["1b", "5b", "35", "7e"] as const;
 const PAGE_DOWN = ["1b", "5b", "36", "7e"] as const;
@@ -322,6 +323,11 @@ function batchResponse(
     events.push(toolEvent(firstTool + offset, config.fileLines));
   }
   events.push({
+    type: "text-delta",
+    id: `ctrl-o-brutal-tail-${batch}`,
+    delta: `${TAIL_SENTINEL}_B${pad(batch, 2)}\n`,
+  });
+  events.push({
     type: "finish",
     finishReason: { unified: "tool-calls", raw: "tool-calls" },
   });
@@ -382,7 +388,7 @@ done
   for (let batch = 0; batch < config.batches; batch += 1) {
     responses.push(batchResponse(batch, config));
   }
-  responses.push(fakeGatewayFinalText(HISTORY_DONE));
+  responses.push(fakeGatewayFinalText(`${HISTORY_DONE}\n${TAIL_SENTINEL}`));
   responses.push(fakeGatewayToolCall("ctrl-o-brutal-live", "run_command", {
     command: "./ctrl-o-live.sh",
   }));
@@ -699,6 +705,22 @@ async function thrashViewer(
   }
 }
 
+async function verifyTailSurvivesReviewToFull(
+  session: TmuxSession,
+): Promise<void> {
+  await session.sendHexBytes(CTRL_O);
+  const review = await waitForMode(session, "review", "");
+  expect(review).toContain(TAIL_SENTINEL);
+
+  await session.sendKeys("Right");
+  const full = await waitForMode(session, "full", "");
+  expect(full).toContain(TAIL_SENTINEL);
+  expect(session.paneStatus().dead).toBe(false);
+
+  await session.sendHexBytes(CTRL_O);
+  await session.waitForComposer(TIMEOUT);
+}
+
 async function verifyOldestTranscriptEntrySurvives(
   session: TmuxSession,
   draft: string,
@@ -856,6 +878,9 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
     expect(history).toContain(firstChatMarker(config));
     expect(history).toContain(lastChatMarker(config));
     expect(history).toContain(compactToolMarker(0));
+
+    await verifyTailSurvivesReviewToFull(session);
+    expect(readFileSync(paths.stderrPath, "utf8")).toBe("");
 
     await session.sendText("Run the prepared live command while I inspect the transcript.");
     await session.waitForText(LIVE_START, TIMEOUT);
