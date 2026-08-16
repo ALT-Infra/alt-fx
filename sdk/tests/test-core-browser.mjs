@@ -171,6 +171,23 @@ try {
   await runCase("unsupported UI", "force-unsupported=1", (result) => {
     expect(result.state === "unsupported", `unexpected state ${result.state}`);
   });
+
+  const { targetId } = await command("Target.createTarget", { url: "about:blank" });
+  const { sessionId } = await command("Target.attachToTarget", { targetId, flatten: true });
+  try {
+    await command("Runtime.enable", {}, sessionId);
+    await command("Page.enable", {}, sessionId);
+    await command("Page.navigate", { url: `http://127.0.0.1:${port}/sdk/browser-test-terminal.html` }, sessionId);
+    const result = await waitFor("window.__fxBrowserTerminalTest && ['completed', 'failed'].includes(window.__fxBrowserTerminalTest.state) && window.__fxBrowserTerminalTest", sessionId);
+    expect(result.state === "completed", result.error || `unexpected terminal state ${result.state}`);
+    expect(result.code === 0, `unexpected terminal exit code ${result.code}`);
+    expect(result.output.includes("Run /help for commands"), "browser terminal startup output missing");
+    expect(result.dataListeners === 0, `browser terminal leaked ${result.dataListeners} data listener(s)`);
+    expect(result.resizeListeners === 0, `browser terminal leaked ${result.resizeListeners} resize listener(s)`);
+    console.log("browser terminal startup and shutdown passed");
+  } finally {
+    await command("Target.closeTarget", { targetId });
+  }
 } finally {
   socket.close();
   chrome.kill();

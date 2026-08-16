@@ -427,7 +427,7 @@ const App = struct {
 
     pub fn agentStreamProvider(_: *const Self) agent_stream_provider.Provider {
         return if (comptime host_target.is_wasm)
-            js_host_stream_provider.provider(builtin_gateway.buildAgentRequest)
+            js_host_stream_provider.provider()
         else
             builtin_gateway.agent_stream_provider;
     }

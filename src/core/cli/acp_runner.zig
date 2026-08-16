@@ -38,10 +38,15 @@ pub const Config = struct {
     devbox_provider: ?devbox_executor.Provider = null,
     permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
     model_override: ?[]const u8 = null,
+    credential_override: ?[]const u8 = null,
+    home_override: ?[]const u8 = null,
+    workspace_root_override: ?[]const u8 = null,
     log_file: ?[]const u8 = null,
     context_limit_overrides: []const config_runtime.context_limits.Override = &.{},
     additional_directories: []const []const u8 = &.{},
     saved_directories_suppressed: bool = false,
+    allow_acp_mcp: bool = true,
+    allow_native_tools: bool = true,
 };
 
 pub const RunFn = *const fn (?*anyopaque, Allocator, Config) anyerror!void;

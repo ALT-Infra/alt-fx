@@ -1,0 +1,54 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>libfx browser terminal test</title>
+<script type="module">
+  import { createFxTerminal, supportsJspi } from "./browser.js";
+
+  const decoder = new TextDecoder();
+  let output = "";
+  const dataListeners = new Set();
+  const resizeListeners = new Set();
+  const terminal = {
+    cols: 80,
+    rows: 24,
+    write(value) {
+      output += typeof value === "string" ? value : decoder.decode(value, { stream: true });
+    },
+    drain() {},
+    onData(callback) {
+      dataListeners.add(callback);
+      return () => dataListeners.delete(callback);
+    },
+    onResize(callback) {
+      resizeListeners.add(callback);
+      return () => resizeListeners.delete(callback);
+    },
+  };
+
+  window.__fxBrowserTerminalTest = { state: "starting" };
+  try {
+    if (!supportsJspi()) throw new Error("JSPI unavailable");
+    const runtime = await createFxTerminal({
+      wasm: "../zig-out/bin/fx-term.wasm",
+      terminal,
+      env: { AI_GATEWAY_API_KEY: "browser-terminal-test-key" },
+    });
+    await runtime.interactive;
+    const deadline = performance.now() + 5000;
+    while (!output.includes("Run /help for commands")) {
+      if (performance.now() >= deadline) throw new Error("startup output missing");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    runtime.write("/exit\r");
+    const code = await runtime.exited;
+    window.__fxBrowserTerminalTest = {
+      state: "completed",
+      code,
+      output,
+      dataListeners: dataListeners.size,
+      resizeListeners: resizeListeners.size,
+    };
+  } catch (error) {
+    window.__fxBrowserTerminalTest = { state: "failed", error: error?.stack || String(error), output };
+  }
+</script>

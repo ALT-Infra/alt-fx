@@ -329,6 +329,7 @@ function createRuntime(options) {
   }
 
   function termPollInput(timeoutMs) {
+    options.onTerminalPoll?.();
     if (stdin.chunks.length) return 1;
     if (stdin.closed) return -1;
     return stdin.wait(timeoutMs >= 0 ? timeoutMs : undefined).then(() =>
@@ -830,8 +831,31 @@ export async function createFxTerminal(options) {
   const emit = (type, detail = {}) => {
     try { options.onEvent?.({ type, timestamp: performance.now(), ...detail }); } catch {}
   };
+  let resolveInteractive;
+  let rejectInteractive;
+  let interactiveScheduled = false;
+  const interactive = new Promise((resolve, reject) => {
+    resolveInteractive = resolve;
+    rejectInteractive = reject;
+  });
+  const stdout = (bytes) => options.terminal.write(bytes);
+  const onTerminalPoll = () => {
+    if (interactiveScheduled) return;
+    interactiveScheduled = true;
+    queueMicrotask(async () => {
+      try {
+        await options.terminal.drain?.();
+        resolveInteractive();
+      } catch (error) {
+        rejectInteractive(error);
+      }
+    });
+  };
   emit("runtime.start", { surface: "terminal" });
-  const runtime = await instantiate({ ...options, emit, stdout: (bytes) => options.terminal.write(bytes) });
+  const runtime = await instantiate({ ...options, emit, stdout, onTerminalPoll });
+  runtime.exited.then((code) => {
+    if (!interactiveScheduled) rejectInteractive(new Error(`fx terminal exited with code ${code} before becoming interactive`));
+  });
   emit("runtime.ready", { surface: "terminal" });
   const interruptKey = options.interruptKey ?? "\x03";
   const forwardData = (data) => {
@@ -858,6 +882,7 @@ export async function createFxTerminal(options) {
     emit("runtime.exit", { surface: "terminal", code });
   });
   return {
+    interactive,
     exited: runtime.exited,
     write(data) {
       if (interruptKey && typeof data === "string" && data.includes(interruptKey)) runtime.abortHostEffects();
@@ -901,7 +926,10 @@ export async function createFxAgent(options) {
     try { options.onEvent?.({ type, timestamp: performance.now(), ...detail }); } catch {}
   };
   emit("runtime.start");
-  const runtime = await instantiate({ ...options, args: ["acp"] });
+  const runtimeOptions = { ...options, args: ["acp"] };
+  const runtime = options.runtimeFactory
+    ? await options.runtimeFactory(runtimeOptions)
+    : await instantiate(runtimeOptions);
   emit("runtime.ready");
   const send = (message) => {
     if (closing) throw new Error("fx agent is closing");
@@ -1064,6 +1092,7 @@ export async function createFxAgent(options) {
             waiters.splice(0).forEach((resolve) => resolve({ done: true }));
           });
         turn.stopReason = turn.result.then((turnResult) => turnResult.stopReason);
+        void turn.stopReason.catch(() => {});
         if (signal?.aborted) turn.cancel();
         return turn;
       },

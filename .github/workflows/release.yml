@@ -6,7 +6,11 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: stable-release
+  cancel-in-progress: false
 
 jobs:
   check-version:
@@ -15,7 +19,7 @@ jobs:
       needed: ${{ steps.check.outputs.needed }}
       version: ${{ steps.check.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
@@ -23,6 +27,10 @@ jobs:
         id: check
         run: |
           VERSION=$(grep 'pub const version' src/main.zig | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::src/main.zig version is not strict SemVer"
+            exit 1
+          fi
           TAG="v${VERSION}"
           echo "version=${TAG}" >> "$GITHUB_OUTPUT"
           if git rev-parse "$TAG" >/dev/null 2>&1; then
@@ -49,10 +57,10 @@ jobs:
           - name: macos-x86_64
             target: x86_64-macos
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: "0.16.0"
 
@@ -66,7 +74,7 @@ jobs:
           sha256sum fx-${{ matrix.name }}.tar.gz > fx-${{ matrix.name }}.tar.gz.sha256
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: fx-${{ matrix.name }}
           path: |
@@ -86,19 +94,25 @@ jobs:
   release:
     needs: [check-version, build, build-macos-arm64]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: fx-*
           merge-multiple: true
 
       - name: Create git tag
+        env:
+          RELEASE_TAG: ${{ needs.check-version.outputs.version }}
         run: |
-          git tag ${{ needs.check-version.outputs.version }}
-          git push origin ${{ needs.check-version.outputs.version }}
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          git tag -- "$RELEASE_TAG"
+          git push origin "refs/tags/${RELEASE_TAG}"
 
       - name: Extract changelog entry
         run: |
@@ -111,7 +125,7 @@ jobs:
           echo "Extracted release notes ($LINES lines)"
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ needs.check-version.outputs.version }}
           body_path: /tmp/release-notes.md
@@ -122,9 +136,10 @@ jobs:
       - name: Publish to CDN
         env:
           BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
+          VERSION: ${{ needs.check-version.outputs.version }}
         run: |
           set -euo pipefail
-          VERSION="${{ needs.check-version.outputs.version }}"
+          [[ "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
           CDN_BASE="cli"
 
           for FILE in fx-*.tar.gz fx-*.tar.gz.sha256; do
