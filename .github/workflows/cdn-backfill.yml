@@ -37,8 +37,8 @@ jobs:
       - name: Resolve the authenticated bundle identity
         id: identity
         env:
-          RELEASE_BUNDLE_PRIVATE_ORIGIN: ${{ vars.RELEASE_BUNDLE_PRIVATE_ORIGIN }}
-          RELEASE_BUNDLE_READ_WRITE_TOKEN: ${{ secrets.RELEASE_BUNDLE_READ_WRITE_TOKEN }}
+          RELEASE_BUNDLE_READ_ORIGIN: ${{ vars.RELEASE_BUNDLE_READ_ORIGIN }}
+          RELEASE_BUNDLE_READ_TOKEN: ${{ secrets.RELEASE_BUNDLE_READ_TOKEN }}
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
@@ -57,8 +57,8 @@ jobs:
         env:
           BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
           GH_TOKEN: ${{ github.token }}
-          RELEASE_BUNDLE_PRIVATE_ORIGIN: ${{ vars.RELEASE_BUNDLE_PRIVATE_ORIGIN }}
-          RELEASE_BUNDLE_READ_WRITE_TOKEN: ${{ secrets.RELEASE_BUNDLE_READ_WRITE_TOKEN }}
+          RELEASE_BUNDLE_READ_ORIGIN: ${{ vars.RELEASE_BUNDLE_READ_ORIGIN }}
+          RELEASE_BUNDLE_READ_TOKEN: ${{ secrets.RELEASE_BUNDLE_READ_TOKEN }}
         run: |
           set -euo pipefail
           python3 -m scripts.release.publish reconcile \
@@ -80,8 +80,8 @@ jobs:
         env:
           BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
           GH_TOKEN: ${{ github.token }}
-          RELEASE_BUNDLE_PRIVATE_ORIGIN: ${{ vars.RELEASE_BUNDLE_PRIVATE_ORIGIN }}
-          RELEASE_BUNDLE_READ_WRITE_TOKEN: ${{ secrets.RELEASE_BUNDLE_READ_WRITE_TOKEN }}
+          RELEASE_BUNDLE_READ_ORIGIN: ${{ vars.RELEASE_BUNDLE_READ_ORIGIN }}
+          RELEASE_BUNDLE_READ_TOKEN: ${{ secrets.RELEASE_BUNDLE_READ_TOKEN }}
         run: |
           set -euo pipefail
           python3 -m scripts.release.publish reconcile --mode post-cleanup-bridge

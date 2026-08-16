@@ -29,8 +29,8 @@ jobs:
       - name: Resolve exact publication identity
         id: check
         env:
-          RELEASE_BUNDLE_PRIVATE_ORIGIN: ${{ vars.RELEASE_BUNDLE_PRIVATE_ORIGIN }}
-          RELEASE_BUNDLE_READ_WRITE_TOKEN: ${{ secrets.RELEASE_BUNDLE_READ_WRITE_TOKEN }}
+          RELEASE_BUNDLE_READ_ORIGIN: ${{ vars.RELEASE_BUNDLE_READ_ORIGIN }}
+          RELEASE_BUNDLE_READ_TOKEN: ${{ secrets.RELEASE_BUNDLE_READ_TOKEN }}
         run: |
           set -euo pipefail
           VERSION=$(grep 'pub const version' src/main.zig | head -1 | sed 's/.*"\(.*\)".*/\1/')
@@ -152,7 +152,7 @@ jobs:
         if: needs.check-version.outputs.state == 'build'
         env:
           RELEASE_BUNDLE_PRIVATE_ORIGIN: ${{ vars.RELEASE_BUNDLE_PRIVATE_ORIGIN }}
-          RELEASE_BUNDLE_READ_WRITE_TOKEN: ${{ secrets.RELEASE_BUNDLE_READ_WRITE_TOKEN }}
+          RELEASE_BUNDLE_WRITE_TOKEN: ${{ secrets.RELEASE_BUNDLE_WRITE_TOKEN }}
         run: |
           set -euo pipefail
           python3 -m scripts.release.publish seal \
@@ -165,8 +165,8 @@ jobs:
         env:
           BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
           GH_TOKEN: ${{ github.token }}
-          RELEASE_BUNDLE_PRIVATE_ORIGIN: ${{ vars.RELEASE_BUNDLE_PRIVATE_ORIGIN }}
-          RELEASE_BUNDLE_READ_WRITE_TOKEN: ${{ secrets.RELEASE_BUNDLE_READ_WRITE_TOKEN }}
+          RELEASE_BUNDLE_READ_ORIGIN: ${{ vars.RELEASE_BUNDLE_READ_ORIGIN }}
+          RELEASE_BUNDLE_READ_TOKEN: ${{ secrets.RELEASE_BUNDLE_READ_TOKEN }}
         run: |
           set -euo pipefail
           python3 -m scripts.release.publish reconcile \

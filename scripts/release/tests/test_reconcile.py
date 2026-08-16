@@ -4,6 +4,8 @@ import copy
 import hashlib
 import json
 import unittest
+from pathlib import Path
+from unittest import mock
 
 from scripts.release.reconcile import (
     ASSET_NAMES,
@@ -15,7 +17,13 @@ from scripts.release.reconcile import (
     Release,
     reconcile,
 )
-from scripts.release.publish import load_bundle, seal_bundle
+from scripts.release.publish import (
+    BlobBundleStore,
+    HttpBundleReader,
+    _blob_put,
+    load_bundle,
+    seal_bundle,
+)
 
 
 def make_bundle(tag: str = "v0.4.5", epoch: int = 0) -> Bundle:
@@ -406,6 +414,63 @@ class BundleStoreTests(unittest.TestCase):
                         pinned_index_digest=pinned,
                     )
                 self.assertEqual([], backend.writes)
+
+
+class ProviderAdapterTests(unittest.TestCase):
+    def test_blob_put_sends_explicit_overwrite_policy(self) -> None:
+        response = mock.MagicMock()
+        response.__enter__.return_value.status = 200
+        response.__exit__.return_value = False
+
+        with mock.patch("urllib.request.urlopen", return_value=response) as urlopen:
+            _blob_put("bundle/object", b"immutable", token="write-token", mutable=False)
+            immutable_request = urlopen.call_args.args[0]
+            self.assertEqual("0", immutable_request.get_header("X-allow-overwrite"))
+
+            _blob_put("cli/stable.json", b"{}\n", token="write-token", mutable=True)
+            mutable_request = urlopen.call_args.args[0]
+            self.assertEqual("1", mutable_request.get_header("X-allow-overwrite"))
+
+    def test_private_blob_writer_rejects_credential_forwarding_origins(self) -> None:
+        for origin in [
+            "https://store.private.blob.vercel-storage.com.attacker.example",
+            "https://user@store.private.blob.vercel-storage.com",
+            "https://store.private.blob.vercel-storage.com/path",
+            "http://store.private.blob.vercel-storage.com",
+        ]:
+            with self.subTest(origin=origin), self.assertRaises(ReconcileConflict):
+                BlobBundleStore(read_origin=origin, token="write-token")
+
+        store = BlobBundleStore(
+            read_origin="https://store.private.blob.vercel-storage.com",
+            token="write-token",
+        )
+        self.assertEqual(
+            "https://store.private.blob.vercel-storage.com",
+            store.read_origin,
+        )
+
+    def test_read_only_bundle_endpoint_requires_an_exact_https_origin(self) -> None:
+        for origin in [
+            "http://bundle.example.com",
+            "https://user@bundle.example.com",
+            "https://bundle.example.com/path",
+            "https://bundle.example.com?target=other",
+        ]:
+            with self.subTest(origin=origin), self.assertRaises(ReconcileConflict):
+                HttpBundleReader(read_origin=origin, token="read-token")
+
+        reader = HttpBundleReader(
+            read_origin="https://bundle.example.com",
+            token="read-token",
+        )
+        self.assertEqual("https://bundle.example.com", reader.read_origin)
+
+    def test_guarded_repair_workflow_has_no_private_bundle_write_secret(self) -> None:
+        workflow = Path(".github/workflows/cdn-backfill.yml").read_text()
+        self.assertIn("RELEASE_BUNDLE_READ_TOKEN", workflow)
+        self.assertNotIn("RELEASE_BUNDLE_WRITE_TOKEN", workflow)
+        self.assertNotIn("RELEASE_BUNDLE_READ_WRITE_TOKEN", workflow)
 
 
 if __name__ == "__main__":

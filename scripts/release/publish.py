@@ -33,9 +33,11 @@ from scripts.release.reconcile import (
 DEFAULT_PUBLIC_CDN_ORIGIN = "https://ugiwefobuo4tac0m.public.blob.vercel-storage.com"
 
 
-class BundleStore(Protocol):
+class BundleReader(Protocol):
     def read(self, path: str) -> bytes | None: ...
 
+
+class BundleStore(BundleReader, Protocol):
     def write_immutable(self, path: str, body: bytes) -> None: ...
 
 
@@ -74,7 +76,7 @@ def seal_bundle(store: BundleStore, bundle: Bundle, *, prefix: str) -> str:
 
 
 def load_bundle(
-    store: BundleStore,
+    store: BundleReader,
     tag: str,
     *,
     prefix: str,
@@ -118,20 +120,28 @@ def _bundle_object_path(prefix: str, digest: str) -> str:
     return f"{normalized}/objects/{digest}"
 
 
-class BlobBundleStore:
-    """Authenticated fixed-path storage backed by a private Vercel Blob store."""
+class HttpBundleReader:
+    """Authenticated fixed-path reader for a least-privilege bundle endpoint."""
 
     def __init__(self, *, read_origin: str, token: str) -> None:
-        origin = read_origin.rstrip("/")
-        if not origin.startswith("https://") or ".private.blob.vercel-storage.com" not in origin:
-            raise ReconcileConflict("private bundle origin must be a private Vercel Blob origin")
+        origin, _ = _validated_https_origin(read_origin)
         if not token:
-            raise ReconcileConflict("private bundle token is missing")
+            raise ReconcileConflict("private bundle read token is missing")
         self.read_origin = origin
         self.token = token
 
     def read(self, path: str) -> bytes | None:
         return _http_read(f"{self.read_origin}/{_quote_path(path)}", token=self.token)
+
+
+class BlobBundleStore(HttpBundleReader):
+    """Fixed-path private Vercel Blob writer used only while sealing."""
+
+    def __init__(self, *, read_origin: str, token: str) -> None:
+        origin, hostname = _validated_https_origin(read_origin)
+        if not hostname.endswith(".private.blob.vercel-storage.com"):
+            raise ReconcileConflict("private bundle origin must be a private Vercel Blob origin")
+        super().__init__(read_origin=origin, token=token)
 
     def write_immutable(self, path: str, body: bytes) -> None:
         _blob_put(path, body, token=self.token, mutable=False)
@@ -307,10 +317,17 @@ def _load_config(path: Path) -> dict[str, object]:
     return value
 
 
-def _private_store_from_env() -> BlobBundleStore:
+def _private_reader_from_env() -> HttpBundleReader:
+    return HttpBundleReader(
+        read_origin=os.environ.get("RELEASE_BUNDLE_READ_ORIGIN", ""),
+        token=os.environ.get("RELEASE_BUNDLE_READ_TOKEN", ""),
+    )
+
+
+def _private_writer_from_env() -> BlobBundleStore:
     return BlobBundleStore(
         read_origin=os.environ.get("RELEASE_BUNDLE_PRIVATE_ORIGIN", ""),
-        token=os.environ.get("RELEASE_BUNDLE_READ_WRITE_TOKEN", ""),
+        token=os.environ.get("RELEASE_BUNDLE_WRITE_TOKEN", ""),
     )
 
 
@@ -325,7 +342,7 @@ def _cmd_bundle_status(args: argparse.Namespace, config: dict[str, object]) -> i
     if args.tag == _config_string(config, "legacy_terminal_tag"):
         print("legacy-complete")
         return 0
-    store = _private_store_from_env()
+    store = _private_reader_from_env()
     prefix = _config_string(config, "private_bundle_prefix")
     raw_index = store.read(_bundle_index_path(prefix, args.tag))
     if raw_index is None:
@@ -341,7 +358,7 @@ def _cmd_bundle_status(args: argparse.Namespace, config: dict[str, object]) -> i
 
 def _cmd_bundle_identity(args: argparse.Namespace, config: dict[str, object]) -> int:
     bundle = load_bundle(
-        _private_store_from_env(),
+        _private_reader_from_env(),
         args.tag,
         prefix=_config_string(config, "private_bundle_prefix"),
     )
@@ -365,7 +382,7 @@ def _cmd_seal(args: argparse.Namespace, config: dict[str, object]) -> int:
         release_body=body,
     )
     digest = seal_bundle(
-        _private_store_from_env(),
+        _private_writer_from_env(),
         bundle,
         prefix=_config_string(config, "private_bundle_prefix"),
     )
@@ -376,7 +393,7 @@ def _cmd_seal(args: argparse.Namespace, config: dict[str, object]) -> int:
 def _cmd_reconcile(args: argparse.Namespace, config: dict[str, object]) -> int:
     prefix = _config_string(config, "private_bundle_prefix")
     bridge_tag = _config_string(config, "bridge_tag")
-    store = _private_store_from_env()
+    store = _private_reader_from_env()
     pinned_digest = None
     if args.mode == Mode.POST_CLEANUP_BRIDGE.value:
         post_cleanup = config.get("post_cleanup_bridge")
@@ -507,6 +524,29 @@ def _http_read(url: str, *, token: str | None = None) -> bytes | None:
         raise ReconcileConflict("object read failed") from exc
 
 
+def _validated_https_origin(raw: str) -> tuple[str, str]:
+    if not raw or raw != raw.strip():
+        raise ReconcileConflict("private bundle origin must be an exact HTTPS origin")
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        port = parsed.port
+    except ValueError as exc:
+        raise ReconcileConflict("private bundle origin must be an exact HTTPS origin") from exc
+    hostname = parsed.hostname
+    if (
+        parsed.scheme != "https"
+        or hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ReconcileConflict("private bundle origin must be an exact HTTPS origin")
+    return f"https://{hostname}", hostname
+
+
 def _blob_put(path: str, body: bytes, *, token: str, mutable: bool) -> None:
     content_type = "application/octet-stream"
     if path.endswith(".json"):
@@ -520,6 +560,7 @@ def _blob_put(path: str, body: bytes, *, token: str, mutable: bool) -> None:
         "x-api-version": "7",
         "x-content-type": content_type,
         "x-add-random-suffix": "0",
+        "x-allow-overwrite": "1" if mutable else "0",
         "x-cache-control-max-age": "60" if mutable else "31536000",
     }
     request = urllib.request.Request(
