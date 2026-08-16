@@ -12,12 +12,39 @@ permissions:
 
 jobs:
   compare:
-    name: macOS arm64 ReleaseSafe delta
-    runs-on: macos-15
+    name: ReleaseSafe delta (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            target: x86_64-linux
+            runner: ubuntu-24.04
+            section_format: elf
+            expected_file: "ELF 64-bit LSB.*x86-64"
+          - name: linux-aarch64
+            target: aarch64-linux
+            runner: ubuntu-24.04-arm
+            section_format: elf
+            expected_file: "ELF 64-bit LSB.*ARM aarch64"
+          - name: macos-x86_64
+            target: x86_64-macos
+            runner: macos-15-intel
+            section_format: macho
+            expected_file: "Mach-O 64-bit executable x86_64"
+          - name: macos-aarch64
+            target: aarch64-macos
+            runner: macos-15
+            section_format: macho
+            expected_file: "Mach-O 64-bit executable arm64"
     env:
       BASE_SHA: ${{ github.event.pull_request.base.sha }}
       HEAD_SHA: ${{ github.sha }}
+      EXPECTED_FILE: ${{ matrix.expected_file }}
+      SECTION_FORMAT: ${{ matrix.section_format }}
+      TARGET: ${{ matrix.target }}
 
     steps:
       - uses: actions/checkout@v4
@@ -41,15 +68,19 @@ jobs:
           mkdir -p "$evidence_dir"
           test "$(git rev-parse HEAD)" = "$HEAD_SHA"
           zig build \
-            -Dtarget=aarch64-macos \
+            -Dtarget=${{ matrix.target }} \
             -Doptimize=ReleaseSafe \
             --cache-dir "$RUNNER_TEMP/fx-head-cache" \
             --global-cache-dir "$RUNNER_TEMP/fx-global-cache"
           cp zig-out/bin/fx "$evidence_dir/head-fx"
           file "$evidence_dir/head-fx" > "$evidence_dir/head-file.txt"
           cat "$evidence_dir/head-file.txt"
-          grep -q "Mach-O 64-bit executable arm64" "$evidence_dir/head-file.txt"
-          size -m "$evidence_dir/head-fx" > "$evidence_dir/head-sections.txt"
+          grep -Eq "$EXPECTED_FILE" "$evidence_dir/head-file.txt"
+          if [ "$SECTION_FORMAT" = "macho" ]; then
+            size -m "$evidence_dir/head-fx" > "$evidence_dir/head-sections.txt"
+          else
+            size -A -d "$evidence_dir/head-fx" > "$evidence_dir/head-sections.txt"
+          fi
           cat "$evidence_dir/head-sections.txt"
 
       - name: Build base binary
@@ -67,7 +98,7 @@ jobs:
           (
             cd "$base_worktree"
             zig build \
-              -Dtarget=aarch64-macos \
+              -Dtarget=${{ matrix.target }} \
               -Doptimize=ReleaseSafe \
               --cache-dir "$RUNNER_TEMP/fx-base-cache" \
               --global-cache-dir "$RUNNER_TEMP/fx-global-cache"
@@ -75,8 +106,12 @@ jobs:
           cp "$base_worktree/zig-out/bin/fx" "$evidence_dir/base-fx"
           file "$evidence_dir/base-fx" > "$evidence_dir/base-file.txt"
           cat "$evidence_dir/base-file.txt"
-          grep -q "Mach-O 64-bit executable arm64" "$evidence_dir/base-file.txt"
-          size -m "$evidence_dir/base-fx" > "$evidence_dir/base-sections.txt"
+          grep -Eq "$EXPECTED_FILE" "$evidence_dir/base-file.txt"
+          if [ "$SECTION_FORMAT" = "macho" ]; then
+            size -m "$evidence_dir/base-fx" > "$evidence_dir/base-sections.txt"
+          else
+            size -A -d "$evidence_dir/base-fx" > "$evidence_dir/base-sections.txt"
+          fi
           cat "$evidence_dir/base-sections.txt"
 
       - name: Compare binary sizes
@@ -92,7 +127,7 @@ jobs:
             --head-sections "$evidence_dir/head-sections.txt" \
             --base-sha "$BASE_SHA" \
             --head-sha "$HEAD_SHA" \
-            --target aarch64-macos \
+            --target "$TARGET" \
             --warning-bytes 52429 \
             --output-json "$evidence_dir/report.json" \
             --output-markdown "$evidence_dir/report.md" \
@@ -105,13 +140,13 @@ jobs:
           DELTA_BYTES: ${{ steps.size.outputs.delta_bytes }}
         run: |
           printf '%s\n' \
-            "::warning title=Binary size increase::ReleaseSafe grew by ${DELTA_BYTES} bytes; inspect the retained section report."
+            "::warning title=Binary size increase::${TARGET} ReleaseSafe grew by ${DELTA_BYTES} bytes; inspect the retained section report."
 
       - name: Upload size evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: binary-size-evidence-${{ github.event.pull_request.number }}
+          name: binary-size-evidence-${{ matrix.name }}-${{ github.event.pull_request.number }}
           path: |
             ${{ runner.temp }}/fx-binary-size-evidence/report.json
             ${{ runner.temp }}/fx-binary-size-evidence/report.md
@@ -126,7 +161,7 @@ jobs:
         if: steps.size.outputs.warning == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: binary-size-binaries-${{ github.event.pull_request.number }}
+          name: binary-size-binaries-${{ matrix.name }}-${{ github.event.pull_request.number }}
           path: |
             ${{ runner.temp }}/fx-binary-size-evidence/base-fx
             ${{ runner.temp }}/fx-binary-size-evidence/head-fx

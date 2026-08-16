@@ -14,6 +14,7 @@ SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 TARGET_PATTERN = re.compile(r"[A-Za-z0-9_.-]+")
 SEGMENT_PATTERN = re.compile(r"^Segment\s+(\S+):\s+(\d+)")
 SECTION_PATTERN = re.compile(r"^Section\s+(\S+):\s+(\d+)")
+ELF_SECTION_PATTERN = re.compile(r"^(\S+)\s+(\d+)\s+(?:0x)?[0-9A-Fa-f]+$")
 
 
 class BinarySizeError(RuntimeError):
@@ -76,6 +77,38 @@ def parse_macho_sections(path: pathlib.Path) -> tuple[dict[str, int], dict[str, 
     return segments, sections
 
 
+def parse_elf_sections(path: pathlib.Path) -> tuple[dict[str, int], dict[str, int]]:
+    if not path.is_file():
+        raise BinarySizeError(f"section report does not exist: {path}")
+    sections: dict[str, int] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        section_match = ELF_SECTION_PATTERN.match(raw_line.strip())
+        if not section_match:
+            continue
+        name = section_match.group(1)
+        if name in sections:
+            raise BinarySizeError(
+                f"section report contains duplicate section {name}: {path}"
+            )
+        sections[name] = int(section_match.group(2))
+    if not sections:
+        raise BinarySizeError(f"section report contains no ELF sections: {path}")
+    if ".text" not in sections:
+        raise BinarySizeError(f"section report is missing .text section: {path}")
+    return {}, sections
+
+
+def parse_sections(
+    path: pathlib.Path,
+    target: str,
+) -> tuple[dict[str, int], dict[str, int]]:
+    if target.endswith("-macos"):
+        return parse_macho_sections(path)
+    if target.endswith("-linux"):
+        return parse_elf_sections(path)
+    raise BinarySizeError(f"unsupported target: {target}")
+
+
 def deltas(base: dict[str, int], head: dict[str, int]) -> dict[str, int]:
     return {
         key: head.get(key, 0) - base.get(key, 0)
@@ -104,8 +137,8 @@ def build_report(
 
     base = artifact_evidence(base_binary, base_sha)
     head = artifact_evidence(head_binary, head_sha)
-    base_segments, base_section_values = parse_macho_sections(base_sections)
-    head_segments, head_section_values = parse_macho_sections(head_sections)
+    base_segments, base_section_values = parse_sections(base_sections, target)
+    head_segments, head_section_values = parse_sections(head_sections, target)
     delta_bytes = int(head["size_bytes"]) - int(base["size_bytes"])
     if delta_bytes > 0:
         direction = "increase"
