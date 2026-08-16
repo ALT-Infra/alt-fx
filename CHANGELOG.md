@@ -1,13 +1,24 @@
 # fx
 
-## 0.4.3
+## 0.4.4
 
 <!-- release:start -->
+
+### New Features
+
+- **Native Node.js agents:** Run headless fx agents inside Node.js through a native `libfx` addon, with fetch streaming and cancellation handled by the host
+- **Shared JavaScript SDK:** Use `createFxAgent()` and `createFxTerminal()` from `libfx` in Node.js or the browser, with WebAssembly fallback when a native surface is unavailable
+
+### Bug Fixes
+
+- **Signed-in account data:** Restore model catalog and credit balance loading for Vercel-authenticated sessions
+<!-- release:end -->
+
+## 0.4.3
 
 ### Improvements
 
 - **Smaller macOS arm64 binary:** Reduce the native binary size with profile-guided optimization tuned to common fx workloads
-<!-- release:end -->
 
 ## 0.4.2
 
