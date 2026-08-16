@@ -18,6 +18,7 @@ const requiredNativeNames = new Set([
 const files = [
   ["sdk/package.json", "package.json"],
   ["sdk/README.md", "README.md"],
+  ["LICENSE", "LICENSE"],
   ["sdk/browser.js", "browser.js"],
   ["sdk/node.js", "node.js"],
   ["sdk/fx-sdk.js", "fx-sdk.js"],

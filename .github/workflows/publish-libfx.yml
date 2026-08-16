@@ -261,7 +261,7 @@ jobs:
 
           rm -rf sdk/dist/libfx
           mkdir -p sdk/dist/libfx
-          cp sdk/package.json sdk/README.md sdk/browser.js sdk/node.js sdk/fx-sdk.js sdk/dist/libfx/
+          cp sdk/package.json sdk/README.md sdk/browser.js sdk/node.js sdk/fx-sdk.js LICENSE sdk/dist/libfx/
           cp wasm-artifacts/fx-core.wasm wasm-artifacts/fx-term.wasm sdk/dist/libfx/
           cp native-addons/*.node sdk/dist/libfx/
           jq --arg version "$LIBFX_VERSION" '.version = $version | del(.files)' \
@@ -276,7 +276,7 @@ jobs:
             const report = require("/tmp/libfx-pack.json")[0];
             const names = new Set(report.files.map(({ path }) => path));
             const required = [
-              "package.json", "README.md", "browser.js", "node.js", "fx-sdk.js",
+              "package.json", "README.md", "LICENSE", "browser.js", "node.js", "fx-sdk.js",
               "fx-core.wasm", "fx-term.wasm",
               "libfx.linux-x64.node", "libfx.linux-arm64.node",
               "libfx.darwin-x64.node", "libfx.darwin-arm64.node",

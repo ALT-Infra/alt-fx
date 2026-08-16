@@ -1092,6 +1092,7 @@ export async function createFxAgent(options) {
             waiters.splice(0).forEach((resolve) => resolve({ done: true }));
           });
         turn.stopReason = turn.result.then((turnResult) => turnResult.stopReason);
+        void turn.stopReason.catch(() => {});
         if (signal?.aborted) turn.cancel();
         return turn;
       },

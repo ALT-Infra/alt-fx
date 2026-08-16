@@ -32,7 +32,8 @@
     "fx-core.wasm",
     "fx-term.wasm",
     "*.node",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "engines": {
     "node": ">=20"

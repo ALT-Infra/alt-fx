@@ -1,6 +1,7 @@
 import { access, readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
+import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   createFxAgent as createWasmAgent,
@@ -48,7 +49,7 @@ async function loadNativeCandidate(candidate) {
   if (typeof candidate !== "string") {
     throw new TypeError("nativeAddon must be a module, path, URL, false, or undefined");
   }
-  if (candidate.endsWith(".node")) return require(candidate);
+  if (candidate.endsWith(".node")) return require(isAbsolute(candidate) ? candidate : resolve(candidate));
   const imported = await import(candidate.startsWith("file:") ? candidate : pathToFileURL(candidate).href);
   return imported.default ?? imported;
 }
@@ -175,7 +176,7 @@ function createNativeCoreRuntime(addon, options) {
       }
       addon.finishCoreFetch(core);
     } catch (error) {
-      if (error?.name !== "AbortError") {
+      if (error?.name !== "AbortError" || !controller.signal.aborted) {
         try { addon.failCoreFetch(core); } catch {}
       }
     } finally {
@@ -197,7 +198,7 @@ function createNativeCoreRuntime(addon, options) {
           if (line) lineHandler(JSON.parse(line));
         }
       }
-      if (addon.coreExited(core)) finish(0);
+      if (addon.coreExited(core)) finish(addon.coreExitCode(core));
     } catch {
       finish(1);
     }

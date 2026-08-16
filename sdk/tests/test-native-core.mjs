@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 import { strict as assert } from "node:assert";
-import { resolve } from "node:path";
+import { relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createFxAgent } from "../node.js";
 
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
-const addon = resolve(process.argv[2] || resolve(scriptDir, "../../zig-out/lib/libfx.node"));
+const defaultAddon = resolve(scriptDir, "../../zig-out/lib/libfx.node");
+const addon = process.argv[2] || `./${relative(process.cwd(), defaultAddon)}`;
 const events = [];
 const agent = await createFxAgent({
   nativeAddon: addon,

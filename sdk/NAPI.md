@@ -76,6 +76,7 @@ The adapter polls `drainCore()` and `takeCoreFetch()` every 2 milliseconds. ACP 
 | `finishCoreFetch(handle)` / `failCoreFetch(handle)` | Completes the host stream successfully or with transport failure. |
 | `abortCoreFetch(handle)` | Wakes the Zig worker while Node aborts the matching `AbortController`. |
 | `coreExited(handle)` | Reports whether the ACP thread has exited. |
+| `coreExitCode(handle)` | Returns the ACP thread's numeric exit status. |
 | `destroyCore(handle)` | Closes input, joins the thread, and releases native memory. |
 
 This ABI is internal. Consumers should use `createFxAgent()` from `sdk/node.js`; exposing the primitive functions keeps the native boundary small and testable.
@@ -219,7 +220,7 @@ Published packages contain one addon for each supported tuple:
 - `darwin-x64`;
 - `darwin-arm64`.
 
-`package-libfx.mjs` requires exactly those four names when assembling a publishable multi-platform package. It rejects missing, duplicate, or unexpected addon names. The publish workflow builds and tests each addon on its native runner before combining the artifacts with both WebAssembly surfaces.
+`package-libfx.mjs` requires exactly those four names when assembling a publishable multi-platform package. It rejects missing, duplicate, or unexpected addon names. The publish workflow builds and tests each addon on its native runner before combining the artifacts with both WebAssembly surfaces, the README, and the Apache-2.0 license.
 
 ## Error model
 

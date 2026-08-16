@@ -24,8 +24,7 @@ const provider_context = host_stream_provider.initContext(builtin_gateway.buildA
     .close_fn = close,
 });
 
-pub fn provider(build_fn: stream_provider.BuildFn) stream_provider.Provider {
-    _ = build_fn;
+pub fn provider() stream_provider.Provider {
     return host_stream_provider.provider(@constCast(&provider_context));
 }
 

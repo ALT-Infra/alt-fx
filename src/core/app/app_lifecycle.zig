@@ -267,12 +267,34 @@ pub fn loadStartupState(
     default_agent_step_limit: usize,
 ) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateFromOwnedWorkspace(alloc, transport, secret_store, workspace_root, default_model, default_fast_mode, default_agent_step_limit, .refresh_if_needed);
+    return loadStartupStateFromOwnedWorkspace(alloc, transport, secret_store, workspace_root, default_model, default_fast_mode, default_agent_step_limit, null, .refresh_if_needed);
 }
 
 pub fn loadStartupStateWithoutCredentials(alloc: Allocator, default_model: []const u8, default_fast_mode: bool, default_agent_step_limit: usize) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, workspace_root, default_model, default_fast_mode, default_agent_step_limit, null);
+    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, workspace_root, default_model, default_fast_mode, default_agent_step_limit, null, null);
+}
+
+pub fn loadEmbeddedStartupState(
+    alloc: Allocator,
+    home_dir: []const u8,
+    workspace_root: []const u8,
+    default_model: []const u8,
+    default_fast_mode: bool,
+    default_agent_step_limit: usize,
+) !StartupState {
+    const owned_workspace_root = try io_mod.realpathAlloc(alloc, workspace_root);
+    return loadStartupStateFromOwnedWorkspace(
+        alloc,
+        oauth_transport.unavailable_provider,
+        host.unavailable_secret_store,
+        owned_workspace_root,
+        default_model,
+        default_fast_mode,
+        default_agent_step_limit,
+        home_dir,
+        null,
+    );
 }
 
 pub fn loadCatalogStartupState(
@@ -283,7 +305,7 @@ pub fn loadCatalogStartupState(
     default_agent_step_limit: usize,
 ) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, secret_store, workspace_root, default_model, default_fast_mode, default_agent_step_limit, .stored);
+    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, secret_store, workspace_root, default_model, default_fast_mode, default_agent_step_limit, null, .stored);
 }
 
 pub fn loadStartupStatus(
@@ -338,12 +360,12 @@ pub fn applyWorkspaceLaunch(
 
 fn loadStartupStateForWorkspace(alloc: Allocator, workspace_root: []const u8, default_model: []const u8, default_agent_step_limit: usize) !StartupState {
     const owned_workspace_root = try alloc.dupe(u8, workspace_root);
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, owned_workspace_root, default_model, false, default_agent_step_limit, null);
+    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, owned_workspace_root, default_model, false, default_agent_step_limit, null, null);
 }
 
 fn loadStartupStateForWorkspaceWithFastDefault(alloc: Allocator, workspace_root: []const u8, default_model: []const u8, default_agent_step_limit: usize) !StartupState {
     const owned_workspace_root = try alloc.dupe(u8, workspace_root);
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, owned_workspace_root, default_model, true, default_agent_step_limit, null);
+    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, owned_workspace_root, default_model, true, default_agent_step_limit, null, null);
 }
 
 const CredentialLoadMode = credentials.LoadMode;
@@ -356,6 +378,7 @@ fn loadStartupStateFromOwnedWorkspace(
     default_model: []const u8,
     default_fast_mode: bool,
     default_agent_step_limit: usize,
+    profile_home: ?[]const u8,
     credential_mode: ?CredentialLoadMode,
 ) !StartupState {
     var state = StartupState{ .agent_step_limit = default_agent_step_limit };
@@ -363,7 +386,10 @@ fn loadStartupStateFromOwnedWorkspace(
 
     state.workspace_root = owned_workspace_root;
     debug_trace.configureFromEnv(alloc, state.workspace_root);
-    var detailed = try config_runtime.loadMergedSettingsDetailed(alloc, state.workspace_root);
+    var detailed = if (profile_home) |home_dir|
+        try config_runtime.loadMergedSettingsDetailedFromHome(alloc, home_dir, state.workspace_root)
+    else
+        try config_runtime.loadMergedSettingsDetailed(alloc, state.workspace_root);
     defer detailed.deinit(alloc);
     const settings = &detailed.settings;
 

@@ -16,6 +16,7 @@ for (const [name, args] of [
   ["closeCore", []],
   ["drainCore", []],
   ["coreExited", []],
+  ["coreExitCode", []],
   ["destroyCore", []],
 ]) {
   assert.throws(() => addon[name](...args), {

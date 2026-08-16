@@ -6,6 +6,7 @@ const background_process_provider = @import("core/execution/background_process_p
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
 const generation_usage_provider = @import("core/session/generation_usage_provider.zig");
 const host = @import("core/hosts/host.zig");
+const debug_trace = @import("core/shared/debug_trace.zig");
 const io_mod = @import("core/shared/io.zig");
 const streamable_http = @import("core/mcp/streamable_http.zig");
 const host_stream_provider = @import("gateway/host_stream_provider.zig");
@@ -159,6 +160,13 @@ const FetchBridge = struct {
     shutting_down: bool = false,
     status: u16 = 0,
 
+    fn clearPendingRequest(self: *FetchBridge, reason: []const u8) void {
+        if (!self.request_pending) return;
+        debug_trace.logf("napi", "dropping pending host fetch reason={s} bytes={d}", .{ reason, self.request.items.len });
+        self.request.clearRetainingCapacity();
+        self.request_pending = false;
+    }
+
     fn open(raw: ?*anyopaque, method: []const u8, url: []const u8, headers: []const u8, body: []const u8) !i32 {
         const self: *FetchBridge = @ptrCast(@alignCast(raw.?));
         const io = io_mod.getIo();
@@ -166,6 +174,7 @@ const FetchBridge = struct {
         defer self.mutex.unlock(io);
         if (self.shutting_down) return error.HostStreamUnavailable;
         if (self.aborted) {
+            self.clearPendingRequest("open_after_abort");
             self.aborted = false;
             return error.Cancelled;
         }
@@ -226,6 +235,7 @@ const FetchBridge = struct {
         const self: *FetchBridge = @ptrCast(@alignCast(raw.?));
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
+        self.clearPendingRequest("stream_close");
         self.response_started = false;
         self.response_done = false;
         self.failed = false;
@@ -298,6 +308,7 @@ const FetchBridge = struct {
     fn abort(self: *FetchBridge) void {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
+        self.clearPendingRequest("abort");
         self.aborted = true;
         self.wake.broadcast(io);
         self.mutex.unlock(io);
@@ -306,6 +317,7 @@ const FetchBridge = struct {
     fn shutdown(self: *FetchBridge) void {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
+        self.clearPendingRequest("shutdown");
         self.shutting_down = true;
         self.aborted = true;
         self.wake.broadcast(io);
@@ -340,7 +352,11 @@ const Runtime = struct {
 
     fn writeOutput(context: ?*anyopaque, bytes: []const u8) !void {
         const self: *Runtime = @ptrCast(@alignCast(context.?));
-        try self.output.write(self.alloc, bytes);
+        self.output.write(self.alloc, bytes) catch |err| {
+            debug_trace.logf("napi", "native output failed err={s}", .{@errorName(err)});
+            self.exit_code.store(1, .seq_cst);
+            return err;
+        };
     }
 
     fn run(self: *Runtime) void {
@@ -385,7 +401,8 @@ const Runtime = struct {
             },
             jsonrpc.Reader.initCallback(self, Runtime.readInput),
             jsonrpc.Writer.initCallback(self, Runtime.writeOutput),
-        ) catch {
+        ) catch |err| {
+            debug_trace.logf("napi", "native runtime failed err={s}", .{@errorName(err)});
             self.exit_code.store(1, .seq_cst);
         };
         self.exited.store(true, .seq_cst);
@@ -801,6 +818,16 @@ fn coreExited(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_v
     return value;
 }
 
+fn coreExitCode(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argv: [1]c.napi_value = undefined;
+    const handle = runtimeHandleArg(env, info, &argv) orelse return null;
+    const runtime = lockRuntime(env, handle) orelse return null;
+    defer unlockRuntime(handle);
+    var value: c.napi_value = undefined;
+    _ = c.napi_create_uint32(env, runtime.exit_code.load(.seq_cst), &value);
+    return value;
+}
+
 fn destroyCore(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
     var argv: [1]c.napi_value = undefined;
     const handle = runtimeHandleArg(env, info, &argv) orelse return null;
@@ -832,6 +859,7 @@ export fn napi_register_module_v1(env: c.napi_env, exports: c.napi_value) callco
     if (!exportFunction(env, exports, "failCoreFetch", failCoreFetch)) return null;
     if (!exportFunction(env, exports, "abortCoreFetch", abortCoreFetch)) return null;
     if (!exportFunction(env, exports, "coreExited", coreExited)) return null;
+    if (!exportFunction(env, exports, "coreExitCode", coreExitCode)) return null;
     if (!exportFunction(env, exports, "destroyCore", destroyCore)) return null;
     return exports;
 }
