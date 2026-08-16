@@ -12,6 +12,7 @@ const process_supervisor = @import("../background/process_supervisor.zig");
 const background_process_provider = @import(
     "../execution/background_process_provider.zig",
 );
+const process_tree = @import("../execution/process_tree.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const sandbox = @import("../permissions/sandbox.zig");
 const execution_router = @import("../execution/router.zig");
@@ -3128,6 +3129,11 @@ fn applyMonitorSocketTimeout(stream: std.Io.net.Stream, timeout_ms: i64) void {
     ) catch {};
 }
 
+const SignalTarget = struct {
+    pid: std.posix.pid_t,
+    token: process_supervisor.ProcessInstanceToken,
+};
+
 const Session = struct {
     alloc: Allocator,
     tracker: WorkTracker,
@@ -4107,6 +4113,58 @@ const Session = struct {
 
     fn signalProcess(self: *Session, signal: contracts.Signal) bool {
         return self.signalNative(signalValue(signal));
+    }
+
+    fn signalTarget(self: *Session) ?SignalTarget {
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        defer self.mutex.unlock(zio);
+        if (!contracts.lifecycle_controls(self.lifecycle).signal) return null;
+        return .{
+            .pid = self.child_pid orelse return null,
+            .token = self.child_token orelse return null,
+        };
+    }
+
+    fn matchesSignalTarget(self: *Session, target: SignalTarget) bool {
+        var pid_buffer: [32]u8 = undefined;
+        const pid_text = std.fmt.bufPrint(
+            &pid_buffer,
+            "{d}",
+            .{target.pid},
+        ) catch return false;
+        return self.durable.profile.process_provider.matchToken(
+            self.alloc,
+            pid_text,
+            target.token,
+        ) == .matched;
+    }
+
+    fn signalTerminalProcesses(
+        self: *Session,
+        signal: contracts.Signal,
+    ) !bool {
+        const target = self.signalTarget() orelse return false;
+        if (!self.matchesSignalTarget(target)) return false;
+
+        var descendants = try process_tree.Tracker.init(self.alloc);
+        defer descendants.deinit();
+        descendants.refresh(target.pid) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.ProcessIdentityUnavailable,
+        };
+        if (!self.matchesSignalTarget(target)) return false;
+
+        const delivered = descendants.signalOutsideProcessGroup(
+            signalValue(signal),
+            target.pid,
+        );
+        debug_trace.logf(
+            "terminal_host",
+            "session signal reached outside-group descendants id={s} count={d}",
+            .{ self.id, delivered },
+        );
+        return self.signalProcess(signal);
     }
 
     fn signalNative(self: *Session, signal: std.c.SIG) bool {
@@ -5431,7 +5489,7 @@ fn signalAction(
         request.authority.?,
         .signal,
     );
-    if (!session.signalProcess(request.signal)) {
+    if (!try session.signalTerminalProcesses(request.signal)) {
         return error.ProcessIdentityUnavailable;
     }
     session.mutex.lockUncancelable(zio);

@@ -68,6 +68,27 @@ function processExists(pid: number): boolean {
   }
 }
 
+function processGroupId(pid: number): number {
+  const value = Number(
+    execFileSync("ps", ["-p", String(pid), "-o", "pgid="], {
+      encoding: "utf8",
+    }).trim(),
+  );
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`missing process group for ${pid}`);
+  }
+  return value;
+}
+
+async function waitForSignalMarker(path: string): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    if (existsSync(path) && readFileSync(path, "utf8") === "term") return;
+    await Bun.sleep(25);
+  }
+  throw new Error(`terminal signal marker did not appear at ${path}`);
+}
+
 function directChildPids(pid: number): number[] {
   return execFileSync("ps", ["-axo", "pid=,ppid="], { encoding: "utf8" })
     .trim()
@@ -1520,6 +1541,100 @@ test.skipIf(!tmuxAvailable())(
     expect(listResult).toContain('"lifecycle":"exited"');
     expect(listResult).not.toContain("owner_authority");
     expect(listResult).not.toContain("proof");
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "TUI public signal reaches a foreground job outside the shell process group",
+  async () => {
+    const fixture = createFixture("fx-tui-terminal-public-signal-");
+    const proofPath = join(fixture.root, "foreground-signal.proof");
+    const termPath = join(fixture.root, "foreground-signal.term");
+    const scriptPath = join(fixture.workspace, "foreground-signal.sh");
+    writeFileSync(
+      scriptPath,
+      `#!${TERMINAL_FIXTURE_SHELL}
+trap 'printf term > ${JSON.stringify(termPath)}; exit 0' TERM
+printf '%s %s %s\n' "$$" "$PPID" "$(ps -o pgid= -p $$ | tr -d ' ')" > ${JSON.stringify(proofPath)}
+printf 'TUI_PUBLIC_SIGNAL_READY\n'
+${holdUntilCleanup(fixture.root)}
+`,
+    );
+    chmodSync(scriptPath, 0o700);
+
+    let terminalSessionId = "";
+    let targetPid = 0;
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("tui_terminal_signal_start", "terminal", {
+        action: "start",
+        cwd: fixture.workspace,
+        command: JSON.stringify(scriptPath),
+        shell: {
+          kind: "executable",
+          path: TERMINAL_FIXTURE_SHELL,
+          clean_start: true,
+        },
+        backend: "native",
+        return_when: {
+          kind: "match",
+          pattern: "TUI_PUBLIC_SIGNAL_READY",
+        },
+        wait_ceiling_ms: 20_000,
+        dimensions: { rows: 24, columns: 80 },
+      }),
+      async (body) => {
+        const result = JSON.parse(
+          toolResultText(body, "tui_terminal_signal_start"),
+        ) as {
+          success: { start: { session: { session_id: string } } };
+        };
+        terminalSessionId = result.success.start.session.session_id;
+        expect(terminalSessionId.length).toBeGreaterThan(0);
+        await waitForTrace(proofPath, " ");
+        const [pidText, parentText, pgidText] = readFileSync(proofPath, "utf8")
+          .trim()
+          .split(/\s+/);
+        targetPid = Number(pidText);
+        const targetParentPid = Number(parentText);
+        const targetPgid = Number(pgidText);
+        const record = await waitForTerminalRecord(
+          fixture.home,
+          (candidate) => candidate.session_id === terminalSessionId,
+        );
+        const shellPid = Number(record.pid);
+        expect(targetPid).toBeGreaterThan(0);
+        expect(targetParentPid).toBe(shellPid);
+        expect(targetPgid).toBe(processGroupId(targetPid));
+        expect(targetPgid).not.toBe(processGroupId(shellPid));
+        return fakeGatewayToolCall("tui_terminal_signal", "terminal", {
+          action: "signal",
+          session_id: terminalSessionId,
+          signal: "terminate",
+        });
+      },
+      (body) => {
+        const result = JSON.parse(
+          toolResultText(body, "tui_terminal_signal"),
+        ) as { success: { signal: { signal: string } } };
+        expect(result.success.signal.signal).toBe("terminate");
+        return fakeGatewayFinalText("TUI public terminal signal complete");
+      },
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway);
+
+    await active.sendText("Signal the foreground terminal fixture.");
+    const pane = await active.waitForText(
+      "TUI public terminal signal complete",
+      TIMEOUT,
+    );
+    expect(pane).toContain("Used terminal start");
+    expect(pane).toContain("Used terminal signal");
+    expect(gateway.requests).toHaveLength(3);
+    await waitForSignalMarker(termPath);
+    await waitForOwnedProcessExit([targetPid]);
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
   TIMEOUT,

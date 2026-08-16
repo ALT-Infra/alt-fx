@@ -262,6 +262,18 @@ function processExists(pid: number): boolean {
   }
 }
 
+function processGroupId(pid: number): number {
+  const value = Number(
+    execFileSync("ps", ["-p", String(pid), "-o", "pgid="], {
+      encoding: "utf8",
+    }).trim(),
+  );
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`missing process group for ${pid}`);
+  }
+  return value;
+}
+
 function processFdCount(pid: number): number {
   const proc = `/proc/${pid}/fd`;
   if (existsSync(proc)) return readdirSync(proc).length;
@@ -7538,6 +7550,85 @@ test("writes resize waits cancellation signals and close remain session-scoped",
   expect(await waitForExit(host)).toBe(0);
   expect(existsSync(paths.socket)).toBe(false);
 }, NATIVE_STARTUP_OBSERVATION_BUDGET_MS * 8 + 60_000);
+
+test("signal reaches a background job outside the shell process group", async () => {
+  if (!existsSync("/bin/zsh")) return;
+  const home = makeHome();
+  const paths = hostPaths(home);
+  const proofPath = join(home, "background-signal.proof");
+  const termPath = join(home, "background-signal.term");
+  const stopPath = join(home, "background-signal.stop");
+  const scriptPath = join(home, "background-signal.sh");
+  writeFileSync(
+    scriptPath,
+    `#!/bin/sh
+trap 'printf term > ${JSON.stringify(termPath)}; exit 0' TERM
+printf '%s %s %s\n' "$$" "$PPID" "$(ps -o pgid= -p $$ | tr -d ' ')" > ${JSON.stringify(proofPath)}
+while [ ! -e ${JSON.stringify(stopPath)} ]; do sleep 0.05; done
+`,
+  );
+  chmodSync(scriptPath, 0o700);
+
+  const host = startHost(home, undefined, 200);
+  await waitFor(() => existsSync(paths.socket));
+  const control = await handshake(paths.socket, { minimum: 4, current: 5 });
+  let targetPid = 0;
+
+  try {
+    const started = await startNativeCommandFixture(
+      control.client,
+      control.revision!,
+      313_000,
+      {
+        cwd: home,
+        command:
+          `${JSON.stringify(scriptPath)} & child=$!; ` +
+          `while [ ! -s ${JSON.stringify(proofPath)} ]; do sleep 0.05; done; ` +
+          "printf 'background-signal-ready\\n'; wait \"$child\"",
+        shell: { executable: { path: "/bin/zsh", clean_start: true } },
+        returnWhen: { match: "background-signal-ready" },
+      },
+    );
+    const sessionId = (started.session as { session_id: string }).session_id;
+    const [pidText, parentText, pgidText] = readFileSync(proofPath, "utf8")
+      .trim()
+      .split(/\s+/);
+    targetPid = Number(pidText);
+    const targetParentPid = Number(parentText);
+    const targetPgid = Number(pgidText);
+    const shellPid = Number(durableTerminalRecordFor(home, sessionId).pid);
+    expect(targetPid).toBeGreaterThan(0);
+    expect(targetParentPid).toBe(shellPid);
+    expect(targetPgid).toBe(processGroupId(targetPid));
+    expect(targetPgid).not.toBe(processGroupId(shellPid));
+
+    const signaled = await requestAction(
+      control.client,
+      control.revision!,
+      313_010,
+      "signal",
+      { session_id: sessionId, signal: "terminate" },
+    );
+    expect(success(signaled, "signal").signal).toBe("terminate");
+    await waitFor(
+      () => existsSync(termPath) && readFileSync(termPath, "utf8") === "term",
+      2_000,
+    );
+    expect(readFileSync(termPath, "utf8")).toBe("term");
+    await waitFor(() => !processExists(targetPid), 5_000);
+  } finally {
+    writeFileSync(stopPath, "");
+    if (targetPid > 0 && processExists(targetPid)) {
+      await waitFor(() => !processExists(targetPid), 5_000).catch(() => {
+        try {
+          process.kill(targetPid, "SIGKILL");
+        } catch {}
+      });
+    }
+    control.client.close();
+    if (host.exitCode === null) await waitForExit(host);
+  }
+}, NATIVE_STARTUP_OBSERVATION_BUDGET_MS * 3 + 30_000);
 
 test.skipIf(!tmuxAvailable())(
   "malformed close recovery cleans only its tmux owner and preserves a live sibling",
