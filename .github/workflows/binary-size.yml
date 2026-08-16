@@ -1,0 +1,134 @@
+name: Binary Size
+
+on:
+  pull_request:
+
+concurrency:
+  group: binary-size-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    name: macOS arm64 ReleaseSafe delta
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      HEAD_SHA: ${{ github.sha }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+          use-cache: false
+
+      - name: Test size reporter
+        run: python3 -m unittest scripts.tests.test_binary_size -v
+
+      - name: Build pull request binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence_dir="$RUNNER_TEMP/fx-binary-size-evidence"
+          mkdir -p "$evidence_dir"
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          zig build \
+            -Dtarget=aarch64-macos \
+            -Doptimize=ReleaseSafe \
+            --cache-dir "$RUNNER_TEMP/fx-head-cache" \
+            --global-cache-dir "$RUNNER_TEMP/fx-global-cache"
+          cp zig-out/bin/fx "$evidence_dir/head-fx"
+          file "$evidence_dir/head-fx" > "$evidence_dir/head-file.txt"
+          cat "$evidence_dir/head-file.txt"
+          grep -q "Mach-O 64-bit executable arm64" "$evidence_dir/head-file.txt"
+          size -m "$evidence_dir/head-fx" > "$evidence_dir/head-sections.txt"
+          cat "$evidence_dir/head-sections.txt"
+
+      - name: Build base binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence_dir="$RUNNER_TEMP/fx-binary-size-evidence"
+          base_worktree="$RUNNER_TEMP/fx-binary-size-base"
+          cleanup() {
+            git worktree remove --force "$base_worktree" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT INT TERM
+          git worktree add --detach "$base_worktree" "$BASE_SHA"
+          test "$(git -C "$base_worktree" rev-parse HEAD)" = "$BASE_SHA"
+          (
+            cd "$base_worktree"
+            zig build \
+              -Dtarget=aarch64-macos \
+              -Doptimize=ReleaseSafe \
+              --cache-dir "$RUNNER_TEMP/fx-base-cache" \
+              --global-cache-dir "$RUNNER_TEMP/fx-global-cache"
+          )
+          cp "$base_worktree/zig-out/bin/fx" "$evidence_dir/base-fx"
+          file "$evidence_dir/base-fx" > "$evidence_dir/base-file.txt"
+          cat "$evidence_dir/base-file.txt"
+          grep -q "Mach-O 64-bit executable arm64" "$evidence_dir/base-file.txt"
+          size -m "$evidence_dir/base-fx" > "$evidence_dir/base-sections.txt"
+          cat "$evidence_dir/base-sections.txt"
+
+      - name: Compare binary sizes
+        id: size
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence_dir="$RUNNER_TEMP/fx-binary-size-evidence"
+          python3 -m scripts.binary_size \
+            --base-binary "$evidence_dir/base-fx" \
+            --head-binary "$evidence_dir/head-fx" \
+            --base-sections "$evidence_dir/base-sections.txt" \
+            --head-sections "$evidence_dir/head-sections.txt" \
+            --base-sha "$BASE_SHA" \
+            --head-sha "$HEAD_SHA" \
+            --target aarch64-macos \
+            --warning-bytes 52429 \
+            --output-json "$evidence_dir/report.json" \
+            --output-markdown "$evidence_dir/report.md" \
+            --github-output "$GITHUB_OUTPUT"
+          cat "$evidence_dir/report.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Annotate notable growth
+        if: steps.size.outputs.warning == 'true'
+        env:
+          DELTA_BYTES: ${{ steps.size.outputs.delta_bytes }}
+        run: |
+          printf '%s\n' \
+            "::warning title=Binary size increase::ReleaseSafe grew by ${DELTA_BYTES} bytes; inspect the retained section report."
+
+      - name: Upload size evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-size-evidence-${{ github.event.pull_request.number }}
+          path: |
+            ${{ runner.temp }}/fx-binary-size-evidence/report.json
+            ${{ runner.temp }}/fx-binary-size-evidence/report.md
+            ${{ runner.temp }}/fx-binary-size-evidence/base-file.txt
+            ${{ runner.temp }}/fx-binary-size-evidence/head-file.txt
+            ${{ runner.temp }}/fx-binary-size-evidence/base-sections.txt
+            ${{ runner.temp }}/fx-binary-size-evidence/head-sections.txt
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload binaries for investigation
+        if: steps.size.outputs.warning == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-size-binaries-${{ github.event.pull_request.number }}
+          path: |
+            ${{ runner.temp }}/fx-binary-size-evidence/base-fx
+            ${{ runner.temp }}/fx-binary-size-evidence/head-fx
+          compression-level: 0
+          retention-days: 7
