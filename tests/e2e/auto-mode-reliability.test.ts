@@ -140,6 +140,44 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
+    "an exact read-only git status bypasses automatic review",
+    async () => {
+      const root = createIsolatedRoot();
+      const initialized = Bun.spawnSync(["/usr/bin/git", "init", "--quiet"], {
+        cwd: root.workspace,
+      });
+      expect(initialized.exitCode).toBe(0);
+      const gateway = startGateway(
+        [
+          commandCall("git status --short --branch", "direct_git_status"),
+          fakeGatewayFinalText("git inspection complete"),
+        ],
+        [fakeGatewayPermissionDecision("ask", "unused_git_review")],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Inspect repository status."],
+        {
+          cwd: root.workspace,
+          env: gatewayEnv(root, gateway),
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      expect(gateway.requests).toHaveLength(2);
+      expect(gateway.classifierRequests).toHaveLength(0);
+      const json = JSON.parse(result.stdout.trim()) as {
+        tool_calls: Array<{ name: string; status: string }>;
+      };
+      expect(json.tool_calls).toContainEqual(
+        expect.objectContaining({ name: "run_command", status: "success" }),
+      );
+    },
+    TIMEOUT,
+  );
+
+  test(
     "a first automatic block returns to the agent for a safe replan",
     async () => {
       const root = createIsolatedRoot();

@@ -4,6 +4,9 @@ const sandbox = @import("../permissions/sandbox.zig");
 
 const max_command_bytes = 8 * 1024;
 const max_ls_operands = 64;
+const max_read_operands = 64;
+const max_line_count = 10_000;
+const max_git_log_count = 1_000;
 pub const max_direct_pipeline_stages = 8;
 
 const PrintfFormatLanguage = enum {
@@ -43,6 +46,7 @@ pub const ApprovalReason = enum {
 
 pub const EnvironmentProfile = enum {
     basic_read_only,
+    git_read_only,
 };
 
 pub const DirectStage = struct {
@@ -138,6 +142,7 @@ pub fn plan(
 const TemporaryStage = struct {
     executable: []const u8,
     argv: []const []const u8,
+    environment_profile: EnvironmentProfile = .basic_read_only,
 };
 
 const StageAdmission = union(enum) {
@@ -229,6 +234,7 @@ fn parseStage(
         .direct => |stage| .{ .direct = .{
             .executable = stage.executable,
             .argv = stage.argv,
+            .environment_profile = stage.environment_profile,
         } },
     };
 }
@@ -249,7 +255,6 @@ fn planFamily(
     target_os: std.Target.Os.Tag,
 ) std.mem.Allocator.Error!StageAdmission {
     const command = words[0];
-    if (std.mem.eql(u8, command, "git")) return .{ .approval_required = .command_owned_input };
     if (isFilesystemMutation(command)) return .{ .approval_required = .filesystem_write };
     if (isNetworkCommand(command)) return .{ .approval_required = .network_access };
     if (isProcessOrSystemCommand(command)) return .{ .approval_required = .process_or_system };
@@ -257,6 +262,11 @@ fn planFamily(
     if (std.mem.eql(u8, command, "pwd")) return planPwd(alloc, words);
     if (std.mem.eql(u8, command, "ls")) return planLs(alloc, words, target_os);
     if (std.mem.eql(u8, command, "wc")) return planWc(alloc, words);
+    if (std.mem.eql(u8, command, "cat")) return planCat(alloc, words);
+    if (std.mem.eql(u8, command, "head")) return planHeadOrTail(alloc, words, "/usr/bin/head");
+    if (std.mem.eql(u8, command, "tail")) return planHeadOrTail(alloc, words, "/usr/bin/tail");
+    if (std.mem.eql(u8, command, "grep")) return planGrep(alloc, words);
+    if (std.mem.eql(u8, command, "git")) return planGit(alloc, words);
     return .{ .approval_required = .unknown_command };
 }
 
@@ -422,6 +432,265 @@ fn planWc(
     } };
 }
 
+fn planCat(
+    alloc: std.mem.Allocator,
+    words: []const []const u8,
+) std.mem.Allocator.Error!StageAdmission {
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.append(alloc, "/bin/cat");
+
+    var operand_start: usize = 1;
+    var explicit_separator = false;
+    if (operand_start < words.len and std.mem.eql(u8, words[operand_start], "--")) {
+        explicit_separator = true;
+        operand_start += 1;
+    }
+    const operands = words[operand_start..];
+    if (operands.len > max_read_operands) {
+        return .{ .approval_required = .unsupported_argument };
+    }
+    for (operands) |operand| {
+        if (!explicit_separator and operand.len > 0 and operand[0] == '-') {
+            return .{ .approval_required = .unsupported_argument };
+        }
+    }
+    try argv.append(alloc, "--");
+    try argv.appendSlice(alloc, operands);
+    return .{ .direct = .{
+        .executable = "/bin/cat",
+        .argv = try argv.toOwnedSlice(alloc),
+    } };
+}
+
+fn planHeadOrTail(
+    alloc: std.mem.Allocator,
+    words: []const []const u8,
+    executable: []const u8,
+) std.mem.Allocator.Error!StageAdmission {
+    var index: usize = 1;
+    var count: []const u8 = "10";
+    if (index < words.len and std.mem.eql(u8, words[index], "-n")) {
+        if (index + 1 >= words.len or !boundedDecimal(words[index + 1], max_line_count)) {
+            return .{ .approval_required = .unsupported_argument };
+        }
+        count = words[index + 1];
+        index += 2;
+    }
+
+    var explicit_separator = false;
+    if (index < words.len and std.mem.eql(u8, words[index], "--")) {
+        explicit_separator = true;
+        index += 1;
+    }
+    const operands = words[index..];
+    if (operands.len > max_read_operands) {
+        return .{ .approval_required = .unsupported_argument };
+    }
+    for (operands) |operand| {
+        if (!explicit_separator and operand.len > 0 and operand[0] == '-') {
+            return .{ .approval_required = .unsupported_argument };
+        }
+    }
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(alloc, &.{ executable, "-n", count, "--" });
+    try argv.appendSlice(alloc, operands);
+    return .{ .direct = .{
+        .executable = executable,
+        .argv = try argv.toOwnedSlice(alloc),
+    } };
+}
+
+fn planGrep(
+    alloc: std.mem.Allocator,
+    words: []const []const u8,
+) std.mem.Allocator.Error!StageAdmission {
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.append(alloc, "/usr/bin/grep");
+
+    var index: usize = 1;
+    while (index < words.len) : (index += 1) {
+        const word = words[index];
+        if (std.mem.eql(u8, word, "--")) {
+            index += 1;
+            break;
+        }
+        if (word.len <= 1 or word[0] != '-') break;
+        for (word[1..]) |flag| {
+            const canonical = switch (flag) {
+                'E' => "-E",
+                'F' => "-F",
+                'i' => "-i",
+                'n' => "-n",
+                'v' => "-v",
+                else => return .{ .approval_required = .unsupported_argument },
+            };
+            try argv.append(alloc, canonical);
+        }
+    }
+    if (index >= words.len) return .{ .approval_required = .unsupported_argument };
+    const pattern_and_operands = words[index..];
+    if (pattern_and_operands.len - 1 > max_read_operands) {
+        return .{ .approval_required = .unsupported_argument };
+    }
+    try argv.append(alloc, "--");
+    try argv.appendSlice(alloc, pattern_and_operands);
+    return .{ .direct = .{
+        .executable = "/usr/bin/grep",
+        .argv = try argv.toOwnedSlice(alloc),
+    } };
+}
+
+fn planGit(
+    alloc: std.mem.Allocator,
+    words: []const []const u8,
+) std.mem.Allocator.Error!StageAdmission {
+    if (words.len < 2) return .{ .approval_required = .command_owned_input };
+    if (std.mem.eql(u8, words[1], "status")) return planGitStatus(alloc, words[2..]);
+    if (std.mem.eql(u8, words[1], "diff")) return planGitDiff(alloc, words[2..]);
+    if (std.mem.eql(u8, words[1], "log")) return planGitLog(alloc, words[2..]);
+    return .{ .approval_required = .command_owned_input };
+}
+
+fn appendGitPrelude(
+    alloc: std.mem.Allocator,
+    argv: *std.ArrayList([]const u8),
+) std.mem.Allocator.Error!void {
+    try argv.appendSlice(alloc, &.{
+        "/usr/bin/git",
+        "--no-pager",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+    });
+}
+
+fn directGit(argv: []const []const u8) StageAdmission {
+    return .{ .direct = .{
+        .executable = "/usr/bin/git",
+        .argv = argv,
+        .environment_profile = .git_read_only,
+    } };
+}
+
+fn planGitStatus(
+    alloc: std.mem.Allocator,
+    arguments: []const []const u8,
+) std.mem.Allocator.Error!StageAdmission {
+    var argv: std.ArrayList([]const u8) = .empty;
+    try appendGitPrelude(alloc, &argv);
+    try argv.appendSlice(alloc, &.{ "status", "--ignore-submodules=all" });
+    for (arguments) |argument| {
+        const canonical = if (std.mem.eql(u8, argument, "-s"))
+            "--short"
+        else if (std.mem.eql(u8, argument, "-b"))
+            "--branch"
+        else if (std.mem.eql(u8, argument, "--short") or
+            std.mem.eql(u8, argument, "--branch") or
+            std.mem.eql(u8, argument, "--porcelain") or
+            std.mem.eql(u8, argument, "--porcelain=v1") or
+            std.mem.eql(u8, argument, "--untracked-files=no") or
+            std.mem.eql(u8, argument, "--untracked-files=normal") or
+            std.mem.eql(u8, argument, "--untracked-files=all"))
+            argument
+        else
+            return .{ .approval_required = .unsupported_argument };
+        try argv.append(alloc, canonical);
+    }
+    return directGit(try argv.toOwnedSlice(alloc));
+}
+
+fn planGitDiff(
+    alloc: std.mem.Allocator,
+    arguments: []const []const u8,
+) std.mem.Allocator.Error!StageAdmission {
+    var argv: std.ArrayList([]const u8) = .empty;
+    try appendGitPrelude(alloc, &argv);
+    try argv.appendSlice(alloc, &.{ "diff", "--no-ext-diff", "--no-textconv", "--color=never" });
+
+    var index: usize = 0;
+    while (index < arguments.len and !std.mem.eql(u8, arguments[index], "--")) : (index += 1) {
+        const argument = arguments[index];
+        if (!(std.mem.eql(u8, argument, "--cached") or
+            std.mem.eql(u8, argument, "--staged") or
+            std.mem.eql(u8, argument, "--stat") or
+            std.mem.eql(u8, argument, "--shortstat") or
+            std.mem.eql(u8, argument, "--numstat") or
+            std.mem.eql(u8, argument, "--name-only") or
+            std.mem.eql(u8, argument, "--name-status") or
+            std.mem.eql(u8, argument, "--check") or
+            std.mem.eql(u8, argument, "--no-renames")))
+        {
+            return .{ .approval_required = .unsupported_argument };
+        }
+        try argv.append(alloc, argument);
+    }
+    const operands = if (index < arguments.len) arguments[index + 1 ..] else &.{};
+    if (operands.len > max_read_operands) {
+        return .{ .approval_required = .unsupported_argument };
+    }
+    try argv.append(alloc, "--");
+    try argv.appendSlice(alloc, operands);
+    return directGit(try argv.toOwnedSlice(alloc));
+}
+
+fn planGitLog(
+    alloc: std.mem.Allocator,
+    arguments: []const []const u8,
+) std.mem.Allocator.Error!StageAdmission {
+    var argv: std.ArrayList([]const u8) = .empty;
+    try appendGitPrelude(alloc, &argv);
+    try argv.appendSlice(alloc, &.{ "log", "--no-ext-diff", "--no-textconv", "--color=never", "--max-count=100" });
+
+    var index: usize = 0;
+    while (index < arguments.len and !std.mem.eql(u8, arguments[index], "--")) : (index += 1) {
+        const argument = arguments[index];
+        if (std.mem.eql(u8, argument, "-n")) {
+            if (index + 1 >= arguments.len or !boundedDecimal(arguments[index + 1], max_git_log_count)) {
+                return .{ .approval_required = .unsupported_argument };
+            }
+            try argv.appendSlice(alloc, arguments[index .. index + 2]);
+            index += 1;
+            continue;
+        }
+        if (std.mem.startsWith(u8, argument, "--max-count=")) {
+            if (!boundedDecimal(argument["--max-count=".len..], max_git_log_count)) {
+                return .{ .approval_required = .unsupported_argument };
+            }
+            try argv.append(alloc, argument);
+            continue;
+        }
+        if (!(std.mem.eql(u8, argument, "--oneline") or
+            std.mem.eql(u8, argument, "--stat") or
+            std.mem.eql(u8, argument, "--shortstat") or
+            std.mem.eql(u8, argument, "--name-only") or
+            std.mem.eql(u8, argument, "--name-status") or
+            std.mem.eql(u8, argument, "--no-merges") or
+            std.mem.eql(u8, argument, "--decorate") or
+            std.mem.eql(u8, argument, "--decorate=short") or
+            std.mem.eql(u8, argument, "--decorate=no")))
+        {
+            return .{ .approval_required = .unsupported_argument };
+        }
+        try argv.append(alloc, argument);
+    }
+    const operands = if (index < arguments.len) arguments[index + 1 ..] else &.{};
+    if (operands.len > max_read_operands) {
+        return .{ .approval_required = .unsupported_argument };
+    }
+    try argv.append(alloc, "--");
+    try argv.appendSlice(alloc, operands);
+    return directGit(try argv.toOwnedSlice(alloc));
+}
+
+fn boundedDecimal(value: []const u8, maximum: usize) bool {
+    if (value.len == 0) return false;
+    for (value) |byte| if (!std.ascii.isDigit(byte)) return false;
+    const parsed = std.fmt.parseUnsigned(usize, value, 10) catch return false;
+    return parsed <= maximum;
+}
+
 fn isFilesystemMutation(command: []const u8) bool {
     return std.mem.eql(u8, command, "touch") or
         std.mem.eql(u8, command, "rm") or
@@ -491,7 +760,7 @@ fn ownPlan(
         stages[stage_index] = .{
             .executable = stage.executable,
             .argv = argv,
-            .environment_profile = .basic_read_only,
+            .environment_profile = stage.environment_profile,
         };
         initialized += 1;
     }
@@ -572,6 +841,13 @@ fn expectApproval(
     switch (admission) {
         .direct_read_only => return error.TestExpectedApproval,
         .approval_required => |reason| try std.testing.expectEqual(expected, reason),
+    }
+}
+
+fn expectArgv(expected: []const []const u8, actual: []const []const u8) !void {
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |expected_arg, actual_arg| {
+        try std.testing.expectEqualStrings(expected_arg, actual_arg);
     }
 }
 
@@ -657,7 +933,21 @@ test "planner admits the reviewed direct command matrix" {
         "ls -- -option-looking-path",
         "wc",
         "wc -Lclmw",
+        "cat README.md",
+        "cat -- -option-looking-path",
+        "head README.md",
+        "head -n 20 README.md",
+        "tail -n 20 -- -option-looking-path",
+        "grep -n TODO src/main.zig",
+        "grep -Fi -- '-needle' README.md",
+        "git status",
+        "git status --short --branch",
+        "git diff --stat",
+        "git diff --name-only -- src",
+        "git log --oneline -n 5",
+        "git log --max-count=20 -- src",
         "printf x | wc -c",
+        "git status --short | wc -l",
     };
 
     for (cases) |command| {
@@ -691,10 +981,7 @@ test "planner returns stable reasons for approval-bearing forms" {
         .{ .command = "printf \"$(touch created.txt)\"", .reason = .dynamic_shell },
         .{ .command = "printf `touch created.txt`", .reason = .dynamic_shell },
         .{ .command = "cat <(touch created.txt)", .reason = .dynamic_shell },
-        .{ .command = "git status", .reason = .command_owned_input },
-        .{ .command = "git status --short --branch", .reason = .command_owned_input },
         .{ .command = "git status && touch created.txt", .reason = .unsupported_shell },
-        .{ .command = "git status --short | wc -l", .reason = .command_owned_input },
         .{ .command = "printf x | tee created.txt", .reason = .unknown_command },
         .{ .command = "printf x | wc -c < input.txt", .reason = .unsupported_input_redirect, .target_os = .linux },
         .{ .command = "sh -c 'printf x'", .reason = .process_or_system },
@@ -710,6 +997,21 @@ test "planner returns stable reasons for approval-bearing forms" {
         .{ .command = "wc -c fifo", .reason = .unsupported_argument },
         .{ .command = "wc --files0-from=paths", .reason = .unsupported_argument },
         .{ .command = "git -C other status", .reason = .command_owned_input },
+        .{ .command = "git push origin HEAD", .reason = .command_owned_input },
+        .{ .command = "git status --ignored", .reason = .unsupported_argument },
+        .{ .command = "git status --short -- src", .reason = .unsupported_argument },
+        .{ .command = "git diff --ext-diff", .reason = .unsupported_argument },
+        .{ .command = "git diff HEAD", .reason = .unsupported_argument },
+        .{ .command = "git log -p", .reason = .unsupported_argument },
+        .{ .command = "git log -n 1001", .reason = .unsupported_argument },
+        .{ .command = "git log --format='%x00'", .reason = .unsupported_argument },
+        .{ .command = "cat -n README.md", .reason = .unsupported_argument },
+        .{ .command = "head -n -1 README.md", .reason = .unsupported_argument },
+        .{ .command = "head -n 10001 README.md", .reason = .unsupported_argument },
+        .{ .command = "tail -f app.log", .reason = .unsupported_argument },
+        .{ .command = "grep -r TODO src", .reason = .unsupported_argument },
+        .{ .command = "grep -e TODO src", .reason = .unsupported_argument },
+        .{ .command = "grep -n", .reason = .unsupported_argument },
         .{ .command = "unknown-reader file", .reason = .unknown_command },
         .{ .command = "wc -c < input.txt", .reason = .unsupported_input_redirect },
         .{ .command = "wc -c < input.txt", .reason = .unsupported_input_redirect, .target_os = .linux },
@@ -813,6 +1115,50 @@ test "planner canonicalizes target policies and per-stage environments" {
     try std.testing.expectEqualStrings("/usr/bin/wc", direct.stages[1].executable);
     try std.testing.expectEqualStrings("-c", direct.stages[1].argv[1]);
     try std.testing.expectEqual(EnvironmentProfile.basic_read_only, direct.stages[1].environment_profile);
+}
+
+test "planner pins read-only git inspection to hardened argv and environment" {
+    var admission = try expectDirect("git diff --name-only -- src", .linux);
+    defer admission.deinit(std.testing.allocator);
+    const stage = admission.direct_read_only.stages[0];
+
+    try std.testing.expectEqual(EnvironmentProfile.git_read_only, stage.environment_profile);
+    try std.testing.expectEqualStrings("/usr/bin/git", stage.executable);
+    const expected = [_][]const u8{
+        "/usr/bin/git",
+        "--no-pager",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--color=never",
+        "--name-only",
+        "--",
+        "src",
+    };
+    try expectArgv(&expected, stage.argv);
+}
+
+test "planner canonicalizes bounded readers without preserving option ambiguity" {
+    const cases = [_]struct {
+        command: []const u8,
+        expected: []const []const u8,
+    }{
+        .{ .command = "cat -- -input", .expected = &.{ "/bin/cat", "--", "-input" } },
+        .{ .command = "head -n 25 README.md", .expected = &.{ "/usr/bin/head", "-n", "25", "--", "README.md" } },
+        .{ .command = "tail app.log", .expected = &.{ "/usr/bin/tail", "-n", "10", "--", "app.log" } },
+        .{ .command = "grep -Fin needle src/main.zig", .expected = &.{ "/usr/bin/grep", "-F", "-i", "-n", "--", "needle", "src/main.zig" } },
+    };
+    for (cases) |case| {
+        var admission = try expectDirect(case.command, .macos);
+        defer admission.deinit(std.testing.allocator);
+        const stage = admission.direct_read_only.stages[0];
+        try std.testing.expectEqual(EnvironmentProfile.basic_read_only, stage.environment_profile);
+        try expectArgv(case.expected, stage.argv);
+    }
 }
 
 test "planner target policies use reviewed absolute executables and argv" {
