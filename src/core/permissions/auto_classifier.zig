@@ -367,11 +367,14 @@ pub const Reviewer = struct {
         } else return .invalid;
         var target_pending_assistant = review_turn.pending_assistant;
         target_pending_assistant.tool_calls = review_turn.pending_assistant.tool_calls[target_call_index .. target_call_index + 1];
+        // Native attachments are never authority evidence for the reviewer.
+        // Keep the exact pending tool call, but do not forward assistant images.
+        target_pending_assistant.images = &.{};
         messages[message_index] = target_pending_assistant;
         message_index += 1;
         messages[message_index] = .{ .role = .system, .content = instruction };
 
-        const payload = gateway_json.buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
+        var payload = gateway_json.buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
             alloc,
             tools_json,
             messages,
@@ -381,6 +384,31 @@ pub const Reviewer = struct {
             deadline,
             cancel_flag,
         ) catch |err| return constructionFailure(err);
+        if (payload.len > max_review_packet_bytes and
+            target_pending_assistant.content != null and
+            target_pending_assistant.content.?.len > 0)
+        {
+            // The assistant preamble is optional, untrusted context. Drop it
+            // before failing the complete action and human-authority packet.
+            alloc.free(payload);
+            target_pending_assistant.content = null;
+            messages[message_index - 1] = target_pending_assistant;
+            payload = gateway_json.buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
+                alloc,
+                tools_json,
+                messages,
+                review_turn.target_call_id,
+                .{},
+                2048,
+                deadline,
+                cancel_flag,
+            ) catch |err| return constructionFailure(err);
+            debug_trace.logf(
+                "permission",
+                "event=auto_review_optional_context_omitted kind=assistant_preamble payload_bytes={d} target_call_id={s}",
+                .{ payload.len, review_turn.target_call_id },
+            );
+        }
         defer alloc.free(payload);
         if (payload.len > max_review_packet_bytes) {
             debug_trace.logf(
@@ -1498,6 +1526,92 @@ test "automatic review rejects an oversized complete packet without sending" {
     });
     try std.testing.expectEqual(std.meta.Tag(ParseOutcome).invalid, std.meta.activeTag(outcome));
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
+}
+
+test "automatic review drops an oversized assistant preamble before sending complete evidence" {
+    const FakeTransport = struct {
+        calls: usize = 0,
+        omitted_preamble: bool = false,
+        kept_authority: bool = false,
+        kept_action: bool = false,
+
+        fn send(
+            raw_ctx: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            payload: []const u8,
+            _: std.Io.Clock.Timestamp,
+            _: *std.atomic.Value(bool),
+        ) anyerror!TransportOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx));
+            self.calls += 1;
+            self.omitted_preamble = std.mem.find(
+                u8,
+                payload,
+                "UNTRUSTED_ASSISTANT_PREAMBLE_",
+            ) == null;
+            self.kept_authority = std.mem.find(
+                u8,
+                payload,
+                "Inspect the repository, then report its status.",
+            ) != null;
+            self.kept_action = std.mem.find(u8, payload, "git status --short") != null;
+            return .{ .completion = .{ .completion = .{
+                .tool_calls = &.{.{
+                    .id = "review",
+                    .name = tool_name,
+                    .arguments_json = "{\"risk\":\"low\",\"authorization\":\"high\",\"decision\":\"allow\",\"rationale\":\"Requested repository inspection.\"}",
+                }},
+            } } };
+        }
+    };
+
+    var fake = FakeTransport{};
+    const reviewer = Reviewer.withTransport(.{
+        .context = @ptrCast(&fake),
+        .send_fn = FakeTransport.send,
+    }, null, 1000);
+    const oversized_preamble = "UNTRUSTED_ASSISTANT_PREAMBLE_" ** 512;
+    var outcome = try reviewer.review(std.testing.allocator, .{
+        .workspace_root = "/tmp/workspace",
+        .review_turn = .{
+            .model = "openai/gpt-5",
+            .request_messages = &.{},
+            .pending_assistant = .{
+                .role = .assistant,
+                .content = oversized_preamble,
+                .images = &.{.{
+                    .id = 1,
+                    .path = @constCast("/tmp/untrusted.png"),
+                    .media_type = @constCast("image/png"),
+                }},
+                .tool_calls = &.{.{
+                    .id = "status",
+                    .name = "run_command",
+                    .arguments_json = "{\"command\":\"git status --short\"}",
+                }},
+            },
+            .target_call_id = "status",
+            .origin = .root,
+            .root_user_messages = &.{"Inspect the repository, then report its status."},
+        },
+        .targets = &.{},
+        .action = .{ .command = .{
+            .command = "git status --short",
+            .resolved_cwd = "/tmp/workspace",
+            .background = false,
+            .backend = .none,
+            .target_os = .linux,
+        } },
+        .escalation_reason = "command_requires_approval",
+    });
+    defer outcome.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expect(fake.omitted_preamble);
+    try std.testing.expect(fake.kept_authority);
+    try std.testing.expect(fake.kept_action);
+    try std.testing.expectEqual(std.meta.Tag(ParseOutcome).valid, std.meta.activeTag(outcome));
 }
 
 test "review turn validation admits only bounded root text or inherited root authority" {
