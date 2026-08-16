@@ -163,7 +163,8 @@ async function waitForAppearanceMenu(
     latest = await session.capturePaneGrid();
     const pane = latest.join("\n");
     if (
-      pane.includes("Appearance") &&
+      pane.includes("Input appearance") &&
+      pane.includes("Maxxing mode") &&
       (expectedSelection === undefined || pane.includes(expectedSelection))
     ) return latest;
     await Bun.sleep(100);

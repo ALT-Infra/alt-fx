@@ -5422,6 +5422,7 @@ describe("effect-aware command permissions", () => {
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Create interactive 64 KiB delivery fixture.");
       await activeSession.waitForText("INTERACTIVE_64K_PARENT_FIRST_DONE", TIMEOUT);
+      await waitForGatewayRequestCount(gateway, 4);
       expect(gateway.requests).toHaveLength(4);
       expect(childId.length).toBeGreaterThan(0);
       expect(messageEventId.length).toBeGreaterThan(0);
