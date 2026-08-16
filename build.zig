@@ -415,10 +415,10 @@ fn discoverNodeIncludeDir(b: *std.Build) []const u8 {
         &.{ "node", "-p", "require('node:path').join(require('node:path').dirname(process.execPath), '..', 'include', 'node')" },
         &code,
         .ignore,
-    ) catch @panic("Node.js is required to locate node_api.h; pass -Dnode-include-dir=<path>");
-    if (code != 0) @panic("could not locate node_api.h; pass -Dnode-include-dir=<path>");
+    ) catch std.process.fatal("Node.js is required to locate node_api.h; pass -Dnode-include-dir=<path>", .{});
+    if (code != 0) std.process.fatal("could not locate node_api.h; pass -Dnode-include-dir=<path>", .{});
     const trimmed = std.mem.trim(u8, out, " \t\r\n");
-    return b.allocator.dupe(u8, trimmed) catch @panic("could not allocate Node include path");
+    return b.allocator.dupe(u8, trimmed) catch std.process.fatal("could not allocate Node include path", .{});
 }
 
 fn readGitCommit(b: *std.Build) []const u8 {
