@@ -18,6 +18,7 @@ from scripts.pgso.qualify import (
     BenchmarkPair,
     EvidenceRecorder,
     _read_hyperfine_samples,
+    build_benchmark_pair,
     build_profile_linked_benchmarks,
     compare_samples,
     measure_alternating,
@@ -351,7 +352,14 @@ class PgsoQualificationTests(unittest.TestCase):
             return base_runner(argv, **kwargs)
 
         with (
-            mock.patch.dict(os.environ, {"FX_DISABLE_KEYCHAIN": "0"}),
+            mock.patch.dict(
+                os.environ,
+                {
+                    "FX_DISABLE_KEYCHAIN": "0",
+                    "AI_GATEWAY_API_KEY": "must-not-leak",
+                    "FX_E2E_REAL_API": "1",
+                },
+            ),
             mock.patch("scripts.pgso.qualify.run_checked", side_effect=fake_run),
         ):
             measure_startup(
@@ -367,6 +375,12 @@ class PgsoQualificationTests(unittest.TestCase):
         self.assertTrue(environments)
         self.assertTrue(
             all(environment["FX_DISABLE_KEYCHAIN"] == "1" for environment in environments)
+        )
+        self.assertTrue(
+            all("AI_GATEWAY_API_KEY" not in environment for environment in environments)
+        )
+        self.assertTrue(
+            all("FX_E2E_REAL_API" not in environment for environment in environments)
         )
 
     def test_startup_measurement_rejects_a_truncated_hyperfine_round(self) -> None:
@@ -487,6 +501,45 @@ class PgsoQualificationTests(unittest.TestCase):
         self.assertEqual(str(control), calls[0][0])
         self.assertEqual(str(candidate), calls[1][0])
         self.assertTrue(results[0].passed)
+
+    def test_benchmark_pair_uses_the_external_control_for_minimum_macos(self) -> None:
+        plan = BENCHMARK_PLANS[0]
+        output = self.root / "pair"
+        external = self.root / "fixtures" / "external-control"
+        candidate = self.root / "fixtures" / "candidate"
+        raw_profile = self.root / "fixtures" / "training.profraw"
+        for path in (external, candidate, raw_profile):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"evidence")
+
+        with (
+            mock.patch(
+                "scripts.pgso.qualify.build_control",
+                side_effect=AssertionError("ordinary control build is wasteful"),
+                create=True,
+            ),
+            mock.patch("scripts.pgso.qualify.emit_bitcode", return_value="b" * 64),
+            mock.patch(
+                "scripts.pgso.qualify.build_external_o2_control",
+                return_value=external,
+            ),
+            mock.patch(
+                "scripts.pgso.qualify.read_macos_minos",
+                return_value="15.0",
+            ) as read_minos,
+            mock.patch(
+                "scripts.pgso.qualify.build_instrumented",
+                return_value=(raw_profile,),
+            ) as instrument,
+            mock.patch("scripts.pgso.qualify.merge_profile_batch", return_value=1),
+            mock.patch("scripts.pgso.qualify.apply_profile"),
+            mock.patch("scripts.pgso.qualify.link_candidate", return_value=candidate),
+        ):
+            pair = build_benchmark_pair(object(), self.root, output, plan)
+
+        self.assertEqual(external, pair.control_binary)
+        self.assertEqual(external, read_minos.call_args.args[1])
+        self.assertEqual("15.0", instrument.call_args.args[2])
 
     def test_builds_all_profile_linked_benchmarks_before_candidate_link(self) -> None:
         paths = PipelinePaths.create(self.root / "run")

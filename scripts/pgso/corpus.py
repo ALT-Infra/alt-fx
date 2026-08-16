@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import json
 import os
@@ -9,11 +10,12 @@ import re
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Callable, Mapping, Sequence
+import uuid
+from collections.abc import Callable, Iterator, Mapping, Sequence
 
 from scripts.pgso.model import PgsoError, sha256_file
 from scripts.pgso.pipeline import merge_profile_batch
-from scripts.pgso.runner import CommandResult, run_checked
+from scripts.pgso.runner import CommandResult, hermetic_environment, run_checked
 
 
 REQUIRED_DIRECT_COMMANDS = (
@@ -40,8 +42,8 @@ ISOLATED_ENVIRONMENT_KEYS = (
     "TMUX_TMPDIR",
     "FX_TRACE_LOG",
     "FX_TRACE_SCOPES",
+    "FX_E2E_DISABLE_DOTENV",
 )
-
 
 @dataclasses.dataclass(frozen=True)
 class Scenario:
@@ -54,7 +56,6 @@ class Scenario:
     requires_tmux: bool
     allow_keychain: bool
     test_file: str | None
-    skip_reason: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -97,7 +98,6 @@ class ScenarioResult:
     status: str
     elapsed_seconds: float
     raw_profiles: int
-    skip_reason: str | None = None
     error: str | None = None
 
 
@@ -244,11 +244,8 @@ def _parse_scenario(
         if not expected_test.is_file():
             raise PgsoError(f"test file does not exist: {test_file}")
 
-    skip_reason = values.get("skip_reason")
-    if skip_reason is not None and (
-        not isinstance(skip_reason, str) or not skip_reason.strip()
-    ):
-        raise PgsoError(f"scenario {name} skip_reason must be nonempty")
+    if "skip_reason" in defaults or "skip_reason" in scenario_raw:
+        raise PgsoError(f"scenario {name} cannot be skipped")
 
     return Scenario(
         name=name,
@@ -260,7 +257,6 @@ def _parse_scenario(
         requires_tmux=requires_tmux,
         allow_keychain=allow_keychain,
         test_file=test_file,
-        skip_reason=skip_reason,
     )
 
 
@@ -364,14 +360,33 @@ def load_corpus(
     )
 
 
-def _install_training_binary(corpus: Corpus, binary: pathlib.Path) -> pathlib.Path:
+@contextlib.contextmanager
+def _installed_training_binary(
+    corpus: Corpus,
+    binary: pathlib.Path,
+) -> Iterator[pathlib.Path]:
     if not binary.is_file() or binary.stat().st_size == 0:
         raise PgsoError(f"training binary is missing or empty: {binary}")
     canonical = corpus.repo_root / "zig-out" / "bin" / "fx"
     canonical.parent.mkdir(parents=True, exist_ok=True)
     if canonical.is_symlink():
         raise PgsoError(f"canonical training binary cannot be a symlink: {canonical}")
-    if binary.resolve() != canonical.resolve():
+    if binary.resolve() == canonical.resolve():
+        yield canonical
+        return
+
+    backup: pathlib.Path | None = None
+    original_hash: str | None = None
+    if canonical.exists():
+        if not canonical.is_file():
+            raise PgsoError(f"canonical training binary is not a file: {canonical}")
+        original_hash = sha256_file(canonical)
+        backup = canonical.with_name(
+            f".{canonical.name}.pgso-backup-{uuid.uuid4().hex}"
+        )
+        os.replace(canonical, backup)
+
+    try:
         with tempfile.NamedTemporaryFile(
             dir=canonical.parent,
             prefix=f".{canonical.name}.",
@@ -384,9 +399,16 @@ def _install_training_binary(corpus: Corpus, binary: pathlib.Path) -> pathlib.Pa
             os.replace(temporary, canonical)
         finally:
             temporary.unlink(missing_ok=True)
-    if sha256_file(canonical) != sha256_file(binary):
-        raise PgsoError("canonical training binary hash mismatch after installation")
-    return canonical
+        if sha256_file(canonical) != sha256_file(binary):
+            raise PgsoError("canonical training binary hash mismatch after installation")
+        yield canonical
+    finally:
+        if canonical.is_file() or canonical.is_symlink():
+            canonical.unlink(missing_ok=True)
+        if backup is not None:
+            os.replace(backup, canonical)
+            if original_hash is None or sha256_file(canonical) != original_hash:
+                raise PgsoError("canonical training binary hash mismatch after restoration")
 
 
 def _cleanup_tmux(
@@ -439,10 +461,8 @@ def _new_tmux_dir() -> pathlib.Path:
 
 
 def _scenario_environment(runtime_home: pathlib.Path) -> dict[str, str]:
-    environment = os.environ.copy()
-    for key in ISOLATED_ENVIRONMENT_KEYS:
-        environment.pop(key, None)
-    environment["HOME"] = str(runtime_home)
+    environment = hermetic_environment(runtime_home)
+    environment["FX_E2E_DISABLE_DOTENV"] = "1"
     return environment
 
 
@@ -498,6 +518,112 @@ def _scenario_argv(
     return tuple(resolved)
 
 
+def _execute_scenario(
+    corpus: Corpus,
+    scenario: Scenario,
+    canonical: pathlib.Path,
+    bun: pathlib.Path | str,
+    runtime_home: pathlib.Path,
+    log_dir: pathlib.Path,
+    environment: dict[str, str],
+    command_runner: Callable[..., CommandResult],
+) -> CommandResult:
+    scenario_home = runtime_home / scenario.name
+    _prepare_runtime_home(scenario_home, allow_keychain=scenario.allow_keychain)
+    environment.update(_scenario_environment(scenario_home))
+    for key in scenario.env_unset:
+        environment.pop(key, None)
+    environment.update(dict(scenario.env_set))
+    environment["HOME"] = str(scenario_home)
+    environment["FX_E2E_DISABLE_DOTENV"] = "1"
+    tmux_dir: pathlib.Path | None = None
+    if scenario.requires_tmux:
+        tmux_dir = _new_tmux_dir()
+        environment["TMUX_TMPDIR"] = str(tmux_dir)
+
+    primary_error: BaseException | None = None
+    try:
+        return command_runner(
+            _scenario_argv(scenario, canonical, bun),
+            cwd=_resolve_cwd(corpus.repo_root, scenario.cwd),
+            env=environment,
+            timeout_s=scenario.timeout_seconds,
+            log_path=log_dir / f"{scenario.name}.json",
+        )
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        if tmux_dir is not None:
+            try:
+                _cleanup_tmux(environment, tmux_dir)
+            except Exception:
+                if primary_error is None:
+                    raise
+
+
+def _run_scenarios(
+    corpus: Corpus,
+    binary: pathlib.Path,
+    scenarios: Sequence[Scenario],
+    *,
+    bun: pathlib.Path | str,
+    runtime_home: pathlib.Path,
+    log_dir: pathlib.Path,
+    prepare: Callable[[Scenario, dict[str, str]], object],
+    finish: Callable[[Scenario, CommandResult, object], int],
+    failure_label: str,
+    command_runner: Callable[..., CommandResult],
+) -> CorpusResult:
+    results: list[ScenarioResult] = []
+    merged_raw_profiles = 0
+    with _installed_training_binary(corpus, binary) as canonical:
+        for scenario in scenarios:
+            command_result: CommandResult | None = None
+            try:
+                environment: dict[str, str] = {}
+                state = prepare(scenario, environment)
+                command_result = _execute_scenario(
+                    corpus,
+                    scenario,
+                    canonical,
+                    bun,
+                    runtime_home,
+                    log_dir,
+                    environment,
+                    command_runner,
+                )
+                raw_profiles = finish(scenario, command_result, state)
+                merged_raw_profiles += raw_profiles
+            except Exception as error:
+                results.append(
+                    ScenarioResult(
+                        name=scenario.name,
+                        status="failed",
+                        elapsed_seconds=(
+                            0 if command_result is None else command_result.elapsed_seconds
+                        ),
+                        raw_profiles=0,
+                        error=str(error),
+                    )
+                )
+                result = _result(results, merged_raw_profiles)
+                raise CorpusRunError(
+                    f"{failure_label} scenario failed: {scenario.name}: {error}",
+                    result,
+                ) from error
+
+            results.append(
+                ScenarioResult(
+                    name=scenario.name,
+                    status="passed",
+                    elapsed_seconds=command_result.elapsed_seconds,
+                    raw_profiles=raw_profiles,
+                )
+            )
+    return _result(results, merged_raw_profiles)
+
+
 def run_corpus(
     corpus: Corpus,
     binary: pathlib.Path,
@@ -509,135 +635,53 @@ def run_corpus(
     command_runner: Callable[..., CommandResult] = run_checked,
     profile_merger: Callable[..., int] = merge_profile_batch,
 ) -> CorpusResult:
-    canonical = _install_training_binary(corpus, binary)
     profile_dir.mkdir(parents=True, exist_ok=True)
     log_dir = profile_dir.parent.parent / "logs" / "corpus"
     log_dir.mkdir(parents=True, exist_ok=True)
     runtime_home = profile_dir.parent / "home"
     runtime_home.mkdir(parents=True, exist_ok=True)
-    results: list[ScenarioResult] = []
-    merged_raw_profiles = 0
-    for scenario in corpus.scenarios:
-        if scenario.skip_reason is not None:
-            results.append(
-                ScenarioResult(
-                    name=scenario.name,
-                    status="skipped",
-                    elapsed_seconds=0,
-                    raw_profiles=0,
-                    skip_reason=scenario.skip_reason,
-                )
-            )
-            continue
-
-        scenario_home = runtime_home / scenario.name
-        _prepare_runtime_home(
-            scenario_home,
-            allow_keychain=scenario.allow_keychain,
-        )
-        environment = _scenario_environment(scenario_home)
-        for key in scenario.env_unset:
-            environment.pop(key, None)
-        environment.update(dict(scenario.env_set))
-        environment["HOME"] = str(scenario_home)
+    def prepare(scenario: Scenario, environment: dict[str, str]) -> object:
         environment["LLVM_PROFILE_FILE"] = str(
             profile_dir / f"{scenario.name}-%m-%p-%c.profraw"
         )
-        if scenario.requires_tmux:
-            tmux_dir = _new_tmux_dir()
-            environment["TMUX_TMPDIR"] = str(tmux_dir)
+        return set(profile_dir.glob("*.profraw"))
 
-        argv = _scenario_argv(scenario, canonical, bun)
-        before = set(profile_dir.glob("*.profraw"))
-        command_result: CommandResult | None = None
-        scenario_error: Exception | None = None
-        try:
-            command_result = command_runner(
-                argv,
-                cwd=_resolve_cwd(corpus.repo_root, scenario.cwd),
-                env=environment,
-                timeout_s=scenario.timeout_seconds,
-                log_path=log_dir / f"{scenario.name}.json",
-            )
-        except Exception as error:
-            scenario_error = error
-
-        if scenario.requires_tmux:
-            try:
-                _cleanup_tmux(environment, tmux_dir)
-            except Exception as error:
-                if scenario_error is None:
-                    scenario_error = error
-
-        if scenario_error is not None:
-            results.append(
-                ScenarioResult(
-                    name=scenario.name,
-                    status="failed",
-                    elapsed_seconds=0,
-                    raw_profiles=0,
-                    error=str(scenario_error),
-                )
-            )
-            result = _result(results, merged_raw_profiles)
-            raise CorpusRunError(
-                f"corpus scenario failed: {scenario.name}: {scenario_error}",
-                result,
-            ) from scenario_error
-
+    def finish(
+        scenario: Scenario,
+        _command_result: CommandResult,
+        state: object,
+    ) -> int:
+        before = state
+        if not isinstance(before, set):
+            raise PgsoError("invalid training profile snapshot")
         generated = tuple(sorted(set(profile_dir.glob("*.profraw")) - before))
         if not generated or any(
             not profile.is_file() or profile.stat().st_size == 0
             for profile in generated
         ):
-            results.append(
-                ScenarioResult(
-                    name=scenario.name,
-                    status="failed",
-                    elapsed_seconds=command_result.elapsed_seconds,
-                    raw_profiles=len(generated),
-                    error="produced no raw profile",
-                )
-            )
-            result = _result(results, merged_raw_profiles)
-            raise CorpusRunError(
-                f"corpus scenario produced no raw profile: {scenario.name}",
-                result,
-            )
-
+            raise PgsoError("produced no raw profile")
         try:
-            merged_raw_profiles += profile_merger(
+            return profile_merger(
                 toolchain,
                 generated,
                 merged_profile,
                 log_dir / f"{scenario.name}-merge.json",
             )
         except Exception as error:
-            results.append(
-                ScenarioResult(
-                    name=scenario.name,
-                    status="failed",
-                    elapsed_seconds=command_result.elapsed_seconds,
-                    raw_profiles=len(generated),
-                    error=str(error),
-                )
-            )
-            result = _result(results, merged_raw_profiles)
-            raise CorpusRunError(
-                f"corpus profile merge failed: {scenario.name}: {error}",
-                result,
-            ) from error
+            raise PgsoError(f"profile merge failed: {error}") from error
 
-        results.append(
-            ScenarioResult(
-                name=scenario.name,
-                status="passed",
-                elapsed_seconds=command_result.elapsed_seconds,
-                raw_profiles=len(generated),
-            )
-        )
-
-    return _result(results, merged_raw_profiles)
+    return _run_scenarios(
+        corpus,
+        binary,
+        corpus.scenarios,
+        bun=bun,
+        runtime_home=runtime_home,
+        log_dir=log_dir,
+        prepare=prepare,
+        finish=finish,
+        failure_label="training corpus",
+        command_runner=command_runner,
+    )
 
 
 def run_behavior_corpus(
@@ -648,94 +692,37 @@ def run_behavior_corpus(
     bun: pathlib.Path | str = "bun",
     command_runner: Callable[..., CommandResult] = run_checked,
 ) -> CorpusResult:
-    canonical = _install_training_binary(corpus, binary)
     log_dir = output_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     trace_dir = output_dir / "traces"
     trace_dir.mkdir(parents=True, exist_ok=True)
     runtime_home = output_dir / "home"
     runtime_home.mkdir(parents=True, exist_ok=True)
-    results: list[ScenarioResult] = []
-    for scenario in corpus.candidate_scenarios:
-        if scenario.skip_reason is not None:
-            results.append(
-                ScenarioResult(
-                    name=scenario.name,
-                    status="skipped",
-                    elapsed_seconds=0,
-                    raw_profiles=0,
-                    skip_reason=scenario.skip_reason,
-                )
-            )
-            continue
-
-        scenario_home = runtime_home / scenario.name
-        _prepare_runtime_home(
-            scenario_home,
-            allow_keychain=scenario.allow_keychain,
-        )
-        environment = _scenario_environment(scenario_home)
-        for key in scenario.env_unset:
-            environment.pop(key, None)
-        environment.update(dict(scenario.env_set))
-        environment["HOME"] = str(scenario_home)
+    def prepare(scenario: Scenario, environment: dict[str, str]) -> object:
         trace_path = trace_dir / f"{scenario.name}.log"
         trace_path.unlink(missing_ok=True)
         environment["FX_TRACE_LOG"] = str(trace_path)
-        if scenario.requires_tmux:
-            tmux_dir = _new_tmux_dir()
-            environment["TMUX_TMPDIR"] = str(tmux_dir)
+        return None
 
-        argv = _scenario_argv(scenario, canonical, bun)
-        command_result: CommandResult | None = None
-        scenario_error: Exception | None = None
-        try:
-            command_result = command_runner(
-                argv,
-                cwd=_resolve_cwd(corpus.repo_root, scenario.cwd),
-                env=environment,
-                timeout_s=scenario.timeout_seconds,
-                log_path=log_dir / f"{scenario.name}.json",
-            )
-        except Exception as error:
-            scenario_error = error
+    def finish(
+        _scenario: Scenario,
+        _command_result: CommandResult,
+        _state: object,
+    ) -> int:
+        return 0
 
-        if scenario.requires_tmux:
-            try:
-                _cleanup_tmux(environment, tmux_dir)
-            except Exception as error:
-                if scenario_error is None:
-                    scenario_error = error
-
-        if scenario_error is not None:
-            results.append(
-                ScenarioResult(
-                    name=scenario.name,
-                    status="failed",
-                    elapsed_seconds=0,
-                    raw_profiles=0,
-                    error=str(scenario_error),
-                )
-            )
-            result = _result(results, 0)
-            raise CorpusRunError(
-                f"behavior corpus scenario failed: {scenario.name}: "
-                f"{scenario_error}",
-                result,
-            ) from scenario_error
-
-        if command_result is None:
-            raise PgsoError(f"scenario completed without a result: {scenario.name}")
-        results.append(
-            ScenarioResult(
-                name=scenario.name,
-                status="passed",
-                elapsed_seconds=command_result.elapsed_seconds,
-                raw_profiles=0,
-            )
-        )
-
-    return _result(results, 0)
+    return _run_scenarios(
+        corpus,
+        binary,
+        corpus.candidate_scenarios,
+        bun=bun,
+        runtime_home=runtime_home,
+        log_dir=log_dir,
+        prepare=prepare,
+        finish=finish,
+        failure_label="behavior corpus",
+        command_runner=command_runner,
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:

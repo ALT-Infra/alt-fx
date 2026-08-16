@@ -11,6 +11,7 @@ from scripts.pgso.distributed import (
     aggregate_scenario_shards,
     matrix_payload,
     plan_shards,
+    run_plan,
     select_corpus,
     validate_seed_identity,
 )
@@ -72,8 +73,54 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertNotIn('          llvm: "true"', heavy_job)
         self.assertNotIn("--llvm-bin", heavy_job)
 
+    def test_measurement_matrices_are_generated_from_python_definitions(self) -> None:
+        repo_root = pathlib.Path(__file__).resolve().parents[3]
+        workflow = (
+            repo_root / ".github/workflows/pgso-macos-arm64.yml"
+        ).read_text()
+        startup_job = workflow.split("\n  startup:\n", 1)[1].split(
+            "\n  heavy:\n", 1
+        )[0]
+        heavy_job = workflow.split("\n  heavy:\n", 1)[1].split(
+            "\n  aggregate:\n", 1
+        )[0]
+
+        self.assertIn("fromJSON(needs.seed.outputs.startup)", startup_job)
+        self.assertIn("fromJSON(needs.seed.outputs.heavy)", heavy_job)
+        self.assertNotIn("name: [help, version", startup_job)
+        self.assertNotIn("- file-index-100k", heavy_job)
+
 
 class ShardPlanningTests(unittest.TestCase):
+    def test_measurement_plans_come_from_the_authoritative_definitions(self) -> None:
+        missing_corpus = pathlib.Path("/does/not/need/to/exist.json")
+
+        self.assertEqual(
+            {
+                "include": [
+                    {"name": name}
+                    for name in ("help", "version", "status", "background", "doctor", "sessions")
+                ]
+            },
+            run_plan("startup", missing_corpus, 20),
+        )
+        self.assertEqual(
+            {
+                "include": [
+                    {"name": name}
+                    for name in (
+                        "file-index-100k",
+                        "ui-activity",
+                        "approval-transcript",
+                        "approval-diff",
+                        "approval-combined",
+                        "approval-payload",
+                    )
+                ]
+            },
+            run_plan("heavy", missing_corpus, 20),
+        )
+
     def test_plan_assigns_every_scenario_exactly_once(self) -> None:
         scenarios = tuple(
             scenario(f"scenario-{index:02d}", float(index + 1))
@@ -205,7 +252,6 @@ class ShardAggregationTests(unittest.TestCase):
                         "status": "passed",
                         "elapsed_seconds": 1.0,
                         "raw_profiles": 1,
-                        "skip_reason": None,
                         "error": None,
                     }
                     for name in names

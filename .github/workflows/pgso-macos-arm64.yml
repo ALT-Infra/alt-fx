@@ -38,6 +38,8 @@ jobs:
     outputs:
       training: ${{ steps.plan.outputs.training }}
       behavior: ${{ steps.plan.outputs.behavior }}
+      startup: ${{ steps.plan.outputs.startup }}
+      heavy: ${{ steps.plan.outputs.heavy }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -72,10 +74,18 @@ jobs:
         run: |
           training="$(python3 -m scripts.pgso.distributed plan --phase training --maximum-shards 20)"
           behavior="$(python3 -m scripts.pgso.distributed plan --phase behavior --maximum-shards 20)"
-          echo "training=$training" >> "$GITHUB_OUTPUT"
-          echo "behavior=$behavior" >> "$GITHUB_OUTPUT"
+          startup="$(python3 -m scripts.pgso.distributed plan --phase startup)"
+          heavy="$(python3 -m scripts.pgso.distributed plan --phase heavy)"
+          {
+            echo "training=$training"
+            echo "behavior=$behavior"
+            echo "startup=$startup"
+            echo "heavy=$heavy"
+          } >> "$GITHUB_OUTPUT"
           echo "Training matrix: $training"
           echo "Behavior matrix: $behavior"
+          echo "Startup matrix: $startup"
+          echo "Heavy matrix: $heavy"
 
       - name: Upload immutable seed
         uses: actions/upload-artifact@v4
@@ -286,14 +296,13 @@ jobs:
 
   startup:
     name: Startup ${{ matrix.name }}
-    needs: candidate
+    needs: [seed, candidate]
     runs-on: macos-15
     timeout-minutes: 45
     strategy:
       fail-fast: false
       max-parallel: 6
-      matrix:
-        name: [help, version, status, background, doctor, sessions]
+      matrix: ${{ fromJSON(needs.seed.outputs.startup) }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -342,20 +351,13 @@ jobs:
 
   heavy:
     name: Heavy ${{ matrix.name }}
-    needs: candidate
+    needs: [seed, candidate]
     runs-on: macos-15
     timeout-minutes: 60
     strategy:
       fail-fast: false
       max-parallel: 6
-      matrix:
-        name:
-          - file-index-100k
-          - ui-activity
-          - approval-transcript
-          - approval-diff
-          - approval-combined
-          - approval-payload
+      matrix: ${{ fromJSON(needs.seed.outputs.heavy) }}
     steps:
       - uses: actions/checkout@v4
         with:

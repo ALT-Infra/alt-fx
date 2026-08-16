@@ -6,6 +6,7 @@ import json
 import os
 import pathlib
 import shlex
+import signal
 import sys
 import tempfile
 import threading
@@ -14,10 +15,29 @@ import unittest
 from unittest import mock
 
 from scripts.pgso.model import PgsoError
-from scripts.pgso.runner import run_checked
+from scripts.pgso.runner import cancellation_guard, run_checked
 
 
 class PgsoRunnerTests(unittest.TestCase):
+    def test_cancellation_guard_converts_sigterm_and_restores_handlers(self) -> None:
+        installed: dict[object, object] = {}
+
+        def install(signum, handler):
+            installed[signum] = handler
+
+        with (
+            mock.patch("scripts.pgso.runner.signal.getsignal", return_value="original"),
+            mock.patch("scripts.pgso.runner.signal.signal", side_effect=install),
+        ):
+            with self.assertRaisesRegex(PgsoError, "cancelled by SIGTERM"):
+                with cancellation_guard():
+                    handler = installed[signal.SIGTERM]
+                    assert callable(handler)
+                    handler(signal.SIGTERM, None)
+
+        self.assertEqual("original", installed[signal.SIGINT])
+        self.assertEqual("original", installed[signal.SIGTERM])
+
     def test_child_output_is_visible_before_the_command_finishes(self) -> None:
         class LiveOutput(io.StringIO):
             def __init__(self) -> None:
@@ -179,6 +199,69 @@ class PgsoRunnerTests(unittest.TestCase):
             self.assertEqual("passed", log["status"])
             self.assertNotIn("environment", log)
             self.assertNotIn("must-not-be-logged", log_path.read_text())
+
+    def test_noisy_output_is_truncated_in_memory_and_in_the_json_log(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="fx-pgso-runner-") as tmp:
+            root = pathlib.Path(tmp)
+            log_path = root / "bounded.json"
+            with (
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+                mock.patch(
+                    "scripts.pgso.runner.MAX_CAPTURED_OUTPUT_CHARS",
+                    128,
+                ),
+            ):
+                result = run_checked(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import sys; print('x' * 4096); print('y' * 4096, file=sys.stderr)",
+                    ],
+                    cwd=root,
+                    env=os.environ.copy(),
+                    timeout_s=5,
+                    log_path=log_path,
+                )
+
+            log = json.loads(log_path.read_text())
+            self.assertTrue(result.stdout_truncated)
+            self.assertTrue(result.stderr_truncated)
+            self.assertTrue(log["stdout_truncated"])
+            self.assertTrue(log["stderr_truncated"])
+            self.assertGreater(log["stdout_total_chars"], 4096)
+            self.assertGreater(log["stderr_total_chars"], 4096)
+            self.assertLess(len(log["stdout"]), 256)
+            self.assertLess(len(log["stderr"]), 256)
+
+    def test_interruption_terminates_the_process_group_and_logs_cancellation(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="fx-pgso-runner-") as tmp:
+            root = pathlib.Path(tmp)
+            process = mock.Mock()
+            process.stdout = io.StringIO("partial stdout\n")
+            process.stderr = io.StringIO("")
+            process.poll.return_value = None
+            process.wait.side_effect = KeyboardInterrupt()
+            process.returncode = -2
+            log_path = root / "cancelled.json"
+
+            with (
+                mock.patch("scripts.pgso.runner.subprocess.Popen", return_value=process),
+                mock.patch("scripts.pgso.runner._terminate_process_group") as terminate,
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                run_checked(
+                    ["fixture"],
+                    cwd=root,
+                    env={},
+                    timeout_s=5,
+                    log_path=log_path,
+                )
+
+            terminate.assert_called_once_with(process)
+            log = json.loads(log_path.read_text())
+            self.assertEqual("cancelled", log["status"])
+            self.assertEqual("partial stdout\n", log["stdout"])
 
     def test_nonzero_exit_raises_after_logging_output(self) -> None:
         with tempfile.TemporaryDirectory(prefix="fx-pgso-runner-") as tmp:

@@ -35,14 +35,14 @@ from scripts.pgso.qualify import (
     relink_profile_linked_benchmarks,
     require_measurements_passed,
 )
-from scripts.pgso.runner import run_checked
+from scripts.pgso.runner import cancellation_guard, run_checked
 from scripts.pgso.toolchain import SUPPORTED_TARGET
 from scripts.pgso.toolchain import Toolchain
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 DEFAULT_CORPUS = REPO_ROOT / "scripts" / "pgso" / "corpus.json"
-MUTATING_COMMANDS = ("build", "train", "qualify", "all")
+MUTATING_COMMANDS = ("build", "train", "all")
 REQUIRED_BUN_VERSION = "1.3.14"
 REQUIRED_HYPERFINE_VERSION = "1.20.0"
 
@@ -107,7 +107,6 @@ def _parser() -> argparse.ArgumentParser:
     descriptions = {
         "build": "Build the control and instrumented compiler artifacts",
         "train": "Build a candidate from the versioned production corpus",
-        "qualify": "Build and run correctness and performance qualification",
         "all": "Run the complete non-publishing Stage 1 candidate gate",
     }
     for command in MUTATING_COMMANDS:
@@ -132,7 +131,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         return arguments
     if arguments.timeout_seconds <= 0:
         parser.error("--timeout-seconds must be positive")
-    if arguments.command in ("qualify", "all") and arguments.samples < 50:
+    if arguments.command == "all" and arguments.samples < 50:
         parser.error("--samples must be at least 50 for qualification")
     return arguments
 
@@ -553,21 +552,22 @@ def run_command(arguments: argparse.Namespace) -> pathlib.Path:
 
         recorder.complete()
         return recorder.path
-    except Exception as error:
+    except BaseException as error:
         recorder.fail(stage, error)
         raise
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     try:
-        arguments = parse_args(argv)
-        if arguments.command == "report":
-            payload = load_read_only_manifest(arguments.output_dir)
-            print(json.dumps(payload, indent=2, sort_keys=True))
+        with cancellation_guard():
+            arguments = parse_args(argv)
+            if arguments.command == "report":
+                payload = load_read_only_manifest(arguments.output_dir)
+                print(json.dumps(payload, indent=2, sort_keys=True))
+                return 0
+            manifest_path = run_command(arguments)
+            print(manifest_path)
             return 0
-        manifest_path = run_command(arguments)
-        print(manifest_path)
-        return 0
     except PgsoError as error:
         print(f"PGSO failed: {error}", file=sys.stderr)
         return 1
