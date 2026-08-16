@@ -246,19 +246,6 @@ const FetchBridge = struct {
         self.mutex.unlock(io);
     }
 
-    fn takeRequest(self: *FetchBridge, destination: []u8) !usize {
-        const io = io_mod.getIo();
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        if (!self.request_pending) return 0;
-        if (self.request.items.len > destination.len) return error.BufferTooSmall;
-        @memcpy(destination[0..self.request.items.len], self.request.items);
-        const len = self.request.items.len;
-        self.request.clearRetainingCapacity();
-        self.request_pending = false;
-        return len;
-    }
-
     fn startResponse(self: *FetchBridge, status: u16) !void {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);

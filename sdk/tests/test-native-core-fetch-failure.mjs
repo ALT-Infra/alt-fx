@@ -7,9 +7,6 @@ import { createFxAgent } from "../node.js";
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
 const addon = resolve(process.argv[2] || resolve(scriptDir, "../../zig-out/lib/libfx.node"));
 let timeoutId;
-const timeout = new Promise((_, reject) => {
-  timeoutId = setTimeout(() => reject(new Error("native host-fetch failure hung")), 5000);
-});
 const agent = await createFxAgent({
   nativeAddon: addon,
   backend: "native",
@@ -28,6 +25,9 @@ let closed = false;
 try {
   const session = await agent.createSession();
   const turn = session.prompt("fail host fetch");
+  const timeout = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => reject(new Error("native host-fetch failure hung")), 5000);
+  });
   await assert.rejects(
     Promise.race([turn.result, timeout]),
     (error) => error.message !== "native host-fetch failure hung",

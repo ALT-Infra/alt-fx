@@ -3,6 +3,7 @@ const stream_provider = @import("../core/agent/stream_provider.zig");
 const gateway_client = @import("client.zig");
 
 const Allocator = std.mem.Allocator;
+const max_error_body_bytes = 1024 * 1024;
 
 pub const Transport = struct {
     context: ?*anyopaque,
@@ -137,7 +138,9 @@ fn readBody(alloc: Allocator, transport: Transport, handle: i32, cancel_flag: *s
         if (count == -2) return error.Cancelled;
         if (count < 0) return error.HostStreamFailed;
         if (count == 0) break;
-        try out.appendSlice(alloc, chunk[0..@intCast(count)]);
+        const len: usize = @intCast(count);
+        if (len > max_error_body_bytes - out.items.len) return error.HostStreamFailed;
+        try out.appendSlice(alloc, chunk[0..len]);
     }
     return out.toOwnedSlice(alloc);
 }
@@ -195,3 +198,48 @@ const HostStreamReader = struct {
         return count;
     }
 };
+
+test "error response bodies are bounded" {
+    const FakeTransport = struct {
+        body: []const u8,
+        offset: usize = 0,
+
+        fn open(_: ?*anyopaque, _: []const u8, _: []const u8, _: []const u8, _: []const u8) anyerror!i32 {
+            return 1;
+        }
+
+        fn status(_: ?*anyopaque, _: i32, status_out: *u16) i32 {
+            status_out.* = 500;
+            return 1;
+        }
+
+        fn next(raw: ?*anyopaque, _: i32, out: []u8) i32 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const len = @min(out.len, self.body.len - self.offset);
+            if (len == 0) return 0;
+            @memcpy(out[0..len], self.body[self.offset..][0..len]);
+            self.offset += len;
+            return @intCast(len);
+        }
+
+        fn close(_: ?*anyopaque, _: i32) void {}
+    };
+
+    const body = try std.testing.allocator.alloc(u8, max_error_body_bytes + 1);
+    defer std.testing.allocator.free(body);
+    @memset(body, 'x');
+    var fake = FakeTransport{ .body = body };
+    const transport = Transport{
+        .context = &fake,
+        .open_fn = FakeTransport.open,
+        .status_fn = FakeTransport.status,
+        .next_fn = FakeTransport.next,
+        .close_fn = FakeTransport.close,
+    };
+    var cancel_flag = std.atomic.Value(bool).init(false);
+
+    try std.testing.expectError(
+        error.HostStreamFailed,
+        readBody(std.testing.allocator, transport, 1, &cancel_flag, null),
+    );
+}

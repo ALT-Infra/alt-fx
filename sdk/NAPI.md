@@ -156,6 +156,7 @@ All untrusted values crossing the native boundary are bounded before allocation 
 | Output queue | 8 MiB |
 | Fetch request record | 8 MiB |
 | Fetch response queue | 8 MiB |
+| Gateway error body | 1 MiB |
 | One output drain | 1 MiB |
 | Active runtimes | 64 per process |
 | ACP tool result | 64 KiB |
