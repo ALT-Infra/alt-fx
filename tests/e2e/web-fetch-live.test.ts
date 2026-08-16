@@ -91,7 +91,7 @@ async function startFakeGateway(responses: Response[]) {
     port,
     async fetch(req) {
       const url = new URL(req.url);
-      if (url.pathname === "/v1/models") {
+      if (url.pathname === "/coding-agent/v1/models") {
         return Response.json({
           data: [{ id: OUTER_MODEL, type: "language", tags: ["tool-use"] }],
         });

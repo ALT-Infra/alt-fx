@@ -3061,7 +3061,7 @@ describe("cli: models", () => {
         try {
           const result = await runFx(["models"], {
             env: {
-              ...modelsGatewayEnv(home, `${gateway.baseUrl}/v1/models`),
+              ...modelsGatewayEnv(home, `${gateway.baseUrl}/coding-agent/v1/models`),
               ...(scenario.authenticated ? {} : NO_GATEWAY_AUTH),
             },
           });
@@ -3103,7 +3103,7 @@ describe("cli: models", () => {
         try {
           const result = await runFx(["models", "--json"], {
             env: {
-              ...modelsGatewayEnv(home, `${gateway.baseUrl}/v1/models`),
+              ...modelsGatewayEnv(home, `${gateway.baseUrl}/coding-agent/v1/models`),
               FX_TRACE_LOG: tracePath,
               FX_TRACE_SCOPES: "catalog",
             },
@@ -3152,7 +3152,7 @@ describe("cli: models", () => {
       });
       try {
         const result = await runFx(["models", "--json"], {
-          env: modelsGatewayEnv(unavailableHome, `${gateway.baseUrl}/v1/models`),
+          env: modelsGatewayEnv(unavailableHome, `${gateway.baseUrl}/coding-agent/v1/models`),
         });
         expect(result.code).not.toBe(0);
         expect(result.stderr).toBe("");
@@ -3212,7 +3212,7 @@ describe("cli: models", () => {
         const gateway = startFakeGateway([], { models: scenario.response });
         try {
           const result = await runFx(["models", "--json"], {
-            env: modelsGatewayEnv(home, `${gateway.baseUrl}/v1/models`),
+            env: modelsGatewayEnv(home, `${gateway.baseUrl}/coding-agent/v1/models`),
           });
 
           expect(result.code).not.toBe(0);
@@ -3240,7 +3240,7 @@ describe("cli: models", () => {
         cwd: REPO_ROOT,
         env: {
           ...process.env,
-          ...modelsGatewayEnv(home, `${gateway.baseUrl}/v1/models`),
+          ...modelsGatewayEnv(home, `${gateway.baseUrl}/coding-agent/v1/models`),
         },
         stdout: "pipe",
         stderr: "pipe",
@@ -3902,7 +3902,7 @@ describe("cli: ask success", () => {
               VERCEL_OIDC_TOKEN: undefined,
               FX_GATEWAY_BASE_URL: gateway.baseUrl,
               FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-              FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/v1/models`,
+              FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
             },
             timeoutMs: 60_000,
           },
