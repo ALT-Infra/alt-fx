@@ -319,6 +319,43 @@ describe("fx ask presentation", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
+    "light theme uses readable syntax colors in TTY code blocks with redirected stdin",
+    async () => {
+      const root = createRoot();
+      const gateway = startFakeGateway([fakeGatewayFinalText(MARKDOWN)]);
+      gateways.push(gateway);
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+
+      const session = await TmuxSession.create({
+        cmd: `${terminalCommand([
+          "ask",
+          "--no-save",
+          "Render the light-theme fixture.",
+        ])} </dev/null`,
+        cwd: root.workspace,
+        env: {
+          ...gatewayEnv(root.home, gateway),
+          FX_THEME: "light",
+          NO_COLOR: undefined,
+        },
+        width: 120,
+        height: 40,
+        remainOnExit: true,
+        stderrPath,
+      });
+      sessions.push(session);
+
+      await session.waitForText("__FX_EXIT_0__", TIMEOUT);
+      const escaped = await session.captureFullScrollbackEscapes();
+      expect(escaped).toContain("\x1b[38;5;238mconst\x1b[39m");
+      expect(escaped).not.toContain("\x1b[38;5;252mconst\x1b[39m");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
     "TTY output taller than the pane survives in native scrollback",
     async () => {
       const root = createRoot();

@@ -72,6 +72,9 @@ pub const Runtime = struct {
 
         try self.shell.initBacking(alloc);
         try self.shell.enableShadowVt(alloc);
+        self.shell.setCommandOutputRenderPolicy(.{
+            .code_highlight_theme = if (ui_render.is_light) .light else .dark,
+        });
         const start = normalizeStartCursor(layout, cursor);
         self.shell.shadow_vt.?.cursor_row = start.row;
         self.shell.shadow_vt.?.cursor_col = start.col;
@@ -353,23 +356,14 @@ fn probeTerminal(
     no_color: bool,
 ) shell_runtime.CursorPosition {
     const fallback = shell_runtime.CursorPosition{ .row = layout.rows, .col = 1 };
-    if (std.c.isatty(std.posix.STDIN_FILENO) == 0) {
-        ui_render.initTheme(false, null);
-        return fallback;
-    }
-    terminal.captureOriginalTermios() catch {
-        ui_render.initTheme(false, null);
-        return fallback;
-    };
-    terminal.enableRawMode() catch {
-        ui_render.initTheme(false, null);
-        return fallback;
-    };
+    const fallback_light = if (no_color) false else ui_render.explicitThemeOverride() orelse false;
+    ui_render.initTheme(fallback_light, null);
+    if (std.c.isatty(std.posix.STDIN_FILENO) == 0) return fallback;
+    terminal.captureOriginalTermios() catch return fallback;
+    terminal.enableRawMode() catch return fallback;
     defer terminal.disableRawMode();
 
-    if (no_color) {
-        ui_render.initTheme(false, null);
-    } else {
+    if (!no_color) {
         const theme = ui_render.detectTheme(std.heap.c_allocator, terminal);
         ui_render.initTheme(theme.light, theme.rgb);
     }
@@ -454,6 +448,38 @@ test "ask presentation paints Minimal prompt and assistant into a footerless fra
     try std.testing.expect(runtime.shell.shadow_vt.?.cellAt(1, 1) != null);
     const length = try output.length(io_mod.getIo());
     try std.testing.expect(length > restore_terminal_sequence.len);
+}
+
+test "ask presentation carries the light theme into semantic code blocks" {
+    const alloc = std.testing.allocator;
+    ui_render.initTheme(true, null);
+    defer ui_render.initTheme(false, null);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var output = try tmp.dir.createFile(std.testing.io, "ask-light-frame.log", .{ .read = true });
+    defer output.close(io_mod.getIo());
+
+    var runtime = try Runtime.initConfigured(
+        alloc,
+        .{ .text = @constCast("show code") },
+        false,
+        output,
+        zeroFooterLayout(.{
+            .rows = 12,
+            .cols = 48,
+            .content_bottom = 12,
+            .divider_top_row = 12,
+            .input_row = 12,
+            .divider_bottom_row = 12,
+            .hint_row = 12,
+        }),
+        .{ .row = 1, .col = 1 },
+        true,
+    );
+    defer runtime.deinit();
+
+    try std.testing.expect(runtime.shell.retainedTranscriptStyles().code_highlight_theme == .light);
 }
 
 test "ask presentation retains a streaming write failure until finish" {

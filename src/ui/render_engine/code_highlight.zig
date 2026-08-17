@@ -3,15 +3,50 @@ const languages = @import("code_highlight_languages.zig");
 
 const Allocator = std.mem.Allocator;
 
-const keyword_style = "\x1b[38;5;252m";
-const string_style = "\x1b[38;5;250m";
-const number_style = "\x1b[38;5;250m";
-const comment_style = "\x1b[38;5;245m";
 const reset_style = "\x1b[39m";
 
-pub fn highlight(alloc: Allocator, source: []const u8, profile: *const languages.Profile) ![]u8 {
+pub const Theme = enum {
+    dark,
+    light,
+};
+
+const Palette = struct {
+    keyword_style: []const u8,
+    string_style: []const u8,
+    number_style: []const u8,
+    comment_style: []const u8,
+};
+
+const dark_palette: Palette = .{
+    .keyword_style = "\x1b[38;5;252m",
+    .string_style = "\x1b[38;5;250m",
+    .number_style = "\x1b[38;5;250m",
+    .comment_style = "\x1b[38;5;245m",
+};
+
+const light_palette: Palette = .{
+    .keyword_style = "\x1b[38;5;238m",
+    .string_style = "\x1b[38;5;241m",
+    .number_style = "\x1b[38;5;241m",
+    .comment_style = "\x1b[38;5;243m",
+};
+
+fn paletteForTheme(theme: Theme) Palette {
+    return switch (theme) {
+        .dark => dark_palette,
+        .light => light_palette,
+    };
+}
+
+pub fn highlight(
+    alloc: Allocator,
+    source: []const u8,
+    profile: *const languages.Profile,
+    theme: Theme,
+) ![]u8 {
     var styled: std.ArrayList(u8) = .empty;
     errdefer styled.deinit(alloc);
+    const palette = paletteForTheme(theme);
 
     var index: usize = 0;
     while (index < source.len) {
@@ -21,24 +56,24 @@ pub fn highlight(alloc: Allocator, source: []const u8, profile: *const languages
             continue;
         }
         if (blockCommentEnd(source, index, profile.block_comment)) |end| {
-            try appendStyled(alloc, &styled, comment_style, source[index..end]);
+            try appendStyled(alloc, &styled, palette.comment_style, source[index..end]);
             index = end;
             continue;
         }
         if (lineCommentEnd(source, index, profile.line_comments)) |end| {
-            try appendStyled(alloc, &styled, comment_style, source[index..end]);
+            try appendStyled(alloc, &styled, palette.comment_style, source[index..end]);
             index = end;
             continue;
         }
         if (isQuote(source[index], profile.quotes)) {
             const end = quotedEnd(source, index);
-            try appendStyled(alloc, &styled, string_style, source[index..end]);
+            try appendStyled(alloc, &styled, palette.string_style, source[index..end]);
             index = end;
             continue;
         }
         if (isNumberStart(source, index)) {
             const end = numberEnd(source, index);
-            try appendStyled(alloc, &styled, number_style, source[index..end]);
+            try appendStyled(alloc, &styled, palette.number_style, source[index..end]);
             index = end;
             continue;
         }
@@ -46,9 +81,9 @@ pub fn highlight(alloc: Allocator, source: []const u8, profile: *const languages
             const end = identifierEnd(source, index);
             const token = source[index..end];
             if (inList(token, profile.keywords, profile.keyword_case)) {
-                try appendStyled(alloc, &styled, keyword_style, token);
+                try appendStyled(alloc, &styled, palette.keyword_style, token);
             } else if (inList(token, profile.literals, profile.keyword_case)) {
-                try appendStyled(alloc, &styled, number_style, token);
+                try appendStyled(alloc, &styled, palette.number_style, token);
             } else {
                 try styled.appendSlice(alloc, token);
             }
@@ -180,7 +215,7 @@ fn count(text: []const u8, needle: []const u8) usize {
 test "supported source gains balanced colors without changing code bytes" {
     const alloc = std.testing.allocator;
     const source = "const value = \"const\"; // return\n";
-    const styled = try highlight(alloc, source, languages.resolve("zig").?);
+    const styled = try highlight(alloc, source, languages.resolve("zig").?, .dark);
     defer alloc.free(styled);
 
     const plain = try stripAnsi(alloc, styled);
@@ -192,6 +227,21 @@ test "supported source gains balanced colors without changing code bytes" {
     try std.testing.expectEqual(@as(usize, 1), count(styled, "\x1b[38;5;252mconst"));
     try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;250m\"const\"\x1b[39m") != null);
     try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;252mreturn") == null);
+}
+
+test "light theme uses a readable syntax palette without changing code bytes" {
+    const alloc = std.testing.allocator;
+    const source = "const value = \"ready\"; // comment\n";
+    const styled = try highlight(alloc, source, languages.resolve("zig").?, .light);
+    defer alloc.free(styled);
+
+    const plain = try stripAnsi(alloc, styled);
+    defer alloc.free(plain);
+    try std.testing.expectEqualStrings(source, plain);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;238mconst\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;241m\"ready\"\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[38;5;243m// comment\x1b[39m") != null);
+    try std.testing.expectEqual(count(styled, "\x1b[38;5;"), count(styled, "\x1b[39m"));
 }
 
 test "every registered profile highlights representative source" {
@@ -228,7 +278,7 @@ test "every registered profile highlights representative source" {
     };
 
     for (cases) |case| {
-        const styled = try highlight(alloc, case.source, languages.resolve(case.label).?);
+        const styled = try highlight(alloc, case.source, languages.resolve(case.label).?, .dark);
         defer alloc.free(styled);
         const plain = try stripAnsi(alloc, styled);
         defer alloc.free(plain);
@@ -240,11 +290,11 @@ test "every registered profile highlights representative source" {
 test "profiles use configured block comments and case-insensitive keywords" {
     const alloc = std.testing.allocator;
     const source = "/* comment */\nSELECT id FROM users\n<!-- note -->";
-    const css = try highlight(alloc, source[0..13], languages.resolve("css").?);
+    const css = try highlight(alloc, source[0..13], languages.resolve("css").?, .dark);
     defer alloc.free(css);
-    const sql = try highlight(alloc, source[14..34], languages.resolve("sql").?);
+    const sql = try highlight(alloc, source[14..34], languages.resolve("sql").?, .dark);
     defer alloc.free(sql);
-    const html = try highlight(alloc, source[35..], languages.resolve("html").?);
+    const html = try highlight(alloc, source[35..], languages.resolve("html").?, .dark);
     defer alloc.free(html);
 
     try std.testing.expect(std.mem.indexOf(u8, css, "\x1b[38;5;245m/* comment */\x1b[39m") != null);
