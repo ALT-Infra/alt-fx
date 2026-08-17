@@ -14,15 +14,17 @@ pub const max_approvals: usize = 64;
 pub const max_active_work_notifications: usize = 8;
 pub const max_active_work_notification_bytes: usize = 48 * 1024;
 pub const max_live_approvals: usize = max_approvals;
-pub const max_live_approval_bytes: usize = 160 * 1024;
 pub const max_authority_grants: usize = domain.max_admission_items;
-pub const max_authority_grant_bytes: usize = 128 * 1024;
 pub const max_consumer_cursor_bytes: usize = 16 * 1024;
 pub const max_retention_target_bytes: usize = 64 * 1024;
-pub const max_irreducible_canonical_bytes: usize = 224 * 1024;
 pub const max_retained_delivery_canonical_bytes: usize = 96 * 1024;
 pub const capacity_contract_version: u64 = 2;
 pub const max_delivery_content_bytes: usize = domain.max_message_bytes;
+pub const max_approval_projection_bytes: usize = domain.max_message_bytes +
+    2 * std.Io.Dir.max_path_bytes + 1024;
+pub const max_live_approval_bytes: usize = 192 * 1024;
+pub const max_authority_grant_bytes: usize = 128 * 1024;
+pub const max_irreducible_canonical_bytes: usize = 224 * 1024;
 pub const max_trusted_context_bytes: usize = 16 * 1024;
 pub const max_delivery_page: usize = domain.max_page_limit;
 
@@ -268,7 +270,8 @@ pub const RelationshipApproval = struct {
 
 /// Durable projection of one canonical prepared request. The executable
 /// payload is represented by its canonical digest; human surfaces receive only
-/// the bounded label, explanation, and optional file review exposed by fx.
+/// the bounded label, explanation, command projection, and optional file review
+/// exposed by fx.
 pub const Approval = struct {
     id: []u8,
     kind: ApprovalKind,
@@ -280,6 +283,7 @@ pub const Approval = struct {
     identity_fingerprint: [32]u8 = [_]u8{0} ** 32,
     label: []u8,
     explanation: ?[]u8,
+    command: ?[]u8 = null,
     file: ?permission_request.FileApprovalRequest = null,
     grants: []types.PermissionGrant,
     status: ApprovalStatus,
@@ -295,6 +299,7 @@ pub const Approval = struct {
         if (self.relationship) |*value| value.deinit(alloc);
         alloc.free(self.label);
         if (self.explanation) |value| alloc.free(value);
+        if (self.command) |value| alloc.free(value);
         if (self.file) |value| {
             permission_request.deinitFileApprovalRequest(alloc, value);
         }
@@ -317,6 +322,8 @@ pub const Approval = struct {
         errdefer alloc.free(label);
         const explanation = if (self.explanation) |value| try alloc.dupe(u8, value) else null;
         errdefer if (explanation) |value| alloc.free(value);
+        const command = if (self.command) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (command) |value| alloc.free(value);
         const file = if (self.file) |value|
             try permission_request.dupeFileApprovalRequest(alloc, value)
         else
@@ -335,6 +342,7 @@ pub const Approval = struct {
             .identity_fingerprint = self.identity_fingerprint,
             .label = label,
             .explanation = explanation,
+            .command = command,
             .file = file,
             .grants = try types.dupePermissionGrantSlice(alloc, self.grants),
             .status = self.status,
@@ -620,6 +628,8 @@ pub fn validateLedger(ledger: Ledger) ValidationError!void {
         validateContent(approval.label) catch return error.InvalidLedger;
         if (approval.explanation) |value| validateContent(value) catch
             return error.InvalidLedger;
+        if (approval.command) |value| validateApprovalProjection(value) catch
+            return error.InvalidLedger;
         if (approval.file) |file| {
             _ = permission_request.fileRequestFootprint(.{
                 .label = approval.label,
@@ -643,7 +653,7 @@ pub fn validateLedger(ledger: Ledger) ValidationError!void {
             },
             .relationship => if (approval.work_id != null or
                 approval.relationship == null or approval.file != null or
-                approval.grants.len != 0)
+                approval.command != null or approval.grants.len != 0)
             {
                 return error.InvalidLedger;
             },
@@ -657,7 +667,8 @@ pub fn validateLedger(ledger: Ledger) ValidationError!void {
         }
         for (approval.grants) |grant| {
             validateContent(grant.tool_name) catch return error.InvalidLedger;
-            validateContent(grant.target_path) catch return error.InvalidLedger;
+            validateApprovalProjection(grant.target_path) catch
+                return error.InvalidLedger;
         }
         if (!std.mem.eql(
             u8,
@@ -673,7 +684,8 @@ pub fn validateLedger(ledger: Ledger) ValidationError!void {
     }
     for (ledger.authority_grants, 0..) |grant, index| {
         validateContent(grant.tool_name) catch return error.InvalidLedger;
-        validateContent(grant.target_path) catch return error.InvalidLedger;
+        validateApprovalProjection(grant.target_path) catch
+            return error.InvalidLedger;
         for (ledger.authority_grants[0..index]) |prior| {
             if (std.mem.eql(u8, prior.tool_name, grant.tool_name) and
                 std.mem.eql(u8, prior.target_path, grant.target_path))
@@ -740,7 +752,9 @@ pub fn canonicalBudgetUsage(ledger: Ledger) ?CanonicalBudgetUsage {
     }
     var grants: CollectionCharge = .{};
     for (ledger.authority_grants) |grant| {
-        if (!grants.add(grant)) return null;
+        const grant_bytes = canonicalPermissionGrantWireBytes(grant) orelse
+            return null;
+        if (!grants.addBytes(grant_bytes)) return null;
     }
     var cursors: CollectionCharge = .{};
     for (ledger.cursors) |cursor| {
@@ -813,7 +827,54 @@ fn addApprovalBudgetCharge(
     worst_case.status = .allowed_once;
     worst_case.resolved_at_ms = std.math.minInt(i64);
     worst_case.resolved_revision = std.math.maxInt(u64);
-    return charge.add(worst_case);
+    const bytes = canonicalApprovalWireBytes(worst_case) orelse return false;
+    return charge.addBytes(bytes);
+}
+
+fn canonicalApprovalWireBytes(approval: Approval) ?usize {
+    var empty_grants: [domain.max_admission_items]types.PermissionGrant = undefined;
+    if (approval.grants.len > empty_grants.len) return null;
+    for (approval.grants, empty_grants[0..approval.grants.len]) |grant, *empty| {
+        empty.* = .{
+            .tool_name = grant.tool_name,
+            .target_path = @constCast(""),
+        };
+    }
+    var base = approval;
+    base.command = null;
+    base.grants = empty_grants[0..approval.grants.len];
+    var bytes = canonicalJsonBytes(base) orelse return null;
+    if (approval.command) |command| {
+        bytes = std.math.add(
+            usize,
+            bytes,
+            canonicalBase64TextBytes(command),
+        ) catch return null;
+    }
+    for (approval.grants) |grant| {
+        bytes = std.math.add(
+            usize,
+            bytes,
+            canonicalBase64TextBytes(grant.target_path),
+        ) catch return null;
+    }
+    return bytes;
+}
+
+fn canonicalPermissionGrantWireBytes(grant: types.PermissionGrant) ?usize {
+    var base = grant;
+    base.target_path = @constCast("");
+    const base_bytes = canonicalJsonBytes(base) orelse return null;
+    return std.math.add(
+        usize,
+        base_bytes,
+        canonicalBase64TextBytes(grant.target_path),
+    ) catch null;
+}
+
+fn canonicalBase64TextBytes(value: []const u8) usize {
+    return "{\"encoding\":\"base64\",\"data\":\"\"}".len +
+        std.base64.standard.Encoder.calcSize(value.len);
 }
 
 fn addCursorBudgetCharge(
@@ -986,11 +1047,15 @@ fn grantAdmissionFits(
     const current = canonicalBudgetUsage(ledger) orelse return false;
     var retained: CollectionCharge = .{};
     for (ledger.authority_grants) |grant| {
-        if (!retained.add(grant)) return false;
+        const grant_bytes = canonicalPermissionGrantWireBytes(grant) orelse
+            return false;
+        if (!retained.addBytes(grant_bytes)) return false;
     }
     for (grants, 0..) |grant, index| {
         if (!admitted.*[index]) continue;
-        if (!retained.add(grant)) return false;
+        const grant_bytes = canonicalPermissionGrantWireBytes(grant) orelse
+            return false;
+        if (!retained.addBytes(grant_bytes)) return false;
     }
     const updated = usageWithCollection(
         current,
@@ -2475,6 +2540,7 @@ pub const ApprovalInput = struct {
     prepared_fingerprint: [32]u8,
     label: []const u8,
     explanation: ?[]const u8,
+    command: ?[]const u8 = null,
     file: ?permission_request.FileApprovalRequest = null,
     grants: []const types.PermissionGrant,
     created_at_ms: i64,
@@ -2502,6 +2568,10 @@ pub fn approvalIdentityFingerprint(input: ApprovalInput) [32]u8 {
     hash.update(&input.prepared_fingerprint);
     hashString(&hash, input.label);
     hashOptionalString(&hash, input.explanation);
+    if (input.command) |command| {
+        hash.update("command-projection\x00");
+        hashString(&hash, command);
+    }
     hashNormalizedGrants(&hash, input.grants);
     if (input.file) |file| {
         hash.update("file-projection\x00");
@@ -2536,6 +2606,8 @@ pub fn registerApproval(
     validateContent(input.label) catch return error.InvalidApproval;
     if (input.explanation) |value| validateContent(value) catch
         return error.InvalidApproval;
+    if (input.command) |value| validateApprovalProjection(value) catch
+        return error.InvalidApproval;
     if (input.file) |file| {
         _ = permission_request.fileRequestFootprint(.{
             .label = input.label,
@@ -2545,13 +2617,18 @@ pub fn registerApproval(
         }) catch return error.InvalidApproval;
     }
     if (input.grants.len > domain.max_admission_items) return error.InvalidApproval;
+    for (input.grants) |grant| {
+        validateContent(grant.tool_name) catch return error.InvalidApproval;
+        validateApprovalProjection(grant.target_path) catch
+            return error.InvalidApproval;
+    }
     switch (input.kind) {
         .tool => if (input.work_id == null or input.relationship != null) {
             return error.InvalidApproval;
         },
         .relationship => if (input.work_id != null or
             input.relationship == null or input.file != null or
-            input.grants.len != 0)
+            input.command != null or input.grants.len != 0)
         {
             return error.InvalidApproval;
         },
@@ -2594,6 +2671,8 @@ pub fn registerApproval(
     errdefer alloc.free(label);
     const explanation = if (input.explanation) |value| try alloc.dupe(u8, value) else null;
     errdefer if (explanation) |value| alloc.free(value);
+    const command = if (input.command) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (command) |value| alloc.free(value);
     const file = if (input.file) |value|
         permission_request.dupeFileApprovalRequest(alloc, value) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -2617,6 +2696,7 @@ pub fn registerApproval(
         .identity_fingerprint = identity_fingerprint,
         .label = label,
         .explanation = explanation,
+        .command = command,
         .file = file,
         .grants = grants,
         .status = .pending,
@@ -2777,18 +2857,23 @@ pub fn decideToolAuthority(
         return .unavailable;
     }
     if (authority.permission_mode == .yolo) return .allow;
+    const permission_name = if (target_kind == .command_cwd and
+        std.mem.eql(u8, tool_name, "terminal"))
+        "run_command"
+    else
+        tool_name;
     return switch (try permissions.ruleDecisionFor(
         alloc,
         authority.rules,
         workspace_root,
-        tool_name,
+        permission_name,
         target,
         target_kind,
     )) {
         .allow => .allow,
         .deny => .deny,
-        .ask => if (permissions.sessionGrantAllowed(authority.grants, tool_name, target)) .allow else .ask,
-        .none => if (permissions.sessionGrantAllowed(authority.grants, tool_name, target)) .allow else .ask,
+        .ask => if (permissions.sessionGrantAllowed(authority.grants, permission_name, target)) .allow else .ask,
+        .none => if (permissions.sessionGrantAllowed(authority.grants, permission_name, target)) .allow else .ask,
     };
 }
 
@@ -2860,7 +2945,8 @@ pub fn applyAlwaysGrants(
     if (grants.len > domain.max_admission_items) return error.InvalidApproval;
     for (grants) |grant| {
         validateContent(grant.tool_name) catch return error.InvalidApproval;
-        validateContent(grant.target_path) catch return error.InvalidApproval;
+        validateApprovalProjection(grant.target_path) catch
+            return error.InvalidApproval;
     }
     var admitted = [_]bool{false} ** domain.max_admission_items;
     const added_count = selectNewGrants(
@@ -3037,6 +3123,7 @@ fn approvalAsInput(approval: Approval) ApprovalInput {
         .prepared_fingerprint = approval.prepared_fingerprint,
         .label = approval.label,
         .explanation = approval.explanation,
+        .command = approval.command,
         .file = approval.file,
         .grants = approval.grants,
         .created_at_ms = approval.created_at_ms,
@@ -3183,7 +3270,15 @@ fn validatePolicy(policy: domain.NotificationPolicy) !void {
 }
 
 fn validateContent(value: []const u8) !void {
-    if (value.len == 0 or value.len > max_delivery_content_bytes or
+    return validateBoundedContent(value, max_delivery_content_bytes);
+}
+
+fn validateApprovalProjection(value: []const u8) !void {
+    return validateBoundedContent(value, max_approval_projection_bytes);
+}
+
+fn validateBoundedContent(value: []const u8, max_bytes: usize) !void {
+    if (value.len == 0 or value.len > max_bytes or
         !std.unicode.utf8ValidateSlice(value) or
         std.mem.indexOfScalar(u8, value, 0) != null)
     {
@@ -4627,10 +4722,12 @@ test "approval replay identity includes work label explanation and normalized gr
         .prepared_fingerprint = [_]u8{9} ** 32,
         .label = "prepared action",
         .explanation = "bounded explanation",
+        .command = "# terminal.exec profile=user shell=/bin/zsh\nzig build test",
         .grants = &grants,
         .created_at_ms = 1,
     };
     try std.testing.expectEqual(RegisterApprovalResult.registered, try registerApproval(alloc, &ledger, base));
+    try std.testing.expectEqualStrings(base.command.?, ledger.approvals[0].command.?);
     var same = base;
     same.grants = &reordered;
     same.created_at_ms = 2;
@@ -4644,6 +4741,9 @@ test "approval replay identity includes work label explanation and normalized gr
     changed = base;
     changed.explanation = null;
     try std.testing.expectError(error.ApprovalConflict, registerApproval(alloc, &ledger, changed));
+    changed = base;
+    changed.command = "# terminal.exec profile=clean shell=/bin/zsh\nzig build test";
+    try std.testing.expectError(error.ApprovalConflict, registerApproval(alloc, &ledger, changed));
     const changed_grants = [_]types.PermissionGrant{.{
         .tool_name = @constCast("read_file"),
         .target_path = @constCast("/tmp/changed"),
@@ -4651,6 +4751,85 @@ test "approval replay identity includes work label explanation and normalized gr
     changed = base;
     changed.grants = &changed_grants;
     try std.testing.expectError(error.ApprovalConflict, registerApproval(alloc, &ledger, changed));
+}
+
+test "near-limit captured commands persist subagent approvals across profiles" {
+    const command_environment = @import("../execution/command_environment.zig");
+    const terminal_contracts = @import("../terminal/contracts.zig");
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const command = try arena.alloc(u8, terminal_contracts.max_command_bytes);
+    @memset(command, 0x01);
+    command[0] = '#';
+    command[command.len - 1] = '\n';
+    const environments = [_]command_environment.Environment{
+        .legacy,
+        .{ .clean = "/bin/zsh" },
+        .{ .user = "/bin/zsh" },
+    };
+
+    for (environments) |environment| {
+        var ledger = try Ledger.init(alloc, "child");
+        defer ledger.deinit(alloc);
+        const approval_command = try command_environment.formatApprovalCommand(
+            arena,
+            environment,
+            command,
+        );
+        const command_identity = try command_environment.permissionCommandIdentity(
+            arena,
+            environment,
+            command,
+        );
+        const grant_target = try std.fmt.allocPrint(
+            arena,
+            "/tmp/workspace::{s}",
+            .{command_identity},
+        );
+        try std.testing.expect(approval_command.len > max_delivery_content_bytes);
+        try std.testing.expect(grant_target.len > max_delivery_content_bytes);
+        try std.testing.expect(approval_command.len <= max_approval_projection_bytes);
+        try std.testing.expect(grant_target.len <= max_approval_projection_bytes);
+        const grants = [_]types.PermissionGrant{.{
+            .tool_name = @constCast("bash"),
+            .target_path = grant_target,
+        }};
+        try std.testing.expectEqual(.registered, try registerApproval(alloc, &ledger, .{
+            .id = "near-limit-command",
+            .kind = .tool,
+            .child_id = "child",
+            .root_id = "root",
+            .work_id = "work",
+            .prepared_fingerprint = [_]u8{11} ** 32,
+            .label = "captured command",
+            .explanation = null,
+            .command = approval_command,
+            .grants = &grants,
+            .created_at_ms = 1,
+        }));
+        try validateLedger(ledger);
+        const approval_usage = canonicalBudgetUsage(ledger) orelse
+            return error.TestUnexpectedResult;
+        try std.testing.expect(
+            (canonicalJsonBytes(ledger.approvals[0]) orelse
+                return error.TestUnexpectedResult) > max_live_approval_bytes,
+        );
+        try std.testing.expect(approval_usage.live_approval_bytes <= max_live_approval_bytes);
+
+        var root = try Ledger.init(alloc, "root");
+        defer root.deinit(alloc);
+        try std.testing.expect(try applyAlwaysGrants(alloc, &root, &grants));
+        try validateLedger(root);
+        const authority_usage = canonicalBudgetUsage(root) orelse
+            return error.TestUnexpectedResult;
+        try std.testing.expect(
+            (canonicalJsonBytes(root.authority_grants[0]) orelse
+                return error.TestUnexpectedResult) > max_authority_grant_bytes,
+        );
+        try std.testing.expect(authority_usage.authority_grant_bytes <= max_authority_grant_bytes);
+    }
 }
 
 fn testFileApprovalRequest() permission_request.FileApprovalRequest {
@@ -5430,7 +5609,7 @@ test "live authority applies deny revocation and sibling grant isolation" {
         .pattern = @constCast("git push *"),
         .action = .deny,
     }};
-    const tools = [_][]const u8{"run_command"};
+    const tools = [_][]const u8{"terminal"};
     const allowed_grants = [_]types.PermissionGrant{.{
         .tool_name = @constCast("bash"),
         .target_path = @constCast("git status"),
@@ -5447,29 +5626,29 @@ test "live authority applies deny revocation and sibling grant isolation" {
     };
     try std.testing.expectEqual(
         ToolAuthorityDecision.deny,
-        try decideToolAuthority(alloc, authority, "/tmp", "run_command", "git push origin main", .none),
+        try decideToolAuthority(alloc, authority, "/tmp", "terminal", "git push origin main", .command_cwd),
     );
     try std.testing.expectEqual(
         ToolAuthorityDecision.allow,
-        try decideToolAuthority(alloc, authority, "/tmp", "run_command", "git status", .none),
+        try decideToolAuthority(alloc, authority, "/tmp", "terminal", "git status", .command_cwd),
     );
     var sibling = authority;
     sibling.grants = &.{};
     try std.testing.expectEqual(
         ToolAuthorityDecision.ask,
-        try decideToolAuthority(alloc, sibling, "/tmp", "run_command", "git status", .none),
+        try decideToolAuthority(alloc, sibling, "/tmp", "terminal", "git status", .command_cwd),
     );
     var child_claim = authority;
     child_claim.permission_mode = .ask;
     try std.testing.expectEqual(
         ToolAuthorityDecision.allow,
-        try decideToolAuthority(alloc, child_claim, "/tmp", "run_command", "git status", .none),
+        try decideToolAuthority(alloc, child_claim, "/tmp", "terminal", "git status", .command_cwd),
     );
     var yolo = authority;
     yolo.permission_mode = .yolo;
     try std.testing.expectEqual(
         ToolAuthorityDecision.allow,
-        try decideToolAuthority(alloc, yolo, "/tmp", "run_command", "git push origin main", .none),
+        try decideToolAuthority(alloc, yolo, "/tmp", "terminal", "git push origin main", .command_cwd),
     );
     try std.testing.expectEqual(
         ToolAuthorityDecision.unavailable,
@@ -5482,7 +5661,10 @@ test "approval response is exact once and always grants precede wake effect" {
     var grants = try alloc.alloc(types.PermissionGrant, 1);
     grants[0] = .{
         .tool_name = try alloc.dupe(u8, "bash"),
-        .target_path = try alloc.dupe(u8, "git status"),
+        .target_path = try alloc.dupe(
+            u8,
+            "@fx-terminal-env:user:8:/bin/zsh::git status",
+        ),
     };
     var approval = Approval{
         .id = try alloc.dupe(u8, "11111111111111111111111111111111"),
@@ -5514,6 +5696,10 @@ test "approval response is exact once and always grants precede wake effect" {
     defer root.deinit(alloc);
     try std.testing.expect(try applyAlwaysGrants(alloc, &root, approval.grants));
     try std.testing.expectEqual(@as(u64, 1), root.authority_generation);
+    try std.testing.expectEqualStrings(
+        approval.grants[0].target_path,
+        root.authority_grants[0].target_path,
+    );
     try applyApprovalDecision(&approval, decision, 2, 1);
     try std.testing.expectEqual(ApprovalStatus.allowed_always, approval.status);
     try std.testing.expect(decideApprovalResponse(approval, response, .{

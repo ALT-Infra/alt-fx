@@ -12,6 +12,7 @@ const process_supervisor = @import("../background/process_supervisor.zig");
 const background_process_provider = @import(
     "../execution/background_process_provider.zig",
 );
+const process_tree = @import("../execution/process_tree.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const sandbox = @import("../permissions/sandbox.zig");
 const execution_router = @import("../execution/router.zig");
@@ -3128,6 +3129,11 @@ fn applyMonitorSocketTimeout(stream: std.Io.net.Stream, timeout_ms: i64) void {
     ) catch {};
 }
 
+const SignalTarget = struct {
+    pid: std.posix.pid_t,
+    token: process_supervisor.ProcessInstanceToken,
+};
+
 const Session = struct {
     alloc: Allocator,
     tracker: WorkTracker,
@@ -3188,7 +3194,7 @@ const Session = struct {
     ) !Session {
         var login_shell_buffer: [4096]u8 = undefined;
         const shell_path = switch (request.shell) {
-            .user_login => configuredLoginShellInto(&login_shell_buffer) orelse "",
+            .user_login => shell_resolver.configuredLoginShellInto(&login_shell_buffer) orelse "",
             .executable => |value| value.path,
         };
         const shell = try alloc.dupe(u8, shell_path);
@@ -3367,7 +3373,7 @@ const Session = struct {
         transport_root: []const u8,
     ) !void {
         var login_shell_buffer: [4096]u8 = undefined;
-        const configured = configuredLoginShellInto(&login_shell_buffer);
+        const configured = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
         var invocation = try shell_resolver.resolve(configured, request.shell);
         if (!std.mem.eql(u8, self.shell, invocation.path)) {
             self.alloc.free(self.shell);
@@ -3700,7 +3706,7 @@ const Session = struct {
 
     fn launchNative(self: *Session, request: contracts.StartRequest) !void {
         var login_shell_buffer: [4096]u8 = undefined;
-        const configured = configuredLoginShellInto(&login_shell_buffer);
+        const configured = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
         var invocation = try shell_resolver.resolve(
             configured,
             request.shell,
@@ -4107,6 +4113,58 @@ const Session = struct {
 
     fn signalProcess(self: *Session, signal: contracts.Signal) bool {
         return self.signalNative(signalValue(signal));
+    }
+
+    fn signalTarget(self: *Session) ?SignalTarget {
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        defer self.mutex.unlock(zio);
+        if (!contracts.lifecycle_controls(self.lifecycle).signal) return null;
+        return .{
+            .pid = self.child_pid orelse return null,
+            .token = self.child_token orelse return null,
+        };
+    }
+
+    fn matchesSignalTarget(self: *Session, target: SignalTarget) bool {
+        var pid_buffer: [32]u8 = undefined;
+        const pid_text = std.fmt.bufPrint(
+            &pid_buffer,
+            "{d}",
+            .{target.pid},
+        ) catch return false;
+        return self.durable.profile.process_provider.matchToken(
+            self.alloc,
+            pid_text,
+            target.token,
+        ) == .matched;
+    }
+
+    fn signalTerminalProcesses(
+        self: *Session,
+        signal: contracts.Signal,
+    ) !bool {
+        const target = self.signalTarget() orelse return false;
+        if (!self.matchesSignalTarget(target)) return false;
+
+        var descendants = try process_tree.Tracker.init(self.alloc);
+        defer descendants.deinit();
+        descendants.refresh(target.pid) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.ProcessIdentityUnavailable,
+        };
+        if (!self.matchesSignalTarget(target)) return false;
+
+        const delivered = descendants.signalOutsideProcessGroup(
+            signalValue(signal),
+            target.pid,
+        );
+        debug_trace.logf(
+            "terminal_host",
+            "session signal reached outside-group descendants id={s} count={d}",
+            .{ self.id, delivered },
+        );
+        return self.signalProcess(signal);
     }
 
     fn signalNative(self: *Session, signal: std.c.SIG) bool {
@@ -5431,7 +5489,7 @@ fn signalAction(
         request.authority.?,
         .signal,
     );
-    if (!session.signalProcess(request.signal)) {
+    if (!try session.signalTerminalProcesses(request.signal)) {
         return error.ProcessIdentityUnavailable;
     }
     session.mutex.lockUncancelable(zio);
@@ -5486,11 +5544,18 @@ fn closeAction(
         session.lifecycle == .running;
     session.mutex.unlock(zio);
     if (still_live) {
-        const requested_signal: contracts.Signal = if (request.policy == .force)
-            .kill
+        const delivered = if (request.policy == .force)
+            session.signalTerminalProcesses(.kill) catch |err| blk: {
+                debug_trace.logf(
+                    "terminal_host",
+                    "force close tree signal failed id={s} err={s}; falling back to shell group",
+                    .{ session.id, @errorName(err) },
+                );
+                break :blk session.signalProcess(.kill);
+            }
         else
-            .terminate;
-        if (!session.signalProcess(requested_signal)) session.markLost();
+            session.signalProcess(.terminate);
+        if (!delivered) session.markLost();
     }
     if (request.policy == .graceful and still_live) {
         const started = io_mod.milliTimestamp();
@@ -5981,25 +6046,6 @@ fn signalTestBarrier(name: []const u8) void {
         .{ .truncate = true },
     ) catch return;
     file.close(io_mod.getIo());
-}
-
-fn configuredLoginShellInto(buffer: []u8) ?[]const u8 {
-    var entry: std.c.passwd = undefined;
-    var scratch: [4096]u8 = undefined;
-    var found: ?*std.c.passwd = null;
-    if (std.c.getpwuid_r(
-        std.c.getuid(),
-        &entry,
-        &scratch,
-        scratch.len,
-        &found,
-    ) != 0) return null;
-    const record = found orelse return null;
-    const shell_ptr = record.shell orelse return null;
-    const shell = std.mem.span(shell_ptr);
-    if (shell.len == 0 or shell.len > buffer.len) return null;
-    @memcpy(buffer[0..shell.len], shell);
-    return buffer[0..shell.len];
 }
 
 fn outcomeFromTerm(term: std.process.Child.Term) ?contracts.ReturnOutcome {

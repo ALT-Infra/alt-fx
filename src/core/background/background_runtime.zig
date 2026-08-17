@@ -3259,7 +3259,6 @@ test "background lifecycle traces stay metadata only" {
         @embedFile("../tooling/tool_runtime.zig"),
         @embedFile("../execution/command_contract.zig"),
         @embedFile("../../tools/shell/background_process.zig"),
-        @embedFile("../../tools/shell/run_command.zig"),
     };
     for (sources) |source| {
         try expectNoBackgroundLifecycleTracePathLeak(source);

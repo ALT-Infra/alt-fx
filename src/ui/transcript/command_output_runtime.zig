@@ -1824,7 +1824,7 @@ pub fn processPresentationForBlock(
     const Shell = @TypeOf(shell.*);
     if (comptime !@hasField(Shell, "tool_details")) return null;
     for (shell.tool_details.items) |detail| {
-        if (!std.mem.eql(u8, detail.tool_name, "run_command")) continue;
+        if (!detail.isCapturedCommand()) continue;
         if (detail.lifecycle_id != null and block.lifecycle_id != null and
             sameLifecycleId(detail.lifecycle_id, block.lifecycle_id))
         {
