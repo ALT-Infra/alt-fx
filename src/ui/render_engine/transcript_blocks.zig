@@ -52,6 +52,7 @@ pub const ToolFallbackDisposition = enum {
 pub const ToolDetailRecord = struct {
     entry_id: u32,
     tool_name: []u8,
+    captured_command: bool = false,
     activity_kind: ?types.ToolActivityKind = null,
     arguments_json: ?[]u8 = null,
     result: ?[]u8 = null,
@@ -64,6 +65,12 @@ pub const ToolDetailRecord = struct {
     lifecycle_id: ?types.ToolLifecycleId = null,
     presentation_group_id: ?types.ToolPresentationGroupId = null,
     command_output_entry_id: ?u32 = null,
+
+    pub fn isCapturedCommand(self: ToolDetailRecord) bool {
+        // Hand-built details and restored records may predate the explicit
+        // classifier. Preserve their historical presentation contract.
+        return self.captured_command or std.mem.eql(u8, self.tool_name, "run_command");
+    }
 
     pub fn deinit(self: *ToolDetailRecord, alloc: std.mem.Allocator) void {
         alloc.free(self.tool_name);

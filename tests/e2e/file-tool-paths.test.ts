@@ -428,8 +428,8 @@ describe("filesystem path handling", () => {
           },
           {
             id: "added_cwd_1",
-            name: "run_command",
-            input: { command: "pwd", cwd: root.external },
+            name: "terminal",
+            input: { action: "exec", command: "pwd", cwd: root.external },
             expected: root.external,
           },
         ];
@@ -608,7 +608,8 @@ describe("filesystem path handling", () => {
       const marker = join(root.external, "sandbox-proof.txt");
       writeFileSync(join(root.workspace, ".fx.json"), JSON.stringify({ sandbox: "os" }));
       const gateway = startFakeGateway([
-        toolCall("added_sandbox_write_1", "run_command", {
+        toolCall("added_sandbox_write_1", "terminal", {
+          action: "exec",
           command: "printf SANDBOX_ADDED_WRITE > sandbox-proof.txt",
           cwd: root.external,
         }),
@@ -635,7 +636,7 @@ describe("filesystem path handling", () => {
         const json = parseFxJson(result);
         expect(readFileSync(marker, "utf8")).toBe("SANDBOX_ADDED_WRITE");
         expect(json.tool_calls.map(({ name, status }) => ({ name, status }))).toEqual([
-          { name: "run_command", status: "success" },
+          { name: "terminal", status: "success" },
         ]);
         expect(gateway.classifierRequests).toHaveLength(1);
       } finally {
@@ -667,7 +668,7 @@ describe("filesystem path handling", () => {
             "--auto",
             "--json",
             "--no-save",
-            `Use read_file to read exactly ${target}, then reply with its exact content. Do not use run_command.`,
+            `Use read_file to read exactly ${target}, then reply with its exact content. Do not use terminal.`,
           ],
           {
             cwd: root.workspace,
@@ -746,7 +747,7 @@ describe("filesystem path handling", () => {
   );
 
   test(
-    "run_command reviews and executes external working-directory aliases",
+    "terminal reviews and executes external working-directory aliases",
     async () => {
       const root = createIsolatedRoot();
       try {
@@ -759,7 +760,8 @@ describe("filesystem path handling", () => {
         for (const scenario of cases) {
           const marker = join(scenario.canonical, `${scenario.id}.txt`);
           const gateway = startFakeGateway([
-            toolCall(scenario.id, "run_command", {
+            toolCall(scenario.id, "terminal", {
+              action: "exec",
               command: `pwd; printf ${scenario.id} > ${scenario.id}.txt`,
               cwd: scenario.cwd,
             }),
@@ -786,7 +788,7 @@ describe("filesystem path handling", () => {
             expect(readFileSync(marker, "utf8")).toBe(scenario.id);
             expect(
               json.tool_calls.map(({ name, status }) => ({ name, status })),
-            ).toEqual([{ name: "run_command", status: "success" }]);
+            ).toEqual([{ name: "terminal", status: "success" }]);
           } finally {
             gateway.stop();
           }

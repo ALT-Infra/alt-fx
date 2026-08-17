@@ -587,7 +587,6 @@ const App = struct {
             &app,
             footer_rows,
             builtin_gateway.default_model,
-            builtin_gateway.default_fast_mode,
             default_max_agent_steps,
             handle_sigwinch,
             launch.record_requested,
@@ -1492,8 +1491,6 @@ const App = struct {
             .permission_mode = permission_mode,
             .permission_rules = permission_rules,
             .subagent_available = self.session_persistence.subagent_host != null,
-            .terminal_available = self.session_persistence.subagent_host != null and
-                tool_dispatch.ToolCapabilities.for_host(host.current()).terminalAvailable(),
         });
     }
 
@@ -3172,7 +3169,6 @@ fn fullEntryConfig() app_entry_runtime.Config {
         .build_channel = compiled_update_channel,
         .command_catalog = builtin_commands.top_level_registry,
         .default_model = builtin_gateway.default_model,
-        .default_fast_mode = builtin_gateway.default_fast_mode,
         .default_agent_step_limit = default_max_agent_steps,
         .models_path = builtin_gateway.models_path,
         .gateway_retry_count = builtin_gateway.retry_count,
@@ -3209,7 +3205,6 @@ fn localEntryConfig() app_entry_runtime.Config {
         .build_channel = compiled_update_channel,
         .command_catalog = builtin_commands.top_level_registry,
         .default_model = builtin_gateway.default_model,
-        .default_fast_mode = builtin_gateway.default_fast_mode,
         .default_agent_step_limit = default_max_agent_steps,
         .models_path = builtin_gateway.models_path,
         .gateway_retry_count = builtin_gateway.retry_count,

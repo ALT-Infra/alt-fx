@@ -9,6 +9,7 @@ const debug_trace = @import("../../shared/debug_trace.zig");
 const file_mutation_contract = @import("../../tooling/file_mutation_contract.zig");
 const tooling_tool_admission = @import("../../tooling/tool_admission.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
+const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
 const test_builtin_tools = if (builtin.is_test)
     @import("../../../builtins/tools.zig")
 else
@@ -26,6 +27,124 @@ const ToolPermissionDecision = types.ToolPermissionDecision;
 const TraceContext = debug_trace.TraceContext;
 const AgentRuntimeDeps = runtime_deps.AgentRuntimeDeps;
 const ToolExecutionResult = runtime_tool_contracts.ToolExecutionResult;
+
+const TerminalValidationDigest = [std.crypto.hash.sha2.Sha256.digest_length]u8;
+
+const TerminalValidationDigestDecision = struct {
+    append_current: bool,
+    repeated: bool,
+};
+
+fn containsTerminalValidationDigest(
+    digests: []const TerminalValidationDigest,
+    wanted: TerminalValidationDigest,
+) bool {
+    for (digests) |digest| {
+        if (std.mem.eql(u8, digest[0..], wanted[0..])) return true;
+    }
+    return false;
+}
+
+fn terminalValidationDigestDecision(
+    previous: []const TerminalValidationDigest,
+    current: []const TerminalValidationDigest,
+    digest: TerminalValidationDigest,
+) TerminalValidationDigestDecision {
+    return .{
+        .append_current = !containsTerminalValidationDigest(current, digest),
+        .repeated = containsTerminalValidationDigest(previous, digest),
+    };
+}
+
+pub const TerminalValidationRetryState = struct {
+    previous: std.ArrayList(TerminalValidationDigest) = .empty,
+    current: std.ArrayList(TerminalValidationDigest) = .empty,
+    stop_after_batch: bool = false,
+
+    pub fn deinit(self: *TerminalValidationRetryState, alloc: Allocator) void {
+        self.previous.deinit(alloc);
+        self.current.deinit(alloc);
+        self.* = .{};
+    }
+
+    pub fn beginBatch(self: *TerminalValidationRetryState) void {
+        self.current.clearRetainingCapacity();
+        self.stop_after_batch = false;
+    }
+
+    pub fn observe(
+        self: *TerminalValidationRetryState,
+        alloc: Allocator,
+        call: ToolCall,
+        model_output: []const u8,
+    ) Allocator.Error!void {
+        if (!std.mem.eql(u8, call.name, "terminal")) return;
+        if (try tool_result_errors.inspectTerminalActionFieldCorrection(
+            alloc,
+            model_output,
+        ) == null) return;
+
+        var digest: TerminalValidationDigest = undefined;
+        std.crypto.hash.sha2.Sha256.hash(model_output, &digest, .{});
+        const decision = terminalValidationDigestDecision(
+            self.previous.items,
+            self.current.items,
+            digest,
+        );
+        if (decision.append_current) try self.current.append(alloc, digest);
+        self.stop_after_batch = self.stop_after_batch or decision.repeated;
+    }
+
+    pub fn finishBatch(self: *TerminalValidationRetryState) bool {
+        if (self.stop_after_batch) return true;
+        const previous = self.previous;
+        self.previous = self.current;
+        self.current = previous;
+        self.current.clearRetainingCapacity();
+        return false;
+    }
+};
+
+test "terminal validation retry state retains independent batch corrections" {
+    const alloc = std.testing.allocator;
+    const correction_s = try tool_result_errors.terminalActionFieldCorrectionJson(alloc, .{
+        .action = "start",
+        .invalid_fields = &.{"session_id"},
+        .missing_fields = &.{},
+        .allowed_fields = &.{ "action", "command" },
+        .conflicts = &.{},
+    });
+    defer alloc.free(correction_s);
+    const correction_t = try tool_result_errors.terminalActionFieldCorrectionJson(alloc, .{
+        .action = "read",
+        .invalid_fields = &.{"command"},
+        .missing_fields = &.{},
+        .allowed_fields = &.{ "action", "session_id", "cursor_segment" },
+        .conflicts = &.{},
+    });
+    defer alloc.free(correction_t);
+    const call: ToolCall = .{
+        .id = "terminal-call",
+        .name = "terminal",
+        .arguments_json = "{}",
+    };
+
+    var state: TerminalValidationRetryState = .{};
+    defer state.deinit(alloc);
+    state.beginBatch();
+    try state.observe(alloc, call, correction_s);
+    try state.observe(alloc, call, correction_t);
+    try state.observe(alloc, call, correction_s);
+    try std.testing.expectEqual(@as(usize, 2), state.current.items.len);
+    try std.testing.expect(!state.finishBatch());
+
+    state.beginBatch();
+    try state.observe(alloc, call, correction_t);
+    try state.observe(alloc, call, "ordinary valid result");
+    try state.observe(alloc, call, correction_s);
+    try std.testing.expectEqual(@as(usize, 2), state.current.items.len);
+    try std.testing.expect(state.finishBatch());
+}
 
 /// Human denials retained only for the current agent turn. Entries use the
 /// canonical external file action rather than the provider's tool-call ID.
@@ -73,14 +192,50 @@ pub fn deferVisibleLifecycleUntilAfterPermission(tool_name: []const u8) bool {
         file_mutation_contract.isToolName(tool_name);
 }
 
-pub fn deferRunCommandLifecycleUntilAfterAutoPermission(
-    tool_name: []const u8,
+pub fn deferCapturedCommandLifecycleForAutoPermissionNotice(
+    registry: tool_dispatch.Registry,
+    arena: Allocator,
+    call: ToolCall,
     permission_mode: PermissionMode,
     interactive_presentation: bool,
-) bool {
+) !bool {
     return interactive_presentation and
         permission_mode == .auto and
-        std.mem.eql(u8, tool_name, "run_command");
+        try tooling_tool_admission.callUsesCommandAuthority(
+            registry,
+            arena,
+            call,
+        );
+}
+
+test "auto permission lifecycle deferral applies only to terminal exec" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const exec = ToolCall{
+        .id = "exec",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"pwd\"}",
+    };
+    const start = ToolCall{
+        .id = "start",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"start\"}",
+    };
+    try std.testing.expect(try deferCapturedCommandLifecycleForAutoPermissionNotice(
+        test_builtin_tools.registry,
+        arena,
+        exec,
+        .auto,
+        true,
+    ));
+    try std.testing.expect(!try deferCapturedCommandLifecycleForAutoPermissionNotice(
+        test_builtin_tools.registry,
+        arena,
+        start,
+        .auto,
+        true,
+    ));
 }
 
 pub fn requestToolPermissionTraced(
@@ -567,11 +722,28 @@ pub fn applyInitialSessionGrants(
     arena: Allocator,
     local_grants: *std.ArrayList(PermissionGrant),
     workspace_root: []const u8,
-    tool_name: []const u8,
+    call: ToolCall,
     target_path: []const u8,
 ) !void {
-    const target_kind = if (hooks.tool_registry.lookup(tool_name)) |tool| tool.permission_target_kind else .none;
-    const grants = try permissions.suggestedSessionGrants(arena, workspace_root, tool_name, target_path, target_kind);
+    const command_call = try tooling_tool_admission.callUsesCommandAuthority(
+        hooks.tool_registry,
+        arena,
+        call,
+    );
+    const permission_name = if (command_call) "run_command" else call.name;
+    const target_kind = if (command_call)
+        tool_dispatch.PermissionTargetKind.command_cwd
+    else if (hooks.tool_registry.lookup(call.name)) |tool|
+        tool.permission_target_kind
+    else
+        .none;
+    const grants = try permissions.suggestedSessionGrants(
+        arena,
+        workspace_root,
+        permission_name,
+        target_path,
+        target_kind,
+    );
     for (grants) |grant| {
         // A broader sandbox retry is a separate scope and must receive its own
         // decision. Only that widening decision may retain a sandbox grant.

@@ -3,6 +3,7 @@ const session = @import("session.zig");
 const session_usage = @import("session_usage.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const types = @import("../shared/types.zig");
+const captured_command = @import("../tooling/captured_command.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -487,7 +488,7 @@ pub fn parseHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Histor
         if (cancelled_command != null and
             (terminal_reason != .cancelled or
                 tool_call == null or
-                !std.mem.eql(u8, tool_call.?.name, "run_command")))
+                !try isCapturedCommandToolCall(alloc, tool_call.?)))
         {
             return error.InvalidSessionFormat;
         }
@@ -502,6 +503,10 @@ pub fn parseHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Histor
         } };
     }
     return error.InvalidSessionFormat;
+}
+
+fn isCapturedCommandToolCall(alloc: Allocator, call: types.ToolCall) !bool {
+    return captured_command.isToolCall(alloc, call.name, call.arguments_json);
 }
 
 pub fn validateState(state: DurableSessionState) !void {

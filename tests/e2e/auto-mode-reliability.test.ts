@@ -80,7 +80,7 @@ function gatewayEnv(
 }
 
 function commandCall(command: string, id: string) {
-  return fakeGatewayToolCall(id, "run_command", { command });
+  return fakeGatewayToolCall(id, "terminal", { action: "exec", command });
 }
 
 function startGateway(
@@ -111,9 +111,17 @@ async function waitForEither(
 
 describe("lean auto mode reliability", () => {
   test(
-    "a deterministically safe action bypasses automatic review",
+    "a configured safe command bypasses automatic review",
     async () => {
       const root = createIsolatedRoot();
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        JSON.stringify({
+          sandbox: "none",
+          permission: { bash: { pwd: "allow" } },
+          maxxing_mode: "legacy",
+        }),
+      );
       const gateway = startGateway(
         [commandCall("pwd", "direct_pwd"), fakeGatewayFinalText("direct action complete")],
         [fakeGatewayPermissionDecision("ask", "unused_review")],
@@ -136,14 +144,14 @@ describe("lean auto mode reliability", () => {
         tool_calls: Array<{ name: string; status: string }>;
       };
       expect(json.tool_calls).toContainEqual(
-        expect.objectContaining({ name: "run_command", status: "success" }),
+        expect.objectContaining({ name: "terminal", status: "success" }),
       );
     },
     TIMEOUT,
   );
 
   test(
-    "an exact read-only git status bypasses automatic review",
+    "an exact read-only git status is reviewed once through the user profile",
     async () => {
       const root = createIsolatedRoot();
       const initialized = Bun.spawnSync(["/usr/bin/git", "init", "--quiet"], {
@@ -155,7 +163,7 @@ describe("lean auto mode reliability", () => {
           commandCall("git status --short --branch", "direct_git_status"),
           fakeGatewayFinalText("git inspection complete"),
         ],
-        [fakeGatewayPermissionDecision("ask", "unused_git_review")],
+        [fakeGatewayPermissionDecision("allow", "approved_git_review")],
       );
 
       const result = await runFx(
@@ -169,12 +177,12 @@ describe("lean auto mode reliability", () => {
 
       expect(result.code).toBe(0);
       expect(gateway.requests).toHaveLength(2);
-      expect(gateway.classifierRequests).toHaveLength(0);
+      expect(gateway.classifierRequests).toHaveLength(1);
       const json = JSON.parse(result.stdout.trim()) as {
         tool_calls: Array<{ name: string; status: string }>;
       };
       expect(json.tool_calls).toContainEqual(
-        expect.objectContaining({ name: "run_command", status: "success" }),
+        expect.objectContaining({ name: "terminal", status: "success" }),
       );
     },
     TIMEOUT,
@@ -184,6 +192,14 @@ describe("lean auto mode reliability", () => {
     "a first automatic block returns to the agent for a safe replan",
     async () => {
       const root = createIsolatedRoot();
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        JSON.stringify({
+          sandbox: "none",
+          permission: { bash: { pwd: "allow" } },
+          maxxing_mode: "legacy",
+        }),
+      );
       const rejectedMarker = join(root.workspace, "rejected-action-must-not-run");
       const gateway = startGateway(
         [
@@ -325,6 +341,14 @@ describe("lean auto mode reliability", () => {
     "a prompt-capable host also lets the agent recover before asking the user",
     async () => {
       const root = createIsolatedRoot();
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        JSON.stringify({
+          sandbox: "none",
+          permission: { bash: { pwd: "allow" } },
+          maxxing_mode: "legacy",
+        }),
+      );
       const rejectedMarker = join(root.workspace, "tui-rejected-action-must-not-run");
       const stderrPath = join(root.root, "stderr.log");
       writeFileSync(stderrPath, "");
@@ -404,7 +428,7 @@ describe("lean auto mode reliability", () => {
       await activeSession.sendText("Initialize the saved allow session.");
       await activeSession.waitForText("allow session initialized", TIMEOUT);
       await activeSession.sendText(
-        `/permissions remember allow run_command ${JSON.stringify({ command: allowedCommand })}`,
+        `/permissions remember allow terminal ${JSON.stringify({ action: "exec", command: allowedCommand })}`,
       );
       await activeSession.waitForText("Remember allow for this saved session", TIMEOUT);
       await activeSession.sendKeys("1");
@@ -459,7 +483,7 @@ describe("lean auto mode reliability", () => {
         join(root.home, ".fx", "settings.json"),
         JSON.stringify({
           sandbox: "none",
-          permission: { bash: { [blockedCommand]: "allow" } },
+          permission: { bash: { [blockedCommand]: "allow", pwd: "allow" } },
           maxxing_mode: "legacy",
         }),
       );
@@ -486,7 +510,7 @@ describe("lean auto mode reliability", () => {
       await activeSession.sendText("Initialize this saved session.");
       await activeSession.waitForText("session initialized", TIMEOUT);
       await activeSession.sendText(
-        `/permissions remember deny run_command ${JSON.stringify({ command: blockedCommand })}`,
+        `/permissions remember deny terminal ${JSON.stringify({ action: "exec", command: blockedCommand })}`,
       );
       await activeSession.waitForText("Remember deny for this saved session", TIMEOUT);
       await activeSession.sendKeys("1");

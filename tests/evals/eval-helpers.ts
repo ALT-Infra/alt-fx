@@ -388,26 +388,26 @@ export function assertNoAskUserQuestionMatching(
   expect(matchingOrUninspectable).toBe(false);
 }
 
-export function assertRunCommandMatches(
+export function assertTerminalExecMatches(
   result: EvalResult,
   pattern: RegExp,
 ): void {
-  const matched = recordedRunCommands(result).some((command) => pattern.test(command));
+  const matched = recordedTerminalExecCommands(result).some((command) => pattern.test(command));
   expect(matched).toBe(true);
 }
 
-export function assertNoRunCommandMatches(
+export function assertNoTerminalExecMatches(
   result: EvalResult,
   pattern: RegExp,
 ): void {
-  const matched = recordedRunCommands(result).some((command) => pattern.test(command));
+  const matched = recordedTerminalExecCommands(result).some((command) => pattern.test(command));
   expect(matched).toBe(false);
 }
 
-function recordedRunCommands(result: EvalResult): string[] {
+function recordedTerminalExecCommands(result: EvalResult): string[] {
   const commands = new Set<string>();
   for (const tc of result.json.tool_calls ?? []) {
-    if (tc.name !== "run_command") continue;
+    if (tc.name !== "terminal") continue;
     const command = tc.command_result?.command;
     if (command) commands.add(command);
   }
@@ -418,12 +418,12 @@ function recordedRunCommands(result: EvalResult): string[] {
   return [...commands];
 }
 
-export function assertFirstRunCommandMatches(
+export function assertFirstTerminalExecMatches(
   result: EvalResult,
   pattern: RegExp,
 ): void {
   const first = result.json.tool_calls?.[0];
-  expect(first?.name).toBe("run_command");
+  expect(first?.name).toBe("terminal");
   expect(pattern.test(first?.command_result?.command ?? "")).toBe(true);
 }
 

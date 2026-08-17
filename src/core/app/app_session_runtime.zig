@@ -26,6 +26,7 @@ const session_child_store = @import("../session/session_child_store.zig");
 const result_store = @import("../session/result_store.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
 const command_output_content = @import("../tooling/command_output_content.zig");
+const captured_command = @import("../tooling/captured_command.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
 const session_log = @import("../session/session_log.zig");
 const session_resume_view = @import("../session/session_resume_view.zig");
@@ -2101,8 +2102,7 @@ pub fn Runtime(comptime App: type) type {
         pub fn recordToolTerminal(
             app: *App,
             event: types.ToolLifecycleEvent,
-            tool_name: ?[]const u8,
-            activity_kind: types.ToolActivityKind,
+            captured_command_call: bool,
         ) void {
             const terminal = switch (event) {
                 .terminal => |value| value,
@@ -2115,10 +2115,7 @@ pub fn Runtime(comptime App: type) type {
             if (capture_disabled) {
                 app.session_persistence.disabled_cancelled_command_capture = null;
             }
-            if (activity_kind != .command or
-                tool_name == null or
-                !std.mem.eql(u8, tool_name.?, "run_command"))
-            {
+            if (!captured_command_call) {
                 discardPendingCancelledCommand(app, terminal.id, "non_command_terminal");
                 return;
             }
@@ -2332,9 +2329,14 @@ pub fn Runtime(comptime App: type) type {
                 pending.discard(app.alloc);
                 return appendHistoryTurnWithOutcome(app, turn, mode, snapshot_file_ownership);
             };
+            const is_command = try captured_command.isToolCall(
+                app.alloc,
+                call.name,
+                call.arguments_json,
+            );
             if (!pending.cancelled or
                 !pending.completed or
-                !std.mem.eql(u8, call.name, "run_command") or
+                !is_command or
                 !std.mem.eql(u8, call.id, pending.lifecycle_id.call_id))
             {
                 pending.discard(app.alloc);
@@ -3559,11 +3561,14 @@ pub fn Runtime(comptime App: type) type {
             if (try writeAnsweredQuestionResult(app, sink, call, result)) return;
             if (try writeCommittedFilePresentation(app, sink, call, result)) return;
 
-            const is_command = std.mem.eql(u8, result.tool_name, "run_command");
+            const is_command = try captured_command.isToolCall(
+                app.alloc,
+                call.name,
+                call.arguments_json,
+            );
             const context_deferred = types.isContextDeferredToolResult(result);
             const deferred = types.isDeferredToolResult(result);
-            const process_ran = is_command and
-                result.command_process_presentation != null;
+            const process_ran = result.command_process_presentation != null;
 
             var action_arena = std.heap.ArenaAllocator.init(app.alloc);
             defer action_arena.deinit();
@@ -7728,8 +7733,7 @@ test "cancelled command presentation survives a persisted session restart" {
                 .outcome = .{ .kind = .cancelled, .summary = "Cancelled slow" },
                 .command_artifact_handle = "fx-command-cancelled.log",
             } },
-            "run_command",
-            .command,
+            true,
         );
         Runtime(TestApp).recordCommandOutputComplete(&app, lifecycle_id);
 
@@ -7738,8 +7742,8 @@ test "cancelled command presentation survives a persisted session restart" {
             .assistant = @constCast("I started it."),
             .tool_call = .{
                 .id = "cancelled-command",
-                .name = "run_command",
-                .arguments_json = "{\"command\":\"slow\"}",
+                .name = "terminal",
+                .arguments_json = "{\"action\":\"exec\",\"command\":\"slow\"}",
             },
         } });
         session_id = try alloc.dupe(u8, app.session_persistence.writable.?.active_id);
@@ -7798,8 +7802,7 @@ test "cancelled command capture creation failure preserves the row" {
             .id = lifecycle_id,
             .outcome = .{ .kind = .cancelled, .summary = "Cancelled" },
         } },
-        "run_command",
-        .command,
+        true,
     );
     Runtime(TestApp).recordCommandOutputComplete(&app, lifecycle_id);
     try Runtime(TestApp).appendHistoryTurn(&app, .{ .interrupted = .{
@@ -7848,8 +7851,7 @@ test "cancelled command identity failure never persists a replay suffix" {
             .id = lifecycle_id,
             .outcome = .{ .kind = .cancelled, .summary = "Cancelled" },
         } },
-        "run_command",
-        .command,
+        true,
     );
     Runtime(TestApp).recordCommandOutputComplete(&app, lifecycle_id);
     try Runtime(TestApp).appendHistoryTurn(&app, .{ .interrupted = .{
@@ -7892,8 +7894,7 @@ test "cancelled command spill failure degrades without losing the row" {
             .id = lifecycle_id,
             .outcome = .{ .kind = .cancelled, .summary = "Cancelled" },
         } },
-        "run_command",
-        .command,
+        true,
     );
     Runtime(TestApp).recordCommandOutputComplete(&app, lifecycle_id);
     try Runtime(TestApp).appendHistoryTurn(&app, .{ .interrupted = .{
@@ -7942,8 +7943,7 @@ test "reactive interrupted history discards the app replay candidate" {
             .id = lifecycle_id,
             .outcome = .{ .kind = .cancelled, .summary = "Cancelled" },
         } },
-        "run_command",
-        .command,
+        true,
     );
     Runtime(TestApp).recordCommandOutputComplete(&app, lifecycle_id);
     var before = try Runtime(TestApp).childCapability(&app).?.iterate(
@@ -8003,10 +8003,54 @@ test "ordinary command terminal discards the app replay candidate" {
             .id = lifecycle_id,
             .outcome = .{ .kind = .completed, .summary = "Completed" },
         } },
-        "run_command",
-        .command,
+        true,
     );
     try std.testing.expect(app.session_persistence.pending_cancelled_command == null);
+}
+
+test "cancelled durable terminal action preserves the exec replay candidate" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+    const exec_id = types.ToolLifecycleId{
+        .turn_id = 11,
+        .call_id = "cancelled-exec",
+    };
+    const durable_id = types.ToolLifecycleId{
+        .turn_id = 11,
+        .call_id = "cancelled-read",
+    };
+
+    Runtime(TestApp).recordAppliedCommandOutput(
+        &app,
+        exec_id,
+        .stdout,
+        "captured before cancellation\n",
+    );
+    Runtime(TestApp).recordToolTerminal(
+        &app,
+        .{ .terminal = .{
+            .id = exec_id,
+            .outcome = .{ .kind = .cancelled, .summary = "Cancelled exec" },
+        } },
+        true,
+    );
+    Runtime(TestApp).recordCommandOutputComplete(&app, exec_id);
+
+    Runtime(TestApp).recordToolTerminal(
+        &app,
+        .{ .terminal = .{
+            .id = durable_id,
+            .outcome = .{ .kind = .cancelled, .summary = "Cancelled read" },
+        } },
+        false,
+    );
+
+    const pending = app.session_persistence.pending_cancelled_command orelse
+        return error.TestExpectedEqual;
+    try std.testing.expect(pending.matches(exec_id));
+    try std.testing.expect(pending.cancelled);
+    try std.testing.expect(pending.completed);
 }
 
 test "zero-output cancelled command restores detail without an output block" {

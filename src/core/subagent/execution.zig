@@ -21,6 +21,7 @@ const session_event = @import("../session/session_event.zig");
 const session_store = @import("../session/session_store.zig");
 const permissions = @import("../permissions/permissions.zig");
 const tooling_tool_admission = @import("../tooling/tool_admission.zig");
+const shell_resolver = @import("../terminal/shell_resolver.zig");
 const background_runtime = @import("../background/background_runtime.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const types = @import("../shared/types.zig");
@@ -5915,8 +5916,8 @@ test "canonical approval wait refreshes revoked authority and races reject relat
                 arena_state.allocator(),
                 .{
                     .id = "canonical-call",
-                    .name = "run_command",
-                    .arguments_json = "{\"command\":\"git status\"}",
+                    .name = "terminal",
+                    .arguments_json = "{\"action\":\"exec\",\"command\":\"git status\"}",
                 },
                 .auto,
                 &.{},
@@ -5956,7 +5957,7 @@ test "canonical approval wait refreshes revoked authority and races reject relat
         .workspace_root = "/tmp/workspace",
         .permission_grants = &.{},
         .permission_rules = .{ .rules = &rules },
-        .tool_registry = .{ .tools = &.{test_builtin_tools.run_command} },
+        .tool_registry = .{ .tools = &.{test_builtin_tools.terminal} },
         .worker = &turn.worker,
         .permission_prompter = turn.permissionPrompter(),
         .background = &background,
@@ -6100,8 +6101,8 @@ test "canonical approval wait refreshes revoked authority and races reject relat
         refreshed_arena.allocator(),
         .{
             .id = "canonical-call",
-            .name = "run_command",
-            .arguments_json = "{\"command\":\"git status\"}",
+            .name = "terminal",
+            .arguments_json = "{\"action\":\"exec\",\"command\":\"git status\"}",
         },
         "/tmp/workspace",
         "/tmp/workspace",
@@ -7861,9 +7862,12 @@ fn runProductionSandboxGenerationCase(
     }
 
     var host = LiveRevalidationHost{
-        .tool_name = "run_command",
+        .tool_name = "terminal",
         .sandbox_command = "npm test",
     };
+    var login_shell_buffer: [4096]u8 = undefined;
+    const login_shell = shell_resolver.configuredLoginShellInto(&login_shell_buffer) orelse
+        return error.SkipZigTest;
     var authority = authority_mod.Resolver{
         .sessions = &env.store,
         .host = .{ .context = &host, .resolve_fn = LiveRevalidationHost.resolve },
@@ -7908,6 +7912,7 @@ fn runProductionSandboxGenerationCase(
                     .background = false,
                     .resolved_backend = .macos,
                     .target_os = builtin.os.tag,
+                    .environment = .{ .user = login_shell },
                     .scope = .restricted,
                 },
             },
@@ -7931,8 +7936,8 @@ fn runProductionSandboxGenerationCase(
 
     const calls = [_]types.ToolCall{.{
         .id = "generation-bound-sandbox",
-        .name = "run_command",
-        .arguments_json = "{\"command\":\"npm test\"}",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"npm test\"}",
     }};
     const completions = [_]agent_test_support.FakeCompletion{
         .{ .tool_calls = &calls },
@@ -8037,12 +8042,15 @@ test "production child sandbox grant revocation requires a separate widening app
     }
 
     var host = LiveRevalidationHost{
-        .tool_name = "run_command",
+        .tool_name = "terminal",
         .sandbox_command = "npm test",
         .command_action = .ask,
         .changed_command_action = .allow,
         .initial_sandbox_grant = true,
     };
+    var login_shell_buffer: [4096]u8 = undefined;
+    const login_shell = shell_resolver.configuredLoginShellInto(&login_shell_buffer) orelse
+        return error.SkipZigTest;
     var authority = authority_mod.Resolver{
         .sessions = &env.store,
         .host = .{ .context = &host, .resolve_fn = LiveRevalidationHost.resolve },
@@ -8089,6 +8097,7 @@ test "production child sandbox grant revocation requires a separate widening app
                     .background = false,
                     .resolved_backend = .macos,
                     .target_os = builtin.os.tag,
+                    .environment = .{ .user = login_shell },
                     .scope = .restricted,
                 },
             },
@@ -8112,8 +8121,8 @@ test "production child sandbox grant revocation requires a separate widening app
 
     const calls = [_]types.ToolCall{.{
         .id = "revoked-sandbox-grant",
-        .name = "run_command",
-        .arguments_json = "{\"command\":\"npm test\"}",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"npm test\"}",
     }};
     const completions = [_]agent_test_support.FakeCompletion{
         .{ .tool_calls = &calls },
@@ -8190,10 +8199,12 @@ test "production child sandbox grant revocation requires a separate widening app
             ledger.approvals,
             widening_approval_id,
         ) orelse return error.TestApprovalNotRegistered;
-        try std.testing.expectEqualStrings(
-            "broader file access: npm test",
+        try std.testing.expect(std.mem.startsWith(
+            u8,
             widening.label,
-        );
+            "broader file access: # terminal.exec profile=user shell=",
+        ));
+        try std.testing.expect(std.mem.endsWith(u8, widening.label, "\\x0anpm test"));
         try std.testing.expectEqual(
             communication.ApprovalStatus.pending,
             widening.status,

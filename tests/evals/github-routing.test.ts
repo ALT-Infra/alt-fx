@@ -5,8 +5,8 @@ import { join } from "node:path";
 import {
   assertFirstToolIn,
   assertNoAskUserQuestionMatching,
-  assertNoRunCommandMatches,
-  assertRunCommandMatches,
+  assertNoTerminalExecMatches,
+  assertTerminalExecMatches,
   assertToolNotUsed,
   cleanupWorkDir,
   createWorkDir,
@@ -21,7 +21,7 @@ const LOCAL_FIRST_TOOLS = [
   "grep_files",
   "semantic_search",
   "read_file",
-  "run_command",
+  "terminal",
 ] as const;
 
 let workDir: string | null = null;
@@ -78,7 +78,7 @@ function assertNoWebSearchOrHandleQuestion(result: EvalResult): void {
 function assertFirstActionIsLocal(result: EvalResult): void {
   assertFirstToolIn(result, LOCAL_FIRST_TOOLS);
   const first = result.json.tool_calls[0];
-  if (first?.name === "run_command") {
+  if (first?.name === "terminal") {
     expect(/^git\s+/.test(first.command_result?.command ?? "")).toBe(true);
   }
 }
@@ -121,8 +121,8 @@ describe("eval: GitHub and repo routing", () => {
       );
 
       assertNoWebSearchOrHandleQuestion(result);
-      assertNoRunCommandMatches(result, /^gh\s+/);
-      assertRunCommandMatches(result, /^git\s+(log|status|branch)\b/);
+      assertNoTerminalExecMatches(result, /^gh\s+/);
+      assertTerminalExecMatches(result, /^git\s+(log|status|branch)\b/);
       expect(result.json.exit_code).toBe(0);
     },
     TIMEOUT,
@@ -142,7 +142,7 @@ describe("eval: GitHub and repo routing", () => {
         },
       );
 
-      assertRunCommandMatches(result, /^gh\s+/);
+      assertTerminalExecMatches(result, /^gh\s+/);
       assertNoWebSearchOrHandleQuestion(result);
       expect(result.json.exit_code).toBe(0);
     },

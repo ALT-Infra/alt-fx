@@ -251,7 +251,6 @@ const AcpContext = struct {
             } else null,
             .cancel_flag = &session.cancel_flag,
             .background = &self.state.background,
-            .background_launch_policy = .durable_long_lived,
             .session = &session.session_rt,
             .session_allocator = self.alloc,
             .skills_dir = self.state.skills.dir,
@@ -516,8 +515,6 @@ pub fn handlePrompt(
         .permission_rules = session.permission_rules,
         .mcp_runtime = session.mcp,
         .subagent_available = state.subagent_host != null,
-        .terminal_available = state.subagent_host != null and
-            tool_dispatch.ToolCapabilities.for_host(host.current()).terminalAvailable(),
     });
     defer tool_projection.deinit(alloc);
 
@@ -661,7 +658,6 @@ pub fn runSubagentChild(
             .permission_rules = admission.rules,
             .mcp_runtime = mcp,
             .subagent_available = true,
-            .terminal_available = tool_dispatch.ToolCapabilities.for_host(host.current()).terminalAvailable(),
         },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(alloc);
@@ -2389,6 +2385,7 @@ pub fn mapToolKind(tool_name: []const u8) acp_types.ToolCallKind {
     if (std.mem.eql(u8, tool_name, "rename_file")) return .move;
     if (std.mem.eql(u8, tool_name, "copy_file")) return .move;
     if (std.mem.eql(u8, tool_name, "create_folder")) return .edit;
+    if (std.mem.eql(u8, tool_name, "terminal")) return .execute;
     if (std.mem.eql(u8, tool_name, "run_command")) return .execute;
     if (std.mem.eql(u8, tool_name, "memory")) return .other;
     if (std.mem.eql(u8, tool_name, "skill")) return .other;
@@ -2429,7 +2426,7 @@ test "ACP lifecycle action preserves dynamic MCP availability boundaries" {
     defer alloc.free(missing_label);
     try std.testing.expectEqualStrings("Working: mcp_lookup", missing_label);
 
-    const builtin = dynamicMcpToolAvailable(builtin_tools.registry, "run_command", &.{"run_command"}, @ptrCast(&fixture), Fixture.hasTool, .unrestricted);
+    const builtin = dynamicMcpToolAvailable(builtin_tools.registry, "terminal", &.{"terminal"}, @ptrCast(&fixture), Fixture.hasTool, .unrestricted);
     try std.testing.expect(!builtin);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
 }
@@ -3366,8 +3363,8 @@ test "ACP pending tool_call updates keep provider ids stable and dedupe" {
 
     const call = ToolCall{
         .id = "provider_call_7",
-        .name = "run_command",
-        .arguments_json = "{\"command\":\"ls\"}",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"ls\"}",
     };
     const first = try ctx.sendToolCallPending(alloc, call);
     const second = try ctx.sendToolCallPending(alloc, call);
@@ -3410,8 +3407,8 @@ test "ACP defers cancelled sandbox retry to one combined failed update" {
 
     const call = ToolCall{
         .id = "retry_call",
-        .name = "run_command",
-        .arguments_json = "{\"command\":\"npm test\"}",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"npm test\"}",
     };
     const acp_id = try ctx.sendToolCallPending(alloc, call);
     const request: agent_runtime.ToolExecutionRequest = .{
@@ -3476,8 +3473,8 @@ test "ACP defers cancelled sandbox retry to one combined failed update" {
 
     const ordinary_call = ToolCall{
         .id = "ordinary_call",
-        .name = "run_command",
-        .arguments_json = "{\"command\":\"npm test\"}",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"npm test\"}",
     };
     const ordinary_acp_id = try ctx.sendToolCallPending(alloc, ordinary_call);
     var ordinary_request = request;
@@ -3850,7 +3847,7 @@ test "ACP prompt projection configures web search then blocks native execution" 
     try std.testing.expectEqual(@as(usize, 0), provider_state.calls);
 }
 
-test "ACP run_command admission preserves direct configured authority and falls back to approval without a reviewer" {
+test "ACP default user commands require configured authority or review" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -3861,18 +3858,16 @@ test "ACP run_command admission preserves direct configured authority and falls 
 
     const direct = (try requestToolPermissionOutcome(&ctx, arena, .{
         .id = "direct",
-        .name = "run_command",
-        .arguments_json = "{\"command\":\"pwd\"}",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"pwd\"}",
     }, .ask, &.{}, &.{}));
-    switch ((direct.execution_authority orelse return error.TestExpectedEqual).run_command) {
-        .direct_only => |fingerprint| try std.testing.expectEqualStrings("/tmp/workspace", fingerprint.resolved_cwd),
-        .shell_allowed => return error.TestExpectedDirectOnly,
-    }
+    try std.testing.expectEqual(ToolPermissionDecision.permission_required, direct.decision);
+    try std.testing.expect(direct.execution_authority == null);
 
     const blocked = (try requestToolPermissionOutcome(&ctx, arena, .{
         .id = "blocked",
-        .name = "run_command",
-        .arguments_json = "{\"command\":\"touch blocked.txt\"}",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"touch blocked.txt\"}",
     }, .ask, &.{}, &.{}));
     try std.testing.expectEqual(ToolPermissionDecision.permission_required, blocked.decision);
     try std.testing.expect(blocked.execution_authority == null);
@@ -3880,8 +3875,8 @@ test "ACP run_command admission preserves direct configured authority and falls 
     state.active_session.?.permission_rules = try testPermissionRuleSet(alloc, "bash", "touch *", .allow);
     const configured = (try requestToolPermissionOutcome(&ctx, arena, .{
         .id = "configured",
-        .name = "run_command",
-        .arguments_json = "{\"command\":\"touch configured.txt\"}",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"touch configured.txt\"}",
     }, .ask, &.{}, &.{}));
     switch ((configured.execution_authority orelse return error.TestExpectedEqual).run_command) {
         .direct_only => return error.TestExpectedShellAllowed,
@@ -3892,8 +3887,8 @@ test "ACP run_command admission preserves direct configured authority and falls 
     state.active_session.?.permission_rules = .{};
     const automatic = (try requestToolPermissionOutcome(&ctx, arena, .{
         .id = "automatic",
-        .name = "run_command",
-        .arguments_json = "{\"command\":\"touch automatic.txt\"}",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"touch automatic.txt\"}",
     }, .auto, &.{}, &.{}));
     try std.testing.expectEqual(ToolPermissionDecision.deny, automatic.decision);
     try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, automatic.denial_reason.?);
@@ -3940,21 +3935,33 @@ test "ACP auto mode uses automatic review allow and ask without prompting" {
         ),
     };
 
-    const direct = try requestToolPermissionOutcome(&ctx, arena, .{
+    const direct_call: ToolCall = .{
         .id = "direct",
-        .name = "run_command",
-        .arguments_json = "{\"command\":\"pwd\"}",
-    }, .auto, &.{}, &.{});
-    switch ((direct.execution_authority orelse return error.TestExpectedEqual).run_command) {
-        .direct_only => {},
-        .shell_allowed => return error.TestExpectedDirectOnly,
-    }
-    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"pwd\"}",
+    };
+    var direct_review = TestReviewTurn.init("Inspect the workspace.", direct_call);
+    const direct = try requestToolPermissionOutcomeWithRequest(
+        &ctx,
+        arena,
+        direct_call,
+        direct_review.context(),
+        .auto,
+        &.{},
+        null,
+        null,
+        &.{},
+    );
+    try std.testing.expectEqual(
+        command_admission.ShellAuthorizationSource.auto_classifier,
+        direct.execution_authority.?.run_command.shell_allowed.source,
+    );
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
 
     const accepted_call: ToolCall = .{
         .id = "accepted",
-        .name = "run_command",
-        .arguments_json = "{\"command\":\"touch accepted.txt\"}",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"touch accepted.txt\"}",
     };
     var accepted_review = TestReviewTurn.init("Create accepted.txt.", accepted_call);
     const accepted = try requestToolPermissionOutcomeWithRequest(&ctx, arena, accepted_call, accepted_review.context(), .auto, &.{}, null, null, &.{});
@@ -3965,7 +3972,7 @@ test "ACP auto mode uses automatic review allow and ask without prompting" {
             authority.source,
         ),
     }
-    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
     try std.testing.expectEqualStrings(
         "Create accepted.txt.",
         fake.root_text,
@@ -3974,15 +3981,15 @@ test "ACP auto mode uses automatic review allow and ask without prompting" {
     fake.decision = .ask;
     const blocked_call: ToolCall = .{
         .id = "check",
-        .name = "run_command",
-        .arguments_json = "{\"command\":\"touch check.txt\"}",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"touch check.txt\"}",
     };
     var blocked_review = TestReviewTurn.init("Check whether this is allowed.", blocked_call);
     const blocked = try requestToolPermissionOutcomeWithRequest(&ctx, arena, blocked_call, blocked_review.context(), .auto, &.{}, null, null, &.{});
     try std.testing.expectEqual(ToolPermissionDecision.deny, blocked.decision);
     try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, blocked.denial_reason.?);
     try std.testing.expect(blocked.execution_authority == null);
-    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
     const blocked_classifier = blocked.auto_review_result orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(permission_auto_classifier.Decision.ask, blocked_classifier.decision);
     try std.testing.expectEqualStrings("test reviewer rationale", blocked_classifier.rationale);

@@ -3373,11 +3373,11 @@ test "processQueuedPrompt delivers parent context created between tool steps" {
     try expectBodyContains(&first_gateway, 1, "late child delivery");
 }
 
-test "processQueuedPrompt blocks accidental restart of non-live background history command" {
+test "processQueuedPrompt blocks accidental terminal restart of non-live background history" {
     const alloc = std.testing.allocator;
     const command = "while true; do echo labs7; sleep 1; done";
-    const args = "{\"command\":\"while true; do echo labs7; sleep 1; done\",\"background\":true}";
-    const calls = [_]ToolCall{toolCall("call_restart", "run_command", args)};
+    const args = "{\"action\":\"start\",\"command\":\"while true; do echo labs7; sleep 1; done\"}";
+    const calls = [_]ToolCall{toolCall("call_restart", "terminal", args)};
     const completions = [_]FakeCompletion{
         .{ .content = "I will check it.", .tool_calls = &calls },
         .{ .content = "No." },
@@ -3389,7 +3389,7 @@ test "processQueuedPrompt blocks accidental restart of non-live background histo
     hooks.runtime_context_text =
         "Runtime context: previous background command history includes command(s) that are no longer live. Treat these as terminal historical records, not running tasks.\n" ++
         "- command=while true; do echo labs7; sleep 1; done; log=/tmp/labs7.log; state=stopped\n" ++
-        "For any listed command, answer liveness questions from this state; do not assume it is still running, do not reuse it as a running background command, and do not call run_command to restart the same command unless the user explicitly asks to start it again.";
+        "For any listed command, answer liveness questions from this state; do not assume it is still running or reuse it as a live background task. Restart a listed command only if the user explicitly asks.";
 
     var fixture = PromptFixture{};
     var job = fixture.job();
@@ -3407,7 +3407,11 @@ test "processQueuedPrompt blocks accidental restart of non-live background histo
         hooks.lifecycle_events.items[2].terminal.outcome.kind,
     );
     try std.testing.expectEqualStrings("No.", hooks.finish_assistant_text.?);
-    try expectBodyContains(&gateway, 1, "Blocked restarting non-live background command from history");
+    try expectBodyContains(
+        &gateway,
+        1,
+        "Blocked restarting non-live background command from history",
+    );
     try expectBodyContains(&gateway, 1, command);
 }
 

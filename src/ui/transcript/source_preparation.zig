@@ -858,7 +858,7 @@ fn buildCommandOutputOverridesInterruptible(
 
     for (self.tool_details.items) |detail| {
         try build_checkpoint.tick(checkpoint);
-        if (!std.mem.eql(u8, detail.tool_name, "run_command")) continue;
+        if (!detail.isCapturedCommand()) continue;
         const entry_index = overrides.entry_indices.get(detail.entry_id) orelse continue;
         const entry = self.entries.items[entry_index];
         const raw = switch (entry) {

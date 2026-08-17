@@ -1,6 +1,7 @@
 const std = @import("std");
 const auto_classifier = @import("auto_classifier.zig");
 const command_effect = @import("../shell_command/command_effect.zig");
+const command_environment = @import("../execution/command_environment.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
 const types = @import("../shared/types.zig");
 
@@ -10,6 +11,7 @@ pub const CommandContext = struct {
     background: bool,
     resolved_backend: types.BackendKind,
     target_os: std.Target.Os.Tag,
+    environment: command_environment.Environment = .legacy,
     scope: auto_classifier.SandboxScope = .restricted,
 };
 
@@ -19,6 +21,7 @@ pub const AdmissionFingerprint = struct {
     background: bool,
     resolved_backend: types.BackendKind,
     target_os: std.Target.Os.Tag,
+    environment: command_environment.Environment = .legacy,
     scope: auto_classifier.SandboxScope,
 
     pub fn init(ctx: CommandContext) AdmissionFingerprint {
@@ -28,6 +31,7 @@ pub const AdmissionFingerprint = struct {
             .background = ctx.background,
             .resolved_backend = ctx.resolved_backend,
             .target_os = ctx.target_os,
+            .environment = ctx.environment,
             .scope = ctx.scope,
         };
     }
@@ -38,6 +42,7 @@ pub const AdmissionFingerprint = struct {
             self.background == ctx.background and
             self.resolved_backend == ctx.resolved_backend and
             self.target_os == ctx.target_os and
+            self.environment.eql(ctx.environment) and
             self.scope == ctx.scope;
     }
 
@@ -48,6 +53,7 @@ pub const AdmissionFingerprint = struct {
             .background = other.background,
             .resolved_backend = other.resolved_backend,
             .target_os = other.target_os,
+            .environment = other.environment,
             .scope = other.scope,
         });
     }
@@ -123,6 +129,9 @@ pub fn defaultForRunCommand(
     alloc: std.mem.Allocator,
     command_ctx: CommandContext,
 ) DefaultApproval {
+    if (command_ctx.environment.requiresShellRoute()) {
+        return .{ .approval_required = .dynamic_shell };
+    }
     var admission = command_effect.plan(
         alloc,
         command_ctx.command,
@@ -163,5 +172,20 @@ test "normalized default emits direct-only only for a direct plan" {
     try std.testing.expectEqual(
         command_effect.ApprovalReason.filesystem_write,
         defaultForRunCommand(std.testing.allocator, write_ctx).approval_required,
+    );
+}
+
+test "explicit user environment always requires shell authority" {
+    const user_ctx = CommandContext{
+        .command = "pwd",
+        .resolved_cwd = "/workspace",
+        .background = false,
+        .resolved_backend = .none,
+        .target_os = .macos,
+        .environment = .{ .user = "/bin/zsh" },
+    };
+    try std.testing.expectEqual(
+        command_effect.ApprovalReason.dynamic_shell,
+        defaultForRunCommand(std.testing.allocator, user_ctx).approval_required,
     );
 }
