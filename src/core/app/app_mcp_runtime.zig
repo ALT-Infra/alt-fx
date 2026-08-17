@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const mcp_access = @import("../mcp/access_policy.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
@@ -92,6 +93,10 @@ const PendingReload = struct {
     }
 
     fn join(self: *PendingReload) void {
+        if (comptime builtin.single_threaded) {
+            std.debug.assert(self.thread == null);
+            return;
+        }
         if (self.thread) |thread| {
             self.thread = null;
             thread.join();
@@ -322,13 +327,17 @@ pub const State = struct {
         self.pending_reload = pending;
         self.lock.unlock(io_mod.getIo());
 
-        pending.thread = std.Thread.spawn(.{}, PendingReload.run, .{pending}) catch |err| {
-            self.lock.lockUncancelable(io_mod.getIo());
-            if (self.pending_reload == pending) self.pending_reload = null;
-            self.lock.unlock(io_mod.getIo());
-            alloc.destroy(pending);
-            return err;
-        };
+        if (comptime builtin.single_threaded) {
+            pending.run();
+        } else {
+            pending.thread = std.Thread.spawn(.{}, PendingReload.run, .{pending}) catch |err| {
+                self.lock.lockUncancelable(io_mod.getIo());
+                if (self.pending_reload == pending) self.pending_reload = null;
+                self.lock.unlock(io_mod.getIo());
+                alloc.destroy(pending);
+                return err;
+            };
+        }
     }
 
     pub fn takeReloadCompletion(self: *State) ?ReloadCompletion {
