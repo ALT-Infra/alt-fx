@@ -868,13 +868,13 @@ test "full projection matches file details to full diffs by marker and lifecycle
     const compact_first = try @import("../core/output/diff.zig").wrapWithMarkers(
         alloc,
         101,
-        "COMPACT_FIRST\n",
+        "\x1b[38;5;252m  │ \x1b[38;5;203m1 -\x1b[38;5;252m ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnCOMPACT_FIRST_TAIL\x1b[0m\n",
     );
     defer alloc.free(compact_first);
     const compact_second = try @import("../core/output/diff.zig").wrapWithMarkers(
         alloc,
         102,
-        "COMPACT_SECOND\n",
+        "\x1b[38;5;252m  │ \x1b[38;5;77m1 +\x1b[38;5;252m ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnCOMPACT_SECOND_TAIL\x1b[0m\n",
     );
     defer alloc.free(compact_second);
     const entries = [_]transcript_blocks.TranscriptEntry{
@@ -900,8 +900,10 @@ test "full projection matches file details to full diffs by marker and lifecycle
     defer for (&details) |*detail| detail.deinit(alloc);
 
     const Resolver = struct {
+        const full_first = "\x1b[38;5;252m  │ \x1b[38;5;203m1 -\x1b[38;5;252m ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnFULL_FIRST_TAIL\x1b[0m\n";
+
         fn fullForMarker(_: *anyopaque, id: u32) ?[]const u8 {
-            return if (id == 101) "FULL_FIRST\n" else null;
+            return if (id == 101) full_first else null;
         }
 
         fn hasFullForLifecycle(_: *anyopaque, lifecycle_id: types.ToolLifecycleId) bool {
@@ -909,13 +911,14 @@ test "full projection matches file details to full diffs by marker and lifecycle
         }
     };
     var resolver_context: u8 = 0;
+    const styles: transcript_blocks.Styles = .{ .system_notice_label_style = "", .system_notice_text_style = "", .reset_style = "", .dim_style = "", .red_style = "" };
     var projection = try buildProjectionWithDiffResolver(
         alloc,
         &entries,
         &details,
         &.{},
-        .{ .system_notice_label_style = "", .system_notice_text_style = "", .reset_style = "", .dim_style = "", .red_style = "" },
-        80,
+        styles,
+        48,
         null,
         .{
             .context = &resolver_context,
@@ -924,14 +927,46 @@ test "full projection matches file details to full diffs by marker and lifecycle
         },
     );
     defer projection.deinit(alloc);
-    const source = try renderProjectionViewportSource(alloc, &projection, null, 80, 24, 0);
+    const measurement = try measureProjection(alloc, &projection, null, 48);
+    const source = try renderProjectionViewportSource(alloc, &projection, null, 48, @intCast(measurement.total_rows), 0);
     defer alloc.free(source);
 
-    try std.testing.expect(std.mem.indexOf(u8, source, "FULL_FIRST") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "COMPACT_FIRST") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "  │     FULL_FIRST_TAIL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "COMPACT_FIRST_TAIL") == null);
     try std.testing.expect(std.mem.indexOf(u8, source, "RAW_FIRST") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "COMPACT_SECOND") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "  │     COMPACT_SECOND_TAIL") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "RAW_SECOND") != null);
+
+    var wide_projection = try buildProjectionWithDiffResolver(
+        alloc,
+        &entries,
+        &details,
+        &.{},
+        styles,
+        120,
+        null,
+        .{
+            .context = &resolver_context,
+            .full_for_marker = Resolver.fullForMarker,
+            .has_full_for_lifecycle = Resolver.hasFullForLifecycle,
+        },
+    );
+    defer wide_projection.deinit(alloc);
+    const wide_measurement = try measureProjection(alloc, &wide_projection, null, 120);
+    const wide_source = try renderProjectionViewportSource(
+        alloc,
+        &wide_projection,
+        null,
+        120,
+        @intCast(wide_measurement.total_rows),
+        0,
+    );
+    defer alloc.free(wide_source);
+
+    try std.testing.expect(std.mem.indexOf(u8, wide_source, "FULL_FIRST_TAIL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wide_source, "COMPACT_SECOND_TAIL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wide_source, "  │     ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, wide_source, "RAW_SECOND") != null);
 }
 
 test "review bounds compact diff without a full retained sidecar" {
@@ -939,9 +974,9 @@ test "review bounds compact diff without a full retained sidecar" {
     const compact = try diff_mod.wrapWithMarkers(
         alloc,
         103,
-        "COMPACT_REVIEW_1\n" ++
-            "COMPACT_REVIEW_2\n" ++
-            "COMPACT_REVIEW_3\n" ++
+        "\x1b[38;5;252m  │ \x1b[38;5;203m1 -\x1b[38;5;252m ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnCOMPACT_REVIEW_1_TAIL\x1b[0m\n" ++
+            "\x1b[38;5;252m  │ \x1b[38;5;77m2 +\x1b[38;5;252m ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnCOMPACT_REVIEW_2_TAIL\x1b[0m\n" ++
+            "\x1b[38;5;245m  │ 3   ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnCOMPACT_REVIEW_3_TAIL\x1b[0m\n" ++
             "COMPACT_REVIEW_4\n" ++
             "COMPACT_REVIEW_5\n" ++
             "COMPACT_REVIEW_6\n" ++
@@ -979,7 +1014,7 @@ test "review bounds compact diff without a full retained sidecar" {
         &details,
         &.{},
         .{ .system_notice_label_style = "", .system_notice_text_style = "", .reset_style = "", .dim_style = "", .red_style = "" },
-        80,
+        48,
         null,
         .review,
         .{
@@ -990,19 +1025,20 @@ test "review bounds compact diff without a full retained sidecar" {
         null,
     );
     defer projection.deinit(alloc);
-    const measurement = try measureProjection(alloc, &projection, null, 80);
+    const measurement = try measureProjection(alloc, &projection, null, 48);
     const source = try renderProjectionViewportSource(
         alloc,
         &projection,
         null,
-        80,
+        48,
         @intCast(measurement.total_rows),
         0,
     );
     defer alloc.free(source);
 
-    try std.testing.expect(std.mem.indexOf(u8, source, "COMPACT_REVIEW_1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source, "COMPACT_REVIEW_3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "  │     COMPACT_REVIEW_1_TAIL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "  │     COMPACT_REVIEW_2_TAIL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "  │     COMPACT_REVIEW_3_TAIL") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "COMPACT_REVIEW_4") == null);
     try std.testing.expect(std.mem.indexOf(u8, source, "COMPACT_REVIEW_10") == null);
     try std.testing.expect(std.mem.indexOf(u8, source, "7 more lines · → to expand") != null);
@@ -1017,7 +1053,7 @@ test "review bounds compact diff without a full retained sidecar" {
         &details,
         &.{},
         .{ .system_notice_label_style = "", .system_notice_text_style = "", .reset_style = "", .dim_style = "", .red_style = "" },
-        80,
+        48,
         null,
         .full,
         .{
@@ -1028,18 +1064,19 @@ test "review bounds compact diff without a full retained sidecar" {
         null,
     );
     defer full.deinit(alloc);
-    const full_measurement = try measureProjection(alloc, &full, null, 80);
+    const full_measurement = try measureProjection(alloc, &full, null, 48);
     const full_source = try renderProjectionViewportSource(
         alloc,
         &full,
         null,
-        80,
+        48,
         @intCast(full_measurement.total_rows),
         0,
     );
     defer alloc.free(full_source);
 
     try std.testing.expect(std.mem.indexOf(u8, full_source, "COMPACT_REVIEW_10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full_source, "  │     COMPACT_REVIEW_1_TAIL") != null);
     try std.testing.expect(std.mem.indexOf(u8, full_source, "FULL_ARGUMENT_TAIL") != null);
     try std.testing.expect(std.mem.indexOf(u8, full_source, "{\"path\"") == null);
 }
@@ -6881,8 +6918,7 @@ const ProjectionComposeContext = struct {
 
     fn overrideKind(context: *anyopaque, entry: transcript_blocks.TranscriptEntry) ?transcript_blocks.TranscriptBlockKind {
         const self = fromOpaque(context);
-        if (self.depth == .review and self.reviewDiffForEntry(entry) != null) return .diff_block;
-        if (self.fullDiffForEntry(entry) != null) return .diff_block;
+        if (self.diffForEntry(entry) != null) return .diff_block;
         if (self.source_index.renderableCommandBlockIndexForEntry(entry.id()) != null) return .command_output;
         return switch (self.entryAction(entry)) {
             .override => |value| value.kind,
@@ -6896,14 +6932,14 @@ const ProjectionComposeContext = struct {
         out: *std.Io.Writer.Allocating,
     ) !bool {
         const self = fromOpaque(context);
-        if (self.depth == .review) {
-            if (self.reviewDiffForEntry(entry)) |diff| {
-                return appendReviewDiffLines(out, diff, self.builder.styles());
+        if (self.diffForEntry(entry)) |diff| {
+            if (self.depth == .review) {
+                return appendReviewDiffLines(out, self.alloc, diff, self.builder.styles(), self.cols);
             }
-        }
-        if (self.fullDiffForEntry(entry)) |full| {
-            try out.writer.writeAll(full);
-            return std.mem.endsWith(u8, full, "\n");
+            const reflowed = try transcript_blocks.reflowDiffBlock(self.alloc, diff, self.cols);
+            defer self.alloc.free(reflowed);
+            try out.writer.writeAll(reflowed);
+            return std.mem.endsWith(u8, reflowed, "\n");
         }
         if (self.source_index.renderableCommandBlockIndexForEntry(entry.id())) |index| {
             return appendCommandBlockAtEntry(self, out, index, entry.id());
@@ -6954,7 +6990,7 @@ const ProjectionComposeContext = struct {
         return self.entry_actions[self.entry_index];
     }
 
-    fn reviewDiffForEntry(
+    fn diffForEntry(
         self: *const ProjectionComposeContext,
         entry: transcript_blocks.TranscriptEntry,
     ) ?[]const u8 {
@@ -7496,13 +7532,17 @@ fn appendReviewLines(
 
 fn appendReviewDiffLines(
     out: *std.Io.Writer.Allocating,
+    alloc: Allocator,
     bytes: []const u8,
     styles: transcript_blocks.Styles,
+    cols: u16,
 ) !bool {
     const max_lines = review_detail_line_limit;
     const total_lines = logicalLineCount(bytes);
     const preview = prefixThroughLogicalLines(bytes, max_lines);
-    try out.writer.writeAll(preview);
+    const reflowed = try transcript_blocks.reflowDiffBlock(alloc, preview, cols);
+    defer alloc.free(reflowed);
+    try out.writer.writeAll(reflowed);
     if (preview.len > 0 and preview[preview.len - 1] != '\n') try out.writer.writeByte('\n');
     if (total_lines > max_lines) {
         try out.writer.writeAll("  ");

@@ -138,6 +138,12 @@ function expectCleanStderr(path: string) {
   expect(readFileSync(path, "utf8")).toBe("");
 }
 
+function expectDiffSentinelOnRail(text: string, sentinel: string) {
+  const rows = text.split("\n").filter((row) => row.includes(sentinel));
+  expect(rows.length).toBeGreaterThan(0);
+  for (const row of rows) expect(row.startsWith("  │")).toBe(true);
+}
+
 function fullDisplayClearCount(tapePath: string): number {
   const clear = Buffer.from("\x1b[2J");
   let count = 0;
@@ -1417,6 +1423,77 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       expect(replay.stderr).toBe("");
       expect(replay.stdout).toContain("CTRL_O_FIRST_001");
       expect(replay.stdout).toContain("CTRL_O_SECOND_060");
+    },
+    90_000,
+  );
+
+  test(
+    "wraps file diff continuations inside their gutters",
+    async () => {
+      const root = createIsolatedRoot();
+      const target = join(root.workspace, "wrapped.txt");
+      const oldLine = `const wrapped_value = "${"A".repeat(180)}OLD_WRAP_TAIL";\n`;
+      const newLine = `const wrapped_value = "${"B".repeat(180)}NEW_WRAP_TAIL";\n`;
+      writeFileSync(target, oldLine);
+      const gateway = startFakeGateway([
+        toolCall("wrap_diff", "edit_file", {
+          path: "wrapped.txt",
+          old_string: oldLine,
+          new_string: newLine,
+        }),
+        finalText("WRAP_DIFF_COMPLETE"),
+      ]);
+      const tapePath = join(root.root, "diff-wrap.fxtape");
+      const { session, stderrPath } = await launch(
+        root,
+        gateway,
+        { width: 72, height: 40 },
+        { FX_RECORD: tapePath },
+      );
+
+      await session.sendText("Replace the wrapped fixture value.");
+      await waitForFileApproval(session, {
+        required: ["OLD_WRAP_TAIL", "NEW_WRAP_TAIL"],
+      });
+      await decide(session, 1);
+      await session.waitForText("WRAP_DIFF_COMPLETE", TIMEOUT);
+      expect(readFileSync(target, "utf8")).toBe(newLine);
+
+      const inline = await session.captureFullScrollback();
+      expectDiffSentinelOnRail(inline, "OLD_WRAP_TAIL");
+      expectDiffSentinelOnRail(inline, "NEW_WRAP_TAIL");
+
+      await session.sendKeys("C-o");
+      await session.waitForText("Review · ←/→ switch · ctrl o close", TIMEOUT);
+      const review = await session.capturePane();
+      expectDiffSentinelOnRail(review, "OLD_WRAP_TAIL");
+      expectDiffSentinelOnRail(review, "NEW_WRAP_TAIL");
+
+      await session.sendKeys("Right");
+      await session.waitForText("Full detail · ←/→ switch · ctrl o close", TIMEOUT);
+      const full = await session.capturePane();
+      expectDiffSentinelOnRail(full, "OLD_WRAP_TAIL");
+      expectDiffSentinelOnRail(full, "NEW_WRAP_TAIL");
+
+      await session.resizeWindow(56, 40, 500);
+      const narrow = await session.capturePane();
+      expectDiffSentinelOnRail(narrow, "OLD_WRAP_TAIL");
+      expectDiffSentinelOnRail(narrow, "NEW_WRAP_TAIL");
+
+      await session.resizeWindow(100, 40, 500);
+      const wide = await session.capturePane();
+      expectDiffSentinelOnRail(wide, "OLD_WRAP_TAIL");
+      expectDiffSentinelOnRail(wide, "NEW_WRAP_TAIL");
+
+      expect(session.isAlive()).toBe(true);
+      expectCleanStderr(stderrPath);
+      const replay = await runFx(["replay", tapePath, "--frames"], {
+        cwd: root.workspace,
+        env: { HOME: root.home },
+      });
+      expect(replay.code).toBe(0);
+      expect(replay.stderr).toBe("");
+      expect(replay.stdout).toContain("NEW_WRAP_TAIL");
     },
     90_000,
   );
