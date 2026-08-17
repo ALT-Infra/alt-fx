@@ -2401,12 +2401,15 @@ describe("effect-aware command permissions", () => {
 
         await activeSession.waitForText(`TTY_SESSION_FINAL_${sandbox}`, TIMEOUT);
         foregroundFxRow(ttyPath, binary);
-        await activeSession.sendText("Run pwd through the direct route.");
+        await activeSession.sendText("Run pwd through the user profile.");
         await activeSession.waitForText(`TTY_SESSION_PWD_FINAL_${sandbox}`, TIMEOUT);
         foregroundFxRow(ttyPath, binary);
 
         expect(gateway.requests).toHaveLength(4);
-        expect(gateway.classifierRequests).toHaveLength(1);
+        expect(gateway.classifierRequests).toHaveLength(2);
+        expect(gateway.classifierRequests[0]!.body).toContain("action: command");
+        expect(gateway.classifierRequests[1]!.body).toContain("action: command");
+        expect(gateway.classifierRequests[1]!.body).toContain("command: pwd");
         const commandResult = toolResultValue(
           gateway.requests[1]!.body,
           "terminal_session_command",
@@ -2436,7 +2439,7 @@ describe("effect-aware command permissions", () => {
         const stdoutBeginIndex = scrollback.indexOf("TTY_SESSION_STDOUT_BEGIN");
         const stdoutEndIndex = scrollback.indexOf("TTY_SESSION_STDOUT_END");
         const finalIndex = scrollback.indexOf(`TTY_SESSION_FINAL_${sandbox}`);
-        const followupIndex = scrollback.indexOf("Run pwd through the direct route.");
+        const followupIndex = scrollback.indexOf("Run pwd through the user profile.");
         const pwdFinalIndex = scrollback.indexOf(`TTY_SESSION_PWD_FINAL_${sandbox}`);
         expect(completedIndex).toBeGreaterThanOrEqual(0);
         expect(stdoutBeginIndex).toBeGreaterThan(completedIndex);
@@ -2449,10 +2452,11 @@ describe("effect-aware command permissions", () => {
 
         const trace = readFileSync(tracePath, "utf8");
         expect(trace).toContain(
-          `sandbox backend resolved requested=${sandbox} resolved=${sandbox}`,
+          "terminal.exec authority=shell_allowed source=auto_classifier " +
+            "route=approved_shell environment=user",
         );
-        expect(trace).toContain("route=approved_shell");
-        expect(trace).toContain("authority=direct_only route=direct_read_only");
+        expect(trace).toContain("sandbox explicit command environment=user shell=");
+        expect(trace).not.toContain("authority=direct_only route=direct_read_only");
         expectTraceOrder(trace, [
           "event=permission_decision turn_id=1 step_id=1 call_id=terminal_session_command",
           "event=execution_start turn_id=1 step_id=1 call_id=terminal_session_command",
