@@ -332,6 +332,7 @@ function createRuntime(options) {
     options.onTerminalPoll?.();
     if (stdin.chunks.length) return 1;
     if (stdin.closed) return -1;
+    if (timeoutMs === 0) return 0;
     return stdin.wait(timeoutMs >= 0 ? timeoutMs : undefined).then(() =>
       stdin.chunks.length ? 1 : (stdin.closed ? -1 : 0));
   }
