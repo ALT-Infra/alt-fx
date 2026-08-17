@@ -1,9 +1,11 @@
 const std = @import("std");
 const stream_provider = @import("../core/agent/stream_provider.zig");
+const io_mod = @import("../core/shared/io.zig");
 const gateway_client = @import("client.zig");
 
 const Allocator = std.mem.Allocator;
 const max_error_body_bytes = 1024 * 1024;
+const cooperative_pulse_interval_ms = 50;
 
 pub const Transport = struct {
     context: ?*anyopaque,
@@ -150,12 +152,22 @@ const HostStreamReader = struct {
     handle: i32 = -1,
     cancel_flag: *std.atomic.Value(bool) = undefined,
     cooperative_pulse: ?stream_provider.CooperativePulse = null,
+    last_cooperative_pulse: ?std.Io.Clock.Timestamp = null,
     aborted: bool = false,
     buffer: [16 * 1024]u8 = undefined,
     interface: std.Io.Reader = undefined,
 
     fn init(self: *@This(), transport: Transport, handle: i32, cancel_flag: *std.atomic.Value(bool), cooperative_pulse: ?stream_provider.CooperativePulse) void {
-        self.* = .{ .transport = transport, .handle = handle, .cancel_flag = cancel_flag, .cooperative_pulse = cooperative_pulse };
+        self.* = .{
+            .transport = transport,
+            .handle = handle,
+            .cancel_flag = cancel_flag,
+            .cooperative_pulse = cooperative_pulse,
+            .last_cooperative_pulse = if (cooperative_pulse != null)
+                std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake)
+            else
+                null,
+        };
         self.interface = .{ .vtable = &.{ .stream = streamReader, .readVec = readVec }, .buffer = &self.buffer, .seek = 0, .end = 0 };
     }
 
@@ -175,12 +187,32 @@ const HostStreamReader = struct {
         return error.ReadFailed;
     }
 
+    fn pulseAt(self: *@This(), now: std.Io.Clock.Timestamp) !void {
+        if (self.cooperative_pulse == null) return;
+        self.last_cooperative_pulse = now;
+        try pulse(self.cooperative_pulse);
+    }
+
+    fn pulseIfDueAt(self: *@This(), now: std.Io.Clock.Timestamp) !void {
+        if (self.cooperative_pulse == null) return;
+        const last_pulse = self.last_cooperative_pulse orelse return;
+        const elapsed_ms = last_pulse.durationTo(now).raw.toMilliseconds();
+        if (elapsed_ms < cooperative_pulse_interval_ms) return;
+        try self.pulseAt(now);
+    }
+
     fn readHost(self: *@This(), dest: []u8) std.Io.Reader.Error!usize {
         while (true) {
             if (self.cancel_flag.load(.seq_cst)) return self.abortRead();
+            if (self.cooperative_pulse != null) {
+                self.pulseIfDueAt(std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake)) catch return error.ReadFailed;
+            }
+            if (self.cancel_flag.load(.seq_cst)) return self.abortRead();
             const count = self.transport.next(self.handle, dest);
             if (count == -3) {
-                pulse(self.cooperative_pulse) catch return error.ReadFailed;
+                if (self.cooperative_pulse != null) {
+                    self.pulseAt(std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake)) catch return error.ReadFailed;
+                }
                 continue;
             }
             if (count == -2) return self.abortRead();
@@ -242,4 +274,68 @@ test "error response bodies are bounded" {
         error.HostStreamFailed,
         readBody(std.testing.allocator, transport, 1, &cancel_flag, null),
     );
+}
+
+test "host stream reader omits pulse timing state without callback" {
+    const FakeTransport = struct {
+        fn open(_: ?*anyopaque, _: []const u8, _: []const u8, _: []const u8, _: []const u8) anyerror!i32 {
+            return 1;
+        }
+
+        fn status(_: ?*anyopaque, _: i32, _: *u16) i32 {
+            return 1;
+        }
+
+        fn next(_: ?*anyopaque, _: i32, _: []u8) i32 {
+            return 0;
+        }
+
+        fn close(_: ?*anyopaque, _: i32) void {}
+    };
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var reader: HostStreamReader = undefined;
+    reader.init(.{
+        .context = null,
+        .open_fn = FakeTransport.open,
+        .status_fn = FakeTransport.status,
+        .next_fn = FakeTransport.next,
+        .close_fn = FakeTransport.close,
+    }, 1, &cancel_flag, null);
+
+    try std.testing.expect(reader.last_cooperative_pulse == null);
+}
+
+test "host stream reader throttles cooperative pulses" {
+    const PulseTrace = struct {
+        calls: usize = 0,
+
+        fn run(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+        }
+    };
+    const awake_timestamp = struct {
+        fn at(milliseconds: i64) std.Io.Clock.Timestamp {
+            return .{
+                .clock = .awake,
+                .raw = .fromNanoseconds(@as(i96, milliseconds) * std.time.ns_per_ms),
+            };
+        }
+    }.at;
+
+    var trace: PulseTrace = .{};
+    var reader: HostStreamReader = .{
+        .cooperative_pulse = .{ .ctx = &trace, .run = PulseTrace.run },
+        .last_cooperative_pulse = awake_timestamp(100),
+    };
+
+    try reader.pulseIfDueAt(awake_timestamp(149));
+    try std.testing.expectEqual(@as(usize, 0), trace.calls);
+    try reader.pulseIfDueAt(awake_timestamp(150));
+    try std.testing.expectEqual(@as(usize, 1), trace.calls);
+    try reader.pulseIfDueAt(awake_timestamp(199));
+    try std.testing.expectEqual(@as(usize, 1), trace.calls);
+    try reader.pulseIfDueAt(awake_timestamp(200));
+    try std.testing.expectEqual(@as(usize, 2), trace.calls);
 }
