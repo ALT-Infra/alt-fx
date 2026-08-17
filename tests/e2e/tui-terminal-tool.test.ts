@@ -131,7 +131,7 @@ async function cleanupNarrowReturn(
     const inTakeover = pane.includes("Ctrl-] d detach");
     if (!inTakeover) {
       if (!inManager) await active.sendKeys("C-x");
-      await active.waitForText("Background processes", TIMEOUT);
+      await waitForBackgroundProcessManager(active);
       await active.sendKeys("Enter");
       await active.waitForPane(
         (current) =>
@@ -186,6 +186,17 @@ async function waitForNewExactShellPrompt(
     await Bun.sleep(25);
   }
   throw new Error("cleanup did not observe a new exact L1_PROMPT> after Ctrl-C");
+}
+
+async function waitForBackgroundProcessManager(
+  active: TmuxSession,
+): Promise<string> {
+  return active.waitForPane(
+    (pane) =>
+      pane.includes("Background processes") &&
+      !pane.includes("No background processes"),
+    TIMEOUT,
+  );
 }
 
 async function finishNarrowReturn(
@@ -487,19 +498,29 @@ test.skipIf(!tmuxAvailable())(
     );
     await active.sendLiteralText("TAKEOVER_INLINE_DRAFT");
     await active.sendKeys("C-x");
-    await active.waitForText("Background processes", TIMEOUT);
+    await waitForBackgroundProcessManager(active);
     await active.sendKeys("Enter");
-    let pane = await active.waitForText("Ctrl-] d detach", TIMEOUT);
+    let pane = await active.waitForPane(
+      (current) =>
+        current.includes("Ctrl-] d detach") &&
+        current.includes("TAKEOVER_TOP"),
+      TIMEOUT,
+    );
     expect(pane).toContain("TAKEOVER_TOP");
-    expect(pane).toContain("TAKEOVER_BOTTOM");
     expect(pane).not.toContain("Agents & processes");
     expect(pane).not.toContain("Background processes");
     expect(pane).not.toContain("ctrl-x close");
 
     await active.sendText("RAW_KEYBOARD");
-    expect(await active.waitForText("ECHO:RAW_KEYBOARD", TIMEOUT)).toContain(
-      "TAKEOVER_TOP",
+    pane = await active.waitForPane(
+      (current) =>
+        current.includes("ECHO:RAW_KEYBOARD") &&
+        current.includes("TAKEOVER_TOP") &&
+        current.includes("TAKEOVER_BOTTOM"),
+      TIMEOUT,
     );
+    expect(pane).toContain("TAKEOVER_TOP");
+    expect(pane).toContain("TAKEOVER_BOTTOM");
     await active.pasteText("RAW_PASTE\n");
     await active.waitForText("RAW_PASTE", TIMEOUT);
     await active.sendHexBytes(["1b", "5b", "49"]);
@@ -525,7 +546,7 @@ test.skipIf(!tmuxAvailable())(
     await active.waitForText("TAKEOVER_INLINE_DRAFT", TIMEOUT);
     await active.resizeWindow(120, 30);
     await active.sendKeys("C-x");
-    await active.waitForText("Background processes", TIMEOUT);
+    await waitForBackgroundProcessManager(active);
     await active.sendKeys("Enter");
     await active.waitForText("TAKEOVER_TOP", TIMEOUT);
     await active.sendKeys("C-c");
@@ -578,7 +599,7 @@ test.skipIf(!tmuxAvailable())(
         await active.sendKeys("Left");
       }
       await active.sendKeys("C-x");
-      await active.waitForText("Background processes", TIMEOUT);
+      await waitForBackgroundProcessManager(active);
       await active.sendKeys("Enter");
       await active.waitForText("L1_PROMPT>", TIMEOUT);
 
@@ -718,7 +739,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText("Running ", TIMEOUT);
       childStarted = true;
       await active.sendKeys("C-x");
-      await active.waitForText("Background processes", TIMEOUT);
+      await waitForBackgroundProcessManager(active);
       await active.sendKeys("Enter");
       await active.waitForText("L1_PROMPT>", TIMEOUT);
       try {
@@ -760,7 +781,7 @@ test.skipIf(!tmuxAvailable())(
     await active.sendText(`!${scriptPath}`);
     await active.waitForText("Running ", TIMEOUT);
     await active.sendKeys("C-x");
-    await active.waitForText("Background processes", TIMEOUT);
+    await waitForBackgroundProcessManager(active);
     await active.sendKeys("Enter");
     await waitForTrace(fixture.tracePath, "lease acquire submitted");
     await active.sendText("BEFORE_ACQUIRE");
@@ -800,7 +821,7 @@ for (const failure of [
       await active.waitForText("Running ", TIMEOUT);
       await active.sendLiteralText(`INLINE_${failure}`);
       await active.sendKeys("C-x");
-      await active.waitForText("Background processes", TIMEOUT);
+      await waitForBackgroundProcessManager(active);
       await active.sendKeys("Enter");
       if (failure === "write") {
         await active.waitForText("TAKEOVER_TOP", TIMEOUT);
@@ -944,12 +965,7 @@ for (const backend of ["native", "tmux"] as const) {
       );
       const taskId = activeTaskId(fixture.home);
       await active.sendKeys("C-x");
-      await active.waitForPane(
-        (pane) =>
-          pane.includes("Background processes") &&
-          !pane.includes("No background processes"),
-        TIMEOUT,
-      );
+      await waitForBackgroundProcessManager(active);
       await active.sendKeys("Enter");
       await active.waitForText("TAKEOVER_TOP", TIMEOUT);
 
@@ -1065,7 +1081,7 @@ test.skipIf(!tmuxAvailable())(
     await active.waitForText("Running ", TIMEOUT);
     await active.sendLiteralText("TAKEOVER_LOSS_INLINE_DRAFT");
     await active.sendKeys("C-x");
-    await active.waitForText("Background processes", TIMEOUT);
+    await waitForBackgroundProcessManager(active);
     await active.sendKeys("Enter");
     await active.waitForText("TAKEOVER_TOP", TIMEOUT);
 

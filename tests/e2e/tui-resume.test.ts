@@ -127,6 +127,23 @@ async function waitForScrollback(
   throw new Error(`Timed out waiting for ${marker}.\nScrollback:\n${latest}`);
 }
 
+async function waitForScrollbackMarkers(
+  session: TmuxSession,
+  markers: readonly string[],
+  timeout = TIMEOUT,
+): Promise<string> {
+  const deadline = Date.now() + timeout;
+  let latest = "";
+  while (Date.now() < deadline) {
+    latest = await session.captureFullScrollback();
+    if (markers.every((marker) => latest.includes(marker))) return latest;
+    await Bun.sleep(100);
+  }
+  throw new Error(
+    `Timed out waiting for scrollback markers ${markers.join(", ")}.\nScrollback:\n${latest}`,
+  );
+}
+
 function countOccurrences(text: string, needle: string): number {
   return text.split(needle).length - 1;
 }
@@ -2800,8 +2817,17 @@ test.skipIf(!tmuxAvailable())(
       }
 
       await active.sendKeys("C-o");
-      await active.waitForText(afterMarker, TIMEOUT);
-      const grid = await active.capturePaneGrid();
+      const fullTranscript = await active.waitForPane(
+        (pane) =>
+          pane.includes(beforeMarker) &&
+          pane.includes("1 tool call") &&
+          pane.includes("Ran ") &&
+          pane.includes("1 output line") &&
+          pane.includes(outputMarker) &&
+          pane.includes(afterMarker),
+        TIMEOUT,
+      );
+      const grid = fullTranscript.replace(/\n$/, "").split("\n");
       const before = grid.findIndex((line) => line.includes(beforeMarker));
       const header = grid.findIndex((line) => line.includes("1 tool call"));
       const tool = grid.findIndex((line) => line.includes("Ran "));
@@ -3527,7 +3553,12 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText("Would you like to run the following command?", TIMEOUT);
       await active.sendKeys("1");
       await active.sendKeys("Enter");
-      const setupScrollback = await waitForScrollback(active, setupSentinel);
+      const setupScrollback = await waitForScrollbackMarkers(active, [
+        assistantHead,
+        assistantTail,
+        setupCompactLine,
+        setupSentinel,
+      ]);
       expect(setupScrollback).toContain(assistantHead);
       expect(setupScrollback).toContain(assistantTail);
       expect(setupScrollback).toContain(setupCompactLine);
