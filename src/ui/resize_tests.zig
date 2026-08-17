@@ -14,6 +14,7 @@ const assistant_presentation = @import("../core/agent/assistant_presentation.zig
 const builtin_commands = @import("../builtins/commands.zig");
 
 const surface_frame = @import("footer/surface_frame.zig");
+const surface_invalidation = @import("footer/surface_invalidation.zig");
 const interaction_state = @import("footer/interaction_state.zig");
 const approval_prompt = @import("../core/permissions/approval_prompt.zig");
 const render_input = @import("footer/render_input.zig");
@@ -212,17 +213,18 @@ pub const Harness = struct {
                 .prior = self.shell.committed_frame_layout,
             },
             ReservedTranscriptSolveContext.prepareCandidate,
+            ReservedTranscriptSolveContext.resolveCandidate,
         );
 
         var invalidations = snapshot.invalidations;
         self.shell.normalizeFrameInvalidations(&invalidations);
         const paint = &prepared.?;
         var plan = transcriptOnlyPlan(&self.shell, paint, fixed_point.layout.owned_top, invalidations);
-        var transition = try self.shell.finalizeTranscriptTransition(
+        var transition = try resolveAndSealTranscriptTransitionForTest(
+            &self.shell,
             self.alloc,
             &source,
             paint,
-            render_engine.frame_layout.CommittedLayoutSnapshot.fromPaintPlan(plan),
             &plan,
             fixed_point.scroll_plan,
         );
@@ -267,6 +269,7 @@ pub const Harness = struct {
             measurement.replaysDisplacedTranscriptHistory(&self.shell);
         var prepared: ?transcript_painter.PreparedTranscriptSurfacePaint = null;
         defer if (prepared) |*paint| paint.deinit(self.alloc);
+        var resolved_target: ?transcript_runtime.TranscriptRuntime.ResolvedTranscriptTarget = null;
         const activity = frameActivityState(self, &measurement);
         const tracked_entry_id = switch (measurement.activity_projection) {
             .tool_slot => |slot| slot.entry_id,
@@ -289,8 +292,10 @@ pub const Harness = struct {
             activity,
             &source,
             &prepared,
+            &resolved_target,
             footer_reservation_changed,
             replay_displaced_footer_history,
+            invalidations,
         );
 
         const footer_rows = measurement.frameLayoutRows(self.shell.layout.rows, fixed_point.layout.footer_area.top);
@@ -303,11 +308,19 @@ pub const Harness = struct {
             .transient_row => true,
             .none, .overlay_entry => false,
         };
-        const viewport = if (prepared) |*paint|
+        const viewport = if (resolved_target) |target|
+            target.selection()
+        else if (prepared) |*paint|
             paint.selection
         else
             surface_frame.currentSurfaceFooterTranscriptState(&self.shell).selection;
-        const cursor_target = if (prepared) |*paint|
+        const cursor_target = if (resolved_target) |target|
+            render_engine.paint_plan.FrameCursorTarget{
+                .row = target.cursorRow(),
+                .col = target.cursorCol(),
+                .visible = !activity_hides_cursor,
+            }
+        else if (prepared) |*paint|
             render_engine.paint_plan.FrameCursorTarget{
                 .row = paint.cursor.cursor_row,
                 .col = paint.cursor.cursor_col,
@@ -341,15 +354,13 @@ pub const Harness = struct {
         var transition: ?transcript_runtime.TranscriptTransition = null;
         defer if (transition) |*value| value.deinit(self.alloc);
         if (prepared) |*paint| {
-            transition = try self.shell.finalizeTranscriptTransitionForFrame(
+            const target = resolved_target orelse return error.MissingResolvedTranscriptTarget;
+            transition = try self.shell.sealTranscriptTransition(
                 self.alloc,
                 &source,
                 paint,
-                render_engine.frame_layout.CommittedLayoutSnapshot.fromLayout(fixed_point.layout),
                 &footer_frame.paint,
-                fixed_point.scroll_plan,
-                footer_reservation_changed,
-                replay_displaced_footer_history,
+                target,
             );
         }
 
@@ -433,8 +444,17 @@ const ReservedTranscriptSolveContext = struct {
         self.prepared.*.?.bottom_reserved_rows = self.reserved_rows;
         return .{
             .inline_advance_rows = self.h.shell.planTranscriptScroll(&self.prepared.*.?).planned_rows,
-            .occupied_transcript_rows = candidate.transcript_area.height(),
         };
+    }
+
+    fn resolveCandidate(
+        self: *ReservedTranscriptSolveContext,
+        candidate: render_engine.frame_layout.FrameLayout,
+        scroll_plan: render_engine.frame_scroll_plan.FrameScrollPlan,
+    ) !render_engine.frame_fixed_point.CandidateResolution {
+        _ = self;
+        _ = scroll_plan;
+        return .{ .occupied_transcript_rows = candidate.transcript_area.height() };
     }
 };
 
@@ -444,15 +464,21 @@ fn solveTestFrame(
     activity: render_engine.frame_layout.ActivityState,
     source: *const TranscriptPreparationSource,
     prepared: *?transcript_painter.PreparedTranscriptSurfacePaint,
+    resolved_target: *?transcript_runtime.TranscriptRuntime.ResolvedTranscriptTarget,
     footer_reservation_changed: bool,
     replay_displaced_footer_history: bool,
+    attempt_invalidations: render_engine.paint_plan.FrameInvalidationSet,
 ) !render_engine.frame_fixed_point.FramePlan {
     var ctx = TestFrameSolveContext{
         .h = h,
         .source = source,
         .prepared = prepared,
+        .resolved_target = resolved_target,
+        .measurement = measurement,
+        .activity = activity,
         .footer_reservation_changed = footer_reservation_changed,
         .replay_displaced_footer_history = replay_displaced_footer_history,
+        .attempt_invalidations = attempt_invalidations,
     };
     return render_engine.frame_fixed_point.solve(
         TestFrameSolveContext,
@@ -466,6 +492,7 @@ fn solveTestFrame(
             .prior = h.shell.committed_frame_layout,
         },
         TestFrameSolveContext.prepareCandidate,
+        TestFrameSolveContext.resolveCandidate,
     );
 }
 
@@ -473,8 +500,13 @@ const TestFrameSolveContext = struct {
     h: *Harness,
     source: *const TranscriptPreparationSource,
     prepared: *?transcript_painter.PreparedTranscriptSurfacePaint,
+    resolved_target: *?transcript_runtime.TranscriptRuntime.ResolvedTranscriptTarget,
+    measurement: *const surface_frame.SurfaceFooterMeasurement,
+    activity: render_engine.frame_layout.ActivityState,
     footer_reservation_changed: bool,
     replay_displaced_footer_history: bool,
+    attempt_invalidations: render_engine.paint_plan.FrameInvalidationSet,
+    scroll_facts: ?transcript_runtime.TranscriptScrollFacts = null,
 
     fn prepareCandidate(
         self: *TestFrameSolveContext,
@@ -484,8 +516,9 @@ const TestFrameSolveContext = struct {
             paint.deinit(self.h.alloc);
             self.prepared.* = null;
         }
+        self.resolved_target.* = null;
+        self.scroll_facts = null;
         var inline_advance_rows: u16 = 0;
-        var occupied_transcript_rows = candidate.transcript_area.height();
         if (!candidate.transcript_area.isEmpty()) {
             self.prepared.* = try self.h.shell.prepareTranscriptSurfacePaintFromSourceForFrame(
                 self.h.alloc,
@@ -494,34 +527,69 @@ const TestFrameSolveContext = struct {
                 candidate.transcript_area,
                 self.footer_reservation_changed,
             );
-            var scroll_facts = self.h.shell.planTranscriptScrollForFrame(
+            const scroll_facts = try self.h.shell.prepareTranscriptScrollFactsForFrame(
+                self.h.alloc,
+                self.source,
                 &self.prepared.*.?,
                 self.footer_reservation_changed,
                 self.replay_displaced_footer_history,
             );
-            if (try self.h.shell.stagePreparedHistoryFloorForFrame(
-                self.h.alloc,
-                &self.prepared.*.?,
-                candidate.transcript_area,
-                scroll_facts,
-            )) {
-                scroll_facts = self.h.shell.planTranscriptScrollForFrame(
-                    &self.prepared.*.?,
-                    self.footer_reservation_changed,
-                    self.replay_displaced_footer_history,
-                );
-            }
+            self.scroll_facts = scroll_facts;
             inline_advance_rows = scroll_facts.planned_rows;
-            if (self.prepared.*.?.selection.last_visible_row >= candidate.transcript_area.top) {
-                occupied_transcript_rows = self.prepared.*.?.selection.last_visible_row - candidate.transcript_area.top + 1;
-            } else {
-                occupied_transcript_rows = 0;
-            }
         }
-        return .{
-            .inline_advance_rows = inline_advance_rows,
-            .occupied_transcript_rows = occupied_transcript_rows,
-        };
+        return .{ .inline_advance_rows = inline_advance_rows };
+    }
+
+    fn resolveCandidate(
+        self: *TestFrameSolveContext,
+        candidate: render_engine.frame_layout.FrameLayout,
+        scroll_plan: render_engine.frame_scroll_plan.FrameScrollPlan,
+    ) !render_engine.frame_fixed_point.CandidateResolution {
+        if (candidate.transcript_area.isEmpty()) {
+            return .{ .occupied_transcript_rows = 0 };
+        }
+        const prepared = if (self.prepared.*) |*value| value else return error.MissingTranscriptPaint;
+        const scroll_facts = self.scroll_facts orelse return error.MissingTranscriptScrollFacts;
+        const activity = render_engine.activity_placement.resolve(
+            self.measurement.activity_projection,
+            self.activity,
+            candidate,
+        );
+        var candidate_plan = candidate.toPaintPlan(.{
+            .footer_rows = self.measurement.frameLayoutRows(
+                self.h.shell.layout.rows,
+                candidate.footer_area.top,
+            ),
+            .viewport = prepared.selection,
+            .activity = activity,
+            .cursor_target = .{
+                .row = prepared.cursor.cursor_row,
+                .col = prepared.cursor.cursor_col,
+                .visible = true,
+            },
+        });
+        candidate_plan.invalidation = try surface_invalidation.resolveCandidateFrameInvalidations(
+            &self.h.shell,
+            candidate_plan,
+            self.measurement.frameInvalidationUpdate(),
+            self.attempt_invalidations,
+        );
+        const destructive_invalidation = render_engine.frame_retention.transcriptAreaHasDestructiveInvalidation(
+            self.h.shell.committed_frame_layout.transcript_area,
+            candidate_plan.invalidation,
+        );
+        const target = try self.h.shell.resolveTranscriptTransitionTargetForFrame(
+            self.h.alloc,
+            self.source,
+            prepared,
+            render_engine.frame_layout.CommittedLayoutSnapshot.fromLayout(candidate),
+            scroll_plan,
+            scroll_facts,
+            destructive_invalidation,
+            activity == .overlay_entry,
+        );
+        self.resolved_target.* = target;
+        return .{ .occupied_transcript_rows = target.occupiedTranscriptRows() };
     }
 };
 
@@ -743,6 +811,45 @@ fn transcriptOnlyPlan(
         .preserve_scrollback = !shell.pending_scroll_compact,
         .reset_terminal = shell.terminal_reset_pending,
     };
+}
+
+fn resolveAndSealTranscriptTransitionForTest(
+    shell: *TranscriptRuntime,
+    alloc: Allocator,
+    source: *TranscriptPreparationSource,
+    prepared: *transcript_painter.PreparedTranscriptSurfacePaint,
+    plan: *render_engine.paint_plan.PaintPlan,
+    scroll_plan: render_engine.frame_scroll_plan.FrameScrollPlan,
+) !transcript_runtime.TranscriptTransition {
+    const scroll_facts = try shell.prepareTranscriptScrollFactsForFrame(
+        alloc,
+        source,
+        prepared,
+        false,
+        false,
+    );
+    const destructive_invalidation = render_engine.frame_retention.transcriptAreaHasDestructiveInvalidation(
+        shell.committed_frame_layout.transcript_area,
+        plan.invalidation,
+    );
+    const resolved = try shell.resolveTranscriptTransitionTargetForFrame(
+        alloc,
+        source,
+        prepared,
+        render_engine.frame_layout.CommittedLayoutSnapshot.fromPaintPlan(plan.*),
+        scroll_plan,
+        scroll_facts,
+        destructive_invalidation,
+        plan.activity == .overlay_entry,
+    );
+    resolved.applyToPaintPlan(plan);
+    return shell.sealTranscriptTransition(
+        alloc,
+        source,
+        prepared,
+        plan,
+        resolved,
+    );
 }
 
 fn footerRowsForLayout(layout: Layout) render_engine.footer_layout.FooterRows {
@@ -5041,6 +5148,86 @@ test "slash picker dismissal releases reserved picker rows" {
     try std.testing.expectEqual(@as(u16, 16), tall.shell.committed_frame_layout.footer_area.top);
 }
 
+test "slash picker dismissal resolves transcript extent before layout convergence" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 124, 75, 3);
+    defer h.deinit();
+    h.shell.maxxing_mode = .minimal;
+
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var approval = approval_prompt.ApprovalPrompt{};
+    defer approval.deinit(alloc);
+
+    var transcript: std.ArrayList(u8) = .empty;
+    defer transcript.deinit(alloc);
+    for (0..82) |line_number| {
+        var line_buf: [128]u8 = undefined;
+        const line = try std.fmt.bufPrint(
+            &line_buf,
+            "ATOMIC_RENDER_LINE_{d:0>3} carries deterministic resumed transcript geometry.",
+            .{line_number},
+        );
+        try transcript.appendSlice(alloc, line);
+        if (line_number + 1 < 82) try transcript.append(alloc, '\n');
+    }
+
+    try h.shell.initViewport(&h.metrics, 1);
+    _ = try h.shell.appendUserTurnOwned(alloc, .{
+        .text = try alloc.dupe(u8, "Create the deterministic long transcript."),
+        .images = &.{},
+    });
+    _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, transcript.items);
+    h.shell.setAssistantTailWritable(false);
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+    try std.testing.expectEqual(@as(u16, 70), h.shell.last_visible_transcript_last_row);
+
+    try input.textReplacementState().replace(alloc, "/");
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+    try std.testing.expectEqual(@as(u16, 61), h.shell.last_visible_transcript_last_row);
+    try std.testing.expectEqual(@as(u16, 64), try findRowContaining(&h, "❯ /"));
+
+    input.picker.dismissInlinePicker(.slash);
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
+    try std.testing.expectEqual(@as(u16, 61), h.shell.last_visible_transcript_last_row);
+    try std.testing.expectEqual(@as(u16, 64), try findRowContaining(&h, "❯ /"));
+    try std.testing.expectEqual(@as(u16, 63), h.shell.committed_frame_layout.footer_area.top);
+    try std.testing.expectEqual(@as(u16, 66), h.shell.committed_frame_layout.footer_area.bottom);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try countGridOccurrences(&h, "ATOMIC_RENDER_LINE_080"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try countGridOccurrences(&h, "ATOMIC_RENDER_LINE_081"),
+    );
+
+    try input.insertionState().insertByte(alloc, 'x', .clear);
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    try std.testing.expectEqual(@as(u16, 61), h.shell.last_visible_transcript_last_row);
+    try std.testing.expectEqual(@as(u16, 64), try findRowContaining(&h, "❯ /x"));
+    try std.testing.expectEqual(@as(u16, 63), h.shell.committed_frame_layout.footer_area.top);
+    try std.testing.expectEqual(@as(u16, 66), h.shell.committed_frame_layout.footer_area.bottom);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try countGridOccurrences(&h, "ATOMIC_RENDER_LINE_080"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try countGridOccurrences(&h, "ATOMIC_RENDER_LINE_081"),
+    );
+}
+
 test "slash picker dismissal after resize restores the short transcript boundary" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 72, 16, 4);
@@ -6066,7 +6253,11 @@ test "inline approval footer reflow preserves concurrent transcript progress" {
         h.last_frame.shadow_state,
     );
     try std.testing.expect(h.last_frame.transcript_history_floor_respected);
-    try std.testing.expectEqual(idle_footer_top, h.shell.committed_frame_layout.footer_area.top);
+    try std.testing.expect(h.shell.committed_frame_layout.footer_area.top < idle_footer_top);
+    try std.testing.expectEqual(
+        h.shell.last_visible_transcript_last_row + 2,
+        h.shell.committed_frame_layout.footer_area.top,
+    );
     try std.testing.expectEqual(@as(usize, 1), try countGridOccurrences(&h, append_one));
     try std.testing.expectEqual(@as(usize, 1), try countGridOccurrences(&h, append_two));
 }

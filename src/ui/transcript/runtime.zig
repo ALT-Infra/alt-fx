@@ -7211,14 +7211,60 @@ pub const TranscriptRuntime = struct {
         }
     };
 
+    pub const ResolvedTranscriptTarget = struct {
+        target: TransitionTarget,
+        target_layout: render_engine.frame_layout.CommittedLayoutSnapshot,
+        scroll_plan: render_engine.frame_scroll_plan.FrameScrollPlan,
+        scroll_facts: TranscriptScrollFacts,
+        accepted: AcceptedTranscriptRows,
+        source_endpoint_cursor_row: u16,
+        source_endpoint_cursor_col: u16,
+        destructive_invalidation: bool,
+        activity_overlay_active: bool,
+        borrows_pending_resume: bool,
+
+        pub fn selection(self: ResolvedTranscriptTarget) ViewportSelection {
+            return self.target.selection;
+        }
+
+        pub fn cursorRow(self: ResolvedTranscriptTarget) u16 {
+            return self.target.cursor_row;
+        }
+
+        pub fn cursorCol(self: ResolvedTranscriptTarget) u16 {
+            return self.target.cursor_col;
+        }
+
+        pub fn bodyDisposition(self: ResolvedTranscriptTarget) TranscriptBodyDisposition {
+            return self.target.body_disposition;
+        }
+
+        pub fn occupiedTranscriptRows(self: ResolvedTranscriptTarget) u16 {
+            const area = self.target_layout.transcript_area;
+            if (area.isEmpty() or self.target.selection.last_visible_row < area.top) return 0;
+            return self.target.selection.last_visible_row - area.top + 1;
+        }
+
+        pub fn applyToPaintPlan(
+            self: ResolvedTranscriptTarget,
+            plan: *render_engine.paint_plan.PaintPlan,
+        ) void {
+            plan.viewport = self.target.selection;
+            if (plan.cursor_target) |*cursor| {
+                cursor.row = self.target.cursor_row;
+                cursor.col = self.target.cursor_col;
+            }
+        }
+    };
+
     fn stableRetainedTransitionBody(
         self: *const TranscriptRuntime,
         anchor: CommittedTranscriptAnchor,
         source_bytes: []const u8,
         target_layout: render_engine.frame_layout.CommittedLayoutSnapshot,
-        plan: *const render_engine.paint_plan.PaintPlan,
         scroll_plan: render_engine.frame_scroll_plan.FrameScrollPlan,
         destructive_invalidation: bool,
+        activity_overlay_active: bool,
     ) ?RetainedTranscriptBody {
         return render_engine.frame_retention.stableRetainedTranscriptBody(.{
             .full_transcript_active = self.fullTranscriptActive(),
@@ -7230,7 +7276,7 @@ pub const TranscriptRuntime = struct {
             .target_layout = target_layout,
             .scroll_plan = scroll_plan,
             .destructive_invalidation = destructive_invalidation,
-            .activity_overlay_active = plan.activity == .overlay_entry,
+            .activity_overlay_active = activity_overlay_active,
         });
     }
 
@@ -7293,45 +7339,6 @@ pub const TranscriptRuntime = struct {
         return null;
     }
 
-    pub fn stagePreparedHistoryFloorForFrame(
-        self: *const TranscriptRuntime,
-        alloc: Allocator,
-        prepared: *transcript_painter.PreparedTranscriptSurfacePaint,
-        target_area: render_engine.frame_layout.FrameRect,
-        scroll_facts: TranscriptScrollFacts,
-    ) !bool {
-        if (scroll_facts.source_compatible) return false;
-        const anchor = switch (self.transcript_commit_state) {
-            .stable => |value| value,
-            .invalid, .recovering => return false,
-        };
-        var target = TransitionTarget.init(prepared, scroll_facts);
-        target.history_visual_offset = @min(
-            target.total_visual_rows,
-            anchor.history_visual_offset,
-        );
-        const history_floor = self.stableHistoryFloor(
-            target,
-            anchor,
-            scroll_facts,
-        ) orelse return false;
-        var projection_layout = self.layout;
-        projection_layout.content_bottom = target_area.bottom;
-        try target.stagePreparedProjection(
-            alloc,
-            projection_layout,
-            prepared,
-            target_area,
-            history_floor,
-        );
-        debug_trace.logf(
-            "scroll",
-            "transcript_prepare_hold_history_floor source_visual_offset={d} target_visual_offset={d}",
-            .{ history_floor, scroll_facts.target_visual_offset },
-        );
-        return true;
-    }
-
     fn recoveringCanAdvanceSemanticProgress(scroll_facts: TranscriptScrollFacts) bool {
         return scroll_facts.recovery_progress_compatible and
             scroll_facts.recovery_tracks_semantic_progress and
@@ -7344,12 +7351,12 @@ pub const TranscriptRuntime = struct {
         source_bytes: []const u8,
         prepared: *transcript_painter.PreparedTranscriptSurfacePaint,
         target_layout: render_engine.frame_layout.CommittedLayoutSnapshot,
-        plan: *const render_engine.paint_plan.PaintPlan,
         scroll_plan: render_engine.frame_scroll_plan.FrameScrollPlan,
         scroll_facts: TranscriptScrollFacts,
         accepted_semantic_rows: u32,
         accepted_semantic_progress_rows: u32,
         destructive_invalidation: bool,
+        activity_overlay_active: bool,
     ) !TransitionTarget {
         var target = TransitionTarget.init(prepared, scroll_facts);
         switch (self.transcript_commit_state) {
@@ -7375,9 +7382,9 @@ pub const TranscriptRuntime = struct {
                         anchor,
                         source_bytes,
                         target_layout,
-                        plan,
                         scroll_plan,
                         destructive_invalidation,
+                        activity_overlay_active,
                     )) |retained| {
                         target.retainCommittedAnchor(anchor, retained);
                     }
@@ -7877,44 +7884,22 @@ pub const TranscriptRuntime = struct {
         };
     }
 
-    pub fn finalizeTranscriptTransition(
-        self: *TranscriptRuntime,
-        alloc: Allocator,
-        source: *TranscriptPreparationSource,
-        prepared: *transcript_painter.PreparedTranscriptSurfacePaint,
-        target_layout: render_engine.frame_layout.CommittedLayoutSnapshot,
-        plan: *render_engine.paint_plan.PaintPlan,
-        scroll_plan: render_engine.frame_scroll_plan.FrameScrollPlan,
-    ) !TranscriptTransition {
-        return self.finalizeTranscriptTransitionForFrame(
-            alloc,
-            source,
-            prepared,
-            target_layout,
-            plan,
-            scroll_plan,
-            false,
-            false,
-        );
+    fn borrowsPendingResumeSource(
+        self: *const TranscriptRuntime,
+        source: *const TranscriptPreparationSource,
+    ) bool {
+        return if (self.pending_resume_source) |*pending| source == pending else false;
     }
 
-    pub fn finalizeTranscriptTransitionForFrame(
-        self: *TranscriptRuntime,
+    pub fn prepareTranscriptScrollFactsForFrame(
+        self: *const TranscriptRuntime,
         alloc: Allocator,
-        source: *TranscriptPreparationSource,
+        source: *const TranscriptPreparationSource,
         prepared: *transcript_painter.PreparedTranscriptSurfacePaint,
-        target_layout: render_engine.frame_layout.CommittedLayoutSnapshot,
-        plan: *render_engine.paint_plan.PaintPlan,
-        scroll_plan: render_engine.frame_scroll_plan.FrameScrollPlan,
         footer_reservation_changed: bool,
         replay_displaced_footer_history: bool,
-    ) !TranscriptTransition {
-        try scroll_plan.validate(self.layout.rows);
-        const borrows_pending_resume = if (self.pending_resume_source) |*pending|
-            source == pending
-        else
-            false;
-        if (borrows_pending_resume) switch (self.transcript_commit_state) {
+    ) !TranscriptScrollFacts {
+        if (self.borrowsPendingResumeSource(source)) switch (self.transcript_commit_state) {
             .invalid => try transcript_painter.seedPreparedPresentationBoundary(
                 alloc,
                 prepared,
@@ -7937,11 +7922,25 @@ pub const TranscriptRuntime = struct {
             },
             .stable => {},
         };
-        const scroll_facts = self.planTranscriptScrollForFrame(
+        return self.planTranscriptScrollForFrame(
             prepared,
             footer_reservation_changed,
             replay_displaced_footer_history,
         );
+    }
+
+    pub fn resolveTranscriptTransitionTargetForFrame(
+        self: *const TranscriptRuntime,
+        alloc: Allocator,
+        source: *const TranscriptPreparationSource,
+        prepared: *transcript_painter.PreparedTranscriptSurfacePaint,
+        target_layout: render_engine.frame_layout.CommittedLayoutSnapshot,
+        scroll_plan: render_engine.frame_scroll_plan.FrameScrollPlan,
+        scroll_facts: TranscriptScrollFacts,
+        destructive_invalidation: bool,
+        activity_overlay_active: bool,
+    ) !ResolvedTranscriptTarget {
+        try scroll_plan.validate(self.layout.rows);
         if (scroll_plan.requested_inline_advance_rows != scroll_facts.planned_rows) {
             return error.InvalidFrameScrollPlan;
         }
@@ -7952,29 +7951,135 @@ pub const TranscriptRuntime = struct {
             scroll_facts.semantic_rows,
             scroll_facts.semantic_progress_rows,
         );
-        const destructive_invalidation = render_engine.frame_retention.transcriptAreaHasDestructiveInvalidation(
-            self.committed_frame_layout.transcript_area,
-            plan.invalidation,
-        );
         const source_endpoint_cursor_row = prepared.cursor.cursor_row;
         const source_endpoint_cursor_col = prepared.cursor.cursor_col;
-        var target = try self.resolveTransitionTarget(
+        const target = try self.resolveTransitionTarget(
             alloc,
             source.bytes,
             prepared,
             target_layout,
-            plan,
             scroll_plan,
             scroll_facts,
             accepted.semantic_rows,
             accepted.semantic_progress_rows,
             destructive_invalidation,
+            activity_overlay_active,
         );
-        plan.viewport = target.selection;
-        if (plan.cursor_target) |*cursor| {
-            cursor.row = target.cursor_row;
-            cursor.col = target.cursor_col;
+        if (!target_layout.transcript_area.isEmpty() and
+            target.selection.last_visible_row > target_layout.transcript_area.bottom)
+        {
+            return error.InvalidTranscriptTransition;
         }
+        return .{
+            .target = target,
+            .target_layout = target_layout,
+            .scroll_plan = scroll_plan,
+            .scroll_facts = scroll_facts,
+            .accepted = accepted,
+            .source_endpoint_cursor_row = source_endpoint_cursor_row,
+            .source_endpoint_cursor_col = source_endpoint_cursor_col,
+            .destructive_invalidation = destructive_invalidation,
+            .activity_overlay_active = activity_overlay_active,
+            .borrows_pending_resume = self.borrowsPendingResumeSource(source),
+        };
+    }
+
+    pub fn finalizeTranscriptTransitionForFrame(
+        self: *TranscriptRuntime,
+        alloc: Allocator,
+        source: *TranscriptPreparationSource,
+        prepared: *transcript_painter.PreparedTranscriptSurfacePaint,
+        target_layout: render_engine.frame_layout.CommittedLayoutSnapshot,
+        plan: *render_engine.paint_plan.PaintPlan,
+        scroll_plan: render_engine.frame_scroll_plan.FrameScrollPlan,
+        footer_reservation_changed: bool,
+        replay_displaced_footer_history: bool,
+    ) !TranscriptTransition {
+        const scroll_facts = try self.prepareTranscriptScrollFactsForFrame(
+            alloc,
+            source,
+            prepared,
+            footer_reservation_changed,
+            replay_displaced_footer_history,
+        );
+        const destructive_invalidation = render_engine.frame_retention.transcriptAreaHasDestructiveInvalidation(
+            self.committed_frame_layout.transcript_area,
+            plan.invalidation,
+        );
+        const resolved = try self.resolveTranscriptTransitionTargetForFrame(
+            alloc,
+            source,
+            prepared,
+            target_layout,
+            scroll_plan,
+            scroll_facts,
+            destructive_invalidation,
+            plan.activity == .overlay_entry,
+        );
+        resolved.applyToPaintPlan(plan);
+        return self.sealTranscriptTransition(
+            alloc,
+            source,
+            prepared,
+            plan,
+            resolved,
+        );
+    }
+
+    pub fn sealTranscriptTransition(
+        self: *TranscriptRuntime,
+        alloc: Allocator,
+        source: *TranscriptPreparationSource,
+        prepared: *transcript_painter.PreparedTranscriptSurfacePaint,
+        plan: *const render_engine.paint_plan.PaintPlan,
+        resolved: ResolvedTranscriptTarget,
+    ) !TranscriptTransition {
+        try resolved.scroll_plan.validate(self.layout.rows);
+        const plan_layout = render_engine.frame_layout.CommittedLayoutSnapshot.fromPaintPlan(plan.*);
+        if (!std.meta.eql(plan_layout, resolved.target_layout) or
+            !std.meta.eql(plan.viewport, resolved.target.selection) or
+            (plan.activity == .overlay_entry) != resolved.activity_overlay_active)
+        {
+            return error.InvalidTranscriptTransition;
+        }
+        const destructive_invalidation = render_engine.frame_retention.transcriptAreaHasDestructiveInvalidation(
+            self.committed_frame_layout.transcript_area,
+            plan.invalidation,
+        );
+        if (destructive_invalidation != resolved.destructive_invalidation or
+            self.borrowsPendingResumeSource(source) != resolved.borrows_pending_resume)
+        {
+            return error.InvalidTranscriptTransition;
+        }
+        switch (resolved.target.body_disposition) {
+            .paint => if (!std.meta.eql(prepared.selection, resolved.target.selection) or
+                prepared.cursor.cursor_row != resolved.target.cursor_row or
+                prepared.cursor.cursor_col != resolved.target.cursor_col)
+            {
+                return error.InvalidTranscriptTransition;
+            },
+            .retain_committed => |retained| {
+                const anchor = switch (self.transcript_commit_state) {
+                    .stable => |value| value,
+                    .invalid, .recovering => return error.InvalidTranscriptTransition,
+                };
+                if (!std.meta.eql(anchor.selection, resolved.target.selection) or
+                    anchor.cursor_row != resolved.target.cursor_row or
+                    anchor.cursor_col != resolved.target.cursor_col or
+                    anchor.occupied_last_row != retained.occupied_last_row)
+                {
+                    return error.InvalidTranscriptTransition;
+                }
+            },
+        }
+        const borrows_pending_resume = resolved.borrows_pending_resume;
+        const scroll_plan = resolved.scroll_plan;
+        const scroll_facts = resolved.scroll_facts;
+        const accepted = resolved.accepted;
+        const target_layout = resolved.target_layout;
+        const source_endpoint_cursor_row = resolved.source_endpoint_cursor_row;
+        const source_endpoint_cursor_col = resolved.source_endpoint_cursor_col;
+        var target = resolved.target;
         const source_diagnostic = self.transcriptCommitDiagnostic();
         debug_trace.logf(
             "scroll",
@@ -10142,6 +10247,46 @@ fn acceptedTranscriptRowsForInlineRows(
     };
 }
 
+fn resolveAndSealTranscriptTransitionForRuntimeTest(
+    runtime: *TranscriptRuntime,
+    alloc: Allocator,
+    source: *TranscriptPreparationSource,
+    prepared: *transcript_painter.PreparedTranscriptSurfacePaint,
+    target_layout: render_engine.frame_layout.CommittedLayoutSnapshot,
+    plan: *render_engine.paint_plan.PaintPlan,
+    scroll_plan: render_engine.frame_scroll_plan.FrameScrollPlan,
+) !TranscriptTransition {
+    const scroll_facts = try runtime.prepareTranscriptScrollFactsForFrame(
+        alloc,
+        source,
+        prepared,
+        false,
+        false,
+    );
+    const destructive_invalidation = render_engine.frame_retention.transcriptAreaHasDestructiveInvalidation(
+        runtime.committed_frame_layout.transcript_area,
+        plan.invalidation,
+    );
+    const resolved = try runtime.resolveTranscriptTransitionTargetForFrame(
+        alloc,
+        source,
+        prepared,
+        target_layout,
+        scroll_plan,
+        scroll_facts,
+        destructive_invalidation,
+        plan.activity == .overlay_entry,
+    );
+    resolved.applyToPaintPlan(plan);
+    return runtime.sealTranscriptTransition(
+        alloc,
+        source,
+        prepared,
+        plan,
+        resolved,
+    );
+}
+
 fn testFrameCommitResult(
     committed_rows: u16,
     shadow_state: render_engine.terminal_diff.ShadowCommitState,
@@ -11306,7 +11451,8 @@ test "measured recovery rebases from accepted projection before retiring resize 
         .bottom_reserved_rows = 0,
         .preserve_scrollback = true,
     };
-    var transition = try runtime.finalizeTranscriptTransition(
+    var transition = try resolveAndSealTranscriptTransitionForRuntimeTest(
+        &runtime,
         alloc,
         &source,
         &prepared,
@@ -11465,7 +11611,8 @@ test "source rewrite replays unchanged history prefix after footer projection re
         .bottom_reserved_rows = 0,
         .preserve_scrollback = true,
     };
-    var transition = try runtime.finalizeTranscriptTransition(
+    var transition = try resolveAndSealTranscriptTransitionForRuntimeTest(
+        &runtime,
         alloc,
         &source,
         &prepared,
