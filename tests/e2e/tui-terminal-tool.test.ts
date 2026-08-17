@@ -19,6 +19,7 @@ import {
   classifierEvidenceFromRequest,
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
+  fakeGatewaySse,
   fakeGatewayToolCall,
   startFakeGateway,
   terminalFixtureShell,
@@ -468,6 +469,23 @@ function toolResultText(body: string, callId: string): string {
     part.type === "tool-result" && part.toolCallId === callId
   );
   return result ? contentText(result.output) : `<missing ${callId}>`;
+}
+
+function fakeTerminalToolBatch(
+  calls: Array<{ id: string; input: Record<string, unknown> }>,
+) {
+  return fakeGatewaySse([
+    ...calls.map((call) => ({
+      type: "tool-call",
+      toolCallId: call.id,
+      toolName: "terminal",
+      input: call.input,
+    })),
+    {
+      type: "finish",
+      finishReason: { unified: "tool-calls", raw: "tool-calls" },
+    },
+  ]);
 }
 
 async function waitForTrace(path: string, needle: string): Promise<string> {
@@ -1163,15 +1181,62 @@ test.skipIf(!tmuxAvailable())(
         close_policy: "force",
       }),
       (body) => {
-        expect(toolResultText(body, "terminal_mixed_start")).toContain(
-          'terminal start field "session_id" is not allowed',
-        );
+        const correction = JSON.parse(
+          toolResultText(body, "terminal_mixed_start"),
+        ) as {
+          error: {
+            code: string;
+            action: string;
+            invalid_fields: string[];
+            missing_fields: string[];
+            allowed_fields: string[];
+            conflicts: string[][];
+            retryable?: boolean;
+          };
+        };
+        expect(correction.error).toEqual({
+          code: "invalid_action_fields",
+          action: "start",
+          invalid_fields: [
+            "session_id",
+            "cursor_segment",
+            "cursor_offset",
+            "after_event_id",
+            "acknowledge_event_id",
+            "max_events",
+            "write",
+            "lease",
+            "monitor",
+            "task_id",
+            "workspace_root",
+            "rows",
+            "columns",
+            "signal",
+            "close_policy",
+          ],
+          missing_fields: [],
+          allowed_fields: [
+            "action",
+            "cwd",
+            "command",
+            "profile",
+            "shell",
+            "backend",
+            "return_when",
+            "wait_ceiling_ms",
+            "dimensions",
+            "initial_monitors",
+          ],
+          conflicts: [],
+        });
         expect(terminalRecords(fixture.home)).toEqual([]);
         expect(existsSync(mixedMarker)).toBe(false);
         return fakeGatewayToolCall("terminal_valid_start", "terminal", {
           action: "start",
+          session_id: null,
           cwd: fixture.workspace,
           command: "printf ACTION_SCHEMA_OK",
+          profile: null,
           shell: {
             kind: "executable",
             path: TERMINAL_FIXTURE_SHELL,
@@ -1180,6 +1245,22 @@ test.skipIf(!tmuxAvailable())(
           backend: "native",
           return_when: { kind: "exit" },
           wait_ceiling_ms: 20_000,
+          dimensions: null,
+          initial_monitors: null,
+          cursor_segment: null,
+          cursor_offset: null,
+          after_event_id: null,
+          acknowledge_event_id: null,
+          max_events: null,
+          write: null,
+          lease: null,
+          monitor: null,
+          task_id: null,
+          workspace_root: null,
+          rows: null,
+          columns: null,
+          signal: null,
+          close_policy: null,
         });
       },
       (body) => {
@@ -1214,7 +1295,12 @@ test.skipIf(!tmuxAvailable())(
         name?: string;
         inputSchema?: {
           type?: string;
-          properties?: Record<string, { type?: string; enum?: string[] }>;
+          properties?: Record<string, {
+            type?: string;
+            enum?: string[];
+            anyOf?: Array<{ type?: string }>;
+            description?: string;
+          }>;
           required?: string[];
           additionalProperties?: boolean;
           oneOf?: unknown[];
@@ -1227,10 +1313,9 @@ test.skipIf(!tmuxAvailable())(
     expect(terminalSchema).toBeDefined();
     expect(terminalSchema!.type).toBe("object");
     expect(terminalSchema!.oneOf).toBeUndefined();
-    expect(terminalSchema!.required).toEqual(["action"]);
     expect(terminalSchema!.additionalProperties).toBe(false);
     const properties = terminalSchema!.properties ?? {};
-    expect(Object.keys(properties)).toEqual([
+    const propertyNames = [
       "action",
       "session_id",
       "cwd",
@@ -1256,19 +1341,36 @@ test.skipIf(!tmuxAvailable())(
       "columns",
       "signal",
       "close_policy",
-    ]);
+    ];
+    expect(Object.keys(properties)).toEqual(propertyNames);
+    expect(terminalSchema!.required).toEqual(propertyNames);
     expect(properties.action!.enum).toEqual([
       "exec", "start", "read", "screen", "write", "wait",
       "monitor", "inspect", "list", "resize", "signal", "close",
     ]);
     expect(properties.action!.type).toBe("string");
-    expect(properties.wait_ceiling_ms!.type).toBe("integer");
-    expect(properties.shell!.type).toBe("object");
-    expect(properties.initial_monitors!.type).toBe("array");
+    for (const name of propertyNames.slice(1)) {
+      expect(properties[name]!.anyOf).toHaveLength(2);
+      expect(properties[name]!.anyOf![1]!.type).toBe("null");
+      expect(properties[name]!.description).toContain(
+        "Set null when the selected action does not use this field.",
+      );
+    }
+    expect(properties.wait_ceiling_ms!.anyOf![0]!.type).toBe("integer");
+    expect(properties.shell!.anyOf![0]!.type).toBe("object");
+    expect(properties.initial_monitors!.anyOf![0]!.type).toBe("array");
 
     const scrollback = await active.captureFullScrollback();
+    expect(scrollback).toContain("Failed start · 15 invalid fields");
     expect(countOccurrences(scrollback, "Used terminal start")).toBe(1);
     expect(scrollback).toContain("Used terminal close");
+    await active.sendKeys("C-o");
+    await Bun.sleep(250);
+    const expanded = await active.capturePane();
+    expect(expanded).toContain("missing_fields");
+    expect(expanded).toContain("allowed_fields");
+    expect(expanded).toContain("conflicts");
+    await active.sendKeys("Escape");
     expect(existsSync(mixedMarker)).toBe(false);
     const records = terminalRecords(fixture.home);
     expect(records).toHaveLength(1);
@@ -1277,6 +1379,62 @@ test.skipIf(!tmuxAvailable())(
     const terminalPid = Number(records[0]!.pid);
     expect(Number.isSafeInteger(terminalPid) && terminalPid > 0).toBe(true);
     await waitForOwnedProcessExit([terminalPid]);
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "terminal repeated correction batches stop after complete results without request three",
+  async () => {
+    const fixture = createFixture("fx-tui-terminal-correction-loop-");
+    const firstBatch = [
+      {
+        id: "terminal_s_1",
+        input: { action: "start", session_id: "terminal-a" },
+      },
+      {
+        id: "terminal_t_1",
+        input: { action: "read", command: "wrong" },
+      },
+    ];
+    const secondBatch = [
+      {
+        id: "terminal_s_2",
+        input: { action: "start", session_id: "terminal-b" },
+      },
+      {
+        id: "terminal_t_2",
+        input: { action: "read", command: "still wrong" },
+      },
+    ];
+    const gateway = startFakeGateway([
+      fakeTerminalToolBatch(firstBatch),
+      (body) => {
+        expect(JSON.parse(toolResultText(body, "terminal_s_1")).error.code)
+          .toBe("invalid_action_fields");
+        expect(JSON.parse(toolResultText(body, "terminal_t_1")).error.code)
+          .toBe("invalid_action_fields");
+        return fakeTerminalToolBatch(secondBatch);
+      },
+      () => {
+        throw new Error("terminal correction loop issued request three");
+      },
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway);
+
+    await active.sendText("Exercise repeated terminal validation corrections.");
+    const pane = await active.waitForText(
+      "Repeated terminal validation failures stopped the tool loop",
+      TIMEOUT,
+    );
+    expect(pane).toContain("no terminal effect");
+    expect(gateway.requests).toHaveLength(2);
+    expect(terminalRecords(fixture.home)).toEqual([]);
+    const trace = readFileSync(fixture.tracePath, "utf8");
+    expect(trace).not.toContain("event=permission_requested");
+    expect(trace).not.toContain("event=before_tool_execution");
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
   TIMEOUT,

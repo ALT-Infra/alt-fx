@@ -597,6 +597,8 @@ pub const FakeAgentRuntimeDeps = struct {
     session_context: ?*session_runtime.SessionRuntime = null,
     validation_not_registered_names: []const []const u8 = &.{},
     validation_failure_names: []const []const u8 = &.{},
+    validation_results: []const ?[]const u8 = &.{},
+    validation_result_index: usize = 0,
     validation_error: ?anyerror = null,
     availability_failure_names: []const []const u8 = &.{},
     workspace_root: []const u8 = "/tmp/workspace",
@@ -906,6 +908,13 @@ pub const FakeAgentRuntimeDeps = struct {
         if (self.last_validated_arguments) |value| self.alloc.free(value);
         self.last_validated_arguments = try self.alloc.dupe(u8, call.arguments_json);
         try self.record("validate:{s}", .{call.name});
+        if (self.validation_result_index < self.validation_results.len) {
+            const result = self.validation_results[self.validation_result_index];
+            self.validation_result_index += 1;
+            if (result) |failure| {
+                return .{ .failure = try arena.dupe(u8, failure) };
+            }
+        }
         for (self.validation_not_registered_names) |name| {
             if (std.mem.eql(u8, name, call.name)) return .not_registered;
         }

@@ -9,6 +9,7 @@ const command_environment = @import("../../core/execution/command_environment.zi
 const io_mod = @import("../../core/shared/io.zig");
 const pathing = @import("../../core/workspace/pathing.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
+const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
 const workspace_access = @import("../../core/workspace/workspace_access.zig");
 const shell_resolver = @import("../../core/terminal/shell_resolver.zig");
 
@@ -161,21 +162,75 @@ pub const Input = struct {
     close_policy: ?contracts.ClosePolicy = null,
 };
 
-pub fn actionFieldNames(action: Action) []const []const u8 {
+pub const public_field_names = blk: {
+    const fields = @typeInfo(Input).@"struct".fields;
+    var names: [fields.len][]const u8 = undefined;
+    for (fields, 0..) |field, index| names[index] = field.name;
+    break :blk names;
+};
+
+pub const ActionFieldContract = struct {
+    allowed: []const []const u8,
+    required: []const []const u8,
+    conflicts: []const tool_result_errors.TerminalActionFieldConflict = &.{},
+};
+
+pub fn actionFieldContract(action: Action) ActionFieldContract {
     return switch (action) {
-        .exec => &.{ "action", "command", "cwd", "profile" },
-        .start => &.{ "action", "cwd", "command", "profile", "shell", "backend", "return_when", "wait_ceiling_ms", "dimensions", "initial_monitors" },
-        .read => &.{ "action", "session_id", "cursor_segment", "cursor_offset" },
-        .screen => &.{ "action", "session_id" },
-        .write => &.{ "action", "session_id", "write", "lease" },
-        .wait => &.{ "action", "session_id", "return_when", "wait_ceiling_ms" },
-        .monitor => &.{ "action", "session_id", "monitor" },
-        .inspect => &.{ "action", "session_id", "after_event_id", "acknowledge_event_id", "max_events" },
-        .list => &.{ "action", "task_id", "workspace_root", "backend" },
-        .resize => &.{ "action", "session_id", "rows", "columns" },
-        .signal => &.{ "action", "session_id", "signal" },
-        .close => &.{ "action", "session_id", "close_policy" },
+        .exec => .{
+            .allowed = &.{ "action", "command", "cwd", "profile" },
+            .required = &.{ "action", "command" },
+        },
+        .start => .{
+            .allowed = &.{ "action", "cwd", "command", "profile", "shell", "backend", "return_when", "wait_ceiling_ms", "dimensions", "initial_monitors" },
+            .required = &.{"action"},
+            .conflicts = &.{.{ "profile", "shell" }},
+        },
+        .read => .{
+            .allowed = &.{ "action", "session_id", "cursor_segment", "cursor_offset" },
+            .required = &.{ "action", "session_id", "cursor_segment" },
+        },
+        .screen => .{
+            .allowed = &.{ "action", "session_id" },
+            .required = &.{ "action", "session_id" },
+        },
+        .write => .{
+            .allowed = &.{ "action", "session_id", "write", "lease" },
+            .required = &.{ "action", "session_id" },
+        },
+        .wait => .{
+            .allowed = &.{ "action", "session_id", "return_when", "wait_ceiling_ms" },
+            .required = &.{ "action", "session_id", "return_when", "wait_ceiling_ms" },
+        },
+        .monitor => .{
+            .allowed = &.{ "action", "session_id", "monitor" },
+            .required = &.{ "action", "session_id", "monitor" },
+        },
+        .inspect => .{
+            .allowed = &.{ "action", "session_id", "after_event_id", "acknowledge_event_id", "max_events" },
+            .required = &.{ "action", "session_id" },
+        },
+        .list => .{
+            .allowed = &.{ "action", "task_id", "workspace_root", "backend" },
+            .required = &.{"action"},
+        },
+        .resize => .{
+            .allowed = &.{ "action", "session_id", "rows", "columns" },
+            .required = &.{ "action", "session_id", "rows", "columns" },
+        },
+        .signal => .{
+            .allowed = &.{ "action", "session_id", "signal" },
+            .required = &.{ "action", "session_id", "signal" },
+        },
+        .close => .{
+            .allowed = &.{ "action", "session_id", "close_policy" },
+            .required = &.{ "action", "session_id", "close_policy" },
+        },
     };
+}
+
+fn actionFieldNames(action: Action) []const []const u8 {
+    return actionFieldContract(action).allowed;
 }
 
 fn actionAllowsField(action: Action, field_name: []const u8) bool {
@@ -185,12 +240,78 @@ fn actionAllowsField(action: Action, field_name: []const u8) bool {
     return false;
 }
 
-fn unexpectedActionField(action: Action, object: std.json.ObjectMap) ?[]const u8 {
+fn isPublicField(field_name: []const u8) bool {
+    for (public_field_names) |known_name| {
+        if (std.mem.eql(u8, known_name, field_name)) return true;
+    }
+    return false;
+}
+
+fn unexpectedUnknownField(object: std.json.ObjectMap) ?[]const u8 {
     var fields = object.iterator();
     while (fields.next()) |entry| {
-        if (!actionAllowsField(action, entry.key_ptr.*)) return entry.key_ptr.*;
+        if (!isPublicField(entry.key_ptr.*)) return entry.key_ptr.*;
     }
     return null;
+}
+
+fn elideKnownNullFields(object: *std.json.ObjectMap) void {
+    for (public_field_names[1..]) |field_name| {
+        const value = object.get(field_name) orelse continue;
+        if (value != .null) continue;
+        _ = object.orderedRemove(field_name);
+    }
+}
+
+const ActionFieldCorrectionScratch = struct {
+    invalid_fields: [public_field_names.len][]const u8 = undefined,
+    missing_fields: [public_field_names.len][]const u8 = undefined,
+    conflicts: [public_field_names.len]tool_result_errors.TerminalActionFieldConflict = undefined,
+};
+
+fn actionFieldCorrection(
+    action: Action,
+    object: std.json.ObjectMap,
+    scratch: *ActionFieldCorrectionScratch,
+) ?tool_result_errors.TerminalActionFieldCorrection {
+    const contract = actionFieldContract(action);
+    var invalid_count: usize = 0;
+    for (public_field_names) |field_name| {
+        if (object.get(field_name) == null) continue;
+        var allowed = false;
+        for (contract.allowed) |allowed_name| {
+            if (std.mem.eql(u8, allowed_name, field_name)) {
+                allowed = true;
+                break;
+            }
+        }
+        if (allowed) continue;
+        scratch.invalid_fields[invalid_count] = field_name;
+        invalid_count += 1;
+    }
+
+    var missing_count: usize = 0;
+    for (contract.required) |field_name| {
+        if (object.get(field_name) != null) continue;
+        scratch.missing_fields[missing_count] = field_name;
+        missing_count += 1;
+    }
+
+    var conflict_count: usize = 0;
+    for (contract.conflicts) |conflict| {
+        if (object.get(conflict[0]) == null or object.get(conflict[1]) == null) continue;
+        scratch.conflicts[conflict_count] = conflict;
+        conflict_count += 1;
+    }
+
+    if (invalid_count == 0 and missing_count == 0 and conflict_count == 0) return null;
+    return .{
+        .action = @tagName(action),
+        .invalid_fields = scratch.invalid_fields[0..invalid_count],
+        .missing_fields = scratch.missing_fields[0..missing_count],
+        .allowed_fields = contract.allowed,
+        .conflicts = scratch.conflicts[0..conflict_count],
+    };
 }
 
 const OwnedInput = struct {
@@ -244,11 +365,19 @@ pub fn decode(
             "terminal arguments must match the advertised action schema",
         ) };
     };
-    if (unexpectedActionField(action, raw.object)) |field_name| {
+    if (unexpectedUnknownField(raw.object)) |field_name| {
         return .{ .failure = try std.fmt.allocPrint(
             ctx.allocator,
             "terminal {s} field \"{s}\" is not allowed",
             .{ @tagName(action), field_name },
+        ) };
+    }
+    elideKnownNullFields(&raw.object);
+    var correction_scratch: ActionFieldCorrectionScratch = .{};
+    if (actionFieldCorrection(action, raw.object, &correction_scratch)) |correction| {
+        return .{ .failure = try tool_result_errors.terminalActionFieldCorrectionJson(
+            ctx.allocator,
+            correction,
         ) };
     }
 
@@ -1131,14 +1260,22 @@ pub fn isIrreversible(_: tool_dispatch.ToolInput) bool {
 
 test "terminal decoder accepts every public action and owns its input" {
     const alloc = std.testing.allocator;
-    inline for (std.meta.tags(Action)) |action| {
-        const args = try std.fmt.allocPrint(
-            alloc,
-            "{{\"action\":\"{s}\"}}",
-            .{@tagName(action)},
-        );
-        defer alloc.free(args);
-        const decoded = try decode(.{ .allocator = alloc }, args);
+    const cases = [_]struct { Action, []const u8 }{
+        .{ .exec, "{\"action\":\"exec\",\"command\":\"true\"}" },
+        .{ .start, "{\"action\":\"start\"}" },
+        .{ .read, "{\"action\":\"read\",\"session_id\":\"terminal-a\",\"cursor_segment\":1}" },
+        .{ .screen, "{\"action\":\"screen\",\"session_id\":\"terminal-a\"}" },
+        .{ .write, "{\"action\":\"write\",\"session_id\":\"terminal-a\"}" },
+        .{ .wait, "{\"action\":\"wait\",\"session_id\":\"terminal-a\",\"return_when\":{\"kind\":\"exit\"},\"wait_ceiling_ms\":1000}" },
+        .{ .monitor, "{\"action\":\"monitor\",\"session_id\":\"terminal-a\",\"monitor\":{\"kind\":\"remove\",\"monitor_id\":\"monitor-a\"}}" },
+        .{ .inspect, "{\"action\":\"inspect\",\"session_id\":\"terminal-a\"}" },
+        .{ .list, "{\"action\":\"list\"}" },
+        .{ .resize, "{\"action\":\"resize\",\"session_id\":\"terminal-a\",\"rows\":24,\"columns\":80}" },
+        .{ .signal, "{\"action\":\"signal\",\"session_id\":\"terminal-a\",\"signal\":\"interrupt\"}" },
+        .{ .close, "{\"action\":\"close\",\"session_id\":\"terminal-a\",\"close_policy\":\"force\"}" },
+    };
+    for (cases) |case| {
+        const decoded = try decode(.{ .allocator = alloc }, case[1]);
         switch (decoded) {
             .failure => |message| {
                 defer alloc.free(message);
@@ -1147,7 +1284,7 @@ test "terminal decoder accepts every public action and owns its input" {
             .input => |input| {
                 defer input.deinit(alloc);
                 try std.testing.expectEqual(
-                    action,
+                    case[0],
                     input.as(OwnedInput).parsed.value.action,
                 );
             },
@@ -1159,27 +1296,36 @@ test "terminal action field ownership is exact for every public action" {
     const expected = [_]struct {
         action: Action,
         fields: []const []const u8,
+        required: []const []const u8,
+        conflicts: []const tool_result_errors.TerminalActionFieldConflict = &.{},
     }{
-        .{ .action = .exec, .fields = &.{ "action", "command", "cwd", "profile" } },
-        .{ .action = .start, .fields = &.{ "action", "cwd", "command", "profile", "shell", "backend", "return_when", "wait_ceiling_ms", "dimensions", "initial_monitors" } },
-        .{ .action = .read, .fields = &.{ "action", "session_id", "cursor_segment", "cursor_offset" } },
-        .{ .action = .screen, .fields = &.{ "action", "session_id" } },
-        .{ .action = .write, .fields = &.{ "action", "session_id", "write", "lease" } },
-        .{ .action = .wait, .fields = &.{ "action", "session_id", "return_when", "wait_ceiling_ms" } },
-        .{ .action = .monitor, .fields = &.{ "action", "session_id", "monitor" } },
-        .{ .action = .inspect, .fields = &.{ "action", "session_id", "after_event_id", "acknowledge_event_id", "max_events" } },
-        .{ .action = .list, .fields = &.{ "action", "task_id", "workspace_root", "backend" } },
-        .{ .action = .resize, .fields = &.{ "action", "session_id", "rows", "columns" } },
-        .{ .action = .signal, .fields = &.{ "action", "session_id", "signal" } },
-        .{ .action = .close, .fields = &.{ "action", "session_id", "close_policy" } },
+        .{ .action = .exec, .fields = &.{ "action", "command", "cwd", "profile" }, .required = &.{ "action", "command" } },
+        .{ .action = .start, .fields = &.{ "action", "cwd", "command", "profile", "shell", "backend", "return_when", "wait_ceiling_ms", "dimensions", "initial_monitors" }, .required = &.{"action"}, .conflicts = &.{.{ "profile", "shell" }} },
+        .{ .action = .read, .fields = &.{ "action", "session_id", "cursor_segment", "cursor_offset" }, .required = &.{ "action", "session_id", "cursor_segment" } },
+        .{ .action = .screen, .fields = &.{ "action", "session_id" }, .required = &.{ "action", "session_id" } },
+        .{ .action = .write, .fields = &.{ "action", "session_id", "write", "lease" }, .required = &.{ "action", "session_id" } },
+        .{ .action = .wait, .fields = &.{ "action", "session_id", "return_when", "wait_ceiling_ms" }, .required = &.{ "action", "session_id", "return_when", "wait_ceiling_ms" } },
+        .{ .action = .monitor, .fields = &.{ "action", "session_id", "monitor" }, .required = &.{ "action", "session_id", "monitor" } },
+        .{ .action = .inspect, .fields = &.{ "action", "session_id", "after_event_id", "acknowledge_event_id", "max_events" }, .required = &.{ "action", "session_id" } },
+        .{ .action = .list, .fields = &.{ "action", "task_id", "workspace_root", "backend" }, .required = &.{"action"} },
+        .{ .action = .resize, .fields = &.{ "action", "session_id", "rows", "columns" }, .required = &.{ "action", "session_id", "rows", "columns" } },
+        .{ .action = .signal, .fields = &.{ "action", "session_id", "signal" }, .required = &.{ "action", "session_id", "signal" } },
+        .{ .action = .close, .fields = &.{ "action", "session_id", "close_policy" }, .required = &.{ "action", "session_id", "close_policy" } },
     };
 
     try std.testing.expectEqual(std.meta.tags(Action).len, expected.len);
     for (expected) |want| {
+        const contract = actionFieldContract(want.action);
         try std.testing.expectEqualSlices(
             []const u8,
             want.fields,
-            actionFieldNames(want.action),
+            contract.allowed,
+        );
+        try std.testing.expectEqualSlices([]const u8, want.required, contract.required);
+        try std.testing.expectEqualSlices(
+            tool_result_errors.TerminalActionFieldConflict,
+            want.conflicts,
+            contract.conflicts,
         );
         inline for (@typeInfo(Input).@"struct".fields) |field| {
             var want_allowed = false;
@@ -1197,27 +1343,166 @@ test "terminal action field ownership is exact for every public action" {
     }
 }
 
-test "terminal decoder rejects cross-action fields regardless of value" {
+test "terminal decoder elides known null placeholders but rejects unknown null fields" {
+    const alloc = std.testing.allocator;
+    const accepted = try decode(
+        .{ .allocator = alloc },
+        "{\"action\":\"start\",\"session_id\":null,\"cursor_segment\":null,\"write\":null,\"signal\":null}",
+    );
+    switch (accepted) {
+        .failure => |message| {
+            defer alloc.free(message);
+            return error.TestUnexpectedResult;
+        },
+        .input => |input| {
+            defer input.deinit(alloc);
+            const value = input.as(OwnedInput).parsed.value;
+            try std.testing.expectEqual(Action.start, value.action);
+            try std.testing.expect(value.session_id == null);
+        },
+    }
+
+    const rejected = try decode(
+        .{ .allocator = alloc },
+        "{\"action\":\"start\",\"unknown\":null}",
+    );
+    switch (rejected) {
+        .failure => |message| {
+            defer alloc.free(message);
+            try std.testing.expectEqualStrings(
+                "terminal start field \"unknown\" is not allowed",
+                message,
+            );
+        },
+        .input => |input| {
+            input.deinit(alloc);
+            return error.TestUnexpectedResult;
+        },
+    }
+}
+
+test "terminal decoder returns one complete canonical action field correction" {
+    const alloc = std.testing.allocator;
+    const decoded = try decode(
+        .{ .allocator = alloc },
+        "{\"signal\":\"terminate\",\"rows\":24,\"action\":\"start\",\"cursor_segment\":1,\"session_id\":\"terminal-a\"}",
+    );
+    const message = switch (decoded) {
+        .failure => |value| value,
+        .input => |input| {
+            input.deinit(alloc);
+            return error.TestUnexpectedResult;
+        },
+    };
+    defer alloc.free(message);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, message, .{});
+    defer parsed.deinit();
+    const correction = parsed.value.object.get("error").?.object;
+    try std.testing.expectEqualStrings(
+        "invalid_action_fields",
+        correction.get("code").?.string,
+    );
+    try std.testing.expectEqualStrings("start", correction.get("action").?.string);
+    const invalid_fields = correction.get("invalid_fields").?.array.items;
+    try std.testing.expectEqual(@as(usize, 4), invalid_fields.len);
+    try std.testing.expectEqualStrings("session_id", invalid_fields[0].string);
+    try std.testing.expectEqualStrings("cursor_segment", invalid_fields[1].string);
+    try std.testing.expectEqualStrings("rows", invalid_fields[2].string);
+    try std.testing.expectEqualStrings("signal", invalid_fields[3].string);
+    try std.testing.expectEqual(@as(usize, 0), correction.get("missing_fields").?.array.items.len);
+    const allowed_fields = correction.get("allowed_fields").?.array.items;
+    try std.testing.expectEqual(actionFieldNames(.start).len, allowed_fields.len);
+    for (actionFieldNames(.start), allowed_fields) |expected, actual| {
+        try std.testing.expectEqualStrings(expected, actual.string);
+    }
+    try std.testing.expectEqual(@as(usize, 0), correction.get("conflicts").?.array.items.len);
+    try std.testing.expect(correction.get("retryable") == null);
+}
+
+test "terminal decoder reports missing fields and active conflicts" {
+    const alloc = std.testing.allocator;
+    const missing = try decode(
+        .{ .allocator = alloc },
+        "{\"action\":\"resize\",\"session_id\":null,\"rows\":null,\"columns\":null}",
+    );
+    const missing_message = switch (missing) {
+        .failure => |value| value,
+        .input => |input| {
+            input.deinit(alloc);
+            return error.TestUnexpectedResult;
+        },
+    };
+    defer alloc.free(missing_message);
+    var missing_parsed = try std.json.parseFromSlice(std.json.Value, alloc, missing_message, .{});
+    defer missing_parsed.deinit();
+    const missing_fields = missing_parsed.value.object.get("error").?.object.get("missing_fields").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), missing_fields.len);
+    try std.testing.expectEqualStrings("session_id", missing_fields[0].string);
+    try std.testing.expectEqualStrings("rows", missing_fields[1].string);
+    try std.testing.expectEqualStrings("columns", missing_fields[2].string);
+
+    const conflict = try decode(
+        .{ .allocator = alloc },
+        "{\"action\":\"start\",\"profile\":\"user\",\"shell\":{\"kind\":\"user_login\"}}",
+    );
+    const conflict_message = switch (conflict) {
+        .failure => |value| value,
+        .input => |input| {
+            input.deinit(alloc);
+            return error.TestUnexpectedResult;
+        },
+    };
+    defer alloc.free(conflict_message);
+    var conflict_parsed = try std.json.parseFromSlice(std.json.Value, alloc, conflict_message, .{});
+    defer conflict_parsed.deinit();
+    const conflicts = conflict_parsed.value.object.get("error").?.object.get("conflicts").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), conflicts.len);
+    try std.testing.expectEqualStrings("profile", conflicts[0].array.items[0].string);
+    try std.testing.expectEqualStrings("shell", conflicts[0].array.items[1].string);
+}
+
+test "terminal correction bytes are independent of raw key order" {
+    const alloc = std.testing.allocator;
+    const first = try decode(
+        .{ .allocator = alloc },
+        "{\"action\":\"start\",\"session_id\":\"terminal-a\",\"signal\":\"terminate\"}",
+    );
+    const first_message = switch (first) {
+        .failure => |value| value,
+        .input => |input| {
+            input.deinit(alloc);
+            return error.TestUnexpectedResult;
+        },
+    };
+    defer alloc.free(first_message);
+    const second = try decode(
+        .{ .allocator = alloc },
+        "{\"signal\":\"terminate\",\"session_id\":\"terminal-a\",\"action\":\"start\"}",
+    );
+    const second_message = switch (second) {
+        .failure => |value| value,
+        .input => |input| {
+            input.deinit(alloc);
+            return error.TestUnexpectedResult;
+        },
+    };
+    defer alloc.free(second_message);
+    try std.testing.expectEqualStrings(first_message, second_message);
+}
+
+test "terminal decoder rejects concrete cross-action fields" {
     const alloc = std.testing.allocator;
     inline for (&.{
-        .{
-            "{\"action\":\"start\",\"session_id\":\"\"}",
-            "terminal start field \"session_id\" is not allowed",
-        },
-        .{
-            "{\"action\":\"list\",\"cwd\":\"\",\"task_id\":\"\"}",
-            "terminal list field \"cwd\" is not allowed",
-        },
-        .{
-            "{\"action\":\"close\",\"close_policy\":\"force\",\"session_id\":\"terminal-a\",\"rows\":0}",
-            "terminal close field \"rows\" is not allowed",
-        },
-    }) |case| {
-        const decoded = try decode(.{ .allocator = alloc }, case[0]);
+        "{\"action\":\"start\",\"session_id\":\"terminal-a\"}",
+        "{\"action\":\"list\",\"cwd\":\"\"}",
+        "{\"action\":\"close\",\"close_policy\":\"force\",\"session_id\":\"terminal-a\",\"rows\":24}",
+    }) |arguments| {
+        const decoded = try decode(.{ .allocator = alloc }, arguments);
         switch (decoded) {
             .failure => |message| {
                 defer alloc.free(message);
-                try std.testing.expectEqualStrings(case[1], message);
+                try std.testing.expect(std.mem.find(u8, message, "invalid_action_fields") != null);
             },
             .input => |input| {
                 input.deinit(alloc);
@@ -1424,9 +1709,19 @@ test "registered terminal validation enforces action-specific input before execu
         else => {},
     };
     switch (mixed) {
-        .failure => |reason| try std.testing.expect(
-            std.mem.find(u8, reason, "terminal start field \"session_id\" is not allowed") != null,
-        ),
+        .failure => |reason| {
+            const correction = (try tool_result_errors.inspectTerminalActionFieldCorrection(
+                std.testing.allocator,
+                reason,
+            )) orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(@as(usize, 6), correction.invalid_field_count);
+            var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, reason, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings(
+                "start",
+                parsed.value.object.get("error").?.object.get("action").?.string,
+            );
+        },
         else => return error.TestUnexpectedResult,
     }
 
@@ -1576,13 +1871,6 @@ test "terminal public wait ceiling maps to action-specific Core requests" {
 
 test "terminal public wait requires wait ceiling and rejects the removed field" {
     const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const ctx: tool_dispatch.DispatchContext = .{
-        .allocator = alloc,
-        .workspace_root = "/tmp",
-    };
 
     const missing_decoded = try decode(
         .{ .allocator = alloc },
@@ -1591,18 +1879,15 @@ test "terminal public wait requires wait ceiling and rejects the removed field" 
     switch (missing_decoded) {
         .failure => |message| {
             defer alloc.free(message);
-            return error.TestUnexpectedResult;
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, message, .{});
+            defer parsed.deinit();
+            const missing_fields = parsed.value.object.get("error").?.object.get("missing_fields").?.array.items;
+            try std.testing.expectEqual(@as(usize, 1), missing_fields.len);
+            try std.testing.expectEqualStrings("wait_ceiling_ms", missing_fields[0].string);
         },
         .input => |input| {
-            defer input.deinit(alloc);
-            try std.testing.expectError(
-                error.MissingWaitCeiling,
-                semanticRequest(
-                    arena,
-                    ctx,
-                    &input.as(OwnedInput).parsed.value,
-                ),
-            );
+            input.deinit(alloc);
+            return error.TestUnexpectedResult;
         },
     }
 
@@ -1871,12 +2156,12 @@ test "terminal decoder and semantic validation reject malformed action input" {
 test "terminal read-only classification is action exact" {
     const alloc = std.testing.allocator;
     inline for (.{
-        .{ "{\"action\":\"read\"}", true },
-        .{ "{\"action\":\"screen\"}", true },
-        .{ "{\"action\":\"inspect\"}", true },
-        .{ "{\"action\":\"inspect\",\"acknowledge_event_id\":1}", false },
+        .{ "{\"action\":\"read\",\"session_id\":\"terminal-a\",\"cursor_segment\":1}", true },
+        .{ "{\"action\":\"screen\",\"session_id\":\"terminal-a\"}", true },
+        .{ "{\"action\":\"inspect\",\"session_id\":\"terminal-a\"}", true },
+        .{ "{\"action\":\"inspect\",\"session_id\":\"terminal-a\",\"acknowledge_event_id\":1}", false },
         .{ "{\"action\":\"list\"}", true },
-        .{ "{\"action\":\"write\"}", false },
+        .{ "{\"action\":\"write\",\"session_id\":\"terminal-a\"}", false },
     }) |case| {
         const decoded = try decode(.{ .allocator = alloc }, case[0]);
         switch (decoded) {

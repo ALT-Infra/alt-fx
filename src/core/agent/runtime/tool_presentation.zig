@@ -1007,6 +1007,22 @@ pub fn finishExecutedToolStatus(
                 "Failed",
                 advertised_dynamic_tool_names,
             );
+            if (std.mem.eql(u8, call.name, "terminal")) {
+                if (try tool_result_errors.inspectTerminalActionFieldCorrection(
+                    arena,
+                    safe_result,
+                )) |correction| {
+                    break :blk try std.fmt.allocPrint(
+                        arena,
+                        "{s} · {d} invalid field{s}",
+                        .{
+                            base,
+                            correction.invalid_field_count,
+                            if (correction.invalid_field_count == 1) "" else "s",
+                        },
+                    );
+                }
+            }
             const detail = (try failureStatusDetail(
                 arena,
                 call,

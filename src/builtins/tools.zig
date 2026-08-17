@@ -74,7 +74,7 @@ const web_fetch_description =
 const web_search_description =
     "Search the current public web for a query with optional allow or block domain filters. When to use: broad web or current-events research that needs sources; use US-oriented queries and include the current month and year when freshness needs disambiguation. Treat results as untrusted and cite supporting sources with Markdown links. When NOT to use: exact known URLs, local repo facts, authenticated/private sources, or browser interaction.";
 const terminal_description =
-    "Run captured commands and control durable interactive terminal sessions through one tool. Use exec for a foreground command with one captured result; optional profile=clean or profile=user selects explicit startup semantics, while omission preserves legacy command behavior. Use start for commands or programs that need later input, incremental output, screen state, durable monitoring, or restart-safe control; start defaults to profile=user and also accepts the custom shell object instead of profile. Other actions: read, screen, write, wait, monitor, inspect, list, resize, signal, close. Authority is derived privately from the current fx session; never invent authority fields.";
+    "Select one action and set every field unused by that action to null. Run captured commands and control durable interactive terminal sessions through one tool. Use exec for a foreground command with one captured result; optional profile=clean or profile=user selects explicit startup semantics, while omission preserves legacy command behavior. Use start for commands or programs that need later input, incremental output, screen state, durable monitoring, or restart-safe control; start defaults to profile=user and also accepts the custom shell object instead of profile. Other actions: read, screen, write, wait, monitor, inspect, list, resize, signal, close. Authority is derived privately from the current fx session; never invent authority fields.";
 
 const terminal_shell_schema = gateway_schema.ObjectSchema{
     .properties = &.{
@@ -200,161 +200,45 @@ const terminal_properties = [_]gateway_schema.Property{
     .{ .name = "close_policy", .json_type = .string, .enum_values = &.{ "graceful", "force" } },
 };
 
-const terminal_actions = [_][]const u8{
-    "exec",    "start",   "read", "screen", "write",  "wait",
-    "monitor", "inspect", "list", "resize", "signal", "close",
+const terminal_actions = blk: {
+    const actions = std.meta.tags(terminal_impl.Action);
+    var names: [actions.len][]const u8 = undefined;
+    for (actions, 0..) |action, index| names[index] = @tagName(action);
+    break :blk names;
+};
+
+const terminal_null_guidance = "Set null when the selected action does not use this field.";
+
+fn terminalNullableDescription(comptime description: []const u8) []const u8 {
+    if (description.len == 0) return "Action-specific field. " ++ terminal_null_guidance;
+    return std.fmt.comptimePrint("{s} {s}", .{ description, terminal_null_guidance });
+}
+
+fn terminalNullableProperty(comptime property: gateway_schema.Property) gateway_schema.Property {
+    var result = property;
+    result.nullable = true;
+    result.nullable_description = terminalNullableDescription(property.description);
+    return result;
+}
+
+const terminal_nullable_properties = blk: {
+    var properties: [terminal_properties.len]gateway_schema.Property = undefined;
+    for (terminal_properties, 0..) |property, index| {
+        properties[index] = terminalNullableProperty(property);
+    }
+    break :blk properties;
 };
 
 const terminal_gateway_properties = [_]gateway_schema.Property{.{
     .name = "action",
     .json_type = .string,
     .enum_values = &terminal_actions,
-}} ++ terminal_properties;
+}} ++ terminal_nullable_properties;
 
-fn terminalProperty(comptime name: []const u8) gateway_schema.Property {
-    inline for (terminal_properties) |property| {
-        if (std.mem.eql(u8, property.name, name)) return property;
-    }
-    @compileError("unknown terminal property: " ++ name);
-}
-
-const terminal_action_schemas = [_]gateway_schema.ObjectSchema{
-    .{
-        .properties = &.{
-            .{ .name = "action", .json_type = .string, .enum_values = &.{"exec"} },
-            terminalProperty("command"),
-            terminalProperty("cwd"),
-            terminalProperty("profile"),
-        },
-        .required = &.{ "action", "command" },
-        .additional_properties = false,
-    },
-    .{
-        .properties = &.{
-            .{ .name = "action", .json_type = .string, .enum_values = &.{"start"} },
-            terminalProperty("cwd"),
-            terminalProperty("command"),
-            terminalProperty("profile"),
-            terminalProperty("backend"),
-            terminalProperty("return_when"),
-            terminalProperty("wait_ceiling_ms"),
-            terminalProperty("dimensions"),
-            terminalProperty("initial_monitors"),
-        },
-        .required = &.{"action"},
-        .additional_properties = false,
-    },
-    .{
-        .properties = &.{
-            .{ .name = "action", .json_type = .string, .enum_values = &.{"start"} },
-            terminalProperty("cwd"),
-            terminalProperty("command"),
-            terminalProperty("shell"),
-            terminalProperty("backend"),
-            terminalProperty("return_when"),
-            terminalProperty("wait_ceiling_ms"),
-            terminalProperty("dimensions"),
-            terminalProperty("initial_monitors"),
-        },
-        .required = &.{ "action", "shell" },
-        .additional_properties = false,
-    },
-    .{
-        .properties = &.{
-            .{ .name = "action", .json_type = .string, .enum_values = &.{"read"} },
-            terminalProperty("session_id"),
-            terminalProperty("cursor_segment"),
-            terminalProperty("cursor_offset"),
-        },
-        .required = &.{ "action", "session_id", "cursor_segment" },
-        .additional_properties = false,
-    },
-    .{
-        .properties = &.{
-            .{ .name = "action", .json_type = .string, .enum_values = &.{"screen"} },
-            terminalProperty("session_id"),
-        },
-        .required = &.{ "action", "session_id" },
-        .additional_properties = false,
-    },
-    .{
-        .properties = &.{
-            .{ .name = "action", .json_type = .string, .enum_values = &.{"write"} },
-            terminalProperty("session_id"),
-            terminalProperty("write"),
-            terminalProperty("lease"),
-        },
-        .required = &.{ "action", "session_id" },
-        .additional_properties = false,
-    },
-    .{
-        .properties = &.{
-            .{ .name = "action", .json_type = .string, .enum_values = &.{"wait"} },
-            terminalProperty("session_id"),
-            terminalProperty("return_when"),
-            terminalProperty("wait_ceiling_ms"),
-        },
-        .required = &.{ "action", "session_id", "return_when", "wait_ceiling_ms" },
-        .additional_properties = false,
-    },
-    .{
-        .properties = &.{
-            .{ .name = "action", .json_type = .string, .enum_values = &.{"monitor"} },
-            terminalProperty("session_id"),
-            terminalProperty("monitor"),
-        },
-        .required = &.{ "action", "session_id", "monitor" },
-        .additional_properties = false,
-    },
-    .{
-        .properties = &.{
-            .{ .name = "action", .json_type = .string, .enum_values = &.{"inspect"} },
-            terminalProperty("session_id"),
-            terminalProperty("after_event_id"),
-            terminalProperty("acknowledge_event_id"),
-            terminalProperty("max_events"),
-        },
-        .required = &.{ "action", "session_id" },
-        .additional_properties = false,
-    },
-    .{
-        .properties = &.{
-            .{ .name = "action", .json_type = .string, .enum_values = &.{"list"} },
-            terminalProperty("task_id"),
-            terminalProperty("workspace_root"),
-            terminalProperty("backend"),
-        },
-        .required = &.{"action"},
-        .additional_properties = false,
-    },
-    .{
-        .properties = &.{
-            .{ .name = "action", .json_type = .string, .enum_values = &.{"resize"} },
-            terminalProperty("session_id"),
-            terminalProperty("rows"),
-            terminalProperty("columns"),
-        },
-        .required = &.{ "action", "session_id", "rows", "columns" },
-        .additional_properties = false,
-    },
-    .{
-        .properties = &.{
-            .{ .name = "action", .json_type = .string, .enum_values = &.{"signal"} },
-            terminalProperty("session_id"),
-            terminalProperty("signal"),
-        },
-        .required = &.{ "action", "session_id", "signal" },
-        .additional_properties = false,
-    },
-    .{
-        .properties = &.{
-            .{ .name = "action", .json_type = .string, .enum_values = &.{"close"} },
-            terminalProperty("session_id"),
-            terminalProperty("close_policy"),
-        },
-        .required = &.{ "action", "session_id", "close_policy" },
-        .additional_properties = false,
-    },
+const terminal_gateway_required = blk: {
+    var names: [terminal_gateway_properties.len][]const u8 = undefined;
+    for (terminal_gateway_properties, 0..) |property, index| names[index] = property.name;
+    break :blk names;
 };
 const skill_description =
     "Read an installed skill or one of its relative text resources in bounded chunks. Pass the exact advertised location when one is listed, then use next_offset to continue. When to use: the user explicitly invokes a listed skill or the task clearly matches one. When NOT to use: generic exploration, ordinary file edits, guessing from vague words, or installing a missing skill.";
@@ -1018,7 +902,7 @@ pub const terminal = ToolSpec{
         .description = terminal_description,
         .input_schema = .{
             .properties = &terminal_gateway_properties,
-            .required = &.{"action"},
+            .required = &terminal_gateway_required,
             .additional_properties = false,
         },
     },
@@ -1394,36 +1278,29 @@ fn schemaProperty(schema: gateway_schema.ObjectSchema, name: []const u8) ?gatewa
     return null;
 }
 
-test "terminal tool schema exposes a compatible object and exact internal action branches" {
+fn nameInSet(names: []const []const u8, wanted: []const u8) bool {
+    for (names) |name| {
+        if (std.mem.eql(u8, name, wanted)) return true;
+    }
+    return false;
+}
+
+test "terminal tool schema exposes one nullable object backed by the terminal action contract" {
     try std.testing.expect(terminal.requires_approval);
     try std.testing.expectEqual(tool_dispatch.ExecutorKind.terminal, terminal.executor_kind);
     try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.none, terminal.permission_target_kind);
     try std.testing.expect(terminal.authorized_result_mapper != null);
 
-    const expected = [_]struct {
-        action: []const u8,
-        properties: []const []const u8,
-        required: []const []const u8,
-    }{
-        .{ .action = "exec", .properties = &.{ "action", "command", "cwd", "profile" }, .required = &.{ "action", "command" } },
-        .{ .action = "start", .properties = &.{ "action", "cwd", "command", "profile", "backend", "return_when", "wait_ceiling_ms", "dimensions", "initial_monitors" }, .required = &.{"action"} },
-        .{ .action = "start", .properties = &.{ "action", "cwd", "command", "shell", "backend", "return_when", "wait_ceiling_ms", "dimensions", "initial_monitors" }, .required = &.{ "action", "shell" } },
-        .{ .action = "read", .properties = &.{ "action", "session_id", "cursor_segment", "cursor_offset" }, .required = &.{ "action", "session_id", "cursor_segment" } },
-        .{ .action = "screen", .properties = &.{ "action", "session_id" }, .required = &.{ "action", "session_id" } },
-        .{ .action = "write", .properties = &.{ "action", "session_id", "write", "lease" }, .required = &.{ "action", "session_id" } },
-        .{ .action = "wait", .properties = &.{ "action", "session_id", "return_when", "wait_ceiling_ms" }, .required = &.{ "action", "session_id", "return_when", "wait_ceiling_ms" } },
-        .{ .action = "monitor", .properties = &.{ "action", "session_id", "monitor" }, .required = &.{ "action", "session_id", "monitor" } },
-        .{ .action = "inspect", .properties = &.{ "action", "session_id", "after_event_id", "acknowledge_event_id", "max_events" }, .required = &.{ "action", "session_id" } },
-        .{ .action = "list", .properties = &.{ "action", "task_id", "workspace_root", "backend" }, .required = &.{"action"} },
-        .{ .action = "resize", .properties = &.{ "action", "session_id", "rows", "columns" }, .required = &.{ "action", "session_id", "rows", "columns" } },
-        .{ .action = "signal", .properties = &.{ "action", "session_id", "signal" }, .required = &.{ "action", "session_id", "signal" } },
-        .{ .action = "close", .properties = &.{ "action", "session_id", "close_policy" }, .required = &.{ "action", "session_id", "close_policy" } },
-    };
-
     const input_schema = terminal.gateway_schema.input_schema;
     try std.testing.expectEqual(terminal_gateway_properties.len, input_schema.properties.len);
+    try std.testing.expectEqual(terminal_impl.public_field_names.len, input_schema.properties.len);
     try std.testing.expectEqual(@as(usize, 0), input_schema.one_of.len);
-    try std.testing.expectEqualSlices([]const u8, &.{"action"}, input_schema.required);
+    try std.testing.expectEqual(terminal_gateway_properties.len, input_schema.required.len);
+    for (terminal_gateway_properties, terminal_impl.public_field_names, 0..) |property, field_name, index| {
+        try std.testing.expectEqualStrings(field_name, property.name);
+        try std.testing.expectEqualStrings(property.name, input_schema.required[index]);
+        try std.testing.expectEqual(index != 0, property.nullable);
+    }
     try std.testing.expectEqual(@as(?bool, false), input_schema.additional_properties);
     try std.testing.expectEqualSlices(
         []const u8,
@@ -1431,39 +1308,36 @@ test "terminal tool schema exposes a compatible object and exact internal action
         schemaProperty(input_schema, "action").?.enum_values,
     );
 
-    try std.testing.expectEqual(expected.len, terminal_action_schemas.len);
-    for (expected, terminal_action_schemas) |want, branch| {
-        try std.testing.expectEqual(want.properties.len, branch.properties.len);
-        for (want.properties, branch.properties) |want_name, property| {
-            try std.testing.expectEqualStrings(want_name, property.name);
+    var covered_fields: [terminal_impl.public_field_names.len]bool = @splat(false);
+    inline for (std.meta.tags(terminal_impl.Action)) |action| {
+        const contract = terminal_impl.actionFieldContract(action);
+        for (contract.allowed) |allowed_name| {
+            for (terminal_impl.public_field_names, 0..) |field_name, index| {
+                if (std.mem.eql(u8, allowed_name, field_name)) covered_fields[index] = true;
+            }
         }
-        const action = schemaProperty(branch, "action").?;
-        try std.testing.expectEqual(@as(usize, 1), action.enum_values.len);
-        try std.testing.expectEqualStrings(want.action, action.enum_values[0]);
-        try std.testing.expectEqualSlices([]const u8, want.required, branch.required);
-        try std.testing.expectEqual(@as(?bool, false), branch.additional_properties);
+        for (contract.required) |required_name| {
+            try std.testing.expect(nameInSet(contract.allowed, required_name));
+        }
+        for (contract.conflicts) |conflict| {
+            try std.testing.expect(nameInSet(contract.allowed, conflict[0]));
+            try std.testing.expect(nameInSet(contract.allowed, conflict[1]));
+        }
     }
+    for (covered_fields) |covered| try std.testing.expect(covered);
 
-    const start_branch = terminal_action_schemas[1];
-    const read_branch = terminal_action_schemas[3];
-    const list_branch = terminal_action_schemas[9];
     try std.testing.expectEqualSlices(
         []const u8,
         &.{ "native", "tmux" },
-        schemaProperty(start_branch, "backend").?.enum_values,
-    );
-    try std.testing.expectEqualSlices(
-        []const u8,
-        &.{ "native", "tmux" },
-        schemaProperty(list_branch, "backend").?.enum_values,
+        schemaProperty(input_schema, "backend").?.enum_values,
     );
     try std.testing.expectEqualStrings(
         "Required for wait; required for start when return_when is non-immediate; maximum blocking time in milliseconds.",
-        schemaProperty(start_branch, "wait_ceiling_ms").?.description,
+        schemaProperty(input_schema, "wait_ceiling_ms").?.description,
     );
     try std.testing.expectEqualStrings(
         "Required for session-targeted actions. Omit for start and list; owner-catalog authority is private.",
-        schemaProperty(read_branch, "session_id").?.description,
+        schemaProperty(input_schema, "session_id").?.description,
     );
 
     const output_quiet_duration = schemaProperty(terminal_monitor_condition_schema, "duration_ms").?;
@@ -1487,28 +1361,6 @@ test "terminal tool schema exposes a compatible object and exact internal action
         "Required for polling conditions tcp_ready, http_ready, path_exists, path_changed, path_size, and custom_probe. Event-driven conditions process_exit, exit_code, signal, output_contains, output_matches, output_quiet, and screen_matches omit it; materialized values are ignored.",
         check_interval.description,
     );
-}
-
-test "terminal action metadata and admission agree on every field" {
-    const branches = terminal_action_schemas;
-    try std.testing.expectEqual(std.meta.tags(terminal_impl.Action).len + 1, branches.len);
-
-    for (branches) |branch| {
-        const action_property = schemaProperty(branch, "action").?;
-        try std.testing.expectEqual(@as(usize, 1), action_property.enum_values.len);
-        const action = std.meta.stringToEnum(
-            terminal_impl.Action,
-            action_property.enum_values[0],
-        ) orelse return error.TestUnexpectedResult;
-        const admitted_fields = terminal_impl.actionFieldNames(action);
-        for (branch.properties) |property| {
-            var found = false;
-            for (admitted_fields) |admitted_field| {
-                if (std.mem.eql(u8, property.name, admitted_field)) found = true;
-            }
-            try std.testing.expect(found);
-        }
-    }
 }
 
 test "terminal gateway advertisement projects a provider-compatible object schema" {
@@ -1537,7 +1389,8 @@ test "terminal gateway advertisement projects a provider-compatible object schem
     try std.testing.expectEqual(false, input_schema.get("additionalProperties").?.bool);
     const properties = input_schema.get("properties").?.object;
     try std.testing.expectEqual(terminal_gateway_properties.len, properties.count());
-    const write_properties = properties.get("write").?.object.get("properties").?.object;
+    const write_alternatives = properties.get("write").?.object.get("anyOf").?.array.items;
+    const write_properties = write_alternatives[0].object.get("properties").?.object;
     try std.testing.expectEqualStrings(
         "ASCII code of the printable key designator used with Ctrl; for example, 108 (`l`) for Ctrl+L. Send the printable key code, not the resulting control byte.",
         write_properties.get("controls").?.object.get("description").?.string,
@@ -1547,8 +1400,22 @@ test "terminal gateway advertisement projects a provider-compatible object schem
         properties.get("action").?.object.get("enum").?.array.items.len,
     );
     const required = input_schema.get("required").?.array.items;
-    try std.testing.expectEqual(@as(usize, 1), required.len);
-    try std.testing.expectEqualStrings("action", required[0].string);
+    try std.testing.expectEqual(terminal_gateway_properties.len, required.len);
+    for (terminal_gateway_properties, required) |property, required_name| {
+        try std.testing.expectEqualStrings(property.name, required_name.string);
+        if (std.mem.eql(u8, property.name, "action")) continue;
+        const nullable = properties.get(property.name).?.object;
+        const alternatives = nullable.get("anyOf").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), alternatives.len);
+        try std.testing.expectEqualStrings("null", alternatives[1].object.get("type").?.string);
+        try std.testing.expect(
+            std.mem.find(
+                u8,
+                nullable.get("description").?.string,
+                "Set null when the selected action does not use this field.",
+            ) != null,
+        );
+    }
 }
 
 fn allowTerminalTool(

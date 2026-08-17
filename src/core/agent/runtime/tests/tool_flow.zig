@@ -4983,6 +4983,111 @@ test "processQueuedPrompt returns ordinary results for repeated calls" {
     try expectBodyNotContains(&gateway, 3, "Repeated identical tool call blocked");
 }
 
+test "processQueuedPrompt stops repeated distinct terminal corrections after the complete second batch" {
+    const alloc = std.testing.allocator;
+    const correction_s = try tool_result_errors.terminalActionFieldCorrectionJson(alloc, .{
+        .action = "start",
+        .invalid_fields = &.{"session_id"},
+        .missing_fields = &.{},
+        .allowed_fields = &.{ "action", "command" },
+        .conflicts = &.{},
+    });
+    defer alloc.free(correction_s);
+    const correction_t = try tool_result_errors.terminalActionFieldCorrectionJson(alloc, .{
+        .action = "read",
+        .invalid_fields = &.{"command"},
+        .missing_fields = &.{},
+        .allowed_fields = &.{ "action", "session_id", "cursor_segment" },
+        .conflicts = &.{},
+    });
+    defer alloc.free(correction_t);
+
+    const first_calls = [_]ToolCall{
+        toolCall("terminal_s_1", "terminal", "{\"action\":\"start\",\"session_id\":\"terminal-a\"}"),
+        toolCall("terminal_t_1", "terminal", "{\"action\":\"read\",\"command\":\"wrong\"}"),
+    };
+    const second_calls = [_]ToolCall{
+        toolCall("terminal_s_2", "terminal", "{\"action\":\"start\",\"session_id\":\"terminal-b\"}"),
+        toolCall("terminal_t_2", "terminal", "{\"action\":\"read\",\"command\":\"still wrong\"}"),
+    };
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &first_calls },
+        .{ .tool_calls = &second_calls },
+        .{ .content = "A third request must not be sent." },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    deps.context_enabled = true;
+    deps.validation_results = &.{ correction_s, correction_t, correction_s, correction_t };
+    defer deps.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &deps, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 4), deps.rejected_names.items.len);
+    try std.testing.expectEqual(@as(usize, 0), deps.permission_names.items.len);
+    try std.testing.expectEqual(@as(usize, 0), deps.executed_names.items.len);
+    try std.testing.expectEqual(@as(usize, 1), deps.history_turns.items.len);
+    const execution = deps.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 2), execution.tool_steps.len);
+    for (execution.tool_steps) |step| {
+        try std.testing.expectEqual(@as(usize, 2), step.tool_calls.len);
+        try std.testing.expectEqual(@as(usize, 2), step.tool_results.len);
+    }
+    try std.testing.expectEqual(@as(usize, 1), deps.system_notices.items.len);
+    try std.testing.expect(
+        std.mem.find(u8, deps.system_notices.items[0], "no terminal effect") != null,
+    );
+}
+
+test "processQueuedPrompt retains a terminal correction across valid neighboring calls" {
+    const alloc = std.testing.allocator;
+    const correction = try tool_result_errors.terminalActionFieldCorrectionJson(alloc, .{
+        .action = "start",
+        .invalid_fields = &.{"session_id"},
+        .missing_fields = &.{},
+        .allowed_fields = &.{ "action", "command" },
+        .conflicts = &.{},
+    });
+    defer alloc.free(correction);
+
+    const first_calls = [_]ToolCall{
+        toolCall("terminal_s_1", "terminal", "{\"action\":\"start\",\"session_id\":\"terminal-a\"}"),
+        toolCall("terminal_valid_1", "terminal", "{\"action\":\"exec\",\"command\":\"true\"}"),
+    };
+    const second_calls = [_]ToolCall{
+        toolCall("terminal_s_2", "terminal", "{\"action\":\"start\",\"session_id\":\"terminal-b\"}"),
+        toolCall("terminal_valid_2", "terminal", "{\"action\":\"exec\",\"command\":\"true\"}"),
+    };
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &first_calls },
+        .{ .tool_calls = &second_calls },
+        .{ .content = "A third request must not be sent." },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    deps.validation_results = &.{ correction, null, correction, null };
+    defer deps.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &deps, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 2), deps.rejected_names.items.len);
+    try std.testing.expectEqual(@as(usize, 2), deps.permission_names.items.len);
+    try std.testing.expectEqual(@as(usize, 2), deps.executed_names.items.len);
+    try std.testing.expectEqualStrings("terminal_valid_1", deps.executed_call_ids.items[0]);
+    try std.testing.expectEqualStrings("terminal_valid_2", deps.executed_call_ids.items[1]);
+    const execution = deps.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 2), execution.tool_steps.len);
+    for (execution.tool_steps) |step| {
+        try std.testing.expectEqual(@as(usize, 2), step.tool_results.len);
+    }
+}
+
 test "processQueuedPrompt command output completion fires on command success and error" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_1", "terminal", "{\"action\":\"exec\",\"command\":\"echo hi\"}")};

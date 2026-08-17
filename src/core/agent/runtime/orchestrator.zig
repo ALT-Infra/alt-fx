@@ -58,6 +58,8 @@ const AgentRuntimeDeps = runtime_deps.AgentRuntimeDeps;
 const CredentialRefreshMode = runtime_deps.CredentialRefreshMode;
 
 const http_error_detail_max_bytes: usize = 4096;
+const repeated_terminal_validation_notice =
+    "Repeated terminal validation failures stopped the tool loop. The invalid terminal calls were not executed and produced no terminal effect.";
 const Config = runtime_config.Config;
 const LifecycleContext = runtime_lifecycle.LifecycleContext;
 const PreparedToolCall = runtime_lifecycle.PreparedToolCall;
@@ -2243,6 +2245,8 @@ fn processQueuedPromptLoop(
     defer local_grants_ptr.* = local_grants;
     var turn_file_mutation_denials: runtime_tool_admission.TurnFileMutationDenials = .{};
     defer turn_file_mutation_denials.deinit(arena);
+    var terminal_validation_retry: runtime_tool_admission.TerminalValidationRetryState = .{};
+    defer terminal_validation_retry.deinit(arena);
     var completed_tool_names = completed_tool_names_ptr.*;
     defer completed_tool_names_ptr.* = completed_tool_names;
     var context_delivery_state: context_contract.DeliveryState = if (deps.context_enabled)
@@ -4373,6 +4377,7 @@ fn processQueuedPromptLoop(
         }
 
         var step_batch = runtime_tool_batch.StepBatchState{};
+        terminal_validation_retry.beginBatch();
         var settled_vision_ids: std.ArrayList(usize) = .empty;
         defer mem_utils.deinitList(arena, &settled_vision_ids);
         var parallel_skip_until: usize = 0;
@@ -5009,6 +5014,13 @@ fn processQueuedPromptLoop(
                                 );
                             },
                             .validation_failure, .availability_failure => {
+                                if (terminal.kind == .validation_failure) {
+                                    try terminal_validation_retry.observe(
+                                        arena,
+                                        tool_call,
+                                        model_output,
+                                    );
+                                }
                                 const execution: ToolExecutionResult = .{
                                     .status = .failure,
                                     .model_output = safe_output,
@@ -5246,6 +5258,11 @@ fn processQueuedPromptLoop(
                 true;
             if (requires_legacy_classification) {
                 if (try runtime_tool_admission.registeredToolValidationFailure(deps, arena, tool_call)) |execution| {
+                    try terminal_validation_retry.observe(
+                        arena,
+                        tool_call,
+                        execution.model_output,
+                    );
                     const prepared = try runtime_execution_memory.prepareToolModelOutput(arena, config, tool_call, execution.model_output);
                     const safe_tool_output = prepared.model_output;
                     _ = try stream_ctx.provisional_statuses.finishExecutedCall(
@@ -6944,6 +6961,35 @@ fn processQueuedPromptLoop(
             &within_turn_suffix,
             &step_batch,
         );
+        if (terminal_validation_retry.finishBatch()) {
+            try deps.push_system_notice(
+                deps.ctx,
+                repeated_terminal_validation_notice,
+            );
+            const assistant_text = if (stop_state.retained_candidate != null)
+                try hooks.prompt.joinVisibleSegments(
+                    arena,
+                    stop_state.retained_candidate,
+                    stop_state.latest_partial,
+                )
+            else
+                "";
+            stop_state.terminal_materializing = true;
+            try finishCommonAssistantTerminal(
+                deps,
+                finalization,
+                arena,
+                job,
+                within_turn_suffix.items,
+                &summary_accumulator,
+                assistant_text,
+                .completed,
+                null,
+                &finish_trace,
+                "terminal_validation_retry",
+            );
+            return;
+        }
         if (terminal_provider_completion) {
             const raw_final = completion.content.?;
             const final_text = try runtime_assistant_stream.normalizeAssistantTextForDisplay(arena, raw_final);
