@@ -540,7 +540,7 @@ test "resume menu renders each session on one line with a right metadata cluster
     const alloc = std.testing.allocator;
     const summaries = [_]session_store.SessionSummary{.{
         .id = @constCast("one"),
-        .workspace_root = @constCast("/Users/faxes/Developer/Fx/worktrees/resume-catalog"),
+        .workspace_root = @constCast("/Users/example/Developer/Fx/worktrees/resume-catalog"),
         .title = @constCast("Redesign resume menu"),
         .created_at_ms = 1,
         .updated_at_ms = 1_000,
@@ -705,7 +705,7 @@ test "resume menu keeps long titles on one narrow row without a workspace spill 
     const alloc = std.testing.allocator;
     const summaries = [_]session_store.SessionSummary{.{
         .id = @constCast("one"),
-        .workspace_root = @constCast("/Users/faxes/Developer/Fx/worktrees/a-very-long-session-catalog-worktree"),
+        .workspace_root = @constCast("/Users/example/Developer/Fx/worktrees/a-very-long-session-catalog-worktree"),
         .title = @constCast("Investigate a very long session catalog rendering issue"),
         .created_at_ms = 1,
         .updated_at_ms = 1,

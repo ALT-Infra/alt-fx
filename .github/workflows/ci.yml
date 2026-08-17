@@ -39,6 +39,10 @@ jobs:
         if: matrix.optimize == 'Debug'
         run: python3 -m scripts.pgso.corpus --manifest scripts/pgso/corpus.json --list
 
+      - name: Audit public surface
+        if: matrix.optimize == 'Debug'
+        run: ./scripts/check-public-surface.sh
+
       - name: Build
         run: zig build -Doptimize=${{ matrix.optimize }}
 
@@ -335,6 +339,7 @@ jobs:
         run: |
           scripts=(
             benchmarks/startup.sh
+            scripts/check-public-surface.sh
           )
           bash -n "${scripts[@]}"
           shellcheck "${scripts[@]}"
