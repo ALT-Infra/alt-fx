@@ -97,6 +97,9 @@ Run the test suite with `zig build test`. See [CONTRIBUTING.md](CONTRIBUTING.md)
 
 [Apache-2.0](LICENSE)
 
+Third-party licenses and attributions are listed in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
 ## Credits
 
 Interface sounds by [cuelume](https://github.com/Danilaa1/cuelume).

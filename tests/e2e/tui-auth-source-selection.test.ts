@@ -86,7 +86,7 @@ function writeSeededFxLogin(
   };
   if (teamId) {
     auth.team_id = teamId;
-    auth.team_slug = "vercel-internal-playground";
+    auth.team_slug = "example-internal-team";
   }
   writeFileSync(authPath, JSON.stringify(auth) + "\n", { mode: 0o600 });
   chmodSync(authPath, 0o600);
@@ -802,7 +802,7 @@ tmuxTest(
       {
         teams: [
           { id: "team_456", slug: "other-team", name: "Other Team" },
-          { id: "team_123", slug: "vercel-internal-playground", name: "Internal Playground" },
+          { id: "team_123", slug: "example-internal-team", name: "Example Internal Team" },
         ],
       },
     );
@@ -840,7 +840,7 @@ tmuxTest(
       (pane) =>
         pane.includes("Choose a Vercel team") &&
         pane.includes("Search: play") &&
-        pane.includes("Internal Playground") &&
+        pane.includes("Example Internal Team") &&
         !pane.includes("Other Team"),
       TIMEOUT,
     );
@@ -874,7 +874,7 @@ tmuxTest(
     expect(catalogEvents.at(-1)).toContain(
       "requested_access=authenticated credential_source=fx_login effective_access=authenticated",
     );
-    for (const secret of [ACQUIRED_LOGIN_TOKEN, "team_123", "vercel-internal-playground"]) {
+    for (const secret of [ACQUIRED_LOGIN_TOKEN, "team_123", "example-internal-team"]) {
       expect(trace).not.toContain(secret);
     }
     expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -1550,7 +1550,7 @@ tmuxTest(
       "seeded-refresh-token",
       "acquired-refresh-token",
       "team_123",
-      "vercel-internal-playground",
+      "example-internal-team",
     ]) {
       expect(trace).not.toContain(secret);
     }
