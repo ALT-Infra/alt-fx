@@ -1241,13 +1241,11 @@ fn requestToolPermissionOutcomeWithRequest(raw_ctx: *anyopaque, arena: Allocator
 }
 
 const TestReviewTurn = struct {
-    request_messages: [1]ChatMessage,
     tool_calls: [1]ToolCall,
     root_messages: [1][]const u8,
 
     fn init(root_text: []const u8, call: ToolCall) TestReviewTurn {
         return .{
-            .request_messages = .{.{ .role = .user, .content = root_text }},
             .tool_calls = .{call},
             .root_messages = .{root_text},
         };
@@ -1256,7 +1254,6 @@ const TestReviewTurn = struct {
     fn context(self: *const TestReviewTurn) permission_auto_classifier.ReviewTurnContext {
         return .{
             .model = "openai/gpt-5",
-            .request_messages = &self.request_messages,
             .pending_assistant = .{ .role = .assistant, .tool_calls = &self.tool_calls },
             .target_call_id = self.tool_calls[0].id,
             .origin = .root,

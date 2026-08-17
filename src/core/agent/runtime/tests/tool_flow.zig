@@ -4359,7 +4359,6 @@ test "processQueuedPrompt denied normal permission appends structured denial wit
     );
     try std.testing.expectEqual(permission_auto_classifier.ReviewOrigin.root, hooks.permission_review_origins.items[0]);
     try std.testing.expectEqual(@as(usize, 1), hooks.permission_review_root_authority_counts.items[0]);
-    try std.testing.expectEqual(@as(usize, 2), hooks.permission_review_message_counts.items[0]);
     try std.testing.expectEqual(@as(usize, 1), hooks.permission_review_pending_call_counts.items[0]);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
     try std.testing.expectEqual(@as(usize, 3), hooks.lifecycle_events.items.len);

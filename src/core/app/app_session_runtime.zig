@@ -4334,6 +4334,8 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             permission_state: session_permission_state.State,
         ) !void {
+            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
             const loaded = if (app.session_persistence.writable) |*value|
                 value
             else

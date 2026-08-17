@@ -1918,50 +1918,9 @@ fn containsImageId(image_ids: []const usize, candidate: usize) bool {
     return false;
 }
 
-/// Finds the canonical current user message after a length-changing request
-/// projection so native image parts can be removed from reviewer context. This
-/// mapping does not establish permission authority.
-fn projectedUserMessageIndex(
-    projected_messages: []const ChatMessage,
-    source_messages: []const ChatMessage,
-    source_index: usize,
-) ?usize {
-    if (source_index >= source_messages.len) return null;
-    const source = source_messages[source_index];
-    if (source.role != .user) return null;
-    if (projected_messages.len == source_messages.len) {
-        if (source_index >= projected_messages.len or
-            projected_messages[source_index].role != .user)
-        {
-            return null;
-        }
-        return source_index;
-    }
-
-    const source_content = source.content orelse return null;
-    var matched_index: ?usize = null;
-    for (projected_messages, 0..) |projected, index| {
-        if (projected.role != .user or
-            projected.permission_feedback != source.permission_feedback)
-        {
-            continue;
-        }
-        const projected_content = projected.content orelse continue;
-        if (projected_content.ptr != source_content.ptr or
-            projected_content.len != source_content.len)
-        {
-            continue;
-        }
-        if (matched_index != null) return null;
-        matched_index = index;
-    }
-    return matched_index;
-}
-
 fn buildReviewTurnContext(
     config: Config,
     model: []const u8,
-    projected_messages: []const ChatMessage,
     current_prompt: []const u8,
     pending_assistant: ChatMessage,
     target_call_id: []const u8,
@@ -1976,7 +1935,6 @@ fn buildReviewTurnContext(
         "";
     return .{
         .model = model,
-        .request_messages = projected_messages,
         .pending_assistant = pending_assistant,
         .target_call_id = target_call_id,
         .origin = switch (config.origin) {
@@ -2385,7 +2343,6 @@ fn processQueuedPromptLoop(
         var stream_result_set = false;
         var gateway_model: []const u8 = job.model;
         var successful_request_messages: []const ChatMessage = &.{};
-        var successful_review_messages: []const ChatMessage = &.{};
         var successful_source_messages: []const ChatMessage = &.{};
         var successful_gateway_model: []const u8 = "";
         var successful_vision_route: runtime_vision_contracts.VisionRoute = .native_images;
@@ -3528,24 +3485,6 @@ fn processQueuedPromptLoop(
             }
 
             successful_request_messages = request_messages;
-            successful_review_messages = blk: {
-                if (vision_route != .native_images) break :blk request_messages;
-                for (successful_request_messages) |message| {
-                    if (message.images.len == 0) continue;
-                    const review_current_user_message_index = projectedUserMessageIndex(
-                        successful_request_messages,
-                        recovery_source_messages,
-                        current_user_message_index,
-                    ) orelse return error.MissingUserMessage;
-                    break :blk try runtime_vision_contracts.project_text_only_messages(
-                        overlay_arena,
-                        successful_request_messages,
-                        review_current_user_message_index,
-                        job.authorized_image_catalog,
-                    );
-                }
-                break :blk request_messages;
-            };
             successful_source_messages = recovery_source_messages;
             successful_gateway_model = gateway_model;
             successful_vision_route = vision_route;
@@ -4537,7 +4476,6 @@ fn processQueuedPromptLoop(
                     const parallel_review_context = buildReviewTurnContext(
                         config,
                         successful_gateway_model,
-                        successful_review_messages,
                         job.prompt,
                         pending_assistant,
                         parallel_call.id,
@@ -5456,7 +5394,6 @@ fn processQueuedPromptLoop(
             const review_context = buildReviewTurnContext(
                 config,
                 successful_gateway_model,
-                successful_review_messages,
                 job.prompt,
                 pending_assistant,
                 execution_call.id,

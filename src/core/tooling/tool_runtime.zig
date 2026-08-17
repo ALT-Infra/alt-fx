@@ -2262,9 +2262,6 @@ const test_context_registry = context_contract.Registry{ .default_provider = .{
     .append_transient_fn = appendNoopTestTransientContext,
 } };
 
-const test_review_messages = [_]types.ChatMessage{
-    .{ .role = .user, .content = "test root request" },
-};
 const test_review_calls = [_]ToolCall{
     .{ .id = "test-review", .name = "run_command", .arguments_json = "{}" },
 };
@@ -2273,7 +2270,6 @@ const test_review_root_messages = [_][]const u8{"test root request"};
 fn testReviewTurn() permission_auto_classifier.ReviewTurnContext {
     return .{
         .model = "openai/gpt-5",
-        .request_messages = &test_review_messages,
         .pending_assistant = .{ .role = .assistant, .tool_calls = &test_review_calls },
         .target_call_id = "test-review",
         .origin = .root,

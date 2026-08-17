@@ -3616,9 +3616,6 @@ test "exact command approval remains valid across live authority revalidation" {
     try std.testing.expect(sessionGrantsAllowAll(grants, call.name, targets.items));
 }
 
-const test_review_request_messages = [_]types.ChatMessage{
-    .{ .role = .user, .content = "test root request" },
-};
 const test_review_tool_calls = [_]ToolCall{
     .{ .id = "test-review", .name = "run_command", .arguments_json = "{}" },
 };
@@ -3627,7 +3624,6 @@ const test_review_root_messages = [_][]const u8{"test root request"};
 fn testReviewTurn() permission_auto_classifier.ReviewTurnContext {
     return .{
         .model = "openai/gpt-5",
-        .request_messages = &test_review_request_messages,
         .pending_assistant = .{ .role = .assistant, .tool_calls = &test_review_tool_calls },
         .target_call_id = "test-review",
         .origin = .root,

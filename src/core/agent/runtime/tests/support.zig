@@ -469,7 +469,6 @@ pub const FakeAgentRuntimeDeps = struct {
     permission_review_origins: std.ArrayList(permission_auto_classifier.ReviewOrigin) = .empty,
     permission_review_root_authority_counts: std.ArrayList(usize) = .empty,
     permission_review_feedback_counts: std.ArrayList(usize) = .empty,
-    permission_review_message_counts: std.ArrayList(usize) = .empty,
     permission_review_pending_call_counts: std.ArrayList(usize) = .empty,
     sandbox_widening_user_intent_contexts: std.ArrayList([]u8) = .empty,
     executed_names: std.ArrayList([]u8) = .empty,
@@ -648,7 +647,6 @@ pub const FakeAgentRuntimeDeps = struct {
         self.permission_review_origins.deinit(self.alloc);
         self.permission_review_root_authority_counts.deinit(self.alloc);
         self.permission_review_feedback_counts.deinit(self.alloc);
-        self.permission_review_message_counts.deinit(self.alloc);
         self.permission_review_pending_call_counts.deinit(self.alloc);
         freeStringList(self.alloc, &self.sandbox_widening_user_intent_contexts);
         freeStringList(self.alloc, &self.executed_names);
@@ -982,10 +980,6 @@ pub const FakeAgentRuntimeDeps = struct {
         try self.permission_review_feedback_counts.append(
             self.alloc,
             0,
-        );
-        try self.permission_review_message_counts.append(
-            self.alloc,
-            review_turn.request_messages.len,
         );
         try self.permission_review_pending_call_counts.append(
             self.alloc,

@@ -1777,14 +1777,10 @@ test "interactive app prepared file mutation callback applies app permission pol
     const deps = app_callbacks.Bindings(FakeApp).agentRuntimeDeps(&app);
     const callback = deps.request_prepared_file_mutation_permission orelse
         return error.TestExpectedPreparedFileMutationCallback;
-    const review_messages = [_]ChatMessage{
-        .{ .role = .user, .content = "do not bypass policy" },
-    };
     const review_calls = [_]ToolCall{call};
     const review_root_messages = [_][]const u8{"do not bypass policy"};
     const review_turn: permission_auto_classifier.ReviewTurnContext = .{
         .model = "openai/gpt-5",
-        .request_messages = &review_messages,
         .pending_assistant = .{ .role = .assistant, .tool_calls = &review_calls },
         .target_call_id = call.id,
         .origin = .root,

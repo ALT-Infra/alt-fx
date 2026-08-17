@@ -350,7 +350,6 @@ fn testRequest() permission_auto_classifier.ReviewRequest {
         .workspace_root = "/tmp/workspace",
         .review_turn = .{
             .model = "openai/gpt-5",
-            .request_messages = &.{.{ .role = .user, .content = "User asked to inspect the repository." }},
             .pending_assistant = pending,
             .target_call_id = "call_1",
             .origin = .root,
