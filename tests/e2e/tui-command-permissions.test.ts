@@ -1032,12 +1032,14 @@ async function launchPermissionResumeHarness(initialResponses: Response[]) {
   };
 }
 
-function expectDirectTrace(tracePath: string) {
+function expectUserProfileTrace(tracePath: string) {
   const trace = readFileSync(tracePath, "utf8");
-  expect(trace).toContain("authority=direct_only route=direct_read_only");
-  expect(trace).toContain("limit=65536");
-  expect(trace).toContain("artifact=false");
-  expect(trace).not.toContain("route=approved_shell");
+  expect(trace).toContain(
+    "terminal.exec authority=shell_allowed source=yolo " +
+      "route=approved_shell environment=user",
+  );
+  expect(trace).toContain("sandbox explicit command environment=user shell=");
+  expect(trace).not.toContain("authority=direct_only route=direct_read_only");
 }
 
 function expectNoCommandArtifacts(root: IsolatedRoot) {
@@ -1306,7 +1308,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "TUI in ask mode executes direct pwd without prompting or using inherited PATH",
+    "TUI yolo executes pwd through the default user profile without prompting",
     async () => {
       const root = createIsolatedRoot();
       const gateway = startFakeGateway([toolCall("pwd"), finalText("direct complete")]);
@@ -1319,7 +1321,7 @@ describe("effect-aware command permissions", () => {
         cwd: root.workspace,
         env: gatewayEnv(root, gateway, {
           PATH: hostilePath(root),
-          FX_PERMISSION_MODE: "ask",
+          FX_PERMISSION_MODE: "yolo",
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "core",
         }),
@@ -1334,9 +1336,9 @@ describe("effect-aware command permissions", () => {
       expect(pane).not.toContain(COMMAND_APPROVAL_PROMPT);
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.requests[1].body).toContain(root.workspace);
-      expectDirectTrace(tracePath);
+      expectUserProfileTrace(tracePath);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
-      expect(existsSync(root.profileMarker)).toBe(false);
+      expect(existsSync(root.profileMarker)).toBe(true);
       expectNoHostileExecutables(root);
       expectNoCommandArtifacts(root);
     },
@@ -1344,7 +1346,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "TUI auto direct command keeps its provisional row before following transcript text",
+    "TUI yolo user-profile command keeps its provisional row before following transcript text",
     async () => {
       const root = createIsolatedRoot();
       const streamText = "DIRECT_NO_NOTICE_STREAM_TEXT";
@@ -1374,7 +1376,7 @@ describe("effect-aware command permissions", () => {
         cwd: root.workspace,
         env: gatewayEnv(root, gateway, {
           PATH: hostilePath(root),
-          FX_PERMISSION_MODE: "auto",
+          FX_PERMISSION_MODE: "yolo",
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "core,permission,tool",
         }),
@@ -1394,9 +1396,9 @@ describe("effect-aware command permissions", () => {
       expect(scrollback).not.toContain("Auto agent approved this request");
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.classifierRequests).toHaveLength(0);
-      expectDirectTrace(tracePath);
+      expectUserProfileTrace(tracePath);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
-      expect(existsSync(root.profileMarker)).toBe(false);
+      expect(existsSync(root.profileMarker)).toBe(true);
       expectNoHostileExecutables(root);
       expectNoCommandArtifacts(root);
     },
@@ -1562,7 +1564,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "TUI direct printf keeps compact output bounded and Ctrl-O complete",
+    "TUI user-profile printf keeps compact output bounded and Ctrl-O complete",
     async () => {
       const root = createIsolatedRoot();
       const tracePath = join(root.root, "direct-printf-trace.log");
@@ -1624,7 +1626,7 @@ describe("effect-aware command permissions", () => {
         cwd: root.workspace,
         env: gatewayEnv(root, gateway, {
           PATH: hostilePath(root),
-          FX_PERMISSION_MODE: "ask",
+          FX_PERMISSION_MODE: "yolo",
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "core,tool,session,command_output",
         }),
@@ -1719,7 +1721,8 @@ describe("effect-aware command permissions", () => {
       expect(lossyModelResult).not.toContain("  DIRECT_PADDED  ");
       expect(lossyModelResult).not.toContain("DIRECT_TRAILING   ");
       expect(lossyModelResult).not.toContain("command_output_replay");
-      expectDirectTrace(tracePath);
+      expectUserProfileTrace(tracePath);
+      expect(existsSync(root.profileMarker)).toBe(true);
       expectNoHostileExecutables(root);
       expectNoCommandArtifacts(root);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -1773,7 +1776,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "TUI treats removed output command as text and preserves compact scrollback across slash commands",
+    "TUI user-profile output preserves compact scrollback across slash commands",
     async () => {
       const root = createIsolatedRoot();
       const stderrPath = join(root.root, "output-setting-removal-stderr.log");
@@ -1810,7 +1813,7 @@ describe("effect-aware command permissions", () => {
       activeSession = await TmuxSession.create({
         cmd: FX_BIN,
         cwd: root.workspace,
-        env: gatewayEnv(root, gateway, { FX_PERMISSION_MODE: "ask" }),
+        env: gatewayEnv(root, gateway, { FX_PERMISSION_MODE: "yolo" }),
         stderrPath,
         width: 90,
         height: 30,
@@ -1872,7 +1875,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "TUI in ask mode completes more than twenty-five serial direct commands when unlimited",
+    "TUI yolo completes more than twenty-five serial user-profile commands when unlimited",
     async () => {
       const root = createIsolatedRoot();
       const gateway = startFakeGateway([
@@ -1890,7 +1893,7 @@ describe("effect-aware command permissions", () => {
         cwd: root.workspace,
         env: gatewayEnv(root, gateway, {
           PATH: hostilePath(root),
-          FX_PERMISSION_MODE: "ask",
+          FX_PERMISSION_MODE: "yolo",
         }),
         stderrPath,
         width: 120,
@@ -1906,7 +1909,7 @@ describe("effect-aware command permissions", () => {
       );
       expect(gateway.requests).toHaveLength(27);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
-      expect(existsSync(root.profileMarker)).toBe(false);
+      expect(existsSync(root.profileMarker)).toBe(true);
       expectNoHostileExecutables(root);
       expectNoCommandArtifacts(root);
 
@@ -3086,7 +3089,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "TUI in ask mode returns every repeated direct command result to the model",
+    "TUI yolo returns every repeated user-profile command result to the model",
     async () => {
       const root = createIsolatedRoot();
       const callIds = Array.from({ length: 10 }, (_, index) => `command_${index + 1}`);
@@ -3103,7 +3106,7 @@ describe("effect-aware command permissions", () => {
         cwd: root.workspace,
         env: gatewayEnv(root, gateway, {
           PATH: hostilePath(root),
-          FX_PERMISSION_MODE: "ask",
+          FX_PERMISSION_MODE: "yolo",
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "core",
         }),
@@ -3121,7 +3124,7 @@ describe("effect-aware command permissions", () => {
       expectOrdinaryToolResults(gateway.requests[1].body, callIds);
       expect(gateway.requests[1].body).not.toContain("Agent stopped:");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
-      expect(existsSync(root.profileMarker)).toBe(false);
+      expect(existsSync(root.profileMarker)).toBe(true);
       expectNoHostileExecutables(root);
       expectNoCommandArtifacts(root);
     },
@@ -3228,7 +3231,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test(
-    "default fx ask in ask mode returns repeated direct command results to the model",
+    "fx ask yolo returns repeated user-profile command results to the model",
     async () => {
       const root = createIsolatedRoot();
       const callIds = ["direct_1", "direct_2", "direct_3"];
@@ -3237,11 +3240,10 @@ describe("effect-aware command permissions", () => {
         finalText("direct repetition complete"),
       ]);
 
-      const result = await runFx(["ask", "Run pwd until you can answer."], {
+      const result = await runFx(["ask", "--yolo", "Run pwd until you can answer."], {
         cwd: root.workspace,
         env: gatewayEnv(root, gateway, {
           PATH: hostilePath(root),
-          FX_PERMISSION_MODE: "ask",
         }),
         timeoutMs: TIMEOUT,
       });
@@ -3252,7 +3254,7 @@ describe("effect-aware command permissions", () => {
       expect(gateway.requests).toHaveLength(2);
       expectOrdinaryToolResults(gateway.requests[1].body, callIds);
       expect(gateway.requests[1].body).not.toContain("Agent stopped:");
-      expect(existsSync(root.profileMarker)).toBe(false);
+      expect(existsSync(root.profileMarker)).toBe(true);
       expectNoHostileExecutables(root);
       expectNoCommandArtifacts(root);
     },
@@ -3260,7 +3262,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test(
-    "default fx ask in ask mode completes more than ten serial direct commands when unlimited",
+    "fx ask yolo completes more than ten serial user-profile commands when unlimited",
     async () => {
       const root = createIsolatedRoot();
       const gateway = startFakeGateway([
@@ -3271,11 +3273,10 @@ describe("effect-aware command permissions", () => {
         finalText("direct unlimited complete"),
       ]);
 
-      const result = await runFx(["ask", "Run pwd until you can answer."], {
+      const result = await runFx(["ask", "--yolo", "Run pwd until you can answer."], {
         cwd: root.workspace,
         env: gatewayEnv(root, gateway, {
           PATH: hostilePath(root),
-          FX_PERMISSION_MODE: "ask",
         }),
         timeoutMs: TIMEOUT,
       });
@@ -3284,7 +3285,7 @@ describe("effect-aware command permissions", () => {
       expect(result.stdout).toContain("direct unlimited complete");
       expect(result.stderr).toContain("Running pwd");
       expect(gateway.requests).toHaveLength(12);
-      expect(existsSync(root.profileMarker)).toBe(false);
+      expect(existsSync(root.profileMarker)).toBe(true);
       expectNoHostileExecutables(root);
       expectNoCommandArtifacts(root);
     },
@@ -3401,7 +3402,7 @@ describe("effect-aware command permissions", () => {
         .join("\n");
       expect(requestBodies).not.toContain('"command":"sleep');
       expect(requestBodies).not.toContain('"command":"while ');
-      expect(existsSync(root.profileMarker)).toBe(false);
+      expect(existsSync(root.profileMarker)).toBe(true);
       expectNoHostileExecutables(root);
       expectNoCommandArtifacts(root);
     },
@@ -5820,18 +5821,17 @@ describe("effect-aware command permissions", () => {
   );
 
   test(
-    "fx ask in ask mode executes direct pwd and returns no artifact",
+    "fx ask yolo executes pwd through the default user profile without an artifact",
     async () => {
       const root = createIsolatedRoot();
       const gateway = startFakeGateway([toolCall("pwd"), finalText("ask direct complete")]);
       const tracePath = join(root.root, "trace.log");
       const result = await runFx(
-        ["ask", "--quiet", "--json", "--no-save", "Run pwd once."],
+        ["ask", "--yolo", "--quiet", "--json", "--no-save", "Run pwd once."],
         {
           cwd: root.workspace,
           env: gatewayEnv(root, gateway, {
             PATH: hostilePath(root),
-            FX_PERMISSION_MODE: "ask",
             FX_TRACE_LOG: tracePath,
             FX_TRACE_SCOPES: "core",
           }),
@@ -5850,8 +5850,8 @@ describe("effect-aware command permissions", () => {
       expect(json.tool_calls[0].command_result.command).toBe("pwd");
       expect(json.tool_calls[0].command_result.cwd).toBe(root.workspace);
       expect(json.tool_calls[0].command_result.output_file).toBeNull();
-      expectDirectTrace(tracePath);
-      expect(existsSync(root.profileMarker)).toBe(false);
+      expectUserProfileTrace(tracePath);
+      expect(existsSync(root.profileMarker)).toBe(true);
       expectNoHostileExecutables(root);
       expectNoCommandArtifacts(root);
     },
@@ -6454,18 +6454,16 @@ describe("effect-aware command permissions", () => {
   );
 
   test(
-    "fx ask projects hostile ls filenames without inherited PATH execution",
+    "fx ask projects hostile ls filenames through the default user profile",
     async () => {
       const root = createIsolatedRoot();
       const gateway = startFakeGateway([toolCall("ls"), finalText("ask ls complete")]);
       const tracePath = join(root.root, "trace.log");
       const result = await runFx(
-        ["ask", "--quiet", "--json", "--no-save", "List this directory."],
+        ["ask", "--yolo", "--quiet", "--json", "--no-save", "List this directory."],
         {
           cwd: root.workspace,
           env: gatewayEnv(root, gateway, {
-            PATH: hostilePath(root),
-            FX_PERMISSION_MODE: "ask",
             FX_TRACE_LOG: tracePath,
             FX_TRACE_SCOPES: "core",
           }),
@@ -6475,11 +6473,12 @@ describe("effect-aware command permissions", () => {
 
       expect(result.code).toBe(0);
       expect(gateway.requests).toHaveLength(2);
-      expect(gateway.requests[1].body).toContain("?name");
+      expect(gateway.requests[1].body).toContain("\\u001bname");
+      expect(gateway.requests[1].body).toContain("line\\nname");
       expect(gateway.requests[1].body).not.toContain("\x1b");
       expect(gateway.requests[1].body).not.toContain("\\x1b");
-      expectDirectTrace(tracePath);
-      expect(existsSync(root.profileMarker)).toBe(false);
+      expectUserProfileTrace(tracePath);
+      expect(existsSync(root.profileMarker)).toBe(true);
       expectNoHostileExecutables(root);
       expectNoCommandArtifacts(root);
     },
@@ -6487,7 +6486,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test(
-    "fx ask preserves quoted shell metacharacters on the direct route",
+    "fx ask preserves quoted shell metacharacters through the user profile",
     async () => {
       const root = createIsolatedRoot();
       const gateway = startFakeGateway([
@@ -6496,12 +6495,11 @@ describe("effect-aware command permissions", () => {
       ]);
       const tracePath = join(root.root, "trace.log");
       const result = await runFx(
-        ["ask", "--quiet", "--json", "--no-save", "Print a literal less-than sign."],
+        ["ask", "--yolo", "--quiet", "--json", "--no-save", "Print a literal less-than sign."],
         {
           cwd: root.workspace,
           env: gatewayEnv(root, gateway, {
             PATH: hostilePath(root),
-            FX_PERMISSION_MODE: "ask",
             FX_TRACE_LOG: tracePath,
             FX_TRACE_SCOPES: "core",
           }),
@@ -6513,7 +6511,8 @@ describe("effect-aware command permissions", () => {
       expect(result.stderr).toContain("Running printf '%s' '<'");
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.requests[1].body).toContain("<stdout>\\n<\\n</stdout>");
-      expectDirectTrace(tracePath);
+      expectUserProfileTrace(tracePath);
+      expect(existsSync(root.profileMarker)).toBe(true);
       expectNoHostileExecutables(root);
       expectNoCommandArtifacts(root);
     },
@@ -6613,35 +6612,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test(
-    "ACP executes direct pwd without a permission request or shell fallback",
-    async () => {
-      const root = createIsolatedRoot();
-      const gateway = startFakeGateway([toolCall("pwd"), finalText("acp direct complete")]);
-      const tracePath = join(root.root, "trace.log");
-      activeClient = AcpClient.create(root.workspace, gatewayEnv(root, gateway, {
-        PATH: hostilePath(root),
-        FX_TRACE_LOG: tracePath,
-        FX_TRACE_SCOPES: "core",
-      }));
-      await startAcpSession(activeClient);
-      const messages = await runAcpPrompt(activeClient, "Run pwd once.");
-      await activeClient.close();
-
-      const serialized = JSON.stringify(messages);
-      expect(serialized).toContain(root.workspace);
-      expect(serialized).not.toContain("request_permission");
-      expect(activeClient.stderr).toBe("");
-      expectDirectTrace(tracePath);
-      expect(existsSync(root.profileMarker)).toBe(false);
-      expectNoHostileExecutables(root);
-      expectNoCommandArtifacts(root);
-      activeClient = null;
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "ACP completes more than twenty-five serial direct commands when unlimited",
+    "ACP completes more than twenty-five serial terminal calls when unlimited",
     async () => {
       const root = createIsolatedRoot();
       const gateway = startFakeGateway([
