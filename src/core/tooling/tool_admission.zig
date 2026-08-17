@@ -414,6 +414,7 @@ pub fn preflightPreparedFileMutation(
     var authorization: file_mutation_contract.FileExecutionAuthorization = .{
         .input = input,
         .policy_targets = policy_targets,
+        .read_disclosure_required = equality_prompt_required,
     };
     if (!edit_prompt_required and !equality_prompt_required) {
         input_owned = false;
@@ -539,6 +540,79 @@ fn fileMutationAuthorizationMayUseAutoReview(
     const intent = authorization.approval_intent orelse return false;
     return intent == .mutation and
         !fileMutationTargetsContainConfiguredAsk(authorization.policy_targets);
+}
+
+fn fileMutationAuthorizationMayBypassAutoReview(
+    input: Input,
+    authorization: file_mutation_contract.FileExecutionAuthorization,
+) bool {
+    if (authorization.prepared == null) return false;
+    const intent = authorization.approval_intent orelse return false;
+    const target_path = authorization.policy_targets.canonical_target_path;
+    return intent == .mutation and
+        !authorization.read_disclosure_required and
+        accessScope(input).contains(target_path) and
+        !sensitiveAutoWriteTarget(target_path) and
+        !fileMutationTargetsContainConfiguredAsk(authorization.policy_targets);
+}
+
+fn sensitiveAutoWriteTarget(path: []const u8) bool {
+    return pathContainsComponentSequence(path, &.{ ".git", "hooks" }) or
+        pathContainsComponentSequence(path, &.{ ".git", "config" }) or
+        pathContainsComponentSequence(path, &.{ ".git", "config.worktree" }) or
+        pathContainsComponentSequence(path, &.{ ".ssh", "authorized_keys" }) or
+        pathContainsComponentSequence(path, &.{ ".ssh", "config" }) or
+        pathContainsComponentSequence(path, &.{ "Library", "LaunchAgents" }) or
+        pathContainsComponentSequence(path, &.{ "Library", "LaunchDaemons" }) or
+        pathContainsComponentSequence(path, &.{ ".config", "autostart" }) or
+        pathContainsComponentSequence(path, &.{ ".config", "fish", "config.fish" }) or
+        pathContainsComponentSequence(path, &.{".zshrc"}) or
+        pathContainsComponentSequence(path, &.{".bashrc"}) or
+        pathContainsComponentSequence(path, &.{".bash_profile"}) or
+        pathContainsComponentSequence(path, &.{".profile"});
+}
+
+fn pathContainsComponentSequence(
+    path: []const u8,
+    expected: []const []const u8,
+) bool {
+    if (expected.len == 0) return false;
+    var matched: usize = 0;
+    var index: usize = 0;
+    while (index < path.len) {
+        while (index < path.len and std.fs.path.isSep(path[index])) : (index += 1) {}
+        const start = index;
+        while (index < path.len and !std.fs.path.isSep(path[index])) : (index += 1) {}
+        if (start == index) break;
+        const component = path[start..index];
+        if (std.mem.eql(u8, component, expected[matched])) {
+            matched += 1;
+            if (matched == expected.len) return true;
+        } else {
+            matched = if (std.mem.eql(u8, component, expected[0])) 1 else 0;
+        }
+    }
+    return false;
+}
+
+fn reversibleStructuredToolMayBypassAutoReview(
+    input: Input,
+    arena: Allocator,
+    call: ToolCall,
+) !bool {
+    const tool = registeredTool(input, call.name) orelse return false;
+    if (tool.executor_kind != .create_folder) return false;
+    const args = try tool_args.parseToolArgsObject(arena, call.arguments_json);
+    const path_arg = try tool_args.requiredStringArg(args, "path");
+    const target_path = accessScope(input).resolvePath(
+        arena,
+        path_arg,
+        .create,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return false,
+    };
+    return !sensitiveAutoWriteTarget(target_path);
 }
 
 fn fileMutationPermissionTargets(
@@ -884,6 +958,14 @@ fn resolveFileMutationPreflightAdmission(
         } },
         .permission_required, .prompt => |authorization| blk: {
             if (permission_mode == .auto and
+                fileMutationAuthorizationMayBypassAutoReview(input, authorization))
+            {
+                break :blk .{ .resolved = .{
+                    .decision = .once,
+                    .execution_authority = .{ .file_mutation = authorization },
+                } };
+            }
+            if (permission_mode == .auto and
                 fileMutationAuthorizationMayUseAutoReview(authorization))
             {
                 const targets = try fileMutationPermissionTargets(
@@ -1000,7 +1082,6 @@ pub fn requestPermissionOutcome(
                 input,
                 arena,
                 call,
-                permission_mode,
                 null,
                 vision_path_label,
                 .configured_rule,
@@ -1023,6 +1104,11 @@ pub fn requestPermissionOutcome(
             permissionOutcomeForDecision(input, arena, call, .once, .session_grant),
             vision_path_authority,
         );
+    }
+    if (permission_mode == .auto and
+        try reversibleStructuredToolMayBypassAutoReview(input, arena, call))
+    {
+        return ordinaryPermissionOutcome(.once);
     }
     if (input.host_sandbox_default == .allow_sandboxed and
         isRunCommandTool(input, call.name))
@@ -1063,7 +1149,6 @@ pub fn requestPermissionOutcome(
             input,
             arena,
             call,
-            permission_mode,
             resolution.auto_review_result,
             vision_path_label,
             unavailable_requirement,
@@ -1636,7 +1721,6 @@ fn requestFileMutationPermissionOutcome(
         input,
         arena,
         call,
-        permission_mode,
         try resolveFileMutationAdmission(
             input,
             arena,
@@ -1659,7 +1743,6 @@ pub fn requestPreparedFileMutationPermissionOutcome(
         input,
         arena,
         call,
-        permission_mode,
         try resolvePreparedFileMutationAdmission(
             input,
             arena,
@@ -1675,7 +1758,6 @@ fn requestFileMutationPermissionOutcomeFromAdmission(
     input: Input,
     arena: Allocator,
     call: ToolCall,
-    permission_mode: PermissionMode,
     admission: FileMutationAdmission,
 ) !command_admission.PermissionOutcome {
     return switch (admission) {
@@ -1693,18 +1775,9 @@ fn requestFileMutationPermissionOutcomeFromAdmission(
             };
             const prompter = input.permission_prompter orelse break :blk unavailable;
             var authorization = pending.authorization;
-            var request_view = try fileMutationPermissionRequest(
+            const request_view = try fileMutationPermissionRequest(
                 "file_mutation",
                 authorization,
-            );
-            request_view.explanation = try tool_presentation.formatAutoPermissionNotice(
-                arena,
-                input.tool_registry,
-                call,
-                permission_mode,
-                .{
-                    .decision = .permission_required,
-                },
             );
             const review = if (authorization.prepared) |*prepared|
                 &prepared.review
@@ -1897,22 +1970,11 @@ fn promptPermissionOutcome(
     input: Input,
     arena: Allocator,
     call: ToolCall,
-    permission_mode: PermissionMode,
     auto_review_result: ?permission_auto_classifier.Result,
     label_override: ?[]const u8,
     unavailable_requirement: command_admission.PermissionRequirement,
 ) !command_admission.PermissionOutcome {
-    var request = try interactivePermissionRequest(input, arena, call, label_override);
-    request.explanation = try tool_presentation.formatAutoPermissionNotice(
-        arena,
-        input.tool_registry,
-        call,
-        permission_mode,
-        .{
-            .decision = .permission_required,
-            .auto_review_result = auto_review_result,
-        },
-    );
+    const request = try interactivePermissionRequest(input, arena, call, label_override);
     const unavailable: command_admission.PermissionOutcome = .{
         .decision = .permission_required,
         .denial_reason = .permission_required,
@@ -3237,6 +3299,7 @@ const test_admission_registry = tool_dispatch.Registry{ .tools = &.{
     test_builtin_tools.edit_file,
     test_builtin_tools.delete_file,
     test_builtin_tools.copy_file,
+    test_builtin_tools.create_folder,
 } };
 
 fn testInputWithClassifier(
@@ -5136,4 +5199,359 @@ test "external prepared file review carries frozen path and diff authority" {
         target_path,
         authorization.input.path(),
     );
+}
+
+test "automatic workspace write uses reversible admission without reviewer" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    var editable = try tmp.dir.createFile(
+        io_mod.getIo(),
+        "workspace/editable.txt",
+        .{ .truncate = true },
+    );
+    defer editable.close(io_mod.getIo());
+    try editable.writeStreamingAll(io_mod.getIo(), "before\n");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var background: BackgroundRuntime = .{};
+    defer background.deinit(alloc);
+    var fake = FakeAutoClassifier{};
+    var input = testInputWithClassifier(
+        &worker,
+        &background,
+        permission_auto_classifier.Classifier.withOverride(
+            @ptrCast(&fake),
+            FakeAutoClassifier.classify,
+        ),
+    );
+    input.workspace_root = workspace;
+    const target_path = try std.fs.path.join(arena, &.{ workspace, "note.txt" });
+    const arguments_json = try std.fmt.allocPrint(
+        arena,
+        "{{\"path\":\"{s}\",\"content\":\"hello\\n\"}}",
+        .{target_path},
+    );
+
+    const outcome = try requestPermissionOutcome(
+        input,
+        arena,
+        .{
+            .id = "workspace-write",
+            .name = "write_file",
+            .arguments_json = arguments_json,
+        },
+        .auto,
+        &.{},
+    );
+
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
+    const authority = outcome.execution_authority orelse
+        return error.TestExpectedEqual;
+    const authorization = switch (authority) {
+        .file_mutation => |value| value,
+        else => return error.TestExpectedEqual,
+    };
+    try std.testing.expect(authorization.prepared != null);
+    try std.testing.expectEqualStrings(target_path, authorization.input.path());
+
+    const edit_target = try std.fs.path.join(arena, &.{ workspace, "editable.txt" });
+    const edit_arguments = try std.fmt.allocPrint(
+        arena,
+        "{{\"path\":\"{s}\",\"old_string\":\"before\",\"new_string\":\"after\"}}",
+        .{edit_target},
+    );
+    const edit_outcome = try requestPermissionOutcome(
+        input,
+        arena,
+        .{
+            .id = "workspace-edit",
+            .name = "edit_file",
+            .arguments_json = edit_arguments,
+        },
+        .auto,
+        &.{},
+    );
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectEqual(ToolPermissionDecision.once, edit_outcome.decision);
+    try std.testing.expect(edit_outcome.execution_authority.? == .file_mutation);
+}
+
+test "automatic added-root write bypasses reviewer while untrusted external write does not" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try tmp.dir.createDirPath(io_mod.getIo(), "added");
+    try tmp.dir.createDirPath(io_mod.getIo(), "external");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const added = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "added");
+    defer alloc.free(added);
+    const external = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external");
+    defer alloc.free(external);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var background: BackgroundRuntime = .{};
+    defer background.deinit(alloc);
+    var fake = FakeAutoClassifier{};
+    var input = testInputWithClassifier(
+        &worker,
+        &background,
+        permission_auto_classifier.Classifier.withOverride(
+            @ptrCast(&fake),
+            FakeAutoClassifier.classify,
+        ),
+    );
+    input.workspace_root = workspace;
+    var additional = [_]workspace_access.Entry{.{
+        .path = @constCast(added),
+        .saved = false,
+        .command_line = true,
+        .available = true,
+        .active = true,
+    }};
+    input.access_scope = .{
+        .primary_directory = workspace,
+        .additional_directories = &additional,
+    };
+
+    const cases = [_]struct {
+        id: []const u8,
+        root: []const u8,
+        expected_review_calls: usize,
+    }{
+        .{ .id = "added-write", .root = added, .expected_review_calls = 0 },
+        .{ .id = "external-write", .root = external, .expected_review_calls = 1 },
+    };
+    for (cases) |case| {
+        const target_path = try std.fs.path.join(arena, &.{ case.root, "note.txt" });
+        const arguments_json = try std.fmt.allocPrint(
+            arena,
+            "{{\"path\":\"{s}\",\"content\":\"hello\\n\"}}",
+            .{target_path},
+        );
+        const outcome = try requestPermissionOutcome(
+            input,
+            arena,
+            .{
+                .id = case.id,
+                .name = "write_file",
+                .arguments_json = arguments_json,
+            },
+            .auto,
+            &.{},
+        );
+        try std.testing.expectEqual(case.expected_review_calls, fake.calls);
+        try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
+        const authority = outcome.execution_authority orelse
+            return error.TestExpectedEqual;
+        try std.testing.expect(authority == .file_mutation);
+    }
+}
+
+test "automatic trusted-root write keeps persistence targets on reviewer path" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace/.git/hooks");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace/.ssh");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace/Library/LaunchAgents");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var background: BackgroundRuntime = .{};
+    defer background.deinit(alloc);
+    var fake = FakeAutoClassifier{};
+    var input = testInputWithClassifier(
+        &worker,
+        &background,
+        permission_auto_classifier.Classifier.withOverride(
+            @ptrCast(&fake),
+            FakeAutoClassifier.classify,
+        ),
+    );
+    input.workspace_root = workspace;
+
+    const relative_targets = [_][]const u8{
+        ".git/hooks/pre-commit",
+        ".git/config",
+        ".ssh/authorized_keys",
+        "Library/LaunchAgents/com.fx.smoke.plist",
+    };
+    for (relative_targets, 0..) |relative_target, index| {
+        const target_path = try std.fs.path.join(arena, &.{ workspace, relative_target });
+        const arguments_json = try std.fmt.allocPrint(
+            arena,
+            "{{\"path\":\"{s}\",\"content\":\"test\\n\"}}",
+            .{target_path},
+        );
+        const outcome = try requestPermissionOutcome(
+            input,
+            arena,
+            .{
+                .id = relative_target,
+                .name = "write_file",
+                .arguments_json = arguments_json,
+            },
+            .auto,
+            &.{},
+        );
+        try std.testing.expectEqual(index + 1, fake.calls);
+        try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
+    }
+}
+
+test "automatic trusted-root overwrite preserves configured read disclosure review" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    var original = try tmp.dir.createFile(
+        io_mod.getIo(),
+        "workspace/secret.txt",
+        .{ .truncate = true },
+    );
+    defer original.close(io_mod.getIo());
+    try original.writeStreamingAll(io_mod.getIo(), "before\n");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var background: BackgroundRuntime = .{};
+    defer background.deinit(alloc);
+    var fake = FakeAutoClassifier{};
+    var input = testInputWithClassifier(
+        &worker,
+        &background,
+        permission_auto_classifier.Classifier.withOverride(
+            @ptrCast(&fake),
+            FakeAutoClassifier.classify,
+        ),
+    );
+    input.workspace_root = workspace;
+    var rules = [_]types.PermissionRule{.{
+        .permission = @constCast("read_file"),
+        .pattern = @constCast("*"),
+        .action = .deny,
+    }};
+    input.permission_rules = .{ .rules = &rules };
+    const target_path = try std.fs.path.join(arena, &.{ workspace, "secret.txt" });
+    const arguments_json = try std.fmt.allocPrint(
+        arena,
+        "{{\"path\":\"{s}\",\"content\":\"after\\n\"}}",
+        .{target_path},
+    );
+
+    const outcome = try requestPermissionOutcome(
+        input,
+        arena,
+        .{
+            .id = "read-disclosure-write",
+            .name = "write_file",
+            .arguments_json = arguments_json,
+        },
+        .auto,
+        &.{},
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
+}
+
+test "automatic trusted-root folder creation bypasses reviewer while external does not" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try tmp.dir.createDirPath(io_mod.getIo(), "external");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const external = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external");
+    defer alloc.free(external);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var background: BackgroundRuntime = .{};
+    defer background.deinit(alloc);
+    var fake = FakeAutoClassifier{};
+    var input = testInputWithClassifier(
+        &worker,
+        &background,
+        permission_auto_classifier.Classifier.withOverride(
+            @ptrCast(&fake),
+            FakeAutoClassifier.classify,
+        ),
+    );
+    input.workspace_root = workspace;
+
+    const cases = [_]struct {
+        id: []const u8,
+        target: []const u8,
+        expected_review_calls: usize,
+    }{
+        .{
+            .id = "workspace-folder",
+            .target = try std.fs.path.join(arena, &.{ workspace, "generated" }),
+            .expected_review_calls = 0,
+        },
+        .{
+            .id = "git-hooks-folder",
+            .target = try std.fs.path.join(arena, &.{ workspace, ".git", "hooks" }),
+            .expected_review_calls = 1,
+        },
+        .{
+            .id = "external-folder",
+            .target = try std.fs.path.join(arena, &.{ external, "generated" }),
+            .expected_review_calls = 2,
+        },
+    };
+    for (cases) |case| {
+        const arguments_json = try std.fmt.allocPrint(
+            arena,
+            "{{\"path\":\"{s}\"}}",
+            .{case.target},
+        );
+        const outcome = try requestPermissionOutcome(
+            input,
+            arena,
+            .{
+                .id = case.id,
+                .name = "create_folder",
+                .arguments_json = arguments_json,
+            },
+            .auto,
+            &.{},
+        );
+        try std.testing.expectEqual(case.expected_review_calls, fake.calls);
+        try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
+        try std.testing.expectEqual(
+            command_admission.ToolExecutionAuthority.ordinary,
+            outcome.execution_authority.?,
+        );
+    }
 }

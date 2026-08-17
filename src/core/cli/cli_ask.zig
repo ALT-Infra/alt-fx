@@ -1737,7 +1737,6 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .push_tool_lifecycle = pushToolLifecycle,
         .push_diff_block = pushDiffBlock,
         .push_system_notice = pushSystemNotice,
-        .push_auto_permission_notice = pushAutoPermissionNotice,
         .push_context_notice = pushContextNotice,
         .push_route_recovery_status = pushRouteRecoveryStatus,
         .push_command_output_complete = pushCommandOutputComplete,
@@ -2056,14 +2055,6 @@ fn finishCliPermissionOutcome(
         .call = call,
         .workspace_root = tool_ctx.workspace_root,
     });
-    try presentCliAutoPermissionOutcome(
-        ctx,
-        tool_ctx,
-        arena,
-        call,
-        permission_mode,
-        outcome,
-    );
     switch (outcome.requirement orelse .approval_required) {
         .configured_rule => try writeBlockedActionGuidance(
             ctx,
@@ -2148,24 +2139,6 @@ fn requestCliPermission(
         .deny => permission_request.OwnedPermissionResponse.init(alloc, .deny, null),
         .unavailable => error.PermissionPromptUnavailable,
     };
-}
-
-fn presentCliAutoPermissionOutcome(
-    ctx: *AskContext,
-    tool_ctx: tool_runtime.Context,
-    arena: Allocator,
-    call: ToolCall,
-    permission_mode: PermissionMode,
-    outcome: command_admission.PermissionOutcome,
-) !void {
-    const notice = try tool_presentation.formatAutoPermissionNotice(
-        arena,
-        tool_ctx.tool_registry,
-        call,
-        permission_mode,
-        outcome,
-    ) orelse return;
-    try pushAutoPermissionNotice(@ptrCast(ctx), notice);
 }
 
 fn promptCliPermissionApproval(
@@ -2747,17 +2720,6 @@ fn pushSystemNotice(raw_ctx: *anyopaque, text: []const u8) !void {
     try ctx.writeStderr("[notice] ");
     try ctx.writeStderr(text);
     try ctx.writeStderr("\n");
-}
-
-fn pushAutoPermissionNotice(raw_ctx: *anyopaque, text: []const u8) !void {
-    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    if (ctx.presenter) |presenter| return presenter.pushNotice(.{
-        .topic = "permissions",
-        .tone = .neutral,
-        .body = text,
-        .visibility = .full_only,
-    });
-    try pushSystemNotice(raw_ctx, text);
 }
 
 fn pushContextNotice(raw_ctx: *anyopaque, text: []const u8) !void {

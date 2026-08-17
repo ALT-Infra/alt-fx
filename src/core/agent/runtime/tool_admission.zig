@@ -73,7 +73,7 @@ pub fn deferVisibleLifecycleUntilAfterPermission(tool_name: []const u8) bool {
         file_mutation_contract.isToolName(tool_name);
 }
 
-pub fn deferRunCommandLifecycleForAutoPermissionNotice(
+pub fn deferRunCommandLifecycleUntilAfterAutoPermission(
     tool_name: []const u8,
     permission_mode: PermissionMode,
     interactive_presentation: bool,

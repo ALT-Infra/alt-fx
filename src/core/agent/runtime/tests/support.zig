@@ -464,7 +464,6 @@ pub const FakeAgentRuntimeDeps = struct {
     system_notices: std.ArrayList([]u8) = .empty,
     interactive_notices: std.ArrayList(types.SemanticNotice) = .empty,
     context_notices: std.ArrayList([]u8) = .empty,
-    auto_permission_notices: std.ArrayList([]u8) = .empty,
     route_recovery_statuses: std.ArrayList(types.RouteRecoveryStatus) = .empty,
     permission_names: std.ArrayList([]u8) = .empty,
     permission_call_ids: std.ArrayList([]u8) = .empty,
@@ -603,7 +602,6 @@ pub const FakeAgentRuntimeDeps = struct {
         .tracker = .published,
     },
     stream_output_token_error: ?anyerror = null,
-    auto_permission_notice_error: ?anyerror = null,
     fail_status_finished: bool = false,
     command_replay_output: ?[]const u8 = null,
     command_replay_capability: ?*session_child_store.SessionChildCapability = null,
@@ -645,7 +643,6 @@ pub const FakeAgentRuntimeDeps = struct {
         for (self.interactive_notices.items) |notice| types.freeSemanticNotice(self.alloc, notice);
         self.interactive_notices.deinit(self.alloc);
         freeStringList(self.alloc, &self.context_notices);
-        freeStringList(self.alloc, &self.auto_permission_notices);
         self.route_recovery_statuses.deinit(self.alloc);
         freeStringList(self.alloc, &self.permission_names);
         freeStringList(self.alloc, &self.permission_call_ids);
@@ -734,7 +731,6 @@ pub const FakeAgentRuntimeDeps = struct {
             .push_system_notice = systemNotice,
             .push_interactive_notice = if (self.enable_interactive_notices) interactiveNotice else null,
             .push_context_notice = contextNotice,
-            .push_auto_permission_notice = autoPermissionNotice,
             .push_route_recovery_status = routeRecoveryStatus,
             .push_command_output_complete = commandOutputComplete,
             .push_http_error = httpError,
@@ -1676,13 +1672,6 @@ pub const FakeAgentRuntimeDeps = struct {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         try self.context_notices.append(self.alloc, try self.alloc.dupe(u8, text));
         try self.record("context_notice:{s}", .{text});
-    }
-
-    fn autoPermissionNotice(raw: *anyopaque, text: []const u8) !void {
-        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        if (self.auto_permission_notice_error) |err| return err;
-        try self.auto_permission_notices.append(self.alloc, try self.alloc.dupe(u8, text));
-        try self.record("auto_permission_notice:{s}", .{text});
     }
 
     fn routeRecoveryStatus(raw: *anyopaque, status: types.RouteRecoveryStatus) !void {

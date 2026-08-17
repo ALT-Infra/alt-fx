@@ -799,7 +799,7 @@ describe("filesystem path handling", () => {
   );
 
   test(
-    "local and external prepared writes share one exact automatic review route",
+    "trusted prepared writes bypass review while untrusted external writes use exact review",
     async () => {
       const root = createIsolatedRoot();
       try {
@@ -809,16 +809,28 @@ describe("filesystem path handling", () => {
 
         const classifiedScenarios = [
           {
-            id: "write_classified_local",
-            path: "classified-local.txt",
-            target: join(root.workspace, "classified-local.txt"),
-            resultPath: "classified-local.txt",
+            id: "write_trusted_local",
+            path: "trusted-local.txt",
+            target: join(root.workspace, "trusted-local.txt"),
+            resultPath: "trusted-local.txt",
+            addDir: false,
+            expectedReview: false,
+          },
+          {
+            id: "write_trusted_added",
+            path: join(root.external, "trusted", "nested", "created.txt"),
+            target: join(root.external, "trusted", "nested", "created.txt"),
+            resultPath: join(root.external, "trusted", "nested", "created.txt"),
+            addDir: true,
+            expectedReview: false,
           },
           {
             id: "write_classified_external",
             path: "../external/classified/nested/created.txt",
             target: join(root.external, "classified", "nested", "created.txt"),
             resultPath: join(root.external, "classified", "nested", "created.txt"),
+            addDir: false,
+            expectedReview: true,
           },
         ];
         for (const scenario of classifiedScenarios) {
@@ -834,6 +846,7 @@ describe("filesystem path handling", () => {
           try {
             const classified = await runFx(
               [
+                ...(scenario.addDir ? ["--add-dir", root.external] : []),
                 "ask",
                 "--auto",
                 "--json",
@@ -848,18 +861,22 @@ describe("filesystem path handling", () => {
             );
             const classifiedJson = parseFxJson(classified);
             expect(classifierGateway.requests).toHaveLength(2);
-            expect(classifierGateway.classifierRequests).toHaveLength(1);
+            expect(classifierGateway.classifierRequests).toHaveLength(
+              scenario.expectedReview ? 1 : 0,
+            );
             expect(classifierGateway.remainingResponseCount()).toBe(0);
-            const reviewBody = classifierGateway.classifierRequests[0]!.body;
-            expect(reviewBody).toContain("\"permission_decision\"");
-            expect(reviewBody).toContain("Execute the requested file tool once.");
-            expect(reviewBody).toContain("escalation_reason: tool_requires_approval");
-            expect(reviewBody).not.toContain("external_file_mutation");
-            expect(reviewBody).toContain(`target[target]: ${scenario.target}`);
-            expect(reviewBody).toContain("action: prepared_file_mutation");
-            expect(reviewBody).toContain("preimage: absent");
-            expect(reviewBody).toContain("additions: 1");
-            expect(reviewBody).toContain("CLASSIFIED_CONTENT");
+            if (scenario.expectedReview) {
+              const reviewBody = classifierGateway.classifierRequests[0]!.body;
+              expect(reviewBody).toContain("\"permission_decision\"");
+              expect(reviewBody).toContain("Execute the requested file tool once.");
+              expect(reviewBody).toContain("escalation_reason: tool_requires_approval");
+              expect(reviewBody).not.toContain("external_file_mutation");
+              expect(reviewBody).toContain(`target[target]: ${scenario.target}`);
+              expect(reviewBody).toContain("action: prepared_file_mutation");
+              expect(reviewBody).toContain("preimage: absent");
+              expect(reviewBody).toContain("additions: 1");
+              expect(reviewBody).toContain("CLASSIFIED_CONTENT");
+            }
             expect(classifiedJson.tool_calls).toEqual([
               { name: "write_file", status: "success" },
             ]);
@@ -907,7 +924,7 @@ describe("filesystem path handling", () => {
     "automatic review rejects an oversized prepared write before transport or execution",
     async () => {
       const root = createIsolatedRoot();
-      const target = join(root.workspace, "large-review.txt");
+      const target = join(root.external, "large-review.txt");
       const tracePath = join(root.root, "permission-trace.log");
       const longReviewRow = `review row 096: ${"x".repeat(2048)}`;
       const content = Array.from(
@@ -919,7 +936,7 @@ describe("filesystem path handling", () => {
       ).join("\n") + "\n";
       const gateway = startFakeGateway([
         toolCall("write_large_review", "write_file", {
-          path: "large-review.txt",
+          path: "../external/large-review.txt",
           content,
         }),
         (body) => {

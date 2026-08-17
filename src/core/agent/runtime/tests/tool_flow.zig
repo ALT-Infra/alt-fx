@@ -1007,7 +1007,6 @@ test "accepted automatic review remains internal before ordinary tool execution"
 
     try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
-    try std.testing.expectEqual(@as(usize, 0), hooks.auto_permission_notices.items.len);
     try std.testing.expect(
         logIndex(&hooks, "status:started").? <
             logIndex(&hooks, "execute:run_command").?,
@@ -1017,37 +1016,7 @@ test "accepted automatic review remains internal before ordinary tool execution"
     );
 }
 
-test "unused auto permission notice sink cannot block lifecycle or execution" {
-    const alloc = std.testing.allocator;
-    const calls = [_]ToolCall{toolCall("call_1", "web_fetch", "{\"url\":\"https://example.com\"}")};
-    const completions = [_]FakeCompletion{
-        .{ .tool_calls = &calls },
-        .{ .content = "Final" },
-    };
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    hooks.permission_decisions = &.{.once};
-    hooks.permission_auto_review_results = &.{.{
-        .risk = .low,
-        .authorization = .high,
-        .decision = .allow,
-        .rationale = "bounded safe action",
-    }};
-    hooks.auto_permission_notice_error = error.TestAutoPermissionNoticeEnqueueFailure;
-    defer hooks.deinit();
-    var fixture = PromptFixture{};
-    var job = fixture.job();
-    job.permission_mode = .auto;
-
-    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
-
-    try std.testing.expect(hooks.lifecycle_events.items.len > 0);
-    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
-    try std.testing.expectEqual(@as(usize, 0), hooks.auto_permission_notices.items.len);
-}
-
-test "auto permission notice does not reposition deferred web fetch lifecycle" {
+test "automatic review does not reposition deferred web fetch lifecycle" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_1", "web_fetch", "{\"url\":\"https://example.com\"}")};
     const completions = [_]FakeCompletion{
@@ -1072,14 +1041,13 @@ test "auto permission notice does not reposition deferred web fetch lifecycle" {
     try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
     try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
-    try std.testing.expectEqual(@as(usize, 0), hooks.auto_permission_notices.items.len);
     try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
     try std.testing.expect(
         !hooks.lifecycle_events.items[0].authoritative_started.place_after_current_transcript,
     );
 }
 
-test "auto permission without a notice preserves lifecycle placement" {
+test "deterministic auto permission preserves lifecycle placement" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_1", "run_command", "{\"command\":\"pwd\"}")};
     const completions = [_]FakeCompletion{
@@ -1098,7 +1066,6 @@ test "auto permission without a notice preserves lifecycle placement" {
     try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
     try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
-    try std.testing.expectEqual(@as(usize, 0), hooks.auto_permission_notices.items.len);
     try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
     try std.testing.expect(
         !hooks.lifecycle_events.items[0].authoritative_started.place_after_current_transcript,

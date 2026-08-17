@@ -4809,7 +4809,7 @@ test "non-web_fetch tool-call metrics retain bounded args and result" {
     try expectContains(buf[0].result(), "normal result");
 }
 
-test "request tool permission keeps safe defaults while unresolved local writes require review" {
+test "request tool permission keeps safe defaults while local writes bypass review" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4828,7 +4828,7 @@ test "request tool permission keeps safe defaults while unresolved local writes 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    try std.testing.expectEqual(ToolPermissionDecision.deny, (try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena, .{
+    try std.testing.expectEqual(ToolPermissionDecision.once, (try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena, .{
         .id = "1",
         .name = "write_file",
         .arguments_json = "{\"path\":\"fx-permission-test.txt\",\"content\":\"hello\"}",
@@ -4991,7 +4991,7 @@ test "run_command admission emits exact authority for deterministic and reviewed
     try std.testing.expectEqualStrings("touch automatic.txt", reviewer.exact_command.?);
 }
 
-test "local and external file mutations use the same automatic review reason" {
+test "local file mutations bypass review while external mutations use exact review" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5045,17 +5045,21 @@ test "local and external file mutations use the same automatic review reason" {
         const prepared = authority.prepared orelse return error.TestExpectedEqual;
         try std.testing.expectEqual(@as(usize, 2), prepared.review.additions);
         try std.testing.expectEqual(@as(usize, 0), prepared.review.deletions);
-        try std.testing.expectEqual(index + 1, reviewer.calls);
-        try std.testing.expectEqual(
-            std.meta.Tag(permission_auto_classifier.Action).file_mutation,
-            reviewer.action_tag.?,
-        );
-        try std.testing.expectEqualStrings("tool_requires_approval", reviewer.escalation_reason.?);
-        try std.testing.expectEqualStrings(target, reviewer.target_path.?);
-        try std.testing.expectEqualStrings(target, reviewer.file_display_path.?);
-        try std.testing.expectEqual(@as(usize, 2), reviewer.file_additions);
-        try std.testing.expectEqual(@as(usize, 0), reviewer.file_deletions);
-        try std.testing.expectEqual(@as(usize, 2), reviewer.file_review_rows);
+        if (index == 0) {
+            try std.testing.expectEqual(@as(usize, 0), reviewer.calls);
+        } else {
+            try std.testing.expectEqual(@as(usize, 1), reviewer.calls);
+            try std.testing.expectEqual(
+                std.meta.Tag(permission_auto_classifier.Action).file_mutation,
+                reviewer.action_tag.?,
+            );
+            try std.testing.expectEqualStrings("tool_requires_approval", reviewer.escalation_reason.?);
+            try std.testing.expectEqualStrings(target, reviewer.target_path.?);
+            try std.testing.expectEqualStrings(target, reviewer.file_display_path.?);
+            try std.testing.expectEqual(@as(usize, 2), reviewer.file_additions);
+            try std.testing.expectEqual(@as(usize, 0), reviewer.file_deletions);
+            try std.testing.expectEqual(@as(usize, 2), reviewer.file_review_rows);
+        }
         try std.testing.expect(rt.worker.pending_permission_request_shared == null);
         try std.testing.expect(!absolutePathExists(target));
     }

@@ -4438,11 +4438,6 @@ fn processQueuedPromptLoop(
                 const parallel_prepared = prepared_tool_calls[tool_call_index .. tool_call_index + parallel_len];
                 const precomputed_results = try arena.alloc(?ToolExecutionResult, parallel_calls.len);
                 @memset(precomputed_results, null);
-                const parallel_permission_outcomes = try arena.alloc(
-                    ?command_admission.PermissionOutcome,
-                    parallel_calls.len,
-                );
-                @memset(parallel_permission_outcomes, null);
                 const parallel_status_started = try arena.alloc(bool, parallel_calls.len);
                 @memset(parallel_status_started, false);
                 const parallel_status_terminalized = try arena.alloc(bool, parallel_calls.len);
@@ -4617,17 +4612,8 @@ fn processQueuedPromptLoop(
                         tool_dispatch.traceDeniedWebSearch(step_ctx, parallel_call, reason);
                         debug_trace.eventf("tool", "execution_result", step_ctx, "call_id={s} name={s} result_kind=permission_denied reason={s} model_output_bytes={d}", .{ parallel_call.id, parallel_call.name, @tagName(reason), denied_output.len });
                         precomputed_results[group_index] = .{ .status = .failure, .model_output = denied_output };
-                        parallel_permission_outcomes[group_index] = permission_outcome;
                         continue;
                     }
-
-                    _ = try runtime_tool_presentation.presentAutoPermissionOutcome(
-                        deps,
-                        arena,
-                        parallel_call,
-                        job.permission_mode,
-                        permission_outcome,
-                    );
 
                     if (decision == .always) {
                         const target_path = try deps.permission_target_for_call(deps.ctx, arena, parallel_call, advertised_dynamic_tool_names);
@@ -4756,8 +4742,7 @@ fn processQueuedPromptLoop(
                 for (
                     admitted_parallel_calls,
                     admitted_precomputed_results,
-                    parallel_permission_outcomes,
-                ) |parallel_call, precomputed, maybe_permission_outcome| {
+                ) |parallel_call, precomputed| {
                     const execution = precomputed orelse continue;
                     if (parallel_call.argument_integrity == .malformed_json) continue;
                     try runtime_tool_admission.recordRejectedToolCall(
@@ -4767,15 +4752,6 @@ fn processQueuedPromptLoop(
                         execution.model_output,
                         null,
                     );
-                    if (maybe_permission_outcome) |permission_outcome| {
-                        _ = try runtime_tool_presentation.presentAutoPermissionOutcome(
-                            deps,
-                            arena,
-                            parallel_call,
-                            job.permission_mode,
-                            permission_outcome,
-                        );
-                    }
                 }
                 const cancelled_call = try runtime_tool_batch.assembleParallelToolResults(
                     arena,
@@ -5066,7 +5042,7 @@ fn processQueuedPromptLoop(
                                 );
                             },
                             .stop_policy => {
-                                const defer_auto_lifecycle = runtime_tool_admission.deferRunCommandLifecycleForAutoPermissionNotice(
+                                const defer_auto_lifecycle = runtime_tool_admission.deferRunCommandLifecycleUntilAfterAutoPermission(
                                     tool_call.name,
                                     job.permission_mode,
                                     lifecycle.scope.kind == .interactive,
@@ -5431,7 +5407,7 @@ fn processQueuedPromptLoop(
             else
                 local_grants.items;
             var status_started = false;
-            const defer_auto_command_lifecycle = runtime_tool_admission.deferRunCommandLifecycleForAutoPermissionNotice(
+            const defer_auto_command_lifecycle = runtime_tool_admission.deferRunCommandLifecycleUntilAfterAutoPermission(
                 tool_call.name,
                 action_permission_mode,
                 lifecycle.scope.kind == .interactive,
@@ -5829,13 +5805,6 @@ fn processQueuedPromptLoop(
                     denied_output,
                     null,
                 );
-                _ = try runtime_tool_presentation.presentAutoPermissionOutcome(
-                    deps,
-                    call_allocator,
-                    execution_call,
-                    action_permission_mode,
-                    permission_outcome,
-                );
                 if (deps.tool_activity_recorder) |recorder| {
                     recorder.record(tool_call.id, tool_call.name, .denied) catch |err| {
                         debug_trace.eventf(
@@ -5849,14 +5818,6 @@ fn processQueuedPromptLoop(
                 }
                 continue;
             }
-
-            const auto_permission_notice_presented = try runtime_tool_presentation.presentAutoPermissionOutcome(
-                deps,
-                call_allocator,
-                execution_call,
-                action_permission_mode,
-                permission_outcome,
-            );
 
             const execution_authority = permission_outcome.execution_authority orelse {
                 debug_trace.eventf(
@@ -5888,26 +5849,15 @@ fn processQueuedPromptLoop(
             );
 
             if (!status_started) {
-                status_started = if (defer_auto_command_lifecycle and auto_permission_notice_presented)
-                    try runtime_tool_presentation.startToolVisibleLifecycleAfterCurrentTranscript(
-                        deps,
-                        call_allocator,
-                        turn_id,
-                        stream_ctx.provisional_statuses.presentation_group_id,
-                        execution_call,
-                        file_display_path,
-                        advertised_dynamic_tool_names,
-                    )
-                else
-                    try runtime_tool_presentation.startToolVisibleLifecycle(
-                        deps,
-                        call_allocator,
-                        turn_id,
-                        stream_ctx.provisional_statuses.presentation_group_id,
-                        execution_call,
-                        file_display_path,
-                        advertised_dynamic_tool_names,
-                    );
+                status_started = try runtime_tool_presentation.startToolVisibleLifecycle(
+                    deps,
+                    call_allocator,
+                    turn_id,
+                    stream_ctx.provisional_statuses.presentation_group_id,
+                    execution_call,
+                    file_display_path,
+                    advertised_dynamic_tool_names,
+                );
             }
 
             if (decision == .always and live_authority == null) {
@@ -6389,13 +6339,6 @@ fn processQueuedPromptLoop(
                             prepared_denial.model_output,
                             denied_execution.command_result_json,
                         );
-                        _ = try runtime_tool_presentation.presentAutoPermissionOutcome(
-                            deps,
-                            arena,
-                            tool_call,
-                            action_permission_mode,
-                            widening_outcome,
-                        );
                         if (widening_outcome.feedback) |feedback| {
                             try appendPermissionFeedbackAfterToolResult(
                                 deps,
@@ -6407,14 +6350,6 @@ fn processQueuedPromptLoop(
                         }
                         continue;
                     }
-
-                    _ = try runtime_tool_presentation.presentAutoPermissionOutcome(
-                        deps,
-                        arena,
-                        tool_call,
-                        action_permission_mode,
-                        widening_outcome,
-                    );
 
                     const broader_authority = widening_outcome.execution_authority orelse
                         return error.MissingToolExecutionAuthority;

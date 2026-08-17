@@ -260,23 +260,6 @@ pub fn formatPermissionLabel(alloc: Allocator, registry: tool_dispatch.Registry,
     return std.fmt.allocPrint(alloc, "{s} {s}", .{ call.name, value });
 }
 
-/// Automatic-review routing remains internal. Users see only the ordinary
-/// tool lifecycle or the established human approval UI.
-pub fn formatAutoPermissionNotice(
-    alloc: Allocator,
-    registry: tool_dispatch.Registry,
-    call: ToolCall,
-    permission_mode: types.PermissionMode,
-    outcome: command_admission.PermissionOutcome,
-) !?[]const u8 {
-    _ = alloc;
-    _ = registry;
-    _ = call;
-    _ = permission_mode;
-    _ = outcome;
-    return null;
-}
-
 /// The caller owns the returned allocation and must free it with `alloc`.
 pub fn formatWebSearchActionDetail(alloc: Allocator, args: std.json.ObjectMap) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -706,70 +689,6 @@ test "tool presentation formats permission labels" {
     defer alloc.free(risk);
     try expectContains(risk, "risk: command may discard version-control state");
     try expectContains(risk, "safer: inspect git status first");
-}
-
-test "auto permission presentation keeps reviewer routing internal" {
-    const alloc = std.testing.allocator;
-    const raw_secret = "AI_GATEWAY_API_KEY=should-never-be-presented";
-    try std.testing.expect((try formatAutoPermissionNotice(
-        alloc,
-        test_tool_registry,
-        .{
-            .id = "command",
-            .name = "run_command",
-            .arguments_json = "{\"command\":\"" ++ raw_secret ++ "\"}",
-        },
-        .auto,
-        .{
-            .decision = .once,
-            .execution_authority = .ordinary,
-            .auto_review_result = .{
-                .risk = .low,
-                .authorization = .low,
-                .decision = .allow,
-                .rationale = "safe",
-            },
-        },
-    )) == null);
-}
-
-test "auto permission presentation omits notice for ask reviews" {
-    const alloc = std.testing.allocator;
-    const reason = "AI_GATEWAY_API_KEY=abcdefghijklmnop\n\x1b[31m" ++ ("x" ** 190);
-    try std.testing.expect((try formatAutoPermissionNotice(
-        alloc,
-        test_tool_registry,
-        .{ .id = "command", .name = "run_command", .arguments_json = "{}" },
-        .auto,
-        .{
-            .decision = .permission_required,
-            .denial_reason = .permission_required,
-            .auto_review_result = .{
-                .risk = .high,
-                .authorization = .unknown,
-                .decision = .ask,
-                .rationale = reason,
-            },
-        },
-    )) == null);
-}
-
-test "auto permission presentation omits resultless fallback" {
-    const alloc = std.testing.allocator;
-    try std.testing.expect((try formatAutoPermissionNotice(
-        alloc,
-        test_tool_registry,
-        .{ .id = "command", .name = "run_command", .arguments_json = "{}" },
-        .auto,
-        .{ .decision = .permission_required },
-    )) == null);
-    try std.testing.expect((try formatAutoPermissionNotice(
-        alloc,
-        test_tool_registry,
-        .{ .id = "command", .name = "run_command", .arguments_json = "{}" },
-        .ask,
-        .{ .decision = .permission_required },
-    )) == null);
 }
 
 test "tool presentation preserves plain action fallbacks" {
