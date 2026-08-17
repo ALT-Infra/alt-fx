@@ -247,12 +247,8 @@ fn isPublicField(field_name: []const u8) bool {
     return false;
 }
 
-fn unexpectedUnknownField(object: std.json.ObjectMap) ?[]const u8 {
-    var fields = object.iterator();
-    while (fields.next()) |entry| {
-        if (!isPublicField(entry.key_ptr.*)) return entry.key_ptr.*;
-    }
-    return null;
+fn fieldNameLessThan(_: void, left: []const u8, right: []const u8) bool {
+    return std.mem.order(u8, left, right) == .lt;
 }
 
 fn elideKnownNullFields(object: *std.json.ObjectMap) void {
@@ -264,18 +260,24 @@ fn elideKnownNullFields(object: *std.json.ObjectMap) void {
 }
 
 const ActionFieldCorrectionScratch = struct {
-    invalid_fields: [public_field_names.len][]const u8 = undefined,
+    invalid_fields: std.ArrayList([]const u8) = .empty,
     missing_fields: [public_field_names.len][]const u8 = undefined,
     conflicts: [public_field_names.len]tool_result_errors.TerminalActionFieldConflict = undefined,
+
+    fn deinit(self: *ActionFieldCorrectionScratch, alloc: Allocator) void {
+        self.invalid_fields.deinit(alloc);
+        self.* = undefined;
+    }
 };
 
 fn actionFieldCorrection(
+    alloc: Allocator,
     action: Action,
     object: std.json.ObjectMap,
     scratch: *ActionFieldCorrectionScratch,
-) ?tool_result_errors.TerminalActionFieldCorrection {
+) Allocator.Error!?tool_result_errors.TerminalActionFieldCorrection {
     const contract = actionFieldContract(action);
-    var invalid_count: usize = 0;
+    try scratch.invalid_fields.ensureTotalCapacity(alloc, object.count());
     for (public_field_names) |field_name| {
         if (object.get(field_name) == null) continue;
         var allowed = false;
@@ -286,9 +288,20 @@ fn actionFieldCorrection(
             }
         }
         if (allowed) continue;
-        scratch.invalid_fields[invalid_count] = field_name;
-        invalid_count += 1;
+        scratch.invalid_fields.appendAssumeCapacity(field_name);
     }
+    const unknown_start = scratch.invalid_fields.items.len;
+    var fields = object.iterator();
+    while (fields.next()) |entry| {
+        if (isPublicField(entry.key_ptr.*)) continue;
+        scratch.invalid_fields.appendAssumeCapacity(entry.key_ptr.*);
+    }
+    std.mem.sort(
+        []const u8,
+        scratch.invalid_fields.items[unknown_start..],
+        {},
+        fieldNameLessThan,
+    );
 
     var missing_count: usize = 0;
     for (contract.required) |field_name| {
@@ -304,10 +317,10 @@ fn actionFieldCorrection(
         conflict_count += 1;
     }
 
-    if (invalid_count == 0 and missing_count == 0 and conflict_count == 0) return null;
+    if (scratch.invalid_fields.items.len == 0 and missing_count == 0 and conflict_count == 0) return null;
     return .{
         .action = @tagName(action),
-        .invalid_fields = scratch.invalid_fields[0..invalid_count],
+        .invalid_fields = scratch.invalid_fields.items,
         .missing_fields = scratch.missing_fields[0..missing_count],
         .allowed_fields = contract.allowed,
         .conflicts = scratch.conflicts[0..conflict_count],
@@ -365,16 +378,10 @@ pub fn decode(
             "terminal arguments must match the advertised action schema",
         ) };
     };
-    if (unexpectedUnknownField(raw.object)) |field_name| {
-        return .{ .failure = try std.fmt.allocPrint(
-            ctx.allocator,
-            "terminal {s} field \"{s}\" is not allowed",
-            .{ @tagName(action), field_name },
-        ) };
-    }
     elideKnownNullFields(&raw.object);
     var correction_scratch: ActionFieldCorrectionScratch = .{};
-    if (actionFieldCorrection(action, raw.object, &correction_scratch)) |correction| {
+    defer correction_scratch.deinit(ctx.allocator);
+    if (try actionFieldCorrection(ctx.allocator, action, raw.object, &correction_scratch)) |correction| {
         return .{ .failure = try tool_result_errors.terminalActionFieldCorrectionJson(
             ctx.allocator,
             correction,
@@ -1343,7 +1350,7 @@ test "terminal action field ownership is exact for every public action" {
     }
 }
 
-test "terminal decoder elides known null placeholders but rejects unknown null fields" {
+test "terminal decoder elides known null placeholders but structures unknown null fields" {
     const alloc = std.testing.allocator;
     const accepted = try decode(
         .{ .allocator = alloc },
@@ -1369,16 +1376,87 @@ test "terminal decoder elides known null placeholders but rejects unknown null f
     switch (rejected) {
         .failure => |message| {
             defer alloc.free(message);
-            try std.testing.expectEqualStrings(
-                "terminal start field \"unknown\" is not allowed",
-                message,
-            );
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, message, .{});
+            defer parsed.deinit();
+            const correction = parsed.value.object.get("error").?.object;
+            try std.testing.expectEqualStrings("invalid_action_fields", correction.get("code").?.string);
+            const invalid_fields = correction.get("invalid_fields").?.array.items;
+            try std.testing.expectEqual(@as(usize, 1), invalid_fields.len);
+            try std.testing.expectEqualStrings("unknown", invalid_fields[0].string);
         },
         .input => |input| {
             input.deinit(alloc);
             return error.TestUnexpectedResult;
         },
     }
+}
+
+test "terminal decoder canonicalizes complete unknown field corrections" {
+    const alloc = std.testing.allocator;
+    const first = try decode(
+        .{ .allocator = alloc },
+        "{\"unknown_zeta\":true,\"action\":\"start\",\"signal\":\"terminate\",\"profile\":\"user\",\"sections\":null,\"shell\":{\"kind\":\"user_login\"},\"session_id\":\"terminal-a\"}",
+    );
+    const first_message = switch (first) {
+        .failure => |value| value,
+        .input => |input| {
+            input.deinit(alloc);
+            return error.TestUnexpectedResult;
+        },
+    };
+    defer alloc.free(first_message);
+    const second = try decode(
+        .{ .allocator = alloc },
+        "{\"session_id\":\"terminal-b\",\"shell\":{\"kind\":\"user_login\"},\"sections\":null,\"profile\":\"user\",\"signal\":\"terminate\",\"action\":\"start\",\"unknown_zeta\":false}",
+    );
+    const second_message = switch (second) {
+        .failure => |value| value,
+        .input => |input| {
+            input.deinit(alloc);
+            return error.TestUnexpectedResult;
+        },
+    };
+    defer alloc.free(second_message);
+    try std.testing.expectEqualStrings(first_message, second_message);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, first_message, .{});
+    defer parsed.deinit();
+    const correction = parsed.value.object.get("error").?.object;
+    const invalid_fields = correction.get("invalid_fields").?.array.items;
+    try std.testing.expectEqual(@as(usize, 4), invalid_fields.len);
+    try std.testing.expectEqualStrings("session_id", invalid_fields[0].string);
+    try std.testing.expectEqualStrings("signal", invalid_fields[1].string);
+    try std.testing.expectEqualStrings("sections", invalid_fields[2].string);
+    try std.testing.expectEqualStrings("unknown_zeta", invalid_fields[3].string);
+    const conflicts = correction.get("conflicts").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), conflicts.len);
+    try std.testing.expectEqualStrings("profile", conflicts[0].array.items[0].string);
+    try std.testing.expectEqualStrings("shell", conflicts[0].array.items[1].string);
+
+    const missing = try decode(
+        .{ .allocator = alloc },
+        "{\"sections\":null,\"action\":\"resize\",\"command\":\"wrong\"}",
+    );
+    const missing_message = switch (missing) {
+        .failure => |value| value,
+        .input => |input| {
+            input.deinit(alloc);
+            return error.TestUnexpectedResult;
+        },
+    };
+    defer alloc.free(missing_message);
+    var missing_parsed = try std.json.parseFromSlice(std.json.Value, alloc, missing_message, .{});
+    defer missing_parsed.deinit();
+    const missing_correction = missing_parsed.value.object.get("error").?.object;
+    const missing_invalid = missing_correction.get("invalid_fields").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), missing_invalid.len);
+    try std.testing.expectEqualStrings("command", missing_invalid[0].string);
+    try std.testing.expectEqualStrings("sections", missing_invalid[1].string);
+    const missing_fields = missing_correction.get("missing_fields").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), missing_fields.len);
+    try std.testing.expectEqualStrings("session_id", missing_fields[0].string);
+    try std.testing.expectEqualStrings("rows", missing_fields[1].string);
+    try std.testing.expectEqualStrings("columns", missing_fields[2].string);
 }
 
 test "terminal decoder returns one complete canonical action field correction" {

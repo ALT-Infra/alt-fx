@@ -7073,7 +7073,8 @@ test "terminal exec rejects legacy background input without creating state" {
     });
 
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
-    try expectContains(result.model_output, "field \"background\" is not allowed");
+    try expectContains(result.model_output, "\"code\":\"invalid_action_fields\"");
+    try expectContains(result.model_output, "\"invalid_fields\":[\"background\"]");
     var tasks = try rt.background.snapshotTasks(std.testing.allocator);
     defer tasks.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), tasks.items.len);
@@ -7717,7 +7718,8 @@ test "terminal exec cannot reuse or replace a persisted legacy background task" 
     });
 
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
-    try expectContains(result.model_output, "field \"background\" is not allowed");
+    try expectContains(result.model_output, "\"code\":\"invalid_action_fields\"");
+    try expectContains(result.model_output, "\"invalid_fields\":[\"background\"]");
     var tasks = try rt.background.snapshotTasks(alloc);
     defer tasks.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), tasks.items.len);

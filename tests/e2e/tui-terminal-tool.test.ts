@@ -1179,6 +1179,10 @@ test.skipIf(!tmuxAvailable())(
         columns: 80,
         signal: "terminate",
         close_policy: "force",
+        profile: "user",
+        shell: { kind: "user_login" },
+        sections: null,
+        unknown_zeta: true,
       }),
       (body) => {
         const correction = JSON.parse(
@@ -1213,6 +1217,8 @@ test.skipIf(!tmuxAvailable())(
             "columns",
             "signal",
             "close_policy",
+            "sections",
+            "unknown_zeta",
           ],
           missing_fields: [],
           allowed_fields: [
@@ -1227,7 +1233,7 @@ test.skipIf(!tmuxAvailable())(
             "dimensions",
             "initial_monitors",
           ],
-          conflicts: [],
+          conflicts: [["profile", "shell"]],
         });
         expect(terminalRecords(fixture.home)).toEqual([]);
         expect(existsSync(mixedMarker)).toBe(false);
@@ -1359,9 +1365,22 @@ test.skipIf(!tmuxAvailable())(
     expect(properties.wait_ceiling_ms!.anyOf![0]!.type).toBe("integer");
     expect(properties.shell!.anyOf![0]!.type).toBe("object");
     expect(properties.initial_monitors!.anyOf![0]!.type).toBe("array");
+    expect(properties.return_when!.description).toContain(
+      "required for every wait",
+    );
+    expect(properties.return_when!.description).toContain(
+      "output_contains is monitor-only",
+    );
+    expect(properties.cursor_segment!.description).toContain(
+      "required for every read",
+    );
+    expect(properties.cursor_segment!.description).toContain(
+      "raw_gap.available_from",
+    );
+    expect(properties.close_policy!.description).toContain("Close is final");
 
     const scrollback = await active.captureFullScrollback();
-    expect(scrollback).toContain("Failed start · 15 invalid fields");
+    expect(scrollback).toContain("Failed start · 17 invalid fields");
     expect(countOccurrences(scrollback, "Used terminal start")).toBe(1);
     expect(scrollback).toContain("Used terminal close");
     await active.sendKeys("C-o");
@@ -1385,36 +1404,53 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
-  "terminal repeated correction batches stop after complete results without request three",
+  "terminal repeated unknown correction with a valid neighbor stops without request three",
   async () => {
     const fixture = createFixture("fx-tui-terminal-correction-loop-");
     const firstBatch = [
       {
         id: "terminal_s_1",
-        input: { action: "start", session_id: "terminal-a" },
+        input: {
+          unknown_zeta: null,
+          action: "start",
+          session_id: "terminal-a",
+          sections: null,
+        },
       },
       {
         id: "terminal_t_1",
-        input: { action: "read", command: "wrong" },
+        input: { action: "list" },
       },
     ];
     const secondBatch = [
       {
         id: "terminal_s_2",
-        input: { action: "start", session_id: "terminal-b" },
+        input: {
+          sections: null,
+          session_id: "terminal-b",
+          action: "start",
+          unknown_zeta: null,
+        },
       },
       {
         id: "terminal_t_2",
-        input: { action: "read", command: "still wrong" },
+        input: { action: "list" },
       },
     ];
     const gateway = startFakeGateway([
       fakeTerminalToolBatch(firstBatch),
       (body) => {
-        expect(JSON.parse(toolResultText(body, "terminal_s_1")).error.code)
-          .toBe("invalid_action_fields");
-        expect(JSON.parse(toolResultText(body, "terminal_t_1")).error.code)
-          .toBe("invalid_action_fields");
+        const correction = JSON.parse(
+          toolResultText(body, "terminal_s_1"),
+        ).error;
+        expect(correction.code).toBe("invalid_action_fields");
+        expect(correction.invalid_fields).toEqual([
+          "session_id",
+          "sections",
+          "unknown_zeta",
+        ]);
+        expect(JSON.parse(toolResultText(body, "terminal_t_1")).success.list)
+          .toBeDefined();
         return fakeTerminalToolBatch(secondBatch);
       },
       () => {

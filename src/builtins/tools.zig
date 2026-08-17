@@ -87,7 +87,7 @@ const terminal_shell_schema = gateway_schema.ObjectSchema{
 
 const terminal_return_schema = gateway_schema.ObjectSchema{
     .properties = &.{
-        .{ .name = "kind", .json_type = .string, .enum_values = &.{ "started", "exit", "quiet", "match" } },
+        .{ .name = "kind", .json_type = .string, .enum_values = &.{ "started", "exit", "quiet", "match" }, .description = "started is for start readiness; exit waits for session exit; quiet requires duration_ms; match requires pattern. output_contains is a monitor condition, not a return kind." },
         .{ .name = "duration_ms", .json_type = .integer, .minimum = 1, .description = "Required for quiet." },
         .{ .name = "pattern", .json_type = .string, .description = "Required for match." },
     },
@@ -180,12 +180,12 @@ const terminal_properties = [_]gateway_schema.Property{
     .{ .name = "profile", .json_type = .string, .enum_values = &.{ "clean", "user" }, .description = "Startup profile for exec or start; omission defaults to user, while clean skips user startup files. For start, an explicit shell is used instead of the default profile and is mutually exclusive with profile." },
     .{ .name = "shell", .json_type = .object, .object_schema = &terminal_shell_schema },
     .{ .name = "backend", .json_type = .string, .enum_values = &.{ "native", "tmux" }, .description = "Start backend or optional list filter." },
-    .{ .name = "return_when", .json_type = .object, .object_schema = &terminal_return_schema },
+    .{ .name = "return_when", .json_type = .object, .object_schema = &terminal_return_schema, .description = "Only for start or wait; required for every wait. After a signal intended to stop the session, use kind exit. For output matching, use kind match with pattern; output_contains is monitor-only." },
     .{ .name = "wait_ceiling_ms", .json_type = .integer, .minimum = 1, .description = "Required for wait; required for start when return_when is non-immediate; maximum blocking time in milliseconds." },
     .{ .name = "dimensions", .json_type = .object, .object_schema = &terminal_dimensions_schema },
     .{ .name = "initial_monitors", .json_type = .array, .max_items = 32, .items = &terminal_monitor_definition_schema },
-    .{ .name = "cursor_segment", .json_type = .integer, .minimum = 1 },
-    .{ .name = "cursor_offset", .json_type = .integer },
+    .{ .name = "cursor_segment", .json_type = .integer, .minimum = 1, .description = "Only for read and required for every read. For a new session's first read, use segment 1 with cursor_offset 0; otherwise use unread_range.start or raw_gap.available_from from the latest session facts. Continue from the previous raw_range.end." },
+    .{ .name = "cursor_offset", .json_type = .integer, .description = "Only for read. Use 0 with segment 1 for a new session's first read, then continue from the previous raw_range.end offset." },
     .{ .name = "after_event_id", .json_type = .integer },
     .{ .name = "acknowledge_event_id", .json_type = .integer, .minimum = 1 },
     .{ .name = "max_events", .json_type = .integer, .minimum = 1, .maximum = 256 },
@@ -197,7 +197,7 @@ const terminal_properties = [_]gateway_schema.Property{
     .{ .name = "rows", .json_type = .integer, .minimum = 1, .maximum = 4096 },
     .{ .name = "columns", .json_type = .integer, .minimum = 1, .maximum = 4096 },
     .{ .name = "signal", .json_type = .string, .enum_values = &.{ "hangup", "interrupt", "quit", "terminate", "kill" } },
-    .{ .name = "close_policy", .json_type = .string, .enum_values = &.{ "graceful", "force" } },
+    .{ .name = "close_policy", .json_type = .string, .enum_values = &.{ "graceful", "force" }, .description = "Only for close and required for close. Close is final; read or inspect all needed output before closing." },
 };
 
 const terminal_actions = blk: {
@@ -1338,6 +1338,22 @@ test "terminal tool schema exposes one nullable object backed by the terminal ac
     try std.testing.expectEqualStrings(
         "Required for session-targeted actions. Omit for start and list; owner-catalog authority is private.",
         schemaProperty(input_schema, "session_id").?.description,
+    );
+    try std.testing.expectEqualStrings(
+        "Only for start or wait; required for every wait. After a signal intended to stop the session, use kind exit. For output matching, use kind match with pattern; output_contains is monitor-only. Set null when the selected action does not use this field.",
+        schemaProperty(input_schema, "return_when").?.nullable_description,
+    );
+    try std.testing.expectEqualStrings(
+        "Only for read and required for every read. For a new session's first read, use segment 1 with cursor_offset 0; otherwise use unread_range.start or raw_gap.available_from from the latest session facts. Continue from the previous raw_range.end. Set null when the selected action does not use this field.",
+        schemaProperty(input_schema, "cursor_segment").?.nullable_description,
+    );
+    try std.testing.expectEqualStrings(
+        "Only for close and required for close. Close is final; read or inspect all needed output before closing. Set null when the selected action does not use this field.",
+        schemaProperty(input_schema, "close_policy").?.nullable_description,
+    );
+    try std.testing.expectEqualStrings(
+        "started is for start readiness; exit waits for session exit; quiet requires duration_ms; match requires pattern. output_contains is a monitor condition, not a return kind.",
+        schemaProperty(terminal_return_schema, "kind").?.description,
     );
 
     const output_quiet_duration = schemaProperty(terminal_monitor_condition_schema, "duration_ms").?;
