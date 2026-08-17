@@ -3798,6 +3798,7 @@ test {
     _ = @import("core/permissions/permission_gate.zig");
     _ = @import("core/permissions/permissions.zig");
     _ = @import("core/background/process_supervisor.zig");
+    _ = @import("core/execution/process_tree.zig");
     _ = @import("core/config/prompt_policy.zig");
     _ = @import("core/workspace/record_tape.zig");
     _ = @import("core/session/session.zig");

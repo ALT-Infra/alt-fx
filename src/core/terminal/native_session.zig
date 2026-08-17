@@ -4143,9 +4143,12 @@ const Session = struct {
     fn signalTerminalProcesses(
         self: *Session,
         signal: contracts.Signal,
-    ) !bool {
-        const target = self.signalTarget() orelse return false;
+    ) !?bool {
+        const target = self.signalTarget() orelse return null;
         if (!self.matchesSignalTarget(target)) return false;
+        if (failSignalStageForTest("refresh")) {
+            return error.ProcessIdentityUnavailable;
+        }
 
         var descendants = try process_tree.Tracker.init(self.alloc);
         defer descendants.deinit();
@@ -4155,16 +4158,22 @@ const Session = struct {
         };
         if (!self.matchesSignalTarget(target)) return false;
 
-        const delivered = descendants.signalOutsideProcessGroup(
+        var descendants_delivery = descendants.signalOutsideProcessGroupChecked(
             signalValue(signal),
             target.pid,
         );
+        if (failSignalStageForTest("outside_group")) {
+            descendants_delivery.incomplete = true;
+        }
         debug_trace.logf(
             "terminal_host",
-            "session signal reached outside-group descendants id={s} count={d}",
-            .{ self.id, delivered },
+            "session signal reached outside-group descendants id={s} count={d} incomplete={any}",
+            .{ self.id, descendants_delivery.delivered, descendants_delivery.incomplete },
         );
-        return self.signalProcess(signal);
+        return terminalSignalCompleted(
+            descendants_delivery,
+            !failSignalStageForTest("shell_group") and self.signalProcess(signal),
+        );
     }
 
     fn signalNative(self: *Session, signal: std.c.SIG) bool {
@@ -5489,7 +5498,7 @@ fn signalAction(
         request.authority.?,
         .signal,
     );
-    if (!try session.signalTerminalProcesses(request.signal)) {
+    if (!(try session.signalTerminalProcesses(request.signal) orelse false)) {
         return error.ProcessIdentityUnavailable;
     }
     session.mutex.lockUncancelable(zio);
@@ -5501,6 +5510,23 @@ fn signalAction(
             .signal = request.signal,
         } } },
     ) catch return error.OutOfMemory;
+}
+
+fn terminalSignalCompleted(
+    descendants: process_tree.DeliverySummary,
+    shell_group_delivered: bool,
+) bool {
+    return !descendants.incomplete and shell_group_delivered;
+}
+
+fn failSignalStageForTest(stage: []const u8) bool {
+    const requested = io_mod.getenv("FX_TERMINAL_TEST_FAIL_SIGNAL_STAGE") orelse
+        return false;
+    return std.mem.eql(u8, requested, stage);
+}
+
+fn forceCloseSignalIncomplete(tree_complete: ?bool) bool {
+    return tree_complete == null or !tree_complete.?;
 }
 
 fn closeAction(
@@ -5543,18 +5569,26 @@ fn closeAction(
     var still_live = session.lifecycle == .starting or
         session.lifecycle == .running;
     session.mutex.unlock(zio);
+    var force_signal_attempted = false;
+    var force_tree_complete: ?bool = null;
     if (still_live) {
-        const delivered = if (request.policy == .force)
-            session.signalTerminalProcesses(.kill) catch |err| blk: {
+        const delivered = if (request.policy == .force) blk: {
+            const tree_complete = session.signalTerminalProcesses(.kill) catch |err| {
+                force_signal_attempted = true;
                 debug_trace.logf(
                     "terminal_host",
                     "force close tree signal failed id={s} err={s}; falling back to shell group",
                     .{ session.id, @errorName(err) },
                 );
                 break :blk session.signalProcess(.kill);
+            };
+            if (tree_complete) |complete| {
+                force_signal_attempted = true;
+                force_tree_complete = complete;
+                break :blk complete;
             }
-        else
-            session.signalProcess(.terminate);
+            break :blk false;
+        } else session.signalProcess(.terminate);
         if (!delivered) session.markLost();
     }
     if (request.policy == .graceful and still_live) {
@@ -5595,6 +5629,16 @@ fn closeAction(
         try backend.cleanupChecked(session.durable.profile.process_provider);
     }
     try session.durable.finish_close(io_mod.milliTimestamp());
+    if (force_signal_attempted and forceCloseSignalIncomplete(force_tree_complete)) {
+        return contracts.OwnedResult.init(
+            session.alloc,
+            .{ .failure = .{
+                .action = .close,
+                .code = .session_lost,
+                .session_id = session.id,
+            } },
+        ) catch return error.OutOfMemory;
+    }
     var facts = session.durable.facts();
     facts.next_actions = .{};
     return contracts.OwnedResult.init(
@@ -6219,6 +6263,21 @@ test "terminal outcomes preserve exact exit and signal status" {
     );
     try std.testing.expect(signalFromInt(0) == null);
     try std.testing.expect(signalFromInt(256) == null);
+}
+
+test "terminal signal completion requires checked descendants and shell group" {
+    try std.testing.expect(terminalSignalCompleted(.{}, true));
+    try std.testing.expect(!terminalSignalCompleted(.{
+        .delivered = 1,
+        .incomplete = true,
+    }, true));
+    try std.testing.expect(!terminalSignalCompleted(.{}, false));
+}
+
+test "force close fallback does not erase an incomplete tree operation" {
+    try std.testing.expect(!forceCloseSignalIncomplete(true));
+    try std.testing.expect(forceCloseSignalIncomplete(false));
+    try std.testing.expect(forceCloseSignalIncomplete(null));
 }
 
 fn ignoreWorkUpdate(_: ?*anyopaque, _: bool) void {}
