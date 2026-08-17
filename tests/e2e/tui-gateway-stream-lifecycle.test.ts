@@ -5114,12 +5114,13 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "dynamic MCP approval shows exact arguments and gates deny and allow",
+    "dynamic MCP approval shows exact arguments and preserves deny once and session scope",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-mcp-approval-")));
       const dynamicToolName = "mcp_fixture_echo";
       const argumentSentinel = "FXC194_ARGUMENT_SENTINEL";
-      for (const decision of ["deny", "allow"] as const) {
+      const secondArgumentSentinel = "FXC194_SECOND_ARGUMENT_SENTINEL";
+      for (const decision of ["deny", "allow", "session"] as const) {
         const runRoot = join(root, decision);
         const home = join(runRoot, "home");
         const workspace = join(runRoot, "workspace");
@@ -5157,6 +5158,20 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
               finishReason: { unified: "tool-calls", raw: "tool-calls" },
             },
           ]),
+          ...(decision === "session"
+            ? [fakeGatewaySse([
+              {
+                type: "tool-call",
+                toolCallId: "call_approval_mcp_session_second",
+                toolName: dynamicToolName,
+                input: { text: secondArgumentSentinel },
+              },
+              {
+                type: "finish",
+                finishReason: { unified: "tool-calls", raw: "tool-calls" },
+              },
+            ])]
+            : []),
           fakeGatewayFinalText(finalText),
         ]);
         gateway = mcpGateway;
@@ -5182,19 +5197,32 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
           await session.waitForComposer(TIMEOUT);
           await session.sendText("Run the MCP fixture with the exact sentinel.");
-          const approval = await session.waitForText(APPROVAL_PROMPT, TIMEOUT);
+          const approval = await session.waitForText(
+            "Allow this MCP tool call?",
+            TIMEOUT,
+          );
+          expect(approval).toContain("MCP tool");
+          expect(approval).toContain("Arguments for this request");
+          expect(approval).toContain("Allow once");
+          expect(approval).toContain("Allow this MCP tool for this session");
+          expect(approval).toContain("Deny");
           expect(approval).toContain(dynamicToolName);
           expect(approval).toContain(`{"text":"${argumentSentinel}"}`);
           expect(existsSync(fixture.callStartedPath)).toBe(false);
 
-          await session.sendLiteralText(decision === "deny" ? "3" : "1");
+          await session.sendLiteralText(
+            decision === "deny" ? "3" : decision === "session" ? "2" : "1",
+          );
           await session.waitForText(finalText, TIMEOUT);
           if (decision === "deny") {
             expect(existsSync(fixture.callStartedPath)).toBe(false);
           } else {
             const calls = readDelayedMcpCalls(fixture.callStartedPath);
-            expect(calls).toHaveLength(1);
+            expect(calls).toHaveLength(decision === "session" ? 2 : 1);
             expect(calls[0]?.arguments).toEqual({ text: argumentSentinel });
+            if (decision === "session") {
+              expect(calls[1]?.arguments).toEqual({ text: secondArgumentSentinel });
+            }
           }
           expect(readFileSync(stderrPath, "utf8")).toBe("");
         } finally {
@@ -5303,7 +5331,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
           await session.waitForComposer(TIMEOUT);
           await session.sendText(parentPrompt);
-          const approval = await session.waitForText(APPROVAL_PROMPT, TIMEOUT);
+          const approval = await session.waitForText(
+            "Allow this MCP tool call?",
+            TIMEOUT,
+          );
           expect(approval).toContain(dynamicToolName);
           expect(approval).toContain(`{"text":"${argumentSentinel}"}`);
           expect(existsSync(fixture.callStartedPath)).toBe(false);
@@ -5408,7 +5439,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Run the MCP fixture with overlong arguments.");
-      const approval = await session.waitForText(APPROVAL_PROMPT, TIMEOUT);
+      const approval = await session.waitForText(
+        "Allow this MCP tool call?",
+        TIMEOUT,
+      );
       expect(approval).toContain(dynamicToolName);
       expect(approval).toContain("FXC194_OVER");
       expect(approval).toContain("…");
@@ -5498,7 +5532,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       let mcpStatus = "";
       const readyStatus = "fixture source=profile scope=profile policy=optional transport=stdio state=ready";
       while (Date.now() < readyDeadline) {
-        await session.sendText("/mcp");
+        await session.sendText("/mcp list");
         mcpStatus = await session.captureFullScrollback();
         if (mcpStatus.includes(readyStatus)) break;
         await Bun.sleep(100);

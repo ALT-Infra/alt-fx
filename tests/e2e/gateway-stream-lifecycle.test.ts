@@ -573,7 +573,7 @@ async function waitForMcpServerReady(
     pane.split("\n").some((line) =>
       line.includes(`${serverName} `) && line.includes(` state=${state}`)
     );
-  await session.sendText("/mcp");
+  await session.sendText("/mcp list");
   const status = await session.waitForPane(
     (pane) => hasServerState(pane, "ready") || hasServerState(pane, "failed"),
     timeoutMs,

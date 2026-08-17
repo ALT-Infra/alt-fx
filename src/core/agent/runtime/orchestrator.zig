@@ -4468,6 +4468,15 @@ fn processQueuedPromptLoop(
                         finish_trace.finish("interrupted");
                         return;
                     }
+                    if (try runtime_tool_admission.repeatedDynamicMcpFailure(
+                        arena,
+                        within_turn_suffix.items,
+                        parallel_call,
+                        advertised_dynamic_tool_names,
+                    )) |failure| {
+                        precomputed_results[group_index] = failure;
+                        continue;
+                    }
                     if (preparation_batch.preparations[tool_call_index + group_index]) |preparation| {
                         switch (preparation) {
                             .candidate => |candidate| {
@@ -5183,6 +5192,59 @@ fn processQueuedPromptLoop(
                         continue;
                     },
                 }
+            }
+            if (try runtime_tool_admission.repeatedDynamicMcpFailure(
+                arena,
+                within_turn_suffix.items,
+                tool_call,
+                advertised_dynamic_tool_names,
+            )) |execution| {
+                const prepared = try runtime_execution_memory.prepareToolModelOutput(
+                    arena,
+                    config,
+                    tool_call,
+                    execution.model_output,
+                );
+                const safe_tool_output = prepared.model_output;
+                _ = try stream_ctx.provisional_statuses.finishExecutedCall(
+                    deps,
+                    stream_ctx.alloc,
+                    arena,
+                    turn_id,
+                    tool_call,
+                    false,
+                    null,
+                    execution,
+                    safe_tool_output,
+                    prepared.memory,
+                    null,
+                    advertised_dynamic_tool_names,
+                );
+                try runtime_tool_admission.recordRejectedToolCall(
+                    deps,
+                    arena,
+                    tool_call,
+                    safe_tool_output,
+                    null,
+                );
+                debug_trace.eventf(
+                    "tool",
+                    "execution_result",
+                    step_ctx,
+                    "call_id={s} name={s} result_kind=repeated_mcp_failure model_output_bytes={d}",
+                    .{ tool_call.id, tool_call.name, safe_tool_output.len },
+                );
+                try runtime_tool_batch.appendToolResultContent(
+                    arena,
+                    &within_turn_suffix,
+                    &completed_tool_names,
+                    &step_batch,
+                    tool_call,
+                    safe_tool_output,
+                    prepared.memory,
+                    .{ .increment_error = true },
+                );
+                continue;
             }
             const requires_legacy_classification = if (preparation_batch.preparations[tool_call_index]) |preparation|
                 switch (preparation) {

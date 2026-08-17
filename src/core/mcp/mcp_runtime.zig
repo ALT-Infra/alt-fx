@@ -4937,9 +4937,17 @@ pub const McpRuntime = struct {
     }
 
     pub fn connectAll(self: *McpRuntime, tool_registry: tool_dispatch.Registry) void {
-        if (self.discovery_state.cmpxchgStrong(.idle, .loading, .seq_cst, .seq_cst) != null) return;
         self.discovery_cancel_requested.store(false, .seq_cst);
-        self.connectAllControlled(tool_registry, null, .all);
+        self.connectAllCancellable(tool_registry, &self.discovery_cancel_requested);
+    }
+
+    pub fn connectAllCancellable(
+        self: *McpRuntime,
+        tool_registry: tool_dispatch.Registry,
+        cancel_requested: *std.atomic.Value(bool),
+    ) void {
+        if (self.discovery_state.cmpxchgStrong(.idle, .loading, .seq_cst, .seq_cst) != null) return;
+        self.connectAllControlled(tool_registry, cancel_requested, null, .all);
         self.finishDeferredDiscovery();
         self.discovery_state.store(.complete, .seq_cst);
     }
@@ -4953,7 +4961,12 @@ pub const McpRuntime = struct {
     ) void {
         if (self.discovery_state.cmpxchgStrong(.idle, .loading, .seq_cst, .seq_cst) != null) return;
         self.discovery_cancel_requested.store(false, .seq_cst);
-        self.connectAllControlled(tool_registry, null, .ask_startup);
+        self.connectAllControlled(
+            tool_registry,
+            &self.discovery_cancel_requested,
+            null,
+            .ask_startup,
+        );
         self.discovery_state.store(.complete, .seq_cst);
     }
 
@@ -4974,7 +4987,12 @@ pub const McpRuntime = struct {
                         .acq_rel,
                         .acquire,
                     ) != null) continue;
-                    self.connectAllControlled(tool_registry, null, .ask_deferred);
+                    self.connectAllControlled(
+                        tool_registry,
+                        &self.discovery_cancel_requested,
+                        null,
+                        .ask_deferred,
+                    );
                     self.finishDeferredDiscovery();
                     return;
                 },
@@ -5028,7 +5046,12 @@ pub const McpRuntime = struct {
         tool_registry: tool_dispatch.Registry,
         server_timeout: ?std.Io.Duration,
     ) void {
-        self.connectAllControlled(tool_registry, server_timeout, .all);
+        self.connectAllControlled(
+            tool_registry,
+            &self.discovery_cancel_requested,
+            server_timeout,
+            .all,
+        );
         self.finishDeferredDiscovery();
         self.discovery_state.store(.complete, .seq_cst);
     }
@@ -5036,6 +5059,7 @@ pub const McpRuntime = struct {
     fn connectAllControlled(
         self: *McpRuntime,
         tool_registry: tool_dispatch.Registry,
+        cancel_requested: *std.atomic.Value(bool),
         server_timeout: ?std.Io.Duration,
         phase: startup_admission.Phase,
     ) void {
@@ -5066,7 +5090,7 @@ pub const McpRuntime = struct {
         self.catalog_mutex.unlockShared(io_mod.getIo());
 
         for (self.servers.items) |*server| {
-            if (self.discovery_cancel_requested.load(.seq_cst)) return;
+            if (cancel_requested.load(.acquire)) return;
             switch (startup_admission.decide(
                 server.config.enabled,
                 server.config.required,
@@ -5084,10 +5108,10 @@ pub const McpRuntime = struct {
                 self,
                 server,
                 &used_tool_names,
-                &self.discovery_cancel_requested,
+                cancel_requested,
                 server_timeout,
             ) catch |err| {
-                if (self.discovery_cancel_requested.load(.seq_cst)) return;
+                if (cancel_requested.load(.acquire)) return;
                 debug_trace.logf("mcp", "connection failed for server {s}: {s}", .{ server.config.name, @errorName(err) });
                 if (server.last_error == null) {
                     server.setFailed(self.alloc, @errorName(err));
@@ -5103,7 +5127,7 @@ pub const McpRuntime = struct {
         name: []const u8,
         open_ctx: ?*anyopaque,
         open_url: mcp_auth.OpenUrlFn,
-    ) !void {
+    ) !mcp_auth.AuthenticationResult {
         const server = try self.authenticationServer(name);
         server.connection_lock.lockSharedUncancelable(io_mod.getIo());
         var connection_locked = true;
@@ -5136,7 +5160,7 @@ pub const McpRuntime = struct {
         };
         defer source.challenge.deinit(self.alloc);
         defer if (source.previous_scope) |value| self.alloc.free(value);
-        var credentials = try mcp_auth.authorizeInteractive(self.alloc, .{
+        var credentials = switch (try mcp_auth.authorizeInteractive(self.alloc, .{
             .endpoint = try server.config.remoteUrl(),
             .challenge = source.challenge,
             .config = .{
@@ -5151,7 +5175,10 @@ pub const McpRuntime = struct {
             .open_ctx = open_ctx,
             .open_url = open_url,
             .lifecycle_cancel_flag = &self.retiring,
-        });
+        })) {
+            .credentials => |credentials| credentials,
+            .issuer_mismatch => |mismatch| return .{ .issuer_mismatch = mismatch },
+        };
         var transferred = false;
         defer if (!transferred) credentials.deinit(self.alloc);
         {
@@ -5180,6 +5207,7 @@ pub const McpRuntime = struct {
         server.connection_lock.unlockShared(io_mod.getIo());
         connection_locked = false;
         try resumeToolSubscriptionAfterAuthentication(self, server, deadline);
+        return .authenticated;
     }
 
     pub fn validateAuthenticationServer(self: *McpRuntime, name: []const u8) !void {
@@ -5736,7 +5764,10 @@ pub const McpRuntime = struct {
         access: tool_mcp_runtime.Access,
     ) !tool_mcp_runtime.SearchResult {
         if (self.isDiscovering()) {
-            return .{ .model_output = try alloc.dupe(u8, "{\"tools\":[],\"count\":0}") };
+            return .{ .model_output = try alloc.dupe(
+                u8,
+                "{\"tools\":[],\"count\":0,\"state\":\"discovering\",\"retryable\":true}",
+            ) };
         }
         var operation_access = try OperationAccessGuard.init(
             self.alloc,
@@ -8408,7 +8439,12 @@ fn renderAuthenticationRequired(
     return null;
 }
 
-fn loadStoredCredentials(alloc: Allocator, server: *McpServer) !void {
+fn loadStoredCredentials(
+    alloc: Allocator,
+    server: *McpServer,
+    control: ConnectionControl,
+) !void {
+    try checkConnectionControl(control);
     if (server.config.transport == .stdio or
         !server.config.allow_stored_credentials or
         server.auth_credentials != null)
@@ -8416,13 +8452,27 @@ fn loadStoredCredentials(alloc: Allocator, server: *McpServer) !void {
         return;
     }
     const auth = server.config.auth orelse mcp_contract.McpAuthConfig{};
-    server.auth_credentials = try mcp_auth_store.load(
-        alloc,
-        server.config.name,
-        try server.config.remoteUrl(),
-        auth.resource,
-        auth.issuer,
-    );
+    var credentials = if (control.cancel_flag) |cancel_flag|
+        try mcp_auth_store.loadCancellable(
+            alloc,
+            server.config.name,
+            try server.config.remoteUrl(),
+            auth.resource,
+            auth.issuer,
+            cancel_flag,
+        )
+    else
+        try mcp_auth_store.load(
+            alloc,
+            server.config.name,
+            try server.config.remoteUrl(),
+            auth.resource,
+            auth.issuer,
+        );
+    errdefer if (credentials) |*owned| owned.deinit(alloc);
+    try checkConnectionControl(control);
+    server.auth_credentials = credentials;
+    credentials = null;
     server.auth_credentials_present.store(
         server.auth_credentials != null,
         .release,
@@ -9498,7 +9548,8 @@ fn connectServerForDiscovery(
     used_tool_names: *std.StringHashMap(void),
     control: ConnectionControl,
 ) !void {
-    loadStoredCredentials(runtime.alloc, server) catch |err| {
+    loadStoredCredentials(runtime.alloc, server, control) catch |err| {
+        if (err == error.Cancelled) return err;
         debug_trace.logf(
             "mcp",
             "credential load failed server={s} err={s}",
@@ -11780,7 +11831,7 @@ fn authorizeForChallenge(
         };
     };
     defer if (source.previous_scope) |value| alloc.free(value);
-    var credentials = try mcp_auth.authorizeAutomated(alloc, .{
+    var credentials = switch (try mcp_auth.authorizeAutomated(alloc, .{
         .endpoint = try server.config.remoteUrl(),
         .challenge = challenge,
         .config = .{
@@ -11792,7 +11843,14 @@ fn authorizeForChallenge(
             .scopes = auth_config.scopes,
         },
         .previous_scope = source.previous_scope,
-    });
+    })) {
+        .credentials => |credentials| credentials,
+        .issuer_mismatch => |owned_mismatch| {
+            var mismatch = owned_mismatch;
+            mismatch.deinit();
+            return error.AuthorizationMetadataIssuerMismatch;
+        },
+    };
     var credentials_transferred = false;
     errdefer if (!credentials_transferred) credentials.deinit(alloc);
     try lockMutexWithControl(&server.auth_lock, control);
@@ -15482,7 +15540,10 @@ test "discovery classification separates modern negotiation from legacy fallback
     );
     defer invalid_params.deinit();
     switch (try classifyDiscoveryResponse(invalid_params.value)) {
-        .modern_protocol_error => |protocol_error| try std.testing.expectEqual(@as(i64, -32602), protocol_error.code),
+        .legacy_fallback => |version| try std.testing.expectEqual(
+            LegacyStdioVersion.v2025_11_25,
+            version,
+        ),
         else => return error.TestUnexpectedResult,
     }
 
@@ -16798,12 +16859,52 @@ test "McpRuntime cancels blocked stdio discovery without exposing partial state"
 
     var results = try runtime.searchTools(alloc, "echo", 5, .{}, .{}, .unrestricted);
     defer results.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"tools\":[],\"count\":0}", results.model_output);
+    try std.testing.expectEqualStrings(
+        "{\"tools\":[],\"count\":0,\"state\":\"discovering\",\"retryable\":true}",
+        results.model_output,
+    );
 
     const started_ms = io_mod.milliTimestamp();
     runtime.deinit();
     runtime_deinitialized = true;
     try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1000);
+}
+
+test "caller cancellation interrupts blocked candidate connection" {
+    const Connector = struct {
+        runtime: *McpRuntime,
+        cancel: *std.atomic.Value(bool),
+        started: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.started.store(true, .release);
+            self.runtime.connectAllCancellable(.{}, self.cancel);
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    const args = try alloc.alloc([]const u8, 1);
+    args[0] = try alloc.dupe(u8, "{}");
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "candidate"),
+        .command = try alloc.dupe(u8, "awk"),
+        .args = args,
+        .startup_timeout_ms = 60_000,
+    });
+    var cancel = std.atomic.Value(bool).init(false);
+    var connector = Connector{ .runtime = &runtime, .cancel = &cancel };
+    const thread = try std.Thread.spawn(.{}, Connector.run, .{&connector});
+    while (!connector.started.load(.acquire)) io_mod.sleep(std.time.ns_per_ms);
+    io_mod.sleep(25 * std.time.ns_per_ms);
+    const started_ms = io_mod.milliTimestamp();
+    cancel.store(true, .release);
+    thread.join();
+
+    try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1_000);
+    try std.testing.expectEqual(ServerState.disconnected, runtime.servers.items[0].state);
+    try std.testing.expect(runtime.servers.items[0].last_error == null);
 }
 
 test "MCP health terminal-encodes external identity and omits secret-bearing configuration" {
