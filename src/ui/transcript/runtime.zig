@@ -9444,6 +9444,55 @@ pub const TranscriptRuntime = struct {
         return selection.offset;
     }
 
+    test "full transcript depth changes preserve tail and history viewport intent" {
+        const alloc = std.testing.allocator;
+        const review_measurement = full_transcript_screen.ProjectionMeasurement{
+            .total_rows = 13,
+            .anchor_row = null,
+            .item_rows = &.{
+                .{ .entry_id = 10, .row = 0 },
+                .{ .entry_id = 20, .row = 6 },
+            },
+        };
+        const full_measurement = full_transcript_screen.ProjectionMeasurement{
+            .total_rows = 30,
+            .anchor_row = null,
+            .item_rows = &.{
+                .{ .entry_id = 10, .row = 0 },
+                .{ .entry_id = 20, .row = 12 },
+                .{ .entry_id = 30, .row = 24 },
+            },
+        };
+
+        var tail = TranscriptRuntime{ .full_transcript = .{ .depth = .review } };
+        defer tail.deinit(alloc);
+        try std.testing.expectEqual(
+            @as(u32, 8),
+            selectProjectionViewportOffset(&tail, review_measurement, 5),
+        );
+        try std.testing.expect(try tail.setTranscriptPresentationDepth(alloc, .full));
+        try std.testing.expectEqual(
+            @as(u32, 25),
+            selectProjectionViewportOffset(&tail, full_measurement, 5),
+        );
+        try std.testing.expect(tail.full_transcript.follow_tail);
+
+        var history = TranscriptRuntime{ .full_transcript = .{ .depth = .review } };
+        defer history.deinit(alloc);
+        _ = selectProjectionViewportOffset(&history, review_measurement, 5);
+        history.full_transcript = history.full_transcript.scroll(.up, 2);
+        try std.testing.expectEqual(
+            @as(u32, 6),
+            selectProjectionViewportOffset(&history, review_measurement, 5),
+        );
+        try std.testing.expect(try history.setTranscriptPresentationDepth(alloc, .full));
+        try std.testing.expectEqual(
+            @as(u32, 12),
+            selectProjectionViewportOffset(&history, full_measurement, 5),
+        );
+        try std.testing.expect(!history.full_transcript.follow_tail);
+    }
+
     pub fn prepareTranscriptSurfacePaintFromSourceForArea(
         self: *TranscriptRuntime,
         alloc: Allocator,

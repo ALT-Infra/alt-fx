@@ -1010,11 +1010,16 @@ test.skipIf(!tmuxAvailable())(
 
       await active.sendKeys("Right");
       await active.waitForText("Full detail · ←/→ switch · ctrl o close · PgUp/PgDn scroll · Esc close", TIMEOUT);
-      const expandedAtReviewAnchor = await active.capturePane();
-      expect(expandedAtReviewAnchor).toContain("command: awk");
-      expect(expandedAtReviewAnchor).toContain(commandArgumentTail);
-      expect(expandedAtReviewAnchor).toContain("FULL_CTRL_O_LINE_0001");
-      expect(expandedAtReviewAnchor).not.toContain(tailMarker);
+      const expandedAtTail = await active.capturePane();
+      expect(expandedAtTail).toContain(tailMarker);
+      expect(expandedAtTail).not.toContain("FULL_CTRL_O_LINE_0001");
+
+      await active.sendKeys(Array.from({ length: 140 }, () => "PPage").join(" "));
+      const expandedAtHead = await active.waitForText("command: awk", TIMEOUT);
+      expect(expandedAtHead).toContain(commandArgumentTail);
+      expect(expandedAtHead).toContain("FULL_CTRL_O_LINE_0001");
+      expect(expandedAtHead).not.toContain(tailMarker);
+
       await active.sendKeys(Array.from({ length: 140 }, () => "NPage").join(" "));
       await active.waitForText(tailMarker, TIMEOUT);
       const full = await active.capturePane();
@@ -5340,19 +5345,21 @@ printf '${stdoutTail2}\\n'
       await session.waitForText("┃ Review · ←/→ switch · ctrl o close", TIMEOUT);
       await session.sendKeys("Right");
       await session.waitForText("┃ Full detail · ←/→ switch · ctrl o close", TIMEOUT);
-      const beforePageDown = await session.capturePane();
-      expect(beforePageDown).toContain(`│ ${firstMarker}`);
-      expect(countOccurrences(beforePageDown, firstMarker)).toBe(1);
-      expect(beforePageDown).not.toContain(stdoutTail2);
-      const pages = [beforePageDown];
-      for (let page = 0; page < 8 && !pages.at(-1)!.includes(stdoutTail2); page += 1) {
-        await session.sendHexBytes(["1b", "5b", "36", "7e"]);
+      const tail = await session.capturePane();
+      expect(tail).toContain(stdoutTail2);
+      expect(tail).not.toContain(firstMarker);
+
+      const pages = [tail];
+      for (let page = 0; page < 8 && !pages.at(-1)!.includes(firstMarker); page += 1) {
+        await session.sendHexBytes(["1b", "5b", "35", "7e"]);
         const next = await waitForChangedPane(session, pages.at(-1)!);
         if (next === null) break;
         pages.push(next);
       }
-      const tail = pages.at(-1)!;
-      const output = pages.join("\n").split("\n").filter((line) =>
+      const head = pages.at(-1)!;
+      expect(head).toContain(`│ ${firstMarker}`);
+      expect(countOccurrences(head, firstMarker)).toBe(1);
+      const output = [...pages].reverse().join("\n").split("\n").filter((line) =>
         line.trimStart().startsWith("│ ") && !line.includes("command:")
       ).join("\n");
       for (const marker of orderedTailMarkers) {
