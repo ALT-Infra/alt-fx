@@ -1,8 +1,15 @@
 # fx
 
-## 0.4.4
+## 0.4.5
 
 <!-- release:start -->
+
+### Bug Fixes
+
+- **Public launch upgrade:** Allow fx 0.4.5 to upgrade directly to 0.0.1 during the version reset
+<!-- release:end -->
+
+## 0.4.4
 
 ### New Features
 
@@ -12,7 +19,6 @@
 ### Bug Fixes
 
 - **Signed-in account data:** Restore model catalog and credit balance loading for Vercel-authenticated sessions
-<!-- release:end -->
 
 ## 0.4.3
 

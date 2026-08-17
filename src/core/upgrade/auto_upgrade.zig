@@ -175,7 +175,7 @@ pub const AutoUpgrade = struct {
         var target = helpers.fetchTarget(alloc, self.selected_channel, cdn_base) catch return;
         defer target.deinit(alloc);
 
-        if (!target.shouldInstallAutomatically(current)) return;
+        if (!target.shouldInstall(current)) return;
 
         var label_buf: [64]u8 = undefined;
         const label = target.writeDisplayLabel(&label_buf) catch return;
