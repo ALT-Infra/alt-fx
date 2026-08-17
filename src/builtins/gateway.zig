@@ -38,7 +38,6 @@ const Response = web_search_contract.ProviderResponse;
 const ProgressFn = web_search_contract.ProgressFn;
 
 pub const default_model = "zai/glm-5.2";
-pub const default_fast_mode = true;
 pub const default_chat_url = "https://ai-gateway.vercel.sh/v3/ai/language-model";
 pub const models_path = "/coding-agent/v1/models";
 const credits_path = "/coding-agent/v1/credits";
@@ -1585,7 +1584,6 @@ test "possibly sent web search failure marks billing incomplete" {
 
 test "built-in gateway defaults preserve active provider policy" {
     try std.testing.expectEqualStrings("zai/glm-5.2", default_model);
-    try std.testing.expect(default_fast_mode);
     try std.testing.expectEqualStrings("https://ai-gateway.vercel.sh/v3/ai/language-model", default_chat_url);
     try std.testing.expectEqualStrings("/coding-agent/v1/models", models_path);
     try std.testing.expectEqual(@as(usize, 3), retry_count);

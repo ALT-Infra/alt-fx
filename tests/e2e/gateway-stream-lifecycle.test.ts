@@ -746,11 +746,11 @@ describe("gateway stream lifecycle", () => {
     }
   }, 30_000);
 
-  test("ask keeps the GLM default model identity while enabling fast mode", async () => {
-    const root = createFixtureRoot("default-model-fast");
+  test("ask keeps the GLM default model identity without enabling fast mode", async () => {
+    const root = createFixtureRoot("default-model");
     const tracePath = join(root.root, "trace.log");
     const gateway = startDynamicFakeGateway(
-      () => fakeGatewayFinalText("DEFAULT_MODEL_FAST_COMPLETE"),
+      () => fakeGatewayFinalText("DEFAULT_MODEL_COMPLETE"),
       {
         models: [{
           id: DEFAULT_MODEL,
@@ -777,7 +777,7 @@ describe("gateway stream lifecycle", () => {
 
       expect(result.code).toBe(0);
       expect(parseAskJson(result.stdout).output).toContain(
-        "DEFAULT_MODEL_FAST_COMPLETE",
+        "DEFAULT_MODEL_COMPLETE",
       );
       expect(result.stderr).toBe("");
       expect(gateway.requests).toHaveLength(1);
@@ -786,9 +786,7 @@ describe("gateway stream lifecycle", () => {
       );
       const request = JSON.parse(gateway.requests[0]!.body);
       expect(request).not.toHaveProperty("fast");
-      expect(request).toMatchObject({
-        providerOptions: { gateway: { speed: "fast" } },
-      });
+      expect(request).not.toHaveProperty("providerOptions.gateway.speed");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
