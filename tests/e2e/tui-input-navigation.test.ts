@@ -989,10 +989,6 @@ tmuxTest(
       expect(body).not.toContain(siblingRule);
       expect(body.indexOf(rootRule)).toBeLessThan(body.indexOf(nestedRule));
     };
-    const hasAttachedImage = (pane: string) =>
-      pane.split("\n").some((line) =>
-        isComposerLine(line) && line.includes("[Image 1]")
-      );
     const localGateway = startFakeGateway(
       [
         fakeGatewayFinalText("IMAGE_TYPED_OK"),
@@ -1040,7 +1036,10 @@ tmuxTest(
     expectScopedContext(localGateway.requests[0]!.body);
 
     await active.pasteText(scopedImage);
-    await active.waitForPane(hasAttachedImage, READY_TIMEOUT);
+    await waitForActiveFooter(
+      active,
+      (footer) => footer.includes("[Image 2]"),
+    );
     await active.sendKeys("Enter");
     await active.waitForPane(
       (pane) => pane.includes("IMAGE_PASTED_OK") && hasEmptyComposer(pane),
@@ -1053,7 +1052,10 @@ tmuxTest(
 
     await typeLiteral(active, `/image ${scopedImage}`);
     await active.sendKeys("Enter");
-    await active.waitForPane(hasAttachedImage, READY_TIMEOUT);
+    await waitForActiveFooter(
+      active,
+      (footer) => footer.includes("[Image 3]"),
+    );
     expect(localGateway.requests).toHaveLength(2);
     await typeLiteral(active, " describe via command");
     await active.sendKeys("Enter");
