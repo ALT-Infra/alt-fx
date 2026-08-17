@@ -2014,7 +2014,7 @@ fn executeRawInvocation(
     return formatCollectedOutput(alloc, command, cwd, result);
 }
 
-test "explicit captured profiles execute exact shells without filtering stderr" {
+test "explicit captured profiles execute exact shells without synthetic stderr" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
     std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/bash", .{}) catch
         return error.SkipZigTest;
@@ -2047,13 +2047,10 @@ test "explicit captured profiles execute exact shells without filtering stderr" 
         "/tmp",
         .{ .user = shell_path },
     );
-    try std.testing.expect(std.mem.find(u8, user.output, "profile-stdout") != null);
-    try std.testing.expect(std.mem.find(u8, user.output, "profile-stderr") != null);
-    try std.testing.expect(std.mem.find(
-        u8,
+    try std.testing.expectEqualStrings(
+        "exit_code=0\n<stdout>\nprofile-stdout\n</stdout>\n<stderr>\nprofile-stderr\n</stderr>\n",
         user.output,
-        "bash: no job control in this shell\n",
-    ) != null);
+    );
     if (std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{})) {
         const zsh_user = try executeCommandInEnvironment(
             cfg,

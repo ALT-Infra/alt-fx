@@ -159,6 +159,11 @@ pub fn capturedInvocation(environment_value: Environment, command: []const u8) R
         },
         .user => |path| {
             var invocation = try resolve(path, .user_login);
+            if (std.mem.eql(u8, std.fs.path.basename(path), "bash")) {
+                removeInteractiveFlag(&invocation);
+                invocation.append("-O");
+                invocation.append("expand_aliases");
+            }
             invocation.setCommand(command);
             return invocation;
         },
@@ -336,7 +341,7 @@ test "captured profiles use exact non-PTY argv" {
     const bash_user = try capturedInvocation(.{ .user = "/bin/bash" }, "printf user");
     try std.testing.expectEqualSlices(
         []const u8,
-        &.{ "/bin/bash", "--login", "-i", "-c", "printf user" },
+        &.{ "/bin/bash", "--login", "-O", "expand_aliases", "-c", "printf user" },
         bash_user.argv(),
     );
     const zsh_clean = try capturedInvocation(.{ .clean = "/bin/zsh" }, "printf clean");
