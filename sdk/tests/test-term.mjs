@@ -16,6 +16,8 @@ if (!supportsJspi()) {
 const output = [];
 const streamedDecoder = new TextDecoder();
 let streamedText = "";
+const liveDraft = "queued draft";
+let draftVisibleAt;
 const originalSetTimeout = globalThis.setTimeout;
 let observeZeroTimeouts = false;
 let zeroTimeoutCount = 0;
@@ -34,6 +36,7 @@ const terminal = {
     const chunk = bytes instanceof Uint8Array ? bytes : new TextEncoder().encode(bytes);
     output.push(chunk);
     streamedText += streamedDecoder.decode(chunk, { stream: true });
+    if (draftVisibleAt === undefined && streamedText.includes(liveDraft)) draftVisibleAt = performance.now();
     process.stdout.write(chunk);
   },
   async drain() {
@@ -117,10 +120,9 @@ while (streamStartedAt === undefined) {
   if (performance.now() >= deadline) throw new Error("timed out waiting for continuous fx-term response");
   await new Promise((resolve) => setTimeout(resolve, 10));
 }
-const liveDraft = "queued draft";
 observeZeroTimeouts = true;
 runtime.write(liveDraft);
-while (!streamedText.includes(liveDraft)) {
+while (draftVisibleAt === undefined) {
   if (streamFinishedAt !== undefined) throw new Error("terminal did not render follow-up input while the response was active");
   if (performance.now() >= deadline) throw new Error("timed out waiting for live follow-up input");
   await new Promise((resolve) => setTimeout(resolve, 10));
@@ -145,6 +147,7 @@ if (!text.includes("𝒇x")) throw new Error("shared Fx welcome frame was not ob
 if (!text.includes("Run /help for commands")) throw new Error("shared Fx welcome guidance was not observed");
 if (requestedModel !== "sdk/term-model") throw new Error(`terminal prompt did not use the host-restored model: ${requestedModel}`);
 if (!(streamStartedAt < streamFinishedAt)) throw new Error("terminal fetch did not remain active for continuous streaming");
+if (!(draftVisibleAt < streamFinishedAt)) throw new Error("terminal rendered follow-up input only after continuous streaming finished");
 if (zeroTimeoutCount !== 0) throw new Error(`terminal allocated ${zeroTimeoutCount} zero-timeout poll timer(s)`);
 if (!events.some((event) => event.type === "config.restore" && event.configId === "model")) throw new Error("terminal model restore event was not emitted");
 if (!events.some((event) => event.type === "config.restore" && event.configId === "mode")) throw new Error("terminal mode restore event was not emitted");
