@@ -86,6 +86,7 @@ type RootOptions = {
     | "progress"
     | "stall_operation"
     | "stall_startup"
+    | "tool_failure"
     | "response_missing_jsonrpc"
     | "response_wrong_jsonrpc"
     | "response_missing_payload"
@@ -116,6 +117,7 @@ type RootOptions = {
   legacyVersion?: "2025-06-18" | "2025-11-25";
   legacyDiscoveryVersions?: readonly ["2024-11-05", "2025-06-18", "2025-11-25"];
   legacyDiscoveryMethodNotFound?: boolean;
+  legacyDiscoveryInvalidParams?: boolean;
   legacyRejectNewerInitialize?: boolean;
   draft7Pattern?: string;
   urlRequiredOperation?: "tools" | "resources" | "prompts";
@@ -187,6 +189,8 @@ function createRoot(
               options.legacyDiscoveryVersions?.join(","),
             FX_MCP_LEGACY_DISCOVERY_METHOD_NOT_FOUND:
               options.legacyDiscoveryMethodNotFound ? "1" : undefined,
+            FX_MCP_LEGACY_DISCOVERY_INVALID_PARAMS:
+              options.legacyDiscoveryInvalidParams ? "1" : undefined,
             FX_MCP_LEGACY_REJECT_NEWER_INITIALIZE:
               options.legacyRejectNewerInitialize ? "1" : undefined,
             FX_MCP_DRAFT7_PATTERN: options.draft7Pattern,
@@ -1224,6 +1228,72 @@ describe("modern MCP stdio compatibility", () => {
     await expectFixtureProcessesExited(wire);
   }, 30_000);
 
+  test("invalid-params discovery falls back through initialize and tools call", async () => {
+    const root = createRoot("legacy-invalid-params", LEGACY_FIXTURE, {
+      legacyVersion: "2025-11-25",
+      legacyDiscoveryInvalidParams: true,
+    });
+    gateway = startToolGateway("Invalid params fallback complete.");
+
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Use the legacy stdio MCP tool."],
+      {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway),
+        timeoutMs: 20_000,
+      },
+    );
+
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain(
+      "Invalid params fallback complete.",
+    );
+    const wire = readWire(root.wireLogPath);
+    expect(wire.filter((entry) => entry.message.method === "server/discover"))
+      .toHaveLength(1);
+    expect(wire.filter((entry) => entry.message.method === "initialize"))
+      .toHaveLength(1);
+    expect(wire.filter((entry) => entry.message.method === "tools/list"))
+      .toHaveLength(1);
+    expect(wire.filter((entry) => entry.message.method === "tools/call"))
+      .toHaveLength(1);
+    await expectFixtureProcessesExited(wire);
+  }, 30_000);
+
+  test("third equivalent dynamic MCP failure is blocked before transport", async () => {
+    const root = createRoot("bounded-equivalent-retries", MODERN_FIXTURE, {
+      mode: "tool_failure",
+    });
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("retry_select", "mcp_select_tool", { name: TOOL_NAME }),
+      fakeGatewayToolCall("retry_call_1", TOOL_NAME, { text: "one" }),
+      fakeGatewayToolCall("retry_call_2", TOOL_NAME, { text: "two" }),
+      fakeGatewayToolCall("retry_call_3", TOOL_NAME, { text: "three" }),
+      fakeGatewayFinalText("Bounded MCP retries complete."),
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Call the failing MCP tool."],
+      {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway),
+        timeoutMs: 20_000,
+      },
+    );
+
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("Bounded MCP retries complete.");
+    const wire = readWire(root.wireLogPath);
+    expect(wire.filter((entry) => entry.message.method === "tools/call"))
+      .toHaveLength(2);
+    expect(gateway.requests.at(-1)?.body).toContain(
+      "Repeated MCP tool call blocked: two equivalent attempts failed",
+    );
+    await expectFixtureProcessesExited(wire);
+  }, 30_000);
+
   test("successful discovery selects the latest legacy version from an oldest-first list", async () => {
     const root = createRoot("legacy-discovery-oldest-first", LEGACY_FIXTURE, {
       legacyVersion: "2025-11-25",
@@ -2029,6 +2099,48 @@ describe("modern MCP stdio compatibility", () => {
       expect(wire[2]?.message.params?._meta).toMatchObject({
         progressToken: expect.any(Number),
       });
+
+      await tui.kill();
+      tui = null;
+      await expectFixtureProcessesExited(wire);
+    },
+    30_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "the TUI shows a safe MCP failure detail while preserving model context",
+    async () => {
+      const root = createRoot("tui-tool-failure", MODERN_FIXTURE, {
+        mode: "tool_failure",
+        expectedElicitation: "both",
+      });
+      const activeGateway = startToolGateway("MCP failure detail complete.");
+      gateway = activeGateway;
+      const stderrPath = join(root.root, "stderr.log");
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 120,
+        height: 32,
+        stderrPath,
+        env: fixtureEnv(root, activeGateway),
+      });
+
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Call the failing MCP fixture once.");
+      await tui.waitForText(
+        `Failed ${TOOL_NAME}: Invalid input: labels require at least one item`,
+        20_000,
+      );
+      await tui.waitForText("MCP failure detail complete.", 20_000);
+
+      expect(activeGateway.requests.at(-1)?.body).toContain(
+        "Invalid input: labels require at least one item",
+      );
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      const wire = readWire(root.wireLogPath);
+      expect(wire.filter((entry) => entry.message.method === "tools/call"))
+        .toHaveLength(1);
 
       await tui.kill();
       tui = null;
@@ -3604,6 +3716,50 @@ describe("modern MCP stdio compatibility", () => {
   );
 
   test.skipIf(process.platform === "win32" || !tmuxAvailable())(
+    "MCP reload keeps queued input responsive and cancels a superseded candidate",
+    async () => {
+      const root = createRoot("reload-responsive", MODERN_FIXTURE);
+      const activeGateway = startFakeGateway([], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      gateway = activeGateway;
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 110,
+        height: 32,
+        env: fixtureEnv(root, activeGateway),
+      });
+      await tui.waitForComposer(15_000);
+
+      const profilePath = join(root.home, ".fx", "mcp.json");
+      const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+      profile.mcp.fixture.environment.FX_MCP_MODE = "stall_startup";
+      profile.mcp.fixture.startup_timeout_ms = 60_000;
+      writeFileSync(profilePath, JSON.stringify(profile));
+
+      await tui.sendText("/mcp reload");
+      await tui.waitForText("MCP reconnection started", 2_000);
+      const pathStarted = Date.now();
+      await tui.sendText("/mcp path");
+      await tui.waitForText("mcp.json", 1_000);
+      expect(Date.now() - pathStarted).toBeLessThan(1_000);
+
+      profile.mcp.fixture.environment.FX_MCP_MODE = "normal";
+      writeFileSync(profilePath, JSON.stringify(profile));
+      const supersedeStarted = Date.now();
+      await tui.sendText("/mcp reload");
+      await tui.waitForText("MCP profile reloaded (ready, runtime ", 1_000);
+      expect(Date.now() - supersedeStarted).toBeLessThan(1_000);
+
+      await tui.kill();
+      tui = null;
+      await expectFixtureProcessesExited(readWire(root.wireLogPath));
+    },
+    30_000,
+  );
+
+  test.skipIf(process.platform === "win32" || !tmuxAvailable())(
     "implicit MCP reload rejection preserves command success and warns that the prior runtime remains active",
     async () => {
       const root = createRoot("implicit-reload-warning", MODERN_FIXTURE);
@@ -3633,10 +3789,13 @@ describe("modern MCP stdio compatibility", () => {
       writeFileSync(profilePath, JSON.stringify(profile));
 
       await tui.sendText("/mcp add extra /definitely/missing-optional-mcp-command");
-      const pane = await tui.waitForText("the previous runtime remains active", 10_000);
+      const pane = await tui.waitForText(
+        "MCP reload rejected; the existing runtime was retained",
+        10_000,
+      );
       expect(pane).toContain("Saved MCP server 'extra'.");
-      expect(pane).toContain("Warning: MCP runtime reload was rejected");
-      expect(pane).toContain("run /mcp reload");
+      expect(pane).toContain("MCP reconnection started");
+      expect(pane).toContain("Required MCP server 'fixture' is failed");
       expect(isProcessAlive(originalPid)).toBe(true);
 
       await tui.sendText(prompt);

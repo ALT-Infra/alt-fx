@@ -948,8 +948,7 @@ pub fn Runtime(comptime App: type) type {
                             app_session_runtime.Runtime(App).recordToolTerminal(
                                 app,
                                 lifecycle,
-                                record.tool_name,
-                                record.activity_kind,
+                                record.captured_command,
                             );
                         }
                     },
@@ -2697,7 +2696,7 @@ test "core.app_worker_runtime syncState clears a completed approval" {
     app.worker.processing = true;
     app.worker.pending_permission_request = .{
         .id = 42,
-        .label = "run_command test",
+        .label = "terminal.exec test",
     };
     Runtime(FakeApp).syncState(&app, NoopBridge.lifecyclePresenter(&app));
     try std.testing.expect(app.approval_prompt.isActive());
@@ -2719,7 +2718,7 @@ test "core.app_worker_runtime syncState freezes the thinking clock while an appr
     app.worker.processing = true;
     app.worker.pending_permission_request = .{
         .id = 7,
-        .label = "run_command test",
+        .label = "terminal.exec test",
     };
     Runtime(FakeApp).syncState(&app, NoopBridge.lifecyclePresenter(&app));
     try std.testing.expect(app.approval_prompt.isActive());

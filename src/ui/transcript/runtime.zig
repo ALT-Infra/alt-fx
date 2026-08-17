@@ -26,6 +26,7 @@ const transcript_writer = @import("writer.zig");
 const ui_render = @import("../render.zig");
 const types = @import("../../core/shared/types.zig");
 const command_output_content = @import("../../core/tooling/command_output_content.zig");
+const captured_command = @import("../../core/tooling/captured_command.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 const result_store = @import("../../core/session/result_store.zig");
 const session_child_store = @import("../../core/session/session_child_store.zig");
@@ -2059,10 +2060,11 @@ test "nonzero command remains Ran and shows one neutral exit row" {
     _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
         .id = id,
         .reconciles_provisional_call_id = null,
-        .tool_name = "run_command",
+        .tool_name = "terminal",
         .activity_kind = .command,
-        .arguments_json = "{\"command\":\"false\"}",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"false\"}",
     } });
+    try std.testing.expect(runtime.toolActivityRecord(id).?.captured_command);
     _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
         .id = id,
         .outcome = .{ .kind = .completed, .summary = "Ran false" },
@@ -2074,6 +2076,32 @@ test "nonzero command remains Ran and shows one neutral exit row" {
     try std.testing.expect(std.mem.find(u8, source.bytes, "Ran false") != null);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source.bytes, "│ exit code 7"));
     try std.testing.expect(std.mem.find(u8, source.bytes, "Failed") == null);
+}
+
+test "terminal lifecycle records distinguish captured exec from durable actions" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{};
+    defer runtime.deinit(alloc);
+    const exec_id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "exec" };
+    const start_id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "start" };
+
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = exec_id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "terminal",
+        .activity_kind = .command,
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf exec\"}",
+    } });
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = start_id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "terminal",
+        .activity_kind = .command,
+        .arguments_json = "{\"action\":\"start\",\"command\":\"printf start\"}",
+    } });
+
+    try std.testing.expect(runtime.toolActivityRecord(exec_id).?.captured_command);
+    try std.testing.expect(!runtime.toolActivityRecord(start_id).?.captured_command);
 }
 
 test "nonzero streamed command reuses its active output block" {
@@ -2099,10 +2127,12 @@ test "nonzero streamed command reuses its active output block" {
     _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
         .id = id,
         .reconciles_provisional_call_id = null,
-        .tool_name = "run_command",
+        .tool_name = "terminal",
         .activity_kind = .command,
-        .arguments_json = "{\"command\":\"printf lines; exit 7\"}",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf lines; exit 7\"}",
     } });
+    const started_entry_id = runtime.toolActivityRecord(id).?.entry_id;
+    try std.testing.expect(runtime.toolDetailForEntry(started_entry_id).?.isCapturedCommand());
     var metrics: Metrics = .{};
     try runtime.writeCommandOutputChunkForLifecycle(
         alloc,
@@ -2113,6 +2143,7 @@ test "nonzero streamed command reuses its active output block" {
         "line-1\nline-2\nline-3\nline-4\nline-5\nline-6\n",
         true,
     );
+    try std.testing.expect(runtime.toolDetailForEntry(started_entry_id).?.isCapturedCommand());
     _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
         .id = id,
         .outcome = .{ .kind = .completed, .summary = "Ran printf lines; exit 7" },
@@ -2130,10 +2161,12 @@ test "nonzero streamed command reuses its active output block" {
 
     const block = runtime.command_output_blocks.items[0];
     const status_entry_id = runtime.toolActivityRecord(id).?.entry_id;
+    try std.testing.expect(runtime.toolDetailForEntry(status_entry_id).?.isCapturedCommand());
     try std.testing.expectEqual(
         block.entry_id,
         runtime.toolDetailForEntry(status_entry_id).?.command_output_entry_id,
     );
+    try std.testing.expect(command_output_runtime.processPresentationForBlock(&runtime, block) != null);
     var projection = try command_output_runtime.renderCompactCommandOutputWithProcessPresentation(
         alloc,
         block,
@@ -3691,6 +3724,7 @@ pub const ToolDetailRecord = transcript_blocks.ToolDetailRecord;
 
 const PendingToolDetailStart = struct {
     tool_name: ?[]u8 = null,
+    captured_command: ?bool = null,
     activity_kind: ?types.ToolActivityKind = null,
     arguments_json: ?[]u8 = null,
     lifecycle_id: ?types.ToolLifecycleId = null,
@@ -4683,7 +4717,12 @@ pub const TranscriptRuntime = struct {
             )) return error.MissingLifecycleTranscriptEntry;
             activity_runtime.replaceToolName(alloc, record, owned_name);
             record.activity_kind = activity_kind;
-            self.commitToolDetailStart(alloc, record.entry_id, &detail_start);
+            self.commitLifecycleToolDetailStart(
+                alloc,
+                id,
+                record.entry_id,
+                &detail_start,
+            );
             self.commitToolPresentationGroup(record.entry_id, id, presentation_group_id);
             return null;
         }
@@ -4703,7 +4742,7 @@ pub const TranscriptRuntime = struct {
             activity_kind,
             .provisional,
         );
-        self.commitToolDetailStart(alloc, entry_id, &detail_start);
+        self.commitLifecycleToolDetailStart(alloc, id, entry_id, &detail_start);
         self.commitToolPresentationGroup(entry_id, id, presentation_group_id);
         return null;
     }
@@ -4777,7 +4816,12 @@ pub const TranscriptRuntime = struct {
                     owned_tool_name,
                     activity_kind,
                 );
-                self.commitToolDetailStart(alloc, alias_record.entry_id, &detail_start);
+                self.commitLifecycleToolDetailStart(
+                    alloc,
+                    id,
+                    alias_record.entry_id,
+                    &detail_start,
+                );
                 self.commitToolPresentationGroup(alias_record.entry_id, id, presentation_group_id);
                 return activity_kind;
             }
@@ -4813,7 +4857,12 @@ pub const TranscriptRuntime = struct {
                 owned_tool_name,
                 activity_kind,
             );
-            self.commitToolDetailStart(alloc, record.entry_id, &detail_start);
+            self.commitLifecycleToolDetailStart(
+                alloc,
+                id,
+                record.entry_id,
+                &detail_start,
+            );
             self.commitToolPresentationGroup(record.entry_id, id, presentation_group_id);
             return if (first_authoritative)
                 activity_kind
@@ -4837,7 +4886,7 @@ pub const TranscriptRuntime = struct {
             activity_kind,
             .authoritative,
         );
-        self.commitToolDetailStart(alloc, entry_id, &detail_start);
+        self.commitLifecycleToolDetailStart(alloc, id, entry_id, &detail_start);
         self.commitToolPresentationGroup(entry_id, id, presentation_group_id);
         return activity_kind;
     }
@@ -4930,7 +4979,12 @@ pub const TranscriptRuntime = struct {
         )) return error.MissingLifecycleTranscriptEntry;
         record.phase = .terminal;
         if (detail_start) |*pending| {
-            self.commitToolDetailStart(alloc, record.entry_id, pending);
+            self.commitLifecycleToolDetailStart(
+                alloc,
+                id,
+                record.entry_id,
+                pending,
+            );
         }
         self.commitToolDetailTerminal(
             alloc,
@@ -5333,6 +5387,9 @@ pub const TranscriptRuntime = struct {
         pending.activity_kind = activity_kind;
         if (arguments_json) |value| {
             pending.arguments_json = try alloc.dupe(u8, value);
+            pending.captured_command = try captured_command.isToolCall(alloc, tool_name, value);
+        } else if (std.mem.eql(u8, tool_name, "run_command")) {
+            pending.captured_command = true;
         }
         if (lifecycle_id) |id| {
             if (existing == null or !command_output_runtime.sameLifecycleId(existing.?.lifecycle_id, id)) {
@@ -5359,6 +5416,7 @@ pub const TranscriptRuntime = struct {
             alloc.free(detail.tool_name);
             detail.tool_name = pending.tool_name.?;
             pending.tool_name = null;
+            if (pending.captured_command) |value| detail.captured_command = value;
             if (pending.activity_kind) |kind| detail.activity_kind = kind;
             if (pending.arguments_json) |arguments_json| {
                 if (detail.arguments_json) |old| alloc.free(old);
@@ -5377,6 +5435,7 @@ pub const TranscriptRuntime = struct {
         const detail = ToolDetailRecord{
             .entry_id = entry_id,
             .tool_name = pending.tool_name.?,
+            .captured_command = pending.captured_command orelse false,
             .activity_kind = pending.activity_kind,
             .arguments_json = pending.arguments_json,
             .lifecycle_id = pending.lifecycle_id,
@@ -5390,6 +5449,22 @@ pub const TranscriptRuntime = struct {
         pending.arguments_json = null;
         pending.lifecycle_id = null;
         self.markTranscriptContentDirtyFrom(entry_id);
+    }
+
+    fn commitLifecycleToolDetailStart(
+        self: *TranscriptRuntime,
+        alloc: Allocator,
+        lifecycle_id: types.ToolLifecycleId,
+        entry_id: u32,
+        pending: *PendingToolDetailStart,
+    ) void {
+        const classified = pending.captured_command;
+        self.commitToolDetailStart(alloc, entry_id, pending);
+        if (classified) |captured| {
+            if (self.lifecycle_state.recordPtr(lifecycle_id)) |record| {
+                record.captured_command = captured;
+            }
+        }
     }
 
     fn commitToolPresentationGroup(

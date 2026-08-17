@@ -96,7 +96,7 @@ const LOCAL_FILE_TOOLS = [
 
 const LOCAL_INSPECTION_TOOLS = [
   ...LOCAL_FILE_TOOLS,
-  "run_command",
+  "terminal",
 ] as const;
 
 const WEB_FETCH_TOOL = "web_fetch" as const;
@@ -111,7 +111,7 @@ const DESTRUCTIVE_OR_MUTATING_TOOLS = [
   "delete_file",
   "write_file",
   "edit_file",
-  "run_command",
+  "terminal",
 ] as const;
 
 function askEntrypoint(notes: string): CoveredEntrypoint {
@@ -147,7 +147,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
       category: "local repository inspection",
       tools: LOCAL_INSPECTION_TOOLS,
       commandPattern: "^git\\s+",
-      notes: "A run_command first action is acceptable only when it is a local git inspection.",
+      notes: "A terminal.exec first action is acceptable only when it is a local git inspection.",
     },
     forbiddenTools: [WEB_SEARCH_TOOL, "ask_user_question"],
     expectedUserVisibleBehavior:
@@ -180,7 +180,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     failureCategory: "local search",
     expectedFirstTool: {
       category: "local git command",
-      tools: ["run_command"],
+      tools: ["terminal"],
       commandPattern: "^git\\s+(log|status|branch)\\b",
     },
     forbiddenTools: [WEB_SEARCH_TOOL, "ask_user_question"],
@@ -190,7 +190,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
       type: "tool-call recorder test",
       status: "implemented",
       notes:
-        "The first recorded run_command can be matched against a local git command pattern; A/B runs compare pass-rate deltas rather than deterministic routing.",
+        "The first recorded terminal.exec can be matched against a local git command pattern; A/B runs compare pass-rate deltas rather than deterministic routing.",
     },
     modelBackedEval: {
       required: true,
@@ -261,7 +261,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     currentBaselineResult: {
       status: "passing",
       notes:
-        "Live ./zig-out/bin/fx ask --auto --json --no-save used grep_files first and made five grep_files calls total. Forbidden tools: none; behavior reported concrete local matches in command_policy.zig, tool_permission.zig, and run_command.zig.",
+        "Live ./zig-out/bin/fx ask --auto --json --no-save used grep_files first and made five grep_files calls total. Forbidden tools: none; behavior reported concrete local matches in command_policy.zig, tool_permission.zig, and terminal.zig.",
     },
     targetResult: "Uses local search tools only and reports concrete local matches.",
     coveredEntrypoints: [
@@ -380,7 +380,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     failureCategory: "GitHub routing",
     expectedFirstTool: {
       category: "GitHub CLI metadata read",
-      tools: ["run_command"],
+      tools: ["terminal"],
       commandPattern: "^gh\\s+",
     },
     forbiddenTools: [WEB_SEARCH_TOOL, "ask_user_question"],
@@ -486,7 +486,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     failureCategory: "GitHub routing",
     expectedFirstTool: {
       category: "GitHub CLI metadata read",
-      tools: ["run_command"],
+      tools: ["terminal"],
       commandPattern: "^gh\\s+",
     },
     forbiddenTools: [WEB_SEARCH_TOOL, "ask_user_question"],
@@ -505,7 +505,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     currentBaselineResult: {
       status: "passing",
       notes:
-        "Live ./zig-out/bin/fx ask --auto --json --no-save used run_command first with gh pr view 57 --repo vercel-labs/fx --comments. Forbidden tools: none; behavior summarized PR review comments and bot deploy comments from gh output.",
+        "Live ./zig-out/bin/fx ask --auto --json --no-save used terminal.exec first with gh pr view 57 --repo vercel-labs/fx --comments. Forbidden tools: none; behavior summarized PR review comments and bot deploy comments from gh output.",
     },
     targetResult: "Routes known GitHub PR comments to gh and reports an actionable blocker if gh cannot run.",
     coveredEntrypoints: [
@@ -656,7 +656,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
       tools: [],
       notes: "Should answer from the latest tool result when present.",
     },
-    forbiddenTools: ["run_command", "ask_user_question"],
+    forbiddenTools: ["terminal", "ask_user_question"],
     expectedUserVisibleBehavior:
       "Explains the latest tool failure from recorded evidence and avoids setup commands unless the evidence is missing.",
     deterministicCoverage: {
@@ -718,7 +718,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     failureCategory: "approval loop",
     expectedFirstTool: {
       category: "approval-required command attempt",
-      tools: ["run_command"],
+      tools: ["terminal"],
     },
     forbiddenTools: ["ask_user_question"],
     expectedUserVisibleBehavior:
@@ -780,7 +780,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     failureCategory: "approval loop",
     expectedFirstTool: {
       category: "focused deterministic Bun test",
-      tools: ["run_command"],
+      tools: ["terminal"],
       commandPattern:
         "^(bun\\s+test\\s+tests/evals/agent-quality-matrix\\.test\\.ts|cd\\s+tests/evals\\s+&&\\s+bun\\s+test\\s+agent-quality-matrix\\.test\\.ts|bun\\s+test\\s+agent-quality-matrix\\.test\\.ts)$",
       notes:
@@ -818,7 +818,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     failureCategory: "approval loop",
     expectedFirstTool: {
       category: "changed-file metadata inspection",
-      tools: ["run_command"],
+      tools: ["terminal"],
       commandPattern: "^git\\s+(status\\s+--short|diff\\s+--name-only|diff\\s+--name-status)\\b",
       notes:
         "Start from changed-file metadata only; avoid full diff dumps before choosing focused checks.",
@@ -922,7 +922,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     failureCategory: "large output",
     expectedFirstTool: {
       category: "command with retained evidence",
-      tools: ["run_command"],
+      tools: ["terminal"],
     },
     forbiddenTools: ["ask_user_question"],
     expectedUserVisibleBehavior:
@@ -1105,7 +1105,7 @@ export function firstToolMatchesExpectation(
   }
   if (!toolCall) return false;
   if (!row.expectedFirstTool.tools.includes(toolCall.name)) return false;
-  if (toolCall.name === "run_command" && row.expectedFirstTool.commandPattern) {
+  if (toolCall.name === "terminal" && row.expectedFirstTool.commandPattern) {
     return new RegExp(row.expectedFirstTool.commandPattern).test(
       toolCall.command_result?.command ?? "",
     );

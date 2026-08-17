@@ -76,7 +76,8 @@ describe("yolo permission mode", () => {
       );
 
       const fake = startFakeGateway([
-        fakeGatewayToolCall("yolo_command", "run_command", {
+        fakeGatewayToolCall("yolo_command", "terminal", {
+          action: "exec",
           command: `printf 'YOLO_COMMAND_OK\\n' > ${JSON.stringify(markerPath)}`,
         }),
         fakeGatewayFinalText("YOLO_HEADLESS_DONE"),
@@ -113,7 +114,7 @@ describe("yolo permission mode", () => {
       expect(output.output).toContain("YOLO_HEADLESS_DONE");
       expect(
         output.tool_calls.some(
-          (call) => call.name === "run_command" && call.status === "success",
+          (call) => call.name === "terminal" && call.status === "success",
         ),
       ).toBe(true);
       expect(readFileSync(markerPath, "utf8")).toBe("YOLO_COMMAND_OK\n");

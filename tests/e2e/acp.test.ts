@@ -143,8 +143,8 @@ function lengthLimitedCommandCall(command: string) {
     {
       type: "tool-call",
       toolCallId: "command_1",
-      toolName: "run_command",
-      input: { command },
+      toolName: "terminal",
+      input: { action: "exec", command },
     },
     {
       type: "finish",
@@ -1183,7 +1183,7 @@ describe("acp: model-independent", () => {
           .map((message) => acpContentText(message.content))
           .join("\n");
         expect(prompt).toContain(submitted);
-        expect(request.tools).toHaveLength(27);
+        expect(request.tools).toHaveLength(26);
         const toolNames = serializedToolNames(oracleRequest);
         expect(toolNames).toEqual(
           AUTO_PERPLEXITY_SERIALIZED_TOOL_NAMES,
@@ -1193,7 +1193,7 @@ describe("acp: model-independent", () => {
           .toHaveLength(1);
         expect(findUnavailableCapabilityReferences(oracleRequest)).toEqual([]);
         expect(customProviderGuidanceState(oracleRequest)).toEqual({
-          providerToolIndices: [24],
+          providerToolIndices: [23],
           guidanceMessageIndices: [1],
         });
         expect(gateway.requests[0]!.body).not.toContain(
@@ -5867,7 +5867,8 @@ describe("acp: model-independent", () => {
         JSON.stringify({ permission: { bash: { "printf *": "ask" } } }),
       );
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("approved_command_1", "run_command", {
+        fakeGatewayToolCall("approved_command_1", "terminal", {
+          action: "exec",
           command: `printf approved > '${marker}'`,
         }),
         finalText("command approval complete"),
@@ -6593,7 +6594,8 @@ describe("acp: model-independent", () => {
       const heldReview = deferred<Response>();
       const gateway = startFakeGateway(
         [
-          fakeGatewayToolCall("cancelled_review_command", "run_command", {
+          fakeGatewayToolCall("cancelled_review_command", "terminal", {
+            action: "exec",
             command: `printf cancelled > ${JSON.stringify(marker)}`,
           }),
           finalText("follow-up after ACP review cancellation"),

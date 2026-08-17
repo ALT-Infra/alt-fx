@@ -9,6 +9,7 @@ const debug_trace = @import("../../shared/debug_trace.zig");
 const file_mutation_contract = @import("../../tooling/file_mutation_contract.zig");
 const tooling_tool_admission = @import("../../tooling/tool_admission.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
+const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
 const test_builtin_tools = if (builtin.is_test)
     @import("../../../builtins/tools.zig")
 else
@@ -26,6 +27,124 @@ const ToolPermissionDecision = types.ToolPermissionDecision;
 const TraceContext = debug_trace.TraceContext;
 const AgentRuntimeDeps = runtime_deps.AgentRuntimeDeps;
 const ToolExecutionResult = runtime_tool_contracts.ToolExecutionResult;
+
+const TerminalValidationDigest = [std.crypto.hash.sha2.Sha256.digest_length]u8;
+
+const TerminalValidationDigestDecision = struct {
+    append_current: bool,
+    repeated: bool,
+};
+
+fn containsTerminalValidationDigest(
+    digests: []const TerminalValidationDigest,
+    wanted: TerminalValidationDigest,
+) bool {
+    for (digests) |digest| {
+        if (std.mem.eql(u8, digest[0..], wanted[0..])) return true;
+    }
+    return false;
+}
+
+fn terminalValidationDigestDecision(
+    previous: []const TerminalValidationDigest,
+    current: []const TerminalValidationDigest,
+    digest: TerminalValidationDigest,
+) TerminalValidationDigestDecision {
+    return .{
+        .append_current = !containsTerminalValidationDigest(current, digest),
+        .repeated = containsTerminalValidationDigest(previous, digest),
+    };
+}
+
+pub const TerminalValidationRetryState = struct {
+    previous: std.ArrayList(TerminalValidationDigest) = .empty,
+    current: std.ArrayList(TerminalValidationDigest) = .empty,
+    stop_after_batch: bool = false,
+
+    pub fn deinit(self: *TerminalValidationRetryState, alloc: Allocator) void {
+        self.previous.deinit(alloc);
+        self.current.deinit(alloc);
+        self.* = .{};
+    }
+
+    pub fn beginBatch(self: *TerminalValidationRetryState) void {
+        self.current.clearRetainingCapacity();
+        self.stop_after_batch = false;
+    }
+
+    pub fn observe(
+        self: *TerminalValidationRetryState,
+        alloc: Allocator,
+        call: ToolCall,
+        model_output: []const u8,
+    ) Allocator.Error!void {
+        if (!std.mem.eql(u8, call.name, "terminal")) return;
+        if (try tool_result_errors.inspectTerminalActionFieldCorrection(
+            alloc,
+            model_output,
+        ) == null) return;
+
+        var digest: TerminalValidationDigest = undefined;
+        std.crypto.hash.sha2.Sha256.hash(model_output, &digest, .{});
+        const decision = terminalValidationDigestDecision(
+            self.previous.items,
+            self.current.items,
+            digest,
+        );
+        if (decision.append_current) try self.current.append(alloc, digest);
+        self.stop_after_batch = self.stop_after_batch or decision.repeated;
+    }
+
+    pub fn finishBatch(self: *TerminalValidationRetryState) bool {
+        if (self.stop_after_batch) return true;
+        const previous = self.previous;
+        self.previous = self.current;
+        self.current = previous;
+        self.current.clearRetainingCapacity();
+        return false;
+    }
+};
+
+test "terminal validation retry state retains independent batch corrections" {
+    const alloc = std.testing.allocator;
+    const correction_s = try tool_result_errors.terminalActionFieldCorrectionJson(alloc, .{
+        .action = "start",
+        .invalid_fields = &.{"session_id"},
+        .missing_fields = &.{},
+        .allowed_fields = &.{ "action", "command" },
+        .conflicts = &.{},
+    });
+    defer alloc.free(correction_s);
+    const correction_t = try tool_result_errors.terminalActionFieldCorrectionJson(alloc, .{
+        .action = "read",
+        .invalid_fields = &.{"command"},
+        .missing_fields = &.{},
+        .allowed_fields = &.{ "action", "session_id", "cursor_segment" },
+        .conflicts = &.{},
+    });
+    defer alloc.free(correction_t);
+    const call: ToolCall = .{
+        .id = "terminal-call",
+        .name = "terminal",
+        .arguments_json = "{}",
+    };
+
+    var state: TerminalValidationRetryState = .{};
+    defer state.deinit(alloc);
+    state.beginBatch();
+    try state.observe(alloc, call, correction_s);
+    try state.observe(alloc, call, correction_t);
+    try state.observe(alloc, call, correction_s);
+    try std.testing.expectEqual(@as(usize, 2), state.current.items.len);
+    try std.testing.expect(!state.finishBatch());
+
+    state.beginBatch();
+    try state.observe(alloc, call, correction_t);
+    try state.observe(alloc, call, "ordinary valid result");
+    try state.observe(alloc, call, correction_s);
+    try std.testing.expectEqual(@as(usize, 2), state.current.items.len);
+    try std.testing.expect(state.finishBatch());
+}
 
 /// Human denials retained only for the current agent turn. Entries use the
 /// canonical external file action rather than the provider's tool-call ID.
@@ -73,14 +192,50 @@ pub fn deferVisibleLifecycleUntilAfterPermission(tool_name: []const u8) bool {
         file_mutation_contract.isToolName(tool_name);
 }
 
-pub fn deferRunCommandLifecycleForAutoPermissionNotice(
-    tool_name: []const u8,
+pub fn deferCapturedCommandLifecycleForAutoPermissionNotice(
+    registry: tool_dispatch.Registry,
+    arena: Allocator,
+    call: ToolCall,
     permission_mode: PermissionMode,
     interactive_presentation: bool,
-) bool {
+) !bool {
     return interactive_presentation and
         permission_mode == .auto and
-        std.mem.eql(u8, tool_name, "run_command");
+        try tooling_tool_admission.callUsesCommandAuthority(
+            registry,
+            arena,
+            call,
+        );
+}
+
+test "auto permission lifecycle deferral applies only to terminal exec" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const exec = ToolCall{
+        .id = "exec",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"pwd\"}",
+    };
+    const start = ToolCall{
+        .id = "start",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"start\"}",
+    };
+    try std.testing.expect(try deferCapturedCommandLifecycleForAutoPermissionNotice(
+        test_builtin_tools.registry,
+        arena,
+        exec,
+        .auto,
+        true,
+    ));
+    try std.testing.expect(!try deferCapturedCommandLifecycleForAutoPermissionNotice(
+        test_builtin_tools.registry,
+        arena,
+        start,
+        .auto,
+        true,
+    ));
 }
 
 pub fn requestToolPermissionTraced(
@@ -289,6 +444,274 @@ pub fn retainSessionGrant(hooks: *const AgentRuntimeDeps, arena: Allocator, loca
     try propagateGrant(hooks, grant);
 }
 
+pub fn repeatedDynamicMcpFailure(
+    arena: Allocator,
+    current_turn_messages: []const types.ChatMessage,
+    call: ToolCall,
+    advertised_dynamic_tool_names: []const []const u8,
+) !?ToolExecutionResult {
+    if (!containsName(advertised_dynamic_tool_names, call.name)) return null;
+    if (!try hasTwoEquivalentDynamicMcpFailures(
+        arena,
+        current_turn_messages,
+        call,
+    )) return null;
+    return .{
+        .status = .failure,
+        .model_output = try arena.dupe(
+            u8,
+            "Repeated MCP tool call blocked: two equivalent attempts failed. Change the top-level argument structure, reselect the tool, ask the user, or stop.",
+        ),
+    };
+}
+
+fn hasTwoEquivalentDynamicMcpFailures(
+    arena: Allocator,
+    messages: []const types.ChatMessage,
+    current_call: ToolCall,
+) !bool {
+    var matching_failures: usize = 0;
+    var batch_end = messages.len;
+    while (batch_end > 0) {
+        var assistant_index = batch_end;
+        var found_assistant = false;
+        while (assistant_index > 0) {
+            assistant_index -= 1;
+            if (messages[assistant_index].role == .assistant) {
+                found_assistant = true;
+                break;
+            }
+        }
+        if (!found_assistant) return false;
+
+        const calls = messages[assistant_index].tool_calls;
+        const results = messages[assistant_index + 1 .. batch_end];
+        var completed_calls: usize = 0;
+        var matching_in_batch: usize = 0;
+        var target_completed = false;
+        for (calls) |prior_call| {
+            const status = completedResultStatus(results, prior_call) orelse continue;
+            completed_calls += 1;
+            if (std.mem.eql(u8, prior_call.name, "mcp_select_tool") and
+                status == .success)
+            {
+                return false;
+            }
+            if (!std.mem.eql(u8, prior_call.name, current_call.name)) continue;
+            target_completed = true;
+            if (status != .failure or
+                !try sameTopLevelArgumentShape(
+                    arena,
+                    prior_call.arguments_json,
+                    current_call.arguments_json,
+                ))
+            {
+                return false;
+            }
+            matching_in_batch += 1;
+        }
+        if (target_completed) {
+            matching_failures += matching_in_batch;
+            if (matching_failures >= 2) return true;
+        } else if (completed_calls > 0) {
+            return false;
+        }
+        batch_end = assistant_index;
+    }
+    return false;
+}
+
+fn completedResultStatus(
+    messages: []const types.ChatMessage,
+    call: ToolCall,
+) ?types.PersistedToolStatus {
+    var matched: ?types.PersistedToolStatus = null;
+    for (messages) |message| {
+        if (message.role != .tool) continue;
+        const call_id = message.tool_call_id orelse continue;
+        if (!std.mem.eql(u8, call_id, call.id)) continue;
+        if (matched != null or
+            message.tool_name == null or
+            !std.mem.eql(u8, message.tool_name.?, call.name) or
+            message.tool_result_status == null)
+        {
+            return null;
+        }
+        matched = message.tool_result_status.?;
+    }
+    return matched;
+}
+
+fn sameTopLevelArgumentShape(
+    alloc: Allocator,
+    left_json: []const u8,
+    right_json: []const u8,
+) Allocator.Error!bool {
+    var left = try parseArgumentValue(alloc, left_json);
+    defer if (left) |*parsed| parsed.deinit();
+    var right = try parseArgumentValue(alloc, right_json);
+    defer if (right) |*parsed| parsed.deinit();
+    if (left == null or right == null) return left == null and right == null;
+
+    const left_value = left.?.value;
+    const right_value = right.?.value;
+    if (std.meta.activeTag(left_value) != std.meta.activeTag(right_value)) return false;
+    if (left_value != .object) return true;
+    if (left_value.object.count() != right_value.object.count()) return false;
+    var fields = left_value.object.iterator();
+    while (fields.next()) |field| {
+        const right_field = right_value.object.get(field.key_ptr.*) orelse return false;
+        if (std.meta.activeTag(field.value_ptr.*) != std.meta.activeTag(right_field)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn parseArgumentValue(
+    alloc: Allocator,
+    bytes: []const u8,
+) Allocator.Error!?std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, alloc, bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => null,
+    };
+}
+
+fn containsName(values: []const []const u8, needle: []const u8) bool {
+    for (values) |value| {
+        if (std.mem.eql(u8, value, needle)) return true;
+    }
+    return false;
+}
+
+test "third equivalent dynamic MCP failure is blocked from existing turn history" {
+    const first_calls = [_]ToolCall{.{
+        .id = "call-1",
+        .name = "mcp_plain_getThreads",
+        .arguments_json = "{\"customerId\":\"\",\"labels\":[]}",
+    }};
+    const second_calls = [_]ToolCall{.{
+        .id = "call-2",
+        .name = "mcp_plain_getThreads",
+        .arguments_json = "{\"customerId\":\"placeholder\",\"labels\":[\"fake\"]}",
+    }};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .assistant, .tool_calls = &first_calls },
+        .{ .role = .tool, .tool_call_id = "call-1", .tool_name = "mcp_plain_getThreads", .tool_result_status = .failure },
+        .{ .role = .assistant, .tool_calls = &second_calls },
+        .{ .role = .tool, .tool_call_id = "call-2", .tool_name = "mcp_plain_getThreads", .tool_result_status = .failure },
+    };
+    const advertised = [_][]const u8{"mcp_plain_getThreads"};
+    const current = ToolCall{
+        .id = "call-3",
+        .name = "mcp_plain_getThreads",
+        .arguments_json = "{\"labels\":[\"another\"],\"customerId\":\"invented\"}",
+    };
+
+    const blocked = (try repeatedDynamicMcpFailure(
+        std.testing.allocator,
+        &messages,
+        current,
+        &advertised,
+    )) orelse return error.TestExpectedEqual;
+    defer std.testing.allocator.free(blocked.model_output);
+    try std.testing.expectEqual(runtime_tool_contracts.ToolExecutionStatus.failure, blocked.status);
+    try std.testing.expect(std.mem.find(u8, blocked.model_output, "two equivalent attempts") != null);
+}
+
+test "dynamic MCP retry containment resets on success shape tool and reselection" {
+    const failures = [_]ToolCall{
+        .{ .id = "failure-1", .name = "mcp_plain_getThreads", .arguments_json = "{\"id\":\"one\"}" },
+        .{ .id = "failure-2", .name = "mcp_plain_getThreads", .arguments_json = "{\"id\":\"two\"}" },
+    };
+    const other = [_]ToolCall{.{ .id = "other", .name = "read_file", .arguments_json = "{}" }};
+    const reselect = [_]ToolCall{.{ .id = "select", .name = "mcp_select_tool", .arguments_json = "{\"name\":\"mcp_plain_getThreads\"}" }};
+    const current = ToolCall{ .id = "current", .name = "mcp_plain_getThreads", .arguments_json = "{\"id\":\"three\"}" };
+    const advertised = [_][]const u8{"mcp_plain_getThreads"};
+
+    const success_messages = [_]types.ChatMessage{
+        .{ .role = .assistant, .tool_calls = failures[0..1] },
+        .{ .role = .tool, .tool_call_id = "failure-1", .tool_name = current.name, .tool_result_status = .failure },
+        .{ .role = .assistant, .tool_calls = failures[1..2] },
+        .{ .role = .tool, .tool_call_id = "failure-2", .tool_name = current.name, .tool_result_status = .success },
+    };
+    try std.testing.expect((try repeatedDynamicMcpFailure(
+        std.testing.allocator,
+        &success_messages,
+        current,
+        &advertised,
+    )) == null);
+
+    const other_messages = [_]types.ChatMessage{
+        .{ .role = .assistant, .tool_calls = &failures },
+        .{ .role = .tool, .tool_call_id = "failure-1", .tool_name = current.name, .tool_result_status = .failure },
+        .{ .role = .tool, .tool_call_id = "failure-2", .tool_name = current.name, .tool_result_status = .failure },
+        .{ .role = .assistant, .tool_calls = &other },
+        .{ .role = .tool, .tool_call_id = "other", .tool_name = "read_file", .tool_result_status = .failure },
+    };
+    try std.testing.expect((try repeatedDynamicMcpFailure(
+        std.testing.allocator,
+        &other_messages,
+        current,
+        &advertised,
+    )) == null);
+
+    const reselected_messages = [_]types.ChatMessage{
+        .{ .role = .assistant, .tool_calls = &failures },
+        .{ .role = .tool, .tool_call_id = "failure-1", .tool_name = current.name, .tool_result_status = .failure },
+        .{ .role = .tool, .tool_call_id = "failure-2", .tool_name = current.name, .tool_result_status = .failure },
+        .{ .role = .assistant, .tool_calls = &reselect },
+        .{ .role = .tool, .tool_call_id = "select", .tool_name = "mcp_select_tool", .tool_result_status = .success },
+    };
+    try std.testing.expect((try repeatedDynamicMcpFailure(
+        std.testing.allocator,
+        &reselected_messages,
+        current,
+        &advertised,
+    )) == null);
+
+    const changed_shape = ToolCall{ .id = "changed", .name = current.name, .arguments_json = "{\"id\":3}" };
+    try std.testing.expect((try repeatedDynamicMcpFailure(
+        std.testing.allocator,
+        other_messages[0..3],
+        changed_shape,
+        &advertised,
+    )) == null);
+}
+
+test "parallel unrelated results do not reset matching dynamic MCP failures" {
+    const first_batch = [_]ToolCall{
+        .{ .id = "target-1", .name = "mcp_plain_getThreads", .arguments_json = "not-json" },
+        .{ .id = "other-1", .name = "read_file", .arguments_json = "{}" },
+    };
+    const second_batch = [_]ToolCall{.{
+        .id = "target-2",
+        .name = "mcp_plain_getThreads",
+        .arguments_json = "also-not-json",
+    }};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .assistant, .tool_calls = &first_batch },
+        .{ .role = .tool, .tool_call_id = "other-1", .tool_name = "read_file", .tool_result_status = .success },
+        .{ .role = .tool, .tool_call_id = "target-1", .tool_name = "mcp_plain_getThreads", .tool_result_status = .failure },
+        .{ .role = .assistant, .tool_calls = &second_batch },
+        .{ .role = .tool, .tool_call_id = "target-2", .tool_name = "mcp_plain_getThreads", .tool_result_status = .failure },
+    };
+    const advertised = [_][]const u8{"mcp_plain_getThreads"};
+    const current = ToolCall{
+        .id = "target-3",
+        .name = "mcp_plain_getThreads",
+        .arguments_json = "still-not-json",
+    };
+    const blocked = (try repeatedDynamicMcpFailure(
+        std.testing.allocator,
+        &messages,
+        current,
+        &advertised,
+    )) orelse return error.TestExpectedEqual;
+    defer std.testing.allocator.free(blocked.model_output);
+}
+
 fn appendLocalGrant(arena: Allocator, grants: *std.ArrayList(PermissionGrant), grant: PermissionGrant) !void {
     if (permissions.sessionGrantAllowed(grants.items, grant.tool_name, grant.target_path)) return;
     try grants.append(arena, grant);
@@ -299,11 +722,28 @@ pub fn applyInitialSessionGrants(
     arena: Allocator,
     local_grants: *std.ArrayList(PermissionGrant),
     workspace_root: []const u8,
-    tool_name: []const u8,
+    call: ToolCall,
     target_path: []const u8,
 ) !void {
-    const target_kind = if (hooks.tool_registry.lookup(tool_name)) |tool| tool.permission_target_kind else .none;
-    const grants = try permissions.suggestedSessionGrants(arena, workspace_root, tool_name, target_path, target_kind);
+    const command_call = try tooling_tool_admission.callUsesCommandAuthority(
+        hooks.tool_registry,
+        arena,
+        call,
+    );
+    const permission_name = if (command_call) "run_command" else call.name;
+    const target_kind = if (command_call)
+        tool_dispatch.PermissionTargetKind.command_cwd
+    else if (hooks.tool_registry.lookup(call.name)) |tool|
+        tool.permission_target_kind
+    else
+        .none;
+    const grants = try permissions.suggestedSessionGrants(
+        arena,
+        workspace_root,
+        permission_name,
+        target_path,
+        target_kind,
+    );
     for (grants) |grant| {
         // A broader sandbox retry is a separate scope and must receive its own
         // decision. Only that widening decision may retain a sandbox grant.

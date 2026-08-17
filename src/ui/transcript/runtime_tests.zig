@@ -15769,3 +15769,122 @@ test "finality candidates keep tool turn and replaceable tail offsets independen
     try std.testing.expect(source.replaceable_start > group_floor.start_byte);
     try std.testing.expect(source.replaceable_start < source.bytes.len);
 }
+
+fn applyCompletedReadForFinalityTest(
+    runtime: *TranscriptRuntime,
+    alloc: Allocator,
+    turn_id: u64,
+    call_id: []const u8,
+    presentation_group_id: ?types.ToolPresentationGroupId,
+) !void {
+    const id = types.ToolLifecycleId{ .turn_id = turn_id, .call_id = call_id };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .presentation_group_id = presentation_group_id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "read_file",
+        .activity_kind = .read,
+    } });
+    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = id,
+        .outcome = .{ .kind = .completed, .summary = "Read finality fixture" },
+    } });
+}
+
+test "finality candidates anchor a fully grouped turn at its newest rendered group" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(80, 14, 10),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    runtime.maxxing_mode = .minimal;
+
+    const group_a = types.ToolPresentationGroupId{ .turn_id = 9, .anchor_step_id = 1 };
+    for ([_][]const u8{ "group-a-1", "group-a-2", "group-a-3" }) |call_id| {
+        try applyCompletedReadForFinalityTest(&runtime, alloc, 9, call_id, group_a);
+    }
+    _ = try runtime.appendRawTranscriptEntry(alloc, "SECOND_GROUP_INTRO\n");
+    const group_b = types.ToolPresentationGroupId{ .turn_id = 9, .anchor_step_id = 2 };
+    try applyCompletedReadForFinalityTest(&runtime, alloc, 9, "group-b-1", group_b);
+
+    var source = try runtime.prepareTranscriptSource(alloc, null);
+    defer source.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), source.finality.tool_turn_floors.len);
+    try std.testing.expect(source.finality.mutation_pin_start == null);
+
+    const group_a_header = try std.fmt.allocPrint(
+        alloc,
+        "{s}●\x1b[0m {s}3 tool calls · 3 read\x1b[0m",
+        .{ user_message_card.minimalMarkerStyle(), ui_render.statusline_style },
+    );
+    defer alloc.free(group_a_header);
+    const group_b_header = try std.fmt.allocPrint(
+        alloc,
+        "{s}●\x1b[0m {s}1 tool call · 1 read\x1b[0m",
+        .{ user_message_card.minimalMarkerStyle(), ui_render.statusline_style },
+    );
+    defer alloc.free(group_b_header);
+    const group_a_start = std.mem.find(u8, source.bytes, group_a_header) orelse
+        return error.TestExpectedGroupAHeader;
+    const group_b_start = std.mem.find(u8, source.bytes, group_b_header) orelse
+        return error.TestExpectedGroupBHeader;
+    try std.testing.expect(group_a_start < group_b_start);
+
+    const floor = source.finality.tool_turn_floors[0];
+    try std.testing.expectEqual(@as(u64, 9), floor.turn_id);
+    try std.testing.expectEqual(group_b_start, floor.start_byte);
+}
+
+test "finality candidates keep a mixed legacy turn at its earliest rendered tool row" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(80, 14, 10),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    runtime.maxxing_mode = .minimal;
+
+    const group_a = types.ToolPresentationGroupId{ .turn_id = 10, .anchor_step_id = 1 };
+    try applyCompletedReadForFinalityTest(&runtime, alloc, 10, "mixed-group-a", group_a);
+    try applyCompletedReadForFinalityTest(&runtime, alloc, 10, "mixed-legacy", null);
+    _ = try runtime.appendRawTranscriptEntry(alloc, "LATEST_GROUP_INTRO\n");
+    const group_b = types.ToolPresentationGroupId{ .turn_id = 10, .anchor_step_id = 2 };
+    try applyCompletedReadForFinalityTest(&runtime, alloc, 10, "mixed-group-b", group_b);
+
+    var source = try runtime.prepareTranscriptSource(alloc, null);
+    defer source.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), source.finality.tool_turn_floors.len);
+    try std.testing.expect(source.finality.mutation_pin_start == null);
+
+    const group_a_header = try std.fmt.allocPrint(
+        alloc,
+        "{s}●\x1b[0m {s}1 tool call · 1 read\x1b[0m",
+        .{ user_message_card.minimalMarkerStyle(), ui_render.statusline_style },
+    );
+    defer alloc.free(group_a_header);
+    const earliest_tool_start = std.mem.find(u8, source.bytes, group_a_header) orelse
+        return error.TestExpectedGroupAHeader;
+    const floor = source.finality.tool_turn_floors[0];
+    try std.testing.expectEqual(@as(u64, 10), floor.turn_id);
+    try std.testing.expectEqual(earliest_tool_start, floor.start_byte);
+}
+
+test "finality candidates retain the global pin for an unidentified tool row" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(60, 12, 8),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+
+    _ = try transcript_store.appendPinnedToolStatusAtomic(
+        &runtime,
+        alloc,
+        "● Running unidentified tool\n",
+    );
+    var source = try runtime.prepareTranscriptSource(alloc, null);
+    defer source.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), source.finality.tool_turn_floors.len);
+    try std.testing.expect(source.finality.mutation_pin_start != null);
+}

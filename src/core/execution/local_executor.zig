@@ -61,11 +61,12 @@ pub fn executePreparedCommand(
         },
         .approved_shell => |shell| .{
             .route = .approved_shell,
-            .result = try sandbox.executeCommand(
+            .result = try sandbox.executeCommandInEnvironment(
                 cfg,
                 alloc,
                 shell.command_ctx.command,
                 shell.command_ctx.resolved_cwd,
+                shell.command_ctx.environment,
             ),
         },
     };

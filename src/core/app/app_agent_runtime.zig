@@ -243,10 +243,6 @@ pub fn Runtime(comptime App: type) type {
                     &app.terminal_client
                 else
                     null,
-                .background_launch_policy = if (child_capability != null)
-                    .durable_long_lived
-                else
-                    .process_local_long_lived,
                 .session = &app.session,
                 .session_allocator = app.alloc,
                 .skills_dir = app.skills.dir,
@@ -1108,9 +1104,16 @@ fn formatToolAction(
     };
     if (try tool_presentation.formatRunCommandActivity(arena, ctx.tool_registry, ctx.workspace_root, call)) |activity| {
         defer arena.free(activity.detail);
+        const label = if (activity.compatibility_tool) |compatibility_tool|
+            specLabel(compatibility_tool, state, denied_label)
+        else switch (state) {
+            .active => "Running",
+            .completed => "Ran",
+            .denied => denied_label.?,
+        };
         return formatToolActionValue(
             arena,
-            specLabel(activity.compatibility_tool orelse spec, state, denied_label),
+            label,
             activity.detail,
         );
     }
@@ -1196,7 +1199,7 @@ const test_ignored_list_entries = [_][]const u8{ ".git", "zig-out" };
 const test_gateway_chat_url = "https://gateway.test/chat";
 const test_tools = [_]tool_dispatch.Tool{
     test_builtin_tools.web_search,
-    test_builtin_tools.run_command,
+    test_builtin_tools.terminal,
     test_builtin_tools.memory,
     test_builtin_tools.semantic_search,
     test_builtin_tools.skill,
@@ -1918,8 +1921,8 @@ test "app agent runtime formats active completed denied and MCP tool actions" {
 
     const run_call: ToolCall = .{
         .id = "1",
-        .name = "run_command",
-        .arguments_json = "{\"command\":\"zig build\"}",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"zig build\"}",
     };
 
     const active = try app.describeToolAction(arena, run_call);
@@ -1974,7 +1977,7 @@ test "app agent runtime formats active completed denied and MCP tool actions" {
     try std.testing.expectEqual(@as(usize, 1), app.mcp_has_tool_calls);
 
     app.mcp_has_tool_calls = 0;
-    const builtin_advertised = [_][]const u8{"run_command"};
+    const builtin_advertised = [_][]const u8{"terminal"};
     _ = try Runtime(FakeApp).describeToolActionCompleted(&app, arena, run_call, null, &builtin_advertised, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
     try std.testing.expectEqual(@as(usize, 0), app.mcp_has_tool_calls);
 }
@@ -2012,10 +2015,10 @@ test "app agent runtime bounds a large multiline run command activity" {
     var app = try FakeApp.init(alloc);
     defer app.deinit();
 
-    const arguments_json = "{\"command\":\"" ++ ("x\\n" ** 20_000) ++ "\"}";
+    const arguments_json = "{\"action\":\"exec\",\"command\":\"" ++ ("x\\n" ** 20_000) ++ "\"}";
     const label = try app.describeToolAction(arena, .{
         .id = "large_command",
-        .name = "run_command",
+        .name = "terminal",
         .arguments_json = arguments_json,
     });
 

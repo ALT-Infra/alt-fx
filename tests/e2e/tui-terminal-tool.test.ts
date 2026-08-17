@@ -16,8 +16,10 @@ import { userInfo } from "node:os";
 import { join } from "node:path";
 import { FX_BIN } from "../evals/eval-helpers";
 import {
+  classifierEvidenceFromRequest,
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
+  fakeGatewaySse,
   fakeGatewayToolCall,
   startFakeGateway,
   terminalFixtureShell,
@@ -66,6 +68,27 @@ function processExists(pid: number): boolean {
   } catch {
     return false;
   }
+}
+
+function processGroupId(pid: number): number {
+  const value = Number(
+    execFileSync("ps", ["-p", String(pid), "-o", "pgid="], {
+      encoding: "utf8",
+    }).trim(),
+  );
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`missing process group for ${pid}`);
+  }
+  return value;
+}
+
+async function waitForSignalMarker(path: string): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    if (existsSync(path) && readFileSync(path, "utf8") === "term") return;
+    await Bun.sleep(25);
+  }
+  throw new Error(`terminal signal marker did not appear at ${path}`);
 }
 
 function directChildPids(pid: number): number[] {
@@ -448,6 +471,23 @@ function toolResultText(body: string, callId: string): string {
   return result ? contentText(result.output) : `<missing ${callId}>`;
 }
 
+function fakeTerminalToolBatch(
+  calls: Array<{ id: string; input: Record<string, unknown> }>,
+) {
+  return fakeGatewaySse([
+    ...calls.map((call) => ({
+      type: "tool-call",
+      toolCallId: call.id,
+      toolName: "terminal",
+      input: call.input,
+    })),
+    {
+      type: "finish",
+      finishReason: { unified: "tool-calls", raw: "tool-calls" },
+    },
+  ]);
+}
+
 async function waitForTrace(path: string, needle: string): Promise<string> {
   const deadline = Date.now() + TIMEOUT;
   while (Date.now() < deadline) {
@@ -503,10 +543,12 @@ test.skipIf(!tmuxAvailable())(
     let pane = await active.waitForPane(
       (current) =>
         current.includes("Ctrl-] d detach") &&
-        current.includes("TAKEOVER_TOP"),
+        current.includes("TAKEOVER_TOP") &&
+        current.includes("TAKEOVER_BOTTOM"),
       TIMEOUT,
     );
     expect(pane).toContain("TAKEOVER_TOP");
+    expect(pane).toContain("TAKEOVER_BOTTOM");
     expect(pane).not.toContain("Agents & processes");
     expect(pane).not.toContain("Background processes");
     expect(pane).not.toContain("ctrl-x close");
@@ -1137,17 +1179,70 @@ test.skipIf(!tmuxAvailable())(
         columns: 80,
         signal: "terminate",
         close_policy: "force",
+        profile: "user",
+        shell: { kind: "user_login" },
+        sections: null,
+        unknown_zeta: true,
       }),
       (body) => {
-        expect(toolResultText(body, "terminal_mixed_start")).toContain(
-          'terminal start field "session_id" is not allowed',
-        );
+        const correction = JSON.parse(
+          toolResultText(body, "terminal_mixed_start"),
+        ) as {
+          error: {
+            code: string;
+            action: string;
+            invalid_fields: string[];
+            missing_fields: string[];
+            allowed_fields: string[];
+            conflicts: string[][];
+            retryable?: boolean;
+          };
+        };
+        expect(correction.error).toEqual({
+          code: "invalid_action_fields",
+          action: "start",
+          invalid_fields: [
+            "session_id",
+            "cursor_segment",
+            "cursor_offset",
+            "after_event_id",
+            "acknowledge_event_id",
+            "max_events",
+            "write",
+            "lease",
+            "monitor",
+            "task_id",
+            "workspace_root",
+            "rows",
+            "columns",
+            "signal",
+            "close_policy",
+            "sections",
+            "unknown_zeta",
+          ],
+          missing_fields: [],
+          allowed_fields: [
+            "action",
+            "cwd",
+            "command",
+            "profile",
+            "shell",
+            "backend",
+            "return_when",
+            "wait_ceiling_ms",
+            "dimensions",
+            "initial_monitors",
+          ],
+          conflicts: [["profile", "shell"]],
+        });
         expect(terminalRecords(fixture.home)).toEqual([]);
         expect(existsSync(mixedMarker)).toBe(false);
         return fakeGatewayToolCall("terminal_valid_start", "terminal", {
           action: "start",
+          session_id: null,
           cwd: fixture.workspace,
           command: "printf ACTION_SCHEMA_OK",
+          profile: null,
           shell: {
             kind: "executable",
             path: TERMINAL_FIXTURE_SHELL,
@@ -1156,6 +1251,22 @@ test.skipIf(!tmuxAvailable())(
           backend: "native",
           return_when: { kind: "exit" },
           wait_ceiling_ms: 20_000,
+          dimensions: null,
+          initial_monitors: null,
+          cursor_segment: null,
+          cursor_offset: null,
+          after_event_id: null,
+          acknowledge_event_id: null,
+          max_events: null,
+          write: null,
+          lease: null,
+          monitor: null,
+          task_id: null,
+          workspace_root: null,
+          rows: null,
+          columns: null,
+          signal: null,
+          close_policy: null,
         });
       },
       (body) => {
@@ -1190,7 +1301,12 @@ test.skipIf(!tmuxAvailable())(
         name?: string;
         inputSchema?: {
           type?: string;
-          properties?: Record<string, { type?: string; enum?: string[] }>;
+          properties?: Record<string, {
+            type?: string;
+            enum?: string[];
+            anyOf?: Array<{ type?: string }>;
+            description?: string;
+          }>;
           required?: string[];
           additionalProperties?: boolean;
           oneOf?: unknown[];
@@ -1203,14 +1319,14 @@ test.skipIf(!tmuxAvailable())(
     expect(terminalSchema).toBeDefined();
     expect(terminalSchema!.type).toBe("object");
     expect(terminalSchema!.oneOf).toBeUndefined();
-    expect(terminalSchema!.required).toEqual(["action"]);
     expect(terminalSchema!.additionalProperties).toBe(false);
     const properties = terminalSchema!.properties ?? {};
-    expect(Object.keys(properties)).toEqual([
+    const propertyNames = [
       "action",
       "session_id",
       "cwd",
       "command",
+      "profile",
       "shell",
       "backend",
       "return_when",
@@ -1231,19 +1347,49 @@ test.skipIf(!tmuxAvailable())(
       "columns",
       "signal",
       "close_policy",
-    ]);
+    ];
+    expect(Object.keys(properties)).toEqual(propertyNames);
+    expect(terminalSchema!.required).toEqual(propertyNames);
     expect(properties.action!.enum).toEqual([
-      "start", "read", "screen", "write", "wait", "monitor", "inspect",
-      "list", "resize", "signal", "close",
+      "exec", "start", "read", "screen", "write", "wait",
+      "monitor", "inspect", "list", "resize", "signal", "close",
     ]);
     expect(properties.action!.type).toBe("string");
-    expect(properties.wait_ceiling_ms!.type).toBe("integer");
-    expect(properties.shell!.type).toBe("object");
-    expect(properties.initial_monitors!.type).toBe("array");
+    for (const name of propertyNames.slice(1)) {
+      expect(properties[name]!.anyOf).toHaveLength(2);
+      expect(properties[name]!.anyOf![1]!.type).toBe("null");
+      expect(properties[name]!.description).toContain(
+        "Set null when the selected action does not use this field.",
+      );
+    }
+    expect(properties.wait_ceiling_ms!.anyOf![0]!.type).toBe("integer");
+    expect(properties.shell!.anyOf![0]!.type).toBe("object");
+    expect(properties.initial_monitors!.anyOf![0]!.type).toBe("array");
+    expect(properties.return_when!.description).toContain(
+      "required for every wait",
+    );
+    expect(properties.return_when!.description).toContain(
+      "output_contains is monitor-only",
+    );
+    expect(properties.cursor_segment!.description).toContain(
+      "required for every read",
+    );
+    expect(properties.cursor_segment!.description).toContain(
+      "raw_gap.available_from",
+    );
+    expect(properties.close_policy!.description).toContain("Close is final");
 
     const scrollback = await active.captureFullScrollback();
+    expect(scrollback).toContain("Failed start · 17 invalid fields");
     expect(countOccurrences(scrollback, "Used terminal start")).toBe(1);
     expect(scrollback).toContain("Used terminal close");
+    await active.sendKeys("C-o");
+    await active.sendKeys("PPage");
+    const expanded = await active.waitForText("missing_fields", TIMEOUT);
+    expect(expanded).toContain("missing_fields");
+    expect(expanded).toContain("allowed_fields");
+    expect(expanded).toContain("conflicts");
+    await active.sendKeys("Escape");
     expect(existsSync(mixedMarker)).toBe(false);
     const records = terminalRecords(fixture.home);
     expect(records).toHaveLength(1);
@@ -1252,6 +1398,79 @@ test.skipIf(!tmuxAvailable())(
     const terminalPid = Number(records[0]!.pid);
     expect(Number.isSafeInteger(terminalPid) && terminalPid > 0).toBe(true);
     await waitForOwnedProcessExit([terminalPid]);
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "terminal repeated unknown correction with a valid neighbor stops without request three",
+  async () => {
+    const fixture = createFixture("fx-tui-terminal-correction-loop-");
+    const firstBatch = [
+      {
+        id: "terminal_s_1",
+        input: {
+          unknown_zeta: null,
+          action: "start",
+          session_id: "terminal-a",
+          sections: null,
+        },
+      },
+      {
+        id: "terminal_t_1",
+        input: { action: "list" },
+      },
+    ];
+    const secondBatch = [
+      {
+        id: "terminal_s_2",
+        input: {
+          sections: null,
+          session_id: "terminal-b",
+          action: "start",
+          unknown_zeta: null,
+        },
+      },
+      {
+        id: "terminal_t_2",
+        input: { action: "list" },
+      },
+    ];
+    const gateway = startFakeGateway([
+      fakeTerminalToolBatch(firstBatch),
+      (body) => {
+        const correction = JSON.parse(
+          toolResultText(body, "terminal_s_1"),
+        ).error;
+        expect(correction.code).toBe("invalid_action_fields");
+        expect(correction.invalid_fields).toEqual([
+          "session_id",
+          "sections",
+          "unknown_zeta",
+        ]);
+        expect(JSON.parse(toolResultText(body, "terminal_t_1")).success.list)
+          .toBeDefined();
+        return fakeTerminalToolBatch(secondBatch);
+      },
+      () => {
+        throw new Error("terminal correction loop issued request three");
+      },
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway);
+
+    await active.sendText("Exercise repeated terminal validation corrections.");
+    const pane = await active.waitForText(
+      "Repeated terminal validation failures stopped the tool loop",
+      TIMEOUT,
+    );
+    expect(pane).toContain("no terminal effect");
+    expect(gateway.requests).toHaveLength(2);
+    expect(terminalRecords(fixture.home)).toEqual([]);
+    const trace = readFileSync(fixture.tracePath, "utf8");
+    expect(trace).not.toContain("event=permission_requested");
+    expect(trace).not.toContain("event=before_tool_execution");
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
   TIMEOUT,
@@ -1453,7 +1672,7 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
-  "TUI executes public native terminal start and owner-scoped list",
+  "TUI auto mode reviews terminal start but not owner-scoped list",
   async () => {
     const fixture = createFixture("fx-tui-terminal-public-");
     let startedSessionId = "";
@@ -1488,7 +1707,11 @@ test.skipIf(!tmuxAvailable())(
       fakeGatewayFinalText("TUI public terminal complete"),
     ]);
     gateways.push(gateway);
-    const active = await launch(fixture, gateway);
+    const active = await launch(fixture, gateway, {
+      FX_PERMISSION_MODE: "auto",
+      FX_TRACE_SCOPES:
+        "input,terminal,terminal_client,terminal_store,terminal_host,agent,worker,gateway,permission",
+    });
 
     await active.sendText("Run and list the native terminal fixture.");
     const pane = await active.waitForText("TUI public terminal complete", TIMEOUT);
@@ -1517,6 +1740,206 @@ test.skipIf(!tmuxAvailable())(
     expect(listResult).toContain('"lifecycle":"exited"');
     expect(listResult).not.toContain("owner_authority");
     expect(listResult).not.toContain("proof");
+    expect(gateway.classifierRequests).toHaveLength(1);
+    expect(classifierEvidenceFromRequest(gateway.classifierRequests[0]!.body))
+      .toContain('"action":"start"');
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "TUI public terminal controls reject encoded bytes and deliver key designators",
+  async () => {
+    const fixture = createFixture("fx-tui-terminal-public-controls-");
+    const bytePath = join(fixture.root, "control-byte.txt");
+    let terminalSessionId = "";
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("tui_terminal_controls_start", "terminal", {
+        action: "start",
+        cwd: fixture.workspace,
+        command:
+          "printf 'TUI_PUBLIC_CONTROLS_READY\\n'; stty raw -echo; " +
+          `od -An -tu1 -N1 | tr -d '[:space:]' > ${JSON.stringify(bytePath)}; ` +
+          "printf '\\nTUI_PUBLIC_CONTROLS_DONE\\n'; " +
+          holdUntilCleanup(fixture.root),
+        shell: {
+          kind: "executable",
+          path: TERMINAL_FIXTURE_SHELL,
+          clean_start: true,
+        },
+        backend: "native",
+        return_when: { kind: "match", pattern: "TUI_PUBLIC_CONTROLS_READY" },
+        wait_ceiling_ms: 20_000,
+        dimensions: { rows: 24, columns: 80 },
+      }),
+      (body) => {
+        const result = JSON.parse(
+          toolResultText(body, "tui_terminal_controls_start"),
+        ) as {
+          success: { start: { session: { session_id: string } } };
+        };
+        terminalSessionId = result.success.start.session.session_id;
+        return fakeGatewayToolCall(
+          "tui_terminal_controls_acquire",
+          "terminal",
+          {
+            action: "write",
+            session_id: terminalSessionId,
+            lease: "acquire",
+          },
+        );
+      },
+      (body) => {
+        expect(toolResultText(body, "tui_terminal_controls_acquire"))
+          .toContain('"write_lease":"agent"');
+        return fakeGatewayToolCall(
+          "tui_terminal_controls_encoded_byte",
+          "terminal",
+          {
+            action: "write",
+            session_id: terminalSessionId,
+            lease: "use",
+            write: { kind: "controls", controls: [12] },
+          },
+        );
+      },
+      (body) => {
+        expect(toolResultText(body, "tui_terminal_controls_encoded_byte"))
+          .toContain("InvalidWritePayload");
+        return fakeGatewayToolCall(
+          "tui_terminal_controls_designator",
+          "terminal",
+          {
+            action: "write",
+            session_id: terminalSessionId,
+            lease: "use",
+            write: { kind: "controls", controls: [108] },
+          },
+        );
+      },
+      async (body) => {
+        expect(toolResultText(body, "tui_terminal_controls_designator"))
+          .toContain('"accepted_bytes":1');
+        expect((await waitForTrace(bytePath, "12")).trim()).toBe("12");
+        return fakeGatewayToolCall("tui_terminal_controls_close", "terminal", {
+          action: "close",
+          session_id: terminalSessionId,
+          close_policy: "force",
+        });
+      },
+      (body) => {
+        expect(toolResultText(body, "tui_terminal_controls_close"))
+          .toContain('"lifecycle":"closed"');
+        return fakeGatewayFinalText("TUI public terminal controls complete");
+      },
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway);
+
+    await active.sendText("Exercise public terminal Ctrl+L input.");
+    const pane = await active.waitForText(
+      "TUI public terminal controls complete",
+      TIMEOUT,
+    );
+    expect(pane).toContain("Failed write");
+    expect(pane).toContain("Used terminal write");
+    expect(gateway.requests).toHaveLength(6);
+    expect(readFileSync(bytePath, "utf8").trim()).toBe("12");
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "TUI public signal reaches a foreground job outside the shell process group",
+  async () => {
+    const fixture = createFixture("fx-tui-terminal-public-signal-");
+    const proofPath = join(fixture.root, "foreground-signal.proof");
+    const termPath = join(fixture.root, "foreground-signal.term");
+    const scriptPath = join(fixture.workspace, "foreground-signal.sh");
+    writeFileSync(
+      scriptPath,
+      `#!${TERMINAL_FIXTURE_SHELL}
+trap 'printf term > ${JSON.stringify(termPath)}; exit 0' TERM
+printf '%s %s %s\n' "$$" "$PPID" "$(ps -o pgid= -p $$ | tr -d ' ')" > ${JSON.stringify(proofPath)}
+printf 'TUI_PUBLIC_SIGNAL_READY\n'
+${holdUntilCleanup(fixture.root)}
+`,
+    );
+    chmodSync(scriptPath, 0o700);
+
+    let terminalSessionId = "";
+    let targetPid = 0;
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("tui_terminal_signal_start", "terminal", {
+        action: "start",
+        cwd: fixture.workspace,
+        command: JSON.stringify(scriptPath),
+        shell: {
+          kind: "executable",
+          path: TERMINAL_FIXTURE_SHELL,
+          clean_start: true,
+        },
+        backend: "native",
+        return_when: {
+          kind: "match",
+          pattern: "TUI_PUBLIC_SIGNAL_READY",
+        },
+        wait_ceiling_ms: 20_000,
+        dimensions: { rows: 24, columns: 80 },
+      }),
+      async (body) => {
+        const result = JSON.parse(
+          toolResultText(body, "tui_terminal_signal_start"),
+        ) as {
+          success: { start: { session: { session_id: string } } };
+        };
+        terminalSessionId = result.success.start.session.session_id;
+        expect(terminalSessionId.length).toBeGreaterThan(0);
+        await waitForTrace(proofPath, " ");
+        const [pidText, parentText, pgidText] = readFileSync(proofPath, "utf8")
+          .trim()
+          .split(/\s+/);
+        targetPid = Number(pidText);
+        const targetParentPid = Number(parentText);
+        const targetPgid = Number(pgidText);
+        const record = await waitForTerminalRecord(
+          fixture.home,
+          (candidate) => candidate.session_id === terminalSessionId,
+        );
+        const shellPid = Number(record.pid);
+        expect(targetPid).toBeGreaterThan(0);
+        expect(targetParentPid).toBe(shellPid);
+        expect(targetPgid).toBe(processGroupId(targetPid));
+        expect(targetPgid).not.toBe(processGroupId(shellPid));
+        return fakeGatewayToolCall("tui_terminal_signal", "terminal", {
+          action: "signal",
+          session_id: terminalSessionId,
+          signal: "terminate",
+        });
+      },
+      (body) => {
+        const result = JSON.parse(
+          toolResultText(body, "tui_terminal_signal"),
+        ) as { success: { signal: { signal: string } } };
+        expect(result.success.signal.signal).toBe("terminate");
+        return fakeGatewayFinalText("TUI public terminal signal complete");
+      },
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway);
+
+    await active.sendText("Signal the foreground terminal fixture.");
+    const pane = await active.waitForText(
+      "TUI public terminal signal complete",
+      TIMEOUT,
+    );
+    expect(pane).toContain("Used terminal start");
+    expect(pane).toContain("Used terminal signal");
+    expect(gateway.requests).toHaveLength(3);
+    await waitForSignalMarker(termPath);
+    await waitForOwnedProcessExit([targetPid]);
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
   TIMEOUT,
@@ -1613,7 +2036,10 @@ test.skipIf(!tmuxAvailable())(
       tools: Array<{
         name?: string;
         inputSchema?: {
+          type?: string;
           properties?: Record<string, { enum?: string[] }>;
+          required?: string[];
+          additionalProperties?: boolean;
           oneOf?: unknown[];
         };
       }>;
@@ -1622,9 +2048,13 @@ test.skipIf(!tmuxAvailable())(
       (tool) => tool.name === "terminal",
     )?.inputSchema;
     expect(terminalSchema).toBeDefined();
+    expect(terminalSchema!.type).toBe("object");
     expect(terminalSchema!.oneOf).toBeUndefined();
+    expect(terminalSchema!.additionalProperties).toBe(false);
     expect(terminalSchema!.properties?.action?.enum).toContain("wait");
     const terminalProperties = Object.keys(terminalSchema!.properties ?? {});
+    expect(terminalProperties).toHaveLength(25);
+    expect(terminalSchema!.required).toEqual(terminalProperties);
     expect(
       terminalProperties.filter((name) => name === "wait_ceiling_ms"),
     ).toHaveLength(1);

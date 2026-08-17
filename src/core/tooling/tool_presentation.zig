@@ -124,8 +124,8 @@ pub fn formatRunCommandPermissionLabel(
         command,
         max_run_command_activity_bytes,
     );
-    const suffix = try commandApprovalLabelSuffix(scratch, "run_command", command);
-    return std.fmt.allocPrint(alloc, "run_command {s}{s}", .{ encoded.bytes, suffix });
+    const suffix = try commandApprovalLabelSuffix(scratch, "terminal", command);
+    return std.fmt.allocPrint(alloc, "terminal.exec {s}{s}", .{ encoded.bytes, suffix });
 }
 
 /// The caller owns the returned allocation and must free it with `alloc`.
@@ -162,13 +162,12 @@ pub fn formatRunCommandActivity(
     workspace_root: []const u8,
     call: ToolCall,
 ) !?RunCommandActivity {
-    if (!std.mem.eql(u8, call.name, "run_command")) return null;
-
     var scratch_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer scratch_state.deinit();
     const scratch = scratch_state.allocator();
 
     const args = tool_args.parseToolArgsObject(scratch, call.arguments_json) catch return null;
+    if (!isCapturedCommandCall(registry, call, args)) return null;
     const command = tool_args.optionalStringArg(args, "command") orelse return null;
     var projected_storage: [max_run_command_activity_bytes + 1]u8 = undefined;
     const projected = projectRunCommandActivitySource(command, workspace_root, &projected_storage);
@@ -235,6 +234,14 @@ pub fn formatPermissionLabel(alloc: Allocator, registry: tool_dispatch.Registry,
     if (try runCommandCompatibilitySource(scratch, registry, call)) |source| {
         return std.fmt.allocPrint(alloc, "{s} {s}", .{ source.tool.name, source.command });
     }
+    const args = tool_args.parseToolArgsObject(scratch, call.arguments_json) catch {
+        return try alloc.dupe(u8, call.name);
+    };
+    if (isCapturedCommandCall(registry, call, args)) {
+        const command = tool_args.optionalStringArg(args, "command") orelse
+            return try alloc.dupe(u8, call.name);
+        return formatRunCommandPermissionLabel(alloc, command);
+    }
     const spec = registry.lookup(call.name) orelse return try alloc.dupe(u8, call.name);
     if (file_mutation_contract.isToolName(call.name)) {
         return std.fmt.allocPrint(
@@ -243,10 +250,6 @@ pub fn formatPermissionLabel(alloc: Allocator, registry: tool_dispatch.Registry,
             .{ call.name, spec.label_arg_default },
         );
     }
-    const args = tool_args.parseToolArgsObject(scratch, call.arguments_json) catch {
-        return try alloc.dupe(u8, call.name);
-    };
-
     if (try copyRenameLabel(scratch, call.name, args)) |value| {
         return std.fmt.allocPrint(alloc, "{s} {s}", .{ call.name, value });
     }
@@ -278,6 +281,18 @@ pub fn formatAutoPermissionNotice(
         switch (result.decision) {
             .allow => {
                 if (outcome.decision.isDenied() or outcome.execution_authority == null) return null;
+                var scratch_state = std.heap.ArenaAllocator.init(alloc);
+                defer scratch_state.deinit();
+                const args = tool_args.parseToolArgsObject(scratch_state.allocator(), call.arguments_json) catch null;
+                if (args) |parsed_args| {
+                    if (isCapturedCommandCall(registry, call, parsed_args)) {
+                        return @as(?[]const u8, try std.fmt.allocPrint(
+                            alloc,
+                            "{s}: Running command.",
+                            .{auto_permission_approved_prefix},
+                        ));
+                    }
+                }
                 const spec = registry.lookup(call.name) orelse {
                     return @as(?[]const u8, try std.fmt.allocPrint(alloc, "{s}: Using requested tool.", .{auto_permission_approved_prefix}));
                 };
@@ -353,7 +368,8 @@ fn appendWebSearchDomains(writer: *std.Io.Writer, label: []const u8, value: ?std
 }
 
 fn commandApprovalLabelSuffix(alloc: Allocator, tool_name: []const u8, command: []const u8) ![]const u8 {
-    if (!std.mem.eql(u8, tool_name, "run_command")) return "";
+    if (!std.mem.eql(u8, tool_name, "run_command") and
+        !std.mem.eql(u8, tool_name, "terminal")) return "";
     const risk = command_policy.command_risk_note_for(command);
     const safer = command_policy.command_safer_alternative_for(command);
     if (risk == null and safer == null) return "";
@@ -386,11 +402,27 @@ fn runCommandCompatibilitySource(
     registry: tool_dispatch.Registry,
     call: ToolCall,
 ) !?RunCommandCompatibilitySource {
-    if (!std.mem.eql(u8, call.name, "run_command")) return null;
     const args = tool_args.parseToolArgsObject(alloc, call.arguments_json) catch return null;
+    if (!isCapturedCommandCall(registry, call, args)) return null;
     const command = tool_args.optionalStringArg(args, "command") orelse return null;
     const matched = (try tool_dispatch.matchRunCommandCompatibility(registry, command)) orelse return null;
     return .{ .tool = matched.tool, .command = command };
+}
+
+fn isCapturedCommandCall(
+    registry: tool_dispatch.Registry,
+    call: ToolCall,
+    args: std.json.ObjectMap,
+) bool {
+    // Historical sessions retain their original tool name. Presentation may
+    // interpret those records, but execution remains unavailable because the
+    // registry no longer contains a `run_command` tool.
+    if (std.mem.eql(u8, call.name, "run_command")) return true;
+    const tool = registry.lookup(call.name) orelse return false;
+    if (tool.executor_kind == .run_command) return true;
+    const expected = tool.captured_command_action orelse return false;
+    const action = tool_args.optionalStringArg(args, "action") orelse return false;
+    return std.mem.eql(u8, action, expected);
 }
 
 fn copyRenameLabel(alloc: Allocator, tool_name: []const u8, args: std.json.ObjectMap) !?[]const u8 {
@@ -455,7 +487,7 @@ const test_tools = [_]tool_dispatch.Tool{
     test_builtin_tools.rename_file,
     test_builtin_tools.copy_file,
     test_web_search,
-    test_builtin_tools.run_command,
+    test_builtin_tools.terminal,
     test_builtin_tools.memory,
     test_builtin_tools.skill,
     test_install_skill,
@@ -652,7 +684,7 @@ test "run command activity abbreviates only active workspace paths" {
     });
     defer alloc.free(permission);
     try std.testing.expectEqualStrings(
-        "run_command cd /Users/example/workspace/packages/cli && pwd",
+        "terminal.exec cd /Users/example/workspace/packages/cli && pwd",
         permission,
     );
 }
@@ -716,7 +748,7 @@ test "tool presentation formats permission labels" {
         .arguments_json = "{\"command\":\"npm test\",\"cwd\":\"/tmp/fx\"}",
     });
     defer alloc.free(cwd);
-    try std.testing.expectEqualStrings("run_command npm test @ /tmp/fx", cwd);
+    try std.testing.expectEqualStrings("terminal.exec npm test", cwd);
 
     const risk = try formatPermissionLabel(alloc, test_tool_registry, .{
         .id = "risk",

@@ -19,6 +19,7 @@ const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
 const tooling_tool_admission = @import("../../tooling/tool_admission.zig");
 const hooks = @import("../../hooks/hooks.zig");
 const command_contract = @import("../../execution/command_contract.zig");
+const command_environment = @import("../../execution/command_environment.zig");
 const context_contract = @import("../../workspace/context_contract.zig");
 const tool_preparation = @import("../tool_preparation.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
@@ -57,6 +58,8 @@ const AgentRuntimeDeps = runtime_deps.AgentRuntimeDeps;
 const CredentialRefreshMode = runtime_deps.CredentialRefreshMode;
 
 const http_error_detail_max_bytes: usize = 4096;
+const repeated_terminal_validation_notice =
+    "Repeated terminal validation failures stopped the tool loop. The invalid terminal calls were not executed and produced no terminal effect.";
 const Config = runtime_config.Config;
 const LifecycleContext = runtime_lifecycle.LifecycleContext;
 const PreparedToolCall = runtime_lifecycle.PreparedToolCall;
@@ -80,7 +83,14 @@ fn resolveLiveToolAuthority(
             call,
             advertised_dynamic_tool_names,
         );
-    const target_kind = if (deps.tool_registry.lookup(call.name)) |tool|
+    const command_call = try tooling_tool_admission.callUsesCommandAuthority(
+        deps.tool_registry,
+        arena,
+        call,
+    );
+    const target_kind = if (command_call)
+        tool_dispatch.PermissionTargetKind.command_cwd
+    else if (deps.tool_registry.lookup(call.name)) |tool|
         tool.permission_target_kind
     else
         .none;
@@ -118,8 +128,6 @@ fn rejectPermissionForLiveAuthority(
 
 const PreparationClassifierContext = struct {
     deps: *const AgentRuntimeDeps,
-    gateway_messages: []const ChatMessage,
-    user_prompt: []const u8,
 };
 
 fn preparationExecutionStatus(status: runtime_tool_contracts.ToolExecutionStatus) tool_preparation.ToolStatus {
@@ -178,21 +186,6 @@ fn prepareDeferredDynamicCandidate(
         .not_registered => false,
         .valid, .failure => true,
     };
-}
-
-fn prepareStopPolicyTerminal(
-    raw_ctx: ?*anyopaque,
-    alloc: Allocator,
-    call: ToolCall,
-) anyerror!?tool_preparation.CallbackTerminal {
-    const ctx: *PreparationClassifierContext = @ptrCast(@alignCast(raw_ctx.?));
-    const output = try runtime_stop_policy.blockedNonLiveBackgroundRestart(
-        alloc,
-        ctx.gateway_messages,
-        call,
-        ctx.user_prompt,
-    ) orelse return null;
-    return .{ .model_output = @constCast(output), .status = .failure };
 }
 
 fn preparedTerminalModelOutput(
@@ -900,7 +893,7 @@ fn reactiveSandboxWideningFailure(
         .status = .failure,
         .status_detail = "restricted attempt ran; broader retry did not run",
         .model_output = try tool_result_errors.toolExecutionFailureJson(arena, .{
-            .tool_name = "run_command",
+            .tool_name = "terminal",
             .message = "The restricted sandbox attempt ran and may have partial effects; the broader retry did not run.",
             .details = details[0..detail_count],
             .suggestion = "Inspect the retained restricted result and effects. Do not claim that the command never ran or retry unchanged.",
@@ -948,7 +941,7 @@ fn reactiveSandboxWideningRetryCancelled(
         .cancelled = true,
         .status_detail = "restricted attempt ran; broader retry was cancelled",
         .model_output = try tool_result_errors.toolExecutionFailureJson(arena, .{
-            .tool_name = "run_command",
+            .tool_name = "terminal",
             .message = "The restricted sandbox attempt completed, and the broader retry started before cancellation; either attempt may have partial effects.",
             .details = details[0..detail_count],
             .suggestion = "Inspect both retained results and effects before deciding whether another command is safe.",
@@ -2252,6 +2245,8 @@ fn processQueuedPromptLoop(
     defer local_grants_ptr.* = local_grants;
     var turn_file_mutation_denials: runtime_tool_admission.TurnFileMutationDenials = .{};
     defer turn_file_mutation_denials.deinit(arena);
+    var terminal_validation_retry: runtime_tool_admission.TerminalValidationRetryState = .{};
+    defer terminal_validation_retry.deinit(arena);
     var completed_tool_names = completed_tool_names_ptr.*;
     defer completed_tool_names_ptr.* = completed_tool_names;
     var context_delivery_state: context_contract.DeliveryState = if (deps.context_enabled)
@@ -4157,8 +4152,6 @@ fn processQueuedPromptLoop(
         defer preparation_batch.deinit(arena, arena);
         var classifier_ctx: PreparationClassifierContext = .{
             .deps = deps,
-            .gateway_messages = successful_source_messages,
-            .user_prompt = job.prompt,
         };
         if (deps.context_enabled) {
             for (prepared_tool_calls, 0..) |prepared_call, i| {
@@ -4178,7 +4171,7 @@ fn processQueuedPromptLoop(
                         .idempotent = prepareNoIdempotentTerminal,
                         .validation = prepareValidationTerminal,
                         .availability = prepareAvailabilityTerminal,
-                        .stop_policy = prepareStopPolicyTerminal,
+                        .stop_policy = prepareNoIdempotentTerminal,
                         .deferred_dynamic = prepareDeferredDynamicCandidate,
                     },
                 }) catch |err| {
@@ -4384,6 +4377,7 @@ fn processQueuedPromptLoop(
         }
 
         var step_batch = runtime_tool_batch.StepBatchState{};
+        terminal_validation_retry.beginBatch();
         var settled_vision_ids: std.ArrayList(usize) = .empty;
         defer mem_utils.deinitList(arena, &settled_vision_ids);
         var parallel_skip_until: usize = 0;
@@ -4467,6 +4461,15 @@ fn processQueuedPromptLoop(
                         try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, parallel_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                         finish_trace.finish("interrupted");
                         return;
+                    }
+                    if (try runtime_tool_admission.repeatedDynamicMcpFailure(
+                        arena,
+                        within_turn_suffix.items,
+                        parallel_call,
+                        advertised_dynamic_tool_names,
+                    )) |failure| {
+                        precomputed_results[group_index] = failure;
+                        continue;
                     }
                     if (preparation_batch.preparations[tool_call_index + group_index]) |preparation| {
                         switch (preparation) {
@@ -4614,7 +4617,7 @@ fn processQueuedPromptLoop(
 
                     if (decision == .always) {
                         const target_path = try deps.permission_target_for_call(deps.ctx, arena, parallel_call, advertised_dynamic_tool_names);
-                        try runtime_tool_admission.applyInitialSessionGrants(deps, arena, &local_grants, config.workspace_root, parallel_call.name, target_path);
+                        try runtime_tool_admission.applyInitialSessionGrants(deps, arena, &local_grants, config.workspace_root, parallel_call, target_path);
                     }
 
                     if (!parallel_status_started[group_index]) {
@@ -5011,6 +5014,13 @@ fn processQueuedPromptLoop(
                                 );
                             },
                             .validation_failure, .availability_failure => {
+                                if (terminal.kind == .validation_failure) {
+                                    try terminal_validation_retry.observe(
+                                        arena,
+                                        tool_call,
+                                        model_output,
+                                    );
+                                }
                                 const execution: ToolExecutionResult = .{
                                     .status = .failure,
                                     .model_output = safe_output,
@@ -5048,8 +5058,10 @@ fn processQueuedPromptLoop(
                                 );
                             },
                             .stop_policy => {
-                                const defer_auto_lifecycle = runtime_tool_admission.deferRunCommandLifecycleForAutoPermissionNotice(
-                                    tool_call.name,
+                                const defer_auto_lifecycle = try runtime_tool_admission.deferCapturedCommandLifecycleForAutoPermissionNotice(
+                                    deps.tool_registry,
+                                    arena,
+                                    tool_call,
                                     job.permission_mode,
                                     lifecycle.scope.kind == .interactive,
                                 );
@@ -5184,6 +5196,59 @@ fn processQueuedPromptLoop(
                     },
                 }
             }
+            if (try runtime_tool_admission.repeatedDynamicMcpFailure(
+                arena,
+                within_turn_suffix.items,
+                tool_call,
+                advertised_dynamic_tool_names,
+            )) |execution| {
+                const prepared = try runtime_execution_memory.prepareToolModelOutput(
+                    arena,
+                    config,
+                    tool_call,
+                    execution.model_output,
+                );
+                const safe_tool_output = prepared.model_output;
+                _ = try stream_ctx.provisional_statuses.finishExecutedCall(
+                    deps,
+                    stream_ctx.alloc,
+                    arena,
+                    turn_id,
+                    tool_call,
+                    false,
+                    null,
+                    execution,
+                    safe_tool_output,
+                    prepared.memory,
+                    null,
+                    advertised_dynamic_tool_names,
+                );
+                try runtime_tool_admission.recordRejectedToolCall(
+                    deps,
+                    arena,
+                    tool_call,
+                    safe_tool_output,
+                    null,
+                );
+                debug_trace.eventf(
+                    "tool",
+                    "execution_result",
+                    step_ctx,
+                    "call_id={s} name={s} result_kind=repeated_mcp_failure model_output_bytes={d}",
+                    .{ tool_call.id, tool_call.name, safe_tool_output.len },
+                );
+                try runtime_tool_batch.appendToolResultContent(
+                    arena,
+                    &within_turn_suffix,
+                    &completed_tool_names,
+                    &step_batch,
+                    tool_call,
+                    safe_tool_output,
+                    prepared.memory,
+                    .{ .increment_error = true },
+                );
+                continue;
+            }
             const requires_legacy_classification = if (preparation_batch.preparations[tool_call_index]) |preparation|
                 switch (preparation) {
                     .candidate => |candidate| !preparedCandidateClassificationComplete(candidate),
@@ -5193,6 +5258,11 @@ fn processQueuedPromptLoop(
                 true;
             if (requires_legacy_classification) {
                 if (try runtime_tool_admission.registeredToolValidationFailure(deps, arena, tool_call)) |execution| {
+                    try terminal_validation_retry.observe(
+                        arena,
+                        tool_call,
+                        execution.model_output,
+                    );
                     const prepared = try runtime_execution_memory.prepareToolModelOutput(arena, config, tool_call, execution.model_output);
                     const safe_tool_output = prepared.model_output;
                     _ = try stream_ctx.provisional_statuses.finishExecutedCall(
@@ -5413,8 +5483,10 @@ fn processQueuedPromptLoop(
             else
                 local_grants.items;
             var status_started = false;
-            const defer_auto_command_lifecycle = runtime_tool_admission.deferRunCommandLifecycleForAutoPermissionNotice(
-                tool_call.name,
+            const defer_auto_command_lifecycle = try runtime_tool_admission.deferCapturedCommandLifecycleForAutoPermissionNotice(
+                deps.tool_registry,
+                arena,
+                tool_call,
                 action_permission_mode,
                 lifecycle.scope.kind == .interactive,
             );
@@ -5424,43 +5496,41 @@ fn processQueuedPromptLoop(
                 status_started = try runtime_tool_presentation.startToolVisibleLifecycle(deps, arena, turn_id, stream_ctx.provisional_statuses.presentation_group_id, tool_call, null, advertised_dynamic_tool_names);
             }
 
-            if (requires_legacy_classification) {
-                if (try runtime_stop_policy.blockedNonLiveBackgroundRestart(arena, successful_source_messages, tool_call, job.prompt)) |blocked_output| {
-                    if (!status_started and defer_auto_command_lifecycle) {
-                        status_started = try runtime_tool_presentation.startToolVisibleLifecycle(
-                            deps,
-                            arena,
-                            turn_id,
-                            stream_ctx.provisional_statuses.presentation_group_id,
-                            tool_call,
-                            null,
-                            advertised_dynamic_tool_names,
-                        );
-                    }
-                    _ = try stream_ctx.provisional_statuses.finishDeniedCall(
-                        deps,
-                        stream_ctx.alloc,
-                        arena,
-                        turn_id,
-                        tool_call,
-                        status_started,
-                        null,
-                        "Blocked",
-                        advertised_dynamic_tool_names,
-                    );
-                    debug_trace.eventf("tool", "execution_result", step_ctx, "call_id={s} name={s} result_kind=blocked_non_live_background_restart model_output_bytes={d}", .{ tool_call.id, tool_call.name, blocked_output.len });
-                    try runtime_tool_batch.appendToolResultContent(
-                        arena,
-                        &within_turn_suffix,
-                        &completed_tool_names,
-                        &step_batch,
-                        tool_call,
-                        blocked_output,
-                        null,
-                        .{ .increment_error = true },
-                    );
-                    continue;
-                }
+            if (try runtime_stop_policy.blockedNonLiveBackgroundRestart(
+                arena,
+                successful_source_messages,
+                tool_call,
+                job.prompt,
+            )) |blocked_output| {
+                _ = try stream_ctx.provisional_statuses.finishDeniedCall(
+                    deps,
+                    stream_ctx.alloc,
+                    arena,
+                    turn_id,
+                    tool_call,
+                    status_started,
+                    null,
+                    "Blocked",
+                    advertised_dynamic_tool_names,
+                );
+                debug_trace.eventf(
+                    "tool",
+                    "execution_result",
+                    step_ctx,
+                    "call_id={s} name={s} result_kind=blocked_non_live_background_restart model_output_bytes={d}",
+                    .{ tool_call.id, tool_call.name, blocked_output.len },
+                );
+                try runtime_tool_batch.appendToolResultContent(
+                    arena,
+                    &within_turn_suffix,
+                    &completed_tool_names,
+                    &step_batch,
+                    tool_call,
+                    blocked_output,
+                    null,
+                    .{ .increment_error = true },
+                );
+                continue;
             }
 
             var file_call_arena_state: std.heap.ArenaAllocator = undefined;
@@ -5848,7 +5918,11 @@ fn processQueuedPromptLoop(
                 );
                 return error.MissingToolExecutionAuthority;
             };
-            if (std.mem.eql(u8, tool_call.name, "run_command")) {
+            if (try tooling_tool_admission.callUsesCommandAuthority(
+                deps.tool_registry,
+                call_allocator,
+                tool_call,
+            )) {
                 if (execution_authority != .run_command) return error.InvalidRunCommandExecutionAuthority;
             } else if (is_file_mutation) {
                 if (execution_authority != .file_mutation) {
@@ -5907,13 +5981,13 @@ fn processQueuedPromptLoop(
                             arena,
                             &local_grants,
                             config.workspace_root,
-                            tool_call.name,
+                            tool_call,
                             target.canonical_path,
                         );
                     }
                 } else {
                     const target_path = try deps.permission_target_for_call(deps.ctx, arena, tool_call, advertised_dynamic_tool_names);
-                    try runtime_tool_admission.applyInitialSessionGrants(deps, arena, &local_grants, config.workspace_root, tool_call.name, target_path);
+                    try runtime_tool_admission.applyInitialSessionGrants(deps, arena, &local_grants, config.workspace_root, tool_call, target_path);
                 }
             }
 
@@ -6406,12 +6480,17 @@ fn processQueuedPromptLoop(
                         },
                     }
                     if (widening_outcome.decision == .always and live_authority == null) {
+                        const sandbox_identity = try command_environment.permissionCommandIdentity(
+                            arena,
+                            required.restricted_fingerprint.environment,
+                            required.restricted_fingerprint.command,
+                        );
                         try runtime_tool_admission.retainSessionGrant(
                             deps,
                             arena,
                             &local_grants,
                             "sandbox",
-                            required.restricted_fingerprint.command,
+                            sandbox_identity,
                         );
                     }
                     sandbox_widening_feedback = widening_outcome.feedback;
@@ -6882,6 +6961,35 @@ fn processQueuedPromptLoop(
             &within_turn_suffix,
             &step_batch,
         );
+        if (terminal_validation_retry.finishBatch()) {
+            try deps.push_system_notice(
+                deps.ctx,
+                repeated_terminal_validation_notice,
+            );
+            const assistant_text = if (stop_state.retained_candidate != null)
+                try hooks.prompt.joinVisibleSegments(
+                    arena,
+                    stop_state.retained_candidate,
+                    stop_state.latest_partial,
+                )
+            else
+                "";
+            stop_state.terminal_materializing = true;
+            try finishCommonAssistantTerminal(
+                deps,
+                finalization,
+                arena,
+                job,
+                within_turn_suffix.items,
+                &summary_accumulator,
+                assistant_text,
+                .completed,
+                null,
+                &finish_trace,
+                "terminal_validation_retry",
+            );
+            return;
+        }
         if (terminal_provider_completion) {
             const raw_final = completion.content.?;
             const final_text = try runtime_assistant_stream.normalizeAssistantTextForDisplay(arena, raw_final);

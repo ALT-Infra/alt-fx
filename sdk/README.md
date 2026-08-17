@@ -73,6 +73,6 @@ The staging script includes `zig-out/lib/libfx.node` by default for local testin
 
 The npm `latest` dist-tag is the stable channel. The `dev` dist-tag tracks successful builds from `main` and uses immutable prerelease versions. Publishing runs through `.github/workflows/publish-libfx.yml` with npm trusted publishing and provenance. Configure the npm trusted publisher for the `vercel-labs/fx` repository, workflow filename `publish-libfx.yml`, and GitHub environment `npm`. Because npm requires a package to exist before trusted publishing can be configured, the first `libfx` version must be published once by a maintainer before enabling that relationship.
 
-JavaScript hosts may also provide configuration, prompt history, session persistence, device login, URL opening, and a foreground workspace. The optional workspace adapter exposes only `run_command`, delegated to the host.
+JavaScript hosts can provide configuration, prompt history, session persistence, device login, URL opening, and a foreground workspace. The optional workspace adapter exposes only `terminal` with `{ action: "exec", command }`; command execution is delegated to the host in a clean, root-fixed environment.
 
 WebAssembly builds do not include native processes, OS sandboxing, native MCP, subagents, skills, auto-upgrade, clipboard integration, arbitrary WASI filesystem access, or web search.

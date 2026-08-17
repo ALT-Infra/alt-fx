@@ -77,7 +77,11 @@ pub const ProvisionalToolStatuses = struct {
                 .activity_kind = .read,
             } };
         }
-        const spec = registry.lookup(tool_name) orelse return null;
+        const lookup_name = if (std.mem.eql(u8, tool_name, "run_command"))
+            "terminal"
+        else
+            tool_name;
+        const spec = registry.lookup(lookup_name) orelse return null;
         return switch (spec.activity_kind) {
             .ask, .write, .edit => .ineligible,
             else => .{ .eligible = .{
@@ -698,7 +702,9 @@ fn formatProvisionalProgressLabel(
     label_value: ?[]const u8,
 ) ![]const u8 {
     const display_action_label =
-        if (label_value == null and std.mem.eql(u8, tool_name, "run_command"))
+        if (label_value == null and
+        (std.mem.eql(u8, tool_name, "run_command") or
+            std.mem.eql(u8, tool_name, "terminal")))
             "Preparing command"
         else
             action_label;
@@ -1001,7 +1007,29 @@ pub fn finishExecutedToolStatus(
                 "Failed",
                 advertised_dynamic_tool_names,
             );
-            const detail = failureStatusDetail(call, result, safe_result) orelse break :blk base;
+            if (std.mem.eql(u8, call.name, "terminal")) {
+                if (try tool_result_errors.inspectTerminalActionFieldCorrection(
+                    arena,
+                    safe_result,
+                )) |correction| {
+                    break :blk try std.fmt.allocPrint(
+                        arena,
+                        "{s} · {d} invalid field{s}",
+                        .{
+                            base,
+                            correction.invalid_field_count,
+                            if (correction.invalid_field_count == 1) "" else "s",
+                        },
+                    );
+                }
+            }
+            const detail = (try failureStatusDetail(
+                arena,
+                call,
+                result,
+                safe_result,
+                advertised_dynamic_tool_names,
+            )) orelse break :blk base;
             if (detail.len == 0) break :blk base;
             break :blk try std.fmt.allocPrint(arena, "{s}: {s}", .{ base, detail });
         },
@@ -1037,29 +1065,90 @@ pub fn finishExecutedToolStatus(
 }
 
 fn failureStatusDetail(
+    arena: Allocator,
     call: ToolCall,
     result: ToolExecutionResult,
     safe_result: []const u8,
-) ?[]const u8 {
-    const detail = result.status_detail orelse return null;
-    if (!std.mem.eql(u8, detail, "preflight failed") or
-        !file_mutation_contract.isToolName(call.name) or
-        !std.mem.startsWith(u8, safe_result, call.name))
-    {
-        return detail;
+    advertised_dynamic_tool_names: []const []const u8,
+) !?[]const u8 {
+    if (result.status_detail) |detail| {
+        if (!std.mem.eql(u8, detail, "preflight failed") or
+            !file_mutation_contract.isToolName(call.name) or
+            !std.mem.startsWith(u8, safe_result, call.name))
+        {
+            return detail;
+        }
+
+        const failure_prefix = " failed: ";
+        const remainder = safe_result[call.name.len..];
+        if (!std.mem.startsWith(u8, remainder, failure_prefix)) return detail;
+        const actionable = remainder[failure_prefix.len..];
+        if (actionable.len == 0 or
+            std.mem.findScalar(u8, actionable, '\n') != null or
+            std.mem.findScalar(u8, actionable, '\r') != null)
+        {
+            return detail;
+        }
+        return actionable;
     }
 
-    const failure_prefix = " failed: ";
-    const remainder = safe_result[call.name.len..];
-    if (!std.mem.startsWith(u8, remainder, failure_prefix)) return detail;
-    const actionable = remainder[failure_prefix.len..];
-    if (actionable.len == 0 or
-        std.mem.findScalar(u8, actionable, '\n') != null or
-        std.mem.findScalar(u8, actionable, '\r') != null)
+    if (safe_result.len == 0 or
+        !containsName(advertised_dynamic_tool_names, call.name))
     {
-        return detail;
+        return null;
     }
-    return actionable;
+    const detail = try mcpFailureEnvelopeText(arena, safe_result) orelse safe_result;
+    const encoded = try text_utils.encodeTerminalSafe(arena, detail, 256);
+    return if (encoded.bytes.len == 0) null else encoded.bytes;
+}
+
+fn mcpFailureEnvelopeText(
+    arena: Allocator,
+    safe_result: []const u8,
+) Allocator.Error!?[]const u8 {
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        arena,
+        safe_result,
+        .{},
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    defer parsed.deinit();
+    const envelope = switch (parsed.value) {
+        .object => |object| object,
+        else => return null,
+    };
+    const payload = envelope.get("result") orelse envelope.get("error") orelse
+        return null;
+    const payload_object = switch (payload) {
+        .object => |object| object,
+        else => return null,
+    };
+    if (payload_object.get("content")) |content| {
+        if (content == .array) {
+            for (content.array.items) |item| {
+                if (item != .object) continue;
+                const text = item.object.get("text") orelse continue;
+                if (text == .string and text.string.len > 0) {
+                    const owned: []const u8 = try arena.dupe(u8, text.string);
+                    return owned;
+                }
+            }
+        }
+    }
+    const message = payload_object.get("message") orelse return null;
+    if (message != .string or message.string.len == 0) return null;
+    const owned: []const u8 = try arena.dupe(u8, message.string);
+    return owned;
+}
+
+fn containsName(values: []const []const u8, needle: []const u8) bool {
+    for (values) |value| {
+        if (std.mem.eql(u8, value, needle)) return true;
+    }
+    return false;
 }
 
 fn commandArtifactHandle(
@@ -1188,7 +1277,7 @@ const test_tools = [_]tool_dispatch.Tool{
     test_builtin_tools.read_file,
     test_builtin_tools.write_file,
     test_builtin_tools.edit_file,
-    test_builtin_tools.run_command,
+    test_builtin_tools.terminal,
     test_builtin_tools.ask_user_question,
 };
 const test_tool_registry = tool_dispatch.Registry{ .tools = test_tools[0..] };
@@ -1875,6 +1964,45 @@ test "file edit preflight failure reports the exact mismatch" {
     try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
     try std.testing.expectEqualStrings(
         "Failed edit_file: old_string not found in file",
+        terminal.outcome.summary,
+    );
+}
+
+test "dynamic MCP failure derives a bounded terminal-safe detail from the safe result" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+    const failure =
+        \\{"server":"plain","tool":"mcp_plain_getThreads","result":{"resultType":"complete","isError":true,"content":[{"type":"text","text":"Invalid input: labels require at least one item\nretry rejected"}]}}
+    ;
+    const advertised = [_][]const u8{"mcp_plain_getThreads"};
+
+    try finishExecutedToolStatus(
+        &hooks,
+        arena,
+        7,
+        .{
+            .id = "plain_failure",
+            .name = "mcp_plain_getThreads",
+            .arguments_json = "{}",
+        },
+        true,
+        null,
+        .{ .status = .failure, .model_output = failure },
+        failure,
+        .{ .output_bytes = failure.len, .stored_output_bytes = failure.len },
+        null,
+        &advertised,
+    );
+
+    const terminal = capture.events.items[0].terminal;
+    try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
+    try std.testing.expectEqualStrings(
+        "Failed mcp_plain_getThreads: Invalid input: labels require at least one item\\x0aretry rejected",
         terminal.outcome.summary,
     );
 }

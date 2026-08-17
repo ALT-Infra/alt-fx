@@ -8,6 +8,7 @@ const invalidationReleasePath = process.env.FX_MCP_INVALIDATION_RELEASE_PATH;
 const legacyVersion = process.env.FX_MCP_LEGACY_VERSION ?? "2024-11-05";
 const discoveryVersions = process.env.FX_MCP_LEGACY_DISCOVERY_VERSIONS?.split(",");
 const discoveryMethodNotFound = process.env.FX_MCP_LEGACY_DISCOVERY_METHOD_NOT_FOUND === "1";
+const discoveryInvalidParams = process.env.FX_MCP_LEGACY_DISCOVERY_INVALID_PARAMS === "1";
 const rejectNewerInitialize = process.env.FX_MCP_LEGACY_REJECT_NEWER_INITIALIZE === "1";
 const draft7Pattern = process.env.FX_MCP_DRAFT7_PATTERN;
 const elicitationUrl = process.env.FX_MCP_ELICITATION_URL ?? "https://example.test/authorize";
@@ -179,6 +180,14 @@ function handle(message) {
   }
 
   if (message.method === "server/discover") {
+    if (discoveryInvalidParams) {
+      send({
+        jsonrpc: "2.0",
+        id: message.id,
+        error: { code: -32602, message: "Invalid params" },
+      });
+      return;
+    }
     if (discoveryVersions) {
       send({
         jsonrpc: "2.0",

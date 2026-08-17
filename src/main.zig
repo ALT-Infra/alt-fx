@@ -434,6 +434,14 @@ const App = struct {
 
     pub fn cooperativeTransportPulse(self: *Self) !void {
         if (comptime !host_target.is_wasm) return;
+        if (try event_loop.pump_ready_input(
+            self.terminal,
+            &self.should_exit,
+            RenderAppRuntime.eventLoopCallbacks(self),
+        )) |exit_cause| {
+            if (exit_cause == .input_closed) self.should_exit = true;
+            return;
+        }
         try WorkerAppRuntime.tick(
             self,
             app_callbacks.Bindings(App).onTaskCompletion,
@@ -587,7 +595,6 @@ const App = struct {
             &app,
             footer_rows,
             builtin_gateway.default_model,
-            builtin_gateway.default_fast_mode,
             default_max_agent_steps,
             handle_sigwinch,
             launch.record_requested,
@@ -1357,14 +1364,18 @@ const App = struct {
         );
     }
 
-    pub fn reloadMcp(self: *App) !app_mcp_runtime.ReloadOutcome {
-        return self.mcp.reload(
+    pub fn beginMcpReload(self: *App) !void {
+        return self.mcp.beginReload(
             self.alloc,
             .{ .form = true, .url = true },
             if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
             self.toolRegistry(),
             @intCast(@max(io_mod.milliTimestamp(), 0)),
         );
+    }
+
+    pub fn takeMcpReloadCompletion(self: *App) !?app_mcp_runtime.ReloadCompletion {
+        return self.mcp.takeReloadCompletion();
     }
 
     pub fn startMcpDiscovery(self: *App) void {
@@ -1426,6 +1437,10 @@ const App = struct {
         return self.mcp.renderHealth(alloc);
     }
 
+    pub fn summarizeMcpServers(self: *App, alloc: Allocator) ![]u8 {
+        return self.mcp.renderHealthSummary(alloc);
+    }
+
     pub fn snapshotMcpToolNames(self: *App, alloc: Allocator) ![][]u8 {
         return self.mcp.snapshotToolNames(alloc, self.permission_engine.rules);
     }
@@ -1484,8 +1499,6 @@ const App = struct {
             .permission_mode = permission_mode,
             .permission_rules = permission_rules,
             .subagent_available = self.session_persistence.subagent_host != null,
-            .terminal_available = self.session_persistence.subagent_host != null and
-                tool_dispatch.ToolCapabilities.for_host(host.current()).terminalAvailable(),
         });
     }
 
@@ -2409,6 +2422,7 @@ const App = struct {
         if (try self.model_cache.pollLoadTransition()) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }
+        try app_commands.Handlers(App).collectMcpReloadFacts(self);
         if (comptime host_profile.native_auth or host_profile.js_host_auth) {
             try AuthAppRuntime.collectSignInFacts(self);
         }
@@ -3140,7 +3154,6 @@ fn fullEntryConfig() app_entry_runtime.Config {
         .build_channel = compiled_update_channel,
         .command_catalog = builtin_commands.top_level_registry,
         .default_model = builtin_gateway.default_model,
-        .default_fast_mode = builtin_gateway.default_fast_mode,
         .default_agent_step_limit = default_max_agent_steps,
         .models_path = builtin_gateway.models_path,
         .gateway_retry_count = builtin_gateway.retry_count,
@@ -3177,7 +3190,6 @@ fn localEntryConfig() app_entry_runtime.Config {
         .build_channel = compiled_update_channel,
         .command_catalog = builtin_commands.top_level_registry,
         .default_model = builtin_gateway.default_model,
-        .default_fast_mode = builtin_gateway.default_fast_mode,
         .default_agent_step_limit = default_max_agent_steps,
         .models_path = builtin_gateway.models_path,
         .gateway_retry_count = builtin_gateway.retry_count,
@@ -3841,4 +3853,5 @@ test {
     _ = @import("ui/transcript/runtime_tests.zig");
     _ = @import("core/agent/worker_runtime.zig");
     _ = @import("gateway/client.zig");
+    _ = @import("gateway/host_stream_provider.zig");
 }

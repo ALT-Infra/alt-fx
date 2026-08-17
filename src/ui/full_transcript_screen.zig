@@ -1470,8 +1470,13 @@ test "full projection preserves semantic arguments clipped from a tool heading" 
     } }};
     var details = [_]ToolDetailRecord{.{
         .entry_id = 1,
-        .tool_name = try alloc.dupe(u8, "run_command"),
-        .arguments_json = try std.fmt.allocPrint(alloc, "{{\"command\":\"{s}\"}}", .{command}),
+        .tool_name = try alloc.dupe(u8, "terminal"),
+        .captured_command = true,
+        .arguments_json = try std.fmt.allocPrint(
+            alloc,
+            "{{\"action\":\"exec\",\"command\":\"{s}\",\"profile\":\"clean\"}}",
+            .{command},
+        ),
         .outcome = .completed,
     }};
     defer details[0].deinit(alloc);
@@ -1499,6 +1504,8 @@ test "full projection preserves semantic arguments clipped from a tool heading" 
 
     try std.testing.expect(std.mem.indexOf(u8, source, "command: printf") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "FULL_ARGUMENT_TAIL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "action: exec") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "profile: clean") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "{\"command\"") == null);
 }
 
@@ -7033,15 +7040,15 @@ fn markedDiffContent(bytes: []const u8) ?[]const u8 {
     return bytes[content_start..content_end];
 }
 
-fn isRunCommandDetail(detail: *const ToolDetailRecord) bool {
-    return std.mem.eql(u8, detail.tool_name, "run_command");
+fn isCapturedCommandDetail(detail: *const ToolDetailRecord) bool {
+    return detail.isCapturedCommand();
 }
 
 fn isActivePartialCommand(
     detail: *const ToolDetailRecord,
     block: command_output_runtime.CommandOutputBlock,
 ) bool {
-    return isRunCommandDetail(detail) and
+    return isCapturedCommandDetail(detail) and
         detail.outcome == null and
         storedResultForDetail(detail) == null and
         block.retention_overflow;
@@ -7449,7 +7456,7 @@ fn storedResultForDetail(detail: *const ToolDetailRecord) ?StoredResult {
     }
     if (detail.result_handle) |handle| {
         return .{
-            .kind = if (isRunCommandDetail(detail)) .command_result else .tool_result,
+            .kind = if (isCapturedCommandDetail(detail)) .command_result else .tool_result,
             .handle = handle,
             .preview = detail.result,
         };
@@ -7468,7 +7475,7 @@ fn reviewStoredResultForDetail(detail: *const ToolDetailRecord) ?StoredResult {
     }
     if (detail.result_handle) |handle| {
         return .{
-            .kind = if (isRunCommandDetail(detail)) .command_result else .tool_result,
+            .kind = if (isCapturedCommandDetail(detail)) .command_result else .tool_result,
             .handle = handle,
             .preview = detail.result,
         };
@@ -7811,6 +7818,10 @@ fn appendFullSemanticArguments(
     var iterator = object.iterator();
     while (iterator.next()) |entry| {
         const value = entry.value_ptr.*;
+        if (isCapturedCommandDetail(detail) and
+            std.mem.eql(u8, entry.key_ptr.*, "action") and
+            value == .string and
+            std.mem.eql(u8, value.string, "exec")) continue;
         if (value == .string and argumentVisibleInToolHeading(
             entries,
             detail.entry_id,
@@ -7935,7 +7946,7 @@ fn appendDetailContent(
         stored.detail_depth = depth;
         stored.line_prefix = "│  ";
         if (depth == .review and
-            (isRunCommandDetail(detail) or owned_command_block_index != null))
+            (isCapturedCommandDetail(detail) or owned_command_block_index != null))
         {
             stored.retained_command_fallback = try boundedReviewCommandFallback(
                 alloc,
@@ -7947,7 +7958,7 @@ fn appendDetailContent(
                 checkpoint,
             );
             stored.retained_command_fallback_is_bounded_review = true;
-        } else if (isRunCommandDetail(detail) and stored.kind == .command_replay) {
+        } else if (isCapturedCommandDetail(detail) and stored.kind == .command_replay) {
             stored.retained_command_fallback = try degradedInlineCommandFallback(
                 alloc,
                 entries,
@@ -8014,7 +8025,7 @@ fn appendDetailContent(
         }
         ends_with_newline = true;
     } else if (detail.result) |result| {
-        if (isRunCommandDetail(detail)) {
+        if (isCapturedCommandDetail(detail)) {
             var rendered: std.Io.Writer.Allocating = .init(alloc);
             defer rendered.deinit();
             const parsed = try appendInlineCommandResult(

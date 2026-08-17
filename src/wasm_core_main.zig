@@ -34,7 +34,6 @@ pub fn main(init: std.process.Init) !void {
     io_mod.setEnvironMap(init.environ_map);
     try acp_server.run(std.heap.c_allocator, .{
         .default_model = builtin_gateway.default_model,
-        .default_fast_mode = builtin_gateway.default_fast_mode,
         .default_agent_step_limit = 64,
         .gateway_retry_count = 0,
         .gateway_chat_url = builtin_gateway.default_chat_url,

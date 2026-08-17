@@ -10,6 +10,7 @@ const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
 const elicitation = @import("../core/mcp/elicitation.zig");
 const streamable_http = @import("../core/mcp/streamable_http.zig");
 const profile_paths = @import("../core/shared/profile_paths.zig");
+const text_utils = @import("../core/shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const CommandRequest = command_provider_contract.Request;
@@ -29,7 +30,16 @@ pub const command_provider = command_provider_contract.Provider{ .handle_fn = ha
 
 fn handleCommand(alloc: Allocator, rest: []const u8, command_request: CommandRequest) !CommandResult {
     const trimmed = std.mem.trim(u8, rest, " \t");
-    if (trimmed.len == 0 or std.mem.eql(u8, trimmed, "list")) {
+    if (trimmed.len == 0) {
+        const summarize = command_request.summarize_servers orelse
+            command_request.list_servers_and_tools;
+        return .{
+            .display = .{
+                .block = try summarize(command_request.list_ctx, alloc),
+            },
+        };
+    }
+    if (std.mem.eql(u8, trimmed, "list")) {
         return .{
             .display = .{
                 .block = try command_request.list_servers_and_tools(command_request.list_ctx, alloc),
@@ -98,14 +108,29 @@ fn handleCommand(alloc: Allocator, rest: []const u8, command_request: CommandReq
                 "Interactive MCP authentication is unavailable here.",
                 false,
             );
-        authenticate(command_request.auth_ctx orelse command_request.list_ctx, name) catch |err| {
+        var authentication = authenticate(
+            command_request.auth_ctx orelse command_request.list_ctx,
+            name,
+        ) catch |err| {
             return lineParts(
                 alloc,
                 &.{ "MCP authentication for '", name, "' failed: ", @errorName(err), "." },
                 false,
             );
         };
-        return lineParts(alloc, &.{ "Authenticated MCP server '", name, "'." }, true);
+        defer authentication.deinit();
+        return switch (authentication) {
+            .authenticated => lineParts(
+                alloc,
+                &.{ "Authenticated MCP server '", name, "'." },
+                true,
+            ),
+            .issuer_mismatch => |mismatch| issuerMismatchResult(
+                alloc,
+                name,
+                mismatch,
+            ),
+        };
     }
 
     if (std.mem.startsWith(u8, trimmed, "logout ")) {
@@ -302,6 +327,28 @@ fn lineLiteral(alloc: Allocator, text: []const u8, reload: bool) !CommandResult 
 // string splice.
 fn lineParts(alloc: Allocator, parts: []const []const u8, reload: bool) !CommandResult {
     return .{ .display = .{ .line = try std.mem.concat(alloc, u8, parts) }, .reload = reload };
+}
+
+fn issuerMismatchResult(
+    alloc: Allocator,
+    server_name: []const u8,
+    mismatch: mcp_auth.IssuerMismatch,
+) !CommandResult {
+    var expected = try text_utils.encodeTerminalSafe(alloc, mismatch.expected, 1024);
+    defer expected.deinit(alloc);
+    var returned = try text_utils.encodeTerminalSafe(alloc, mismatch.returned, 1024);
+    defer returned.deinit(alloc);
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try out.writer.print("MCP authentication for '{s}' was rejected: expected issuer ", .{server_name});
+    try std.json.Stringify.value(expected.bytes, .{}, &out.writer);
+    try out.writer.writeAll(" but metadata returned ");
+    try std.json.Stringify.value(returned.bytes, .{}, &out.writer);
+    try out.writer.writeAll(". Add \"oauth\":{\"issuer\":");
+    try std.json.Stringify.value(returned.bytes, .{}, &out.writer);
+    try out.writer.writeAll("} to this server's entry in ~/.fx/mcp.json and retry.");
+    return .{ .display = .{ .line = try out.toOwnedSlice() } };
 }
 
 pub fn configPathFromHome(alloc: Allocator, home: []const u8) ![]u8 {
@@ -1171,11 +1218,18 @@ const TestHome = struct {
 const ListFixture = struct {
     text: []const u8,
     calls: usize = 0,
+    summary_calls: usize = 0,
 
     fn list(raw_ctx: *anyopaque, alloc: Allocator) ![]u8 {
         const self: *ListFixture = @ptrCast(@alignCast(raw_ctx));
         self.calls += 1;
         return alloc.dupe(u8, self.text);
+    }
+
+    fn summary(raw_ctx: *anyopaque, alloc: Allocator) ![]u8 {
+        const self: *ListFixture = @ptrCast(@alignCast(raw_ctx));
+        self.summary_calls += 1;
+        return alloc.dupe(u8, "MCP: no servers configured. Use /mcp add <name> <command> [args...].");
     }
 };
 
@@ -1183,6 +1237,7 @@ fn request(home: ?[]const u8, fixture: *ListFixture) CommandRequest {
     return .{
         .home = home,
         .list_ctx = @ptrCast(fixture),
+        .summarize_servers = ListFixture.summary,
         .list_servers_and_tools = ListFixture.list,
     };
 }
@@ -1452,9 +1507,18 @@ test "built-in MCP command handles list path and reload requests" {
 
     var list_result = try handleCommand(alloc, "", request(null, &fixture));
     defer list_result.deinit(alloc);
-    try expectBlock(list_result, "No MCP servers configured.\n");
-    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    try expectBlock(
+        list_result,
+        "MCP: no servers configured. Use /mcp add <name> <command> [args...].",
+    );
+    try std.testing.expectEqual(@as(usize, 1), fixture.summary_calls);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     try std.testing.expect(!list_result.reload);
+
+    var details = try handleCommand(alloc, "list", request(null, &fixture));
+    defer details.deinit(alloc);
+    try expectBlock(details, "No MCP servers configured.\n");
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1622,10 +1686,22 @@ test "MCP auth requires explicit browser confirmation and logout stays non-secre
             return alloc.dupe(u8, "");
         }
 
-        fn authenticate(raw: *anyopaque, name: []const u8) !void {
+        fn authenticate(
+            raw: *anyopaque,
+            name: []const u8,
+        ) !mcp_auth.AuthenticationResult {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            if (std.mem.eql(u8, name, "mismatch")) {
+                self.auth_calls += 1;
+                return .{ .issuer_mismatch = try mcp_auth.IssuerMismatch.init(
+                    std.testing.allocator,
+                    "https://signin.auth.plain.com/",
+                    "https://signin.auth.plain.com",
+                ) };
+            }
             try std.testing.expectEqualStrings("remote", name);
             self.auth_calls += 1;
+            return .authenticated;
         }
 
         fn validate(raw: *anyopaque, name: []const u8) !void {
@@ -1634,7 +1710,9 @@ test "MCP auth requires explicit browser confirmation and logout stays non-secre
             if (std.mem.eql(u8, name, "local")) {
                 return error.McpAuthenticationNotRemote;
             }
-            try std.testing.expectEqualStrings("remote", name);
+            if (!std.mem.eql(u8, name, "mismatch")) {
+                try std.testing.expectEqualStrings("remote", name);
+            }
         }
 
         fn logout(
@@ -1679,6 +1757,20 @@ test "MCP auth requires explicit browser confirmation and logout stays non-secre
     try std.testing.expectEqual(@as(usize, 2), fixture.validation_calls);
     try std.testing.expectEqual(@as(usize, 1), fixture.auth_calls);
 
+    var mismatch = try handleCommand(
+        alloc,
+        "auth mismatch --open",
+        command_request,
+    );
+    defer mismatch.deinit(alloc);
+    try expectLine(
+        mismatch,
+        "MCP authentication for 'mismatch' was rejected: expected issuer \"https://signin.auth.plain.com/\" but metadata returned \"https://signin.auth.plain.com\". Add \"oauth\":{\"issuer\":\"https://signin.auth.plain.com\"} to this server's entry in ~/.fx/mcp.json and retry.",
+        false,
+    );
+    try std.testing.expectEqual(@as(usize, 3), fixture.validation_calls);
+    try std.testing.expectEqual(@as(usize, 2), fixture.auth_calls);
+
     var local = try handleCommand(alloc, "auth local", command_request);
     defer local.deinit(alloc);
     try expectLine(
@@ -1686,8 +1778,8 @@ test "MCP auth requires explicit browser confirmation and logout stays non-secre
         "MCP authentication for 'local' failed: McpAuthenticationNotRemote.",
         false,
     );
-    try std.testing.expectEqual(@as(usize, 3), fixture.validation_calls);
-    try std.testing.expectEqual(@as(usize, 1), fixture.auth_calls);
+    try std.testing.expectEqual(@as(usize, 4), fixture.validation_calls);
+    try std.testing.expectEqual(@as(usize, 2), fixture.auth_calls);
 
     var logged_out = try handleCommand(alloc, "logout remote", command_request);
     defer logged_out.deinit(alloc);
