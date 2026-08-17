@@ -57,7 +57,7 @@ shared createFxAgent() logic in sdk/fx-sdk.js
 - `exited` settles when the native runtime exits.
 - `abort()` aborts Node fetch and closes native input.
 
-The adapter polls `drainCore()` and `takeCoreFetch()` every 2 milliseconds. ACP output is accumulated to newline boundaries and parsed as JSON. Gateway requests are transferred to Node as bounded request records; Node runs the configured `fetch`, streams bounded response chunks back to Zig, and owns the `AbortController`. This matches the WebAssembly host-fetch boundary and ensures the N-API core never uses the native `std.http` Gateway transport.
+The adapter checks fetch control and drains ACP output on its existing timer. While no body pump exists it may call `takeCoreFetch()`; while a pump exists it calls only `coreFetchActive()` for that fetch handle. An inactive handle aborts its matching `AbortController` on the next callback that observes it. No exact callback latency is guaranteed. ACP output is accumulated to newline boundaries and parsed as JSON. Gateway requests are transferred to Node as bounded request records; Node runs the configured `fetch`, streams bounded response chunks back to Zig, and owns the `AbortController`. This matches the WebAssembly host-fetch boundary and ensures the N-API core never uses the native `std.http` Gateway transport.
 
 ## Native module ABI
 
@@ -65,21 +65,24 @@ The adapter polls `drainCore()` and `takeCoreFetch()` every 2 milliseconds. ACP 
 
 | Export | Purpose |
 | --- | --- |
-| `libfxApiVersion` | Checks compatibility with the JavaScript loader. Currently `1`. |
+| `libfxApiVersion` | Checks compatibility with the JavaScript loader. Currently `2`. Low-level `createCore` backends must declare this exact version. |
 | `createCore(options)` | Allocates a runtime and starts its ACP thread. |
 | `writeCore(handle, buffer)` | Appends bytes to the bounded input queue. |
 | `closeCore(handle)` | Closes input and wakes a blocked ACP reader. |
 | `drainCore(handle)` | Returns up to 1 MiB of queued output as a Node Buffer. |
-| `takeCoreFetch(handle)` | Takes the pending bounded Gateway request for Node-owned fetch. |
-| `startCoreFetchResponse(handle, status)` | Publishes the fetch response status. |
-| `pushCoreFetchResponse(handle, buffer)` | Appends a bounded response chunk. |
-| `finishCoreFetch(handle)` / `failCoreFetch(handle)` | Completes the host stream successfully or with transport failure. |
-| `abortCoreFetch(handle)` | Wakes the Zig worker while Node aborts the matching `AbortController`. |
+| `takeCoreFetch(runtime)` | Takes the pending bounded Gateway request, including its positive `fetchHandle`, for Node-owned fetch. |
+| `coreFetchActive(runtime, fetchHandle)` | Reports whether that request may still receive host response operations. |
+| `startCoreFetchResponse(runtime, fetchHandle, status)` | Publishes the matching fetch response status. |
+| `pushCoreFetchResponse(runtime, fetchHandle, buffer)` | Appends a bounded matching response chunk. |
+| `finishCoreFetch(runtime, fetchHandle)` / `failCoreFetch(runtime, fetchHandle)` | Completes only the matching host stream successfully or with transport failure. |
+| `abortCoreFetch(runtime)` | Wakes the Zig worker while Node aborts the current matching `AbortController`. |
 | `coreExited(handle)` | Reports whether the ACP thread has exited. |
 | `coreExitCode(handle)` | Returns the ACP thread's numeric exit status. |
 | `destroyCore(handle)` | Closes input, joins the thread, and releases native memory. |
 
 This ABI is internal. Consumers should use `createFxAgent()` from `sdk/node.js`; exposing the primitive functions keeps the native boundary small and testable.
+
+Response operations return numeric outcomes: `0` means the operation was stale and ignored, `1` means it was applied, and `2` means a response push encountered bounded backpressure. Stale callbacks never mutate a newer fetch. They emit one payload-free `napi` trace containing only the operation, numeric fetch handle, and drop reason.
 
 Each handle is a JavaScript object wrapped around a `RuntimeHandle`. It is branded with `napi_type_tag` and checked before every operation. A structurally similar object cannot be substituted for a real handle. The wrapper owns a finalizer, so garbage collection invokes the same destruction path as explicit `destroyCore()`.
 
@@ -98,7 +101,7 @@ Creating a core performs these steps:
 
 The runtime thread never calls N-API. It blocks on the fetch bridge while the Node event-loop poller owns `fetch`, response-body iteration, and `AbortController`. Destruction marks the bridge shutting down and wakes every wait before joining the runtime thread, so worker teardown does not depend on further JavaScript callbacks.
 
-The addon initializes one process-wide `std.Io.Threaded` instance. Atomic state protects one-time initialization when the addon is loaded in multiple Node worker environments.
+The addon initializes one process-wide `std.Io.Threaded` instance. Atomic state protects one-time initialization when the addon is loaded in multiple Node worker environments. The same initialization installs the inherited process environment and configures the existing `debug_trace` owner before any runtime thread starts; individual runtimes do not shut global tracing down.
 
 Input and output queues have independent `std.Io.Mutex` protection. The input queue also has a condition variable so the ACP reader sleeps while no input is available. Closing input broadcasts the condition and allows the server thread to terminate.
 
