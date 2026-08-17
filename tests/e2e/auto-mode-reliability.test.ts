@@ -4,6 +4,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   rmSync,
   writeFileSync,
@@ -221,18 +222,25 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
-    "three blocked responses escalate the next unresolved action without a fourth review",
+    "three blocked responses end with one tools-disabled agent response",
     async () => {
       const root = createIsolatedRoot();
       const markers = Array.from(
-        { length: 4 },
+        { length: 3 },
         (_, index) => join(root.workspace, `blocked-action-${index + 1}-must-not-run`),
       );
       const gateway = startGateway(
-        markers.map((marker, index) => (body?: string) => {
+        [
+          ...markers.map((marker, index) => (body?: string) => {
           if (index > 0) expect(body).toContain("auto_denied");
           return commandCall(`touch ${JSON.stringify(marker)}`, `blocked_action_${index + 1}`);
-        }),
+          }),
+          (body?: string) => {
+            expect(body).toContain('"tools":[]');
+            expect(body).toContain('"toolChoice":{"type":"none"}');
+            return fakeGatewayFinalText("Which safe alternative should I use?");
+          },
+        ],
         Array.from(
           { length: 3 },
           (_, index) => fakeGatewayPermissionDecision("ask", `blocked_review_${index + 1}`),
@@ -248,8 +256,9 @@ describe("lean auto mode reliability", () => {
         },
       );
 
-      expect(result.code).toBe(1);
-      expect(result.stdout).toContain("NonInteractivePermissionRequired");
+      expect(result.code).toBe(0);
+      expect(result.stdout).not.toContain("NonInteractivePermissionRequired");
+      expect(result.stdout).toContain("Which safe alternative should I use?");
       expect(gateway.requests).toHaveLength(4);
       expect(gateway.classifierRequests).toHaveLength(3);
       for (const marker of markers) expect(existsSync(marker)).toBe(false);
@@ -258,7 +267,7 @@ describe("lean auto mode reliability", () => {
   );
 
   test.skipIf(process.platform !== "darwin")(
-    "headless sandbox widening terminalizes after three recoverable blocks",
+    "headless sandbox widening uses a tools-disabled response after three blocks",
     async () => {
       const root = createIsolatedRoot("/Users/Shared");
       const marker = join(root.workspace, "sandbox-widening-must-not-run");
@@ -272,10 +281,16 @@ describe("lean auto mode reliability", () => {
         }),
       );
       const gateway = startGateway(
-        Array.from({ length: 4 }, (_, index) => (body?: string) => {
+        [
+          ...Array.from({ length: 3 }, (_, index) => (body?: string) => {
           if (index > 0) expect(body).toContain("auto_denied");
           return commandCall(command, `sandbox_widening_${index + 1}`);
-        }),
+          }),
+          (body?: string) => {
+            expect(body).toContain('"tools":[]');
+            return fakeGatewayFinalText("Sandbox widening needs user direction.");
+          },
+        ],
         [
           fakeGatewayPermissionDecision("ask", "sandbox_review_1"),
           fakeGatewayFinalText("malformed reviewer output"),
@@ -292,11 +307,9 @@ describe("lean auto mode reliability", () => {
         },
       );
 
-      expect(result.code).toBe(1);
-      expect(result.stdout).toContain("NonInteractivePermissionRequired");
-      expect(result.stderr).toContain(
-        "permission required for tool execution in noninteractive mode",
-      );
+      expect(result.code).toBe(0);
+      expect(result.stdout).not.toContain("NonInteractivePermissionRequired");
+      expect(result.stdout).toContain("Sandbox widening needs user direction.");
       expect(gateway.requests).toHaveLength(4);
       expect(gateway.classifierRequests).toHaveLength(3);
       for (const request of gateway.classifierRequests) {
@@ -348,6 +361,158 @@ describe("lean auto mode reliability", () => {
       expect(existsSync(rejectedMarker)).toBe(false);
       expect(gateway.requests).toHaveLength(3);
       expect(gateway.classifierRequests).toHaveLength(1);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "saved-session allow survives restart and bypasses automatic review",
+    async () => {
+      const root = createIsolatedRoot();
+      const allowedMarker = join(root.workspace, "saved-allow-ran");
+      const allowedCommand = `touch ${JSON.stringify(allowedMarker)}`;
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        JSON.stringify({
+          sandbox: "none",
+          permission: { bash: { [allowedCommand]: "ask" } },
+          maxxing_mode: "legacy",
+        }),
+      );
+      const gateway = startGateway([
+        fakeGatewayFinalText("allow session initialized"),
+        commandCall(allowedCommand, "saved_allow_action"),
+        fakeGatewayFinalText("saved allow complete"),
+      ]);
+      const stderrPath = join(root.root, "saved-allow-stderr.log");
+      writeFileSync(stderrPath, "");
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway),
+        stderrPath,
+        width: 140,
+        height: 42,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText("Initialize the saved allow session.");
+      await activeSession.waitForText("allow session initialized", TIMEOUT);
+      await activeSession.sendText(
+        `/permissions remember allow run_command ${JSON.stringify({ command: allowedCommand })}`,
+      );
+      await activeSession.waitForText("Remember allow for this saved session", TIMEOUT);
+      await activeSession.sendKeys("1");
+      await activeSession.waitForText("saved-session permission rule updated", TIMEOUT);
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+
+      const sessionIds = readdirSync(join(root.home, ".fx", "sessions"), {
+        withFileTypes: true,
+      })
+        .filter((entry) =>
+          entry.isDirectory() &&
+          existsSync(
+            join(root.home, ".fx", "sessions", entry.name, "session.json"),
+          )
+        )
+        .map((entry) => entry.name);
+      expect(sessionIds).toHaveLength(1);
+      const result = await runFx(
+        [
+          "ask",
+          "--json",
+          "--resume-id",
+          sessionIds[0]!,
+          "Run the exact saved action.",
+        ],
+        {
+          cwd: root.workspace,
+          env: gatewayEnv(root, gateway),
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      expect(existsSync(allowedMarker)).toBe(true);
+      expect(gateway.classifierRequests).toHaveLength(0);
+      expect(gateway.requests).toHaveLength(3);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "saved-session deny is confirmed, enforced over configured allow, listed, and revoked by id",
+    async () => {
+      const root = createIsolatedRoot();
+      const blockedMarker = join(root.workspace, "saved-deny-must-not-run");
+      const blockedCommand = `touch ${JSON.stringify(blockedMarker)}`;
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        JSON.stringify({
+          sandbox: "none",
+          permission: { bash: { [blockedCommand]: "allow" } },
+          maxxing_mode: "legacy",
+        }),
+      );
+      const gateway = startGateway([
+        fakeGatewayFinalText("session initialized"),
+        commandCall(blockedCommand, "saved_deny_blocked"),
+        (body) => {
+          expect(body).toContain("policy_denied");
+          return commandCall("pwd", "saved_deny_replan");
+        },
+        fakeGatewayFinalText("saved deny replan complete"),
+      ]);
+      const stderrPath = join(root.root, "saved-deny-stderr.log");
+      writeFileSync(stderrPath, "");
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway),
+        stderrPath,
+        width: 140,
+        height: 42,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText("Initialize this saved session.");
+      await activeSession.waitForText("session initialized", TIMEOUT);
+      await activeSession.sendText(
+        `/permissions remember deny run_command ${JSON.stringify({ command: blockedCommand })}`,
+      );
+      await activeSession.waitForText("Remember deny for this saved session", TIMEOUT);
+      await activeSession.sendKeys("1");
+      await activeSession.waitForText("saved-session permission rule updated", TIMEOUT);
+
+      await activeSession.sendText("/permissions");
+      await activeSession.waitForText("saved-session permission rules (1):", TIMEOUT);
+      const listed = await activeSession.captureFullScrollback();
+      const idMatch = listed.match(
+        /saved-session permission rules \(1\):\n\s*(\d+) deny/,
+      );
+      expect(idMatch).not.toBeNull();
+      const ruleId = idMatch![1];
+
+      await activeSession.sendText("Complete the configured action safely.");
+      await activeSession.waitForText("saved deny replan complete", TIMEOUT);
+      expect(existsSync(blockedMarker)).toBe(false);
+      expect(gateway.classifierRequests).toHaveLength(0);
+
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText(`/permissions revoke ${ruleId}`);
+      await activeSession.waitForText("Revoke this saved-session permission rule?", TIMEOUT);
+      await activeSession.sendKeys("1");
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText("/permissions");
+      await activeSession.waitForText("saved-session permission rules: none", TIMEOUT);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       await activeSession.sendText("/quit");

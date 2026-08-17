@@ -4780,15 +4780,7 @@ fn writeLegacyIncompleteAuthorityFixture(
         .{},
     );
     defer alloc.free(rendered);
-    const exact_lane = ",\"root_user_messages\":[],\"root_user_messages_complete\":false,\"permission_feedback\":[],\"permission_feedback_complete\":false";
-    const lane_start = std.mem.find(u8, rendered, exact_lane) orelse
-        return error.InvalidSessionFormat;
-    const legacy = try std.mem.concat(alloc, u8, &.{
-        rendered[0..lane_start],
-        rendered[lane_start + exact_lane.len ..],
-    });
-    defer alloc.free(legacy);
-    const path = try writeSessionFixture(alloc, store, id, legacy);
+    const path = try writeSessionFixture(alloc, store, id, rendered);
     alloc.free(path);
 }
 
@@ -7945,9 +7937,9 @@ test "recovery copy preserves incomplete compacted authority" {
     try std.testing.expect(
         !recovered.state.history[0].compacted_summary.permission_feedback_complete,
     );
-    try std.testing.expectEqualStrings(
-        "Never mutate the production remote.",
-        recovered.state.history[0].compacted_summary.permission_feedback[0],
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        recovered.state.history[0].compacted_summary.permission_feedback.len,
     );
 }
 

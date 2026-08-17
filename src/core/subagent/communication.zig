@@ -1,6 +1,7 @@
 const std = @import("std");
 const permission_request = @import("../permissions/permission_request.zig");
 const permissions = @import("../permissions/permissions.zig");
+const session_permission_state = @import("../permissions/session_permission_state.zig");
 const types = @import("../shared/types.zig");
 const domain = @import("domain.zig");
 const tool_result = @import("tool_result.zig");
@@ -2757,6 +2758,7 @@ pub const LiveAuthority = struct {
     integrations: []const []const u8,
     rules: types.PermissionRuleSet,
     grants: []const types.PermissionGrant,
+    permission_state: ?*const session_permission_state.State = null,
     permission_mode: types.PermissionMode = .yolo,
 };
 

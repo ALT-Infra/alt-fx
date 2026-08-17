@@ -38,6 +38,7 @@ const tool_set_contract = @import("../tooling/tool_set.zig");
 const builtin_tools = @import("../../builtins/tools.zig");
 const types = @import("../shared/types.zig");
 const permissions = @import("../permissions/permissions.zig");
+const session_permission_state = @import("../permissions/session_permission_state.zig");
 const mcp_access = @import("../mcp/access_policy.zig");
 const shell_runtime = @import("../../ui/shell_runtime.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
@@ -1648,11 +1649,12 @@ pub fn Runtime(comptime App: type) type {
                     state.history,
                 );
             }
-            try app.session.restoreWithContextHistoryStart(
+            try app.session.restoreWithPermissionState(
                 app.alloc,
                 state.conversation_language,
                 state.history,
                 state.context_history_start,
+                state.permission_state,
             );
             if (state.usage) |usage| {
                 try app.session.usage.restore(
@@ -4202,6 +4204,11 @@ pub fn Runtime(comptime App: type) type {
             else
                 null;
             defer if (mcp_view) |*view| view.deinit(alloc);
+            var permission_state = app.session.snapshotPermissionState(alloc) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.HostAuthorityUnavailable,
+            };
+            defer permission_state.deinit(alloc);
             return subagent_tool_host.captureHostAuthorityWithMcpView(
                 alloc,
                 .{
@@ -4212,6 +4219,7 @@ pub fn Runtime(comptime App: type) type {
                 integrations,
                 if (comptime @hasField(App, "permission_engine")) app.permission_engine.rules else .{},
                 if (comptime @hasField(App, "permission_engine")) app.permission_engine.grants.items else &.{},
+                permission_state,
                 if (mcp_view) |*view| view else null,
             );
         }
@@ -4322,6 +4330,31 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        pub fn commitPermissionState(
+            app: *App,
+            permission_state: session_permission_state.State,
+        ) !void {
+            const loaded = if (app.session_persistence.writable) |*value|
+                value
+            else
+                return error.SessionPersistenceUnavailable;
+            const now_ms = io_mod.milliTimestamp();
+            var current = try snapshotCurrentState(app, loaded.state, now_ms);
+            defer current.deinit(app.alloc);
+            current.permission_state.deinit(app.alloc);
+            current.permission_state = try session_permission_state.dupe(
+                app.alloc,
+                permission_state,
+            );
+            _ = try loaded.commitStateReplacement(
+                app.alloc,
+                current,
+                .compaction,
+                .retry_expected_tail,
+                .{},
+            );
+        }
+
         fn commitJsHostSnapshot(app: *App, boundary: []const u8) void {
             if (comptime !@hasField(App, "session_persistence")) return;
             if (comptime !runtime_profile.allows(App, .js_host_sessions)) return;
@@ -4400,6 +4433,11 @@ pub fn Runtime(comptime App: type) type {
             }
             const history = try app.session.snapshotHistory(app.alloc);
             errdefer session_runtime.freeHistoryTurnSlice(app.alloc, history);
+            const permission_state = try app.session.snapshotPermissionState(app.alloc);
+            errdefer {
+                var value = permission_state;
+                value.deinit(app.alloc);
+            }
             const usage = try app.session.usage.snapshot(app.alloc);
             const recovery_checkpoint = if (base_state.recovery_checkpoint) |checkpoint|
                 try checkpoint.dupe(app.alloc)
@@ -4418,6 +4456,7 @@ pub fn Runtime(comptime App: type) type {
                 .context_history_start = app.session.contextHistoryStart(),
                 .total_input_tokens = app.total_input_tokens,
                 .total_output_tokens = app.total_output_tokens,
+                .permission_state = permission_state,
                 .usage = usage,
                 .recovery_checkpoint = recovery_checkpoint,
             };
@@ -4441,6 +4480,11 @@ pub fn Runtime(comptime App: type) type {
             }
             const history = try app.alloc.alloc(types.HistoryTurn, 0);
             errdefer app.alloc.free(history);
+            const permission_state = try app.session.snapshotPermissionState(app.alloc);
+            errdefer {
+                var value = permission_state;
+                value.deinit(app.alloc);
+            }
             const usage = try app.session.usage.snapshot(app.alloc);
             return .{
                 .id = id,
@@ -4453,6 +4497,7 @@ pub fn Runtime(comptime App: type) type {
                 .history = history,
                 .total_input_tokens = 0,
                 .total_output_tokens = 0,
+                .permission_state = permission_state,
                 .usage = usage,
             };
         }

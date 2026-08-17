@@ -229,7 +229,13 @@ Security is permission-first.
 
 * session `always` approvals are non-persistent; command approvals match the exact command while other grant categories may use patterns
 
-* unresolved sensitive calls in `auto` mode receive one exact automatic review; the reviewer either allows the exact action or sends it to the human approval path, except when a tool policy makes reviewer ask a final denial; unavailable or invalid review still falls back to approval, and reviewer rationale is turn-local rather than session state
+* configured denies are evaluated before saved-session rules; an exact saved-session deny can narrow a configured allow, while an exact saved-session allow can satisfy an unresolved configured ask
+
+* `/permissions remember allow|deny <tool-name> <arguments-json>` confirms and stores an exact rule only for an active saved session; `/permissions` lists stable rule IDs and `/permissions revoke <rule-id>` removes one
+
+* unresolved sensitive calls in `auto` mode receive one exact automatic review using only the current root request and pending action; non-allow, unavailable, and invalid review results return a recoverable denial to the agent loop rather than opening human approval
+
+* after three permission-blocked response groups, fx either makes one final tools-disabled model request when step budget remains or emits a fixed local fallback when it does not
 
 * the sandbox backend is configured independently; yolo uses an effective backend of `none` without rewriting the saved sandbox setting
 

@@ -13,6 +13,7 @@ const text_utils = @import("../shared/text_utils.zig");
 const diff_mod = @import("../output/diff.zig");
 const pathing = @import("../workspace/pathing.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
+const session_permission_state = @import("../permissions/session_permission_state.zig");
 const permission_prompter = @import("../permissions/permission_prompter.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const permissions = @import("../permissions/permissions.zig");
@@ -44,6 +45,21 @@ pub const HostSandboxDefault = enum {
     prompt,
 };
 
+pub const SessionPermissionStateProvider = struct {
+    context: *anyopaque,
+    snapshot_fn: *const fn (
+        context: *anyopaque,
+        alloc: Allocator,
+    ) anyerror!session_permission_state.State,
+
+    pub fn snapshot(
+        self: SessionPermissionStateProvider,
+        alloc: Allocator,
+    ) !session_permission_state.State {
+        return self.snapshot_fn(self.context, alloc);
+    }
+};
+
 /// Borrowed capabilities required for permission admission. The leaf never
 /// owns, persists, or extends any referenced runtime state.
 pub const Input = struct {
@@ -52,6 +68,8 @@ pub const Input = struct {
     permission_review_turn: ?permission_auto_classifier.ReviewTurnContext = null,
     permission_grants: []const PermissionGrant,
     permission_rules: types.PermissionRuleSet,
+    session_permission_state: ?*const session_permission_state.State = null,
+    session_permission_state_provider: ?SessionPermissionStateProvider = null,
     tool_registry: tool_dispatch.Registry,
     worker: *WorkerRuntime,
     permission_prompter: ?permission_prompter.Prompter = null,
@@ -120,6 +138,8 @@ pub const FileMutationPreflightRequest = struct {
     permission_mode: PermissionMode,
     local_grants: []const PermissionGrant = &.{},
     can_prompt: bool,
+    session_permission_state: ?*const session_permission_state.State = null,
+    prepare_permission_identity: bool = false,
 };
 
 pub const FileMutationPreparationRequest = struct {
@@ -416,7 +436,15 @@ pub fn preflightPreparedFileMutation(
         .policy_targets = policy_targets,
         .read_disclosure_required = equality_prompt_required,
     };
-    if (!edit_prompt_required and !equality_prompt_required) {
+    const state_may_decide = if (request.session_permission_state) |state|
+        state.rules.items.len > 0
+    else
+        false;
+    if (!edit_prompt_required and
+        !equality_prompt_required and
+        !state_may_decide and
+        !request.prepare_permission_identity)
+    {
         input_owned = false;
         policy_targets_owned = false;
         return .{ .allowed = authorization };
@@ -436,13 +464,28 @@ pub fn preflightPreparedFileMutation(
         .semantic_failure => |reason| return .{ .tool_failure = reason },
         .prepared => |value| value,
     };
+    if (request.session_permission_state) |state| {
+        const key = permissionStateKeyForPreparedFileMutation(
+            arena,
+            authorization.prepared.?,
+        ) catch null;
+        if (key) |resolved_key| switch (session_permission_state.decide(state.*, resolved_key)) {
+            .deny => return .policy_denied,
+            .allow => {
+                input_owned = false;
+                policy_targets_owned = false;
+                return .{ .allowed = authorization };
+            },
+            .unresolved => {},
+        };
+    }
     const prompt_required = if (file_mutation_contract.preparedMutationIsNoop(
         authorization.prepared.?,
     ))
         equality_prompt_required
     else
         edit_prompt_required;
-    if (!prompt_required) {
+    if (!prompt_required or request.prepare_permission_identity) {
         input_owned = false;
         policy_targets_owned = false;
         return .{ .allowed = authorization };
@@ -774,12 +817,6 @@ fn automaticReviewOutcome(
     is_dynamic_tool: bool,
     file_authorization: ?file_mutation_contract.FileExecutionAuthorization,
 ) !command_admission.PermissionOutcome {
-    if (input.permission_review_turn) |turn| {
-        if (turn.auto_recovery_exhausted) return .{
-            .decision = .permission_required,
-            .denial_reason = .permission_required,
-        };
-    }
     if (!input.auto_classifier.enabled()) return reviewerUnavailableOutcome(call);
     if (input.permission_review_turn == null) return reviewerUnavailableOutcome(call);
 
@@ -939,6 +976,7 @@ fn fileMutationPreflightRequest(
         .permission_mode = permission_mode,
         .local_grants = local_grants,
         .can_prompt = input.permission_prompter != null or permission_mode == .auto,
+        .session_permission_state = input.session_permission_state,
     };
 }
 
@@ -999,6 +1037,38 @@ fn resolveFileMutationPreflightAdmission(
 }
 
 pub fn requestPermissionOutcome(
+    input: Input,
+    arena: Allocator,
+    call: ToolCall,
+    permission_mode: PermissionMode,
+    local_grants: []const PermissionGrant,
+) !command_admission.PermissionOutcome {
+    if (input.session_permission_state == null) {
+        if (input.session_permission_state_provider) |provider| {
+            var snapshot = try provider.snapshot(arena);
+            defer snapshot.deinit(arena);
+            var resolved = input;
+            resolved.session_permission_state = &snapshot;
+            resolved.session_permission_state_provider = null;
+            return requestPermissionOutcomeResolved(
+                resolved,
+                arena,
+                call,
+                permission_mode,
+                local_grants,
+            );
+        }
+    }
+    return requestPermissionOutcomeResolved(
+        input,
+        arena,
+        call,
+        permission_mode,
+        local_grants,
+    );
+}
+
+fn requestPermissionOutcomeResolved(
     input: Input,
     arena: Allocator,
     call: ToolCall,
@@ -1069,6 +1139,27 @@ pub fn requestPermissionOutcome(
             },
             .none => all_targets_authorized_by_rule = false,
         }
+    }
+
+    if (input.session_permission_state) |state| {
+        const key = permissionStateKeyForCall(input, arena, call) catch null;
+        if (key) |resolved_key| switch (session_permission_state.decide(state.*, resolved_key)) {
+            .deny => return .{
+                .decision = .policy_denied,
+                .denial_reason = .policy_denied,
+            },
+            .allow => return bindVisionPathExecutionAuthority(
+                permissionOutcomeForDecision(
+                    input,
+                    arena,
+                    call,
+                    .once,
+                    .session_state,
+                ),
+                vision_path_authority,
+            ),
+            .unresolved => {},
+        };
     }
 
     if (configured_ask) {
@@ -1600,11 +1691,7 @@ fn requestSandboxWideningOutcomeInternal(
         );
     }
 
-    const auto_recovery_exhausted = if (input.permission_review_turn) |turn|
-        turn.auto_recovery_exhausted
-    else
-        false;
-    if (permission_mode == .auto and !auto_recovery_exhausted) {
+    if (permission_mode == .auto) {
         if (!input.auto_classifier.enabled() or input.permission_review_turn == null) {
             return reviewerUnavailableOutcome(call);
         }
@@ -2069,6 +2156,175 @@ pub fn runCommandContext(
         .resolved_backend = sandbox.resolveBackend(input.sandbox_backend),
         .target_os = builtin.os.tag,
     };
+}
+
+pub fn permissionStateKeyForCall(
+    input: Input,
+    arena: Allocator,
+    call: ToolCall,
+) !session_permission_state.RuleKey {
+    if (file_mutation_contract.isToolName(call.name)) {
+        return error.PreparedFileMutationRequired;
+    }
+    var canonical: std.Io.Writer.Allocating = .init(arena);
+    defer canonical.deinit();
+    try writeIdentityField(&canonical.writer, "fx-permission-state-v1");
+    if (isRunCommandTool(input, call.name)) {
+        const command = try runCommandContext(input, arena, call);
+        try writeIdentityField(&canonical.writer, command.command);
+        try writeIdentityField(&canonical.writer, command.resolved_cwd);
+        try writeIdentityField(
+            &canonical.writer,
+            if (command.background) "background" else "foreground",
+        );
+        try writeIdentityField(&canonical.writer, @tagName(command.resolved_backend));
+        try writeIdentityField(&canonical.writer, @tagName(command.target_os));
+        try writeIdentityField(&canonical.writer, @tagName(command.scope));
+        const bytes = try canonical.toOwnedSlice();
+        return session_permission_state.RuleKey.init(.command, bytes);
+    }
+
+    var targets = try permissionTargetsForCall(input, arena, call);
+    defer targets.deinit(arena);
+    try writeIdentityField(&canonical.writer, call.name);
+    try writeIdentityField(&canonical.writer, call.arguments_json);
+    for (targets.items) |target| {
+        try writeIdentityField(&canonical.writer, target.role);
+        try writeIdentityField(&canonical.writer, target.path);
+    }
+    const bytes = try canonical.toOwnedSlice();
+    return session_permission_state.RuleKey.init(.structured_tool, bytes);
+}
+
+pub const PreparedPermissionStateAction = struct {
+    key: session_permission_state.RuleKey,
+    display_identity: []const u8,
+};
+
+pub fn preparePermissionStateAction(
+    input: Input,
+    arena: Allocator,
+    call: ToolCall,
+) !PreparedPermissionStateAction {
+    if (!file_mutation_contract.isToolName(call.name)) {
+        const request = try interactivePermissionRequest(input, arena, call, null);
+        return .{
+            .key = try permissionStateKeyForCall(input, arena, call),
+            .display_identity = try arena.dupe(u8, request.label),
+        };
+    }
+
+    var prepared_call = switch (try prepareFileMutationCall(arena, call, .{
+        .tool_registry = input.tool_registry,
+        .workspace_root = input.workspace_root,
+        .access_scope = input.access_scope,
+    })) {
+        .prepared => |prepared| prepared,
+        .tool_failure => return error.PermissionStatePreparationFailed,
+    };
+    defer prepared_call.deinit(arena);
+    const preflight = try preflightPreparedFileMutation(arena, call, &prepared_call, .{
+        .tool_registry = input.tool_registry,
+        .workspace_root = input.workspace_root,
+        .access_scope = input.access_scope,
+        .permission_rules = input.permission_rules,
+        .permission_mode = .ask,
+        .can_prompt = true,
+        .prepare_permission_identity = true,
+    });
+    const authorization = switch (preflight) {
+        .allowed, .prompt, .permission_required => |authorization| authorization,
+        .policy_denied => return error.PermissionStatePreparationDenied,
+        .tool_failure => return error.PermissionStatePreparationFailed,
+    };
+    const prepared = authorization.prepared orelse
+        return error.PermissionStatePreparationFailed;
+    return .{
+        .key = try permissionStateKeyForPreparedFileMutation(arena, prepared),
+        .display_identity = try filePermissionStateDisplay(arena, prepared),
+    };
+}
+
+fn permissionStateKeyForPreparedFileMutation(
+    arena: Allocator,
+    prepared: file_mutation_contract.PreparedFileMutation,
+) !session_permission_state.RuleKey {
+    var canonical: std.Io.Writer.Allocating = .init(arena);
+    defer canonical.deinit();
+    try writeIdentityField(&canonical.writer, "fx-permission-state-file-v1");
+    try writeIdentityField(&canonical.writer, prepared.tool_name);
+    try writeIdentityField(&canonical.writer, &prepared.arguments_hash);
+    try writeIdentityField(&canonical.writer, prepared.target_path);
+    try writeIdentityField(&canonical.writer, @tagName(prepared.kind));
+    switch (prepared.preimage) {
+        .absent => try writeIdentityField(&canonical.writer, "preimage-absent"),
+        .present => |preimage| {
+            try writeIdentityField(&canonical.writer, "preimage-present");
+            try writeIdentityField(&canonical.writer, &preimage.content_hash);
+        },
+    }
+    var after_hash: types.ContentHash = undefined;
+    std.crypto.hash.sha2.Sha256.hash(prepared.after_content, &after_hash, .{});
+    try writeIdentityField(&canonical.writer, &after_hash);
+    for (prepared.policy_targets.items) |target| {
+        try writeIdentityField(
+            &canonical.writer,
+            prepared.policy_targets.canonical_target_path[0..target.path_end],
+        );
+        try writeIdentityField(&canonical.writer, @tagName(target.kind));
+        try writeIdentityField(&canonical.writer, @tagName(target.disposition));
+        if (target.expected_identity) |identity| {
+            try writeIdentityU64(&canonical.writer, identity.device);
+            try writeIdentityU64(&canonical.writer, identity.inode);
+            try writeIdentityField(&canonical.writer, @tagName(identity.kind));
+        } else {
+            try writeIdentityField(&canonical.writer, "identity-absent");
+        }
+    }
+    const bytes = try canonical.toOwnedSlice();
+    return session_permission_state.RuleKey.init(.file_mutation, bytes);
+}
+
+fn filePermissionStateDisplay(
+    arena: Allocator,
+    prepared: file_mutation_contract.PreparedFileMutation,
+) ![]const u8 {
+    var after_hash: types.ContentHash = undefined;
+    std.crypto.hash.sha2.Sha256.hash(prepared.after_content, &after_hash, .{});
+    const after_hex = std.fmt.bytesToHex(after_hash[0..8].*, .lower);
+    return switch (prepared.preimage) {
+        .absent => try std.fmt.allocPrint(
+            arena,
+            "{s} {s} preimage=absent after={s}",
+            .{ prepared.tool_name, prepared.display_path, &after_hex },
+        ),
+        .present => |preimage| blk: {
+            const before_hex = std.fmt.bytesToHex(
+                preimage.content_hash[0..8].*,
+                .lower,
+            );
+            break :blk try std.fmt.allocPrint(
+                arena,
+                "{s} {s} preimage={s} after={s}",
+                .{ prepared.tool_name, prepared.display_path, &before_hex, &after_hex },
+            );
+        },
+    };
+}
+
+fn writeIdentityU64(writer: *std.Io.Writer, value: u64) !void {
+    var bytes: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, value, .big);
+    try writeIdentityField(writer, &bytes);
+}
+
+fn writeIdentityField(writer: *std.Io.Writer, value: []const u8) !void {
+    const value_len = std.math.cast(u64, value.len) orelse
+        return error.InvalidPermissionIdentity;
+    var length: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &length, value_len, .big);
+    try writer.writeAll(&length);
+    try writer.writeAll(value);
 }
 
 fn interactivePermissionRequest(
@@ -3242,7 +3498,7 @@ const FakeAutoClassifier = struct {
         const self: *@This() = @ptrCast(@alignCast(raw_ctx));
         self.calls += 1;
         self.review_model = request.review_turn.model;
-        self.review_root_text = request.review_turn.root_user_messages[0];
+        self.review_root_text = request.review_turn.current_root_request;
         self.review_target_call_id = request.review_turn.target_call_id;
         self.action_tag = std.meta.activeTag(request.action);
         switch (request.action) {
@@ -3375,7 +3631,7 @@ fn testReviewTurn() permission_auto_classifier.ReviewTurnContext {
         .pending_assistant = .{ .role = .assistant, .tool_calls = &test_review_tool_calls },
         .target_call_id = "test-review",
         .origin = .root,
-        .root_user_messages = &test_review_root_messages,
+        .current_root_request = test_review_root_messages[0],
     };
 }
 
@@ -3670,7 +3926,7 @@ test "incomplete review authority maps to auto denial without reviewer transport
         ),
     );
     var review_turn = testReviewTurn();
-    review_turn.root_user_evidence_complete = false;
+    review_turn.current_root_request = "";
     input.permission_review_turn = review_turn;
 
     const outcome = try requestPermissionOutcome(
@@ -3689,29 +3945,6 @@ test "incomplete review authority maps to auto denial without reviewer transport
     try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, outcome.denial_reason.?);
     try std.testing.expect(outcome.execution_authority == null);
     try std.testing.expectEqual(@as(usize, 1), state.review_calls);
-    try std.testing.expectEqual(@as(usize, 0), state.transport_calls);
-
-    review_turn.root_user_evidence_complete = true;
-    review_turn.trusted_permission_feedback_complete = false;
-    input.permission_review_turn = review_turn;
-    const incomplete_feedback = try requestPermissionOutcome(
-        input,
-        arena_state.allocator(),
-        .{
-            .id = "test-feedback-review",
-            .name = "run_command",
-            .arguments_json = "{\"command\":\"touch feedback-incomplete.txt\"}",
-        },
-        .auto,
-        &.{},
-    );
-    try std.testing.expectEqual(ToolPermissionDecision.deny, incomplete_feedback.decision);
-    try std.testing.expectEqual(
-        types.ToolPermissionDenialReason.auto_denied,
-        incomplete_feedback.denial_reason.?,
-    );
-    try std.testing.expect(incomplete_feedback.execution_authority == null);
-    try std.testing.expectEqual(@as(usize, 2), state.review_calls);
     try std.testing.expectEqual(@as(usize, 0), state.transport_calls);
 }
 
@@ -4514,7 +4747,7 @@ test "invalid automatic review returns a recoverable denial without a prompter" 
     try std.testing.expect(outcome.auto_review_result == null);
 }
 
-test "exhausted automatic recovery bypasses review and uses ordinary approval" {
+test "exhausted automatic recovery remains a recoverable review denial" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
@@ -4531,9 +4764,7 @@ test "exhausted automatic recovery bypasses review and uses ordinary approval" {
             FakeAutoClassifier.classify,
         ),
     );
-    var review_turn = testReviewTurn();
-    review_turn.auto_recovery_exhausted = true;
-    input.permission_review_turn = review_turn;
+    input.permission_review_turn = testReviewTurn();
     input.permission_prompter = recording.prompter();
     const call = ToolCall{
         .id = "exhausted",
@@ -4541,16 +4772,17 @@ test "exhausted automatic recovery bypasses review and uses ordinary approval" {
         .arguments_json = "{\"command\":\"touch exhausted.txt\"}",
     };
 
-    const approved = try requestPermissionOutcome(
+    const reviewed = try requestPermissionOutcome(
         input,
         arena_state.allocator(),
         call,
         .auto,
         &.{},
     );
-    try std.testing.expectEqual(ToolPermissionDecision.once, approved.decision);
-    try std.testing.expectEqual(@as(usize, 0), fake.calls);
-    try std.testing.expectEqual(@as(usize, 1), recording.calls);
+    try std.testing.expectEqual(ToolPermissionDecision.deny, reviewed.decision);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, reviewed.denial_reason.?);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(@as(usize, 0), recording.calls);
 
     input.permission_prompter = null;
     const headless = try requestPermissionOutcome(
@@ -4560,9 +4792,10 @@ test "exhausted automatic recovery bypasses review and uses ordinary approval" {
         .auto,
         &.{},
     );
-    try std.testing.expectEqual(ToolPermissionDecision.permission_required, headless.decision);
-    try std.testing.expectEqual(types.ToolPermissionDenialReason.permission_required, headless.denial_reason.?);
-    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectEqual(ToolPermissionDecision.deny, headless.decision);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, headless.denial_reason.?);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expectEqual(@as(usize, 0), recording.calls);
 }
 
 test "automatic review is skipped for deterministic command authorities" {
@@ -4620,6 +4853,106 @@ test "automatic review is skipped for deterministic command authorities" {
         configured.execution_authority.?.run_command.shell_allowed.source,
     );
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
+}
+
+test "session deny narrows configured command allow" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var background: BackgroundRuntime = .{};
+    defer background.deinit(alloc);
+    var input = testInputWithClassifier(
+        &worker,
+        &background,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    var rules = [_]types.PermissionRule{.{
+        .permission = @constCast("bash"),
+        .pattern = @constCast("touch *"),
+        .action = .allow,
+    }};
+    input.permission_rules = .{ .rules = &rules };
+    const call = ToolCall{
+        .id = "configured-session-deny",
+        .name = "run_command",
+        .arguments_json = "{\"command\":\"touch configured.txt\"}",
+    };
+    const key = try permissionStateKeyForCall(input, arena, call);
+    var empty: session_permission_state.State = .{};
+    defer empty.deinit(alloc);
+    var applied = try session_permission_state.apply(alloc, empty, .{ .set = .{
+        .key = key,
+        .display_identity = "touch configured.txt",
+        .decision = .deny,
+        .expected_generation = null,
+    } });
+    var state = applied.takeApplied() orelse return error.TestExpectedAppliedState;
+    defer state.deinit(alloc);
+    input.session_permission_state = &state;
+
+    const denied = try requestPermissionOutcome(
+        input,
+        arena,
+        call,
+        .auto,
+        &.{},
+    );
+    try std.testing.expectEqual(ToolPermissionDecision.policy_denied, denied.decision);
+    try std.testing.expect(denied.execution_authority == null);
+}
+
+test "prepared session deny blocks local file mutation without setup effects" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var background: BackgroundRuntime = .{};
+    defer background.deinit(alloc);
+    var input = testInputWithClassifier(
+        &worker,
+        &background,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    input.workspace_root = workspace;
+    const call = ToolCall{
+        .id = "prepared-file-session-deny",
+        .name = "write_file",
+        .arguments_json = "{\"path\":\"blocked.txt\",\"content\":\"blocked\"}",
+    };
+    const identity = try preparePermissionStateAction(input, arena, call);
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.openFile(io_mod.getIo(), "workspace/blocked.txt", .{}),
+    );
+    var empty: session_permission_state.State = .{};
+    defer empty.deinit(alloc);
+    var applied = try session_permission_state.apply(alloc, empty, .{ .set = .{
+        .key = identity.key,
+        .display_identity = identity.display_identity,
+        .decision = .deny,
+        .expected_generation = null,
+    } });
+    var state = applied.takeApplied() orelse return error.TestExpectedAppliedState;
+    defer state.deinit(alloc);
+    input.session_permission_state = &state;
+
+    const denied = try requestPermissionOutcome(input, arena, call, .auto, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.policy_denied, denied.decision);
+    try std.testing.expect(denied.execution_authority == null);
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.openFile(io_mod.getIo(), "workspace/blocked.txt", .{}),
+    );
 }
 
 test "js host workspace sandbox default is lowest priority and prompt disables it" {
@@ -4777,7 +5110,7 @@ test "sandbox widening review carries the full broader command context" {
     try std.testing.expectEqual(permission_auto_classifier.SandboxScope.broader, authority.fingerprint.scope);
 }
 
-test "unavailable sandbox reviewer returns to the agent until recovery is exhausted" {
+test "unavailable sandbox reviewer always returns to the agent" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
@@ -4817,10 +5150,7 @@ test "unavailable sandbox reviewer returns to the agent until recovery is exhaus
     try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, recoverable.denial_reason.?);
     try std.testing.expectEqual(@as(usize, 0), recording.calls);
 
-    var exhausted_turn = input.permission_review_turn.?;
-    exhausted_turn.auto_recovery_exhausted = true;
-    input.permission_review_turn = exhausted_turn;
-    const escalated = try requestSandboxWideningOutcome(
+    const repeated = try requestSandboxWideningOutcome(
         input,
         arena_state.allocator(),
         call,
@@ -4828,8 +5158,9 @@ test "unavailable sandbox reviewer returns to the agent until recovery is exhaus
         &.{},
         widening,
     );
-    try std.testing.expectEqual(ToolPermissionDecision.once, escalated.decision);
-    try std.testing.expectEqual(@as(usize, 1), recording.calls);
+    try std.testing.expectEqual(ToolPermissionDecision.deny, repeated.decision);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, repeated.denial_reason.?);
+    try std.testing.expectEqual(@as(usize, 0), recording.calls);
 }
 
 test "reactive sandbox widening without the restricted result fails closed" {

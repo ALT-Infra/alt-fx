@@ -1,5 +1,6 @@
 const std = @import("std");
 const mcp_access = @import("../mcp/access_policy.zig");
+const session_permission_state = @import("../permissions/session_permission_state.zig");
 const session_layout = @import("../session/session_layout.zig");
 const types = @import("../shared/types.zig");
 
@@ -344,6 +345,7 @@ pub const AdmissionSnapshot = struct {
     tool_names: [][]u8,
     rules: types.PermissionRuleSet,
     grants: []types.PermissionGrant,
+    permission_state: session_permission_state.State = .{},
     integration_names: [][]u8,
     authority_generation: u64 = 0,
     mcp_view: ?mcp_access.View = null,
@@ -355,6 +357,7 @@ pub const AdmissionSnapshot = struct {
         freeStrings(alloc, self.tool_names);
         self.rules.deinit(alloc);
         types.freePermissionGrantSlice(alloc, self.grants);
+        self.permission_state.deinit(alloc);
         freeStrings(alloc, self.integration_names);
         if (self.mcp_view) |*view| view.deinit(alloc);
         self.* = undefined;
@@ -374,6 +377,14 @@ pub const AdmissionSnapshot = struct {
         errdefer rules.deinit(alloc);
         const grants = try types.dupePermissionGrantSlice(alloc, self.grants);
         errdefer types.freePermissionGrantSlice(alloc, grants);
+        const permission_state = try session_permission_state.dupe(
+            alloc,
+            self.permission_state,
+        );
+        errdefer {
+            var value = permission_state;
+            value.deinit(alloc);
+        }
         var mcp_view = if (self.mcp_view) |view| try view.clone(alloc) else null;
         errdefer if (mcp_view) |*view| view.deinit(alloc);
         const integration_names = try cloneStrings(alloc, self.integration_names);
@@ -387,6 +398,7 @@ pub const AdmissionSnapshot = struct {
             .tool_names = tool_names,
             .rules = rules,
             .grants = grants,
+            .permission_state = permission_state,
             .integration_names = integration_names,
             .authority_generation = self.authority_generation,
             .mcp_view = mcp_view,
@@ -404,6 +416,7 @@ pub const AdmissionInput = struct {
     tool_names: []const []const u8 = &.{},
     rules: types.PermissionRuleSet = .{},
     grants: []const types.PermissionGrant = &.{},
+    permission_state: session_permission_state.State = .{},
     integration_names: []const []const u8 = &.{},
     authority_generation: u64 = 0,
     mcp_view: ?mcp_access.View = null,
@@ -442,6 +455,8 @@ pub fn captureAdmission(
         try validateAdmissionText(grant.tool_name);
         try validateAdmissionText(grant.target_path);
     }
+    session_permission_state.validate(input.permission_state) catch
+        return error.InvalidAdmissionItem;
 
     const parent_id = try alloc.dupe(u8, input.parent_id);
     errdefer alloc.free(parent_id);
@@ -455,6 +470,17 @@ pub fn captureAdmission(
     errdefer rules.deinit(alloc);
     const grants = try types.dupePermissionGrantSlice(alloc, input.grants);
     errdefer types.freePermissionGrantSlice(alloc, grants);
+    const permission_state = session_permission_state.dupe(
+        alloc,
+        input.permission_state,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidAdmissionItem,
+    };
+    errdefer {
+        var value = permission_state;
+        value.deinit(alloc);
+    }
     var mcp_view = if (input.mcp_view) |view| try view.clone(alloc) else null;
     errdefer if (mcp_view) |*view| view.deinit(alloc);
     const integration_names = try cloneStrings(alloc, input.integration_names);
@@ -468,6 +494,7 @@ pub fn captureAdmission(
         .tool_names = tool_names,
         .rules = rules,
         .grants = grants,
+        .permission_state = permission_state,
         .integration_names = integration_names,
         .authority_generation = input.authority_generation,
         .mcp_view = mcp_view,

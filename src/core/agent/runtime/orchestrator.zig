@@ -1918,18 +1918,6 @@ fn containsImageId(image_ids: []const usize, candidate: usize) bool {
     return false;
 }
 
-const ReviewAuthority = struct {
-    root_user_messages: []const []const u8,
-    root_user_evidence_complete: bool,
-    trusted_permission_feedback: []const []const u8,
-    trusted_permission_feedback_complete: bool,
-
-    fn deinit(self: ReviewAuthority, alloc: Allocator) void {
-        alloc.free(self.root_user_messages);
-        alloc.free(self.trusted_permission_feedback);
-    }
-};
-
 /// Finds the canonical current user message after a length-changing request
 /// projection so native image parts can be removed from reviewer context. This
 /// mapping does not establish permission authority.
@@ -1970,130 +1958,22 @@ fn projectedUserMessageIndex(
     return matched_index;
 }
 
-noinline fn buildReviewAuthority(
-    alloc: Allocator,
-    origin: runtime_config.TurnOrigin,
-    projected_messages: []const ChatMessage,
-    source_messages: []const ChatMessage,
-    history_start_index: usize,
-    current_user_message_index: usize,
-    projected_current_user_message_index: ?usize,
-    history: []const HistoryTurn,
-    current_root_prompt: []const u8,
-    pending_user_suffix: []const ChatMessage,
-) !ReviewAuthority {
-    _ = projected_messages;
-    _ = history_start_index;
-    _ = projected_current_user_message_index;
-    var root_user_messages: std.ArrayList([]const u8) = .empty;
-    errdefer root_user_messages.deinit(alloc);
-    var trusted_permission_feedback: std.ArrayList([]const u8) = .empty;
-    errdefer trusted_permission_feedback.deinit(alloc);
-    var root_user_evidence_complete = true;
-    var trusted_permission_feedback_complete = true;
-
-    for (history) |turn| switch (turn) {
-        .compacted_summary => |entry| {
-            trusted_permission_feedback_complete =
-                trusted_permission_feedback_complete and
-                entry.permission_feedback_complete;
-            try trusted_permission_feedback.appendSlice(
-                alloc,
-                entry.permission_feedback,
-            );
-        },
-        .assistant => |entry| try appendExecutionPermissionFeedback(
-            alloc,
-            &trusted_permission_feedback,
-            entry.execution,
-        ),
-        .background_command => |entry| try appendExecutionPermissionFeedback(
-            alloc,
-            &trusted_permission_feedback,
-            entry.execution,
-        ),
-        .interrupted => |entry| try appendExecutionPermissionFeedback(
-            alloc,
-            &trusted_permission_feedback,
-            entry.execution,
-        ),
-    };
-
-    if (origin == .root) {
-        for (history) |turn| switch (turn) {
-            .compacted_summary => |entry| {
-                root_user_evidence_complete = root_user_evidence_complete and
-                    entry.root_user_messages_complete;
-                try root_user_messages.appendSlice(alloc, entry.root_user_messages);
-            },
-            .assistant => |entry| try root_user_messages.append(alloc, entry.user.text),
-            .background_command => |entry| try root_user_messages.append(alloc, entry.user.text),
-            .interrupted => |entry| try root_user_messages.append(alloc, entry.user.text),
-        };
-        if (current_root_prompt.len > 0) {
-            try root_user_messages.append(alloc, current_root_prompt);
-        }
-    }
-
-    for (source_messages[current_user_message_index + 1 ..]) |source| {
-        if (source.role != .user or !source.permission_feedback) continue;
-        const feedback = source.content orelse continue;
-        if (feedback.len > 0) try trusted_permission_feedback.append(alloc, feedback);
-    }
-    try appendTrustedPermissionFeedback(alloc, &trusted_permission_feedback, pending_user_suffix);
-
-    const owned_root_user_messages = try root_user_messages.toOwnedSlice(alloc);
-    errdefer alloc.free(owned_root_user_messages);
-    const owned_permission_feedback = try trusted_permission_feedback.toOwnedSlice(alloc);
-    errdefer alloc.free(owned_permission_feedback);
-    return .{
-        .root_user_messages = owned_root_user_messages,
-        .root_user_evidence_complete = root_user_evidence_complete,
-        .trusted_permission_feedback = owned_permission_feedback,
-        .trusted_permission_feedback_complete = trusted_permission_feedback_complete,
-    };
-}
-
 fn buildReviewTurnContext(
-    alloc: Allocator,
     config: Config,
     model: []const u8,
     projected_messages: []const ChatMessage,
-    source_messages: []const ChatMessage,
-    history_start_index: usize,
-    current_user_message_index: usize,
-    projected_current_user_message_index: ?usize,
-    history: []const HistoryTurn,
     current_prompt: []const u8,
-    _: []const u8,
-    pending_user_suffix: []const ChatMessage,
     pending_assistant: ChatMessage,
     target_call_id: []const u8,
-    auto_recovery_exhausted: bool,
-) !permission_auto_classifier.ReviewTurnContext {
-    const authority = try buildReviewAuthority(
-        alloc,
-        config.origin,
-        projected_messages,
-        source_messages,
-        history_start_index,
-        current_user_message_index,
-        projected_current_user_message_index,
-        history,
-        current_prompt,
-        pending_user_suffix,
-    );
-    const child_root_user_messages = if (config.origin == .subagent and
-        config.current_prompt_is_root_authority)
-    blk: {
-        const combined = try alloc.alloc([]const u8, config.root_user_messages.len + 1);
-        @memcpy(combined[0..config.root_user_messages.len], config.root_user_messages);
-        combined[combined.len - 1] = current_prompt;
-        break :blk combined;
-    } else config.root_user_messages;
-    const child_root_user_evidence_complete =
-        config.root_user_evidence_complete and
-        (!config.current_prompt_is_root_authority or current_prompt.len > 0);
+) permission_auto_classifier.ReviewTurnContext {
+    const current_root_request = if (config.origin == .root)
+        current_prompt
+    else if (config.current_prompt_is_root_authority)
+        current_prompt
+    else if (config.root_user_messages.len > 0)
+        config.root_user_messages[config.root_user_messages.len - 1]
+    else
+        "";
     return .{
         .model = model,
         .request_messages = projected_messages,
@@ -2103,73 +1983,84 @@ fn buildReviewTurnContext(
             .root => .root,
             .subagent => .subagent,
         },
-        .root_user_messages = if (config.origin == .subagent)
-            child_root_user_messages
-        else
-            authority.root_user_messages,
-        .root_user_evidence_complete = if (config.origin == .subagent)
-            child_root_user_evidence_complete
-        else
-            authority.root_user_evidence_complete,
-        .inherited_root_context = "",
-        .trusted_permission_feedback = authority.trusted_permission_feedback,
-        .trusted_permission_feedback_complete = authority.trusted_permission_feedback_complete,
-        .auto_recovery_exhausted = auto_recovery_exhausted,
+        .current_root_request = current_root_request,
     };
-}
-
-fn appendExecutionPermissionFeedback(
-    alloc: Allocator,
-    feedback: *std.ArrayList([]const u8),
-    execution: types.ExecutionMemory,
-) !void {
-    for (execution.tool_steps) |step| {
-        for (step.tool_results) |result| {
-            for (result.permission_feedback) |item| {
-                if (item.len > 0) try feedback.append(alloc, item);
-            }
-        }
-    }
 }
 
 const max_automatic_non_allow_response_groups: usize = 3;
+const permission_recovery_fallback = "The blocked action was not run. No safe alternative completed within the configured agent step limit. Provide direction to continue.";
+const permission_recovery_final_guidance = "Permission recovery reached its action limit. Do not call tools. Explain that the blocked action did not run, then ask the user for direction or finish honestly.";
 
 fn automaticRecoveryExhausted(messages: []const ChatMessage) bool {
     var blocked_groups: usize = 0;
-    var group_open = false;
-    var group_has_auto_denial = false;
-    var group_has_success = false;
-
-    for (messages) |message| switch (message.role) {
-        .assistant => {
-            if (group_open) {
-                if (group_has_auto_denial) {
-                    blocked_groups +|= 1;
-                } else if (group_has_success) {
-                    blocked_groups = 0;
-                }
-            }
-            group_open = message.tool_calls.len > 0;
-            group_has_auto_denial = false;
-            group_has_success = false;
-        },
-        .tool => {
-            if (!group_open) continue;
-            if (message.tool_result_status == .success) {
-                group_has_success = true;
-                continue;
-            }
+    var index: usize = 0;
+    while (index < messages.len) : (index += 1) {
+        const assistant = messages[index];
+        if (assistant.role != .assistant or assistant.tool_calls.len == 0) continue;
+        var group_end = index + 1;
+        while (group_end < messages.len and messages[group_end].role != .assistant) {
+            group_end += 1;
+        }
+        if (!responseGroupComplete(messages[index + 1 .. group_end], assistant.tool_calls)) {
+            index = group_end -| 1;
+            continue;
+        }
+        var has_permission_denial = false;
+        var has_success = false;
+        for (messages[index + 1 .. group_end]) |message| {
+            if (message.role != .tool) continue;
+            if (message.tool_result_status == .success) has_success = true;
             const output = message.content orelse continue;
-            if (tool_result_errors.toolPermissionDenialReason(output) == .auto_denied) {
-                group_has_auto_denial = true;
+            if (tool_result_errors.toolPermissionDenialReason(output) != null) {
+                has_permission_denial = true;
             }
-        },
-        else => {},
-    };
-
-    // The trailing group is the action currently being admitted, so it is not
-    // complete and must not count toward escalation yet.
+        }
+        if (has_permission_denial) {
+            blocked_groups +|= 1;
+        } else if (has_success) {
+            blocked_groups = 0;
+        }
+        index = group_end -| 1;
+    }
     return blocked_groups >= max_automatic_non_allow_response_groups;
+}
+
+fn responseGroupComplete(
+    results: []const ChatMessage,
+    calls: []const ToolCall,
+) bool {
+    for (calls) |call| {
+        var found = false;
+        for (results) |result| {
+            if (result.role == .tool and
+                result.tool_call_id != null and
+                std.mem.eql(u8, result.tool_call_id.?, call.id))
+            {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+const PermissionRecoveryPlan = enum {
+    continue_with_tools,
+    final_model_response,
+    local_fallback,
+};
+
+fn permissionRecoveryPlan(
+    messages: []const ChatMessage,
+    step_limit: usize,
+    completed_steps: usize,
+) PermissionRecoveryPlan {
+    if (!automaticRecoveryExhausted(messages)) return .continue_with_tools;
+    if (agent_steps.allowsStep(step_limit, completed_steps)) {
+        return .final_model_response;
+    }
+    return .local_fallback;
 }
 
 test "automatic recovery counts completed response groups and resets after success" {
@@ -2240,6 +2131,31 @@ test "a mixed parallel response group is blocked regardless result order" {
     denial_first[9] = current;
     try std.testing.expect(automaticRecoveryExhausted(&success_first));
     try std.testing.expect(automaticRecoveryExhausted(&denial_first));
+}
+
+test "permission recovery plan respects the ordinary step budget" {
+    const denied = "{\"error\":{\"type\":\"tool_permission_denied\",\"reason\":\"auto_denied\"}}";
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &.{.{ .id = "one", .name = "run_command", .arguments_json = "{}" }} },
+        .{ .role = .tool, .content = denied, .tool_call_id = "one", .tool_result_status = .failure },
+        .{ .role = .assistant, .tool_calls = &.{.{ .id = "two", .name = "run_command", .arguments_json = "{}" }} },
+        .{ .role = .tool, .content = denied, .tool_call_id = "two", .tool_result_status = .failure },
+        .{ .role = .assistant, .tool_calls = &.{.{ .id = "three", .name = "run_command", .arguments_json = "{}" }} },
+        .{ .role = .tool, .content = denied, .tool_call_id = "three", .tool_result_status = .failure },
+    };
+
+    try std.testing.expectEqual(
+        PermissionRecoveryPlan.final_model_response,
+        permissionRecoveryPlan(&messages, 0, 3),
+    );
+    try std.testing.expectEqual(
+        PermissionRecoveryPlan.final_model_response,
+        permissionRecoveryPlan(&messages, 4, 3),
+    );
+    try std.testing.expectEqual(
+        PermissionRecoveryPlan.local_fallback,
+        permissionRecoveryPlan(&messages, 3, 3),
+    );
 }
 
 fn appendTrustedPermissionFeedback(
@@ -2393,6 +2309,14 @@ fn processQueuedPromptLoop(
     var restore_recovery_source = job.recovery_checkpoint != null;
     var step: usize = 0;
     while (agent_steps.allowsStep(config.agent_step_limit, step)) : (step += 1) {
+        const permission_recovery_plan = permissionRecoveryPlan(
+            within_turn_suffix.items,
+            config.agent_step_limit,
+            step,
+        );
+        std.debug.assert(permission_recovery_plan != .local_fallback);
+        const final_permission_response =
+            permission_recovery_plan == .final_model_response;
         current_step_index = step + 1;
         const step_ctx: TraceContext = .{ .turn_id = turn_id, .step_id = debug_trace.nextStepId(), .subagent_id = config.subagent_id };
         const presentation_group_id = runtime_tool_presentation.presentationGroupForStep(
@@ -2412,6 +2336,12 @@ fn processQueuedPromptLoop(
         var ephemeral_overlay: std.ArrayList(ChatMessage) = .empty;
         if (config.explicit_skills_prompt_section.len > 0) {
             try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = config.explicit_skills_prompt_section });
+        }
+        if (final_permission_response) {
+            try ephemeral_overlay.append(overlay_arena, .{
+                .role = .system,
+                .content = permission_recovery_final_guidance,
+            });
         }
         try deps.append_runtime_context(deps.ctx, overlay_arena, &ephemeral_overlay);
         var parent_turn_delivery = try appendPreparedParentTurnContext(
@@ -2456,7 +2386,6 @@ fn processQueuedPromptLoop(
         var gateway_model: []const u8 = job.model;
         var successful_request_messages: []const ChatMessage = &.{};
         var successful_review_messages: []const ChatMessage = &.{};
-        var successful_review_current_user_message_index: ?usize = null;
         var successful_source_messages: []const ChatMessage = &.{};
         var successful_gateway_model: []const u8 = "";
         var successful_vision_route: runtime_vision_contracts.VisionRoute = .native_images;
@@ -2594,7 +2523,9 @@ fn processQueuedPromptLoop(
             );
             debug_trace.eventf("gateway", "before_payload_build", step_ctx, "model={s} gateway_messages={d}", .{ gateway_model, gateway_messages.items.len });
             var vision_route: runtime_vision_contracts.VisionRoute = .native_images;
-            var vision_mode: runtime_gateway_step.VisionToolMode = if (deps.tool_registry.lookup("vision") != null)
+            var vision_mode: runtime_gateway_step.VisionToolMode = if (final_permission_response)
+                .unavailable
+            else if (deps.tool_registry.lookup("vision") != null)
                 .optional
             else
                 .unavailable;
@@ -2635,7 +2566,9 @@ fn processQueuedPromptLoop(
             last_gateway_message_count = request_messages.len;
             const provider_opts = model_capabilities.resolveProviderOptionsForCapabilities(request_capabilities, config.effort, route_fast_mode);
             runtime_telemetry.traceGatewayProviderOptions(step_ctx, gateway_model, route_fast_mode, config.effort, provider_opts);
-            const tool_choice: types.ToolChoice = if (recovery_strategy == .reconcile_tool)
+            const tool_choice: types.ToolChoice = if (final_permission_response)
+                .none
+            else if (recovery_strategy == .reconcile_tool)
                 .none
             else if (configured_first_tool_choice_pending and vision_mode != .required)
                 config.first_call_tool_choice
@@ -2644,11 +2577,20 @@ fn processQueuedPromptLoop(
             const request_payload = deps.agent_stream_provider.build(
                 overlay_arena,
                 .{
-                    .tool_registry = deps.tool_registry,
-                    .serialized_tools = config.gateway_tools_json,
+                    .tool_registry = if (final_permission_response)
+                        .{ .tools = &.{} }
+                    else
+                        deps.tool_registry,
+                    .serialized_tools = if (final_permission_response)
+                        "[]"
+                    else
+                        config.gateway_tools_json,
                     .messages = request_messages,
                     .tool_choice = tool_choice,
-                    .selected_dynamic_tool_schemas = selected_dynamic_tool_schemas.items,
+                    .selected_dynamic_tool_schemas = if (final_permission_response)
+                        &.{}
+                    else
+                        selected_dynamic_tool_schemas.items,
                     .vision_mode = vision_mode,
                     .provider_options = provider_opts,
                     .max_output_tokens = request_capabilities.max_output_tokens,
@@ -2681,7 +2623,13 @@ fn processQueuedPromptLoop(
                 debug_trace.logf("agent", "token progress publication failed source=gateway_prepare err={s}", .{@errorName(progress_err)});
             };
             debug_trace.eventf("gateway", "after_payload_build", step_ctx, "payload_bytes={d} model={s} gateway_messages={d}", .{ request_payload.len, gateway_model, request_messages.len });
-            runtime_telemetry.traceGatewayRequestBuilt(step_ctx, gateway_model, request_payload.len, request_messages.len, config.gateway_tools_json);
+            runtime_telemetry.traceGatewayRequestBuilt(
+                step_ctx,
+                gateway_model,
+                request_payload.len,
+                request_messages.len,
+                if (final_permission_response) "[]" else config.gateway_tools_json,
+            );
             try persistRecoveryCheckpoint(
                 deps,
                 arena,
@@ -3589,7 +3537,6 @@ fn processQueuedPromptLoop(
                         recovery_source_messages,
                         current_user_message_index,
                     ) orelse return error.MissingUserMessage;
-                    successful_review_current_user_message_index = review_current_user_message_index;
                     break :blk try runtime_vision_contracts.project_text_only_messages(
                         overlay_arena,
                         successful_request_messages,
@@ -3814,6 +3761,36 @@ fn processQueuedPromptLoop(
             }
         }
 
+        if (final_permission_response and completion.tool_calls.len > 0) {
+            try stream_ctx.provisional_statuses.finishRejectedCompletions(
+                deps,
+                arena,
+                turn_id,
+                completion.tool_calls,
+                advertised_dynamic_tool_names,
+            );
+            debug_trace.eventf(
+                "permission",
+                "permission_recovery_final_tool_rejected",
+                step_ctx,
+                "tool_call_count={d}",
+                .{completion.tool_calls.len},
+            );
+            try finishFailedTurnWithNotice(
+                deps,
+                finalization,
+                arena,
+                job,
+                within_turn_suffix.items,
+                &summary_accumulator,
+                stop_state,
+                &finish_trace,
+                permission_recovery_fallback,
+                "permission_recovery_fallback",
+            );
+            return;
+        }
+
         if (disposition == .completed and completion.tool_calls.len > 0) {
             const admission = types.authoritativeToolAdmission(completion);
             switch (admission) {
@@ -3967,6 +3944,21 @@ fn processQueuedPromptLoop(
         if (completion.tool_calls.len == 0) {
             const has_content =
                 std.mem.trim(u8, partial_assistant, " \t\r\n").len > 0;
+            if (final_permission_response and !has_content) {
+                try finishFailedTurnWithNotice(
+                    deps,
+                    finalization,
+                    arena,
+                    job,
+                    within_turn_suffix.items,
+                    &summary_accumulator,
+                    stop_state,
+                    &finish_trace,
+                    permission_recovery_fallback,
+                    "permission_recovery_fallback",
+                );
+                return;
+            }
             const needs_continuation =
                 disposition == .completed and
                 !continuation_injected and
@@ -4542,22 +4534,13 @@ fn processQueuedPromptLoop(
                         parallel_status_started[group_index] = try runtime_tool_presentation.startToolVisibleLifecycle(deps, arena, turn_id, stream_ctx.provisional_statuses.presentation_group_id, parallel_call, null, advertised_dynamic_tool_names);
                     }
 
-                    const parallel_review_context = try buildReviewTurnContext(
-                        arena,
+                    const parallel_review_context = buildReviewTurnContext(
                         config,
                         successful_gateway_model,
                         successful_review_messages,
-                        successful_source_messages,
-                        history_start_index,
-                        current_user_message_index,
-                        successful_review_current_user_message_index,
-                        job.history,
                         job.prompt,
-                        root_user_intent_context,
-                        step_batch.pending_user_suffix.items,
                         pending_assistant,
                         parallel_call.id,
-                        automaticRecoveryExhausted(within_turn_suffix.items),
                     );
                     const maybe_parallel_permission: ?command_admission.PermissionOutcome = runtime_tool_admission.requestToolPermissionTraced(deps, arena, parallel_call, parallel_review_context, job.permission_mode, local_grants.items, null, null, advertised_dynamic_tool_names, config.workspace_root, step_ctx) catch |err| blk: {
                         if (err != error.Cancelled or !config.cancel_flag.load(.seq_cst)) return err;
@@ -5470,22 +5453,13 @@ fn processQueuedPromptLoop(
                 try types.dupeToolCall(call_allocator, tool_call)
             else
                 tool_call;
-            const review_context = try buildReviewTurnContext(
-                call_allocator,
+            const review_context = buildReviewTurnContext(
                 config,
                 successful_gateway_model,
                 successful_review_messages,
-                successful_source_messages,
-                history_start_index,
-                current_user_message_index,
-                successful_review_current_user_message_index,
-                job.history,
                 job.prompt,
-                root_user_intent_context,
-                step_batch.pending_user_suffix.items,
                 pending_assistant,
                 execution_call.id,
-                automaticRecoveryExhausted(within_turn_suffix.items),
             );
             const tool_execution_root_user_context = try buildToolExecutionRootUserContext(
                 call_allocator,
@@ -5968,8 +5942,8 @@ fn processQueuedPromptLoop(
                 .call = execution_call,
                 .authority = execution_authority,
                 .root_user_intent_context = tool_execution_root_user_context,
-                .root_user_messages = review_context.root_user_messages,
-                .root_user_evidence_complete = review_context.root_user_evidence_complete,
+                .root_user_messages = &.{},
+                .root_user_evidence_complete = true,
                 .authorized_image_catalog = job.authorized_image_catalog,
                 .current_turn_messages = within_turn_suffix.items,
                 .session_grants = execution_grants,
@@ -6395,8 +6369,8 @@ fn processQueuedPromptLoop(
                             .call = execution_call,
                             .authority = broader_authority,
                             .root_user_intent_context = tool_execution_root_user_context,
-                            .root_user_messages = review_context.root_user_messages,
-                            .root_user_evidence_complete = review_context.root_user_evidence_complete,
+                            .root_user_messages = &.{},
+                            .root_user_evidence_complete = true,
                             .authorized_image_catalog = job.authorized_image_catalog,
                             .current_turn_messages = within_turn_suffix.items,
                             .session_grants = if (live_authority) |resolved|
@@ -6950,6 +6924,15 @@ fn processQueuedPromptLoop(
         }
     }
 
+    const exhausted_recovery_plan = permissionRecoveryPlan(
+        within_turn_suffix.items,
+        config.agent_step_limit,
+        step,
+    );
+    const final_notice = if (exhausted_recovery_plan == .local_fallback)
+        permission_recovery_fallback
+    else
+        config.step_limit_notice;
     runtime_telemetry.traceStepLimitReached(.{
         .ctx = last_step_ctx,
         .step_index = current_step_index,
@@ -6968,8 +6951,11 @@ fn processQueuedPromptLoop(
         &summary_accumulator,
         stop_state,
         &finish_trace,
-        config.step_limit_notice,
-        "step_limit",
+        final_notice,
+        if (exhausted_recovery_plan == .local_fallback)
+            "permission_recovery_fallback"
+        else
+            "step_limit",
     );
 }
 
@@ -7133,476 +7119,6 @@ pub fn copyLatestStopPartial(
         null
     else
         try alloc.dupe(u8, partial);
-}
-
-test "review authority binds current root across native-to-review projection" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const first_vision_calls = [_]ToolCall{
-        .{ .id = "vision_1", .name = "vision", .arguments_json = "{}" },
-        .{ .id = "vision_2", .name = "vision", .arguments_json = "{}" },
-    };
-    const second_vision_calls = [_]ToolCall{
-        .{ .id = "vision_3", .name = "vision", .arguments_json = "{}" },
-        .{ .id = "vision_4", .name = "vision", .arguments_json = "{}" },
-    };
-    var source = [_]ChatMessage{.{ .role = .assistant, .content = "historical response" }} ** 77;
-    source[10] = .{ .role = .assistant, .tool_calls = &first_vision_calls };
-    source[11] = .{ .role = .tool, .content = "failed", .tool_call_id = "vision_1", .tool_name = "vision" };
-    source[12] = .{ .role = .tool, .content = "failed", .tool_call_id = "vision_2", .tool_name = "vision" };
-    source[20] = .{ .role = .assistant, .tool_calls = &second_vision_calls };
-    source[21] = .{ .role = .tool, .content = "failed", .tool_call_id = "vision_3", .tool_name = "vision" };
-    source[22] = .{ .role = .tool, .content = "failed", .tool_call_id = "vision_4", .tool_name = "vision" };
-    const catalog = [_]types.ImageAttachment{.{
-        .id = 1,
-        .path = @constCast("/tmp/private.png"),
-        .media_type = @constCast("image/png"),
-    }};
-    source[76] = .{
-        .role = .user,
-        .content = "Investigate the failed request.",
-        .images = &catalog,
-    };
-    const projected = try runtime_vision_contracts.project_native_messages(arena, &source, 76);
-    try std.testing.expectEqual(@as(usize, 71), projected.len);
-    const review_messages = try runtime_vision_contracts.project_text_only_messages(
-        arena,
-        projected,
-        70,
-        &catalog,
-    );
-    try std.testing.expectEqual(@as(usize, 0), review_messages[70].images.len);
-    try std.testing.expect(std.mem.find(u8, review_messages[70].content.?, "<available_images>") != null);
-
-    const authority = try buildReviewAuthority(
-        arena,
-        .root,
-        review_messages,
-        &source,
-        7,
-        76,
-        70,
-        &.{},
-        "Investigate the failed request.",
-        &.{},
-    );
-
-    try std.testing.expectEqual(@as(usize, 1), authority.root_user_messages.len);
-    try std.testing.expectEqualStrings(
-        "Investigate the failed request.",
-        authority.root_user_messages[0],
-    );
-}
-
-test "review authority preserves exact root-user order across compacted and live history" {
-    const alloc = std.testing.allocator;
-    var compacted_root_messages = [_][]u8{
-        @constCast("first exact request"),
-        @constCast("second exact request"),
-    };
-    const history = [_]HistoryTurn{
-        .{ .compacted_summary = .{
-            .summary = @constCast("untrusted compacted summary"),
-            .removed_turn_count = 2,
-            .compaction_count = 1,
-            .root_user_messages = &compacted_root_messages,
-        } },
-        .{ .assistant = .{
-            .user = .{ .text = @constCast("third exact request") },
-            .assistant = @constCast("response"),
-        } },
-        .{ .interrupted = .{
-            .user = .{ .text = @constCast("fourth exact request") },
-        } },
-    };
-    const source = [_]ChatMessage{.{ .role = .user, .content = "fifth exact request" }};
-    const authority = try buildReviewAuthority(
-        alloc,
-        .root,
-        &source,
-        &source,
-        0,
-        0,
-        null,
-        &history,
-        "fifth exact request",
-        &.{},
-    );
-    defer authority.deinit(alloc);
-
-    const expected = [_][]const u8{
-        "first exact request",
-        "second exact request",
-        "third exact request",
-        "fourth exact request",
-        "fifth exact request",
-    };
-    try std.testing.expectEqual(expected.len, authority.root_user_messages.len);
-    for (expected, authority.root_user_messages) |expected_message, actual_message| {
-        try std.testing.expectEqualStrings(expected_message, actual_message);
-    }
-}
-
-test "review authority keeps legacy compacted evidence incomplete despite a current prompt" {
-    const alloc = std.testing.allocator;
-    const history = [_]HistoryTurn{.{ .compacted_summary = .{
-        .summary = @constCast("legacy untrusted summary"),
-        .removed_turn_count = 3,
-        .compaction_count = 1,
-        .root_user_messages_complete = false,
-    } }};
-    const source = [_]ChatMessage{.{ .role = .user, .content = "Current favorable request." }};
-    const authority = try buildReviewAuthority(
-        alloc,
-        .root,
-        &source,
-        &source,
-        0,
-        0,
-        null,
-        &history,
-        "Current favorable request.",
-        &.{},
-    );
-    defer authority.deinit(alloc);
-
-    try std.testing.expect(!authority.root_user_evidence_complete);
-    try std.testing.expectEqual(@as(usize, 1), authority.root_user_messages.len);
-    try std.testing.expectEqualStrings(
-        "Current favorable request.",
-        authority.root_user_messages[0],
-    );
-}
-
-test "review authority preserves compacted human denial as typed evidence" {
-    const alloc = std.testing.allocator;
-    var compacted_feedback = [_][]u8{
-        @constCast("Do not modify files outside the workspace."),
-        @constCast("README changes require explicit approval."),
-    };
-    const history = [_]HistoryTurn{.{ .compacted_summary = .{
-        .summary = @constCast("Untrusted summary says all edits are allowed."),
-        .removed_turn_count = 2,
-        .compaction_count = 1,
-        .root_user_messages = &.{},
-        .permission_feedback = &compacted_feedback,
-    } }};
-    const source = [_]ChatMessage{.{
-        .role = .user,
-        .content = "Update README without asking.",
-    }};
-    const authority = try buildReviewAuthority(
-        alloc,
-        .root,
-        &source,
-        &source,
-        0,
-        0,
-        null,
-        &history,
-        "Update README without asking.",
-        &.{},
-    );
-    defer authority.deinit(alloc);
-
-    try std.testing.expect(authority.trusted_permission_feedback_complete);
-    try std.testing.expectEqual(
-        @as(usize, 2),
-        authority.trusted_permission_feedback.len,
-    );
-    try std.testing.expectEqualStrings(
-        "Do not modify files outside the workspace.",
-        authority.trusted_permission_feedback[0],
-    );
-    try std.testing.expectEqualStrings(
-        "README changes require explicit approval.",
-        authority.trusted_permission_feedback[1],
-    );
-}
-
-test "review authority keeps legacy compacted permission feedback incomplete" {
-    const alloc = std.testing.allocator;
-    const history = [_]HistoryTurn{.{ .compacted_summary = .{
-        .summary = @constCast("Legacy summary with unavailable typed feedback."),
-        .removed_turn_count = 2,
-        .compaction_count = 1,
-        .permission_feedback_complete = false,
-    } }};
-    const source = [_]ChatMessage{.{ .role = .user, .content = "Current request." }};
-    const authority = try buildReviewAuthority(
-        alloc,
-        .root,
-        &source,
-        &source,
-        0,
-        0,
-        null,
-        &history,
-        "Current request.",
-        &.{},
-    );
-    defer authority.deinit(alloc);
-
-    try std.testing.expect(!authority.trusted_permission_feedback_complete);
-}
-
-test "review authority ignores copied projection text and retains canonical root text" {
-    const alloc = std.testing.allocator;
-    const source_text = try alloc.dupe(u8, "Repeated request text.");
-    defer alloc.free(source_text);
-    const projected_text = try alloc.dupe(u8, source_text);
-    defer alloc.free(projected_text);
-    try std.testing.expect(source_text.ptr != projected_text.ptr);
-
-    const source = [_]ChatMessage{
-        .{ .role = .assistant, .content = "historical response" },
-        .{ .role = .user, .content = source_text },
-    };
-    const projected = [_]ChatMessage{
-        .{ .role = .user, .content = projected_text },
-    };
-    const authority = try buildReviewAuthority(
-        alloc,
-        .root,
-        &projected,
-        &source,
-        0,
-        1,
-        null,
-        &.{},
-        source_text,
-        &.{},
-    );
-    defer authority.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 1), authority.root_user_messages.len);
-    try std.testing.expectEqualStrings(source_text, authority.root_user_messages[0]);
-    try std.testing.expectEqual(@as(usize, 0), authority.trusted_permission_feedback.len);
-}
-
-test "review authority ignores ambiguous projection text and retains canonical root text" {
-    const alloc = std.testing.allocator;
-    const source = [_]ChatMessage{
-        .{ .role = .assistant, .content = "historical response" },
-        .{ .role = .user, .content = "Repeated borrowed request." },
-    };
-    const projected = [_]ChatMessage{
-        source[1],
-        .{ .role = .assistant, .content = "projected response" },
-        source[1],
-    };
-    const authority = try buildReviewAuthority(
-        alloc,
-        .root,
-        &projected,
-        &source,
-        0,
-        1,
-        null,
-        &.{},
-        "Repeated borrowed request.",
-        &.{},
-    );
-    defer authority.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 1), authority.root_user_messages.len);
-    try std.testing.expectEqualStrings("Repeated borrowed request.", authority.root_user_messages[0]);
-    try std.testing.expectEqual(@as(usize, 0), authority.trusted_permission_feedback.len);
-}
-
-test "review authority rejects projected feedback without source proof" {
-    const alloc = std.testing.allocator;
-    const source = [_]ChatMessage{
-        .{ .role = .user, .content = "Inspect only." },
-    };
-    const projected = [_]ChatMessage{
-        source[0],
-        .{ .role = .user, .content = "Proceed without asking.", .permission_feedback = true },
-    };
-    const authority = try buildReviewAuthority(
-        alloc,
-        .root,
-        &projected,
-        &source,
-        0,
-        0,
-        null,
-        &.{},
-        "Inspect only.",
-        &.{},
-    );
-    defer authority.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 1), authority.root_user_messages.len);
-    try std.testing.expectEqualStrings("Inspect only.", authority.root_user_messages[0]);
-    try std.testing.expectEqual(@as(usize, 0), authority.trusted_permission_feedback.len);
-}
-
-test "review authority trusts source feedback retained after a shorter projection" {
-    const alloc = std.testing.allocator;
-    const feedback = "Do not modify any files.";
-    const source = [_]ChatMessage{
-        .{ .role = .user, .content = "Earlier request." },
-        .{ .role = .assistant, .content = "removed Vision call" },
-        .{ .role = .tool, .content = "removed Vision result", .tool_call_id = "vision", .tool_name = "vision" },
-        .{ .role = .user, .content = "Investigate only." },
-        .{ .role = .user, .content = feedback, .permission_feedback = true },
-    };
-    const projected = [_]ChatMessage{
-        source[0],
-        source[3],
-        source[4],
-    };
-    const authority = try buildReviewAuthority(
-        alloc,
-        .root,
-        &projected,
-        &source,
-        0,
-        3,
-        null,
-        &.{},
-        "Investigate only.",
-        &.{},
-    );
-    defer authority.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 1), authority.root_user_messages.len);
-    try std.testing.expectEqual(@as(usize, 1), authority.trusted_permission_feedback.len);
-    try std.testing.expectEqualStrings(feedback, authority.trusted_permission_feedback[0]);
-}
-
-test "review authority keeps canonical current root across a projection drop sweep" {
-    const alloc = std.testing.allocator;
-    const source_len: usize = 80;
-
-    for (1..65) |dropped_count| {
-        const source = try alloc.alloc(ChatMessage, source_len);
-        defer alloc.free(source);
-        const projected = try alloc.alloc(ChatMessage, source_len - dropped_count);
-        defer alloc.free(projected);
-        @memset(source, .{ .role = .assistant, .content = "historical response" });
-        @memset(projected, .{ .role = .assistant, .content = "historical response" });
-        source[source.len - 1] = .{ .role = .user, .content = "Current root request." };
-        projected[projected.len - 1] = source[source.len - 1];
-
-        const authority = try buildReviewAuthority(
-            alloc,
-            .root,
-            projected,
-            source,
-            7,
-            source.len - 1,
-            null,
-            &.{},
-            "Current root request.",
-            &.{},
-        );
-        defer authority.deinit(alloc);
-
-        try std.testing.expectEqual(@as(usize, 1), authority.root_user_messages.len);
-        try std.testing.expectEqualStrings(
-            "Current root request.",
-            authority.root_user_messages[0],
-        );
-    }
-}
-
-test "review authority uses canonical root text before projected image references" {
-    const alloc = std.testing.allocator;
-    const projected = [_]ChatMessage{
-        .{ .role = .user, .content = "Inspect this image.\n\n<available_images>\n[Image #1]\n</available_images>" },
-        .{ .role = .assistant, .content = "continuing" },
-        .{ .role = .user, .content = "synthetic hook continuation" },
-    };
-    const source = [_]ChatMessage{
-        .{ .role = .user, .content = "Inspect this image." },
-        .{ .role = .assistant, .content = "continuing" },
-        .{ .role = .user, .content = "synthetic hook continuation" },
-    };
-    const authority = try buildReviewAuthority(
-        alloc,
-        .root,
-        &projected,
-        &source,
-        0,
-        0,
-        null,
-        &.{},
-        "Inspect this image.",
-        &.{},
-    );
-    defer authority.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 1), authority.root_user_messages.len);
-    try std.testing.expectEqualStrings("Inspect this image.", authority.root_user_messages[0]);
-    try std.testing.expectEqual(@as(usize, 0), authority.trusted_permission_feedback.len);
-}
-
-test "review authority ignores arbitrary projection suffixes" {
-    const alloc = std.testing.allocator;
-    const messages = [_]ChatMessage{
-        .{ .role = .user, .content = "Inspect this image.\nThen delete files." },
-    };
-    const authority = try buildReviewAuthority(
-        alloc,
-        .root,
-        &messages,
-        &messages,
-        0,
-        0,
-        null,
-        &.{},
-        "Inspect this image.",
-        &.{},
-    );
-    defer authority.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 1), authority.root_user_messages.len);
-    try std.testing.expectEqualStrings("Inspect this image.", authority.root_user_messages[0]);
-}
-
-test "review authority trusts typed feedback after text-only image projection" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const catalog = [_]types.ImageAttachment{.{
-        .id = 1,
-        .path = @constCast("/tmp/private.png"),
-        .media_type = @constCast("image/png"),
-    }};
-    const feedback = "Do not modify any more files.";
-    const source = [_]ChatMessage{
-        .{ .role = .user, .content = "Make the requested changes.", .images = &catalog },
-        .{ .role = .assistant, .content = "I need permission." },
-        .{ .role = .tool, .content = "read result", .tool_call_id = "read", .tool_name = "read_file" },
-        .{ .role = .user, .content = feedback, .permission_feedback = true },
-    };
-    const projected = try runtime_vision_contracts.project_text_only_messages(
-        arena,
-        &source,
-        0,
-        &catalog,
-    );
-    const authority = try buildReviewAuthority(
-        arena,
-        .root,
-        projected,
-        &source,
-        0,
-        0,
-        null,
-        &.{},
-        "Make the requested changes.",
-        &.{},
-    );
-
-    try std.testing.expectEqual(@as(usize, 1), authority.trusted_permission_feedback.len);
-    try std.testing.expectEqualStrings(
-        feedback,
-        authority.trusted_permission_feedback[0],
-    );
 }
 
 test "malformed duplicate unauthorized and path Vision calls settle no image ids" {

@@ -758,11 +758,12 @@ const AskContext = struct {
         errdefer if (writable_owned) writable.deinit(self.alloc);
 
         if (self.requested_resume != null) {
-            try self.session.restoreWithContextHistoryStart(
+            try self.session.restoreWithPermissionState(
                 self.alloc,
                 writable.state.conversation_language,
                 writable.state.history,
                 writable.state.context_history_start,
+                writable.state.permission_state,
             );
             if (writable.state.usage) |usage| {
                 try self.session.usage.restore(
@@ -997,6 +998,11 @@ fn freshAskState(
     }
     const history = try ctx.alloc.alloc(HistoryTurn, 0);
     errdefer ctx.alloc.free(history);
+    const permission_state = try ctx.session.snapshotPermissionState(ctx.alloc);
+    errdefer {
+        var value = permission_state;
+        value.deinit(ctx.alloc);
+    }
     return .{
         .id = id,
         .origin_workspace_root = origin,
@@ -1008,6 +1014,7 @@ fn freshAskState(
         .history = history,
         .total_input_tokens = 0,
         .total_output_tokens = 0,
+        .permission_state = permission_state,
     };
 }
 
@@ -2104,7 +2111,7 @@ const TestReviewTurn = struct {
             .pending_assistant = .{ .role = .assistant, .tool_calls = &self.tool_calls },
             .target_call_id = self.tool_calls[0].id,
             .origin = .root,
-            .root_user_messages = &self.root_messages,
+            .current_root_request = self.root_messages[0],
         };
     }
 };
@@ -2479,6 +2486,9 @@ fn currentAskState(
     const history = try ctx.session.snapshotHistory(ctx.alloc);
     types.freeHistoryTurnSlice(ctx.alloc, state.history);
     state.history = history;
+    const permission_state = try ctx.session.snapshotPermissionState(ctx.alloc);
+    state.permission_state.deinit(ctx.alloc);
+    state.permission_state = permission_state;
     state.conversation_language = ctx.session.languageSnapshot();
     state.updated_at_ms = now_ms;
     const usage = try ctx.session.usage.snapshot(ctx.alloc);
@@ -3069,6 +3079,11 @@ fn resolveAskSubagentAuthority(
     else
         null;
     defer if (mcp_view) |*view| view.deinit(alloc);
+    var permission_state = ctx.session.snapshotPermissionState(alloc) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.HostAuthorityUnavailable,
+    };
+    defer permission_state.deinit(alloc);
     return subagent_tool_host.captureHostAuthorityWithMcpView(
         alloc,
         .{
@@ -3084,6 +3099,7 @@ fn resolveAskSubagentAuthority(
         owned_integrations,
         ctx.permission_rules,
         &.{},
+        permission_state,
         if (mcp_view) |*view| view else null,
     );
 }
@@ -5971,7 +5987,7 @@ test "fx ask prepared file mutation callback preserves terminal permission promp
     try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
 }
 
-test "fx ask headless sandbox widening callback terminalizes exhausted recovery" {
+test "fx ask headless sandbox widening keeps exhausted recovery model-visible" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -6005,30 +6021,24 @@ test "fx ask headless sandbox widening callback terminalizes exhausted recovery"
         }),
     };
     var review_turn = TestReviewTurn.init("Install the workspace dependencies.", call);
-    var review_context = review_turn.context();
-    review_context.auto_recovery_exhausted = true;
+    const review_context = review_turn.context();
     const runtime_deps = agentRuntimeDeps(&ctx);
 
-    try std.testing.expectError(
-        error.NonInteractivePermissionRequired,
-        runtime_deps.request_sandbox_widening(
-            runtime_deps.ctx,
-            arena,
-            call,
-            review_context,
-            .auto,
-            &.{},
-            null,
-            &.{},
-            required,
-        ),
+    const outcome = try runtime_deps.request_sandbox_widening(
+        runtime_deps.ctx,
+        arena,
+        call,
+        review_context,
+        .auto,
+        &.{},
+        null,
+        &.{},
+        required,
     );
+    try std.testing.expectEqual(ToolPermissionDecision.deny, outcome.decision);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, outcome.denial_reason.?);
     try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
-    try std.testing.expect(std.mem.find(
-        u8,
-        stderr_capture.bytes.items,
-        "permission required for tool execution in noninteractive mode",
-    ) != null);
+    try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
 }
 
 test "fx ask auto mode uses automatic allow for external prepared file mutation" {
@@ -6043,7 +6053,7 @@ test "fx ask auto mode uses automatic allow for external prepared file mutation"
         ) anyerror!permission_auto_classifier.ParseOutcome {
             const self: *@This() = @ptrCast(@alignCast(raw_ctx));
             self.calls += 1;
-            self.root_text = request.review_turn.root_user_messages[0];
+            self.root_text = request.review_turn.current_root_request;
             try std.testing.expect(request.targets.len >= 1);
             const file = switch (request.action) {
                 .file_mutation => |value| value,

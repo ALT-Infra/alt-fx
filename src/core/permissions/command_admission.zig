@@ -55,6 +55,7 @@ pub const AdmissionFingerprint = struct {
 
 pub const ShellAuthorizationSource = enum {
     configured_rule,
+    session_state,
     session_grant,
     interactive_once,
     interactive_always,

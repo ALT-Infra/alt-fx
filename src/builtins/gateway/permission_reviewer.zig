@@ -354,7 +354,7 @@ fn testRequest() permission_auto_classifier.ReviewRequest {
             .pending_assistant = pending,
             .target_call_id = "call_1",
             .origin = .root,
-            .root_user_messages = &.{"User asked to inspect the repository."},
+            .current_root_request = "User asked to inspect the repository.",
         },
         .targets = &.{},
         .action = .{ .tool = .{

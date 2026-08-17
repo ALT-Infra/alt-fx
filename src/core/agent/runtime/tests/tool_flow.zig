@@ -1309,11 +1309,7 @@ test "resumed persistent child review rejects child-authored authority provenanc
 
     try std.testing.expectEqual(@as(usize, 1), hooks.permission_user_intent_contexts.items.len);
     const review_context = hooks.permission_user_intent_contexts.items[0];
-    try std.testing.expect(std.mem.find(
-        u8,
-        review_context,
-        "Do not modify files.\nInspect the repository only.\n",
-    ) != null);
+    try std.testing.expectEqualStrings("Inspect the repository only.\n", review_context);
     try std.testing.expect(std.mem.find(
         u8,
         review_context,
@@ -1325,16 +1321,8 @@ test "resumed persistent child review rejects child-authored authority provenanc
     );
     try std.testing.expect(hooks.last_execute_root_user_evidence_complete);
     try std.testing.expectEqual(
-        @as(usize, 2),
+        @as(usize, 0),
         hooks.last_execute_root_user_messages.items.len,
-    );
-    try std.testing.expectEqualStrings(
-        "Do not modify files.",
-        hooks.last_execute_root_user_messages.items[0],
-    );
-    try std.testing.expectEqualStrings(
-        "Inspect the repository only.",
-        hooks.last_execute_root_user_messages.items[1],
     );
 }
 
@@ -1363,7 +1351,7 @@ test "subagent turn with empty root context never promotes delegation to trusted
     try std.testing.expectEqual(@as(usize, 0), review_context.len);
 }
 
-test "compacted root authority reaches child-capable tool execution in exact order" {
+test "compacted historical root authority stays out of tool execution" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"README.md\"}")};
     const completions = [_]FakeCompletion{
@@ -1391,22 +1379,9 @@ test "compacted root authority reaches child-capable tool execution in exact ord
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
-    try std.testing.expect(hooks.last_execute_root_user_evidence_complete);
     try std.testing.expectEqual(
-        @as(usize, 3),
+        @as(usize, 0),
         hooks.last_execute_root_user_messages.items.len,
-    );
-    try std.testing.expectEqualStrings(
-        "Do not modify files.",
-        hooks.last_execute_root_user_messages.items[0],
-    );
-    try std.testing.expectEqualStrings(
-        "Inspect README only.",
-        hooks.last_execute_root_user_messages.items[1],
-    );
-    try std.testing.expectEqualStrings(
-        "Stop if secrets are encountered.",
-        hooks.last_execute_root_user_messages.items[2],
     );
 }
 
@@ -4479,7 +4454,71 @@ test "processQueuedPrompt auto permission denial labels lifecycle source" {
     try expectPermissionDeniedToolResult(&gateway, 1, "write_file", .auto_denied);
 }
 
-test "permission review receives selected root turns and untrusted history evidence" {
+test "three permission blocks use one tools-disabled final model step when budget remains" {
+    const alloc = std.testing.allocator;
+    const first = [_]ToolCall{toolCall("blocked-1", "run_command", "{\"command\":\"touch one\"}")};
+    const second = [_]ToolCall{toolCall("blocked-2", "run_command", "{\"command\":\"touch two\"}")};
+    const third = [_]ToolCall{toolCall("blocked-3", "run_command", "{\"command\":\"touch three\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &first },
+        .{ .tool_calls = &second },
+        .{ .tool_calls = &third },
+        .{ .content = "Which safe alternative should I use?" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.permission_decisions = &.{ .deny, .deny, .deny };
+    hooks.permission_denial_reasons = &.{ .auto_denied, .auto_denied, .auto_denied };
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.agent_step_limit = 4;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
+    try expectBodyContains(&gateway, 3, "\"toolChoice\":{\"type\":\"none\"}");
+    try expectBodyContains(&gateway, 3, "\"tools\":[]");
+    try std.testing.expectEqualStrings(
+        "Which safe alternative should I use?",
+        hooks.history_assistant_text.?,
+    );
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+}
+
+test "three permission blocks use local fallback when step budget is exhausted" {
+    const alloc = std.testing.allocator;
+    const first = [_]ToolCall{toolCall("blocked-1", "run_command", "{\"command\":\"touch one\"}")};
+    const second = [_]ToolCall{toolCall("blocked-2", "run_command", "{\"command\":\"touch two\"}")};
+    const third = [_]ToolCall{toolCall("blocked-3", "run_command", "{\"command\":\"touch three\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &first },
+        .{ .tool_calls = &second },
+        .{ .tool_calls = &third },
+        .{ .content = "must not be requested" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.permission_decisions = &.{ .deny, .deny, .deny };
+    hooks.permission_denial_reasons = &.{ .auto_denied, .auto_denied, .auto_denied };
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.agent_step_limit = 3;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try std.testing.expectEqualStrings(
+        "The blocked action was not run. No safe alternative completed within the configured agent step limit. Provide direction to continue.",
+        hooks.history_assistant_text.?,
+    );
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+}
+
+test "permission review receives only the active root request" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_1", "write_file", "{\"path\":\"a\",\"content\":\"x\"}")};
     const completions = [_]FakeCompletion{
@@ -4541,7 +4580,7 @@ test "permission review receives selected root turns and untrusted history evide
     try std.testing.expectEqual(@as(usize, 1), hooks.permission_user_intent_contexts.items.len);
     const context = hooks.permission_user_intent_contexts.items[0];
     try std.testing.expect(std.mem.find(u8, context, "Go ahead.") != null);
-    try std.testing.expect(std.mem.find(u8, context, "Inspect the final state before continuing.") != null);
+    try std.testing.expect(std.mem.find(u8, context, "Inspect the final state before continuing.") == null);
     try std.testing.expect(std.mem.find(u8, context, "true first root request") == null);
     try std.testing.expect(std.mem.find(u8, context, "Create a.txt in the workspace.") == null);
     try std.testing.expect(std.mem.find(u8, context, "surviving recent assistant") == null);
@@ -4690,7 +4729,7 @@ test "batched permission feedback follows every tool result before the next gate
         u8,
         second_review_context,
         "first command feedback marker",
-    ) != null);
+    ) == null);
     try std.testing.expectEqual(@as(usize, 2), hooks.permission_review_pending_call_counts.items[0]);
     try std.testing.expectEqual(@as(usize, 2), hooks.permission_review_pending_call_counts.items[1]);
     try std.testing.expectEqualStrings("call_first", hooks.permission_review_target_call_ids.items[0]);

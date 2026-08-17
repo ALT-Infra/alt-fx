@@ -5,6 +5,7 @@ const types = @import("../../shared/types.zig");
 const diff = @import("../../output/diff.zig");
 const file_mutation = @import("../../tooling/file_mutation.zig");
 const tool_admission = @import("../../tooling/tool_admission.zig");
+const session_permission_state = @import("../../permissions/session_permission_state.zig");
 const command_replay_store = @import("../../session/command_replay_store.zig");
 
 pub const vision = @import("vision_contracts.zig");
@@ -28,6 +29,7 @@ pub const LiveToolAuthority = struct {
     integrations: []const []const u8,
     rules: types.PermissionRuleSet,
     grants: []const PermissionGrant,
+    permission_state: ?*const session_permission_state.State = null,
     permission_mode: types.PermissionMode = .yolo,
 };
 

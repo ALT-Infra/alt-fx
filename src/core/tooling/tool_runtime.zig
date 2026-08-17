@@ -40,6 +40,7 @@ const subagent_tool_host = @import("../subagent/tool_host.zig");
 const subagent_tool_provider = @import("../subagent/tool_provider.zig");
 const subagent_tool_result = @import("../subagent/tool_result.zig");
 const session_runtime = @import("../session/session.zig");
+const session_permission_state = @import("../permissions/session_permission_state.zig");
 const session_codec_mod = @import("../session/session_codec.zig");
 const task_helpers = @import("../tasks/task_helpers.zig");
 const session_child_store = @import("../session/session_child_store.zig");
@@ -154,6 +155,7 @@ pub const Context = struct {
     permission_grants: []const PermissionGrant,
     session_grants: []const PermissionGrant = &.{},
     permission_rules: types.PermissionRuleSet,
+    permission_state_override: ?*const session_permission_state.State = null,
     worker: *WorkerRuntime,
     /// Sole prompt capability admission consults. When null, admission never
     /// prompts: it resolves by rule, automatic review, or fail-closed denial
@@ -224,12 +226,17 @@ pub const Context = struct {
 
     /// Projects only the borrowed capabilities consumed by admission.
     pub fn admissionInput(self: Context) tool_admission.Input {
-        return .{
+        var input: tool_admission.Input = .{
             .workspace_root = self.workspace_root,
             .access_scope = self.access_scope,
             .permission_review_turn = self.permission_review_turn,
             .permission_grants = self.permission_grants,
             .permission_rules = self.permission_rules,
+            .session_permission_state = self.permission_state_override,
+            .session_permission_state_provider = .{
+                .context = @ptrCast(self.session),
+                .snapshot_fn = snapshotSessionPermissionState,
+            },
             .tool_registry = self.tool_registry,
             .worker = self.worker,
             .permission_prompter = self.permission_prompter,
@@ -241,6 +248,10 @@ pub const Context = struct {
             .auto_classifier = self.admissionAutoClassifier(),
             .host_sandbox_default = self.host_sandbox_default,
         };
+        if (self.permission_state_override != null) {
+            input.session_permission_state_provider = null;
+        }
+        return input;
     }
 
     pub fn admissionInputWithLiveAuthority(
@@ -251,6 +262,10 @@ pub const Context = struct {
         if (authority) |live| {
             input.permission_grants = live.grants;
             input.permission_rules = live.rules;
+            input.session_permission_state = live.permission_state;
+            if (live.permission_state != null) {
+                input.session_permission_state_provider = null;
+            }
             input.sandbox_backend = live.sandbox_backend;
             input.advertised_dynamic_tool_names = live.integrations;
         }
@@ -271,6 +286,14 @@ pub const Context = struct {
         });
     }
 };
+
+fn snapshotSessionPermissionState(
+    raw_session: *anyopaque,
+    alloc: Allocator,
+) !session_permission_state.State {
+    const session: *SessionRuntime = @ptrCast(@alignCast(raw_session));
+    return session.snapshotPermissionState(alloc);
+}
 
 fn registeredToolSpec(ctx: Context, name: []const u8) ?*const tool_specs.ToolSpec {
     return ctx.tool_registry.lookup(name);
@@ -2254,7 +2277,7 @@ fn testReviewTurn() permission_auto_classifier.ReviewTurnContext {
         .pending_assistant = .{ .role = .assistant, .tool_calls = &test_review_calls },
         .target_call_id = "test-review",
         .origin = .root,
-        .root_user_messages = &test_review_root_messages,
+        .current_root_request = test_review_root_messages[0],
     };
 }
 
@@ -4989,6 +5012,50 @@ test "run_command admission emits exact authority for deterministic and reviewed
         reviewer.action_tag.?,
     );
     try std.testing.expectEqualStrings("touch automatic.txt", reviewer.exact_command.?);
+}
+
+test "tool context projects immutable session permission state into admission" {
+    const alloc = std.testing.allocator;
+    var rt = TestRuntime{ .workspace_root = "/tmp/workspace", .interactive = false };
+    defer rt.deinit(alloc);
+    var rules = [_]types.PermissionRule{.{
+        .permission = @constCast("bash"),
+        .pattern = @constCast("touch *"),
+        .action = .allow,
+    }};
+    rt.permission_rules = .{ .rules = &rules };
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const call = ToolCall{
+        .id = "runtime-session-deny",
+        .name = "run_command",
+        .arguments_json = "{\"command\":\"touch configured.txt\"}",
+    };
+    const key = try tool_admission.permissionStateKeyForCall(
+        rt.context().admissionInput(),
+        arena,
+        call,
+    );
+    try std.testing.expectEqual(
+        session_permission_state.ApplyStatus.applied,
+        try rt.session.applyPermissionEvent(alloc, .{ .set = .{
+            .key = key,
+            .display_identity = "touch configured.txt",
+            .decision = .deny,
+            .expected_generation = null,
+        } }),
+    );
+
+    const outcome = try tool_admission.requestPermissionOutcome(
+        rt.context().admissionInput(),
+        arena,
+        call,
+        .auto,
+        &.{},
+    );
+    try std.testing.expectEqual(ToolPermissionDecision.policy_denied, outcome.decision);
+    try std.testing.expect(outcome.execution_authority == null);
 }
 
 test "local file mutations bypass review while external mutations use exact review" {

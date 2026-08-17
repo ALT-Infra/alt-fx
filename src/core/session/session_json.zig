@@ -82,20 +82,6 @@ fn writeHistoryTurnJson(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
             try writer.writeAll("{\"kind\":\"compacted_summary\",\"summary\":");
             try std.json.Stringify.value(entry.summary, .{}, writer);
             try writer.print(",\"removed_turn_count\":{d},\"compaction_count\":{d}", .{ entry.removed_turn_count, entry.compaction_count });
-            try writer.writeAll(",\"root_user_messages\":[");
-            for (entry.root_user_messages, 0..) |message, index| {
-                if (index > 0) try writer.writeByte(',');
-                try std.json.Stringify.value(message, .{}, writer);
-            }
-            try writer.writeByte(']');
-            try writer.print(",\"root_user_messages_complete\":{}", .{entry.root_user_messages_complete});
-            try writer.writeAll(",\"permission_feedback\":[");
-            for (entry.permission_feedback, 0..) |feedback, index| {
-                if (index > 0) try writer.writeByte(',');
-                try std.json.Stringify.value(feedback, .{}, writer);
-            }
-            try writer.writeByte(']');
-            try writer.print(",\"permission_feedback_complete\":{}", .{entry.permission_feedback_complete});
             try writer.writeByte('}');
         },
         .assistant => |entry| {
@@ -1507,10 +1493,8 @@ test "session JSON round-trips images summaries and background commands" {
     try std.testing.expectEqualStrings("summary text", loaded.history[1].compacted_summary.summary);
     try std.testing.expectEqual(@as(usize, 5), loaded.history[1].compacted_summary.removed_turn_count);
     try std.testing.expectEqual(@as(usize, 2), loaded.history[1].compacted_summary.compaction_count);
-    try std.testing.expect(loaded.history[1].compacted_summary.root_user_messages_complete);
-    try std.testing.expectEqual(@as(usize, 2), loaded.history[1].compacted_summary.root_user_messages.len);
-    try std.testing.expectEqualStrings("first exact request", loaded.history[1].compacted_summary.root_user_messages[0]);
-    try std.testing.expectEqualStrings("second exact request", loaded.history[1].compacted_summary.root_user_messages[1]);
+    try std.testing.expect(!loaded.history[1].compacted_summary.root_user_messages_complete);
+    try std.testing.expectEqual(@as(usize, 0), loaded.history[1].compacted_summary.root_user_messages.len);
     try std.testing.expectEqualStrings("run dev", loaded.history[2].background_command.user.text);
     try std.testing.expectEqualStrings("/tmp/server.log", loaded.history[2].background_command.log_path);
     try std.testing.expect(loaded.history[2].background_command.expect_url);

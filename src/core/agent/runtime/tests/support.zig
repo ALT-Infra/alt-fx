@@ -439,12 +439,8 @@ fn captureReviewAuthority(
 ) ![]u8 {
     var captured: std.ArrayList(u8) = .empty;
     errdefer captured.deinit(alloc);
-    for (review_turn.root_user_messages) |message| {
-        try captured.appendSlice(alloc, message);
-        try captured.append(alloc, '\n');
-    }
-    for (review_turn.trusted_permission_feedback) |feedback| {
-        try captured.appendSlice(alloc, feedback);
+    if (review_turn.current_root_request.len > 0) {
+        try captured.appendSlice(alloc, review_turn.current_root_request);
         try captured.append(alloc, '\n');
     }
     return captured.toOwnedSlice(alloc);
@@ -981,11 +977,11 @@ pub const FakeAgentRuntimeDeps = struct {
         try self.permission_review_origins.append(self.alloc, review_turn.origin);
         try self.permission_review_root_authority_counts.append(
             self.alloc,
-            review_turn.root_user_messages.len,
+            @intFromBool(review_turn.current_root_request.len > 0),
         );
         try self.permission_review_feedback_counts.append(
             self.alloc,
-            review_turn.trusted_permission_feedback.len,
+            0,
         );
         try self.permission_review_message_counts.append(
             self.alloc,

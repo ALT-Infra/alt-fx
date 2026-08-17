@@ -22,6 +22,7 @@ const session_store = @import("../session/session_store.zig");
 const mcp_access = @import("../mcp/access_policy.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const permissions = @import("../permissions/permissions.zig");
+const session_permission_state = @import("../permissions/session_permission_state.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const types = @import("../shared/types.zig");
@@ -1863,6 +1864,7 @@ pub fn captureHostAuthority(
         integration_names,
         rules,
         grants,
+        .{},
         null,
     );
 }
@@ -1874,6 +1876,7 @@ pub fn captureHostAuthorityWithMcpView(
     integration_names: []const []const u8,
     rules: types.PermissionRuleSet,
     grants: []const types.PermissionGrant,
+    permission_state: session_permission_state.State,
     mcp_view: ?*const mcp_access.View,
 ) !authority.HostAuthority {
     var tool_names: std.ArrayList([]const u8) = .empty;
@@ -1883,13 +1886,14 @@ pub fn captureHostAuthorityWithMcpView(
         if (permissions.rulesDenyAllTargetsForTool(rules, registered_tool.name)) continue;
         try tool_names.append(alloc, registered_tool.name);
     }
-    return authority.HostAuthority.captureWithMcpView(
+    return authority.HostAuthority.captureWithPermissionStateAndMcpView(
         alloc,
         tool_names.items,
         sandbox_backend,
         integration_names,
         rules,
         grants,
+        permission_state,
         mcp_view,
     );
 }
@@ -2321,6 +2325,7 @@ fn captureAdmission(
         .tool_names = snapshot.tools,
         .rules = snapshot.rules,
         .grants = snapshot.grants,
+        .permission_state = snapshot.permission_state,
         .integration_names = snapshot.integrations,
         .authority_generation = if (snapshot.mcp_view) |view|
             mcp_access.authorityGeneration(view)

@@ -19,6 +19,7 @@ const control_store = @import("../subagent/control_store.zig");
 const domain = @import("../subagent/domain.zig");
 const execution = @import("../subagent/execution.zig");
 const permissions = @import("../permissions/permissions.zig");
+const session_permission_state = @import("../permissions/session_permission_state.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const session = @import("../session/session.zig");
 const session_codec = @import("../session/session_codec.zig");
@@ -192,6 +193,10 @@ pub fn ApprovalRuntime(comptime App: type) type {
         }
 
         fn submitPermissionChoice(app: *App, decision: ToolPermissionDecision) !void {
+            if (app.approval_prompt.rule_management != null) {
+                try submitRuleManagementChoice(app, decision);
+                return;
+            }
             if (try submitSubagentPermissionChoice(app, decision)) return;
             var affirmative_claimed = false;
             if (decision != .deny and
@@ -257,6 +262,79 @@ pub fn ApprovalRuntime(comptime App: type) type {
                     requestActiveSurfaceFrame(app);
                 },
                 .stale, .no_pending => {},
+            }
+        }
+
+        fn submitRuleManagementChoice(
+            app: *App,
+            decision: ToolPermissionDecision,
+        ) !void {
+            if (comptime !@hasField(App, "session") or
+                !@hasField(App, "session_persistence") or
+                !@hasDecl(App, "writeDomainNotice"))
+            {
+                return error.RuleManagementUnavailable;
+            } else {
+                if (decision == .deny) {
+                    clearApprovalPromptAfterSubmission(app);
+                    try app.writeDomainNotice(.{
+                        .topic = "permissions",
+                        .tone = .neutral,
+                        .body = "saved-session permission change cancelled",
+                    }, true);
+                    requestActiveSurfaceFrame(app);
+                    return;
+                }
+                const managed = app.approval_prompt.rule_management orelse return;
+                var current = try app.session.snapshotPermissionState(app.alloc);
+                defer current.deinit(app.alloc);
+                const result = try session_permission_state.apply(
+                    app.alloc,
+                    current,
+                    managed.event,
+                );
+                switch (result) {
+                    .applied => |next_value| {
+                        var next = next_value;
+                        defer next.deinit(app.alloc);
+                        try app_session_runtime.Runtime(App).commitPermissionState(
+                            app,
+                            next,
+                        );
+                        app.session.replacePermissionStateOwned(app.alloc, &next);
+                        clearApprovalPromptAfterSubmission(app);
+                        try app.writeDomainNotice(.{
+                            .topic = "permissions",
+                            .tone = .neutral,
+                            .body = "saved-session permission rule updated",
+                        }, true);
+                    },
+                    .stale => {
+                        clearApprovalPrompt(app, "rule_management_stale");
+                        try app.writeDomainNotice(.{
+                            .topic = "permissions",
+                            .tone = .warning,
+                            .body = "saved-session permission rule changed before confirmation",
+                        }, true);
+                    },
+                    .full => {
+                        clearApprovalPrompt(app, "rule_management_full");
+                        try app.writeDomainNotice(.{
+                            .topic = "permissions",
+                            .tone = .warning,
+                            .body = "saved-session permission rule capacity reached",
+                        }, true);
+                    },
+                    .invalid => {
+                        clearApprovalPrompt(app, "rule_management_invalid");
+                        try app.writeDomainNotice(.{
+                            .topic = "permissions",
+                            .tone = .@"error",
+                            .body = "saved-session permission rule is invalid",
+                        }, true);
+                    },
+                }
+                requestActiveSurfaceFrame(app);
             }
         }
 

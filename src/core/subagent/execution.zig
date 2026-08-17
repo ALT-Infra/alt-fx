@@ -521,11 +521,12 @@ pub const TurnContext = struct {
     ) !TurnContext {
         var runtime = session.SessionRuntime{ .max_history_turns = max_history_turns };
         errdefer runtime.deinit(alloc);
-        try runtime.restoreWithContextHistoryStart(
+        try runtime.restoreWithPermissionState(
             alloc,
             loaded.state.conversation_language,
             loaded.state.history,
             loaded.state.context_history_start,
+            loaded.state.permission_state,
         );
         return .{ .alloc = alloc, .runtime = runtime, .loaded = loaded };
     }
@@ -712,6 +713,7 @@ pub const TurnContext = struct {
                 .integrations = snapshot.integrations,
                 .rules = snapshot.rules,
                 .grants = snapshot.grants,
+                .permission_state = &snapshot.permission_state,
                 .permission_mode = snapshot.permission_mode,
             },
             .decision = switch (decision) {

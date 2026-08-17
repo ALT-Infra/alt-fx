@@ -576,12 +576,12 @@ test "text-only Vision keeps later permission restriction trusted across model s
     try std.testing.expectEqual(@as(usize, 2), hooks.permission_names.items.len);
     try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
     try std.testing.expectEqualStrings("vision", hooks.executed_names.items[0]);
-    try std.testing.expectEqual(@as(usize, 1), hooks.permission_review_feedback_counts.items[1]);
+    try std.testing.expectEqual(@as(usize, 0), hooks.permission_review_feedback_counts.items[1]);
     try std.testing.expect(std.mem.find(
         u8,
         hooks.permission_user_intent_contexts.items[1],
         "Do not modify any more files.",
-    ) != null);
+    ) == null);
     try std.testing.expectEqual(@as(usize, 1), countNeedle(
         gateway.request_bodies.items[0],
         "<available_images>",

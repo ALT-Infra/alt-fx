@@ -1260,7 +1260,7 @@ const TestReviewTurn = struct {
             .pending_assistant = .{ .role = .assistant, .tool_calls = &self.tool_calls },
             .target_call_id = self.tool_calls[0].id,
             .origin = .root,
-            .root_user_messages = &self.root_messages,
+            .current_root_request = self.root_messages[0],
         };
     }
 };
@@ -1773,6 +1773,9 @@ fn currentAcpState(
     const history = try session.session_rt.snapshotHistory(alloc);
     types.freeHistoryTurnSlice(alloc, state.history);
     state.history = history;
+    const permission_state = try session.session_rt.snapshotPermissionState(alloc);
+    state.permission_state.deinit(alloc);
+    state.permission_state = permission_state;
     state.conversation_language = session.session_rt.languageSnapshot();
     state.updated_at_ms = now_ms;
     const usage = try session.session_rt.usage.snapshot(alloc);
@@ -3913,7 +3916,7 @@ test "ACP auto mode uses automatic review allow and ask without prompting" {
         ) anyerror!permission_auto_classifier.ParseOutcome {
             const self: *@This() = @ptrCast(@alignCast(raw_ctx));
             self.calls += 1;
-            self.root_text = request.review_turn.root_user_messages[0];
+            self.root_text = request.review_turn.current_root_request;
             return .{ .valid = .{
                 .risk = if (self.decision == .allow) .low else .high,
                 .authorization = if (self.decision == .allow) .medium else .low,
@@ -4002,7 +4005,7 @@ test "ACP auto mode automatic review allows or asks prepared external file mutat
         ) anyerror!permission_auto_classifier.ParseOutcome {
             const self: *@This() = @ptrCast(@alignCast(raw_ctx));
             self.calls += 1;
-            self.root_text = request.review_turn.root_user_messages[0];
+            self.root_text = request.review_turn.current_root_request;
             self.saw_file_mutation_context = std.meta.activeTag(request.action) == .file_mutation;
             return .{ .valid = .{
                 .risk = if (self.decision == .allow) .low else .high,

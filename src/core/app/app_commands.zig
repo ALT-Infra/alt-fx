@@ -27,6 +27,7 @@ const mcp_runtime = @import("../mcp/mcp_runtime.zig");
 const app_mcp_runtime = @import("app_mcp_runtime.zig");
 const model_cache_runtime = @import("model_cache_runtime.zig");
 const permissions = @import("../permissions/permissions.zig");
+const session_permission_state = @import("../permissions/session_permission_state.zig");
 const sandbox = @import("../permissions/sandbox.zig");
 const skill_commands = @import("../skills/skill_commands.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
@@ -530,7 +531,238 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandHandlePermissions(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
+            if (try handlePermissionRuleManagement(app, rest)) return;
             try session_commands.Commands(App).handlePermissions(app, rest);
+            if (std.mem.trim(u8, rest, " \t").len == 0) {
+                try writeSessionPermissionRules(app);
+            }
+        }
+
+        fn writeSessionPermissionRules(app: *App) !void {
+            if (comptime !@hasField(App, "session") or
+                !@hasDecl(@TypeOf(app.session), "snapshotPermissionState"))
+            {
+                return;
+            } else {
+                var snapshot = try app.session.snapshotPermissionState(app.alloc);
+                defer snapshot.deinit(app.alloc);
+                var out: std.Io.Writer.Allocating = .init(app.alloc);
+                defer out.deinit();
+                if (snapshot.rules.items.len == 0) {
+                    try out.writer.writeAll("saved-session permission rules: none");
+                } else {
+                    try out.writer.print(
+                        "saved-session permission rules ({d}):",
+                        .{snapshot.rules.items.len},
+                    );
+                    for (snapshot.rules.items) |rule| {
+                        var identity = try text_utils.encodeTerminalSafe(
+                            app.alloc,
+                            rule.display_identity,
+                            session_permission_state.max_display_identity_bytes,
+                        );
+                        defer identity.deinit(app.alloc);
+                        try out.writer.print(
+                            "\n{d} {s} {s}",
+                            .{ rule.id.value, @tagName(rule.decision), identity.bytes },
+                        );
+                    }
+                }
+                try app.writeDomainNotice(.{
+                    .topic = "permissions",
+                    .tone = .neutral,
+                    .body = out.writer.buffered(),
+                }, true);
+            }
+        }
+
+        fn handlePermissionRuleManagement(app: *App, rest: []const u8) !bool {
+            if (comptime !@hasField(App, "approval_prompt") or
+                !@hasField(App, "session_persistence") or
+                !@hasDecl(App, "preparePermissionStateAction"))
+            {
+                return false;
+            } else {
+                const trimmed = std.mem.trim(u8, rest, " \t");
+                const action = splitPermissionWord(trimmed) orelse return false;
+                const remember = std.ascii.eqlIgnoreCase(action.word, "remember");
+                const revoke = std.ascii.eqlIgnoreCase(action.word, "revoke");
+                if (!remember and !revoke) return false;
+                debug_trace.logf("permission", "event=rule_management_begin action={s}", .{action.word});
+                if (app_session_runtime.Runtime(App).activeSessionId(app) == null) {
+                    try writePermissionManagementNotice(
+                        app,
+                        .@"error",
+                        "saved-session permission rules require an active saved session",
+                    );
+                    return true;
+                }
+                debug_trace.logf("permission", "event=rule_management_session_ready", .{});
+                if (app.approval_prompt.isActive()) {
+                    try writePermissionManagementNotice(
+                        app,
+                        .warning,
+                        "finish the active permission prompt before managing saved-session rules",
+                    );
+                    return true;
+                }
+
+                debug_trace.logf("permission", "event=rule_management_snapshot_start", .{});
+                var snapshot = try app.session.snapshotPermissionState(app.alloc);
+                defer snapshot.deinit(app.alloc);
+                debug_trace.logf("permission", "event=rule_management_snapshot_done rules={d}", .{snapshot.rules.items.len});
+                if (remember) {
+                    const decision_word = splitPermissionWord(action.rest) orelse {
+                        try writePermissionManagementUsage(app);
+                        return true;
+                    };
+                    const decision: session_permission_state.Decision =
+                        if (std.ascii.eqlIgnoreCase(decision_word.word, "allow"))
+                            .allow
+                        else if (std.ascii.eqlIgnoreCase(decision_word.word, "deny"))
+                            .deny
+                        else {
+                            try writePermissionManagementUsage(app);
+                            return true;
+                        };
+                    const tool_word = splitPermissionWord(decision_word.rest) orelse {
+                        try writePermissionManagementUsage(app);
+                        return true;
+                    };
+                    if (tool_word.rest.len == 0) {
+                        try writePermissionManagementUsage(app);
+                        return true;
+                    }
+                    var arena_state = std.heap.ArenaAllocator.init(app.alloc);
+                    defer arena_state.deinit();
+                    debug_trace.logf("permission", "event=rule_management_prepare_start tool={s}", .{tool_word.word});
+                    const prepared = app.preparePermissionStateAction(
+                        arena_state.allocator(),
+                        .{
+                            .id = "permission-rule-management",
+                            .name = tool_word.word,
+                            .arguments_json = tool_word.rest,
+                        },
+                    ) catch {
+                        try writePermissionManagementNotice(
+                            app,
+                            .@"error",
+                            "could not prepare that exact permission action without executing it",
+                        );
+                        return true;
+                    };
+                    debug_trace.logf("permission", "event=rule_management_prepare_done kind={s}", .{@tagName(prepared.key.kind)});
+                    const existing = session_permission_state.ruleForKey(
+                        snapshot,
+                        prepared.key,
+                    );
+                    try app.approval_prompt.syncRuleManagement(
+                        app.alloc,
+                        .{
+                            .id = debug_trace.nextStepId(),
+                            .label = if (decision == .allow)
+                                "Remember allow for this saved session"
+                            else
+                                "Remember deny for this saved session",
+                            .explanation = if (existing == null)
+                                "Confirm this exact saved-session permission rule. The action will not run."
+                            else
+                                "Confirm replacement of the existing exact saved-session rule. The action will not run.",
+                            .command = prepared.display_identity,
+                            .amendment_allowed = false,
+                            .confirmation_only = true,
+                        },
+                        .{ .set = .{
+                            .key = prepared.key,
+                            .display_identity = prepared.display_identity,
+                            .decision = decision,
+                            .expected_generation = if (existing) |rule|
+                                rule.generation
+                            else
+                                null,
+                        } },
+                    );
+                    debug_trace.logf("permission", "event=rule_management_prompt_published", .{});
+                    app.shell.render_requests.request(.footer);
+                    return true;
+                }
+
+                const id_word = splitPermissionWord(action.rest) orelse {
+                    try writePermissionManagementUsage(app);
+                    return true;
+                };
+                if (id_word.rest.len != 0) {
+                    try writePermissionManagementUsage(app);
+                    return true;
+                }
+                const raw_id = std.fmt.parseUnsigned(u64, id_word.word, 10) catch {
+                    try writePermissionManagementUsage(app);
+                    return true;
+                };
+                const rule = session_permission_state.ruleForId(
+                    snapshot,
+                    .{ .value = raw_id },
+                ) orelse {
+                    try writePermissionManagementNotice(
+                        app,
+                        .warning,
+                        "saved-session permission rule not found",
+                    );
+                    return true;
+                };
+                try app.approval_prompt.syncRuleManagement(
+                    app.alloc,
+                    .{
+                        .id = debug_trace.nextStepId(),
+                        .label = "Revoke saved-session permission rule",
+                        .explanation = "Confirm revocation of this stored rule. No current action will be prepared or run.",
+                        .command = rule.display_identity,
+                        .amendment_allowed = false,
+                        .confirmation_only = true,
+                    },
+                    .{ .revoke = .{
+                        .id = rule.id,
+                        .expected_generation = rule.generation,
+                    } },
+                );
+                app.shell.render_requests.request(.footer);
+                return true;
+            }
+        }
+
+        const PermissionWord = struct {
+            word: []const u8,
+            rest: []const u8,
+        };
+
+        fn splitPermissionWord(value: []const u8) ?PermissionWord {
+            const trimmed = std.mem.trim(u8, value, " \t");
+            if (trimmed.len == 0) return null;
+            const end = std.mem.findAny(u8, trimmed, " \t") orelse trimmed.len;
+            return .{
+                .word = trimmed[0..end],
+                .rest = std.mem.trim(u8, trimmed[end..], " \t"),
+            };
+        }
+
+        fn writePermissionManagementUsage(app: *App) !void {
+            try writePermissionManagementNotice(
+                app,
+                .@"error",
+                "usage: /permissions remember <allow|deny> <tool-name> <arguments-json>\n       /permissions revoke <rule-id>",
+            );
+        }
+
+        fn writePermissionManagementNotice(
+            app: *App,
+            tone: types.NoticeTone,
+            body: []const u8,
+        ) !void {
+            try app.writeDomainNotice(.{
+                .topic = "permissions",
+                .tone = tone,
+                .body = body,
+            }, true);
         }
 
         fn commandHandleAllowlist(ctx: *anyopaque, rest: []const u8) !void {
