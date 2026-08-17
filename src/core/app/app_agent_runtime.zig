@@ -16,6 +16,7 @@ const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
 const hooks = @import("../hooks/hooks.zig");
 const io_mod = @import("../shared/io.zig");
 const mcp_elicitation_interaction = @import("../mcp/elicitation_interaction.zig");
+const mcp_model_catalog = @import("../mcp/model_catalog.zig");
 const permission_gate = @import("../permissions/permission_gate.zig");
 const permissions = @import("../permissions/permissions.zig");
 const prompt_policy_contract = @import("../config/prompt_policy.zig");
@@ -749,6 +750,34 @@ pub fn Runtime(comptime App: type) type {
             try app.contextRegistry().appendDefaultStatic(.{
                 .project_context = modelVisibleProjectContext(app),
             }, arena, messages);
+            var snapshot = if (comptime @hasDecl(App, "snapshotMcpModelCatalog"))
+                try app.snapshotMcpModelCatalog(
+                    arena,
+                    if (comptime @hasField(App, "permission_engine")) app.permission_engine.rules else .{},
+                    false,
+                )
+            else
+                try mcp_model_catalog.Snapshot.empty(arena);
+            defer snapshot.deinit(arena);
+            const section = try mcp_model_catalog.render(arena, snapshot);
+            if (section.text.len > 0) {
+                try messages.append(arena, .{ .role = .system, .content = section.text });
+            }
+            if (section.notice) |notice| try pushMcpModelCatalogNotice(app, notice);
+        }
+
+        fn pushMcpModelCatalogNotice(app: *App, notice: []const u8) !void {
+            if (comptime @hasDecl(@TypeOf(app.session), "claimContextNotice")) {
+                if (!try app.session.claimContextNotice(std.heap.c_allocator, notice)) return;
+            }
+            const body = try types.renderContextNoticeBody(std.heap.c_allocator, notice);
+            defer std.heap.c_allocator.free(body);
+            try app_worker_runtime.Runtime(App).pushSemanticNotice(app, .{
+                .topic = "context",
+                .tone = .warning,
+                .body = body,
+                .visibility = .full_only,
+            });
         }
 
         pub fn appendTransientRuntimeContextMessage(
@@ -1423,6 +1452,15 @@ const FakeApp = struct {
 
     fn contextRegistry(self: *const FakeApp) context_contract.Registry {
         return self.context_registry;
+    }
+
+    fn snapshotMcpModelCatalog(
+        _: *FakeApp,
+        alloc: Allocator,
+        _: types.PermissionRuleSet,
+        _: bool,
+    ) !mcp_model_catalog.Snapshot {
+        return mcp_model_catalog.Snapshot.empty(alloc);
     }
 
     fn promptPolicy(_: *const FakeApp) prompt_policy_contract.Policy {
@@ -2288,10 +2326,11 @@ test "app agent runtime appends static and transient context through configured 
     try Runtime(FakeApp).appendStaticContextMessage(&app, arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
     try Runtime(FakeApp).appendTransientRuntimeContextMessage(&app, arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
 
-    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
+    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
     try std.testing.expectEqual(types.ChatRole.system, messages.items[0].role);
     try std.testing.expectEqualStrings("provider static:project context", messages.items[0].content.?);
-    try std.testing.expectEqualStrings("provider transient:/tmp/workspace:auto:macos", messages.items[1].content.?);
+    try std.testing.expect(std.mem.find(u8, messages.items[1].content.?, "<mcp_servers>") != null);
+    try std.testing.expectEqualStrings("provider transient:/tmp/workspace:auto:macos", messages.items[2].content.?);
 }
 
 test "app agent runtime prefers active queued project context snapshot" {
@@ -2311,8 +2350,9 @@ test "app agent runtime prefers active queued project context snapshot" {
 
     try Runtime(FakeApp).appendStaticContextMessage(&app, arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
 
-    try std.testing.expectEqual(@as(usize, 1), messages.items.len);
+    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
     try std.testing.expectEqualStrings("provider static:queued project context", messages.items[0].content.?);
+    try std.testing.expect(std.mem.find(u8, messages.items[1].content.?, "<mcp_servers>") != null);
     const tool_context = testToolContext(&app);
     try std.testing.expectEqualStrings("test.default_context", tool_context.context_registry.defaultProvider().id);
 }

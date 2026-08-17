@@ -66,6 +66,7 @@ const display_width = @import("core/shared/display_width.zig");
 const file_index_mod = @import("core/workspace/file_index.zig");
 const mcp_command_provider = @import("core/mcp/command_provider.zig");
 const mcp_runtime_mod = @import("core/mcp/mcp_runtime.zig");
+const mcp_model_catalog = @import("core/mcp/model_catalog.zig");
 const mcp_access_policy = @import("core/mcp/access_policy.zig");
 const app_mcp_runtime = @import("core/app/app_mcp_runtime.zig");
 const skill_commands = @import("core/skills/skill_commands.zig");
@@ -1350,6 +1351,19 @@ const App = struct {
 
     pub fn acquireMcpRuntime(self: *App) ?app_mcp_runtime.Lease {
         return self.mcp.acquire();
+    }
+
+    pub fn snapshotMcpModelCatalog(
+        self: *App,
+        alloc: Allocator,
+        permission_rules: types.PermissionRuleSet,
+        include_ask_deferred: bool,
+    ) !mcp_model_catalog.Snapshot {
+        return self.mcp.snapshotModelCatalog(
+            alloc,
+            permission_rules,
+            include_ask_deferred,
+        );
     }
 
     pub fn waitForRequiredMcp(

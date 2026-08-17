@@ -245,7 +245,7 @@ const skill_description =
 const install_skill_description =
     "Install a reusable skill from a supported source into fx managed skill storage. When to use: the user asks to install a skill or pastes a skills install command. When NOT to use: no installation is required, install packages, fetch unrelated repos, or modify project code.";
 const mcp_search_tools_description =
-    "Search metadata for configured MCP/dynamic tools without loading every dynamic schema into the main prompt. When to use: you need a specialized external/MCP capability but do not know its exact tool name. When NOT to use: the needed capability is already advertised directly, or ordinary local inspection, execution, web, or user interaction can handle the work.";
+    "Search bounded metadata for configured MCP/dynamic tools without loading every dynamic schema into the main prompt. Include the configured server alias and requested use case in the query; refine the use case when more_available is true. When to use: you need a specialized external/MCP capability but do not know its exact tool name. When NOT to use: the needed capability is already advertised directly, or ordinary local inspection, execution, web, or user interaction can handle the work.";
 const mcp_select_tool_description =
     "Exact-select one configured MCP/dynamic tool by name so its executable schema is advertised on the next model step. When to use: after discovering the exact specialized tool name in configured metadata. When NOT to use: guessing partial names, selecting built-in tools, or executing the dynamic tool directly.";
 const mcp_features_description =

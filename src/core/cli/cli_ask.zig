@@ -33,6 +33,7 @@ const model_capabilities = @import("../config/model_capabilities.zig");
 const mcp_elicitation_interaction = @import("../mcp/elicitation_interaction.zig");
 const mcp_elicitation = @import("../mcp/elicitation.zig");
 const mcp_access_policy = @import("../mcp/access_policy.zig");
+const mcp_model_catalog = @import("../mcp/model_catalog.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
@@ -1878,6 +1879,16 @@ fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Arr
     try ctx.deps.context_registry.appendDefaultStatic(.{
         .project_context = ctx.modelVisibleProjectContext(),
     }, arena, messages);
+    var snapshot = if (ctx.mcp) |mcp|
+        try mcp.snapshotModelCatalog(arena, ctx.permission_rules, true)
+    else
+        try mcp_model_catalog.Snapshot.empty(arena);
+    defer snapshot.deinit(arena);
+    const section = try mcp_model_catalog.render(arena, snapshot);
+    if (section.text.len > 0) {
+        try messages.append(arena, .{ .role = .system, .content = section.text });
+    }
+    if (section.notice) |notice| try pushContextNotice(raw_ctx, notice);
 }
 
 fn validateToolCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !agent_runtime.ToolCallValidationResult {
@@ -4123,12 +4134,14 @@ const TestContextRegistryFixture = struct {
         );
 
         if (expected_static_context) |expected_static| {
-            try std.testing.expectEqual(@as(usize, 2), messages.items.len);
+            try std.testing.expectEqual(@as(usize, 3), messages.items.len);
             try std.testing.expectEqualStrings(expected_static, messages.items[0].content.?);
-            try std.testing.expectEqualStrings(test_registry_transient_context, messages.items[1].content.?);
+            try std.testing.expect(std.mem.find(u8, messages.items[1].content.?, "<mcp_servers>") != null);
+            try std.testing.expectEqualStrings(test_registry_transient_context, messages.items[2].content.?);
         } else {
-            try std.testing.expectEqual(@as(usize, 1), messages.items.len);
-            try std.testing.expectEqualStrings(test_registry_transient_context, messages.items[0].content.?);
+            try std.testing.expectEqual(@as(usize, 2), messages.items.len);
+            try std.testing.expect(std.mem.find(u8, messages.items[0].content.?, "<mcp_servers>") != null);
+            try std.testing.expectEqualStrings(test_registry_transient_context, messages.items[1].content.?);
         }
 
         try testPushAssistantText(deps, "assistant text");

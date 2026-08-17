@@ -1808,6 +1808,14 @@ describe("acp: model-independent", () => {
           `${MODERN_HTTP_TOOL_RESULT}:acp`,
         );
 
+        const initialPrompt = acpGatewayRequest(gateway.requests[0]!.body).prompt
+          .map((message) => acpContentText(message.content))
+          .join("\n");
+        expect(initialPrompt).toContain(
+          '<server name="fixture" state="ready" tools="1" />',
+        );
+        expect(gateway.requests[0]!.body).not.toContain(MCP_TOOL_NAME);
+
         expect(httpFixture.requests.map((entry) => entry.message.method))
           .toEqual(["server/discover", "tools/list", "tools/call"]);
         for (const entry of httpFixture.requests) {

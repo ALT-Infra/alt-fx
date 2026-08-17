@@ -427,7 +427,11 @@ function occurrenceCount(text: string, needle: string): number {
   return text.split(needle).length - 1;
 }
 
-function writeMcpFixture(root: FixtureRoot) {
+function writeMcpFixture(
+  root: FixtureRoot,
+  options: { required?: boolean; toolCount?: number } = {},
+) {
+  const toolCount = options.toolCount ?? 1;
   const scriptPath = join(root.root, "mcp-fixture.js");
   const callLogPath = join(root.root, "mcp-calls.log");
   const pidPath = join(root.root, "mcp.pid");
@@ -466,19 +470,27 @@ function handle(message) {
     return;
   }
   if (message.method === "tools/list") {
+    const tools = Array.from({ length: ${toolCount} }, (_, index) => index === 0 ? {
+      name: "echo",
+      description: "Echo fixture input",
+      inputSchema: {
+        type: "object",
+        properties: { text: { type: "string", description: "EXACT_SCHEMA_QUERY_SENTINEL" } },
+        required: ["text"],
+      },
+    } : {
+      name: "network_tool_" + String(index).padStart(2, "0"),
+      description: "Inspect browser network use case " + index,
+      inputSchema: {
+        type: "object",
+        properties: { request: { type: "string" } },
+      },
+    });
     send({
       jsonrpc: "2.0",
       id: message.id,
       result: {
-        tools: [{
-          name: "echo",
-          description: "Echo fixture input",
-          inputSchema: {
-            type: "object",
-            properties: { text: { type: "string", description: "EXACT_SCHEMA_QUERY_SENTINEL" } },
-            required: ["text"],
-          },
-        }],
+        tools,
       },
     });
     writeFileSync(process.env.FX_MCP_READY_PATH, "ready\\n");
@@ -515,6 +527,7 @@ process.stdin.on("data", (chunk) => {
           type: "local",
           command: [process.execPath, scriptPath],
           enabled: true,
+          required: options.required ?? false,
           environment: {
             FX_MCP_CALL_LOG: callLogPath,
             FX_MCP_PID_PATH: pidPath,
@@ -3342,21 +3355,35 @@ describe("gateway stream lifecycle", () => {
   test("dynamic MCP search stays metadata-only and exact selection reveals instructions and schema", async () => {
     const root = createFixtureRoot("mcp-lazy-context");
     const tracePath = join(root.root, "trace.log");
-    const mcp = writeMcpFixture(root);
-    const searchCallId = "mcp_search_lazy_1";
+    const mcp = writeMcpFixture(root, { toolCount: 30 });
+    const searchCallId = "mcp_search_targeted_1";
+    const broadSearchCallId = "mcp_search_broad_1";
     const selectCallId = "mcp_select_lazy_1";
     const responses = [
       fakeGatewayToolCall(searchCallId, "mcp_search_tools", {
-        query: "SECRET_SERVER_INSTRUCTION_SENTINEL",
+        query: "fixture echo",
+      }),
+      fakeGatewayToolCall(broadSearchCallId, "mcp_search_tools", {
+        query: "fixture",
+        limit: 20,
       }),
       fakeGatewayToolCall(selectCallId, "mcp_select_tool", {
         name: DYNAMIC_MCP_TOOL_NAME,
       }),
+      fakeGatewayToolCall("mcp_call_lazy_1", DYNAMIC_MCP_TOOL_NAME, {
+        text: "lazy MCP proof",
+      }),
       fakeGatewayFinalText("MCP lazy context complete."),
     ];
-    const gateway = startGateway(() =>
-      responses.shift() ?? new Response("unexpected request", { status: 500 })
-    );
+    let requestIndex = 0;
+    const gateway = startDynamicFakeGateway(() => {
+      if (requestIndex === 0) expect(existsSync(mcp.pidPath)).toBe(false);
+      requestIndex += 1;
+      return responses.shift() ?? new Response("unexpected request", { status: 500 });
+    }, {
+      classifierDecision: "allow",
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
     try {
       const result = await runFx(
         ["ask", "--json", "--auto", "--no-save", "Discover the MCP fixture lazily."],
@@ -3371,10 +3398,17 @@ describe("gateway stream lifecycle", () => {
 
       expect(result.code).toBe(0);
       expect(json.output).toContain("MCP lazy context complete.");
-      expect(gateway.requestCount()).toBe(3);
+      expect(gateway.requestCount()).toBe(5);
+      const initialPrompt = promptText(gateway.requests[0]!.body);
+      const initialServer = initialPrompt.match(
+        /<server name="fixture" state="available_on_demand"[^>]*\/>/,
+      )?.[0];
+      expect(initialServer).toBeDefined();
+      expect(initialServer).not.toContain("tools=");
       expect(gateway.requests[0]!.body).not.toContain(DYNAMIC_MCP_TOOL_NAME);
       expect(gateway.requests[0]!.body).not.toContain("SECRET_SERVER_INSTRUCTION_SENTINEL");
       expect(gateway.requests[0]!.body).not.toContain("EXACT_SCHEMA_QUERY_SENTINEL");
+      expect(existsSync(mcp.readyPath)).toBe(true);
 
       const searchOutput = toolResultOutput(gateway.requests[1]!.body, searchCallId);
       const searchTools = JSON.stringify(JSON.parse(searchOutput).tools);
@@ -3383,7 +3417,13 @@ describe("gateway stream lifecycle", () => {
       expect(searchTools).not.toContain("SECRET_SERVER_INSTRUCTION_SENTINEL");
       expect(searchTools).not.toContain("EXACT_SCHEMA_QUERY_SENTINEL");
 
-      const selectedRequest = gatewayRequest(gateway.requests[2]!.body);
+      const broadSearchOutput = JSON.parse(
+        toolResultOutput(gateway.requests[2]!.body, broadSearchCallId),
+      );
+      expect(broadSearchOutput.count).toBe(20);
+      expect(broadSearchOutput.more_available).toBe(true);
+
+      const selectedRequest = gatewayRequest(gateway.requests[3]!.body);
       const selectedTool = selectedRequest.tools.find((tool) =>
         tool.name === DYNAMIC_MCP_TOOL_NAME
       );
@@ -3391,9 +3431,44 @@ describe("gateway stream lifecycle", () => {
       expect(selectedTool?.inputSchema.properties.text.description).toBe(
         "EXACT_SCHEMA_QUERY_SENTINEL",
       );
-      expect(gateway.requests[2]!.body).toContain(
+      expect(gateway.requests[3]!.body).toContain(
         "SECRET_SERVER_INSTRUCTION_SENTINEL",
       );
+      expect(toolResultOutput(gateway.requests[4]!.body, "mcp_call_lazy_1")).toContain(
+        "unexpected MCP call",
+      );
+      expect(readFileSync(mcp.callLogPath, "utf8").trim().split("\n")).toHaveLength(1);
+      await waitForProcessExit(pid);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("required MCP server advertises only its ready count before lazy search", async () => {
+    const root = createFixtureRoot("mcp-ready-server-summary");
+    const tracePath = join(root.root, "trace.log");
+    const mcp = writeMcpFixture(root, { required: true, toolCount: 30 });
+    const gateway = startGateway(() => fakeGatewayFinalText("MCP ready summary complete."));
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Inspect configured MCP availability."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 20_000,
+        },
+      );
+      const pid = Number.parseInt(readFileSync(mcp.pidPath, "utf8"), 10);
+      const initialPrompt = promptText(gateway.requests[0]!.body);
+
+      expect(result.code).toBe(0);
+      expect(initialPrompt).toContain(
+        '<server name="fixture" state="ready" tools="30" />',
+      );
+      expect(gateway.requests[0]!.body).not.toContain(DYNAMIC_MCP_TOOL_NAME);
+      expect(gateway.requests[0]!.body).not.toContain("SECRET_SERVER_INSTRUCTION_SENTINEL");
+      expect(gateway.requests[0]!.body).not.toContain("EXACT_SCHEMA_QUERY_SENTINEL");
       await waitForProcessExit(pid);
     } finally {
       gateway.stop();
@@ -3446,6 +3521,10 @@ describe("gateway stream lifecycle", () => {
         return parentCompletion;
       }
       if (body.includes(childPrompt)) {
+        expect(promptText(body)).toContain(
+          '<server name="fixture" state="ready" tools="1" />',
+        );
+        expect(body).not.toContain(DYNAMIC_MCP_TOOL_NAME);
         return fakeGatewayToolCall("child_mcp_select_1", "mcp_select_tool", {
           name: DYNAMIC_MCP_TOOL_NAME,
         });
