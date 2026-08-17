@@ -54,6 +54,7 @@ function shellQuote(value: string): string {
 function startUpgradeServer(
   root: string,
   argvLogPath: string,
+  version = "v9.9.9",
 ): { baseUrl: string; stop: () => void } {
   const artifactDir = join(root, "release-artifact");
   const wrapperPath = join(artifactDir, "fx");
@@ -77,13 +78,13 @@ exec ${shellQuote(FX_BIN)} "$@"
   const archive = readFileSync(archivePath);
   const checksum = createHash("sha256").update(archive).digest("hex");
   const platform = `${process.platform === "darwin" ? "macos" : "linux"}-${process.arch === "arm64" ? "aarch64" : "x86_64"}`;
-  const archiveRoute = `/v9.9.9/fx-${platform}.tar.gz`;
+  const archiveRoute = `/${version}/fx-${platform}.tar.gz`;
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
     fetch(request) {
       const path = new URL(request.url).pathname;
-      if (path === "/latest.txt") return new Response("v9.9.9\n");
+      if (path === "/latest.txt") return new Response(`${version}\n`);
       if (path === archiveRoute) return new Response(archive);
       if (path === `${archiveRoute}.sha256`) return new Response(`${checksum}\n`);
       return new Response("not found", { status: 404 });
@@ -4799,7 +4800,7 @@ test.skipIf(!tmuxAvailable())(
       fakeGatewayFinalText("UPGRADE_CTRL_G_INITIAL_DONE"),
       fakeGatewayFinalText("UPGRADE_CTRL_G_FOLLOWUP_DONE"),
     ]);
-    const release = startUpgradeServer(root, argvLogPath);
+    const release = startUpgradeServer(root, argvLogPath, "v0.0.1");
 
     try {
       writeFileSync(stderrPath, "");

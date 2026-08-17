@@ -65,7 +65,6 @@ VERIFICATION_E2E_TESTS = (
     "tui-slash-commands.test.ts",
     "tui-slash-extra.test.ts",
     "tui-slash-menu.test.ts",
-    "upgrade.test.ts",
     "web-fetch-permission-progress.test.ts",
     "web-search-permission-progress.test.ts",
     "yolo-permission-mode.test.ts",
@@ -341,7 +340,7 @@ class PgsoCorpusTests(unittest.TestCase):
             tuple(test_file for test_file, _ in corpus.intentional_exclusions),
         )
         self.assertEqual(36, len(corpus.scenarios))
-        self.assertEqual(52, len(corpus.candidate_scenarios))
+        self.assertEqual(51, len(corpus.candidate_scenarios))
         self.assertEqual(
             ("e2e-cli", "e2e-mcp-auth"),
             tuple(
