@@ -5,6 +5,7 @@ const frame_scroll_plan = @import("frame_scroll_plan.zig");
 
 pub const CandidatePreparation = struct {
     inline_advance_rows: u16,
+    occupied_transcript_rows: u16,
 };
 
 pub const CandidateResolution = struct {
@@ -53,7 +54,12 @@ pub fn solve(
             layout_release.released_rows,
             preparation.inline_advance_rows,
         );
-        const resolution = try resolve_candidate(ctx, candidate, scroll_plan);
+        const prepared_projection_is_shorter = preparation.occupied_transcript_rows > 0 and
+            preparation.occupied_transcript_rows < candidate.transcript_area.height();
+        const resolution = if (prepared_projection_is_shorter)
+            CandidateResolution{ .occupied_transcript_rows = preparation.occupied_transcript_rows }
+        else
+            try resolve_candidate(ctx, candidate, scroll_plan);
         debug_trace.logf(
             "frame_layout",
             "fixed_point iteration={d} requested_release={d} requested_inline={d} emitted_scroll={d} remaining_inline={d} prior_owned_top={d} post_scroll_owned_top={d}",
@@ -90,6 +96,7 @@ pub fn solve(
 const FixedPointTestContext = struct {
     inline_advance_rows: u16 = 0,
     prepared_occupied_rows: ?u16 = null,
+    resolved_occupied_rows: ?u16 = null,
     candidate_tops: [8]u16 = [_]u16{0} ** 8,
     candidate_transcript_rows: [8]u16 = [_]u16{0} ** 8,
     resolved_inline_rows: [8]u32 = [_]u32{0} ** 8,
@@ -105,6 +112,7 @@ const FixedPointTestContext = struct {
         self.calls += 1;
         return .{
             .inline_advance_rows = self.inline_advance_rows,
+            .occupied_transcript_rows = self.prepared_occupied_rows orelse layout.transcript_area.height(),
         };
     }
 
@@ -116,7 +124,7 @@ const FixedPointTestContext = struct {
         self.resolved_inline_rows[self.resolution_calls] = scroll_plan.requested_inline_advance_rows;
         self.resolution_calls += 1;
         return .{
-            .occupied_transcript_rows = self.prepared_occupied_rows orelse layout.transcript_area.height(),
+            .occupied_transcript_rows = self.resolved_occupied_rows orelse layout.transcript_area.height(),
         };
     }
 };
@@ -197,7 +205,7 @@ test "frame fixed point compacts a same-owner prepared projection" {
 test "frame fixed point resolves final extent after merging scroll plan" {
     var ctx = FixedPointTestContext{
         .inline_advance_rows = 3,
-        .prepared_occupied_rows = 9,
+        .resolved_occupied_rows = 9,
     };
     const fixed_point = try solveFixedPointForTest(
         &ctx,
@@ -212,6 +220,19 @@ test "frame fixed point resolves final extent after merging scroll plan" {
         ctx.resolved_inline_rows[0..ctx.resolution_calls],
     );
     try std.testing.expectEqual(@as(u16, 9), fixed_point.layout.transcript_area.height());
+}
+
+test "frame fixed point compacts prepared extent before target resolution" {
+    var ctx = FixedPointTestContext{ .prepared_occupied_rows = 9 };
+    const fixed_point = try solveFixedPointForTest(
+        &ctx,
+        fixedPointTestInput(20, 1, 15, 4, .transcript),
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), fixed_point.iterations);
+    try std.testing.expectEqual(@as(usize, 2), ctx.calls);
+    try std.testing.expectEqual(@as(usize, 1), ctx.resolution_calls);
+    try std.testing.expectEqualSlices(u16, &.{ 15, 9 }, ctx.candidate_transcript_rows[0..ctx.calls]);
 }
 
 test "frame fixed point permits document movement beyond terminal height" {

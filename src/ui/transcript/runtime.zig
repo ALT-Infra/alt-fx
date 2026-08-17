@@ -7953,7 +7953,7 @@ pub const TranscriptRuntime = struct {
         );
         const source_endpoint_cursor_row = prepared.cursor.cursor_row;
         const source_endpoint_cursor_col = prepared.cursor.cursor_col;
-        const target = try self.resolveTransitionTarget(
+        const target = self.resolveTransitionTarget(
             alloc,
             source.bytes,
             prepared,
@@ -7964,10 +7964,39 @@ pub const TranscriptRuntime = struct {
             accepted.semantic_progress_rows,
             destructive_invalidation,
             activity_overlay_active,
-        );
+        ) catch |err| {
+            const normal_buffer_recovery_pending = switch (self.transcript_commit_state) {
+                .stable => |anchor| anchor.normal_buffer_recovery_pending,
+                .recovering => |receipt| receipt.normal_buffer_recovery_pending,
+                .invalid => false,
+            };
+            debug_trace.logf(
+                "scroll",
+                "transcript_target_resolution_failed err={s} source_compatible={s} geometry_rebase={s} recovery_rebase={s} normal_buffer_recovery_pending={s} target_visual_offset={d}",
+                .{
+                    @errorName(err),
+                    if (scroll_facts.source_compatible) "true" else "false",
+                    if (scroll_facts.geometry_rebase) "true" else "false",
+                    if (scroll_facts.recovery_rebase) "true" else "false",
+                    if (normal_buffer_recovery_pending) "true" else "false",
+                    scroll_facts.target_visual_offset,
+                },
+            );
+            return err;
+        };
         if (!target_layout.transcript_area.isEmpty() and
             target.selection.last_visible_row > target_layout.transcript_area.bottom)
         {
+            debug_trace.logf(
+                "scroll",
+                "transcript_target_outside_candidate last_visible={d} target_area={d}..{d} body_disposition={s}",
+                .{
+                    target.selection.last_visible_row,
+                    target_layout.transcript_area.top,
+                    target_layout.transcript_area.bottom,
+                    @tagName(target.body_disposition),
+                },
+            );
             return error.InvalidTranscriptTransition;
         }
         return .{

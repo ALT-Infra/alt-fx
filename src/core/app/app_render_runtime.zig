@@ -3332,6 +3332,7 @@ fn FixedPointTranscriptContext(comptime App: type) type {
             self.scroll_facts = null;
             if (!self.prepare_transcript or candidate.transcript_area.isEmpty()) return .{
                 .inline_advance_rows = 0,
+                .occupied_transcript_rows = candidate.transcript_area.height(),
             };
             const source = self.source orelse return error.MissingTranscriptPreparationSource;
 
@@ -3351,8 +3352,13 @@ fn FixedPointTranscriptContext(comptime App: type) type {
                 self.replay_displaced_footer_history,
             );
             self.scroll_facts = scroll_facts;
+            const occupied_transcript_rows = if (prepared.selection.last_visible_row >= candidate.transcript_area.top)
+                prepared.selection.last_visible_row - candidate.transcript_area.top + 1
+            else
+                0;
             return .{
                 .inline_advance_rows = scroll_facts.planned_rows,
+                .occupied_transcript_rows = occupied_transcript_rows,
             };
         }
 
@@ -3575,8 +3581,10 @@ const FixedPointTestContext = struct {
         self: *FixedPointTestContext,
         layout: render_engine.frame_layout.FrameLayout,
     ) !render_engine.frame_fixed_point.CandidatePreparation {
-        _ = layout;
-        return .{ .inline_advance_rows = self.inline_advance_rows };
+        return .{
+            .inline_advance_rows = self.inline_advance_rows,
+            .occupied_transcript_rows = layout.transcript_area.height(),
+        };
     }
 
     fn resolveCandidate(

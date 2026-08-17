@@ -3835,6 +3835,7 @@ test {
     _ = @import("ui/footer/approval_ui.zig");
     _ = @import("ui/footer/surface_invalidation.zig");
     _ = @import("ui/full_transcript_screen.zig");
+    _ = @import("ui/render_engine/frame_fixed_point.zig");
     _ = @import("ui/transcript/runtime.zig");
     _ = @import("ui/transcript/runtime_tests.zig");
     _ = @import("core/agent/worker_runtime.zig");

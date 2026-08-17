@@ -324,6 +324,7 @@ const SolveContext = struct {
         self.scroll_facts = null;
         if (candidate.transcript_area.isEmpty()) return .{
             .inline_advance_rows = 0,
+            .occupied_transcript_rows = 0,
         };
         self.prepared.* = try self.runtime.shell.prepareTranscriptSurfacePaintFromSourceForArea(
             self.runtime.alloc,
@@ -340,8 +341,13 @@ const SolveContext = struct {
             false,
         );
         self.scroll_facts = scroll_facts;
+        const occupied_transcript_rows = if (paint.selection.last_visible_row >= candidate.transcript_area.top)
+            paint.selection.last_visible_row - candidate.transcript_area.top + 1
+        else
+            0;
         return .{
             .inline_advance_rows = scroll_facts.planned_rows,
+            .occupied_transcript_rows = occupied_transcript_rows,
         };
     }
 

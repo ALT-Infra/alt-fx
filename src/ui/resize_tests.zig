@@ -444,6 +444,7 @@ const ReservedTranscriptSolveContext = struct {
         self.prepared.*.?.bottom_reserved_rows = self.reserved_rows;
         return .{
             .inline_advance_rows = self.h.shell.planTranscriptScroll(&self.prepared.*.?).planned_rows,
+            .occupied_transcript_rows = candidate.transcript_area.height(),
         };
     }
 
@@ -519,6 +520,7 @@ const TestFrameSolveContext = struct {
         self.resolved_target.* = null;
         self.scroll_facts = null;
         var inline_advance_rows: u16 = 0;
+        var occupied_transcript_rows = candidate.transcript_area.height();
         if (!candidate.transcript_area.isEmpty()) {
             self.prepared.* = try self.h.shell.prepareTranscriptSurfacePaintFromSourceForFrame(
                 self.h.alloc,
@@ -536,8 +538,16 @@ const TestFrameSolveContext = struct {
             );
             self.scroll_facts = scroll_facts;
             inline_advance_rows = scroll_facts.planned_rows;
+            if (self.prepared.*.?.selection.last_visible_row >= candidate.transcript_area.top) {
+                occupied_transcript_rows = self.prepared.*.?.selection.last_visible_row - candidate.transcript_area.top + 1;
+            } else {
+                occupied_transcript_rows = 0;
+            }
         }
-        return .{ .inline_advance_rows = inline_advance_rows };
+        return .{
+            .inline_advance_rows = inline_advance_rows,
+            .occupied_transcript_rows = occupied_transcript_rows,
+        };
     }
 
     fn resolveCandidate(
