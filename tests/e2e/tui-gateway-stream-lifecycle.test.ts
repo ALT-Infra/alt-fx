@@ -7523,6 +7523,107 @@ describe.skipIf(!tmuxAvailable())("transcript scrollback release", () => {
   }
 
   test(
+    "closed tool groups enter native scrollback before the turn finishes",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-sb-tool-groups-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      for (let index = 1; index <= 3; index += 1) {
+        writeFileSync(join(workspace, `source-${index}.txt`), `source ${index}\n`);
+      }
+      writeFileSync(join(home, ".fx", "settings.json"), sbSettings());
+      writeFileSync(stderrPath, "");
+
+      const finalText = "TOOL_GROUP_SCROLLBACK_FINAL";
+      gateway = startFakeGateway([
+        sbToolCallBatch(
+          Array.from({ length: 3 }, (_, index) => ({
+            id: `group-a-read-${index + 1}`,
+            name: "read_file",
+            input: { path: `source-${index + 1}.txt` },
+          })),
+          "FIRST_GROUP_INTRO",
+        ),
+        sbToolCallBatch(
+          [
+            {
+              id: "group-b-command",
+              name: "run_command",
+              input: { command: "sleep 5; printf HELD_COMMAND_DONE" },
+            },
+          ],
+          "SECOND_GROUP_INTRO",
+        ),
+        fakeGatewayFinalText(finalText),
+      ]);
+      const fakeGateway = gateway as ReturnType<typeof startFakeGateway>;
+
+      session = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: workspace,
+        width: 80,
+        height: 14,
+        minimumHistoryLines: 10_000,
+        stderrPath,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-sb-tool-groups-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_GATEWAY_BASE_URL: fakeGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: fakeGateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: fakeGateway.chatUrl,
+          FX_MODEL: MODEL,
+          FX_MAX_AGENT_STEPS: "4",
+        },
+      });
+
+      const assertClosedGroupOnce = (scrollback: string, label: string) => {
+        expect(
+          countOccurrences(scrollback, "FIRST_GROUP_INTRO"),
+          `${label}: first intro`,
+        ).toBe(1);
+        expect(
+          countOccurrences(scrollback, "● 3 tool calls · 3 read"),
+          `${label}: first header`,
+        ).toBe(1);
+        for (let index = 1; index <= 3; index += 1) {
+          expect(
+            countOccurrences(scrollback, `Read source-${index}.txt`),
+            `${label}: source ${index}`,
+          ).toBe(1);
+        }
+      };
+
+      await session.waitForComposer(SB_TIMEOUT);
+      await session.sendText("Run the two prepared groups.");
+      await session.waitForText("Running sleep 5; printf HELD_COMMAND_DONE", SB_TIMEOUT);
+      await Bun.sleep(150);
+
+      const beforeResize = await session.captureFullScrollback();
+      assertClosedGroupOnce(beforeResize, "before resize");
+      expect(beforeResize).toContain("SECOND_GROUP_INTRO");
+
+      await session.resizeWindow(81, 15, 500);
+      const afterResize = await session.captureFullScrollback();
+      assertClosedGroupOnce(afterResize, "after resize");
+      expect(afterResize).toContain("SECOND_GROUP_INTRO");
+
+      await session.waitForText(finalText, SB_TIMEOUT);
+      await session.waitForPane(hasEmptyComposer, SB_TIMEOUT);
+      const completed = await session.captureFullScrollback();
+      assertClosedGroupOnce(completed, "after completion");
+      expect(countOccurrences(completed, finalText)).toBe(1);
+      expect(fakeGateway.requests).toHaveLength(3);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    SB_TIMEOUT + 30_000,
+  );
+
+  test(
     "sequential tool group and streamed markdown keep native scrollback final",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-sb-release-")));

@@ -3398,6 +3398,86 @@ test "structured command-output rewrite materializes committed transcript scroll
     try expectGridContains(&h, "follow-up table row 60");
 }
 
+fn applyCompletedReadForGroupFinalityResizeTest(
+    h: *Harness,
+    turn_id: u64,
+    call_id: []const u8,
+    group_id: types.ToolPresentationGroupId,
+) !void {
+    const id = types.ToolLifecycleId{ .turn_id = turn_id, .call_id = call_id };
+    _ = try h.shell.applyToolLifecycle(h.alloc, .{ .authoritative_started = .{
+        .id = id,
+        .presentation_group_id = group_id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "read_file",
+        .activity_kind = .read,
+    } });
+    _ = try h.shell.applyToolLifecycle(h.alloc, .{ .terminal = .{
+        .id = id,
+        .outcome = .{ .kind = .completed, .summary = "Read fixed-point fixture" },
+    } });
+}
+
+test "closed tool group finality flows through fixed point resolution and sealing" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 80, 14, 3);
+    defer h.deinit();
+    h.shell.maxxing_mode = .minimal;
+
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var approval = approval_prompt.ApprovalPrompt{};
+    defer approval.deinit(alloc);
+
+    try h.shell.initViewport(&h.metrics, 8);
+    for (0..4) |index| {
+        var line: [32]u8 = undefined;
+        const text = try std.fmt.bufPrint(&line, "startup row {d}\n", .{index});
+        _ = try h.shell.appendRawTranscriptEntry(alloc, text);
+    }
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    const group_a = types.ToolPresentationGroupId{ .turn_id = 92, .anchor_step_id = 1 };
+    var group_a_call_ids: [18][20]u8 = undefined;
+    for (0..group_a_call_ids.len) |index| {
+        const call_id = try std.fmt.bufPrint(
+            &group_a_call_ids[index],
+            "fixed-a-{d:0>2}",
+            .{index},
+        );
+        try applyCompletedReadForGroupFinalityResizeTest(&h, 92, call_id, group_a);
+    }
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    var held_source = try h.shell.prepareTranscriptSource(alloc, null);
+    defer held_source.deinit(alloc);
+    const held = h.shell.stableTranscriptProjectionForFlow(held_source.bytes) orelse
+        return error.TestExpectedStableTranscript;
+    try std.testing.expect(held.visual_offset > held.history_visual_offset);
+
+    _ = try h.shell.appendRawTranscriptEntry(alloc, "SECOND_GROUP_INTRO\n");
+    const group_b = types.ToolPresentationGroupId{ .turn_id = 92, .anchor_step_id = 2 };
+    try applyCompletedReadForGroupFinalityResizeTest(&h, 92, "fixed-b-1", group_b);
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    try std.testing.expect(h.last_frame.planned_scroll_rows > 0);
+    try std.testing.expect(h.last_frame.committed_scroll_rows > 0);
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
+
+    var released_source = try h.shell.prepareTranscriptSource(alloc, null);
+    defer released_source.deinit(alloc);
+    const released = h.shell.stableTranscriptProjectionForFlow(released_source.bytes) orelse
+        return error.TestExpectedStableTranscript;
+    try std.testing.expect(released.history_visual_offset > held.history_visual_offset);
+    try std.testing.expect(released.visual_offset >= released.history_visual_offset);
+    try expectGridContains(&h, "SECOND_GROUP_INTRO");
+}
+
 test "hidden auto approval lifecycle reposition adds no compact scroll rows" {
     var h = try Harness.init(std.testing.allocator, 80, 12, 4);
     defer h.deinit();

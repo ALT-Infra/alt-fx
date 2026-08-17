@@ -5319,6 +5319,31 @@ test "tool presentation groups span silent steps and split on visible assistant 
     try std.testing.expect(
         groups[0].anchor_step_id != groups[2].anchor_step_id,
     );
+
+    var group_b_start_index: ?usize = null;
+    var group_a_terminal_count: usize = 0;
+    for (hooks.lifecycle_events.items, 0..) |event, index| {
+        switch (event) {
+            .authoritative_started => |started| {
+                if (started.presentation_group_id) |group| {
+                    if (std.meta.eql(group, groups[2])) {
+                        group_b_start_index = index;
+                        break;
+                    }
+                }
+            },
+            .terminal => |terminal| {
+                if (std.mem.eql(u8, terminal.id.call_id, "call_1") or
+                    std.mem.eql(u8, terminal.id.call_id, "call_2"))
+                {
+                    group_a_terminal_count += 1;
+                }
+            },
+            .provisional, .progress, .turn_finished => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), group_a_terminal_count);
+    try std.testing.expect(group_b_start_index != null);
 }
 
 test "processQueuedPrompt no-tool length bypasses silent-tool continuation" {
