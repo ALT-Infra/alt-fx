@@ -6,7 +6,7 @@
 
 ### Bug Fixes
 
-- **Stable upgrades:** Keep manual and background upgrades on the same forward-only release order across version-line transitions
+- **Public launch upgrade:** Allow fx 0.4.5 to upgrade directly to 0.0.1 during the version reset
 <!-- release:end -->
 
 ## 0.4.4

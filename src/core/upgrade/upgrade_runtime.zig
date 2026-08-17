@@ -447,19 +447,18 @@ test "completeRunResult reports upgraded when latest differs" {
 
 test "completeRunResult reports no update for an older stable target" {
     const alloc = std.testing.allocator;
-    const target = try update_target.Target.initStableAtEpoch(alloc, "v0.4.5", 0);
+    const target = try update_target.Target.initStable(alloc, "v0.0.1");
 
     var result = try completeRunResult(alloc, .{
         .channel = .stable,
-        .version = "0.0.1",
+        .version = "0.0.2",
         .revision = "0123456789ab",
-        .release_epoch = 1,
     }, .stable, .{ .target_owned = target });
     defer result.deinit(alloc);
 
     try std.testing.expectEqual(output_contracts.UpgradeSnapshot.Status.up_to_date, result.snapshot.status);
-    try std.testing.expectEqualStrings("0.0.1", result.snapshot.current);
-    try std.testing.expectEqualStrings("0.4.5", result.snapshot.latest);
+    try std.testing.expectEqualStrings("0.0.2", result.snapshot.current);
+    try std.testing.expectEqualStrings("0.0.1", result.snapshot.latest);
 }
 
 test "completeRunResult maps worker errors and frees latest version" {

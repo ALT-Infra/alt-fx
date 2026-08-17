@@ -54,7 +54,7 @@ function shellQuote(value: string): string {
 function startUpgradeServer(
   root: string,
   argvLogPath: string,
-): { baseUrl: string; requests: string[]; stop: () => void } {
+): { baseUrl: string; stop: () => void } {
   const artifactDir = join(root, "release-artifact");
   const wrapperPath = join(artifactDir, "fx");
   const archivePath = join(root, "fx.tar.gz");
@@ -78,16 +78,11 @@ exec ${shellQuote(FX_BIN)} "$@"
   const checksum = createHash("sha256").update(archive).digest("hex");
   const platform = `${process.platform === "darwin" ? "macos" : "linux"}-${process.arch === "arm64" ? "aarch64" : "x86_64"}`;
   const archiveRoute = `/v9.9.9/fx-${platform}.tar.gz`;
-  const requests: string[] = [];
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
     fetch(request) {
       const path = new URL(request.url).pathname;
-      requests.push(path);
-      if (path === "/stable.json") {
-        return Response.json({ epoch: 1, version: "v9.9.9" });
-      }
       if (path === "/latest.txt") return new Response("v9.9.9\n");
       if (path === archiveRoute) return new Response(archive);
       if (path === `${archiveRoute}.sha256`) return new Response(`${checksum}\n`);
@@ -96,7 +91,6 @@ exec ${shellQuote(FX_BIN)} "$@"
   });
   return {
     baseUrl: `http://127.0.0.1:${server.port}`,
-    requests,
     stop: () => server.stop(true),
   };
 }
@@ -4832,8 +4826,6 @@ test.skipIf(!tmuxAvailable())(
         "Update installed: ctrl+g to reload",
         UPGRADE_TIMEOUT,
       );
-      expect(release.requests).toContain("/stable.json");
-      expect(release.requests).not.toContain("/latest.txt");
       expect(readFileSync(installedFx, "utf8")).toContain(argvLogPath);
 
       fresh = await TmuxSession.create({

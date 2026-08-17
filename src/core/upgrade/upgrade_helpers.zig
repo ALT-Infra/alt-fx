@@ -71,10 +71,6 @@ fn platformFromTarget() ?[]const u8 {
 pub fn fetchTarget(alloc: Allocator, channel: Channel, base_url: []const u8) !Target {
     return switch (channel) {
         .stable => blk: {
-            if (fetchStableManifest(alloc, base_url)) |target| {
-                break :blk target;
-            } else |_| {}
-
             const latest = try fetchLatestVersion(alloc, base_url);
             defer alloc.free(latest);
             break :blk Target.initStable(alloc, latest) catch return error.FetchFailed;
@@ -94,21 +90,6 @@ pub fn fetchTarget(alloc: Allocator, channel: Channel, base_url: []const u8) !Ta
             break :blk Target.parseDevManifest(alloc, manifest) catch return error.FetchFailed;
         },
     };
-}
-
-fn fetchStableManifest(alloc: Allocator, base_url: []const u8) !Target {
-    var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
-    defer client.deinit();
-    const url = try std.fmt.allocPrint(alloc, "{s}/stable.json", .{base_url});
-    defer alloc.free(url);
-    const manifest = try fetchTextBounded(
-        &client,
-        alloc,
-        url,
-        update_target.max_manifest_bytes,
-    );
-    defer alloc.free(manifest);
-    return Target.parseStableManifest(alloc, manifest) catch return error.FetchFailed;
 }
 
 fn fetchLatestVersion(alloc: Allocator, base_url: []const u8) ![]u8 {
