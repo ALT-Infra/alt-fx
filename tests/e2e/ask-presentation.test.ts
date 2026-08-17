@@ -155,9 +155,12 @@ describe("fx ask presentation", () => {
     } else {
       writeFileSync(
         join(root.home, ".bash_profile"),
-        "export FX_PROFILE_LOGIN=login\nexport FX_PROFILE_RC=rc\n" +
-          "export PATH=\"$HOME/profile-bin:$PATH\"\n" +
-          "alias fx_profile_alias='printf alias-user'\n" +
+        "export FX_PROFILE_LOGIN=login\nexport PATH=\"$HOME/profile-bin:$PATH\"\n" +
+          "source \"$HOME/.bashrc\"\n",
+      );
+      writeFileSync(
+        join(root.home, ".bashrc"),
+        "export FX_PROFILE_RC=rc\nalias fx_profile_alias='printf alias-user'\n" +
           "fx_profile_function() { printf function-user; }\n",
       );
     }
@@ -223,6 +226,12 @@ describe("fx ask presentation", () => {
     );
     expect(gateway.requests[0]!.body).toContain(
       "omission defaults to user, while clean skips user startup files",
+    );
+    expect(gateway.requests[0]!.body).toContain(
+      "User-profile execution supports the configured Bash or zsh login shell",
+    );
+    expect(gateway.requests[0]!.body).toContain(
+      ".bashrc is available only when sourced by the login profile",
     );
     expect(gateway.requests[0]!.body).not.toContain(
       "omission preserves legacy command behavior",

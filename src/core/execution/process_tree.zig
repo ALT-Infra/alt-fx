@@ -33,6 +33,31 @@ const ProcessSnapshot = struct {
     parent_unique_id: ?u64 = null,
 };
 
+pub const DeliverySummary = struct {
+    delivered: usize = 0,
+    incomplete: bool = false,
+};
+
+const ProcessGroupState = union(enum) {
+    found: std.posix.pid_t,
+    vanished,
+    unavailable,
+};
+
+const SystemSignalEffects = struct {
+    fn capture(alloc: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
+        return captureSnapshot(alloc, pid);
+    }
+
+    fn processGroup(pid: std.posix.pid_t) ProcessGroupState {
+        return inspectProcessGroup(pid);
+    }
+
+    fn send(pid: std.posix.pid_t, signal: std.posix.SIG) std.posix.KillError!void {
+        return std.posix.kill(pid, signal);
+    }
+};
+
 /// Tracks a command root and descendants across new sessions or process
 /// groups. Identity checks guard both traversal and signaling against PID
 /// reuse.
@@ -157,7 +182,7 @@ pub const Tracker = struct {
     }
 
     pub fn signalAll(self: *Tracker, signal: std.posix.SIG) usize {
-        return self.signalProcesses(signal, null);
+        return self.signalProcessesChecked(signal, null).delivered;
     }
 
     pub fn signalOutsideProcessGroup(
@@ -165,42 +190,89 @@ pub const Tracker = struct {
         signal: std.posix.SIG,
         preserved_group: std.posix.pid_t,
     ) usize {
-        return self.signalProcesses(signal, preserved_group);
+        return self.signalProcessesChecked(signal, preserved_group).delivered;
     }
 
-    fn signalProcesses(
+    pub fn signalOutsideProcessGroupChecked(
+        self: *Tracker,
+        signal: std.posix.SIG,
+        preserved_group: std.posix.pid_t,
+    ) DeliverySummary {
+        return self.signalProcessesChecked(signal, preserved_group);
+    }
+
+    fn signalProcessesChecked(
         self: *Tracker,
         signal: std.posix.SIG,
         preserved_group: ?std.posix.pid_t,
-    ) usize {
-        var signaled: usize = 0;
+    ) DeliverySummary {
+        return self.signalProcessesWith(
+            signal,
+            preserved_group,
+            SystemSignalEffects,
+        );
+    }
+
+    fn signalProcessesWith(
+        self: *Tracker,
+        signal: std.posix.SIG,
+        preserved_group: ?std.posix.pid_t,
+        comptime Effects: type,
+    ) DeliverySummary {
+        var summary: DeliverySummary = .{};
         var index = self.processes.items.len;
         while (index > 0) {
             index -= 1;
-            const process = self.processes.items[index];
-            const actual = captureSnapshot(self.alloc, process.pid) catch continue;
-            if (!process.identity.eql(actual.identity)) continue;
-            if (!shouldSignalProcess(
-                processGroupId(process.pid),
+            self.signalTrackedProcessWith(
+                self.processes.items[index],
+                signal,
                 preserved_group,
-            )) continue;
-            std.posix.kill(process.pid, signal) catch |err| switch (err) {
-                error.ProcessNotFound => continue,
-                else => continue,
-            };
-            signaled += 1;
+                &summary,
+                Effects,
+            );
         }
         if (self.root) |root| {
-            const actual = captureSnapshot(self.alloc, root.pid) catch return signaled;
-            if (root.identity.eql(actual.identity) and shouldSignalProcess(
-                processGroupId(root.pid),
+            self.signalTrackedProcessWith(
+                root,
+                signal,
                 preserved_group,
-            )) {
-                std.posix.kill(root.pid, signal) catch return signaled;
-                signaled += 1;
-            }
+                &summary,
+                Effects,
+            );
         }
-        return signaled;
+        return summary;
+    }
+
+    fn signalTrackedProcessWith(
+        self: *Tracker,
+        process: TrackedProcess,
+        signal: std.posix.SIG,
+        preserved_group: ?std.posix.pid_t,
+        summary: *DeliverySummary,
+        comptime Effects: type,
+    ) void {
+        const actual = Effects.capture(self.alloc, process.pid) catch |err| {
+            if (err != error.ProcessNotFound) summary.incomplete = true;
+            return;
+        };
+        if (!process.identity.eql(actual.identity)) return;
+        const process_group = switch (Effects.processGroup(process.pid)) {
+            .found => |value| value,
+            .vanished => return,
+            .unavailable => {
+                summary.incomplete = true;
+                return;
+            },
+        };
+        if (!shouldSignalProcess(process_group, preserved_group)) return;
+        Effects.send(process.pid, signal) catch |err| switch (err) {
+            error.ProcessNotFound => return,
+            else => {
+                summary.incomplete = true;
+                return;
+            },
+        };
+        summary.delivered += 1;
     }
 
     pub fn anyAlive(self: *Tracker) bool {
@@ -234,10 +306,42 @@ pub const Tracker = struct {
     ) !void {
         if (comptime builtin.os.tag != .linux) return error.ProcessTreeUnsupported;
         if (!try self.parentIdentityMatches(parent)) return;
+        const task_path = try std.fmt.allocPrint(
+            self.alloc,
+            "/proc/{d}/task",
+            .{parent.pid},
+        );
+        defer self.alloc.free(task_path);
+        var task_dir = std.Io.Dir.openDirAbsolute(
+            io_mod.getIo(),
+            task_path,
+            .{ .iterate = true },
+        ) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer task_dir.close(io_mod.getIo());
+        var tasks = task_dir.iterate();
+        while (try tasks.next(io_mod.getIo())) |entry| {
+            const tid = std.fmt.parseInt(
+                std.posix.pid_t,
+                entry.name,
+                10,
+            ) catch continue;
+            if (tid <= 0) continue;
+            try self.appendLinuxTaskChildren(parent, tid);
+        }
+    }
+
+    fn appendLinuxTaskChildren(
+        self: *Tracker,
+        parent: TrackedProcess,
+        tid: std.posix.pid_t,
+    ) !void {
         const path = try std.fmt.allocPrint(
             self.alloc,
             "/proc/{d}/task/{d}/children",
-            .{ parent.pid, parent.pid },
+            .{ parent.pid, tid },
         );
         defer self.alloc.free(path);
         var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch |err| switch (err) {
@@ -370,10 +474,16 @@ fn shouldSignalProcess(
     return actual != preserved;
 }
 
-fn processGroupId(pid: std.posix.pid_t) ?std.posix.pid_t {
-    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return null;
+fn inspectProcessGroup(pid: std.posix.pid_t) ProcessGroupState {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return .unavailable;
+    }
     const process_group = getpgid(pid);
-    return if (process_group >= 0) process_group else null;
+    if (process_group >= 0) return .{ .found = process_group };
+    return switch (std.c.errno(process_group)) {
+        .SRCH => .vanished,
+        else => .unavailable,
+    };
 }
 
 extern "c" fn getpgid(pid: std.posix.pid_t) std.posix.pid_t;
@@ -435,6 +545,99 @@ test "macOS lineage identity matches only the same unique process" {
         .{ .linux_start_ticks = 42 },
         42,
     ));
+}
+
+test "checked signal delivery distinguishes vanished stale and failed targets" {
+    const FakeEffects = struct {
+        fn capture(_: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
+            return switch (pid) {
+                11 => error.ProcessNotFound,
+                12 => error.ProcessIdentityUnavailable,
+                13 => .{
+                    .identity = .{ .linux_start_ticks = 113 },
+                    .parent_pid = 1,
+                },
+                else => .{
+                    .identity = .{ .linux_start_ticks = @intCast(pid) },
+                    .parent_pid = 1,
+                },
+            };
+        }
+
+        fn processGroup(pid: std.posix.pid_t) ProcessGroupState {
+            return switch (pid) {
+                14 => .vanished,
+                15 => .unavailable,
+                16 => .{ .found = 41 },
+                else => .{ .found = pid + 100 },
+            };
+        }
+
+        fn send(pid: std.posix.pid_t, _: std.posix.SIG) std.posix.KillError!void {
+            return switch (pid) {
+                17 => error.PermissionDenied,
+                18 => error.ProcessNotFound,
+                else => {},
+            };
+        }
+    };
+
+    var tracker = Tracker{ .alloc = std.testing.allocator };
+    defer tracker.deinit();
+    for (10..19) |pid| {
+        try tracker.processes.append(std.testing.allocator, .{
+            .pid = @intCast(pid),
+            .identity = .{ .linux_start_ticks = pid },
+        });
+    }
+
+    const summary = tracker.signalProcessesWith(
+        std.posix.SIG.TERM,
+        41,
+        FakeEffects,
+    );
+    try std.testing.expectEqual(@as(usize, 1), summary.delivered);
+    try std.testing.expect(summary.incomplete);
+}
+
+test "checked signal delivery keeps vanished stale and excluded targets complete" {
+    const FakeEffects = struct {
+        fn capture(_: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
+            if (pid == 21) return error.ProcessNotFound;
+            return .{
+                .identity = .{ .linux_start_ticks = if (pid == 22) 122 else @as(u64, @intCast(pid)) },
+                .parent_pid = 1,
+            };
+        }
+
+        fn processGroup(pid: std.posix.pid_t) ProcessGroupState {
+            return switch (pid) {
+                23 => .vanished,
+                else => .{ .found = 41 },
+            };
+        }
+
+        fn send(_: std.posix.pid_t, _: std.posix.SIG) std.posix.KillError!void {
+            return;
+        }
+    };
+
+    var tracker = Tracker{ .alloc = std.testing.allocator };
+    defer tracker.deinit();
+    for (21..25) |pid| {
+        try tracker.processes.append(std.testing.allocator, .{
+            .pid = @intCast(pid),
+            .identity = .{ .linux_start_ticks = pid },
+        });
+    }
+
+    const summary = tracker.signalProcessesWith(
+        std.posix.SIG.TERM,
+        41,
+        FakeEffects,
+    );
+    try std.testing.expectEqual(@as(usize, 0), summary.delivered);
+    try std.testing.expect(!summary.incomplete);
 }
 
 fn captureSnapshot(alloc: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
