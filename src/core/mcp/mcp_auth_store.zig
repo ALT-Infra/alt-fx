@@ -27,16 +27,32 @@ const KeychainError = Allocator.Error || native_keychain.Error;
 
 const KeychainBackend = struct {
     context: ?*anyopaque = null,
-    load_fn: *const fn (?*anyopaque, Allocator) KeychainError!?[]u8,
-    store_fn: *const fn (?*anyopaque, []const u8) KeychainError!void,
+    load_fn: *const fn (
+        ?*anyopaque,
+        Allocator,
+        ?*const std.atomic.Value(bool),
+    ) KeychainError!?[]u8,
+    store_fn: *const fn (
+        ?*anyopaque,
+        []const u8,
+        ?*const std.atomic.Value(bool),
+    ) KeychainError!void,
     delete_fn: *const fn (?*anyopaque, Allocator) KeychainError!bool,
 
-    fn load(self: KeychainBackend, alloc: Allocator) KeychainError!?[]u8 {
-        return self.load_fn(self.context, alloc);
+    fn load(
+        self: KeychainBackend,
+        alloc: Allocator,
+        cancel_flag: ?*const std.atomic.Value(bool),
+    ) KeychainError!?[]u8 {
+        return self.load_fn(self.context, alloc, cancel_flag);
     }
 
-    fn store(self: KeychainBackend, value: []const u8) KeychainError!void {
-        return self.store_fn(self.context, value);
+    fn store(
+        self: KeychainBackend,
+        value: []const u8,
+        cancel_flag: ?*const std.atomic.Value(bool),
+    ) KeychainError!void {
+        return self.store_fn(self.context, value, cancel_flag);
     }
 
     fn delete(self: KeychainBackend, alloc: Allocator) KeychainError!bool {
@@ -50,12 +66,26 @@ const native_keychain_backend: KeychainBackend = .{
     .delete_fn = nativeKeychainDelete,
 };
 
-fn nativeKeychainLoad(_: ?*anyopaque, alloc: Allocator) KeychainError!?[]u8 {
-    return native_keychain.loadMcpCredentials(alloc);
+fn nativeKeychainLoad(
+    _: ?*anyopaque,
+    alloc: Allocator,
+    cancel_flag: ?*const std.atomic.Value(bool),
+) KeychainError!?[]u8 {
+    return if (cancel_flag) |flag|
+        native_keychain.loadMcpCredentialsCancellable(alloc, flag)
+    else
+        native_keychain.loadMcpCredentials(alloc);
 }
 
-fn nativeKeychainStore(_: ?*anyopaque, value: []const u8) KeychainError!void {
-    return native_keychain.storeMcpCredentials(value);
+fn nativeKeychainStore(
+    _: ?*anyopaque,
+    value: []const u8,
+    cancel_flag: ?*const std.atomic.Value(bool),
+) KeychainError!void {
+    return if (cancel_flag) |flag|
+        native_keychain.storeMcpCredentialsCancellable(value, flag)
+    else
+        native_keychain.storeMcpCredentials(value);
 }
 
 fn nativeKeychainDelete(_: ?*anyopaque, alloc: Allocator) KeychainError!bool {
@@ -136,10 +166,55 @@ pub fn load(
     configured_resource: ?[]const u8,
     configured_issuer: ?[]const u8,
 ) !?mcp_auth.Credentials {
+    return loadControlled(
+        alloc,
+        server_identity,
+        endpoint,
+        configured_resource,
+        configured_issuer,
+        null,
+    );
+}
+
+pub fn loadCancellable(
+    alloc: Allocator,
+    server_identity: []const u8,
+    endpoint: []const u8,
+    configured_resource: ?[]const u8,
+    configured_issuer: ?[]const u8,
+    cancel_flag: *const std.atomic.Value(bool),
+) !?mcp_auth.Credentials {
+    return loadControlled(
+        alloc,
+        server_identity,
+        endpoint,
+        configured_resource,
+        configured_issuer,
+        cancel_flag,
+    );
+}
+
+fn loadControlled(
+    alloc: Allocator,
+    server_identity: []const u8,
+    endpoint: []const u8,
+    configured_resource: ?[]const u8,
+    configured_issuer: ?[]const u8,
+    cancel_flag: ?*const std.atomic.Value(bool),
+) !?mcp_auth.Credentials {
     const backend = storageBackend();
-    var locked = (try openLockedDirForRead(backend)) orelse return null;
+    var locked = (try openLockedDirForReadControlled(
+        backend,
+        cancel_flag,
+    )) orelse return null;
     defer locked.deinit();
-    var store = try loadStore(alloc, &locked.dir, backend, native_keychain_backend);
+    var store = try loadStoreControlled(
+        alloc,
+        &locked.dir,
+        backend,
+        native_keychain_backend,
+        cancel_flag,
+    );
     defer store.deinit(alloc);
 
     const canonical_endpoint = try mcp_auth.canonicalResource(alloc, endpoint);
@@ -266,6 +341,12 @@ fn sameIdentity(
 }
 
 fn openOrCreateLockedDir() !LockedDir {
+    return openOrCreateLockedDirControlled(null);
+}
+
+fn openOrCreateLockedDirControlled(
+    cancel_flag: ?*const std.atomic.Value(bool),
+) !LockedDir {
     const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
     var home_dir = io_mod.VerifiedDir{
         .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }),
@@ -281,16 +362,30 @@ fn openOrCreateLockedDir() !LockedDir {
         profile_paths.mcp_credentials_dir_name,
     );
     errdefer credentials_dir.close();
-    var lock = try io_mod.acquireTimedAdvisoryLock(
-        &credentials_dir,
-        lock_file_name,
-        lock_deadline_ms,
-    );
+    var lock = if (cancel_flag) |flag|
+        try io_mod.acquireTimedAdvisoryLockCancellable(
+            &credentials_dir,
+            lock_file_name,
+            lock_deadline_ms,
+            flag,
+        )
+    else
+        try io_mod.acquireTimedAdvisoryLock(
+            &credentials_dir,
+            lock_file_name,
+            lock_deadline_ms,
+        );
     errdefer lock.release();
     return .{ .dir = credentials_dir, .lock = lock };
 }
 
 fn openExistingLockedDir() !?LockedDir {
+    return openExistingLockedDirControlled(null);
+}
+
+fn openExistingLockedDirControlled(
+    cancel_flag: ?*const std.atomic.Value(bool),
+) !?LockedDir {
     const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
     var home_dir = io_mod.VerifiedDir{
         .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{
@@ -314,19 +409,34 @@ fn openExistingLockedDir() !?LockedDir {
         else => return err,
     };
     errdefer credentials_dir.close();
-    var lock = try io_mod.acquireTimedAdvisoryLock(
-        &credentials_dir,
-        lock_file_name,
-        lock_deadline_ms,
-    );
+    var lock = if (cancel_flag) |flag|
+        try io_mod.acquireTimedAdvisoryLockCancellable(
+            &credentials_dir,
+            lock_file_name,
+            lock_deadline_ms,
+            flag,
+        )
+    else
+        try io_mod.acquireTimedAdvisoryLock(
+            &credentials_dir,
+            lock_file_name,
+            lock_deadline_ms,
+        );
     errdefer lock.release();
     return .{ .dir = credentials_dir, .lock = lock };
 }
 
 fn openLockedDirForRead(backend: StorageBackend) !?LockedDir {
+    return openLockedDirForReadControlled(backend, null);
+}
+
+fn openLockedDirForReadControlled(
+    backend: StorageBackend,
+    cancel_flag: ?*const std.atomic.Value(bool),
+) !?LockedDir {
     return switch (backend) {
-        .profile_file => openExistingLockedDir(),
-        .macos_keychain => try openOrCreateLockedDir(),
+        .profile_file => openExistingLockedDirControlled(cancel_flag),
+        .macos_keychain => try openOrCreateLockedDirControlled(cancel_flag),
     };
 }
 
@@ -365,20 +475,38 @@ fn loadStore(
     backend: StorageBackend,
     keychain: KeychainBackend,
 ) !Store {
+    return loadStoreControlled(alloc, dir, backend, keychain, null);
+}
+
+fn loadStoreControlled(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+    backend: StorageBackend,
+    keychain: KeychainBackend,
+    cancel_flag: ?*const std.atomic.Value(bool),
+) !Store {
+    try checkCancellation(cancel_flag);
     const from_file = try loadFromDir(alloc, dir);
     switch (selectReadDecision(backend, from_file != null)) {
         .use_profile_file => return from_file orelse .{},
         .migrate_profile_file => {
             var store = from_file.?;
             errdefer store.deinit(alloc);
-            try writeStoreToKeychain(alloc, store, keychain);
+            try writeStoreToKeychainControlled(
+                alloc,
+                store,
+                keychain,
+                cancel_flag,
+            );
+            try checkCancellation(cancel_flag);
             try deleteCredentialFile(dir);
             return store;
         },
         .read_keychain => {},
     }
 
-    const maybe_bytes = keychain.load(alloc) catch |err| switch (err) {
+    try checkCancellation(cancel_flag);
+    const maybe_bytes = keychain.load(alloc, cancel_flag) catch |err| switch (err) {
         error.KeychainItemNotFound => null,
         else => return err,
     };
@@ -541,16 +669,33 @@ fn writeStoreToKeychain(
     store: Store,
     keychain: KeychainBackend,
 ) !void {
+    return writeStoreToKeychainControlled(alloc, store, keychain, null);
+}
+
+fn writeStoreToKeychainControlled(
+    alloc: Allocator,
+    store: Store,
+    keychain: KeychainBackend,
+    cancel_flag: ?*const std.atomic.Value(bool),
+) !void {
     const bytes = try serializeStore(alloc, store);
     defer secret.zeroAndFree(alloc, bytes);
-    try keychain.store(bytes);
-    const persisted = keychain.load(alloc) catch |err| switch (err) {
+    try checkCancellation(cancel_flag);
+    try keychain.store(bytes, cancel_flag);
+    try checkCancellation(cancel_flag);
+    const persisted = keychain.load(alloc, cancel_flag) catch |err| switch (err) {
         error.KeychainItemNotFound => return error.McpCredentialStoreWriteMismatch,
         else => return err,
     } orelse return error.McpCredentialStoreWriteMismatch;
     defer secret.zeroAndFree(alloc, persisted);
     if (!std.mem.eql(u8, bytes, persisted)) {
         return error.McpCredentialStoreWriteMismatch;
+    }
+}
+
+fn checkCancellation(cancel_flag: ?*const std.atomic.Value(bool)) !void {
+    if (cancel_flag) |flag| {
+        if (flag.load(.acquire)) return error.Cancelled;
     }
 }
 
@@ -780,6 +925,10 @@ const FakeKeychain = struct {
     delete_calls: usize = 0,
     fail_store: bool = false,
     corrupt_store: bool = false,
+    stall_load: bool = false,
+    stall_store: bool = false,
+    load_started: std.atomic.Value(bool) = .init(false),
+    store_started: std.atomic.Value(bool) = .init(false),
 
     fn deinit(self: *FakeKeychain) void {
         if (self.value) |value| secret.zeroAndFree(self.alloc, value);
@@ -798,8 +947,15 @@ const FakeKeychain = struct {
     fn loadCallback(
         raw_context: ?*anyopaque,
         alloc: Allocator,
+        cancel_flag: ?*const std.atomic.Value(bool),
     ) KeychainError!?[]u8 {
         const self: *FakeKeychain = @ptrCast(@alignCast(raw_context.?));
+        if (self.stall_load) {
+            self.load_started.store(true, .release);
+            const flag = cancel_flag orelse return error.KeychainReadFailed;
+            while (!flag.load(.acquire)) io_mod.sleep(std.time.ns_per_ms);
+            return error.Cancelled;
+        }
         const value = self.value orelse return null;
         return try alloc.dupe(u8, value);
     }
@@ -807,8 +963,15 @@ const FakeKeychain = struct {
     fn storeCallback(
         raw_context: ?*anyopaque,
         value: []const u8,
+        cancel_flag: ?*const std.atomic.Value(bool),
     ) KeychainError!void {
         const self: *FakeKeychain = @ptrCast(@alignCast(raw_context.?));
+        if (self.stall_store) {
+            self.store_started.store(true, .release);
+            const flag = cancel_flag orelse return error.KeychainWriteFailed;
+            while (!flag.load(.acquire)) io_mod.sleep(std.time.ns_per_ms);
+            return error.Cancelled;
+        }
         self.store_calls += 1;
         if (self.fail_store) return error.KeychainWriteFailed;
         const replacement = try self.alloc.dupe(
@@ -1062,6 +1225,138 @@ test "credential store is private atomic and supports restart deletion" {
         null,
         null,
     )) == null);
+}
+
+test "credential load cancellation interrupts a held advisory lock" {
+    const Waiter = struct {
+        cancel: *std.atomic.Value(bool),
+        started: std.atomic.Value(bool) = .init(false),
+        result_error: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.started.store(true, .release);
+            var credentials = loadCancellable(
+                std.heap.smp_allocator,
+                "fixture",
+                "https://mcp.example/service",
+                null,
+                null,
+                self.cancel,
+            ) catch |err| {
+                self.result_error = err;
+                return;
+            };
+            if (credentials) |*owned| owned.deinit(std.heap.smp_allocator);
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home");
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
+    defer alloc.free(home);
+    var test_home = try TestHome.init(home);
+    defer test_home.deinit();
+    test_home.activate();
+
+    var held = try openOrCreateLockedDir();
+    defer held.deinit();
+    var cancel = std.atomic.Value(bool).init(false);
+    var waiter = Waiter{ .cancel = &cancel };
+    const thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
+    while (!waiter.started.load(.acquire)) io_mod.sleep(std.time.ns_per_ms);
+    io_mod.sleep(25 * std.time.ns_per_ms);
+    const started_ms = io_mod.milliTimestamp();
+    cancel.store(true, .release);
+    thread.join();
+
+    try std.testing.expectEqual(error.Cancelled, waiter.result_error.?);
+    try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1_000);
+}
+
+test "credential cancellation interrupts Keychain read and preserves migration source" {
+    const Canceller = struct {
+        started: *const std.atomic.Value(bool),
+        cancel: *std.atomic.Value(bool),
+
+        fn run(self: *@This()) void {
+            while (!self.started.load(.acquire)) io_mod.sleep(std.time.ns_per_ms);
+            self.cancel.store(true, .release);
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home");
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
+    defer alloc.free(home);
+    var test_home = try TestHome.init(home);
+    defer test_home.deinit();
+    test_home.activate();
+
+    {
+        var locked = try openOrCreateLockedDir();
+        defer locked.deinit();
+        var fake = FakeKeychain{ .alloc = alloc, .stall_load = true };
+        defer fake.deinit();
+        var cancel = std.atomic.Value(bool).init(false);
+        var canceller = Canceller{
+            .started = &fake.load_started,
+            .cancel = &cancel,
+        };
+        const thread = try std.Thread.spawn(.{}, Canceller.run, .{&canceller});
+        const started_ms = io_mod.milliTimestamp();
+        try std.testing.expectError(
+            error.Cancelled,
+            loadStoreControlled(
+                alloc,
+                &locked.dir,
+                .macos_keychain,
+                fake.backend(),
+                &cancel,
+            ),
+        );
+        thread.join();
+        try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1_000);
+    }
+
+    var credentials = try testCredentials(
+        alloc,
+        "https://mcp.example/service",
+        "migration-secret",
+    );
+    defer credentials.deinit(alloc);
+    try save(alloc, "fixture", credentials);
+    {
+        var locked = (try openExistingLockedDir()).?;
+        defer locked.deinit();
+        var fake = FakeKeychain{ .alloc = alloc, .stall_store = true };
+        defer fake.deinit();
+        var cancel = std.atomic.Value(bool).init(false);
+        var canceller = Canceller{
+            .started = &fake.store_started,
+            .cancel = &cancel,
+        };
+        const thread = try std.Thread.spawn(.{}, Canceller.run, .{&canceller});
+        try std.testing.expectError(
+            error.Cancelled,
+            loadStoreControlled(
+                alloc,
+                &locked.dir,
+                .macos_keychain,
+                fake.backend(),
+                &cancel,
+            ),
+        );
+        thread.join();
+        _ = try locked.dir.dir.statFile(
+            std.testing.io,
+            profile_paths.mcp_credentials_file_name,
+            .{},
+        );
+    }
 }
 
 test "credential load refuses an ambiguous discovered issuer identity" {

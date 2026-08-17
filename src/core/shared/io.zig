@@ -593,7 +593,7 @@ pub fn acquireTimedAdvisoryLock(
     name: []const u8,
     deadline_ms: u64,
 ) !TimedAdvisoryLock {
-    return acquireTimedAdvisoryLockWithOps(dir, name, deadline_ms, .{});
+    return acquireTimedAdvisoryLockControlled(dir, name, deadline_ms, null, .{});
 }
 
 pub fn acquireTimedAdvisoryLockWithOps(
@@ -602,12 +602,56 @@ pub fn acquireTimedAdvisoryLockWithOps(
     deadline_ms: u64,
     ops: LockOps,
 ) !TimedAdvisoryLock {
+    return acquireTimedAdvisoryLockControlled(dir, name, deadline_ms, null, ops);
+}
+
+pub fn acquireTimedAdvisoryLockCancellable(
+    dir: *VerifiedDir,
+    name: []const u8,
+    deadline_ms: u64,
+    cancel_flag: *const std.atomic.Value(bool),
+) !TimedAdvisoryLock {
+    return acquireTimedAdvisoryLockControlled(
+        dir,
+        name,
+        deadline_ms,
+        cancel_flag,
+        .{},
+    );
+}
+
+pub fn acquireTimedAdvisoryLockCancellableWithOps(
+    dir: *VerifiedDir,
+    name: []const u8,
+    deadline_ms: u64,
+    cancel_flag: *const std.atomic.Value(bool),
+    ops: LockOps,
+) !TimedAdvisoryLock {
+    return acquireTimedAdvisoryLockControlled(
+        dir,
+        name,
+        deadline_ms,
+        cancel_flag,
+        ops,
+    );
+}
+
+fn acquireTimedAdvisoryLockControlled(
+    dir: *VerifiedDir,
+    name: []const u8,
+    deadline_ms: u64,
+    cancel_flag: ?*const std.atomic.Value(bool),
+    ops: LockOps,
+) !TimedAdvisoryLock {
     const file = try openOrCreatePrivateLockFile(dir, name);
     errdefer file.close(getIo());
 
     const started = ops.now_ms(ops.ctx);
     const deadline: i64 = started + @as(i64, @intCast(deadline_ms));
     while (true) {
+        if (cancel_flag) |flag| {
+            if (flag.load(.acquire)) return error.Cancelled;
+        }
         const locked = ops.try_lock(ops.ctx, file) catch |err| switch (err) {
             error.FileLocksUnsupported => return error.LockUnsupported,
             else => return err,
@@ -1122,6 +1166,56 @@ test "timed advisory lock returns busy after deadline" {
         acquireTimedAdvisoryLockWithOps(&dir, "settings.lock", 25, ops),
     );
     try std.testing.expect(state.lock_attempts > 1);
+}
+
+test "cancellable timed advisory lock stops between busy attempts" {
+    const CancelState = struct {
+        cancel: *std.atomic.Value(bool),
+        now_ms: i64 = 0,
+
+        fn tryLock(_: ?*anyopaque, _: std.Io.File) anyerror!bool {
+            return false;
+        }
+
+        fn now(raw: ?*anyopaque) i64 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return self.now_ms;
+        }
+
+        fn sleep(raw: ?*anyopaque, millis: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.now_ms += @intCast(millis);
+            self.cancel.store(true, .release);
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir = VerifiedDir{ .dir = try tmp.dir.openDir(
+        getIo(),
+        ".",
+        .{ .iterate = true, .follow_symlinks = false },
+    ) };
+    defer dir.close();
+    var cancel = std.atomic.Value(bool).init(false);
+    var state = CancelState{ .cancel = &cancel };
+
+    try std.testing.expectError(
+        error.Cancelled,
+        acquireTimedAdvisoryLockCancellableWithOps(
+            &dir,
+            "credentials.lock",
+            2_000,
+            &cancel,
+            .{
+                .ctx = &state,
+                .try_lock = CancelState.tryLock,
+                .now_ms = CancelState.now,
+                .sleep_ms = CancelState.sleep,
+            },
+        ),
+    );
+    try std.testing.expectEqual(@as(i64, 10), state.now_ms);
 }
 
 test "timed advisory lock reports unsupported without unlocked fallback" {

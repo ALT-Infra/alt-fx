@@ -196,6 +196,52 @@ pub fn render(alloc: Allocator, snapshot: Snapshot) ![]u8 {
     return out.toOwnedSlice();
 }
 
+pub fn renderSummary(alloc: Allocator, snapshot: Snapshot) ![]u8 {
+    if (snapshot.servers.len == 0) {
+        return alloc.dupe(
+            u8,
+            "MCP: no servers configured. Use /mcp add <name> <command> [args...].",
+        );
+    }
+    var ready: usize = 0;
+    var connecting: usize = 0;
+    var auth_required: usize = 0;
+    var failed: usize = 0;
+    var first_auth_server: ?[]const u8 = null;
+    for (snapshot.servers) |server| {
+        if (server.authentication == .required) {
+            auth_required += 1;
+            if (first_auth_server == null) first_auth_server = server.configured_name;
+            continue;
+        }
+        switch (server.connection) {
+            .ready => ready += 1,
+            .connecting => connecting += 1,
+            .failed => failed += 1,
+            .disconnected, .disabled => {},
+        }
+    }
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try out.writer.print(
+        "MCP: {d} {s} — {d} ready, {d} connecting, {d} needs auth, {d} failed.",
+        .{
+            snapshot.servers.len,
+            if (snapshot.servers.len == 1) "server" else "servers",
+            ready,
+            connecting,
+            auth_required,
+            failed,
+        },
+    );
+    if (first_auth_server) |name| {
+        try out.writer.print(" Run /mcp auth {s} --open.", .{name});
+    }
+    try out.writer.writeAll(" Use /mcp list for details.");
+    return out.toOwnedSlice();
+}
+
 fn writeOptionalCount(writer: *std.Io.Writer, count: ?usize) !void {
     if (count) |value| try writer.print("{d}", .{value}) else try writer.writeAll("unknown");
 }
@@ -291,6 +337,39 @@ test "health rendering includes complete typed state without secret-bearing conf
     try std.testing.expect(std.mem.find(u8, output, "catalog_generation") == null);
     try std.testing.expect(std.mem.find(u8, output, "Authorization") == null);
     try std.testing.expect(std.mem.find(u8, output, "https://") == null);
+}
+
+test "compact health summary reports actionable aggregate state" {
+    const alloc = std.testing.allocator;
+    const empty = Snapshot{ .captured_at_ms = 0, .servers = &.{} };
+    const empty_output = try renderSummary(alloc, empty);
+    defer alloc.free(empty_output);
+    try std.testing.expectEqualStrings(
+        "MCP: no servers configured. Use /mcp add <name> <command> [args...].",
+        empty_output,
+    );
+
+    var servers = [_]ServerSnapshot{
+        emptyServerSnapshot(),
+        emptyServerSnapshot(),
+        emptyServerSnapshot(),
+        emptyServerSnapshot(),
+    };
+    servers[0].configured_name = @constCast("ready");
+    servers[0].connection = .ready;
+    servers[1].configured_name = @constCast("loading");
+    servers[1].connection = .connecting;
+    servers[2].configured_name = @constCast("plain");
+    servers[2].connection = .failed;
+    servers[2].authentication = .required;
+    servers[3].configured_name = @constCast("broken");
+    servers[3].connection = .failed;
+    const summary = try renderSummary(alloc, .{ .captured_at_ms = 0, .servers = &servers });
+    defer alloc.free(summary);
+    try std.testing.expectEqualStrings(
+        "MCP: 4 servers — 1 ready, 1 connecting, 1 needs auth, 1 failed. Run /mcp auth plain --open. Use /mcp list for details.",
+        summary,
+    );
 }
 
 fn emptyServerSnapshot() ServerSnapshot {

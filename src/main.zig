@@ -1357,14 +1357,18 @@ const App = struct {
         );
     }
 
-    pub fn reloadMcp(self: *App) !app_mcp_runtime.ReloadOutcome {
-        return self.mcp.reload(
+    pub fn beginMcpReload(self: *App) !void {
+        return self.mcp.beginReload(
             self.alloc,
             .{ .form = true, .url = true },
             if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
             self.toolRegistry(),
             @intCast(@max(io_mod.milliTimestamp(), 0)),
         );
+    }
+
+    pub fn takeMcpReloadCompletion(self: *App) !?app_mcp_runtime.ReloadCompletion {
+        return self.mcp.takeReloadCompletion();
     }
 
     pub fn startMcpDiscovery(self: *App) void {
@@ -1424,6 +1428,10 @@ const App = struct {
 
     pub fn listMcpServersAndTools(self: *App, alloc: Allocator) ![]u8 {
         return self.mcp.renderHealth(alloc);
+    }
+
+    pub fn summarizeMcpServers(self: *App, alloc: Allocator) ![]u8 {
+        return self.mcp.renderHealthSummary(alloc);
     }
 
     pub fn snapshotMcpToolNames(self: *App, alloc: Allocator) ![][]u8 {
@@ -2409,6 +2417,7 @@ const App = struct {
         if (try self.model_cache.pollLoadTransition()) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }
+        try app_commands.Handlers(App).collectMcpReloadFacts(self);
         if (comptime host_profile.native_auth or host_profile.js_host_auth) {
             try AuthAppRuntime.collectSignInFacts(self);
         }
