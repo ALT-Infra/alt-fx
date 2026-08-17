@@ -826,28 +826,32 @@ tmuxTest(
     await session.sendText("/login");
     await session.waitForText("Choose a Vercel team", TIMEOUT);
     await session.resizeWindow(80, 5);
-    await session.sendLiteralText("play");
-    await session.waitForPane((pane) => pane.includes("Search: play"), TIMEOUT);
+    await session.sendLiteralText("example");
+    await session.waitForPane((pane) => pane.includes("Search: example"), TIMEOUT);
     const compactTeamPickerGrid = await session.capturePaneGrid();
-    const compactSearchRow = compactTeamPickerGrid.findIndex((row) => row.includes("Search: play"));
+    const compactSearchRow = compactTeamPickerGrid.findIndex((row) =>
+      row.includes("Search: example"),
+    );
     expect(compactSearchRow).toBeGreaterThanOrEqual(0);
     const compactSearchEnd =
-      compactTeamPickerGrid[compactSearchRow]!.indexOf("Search: play") + "Search: play".length;
+      compactTeamPickerGrid[compactSearchRow]!.indexOf("Search: example") +
+      "Search: example".length;
     expect(session.cursorPosition()).toEqual({ row: compactSearchRow, col: compactSearchEnd });
 
     await session.resizeWindow(80, 24);
     await session.waitForPane(
       (pane) =>
         pane.includes("Choose a Vercel team") &&
-        pane.includes("Search: play") &&
+        pane.includes("Search: example") &&
         pane.includes("Example Internal Team") &&
         !pane.includes("Other Team"),
       TIMEOUT,
     );
     const teamPickerGrid = await session.capturePaneGrid();
-    const searchRow = teamPickerGrid.findIndex((row) => row.includes("Search: play"));
+    const searchRow = teamPickerGrid.findIndex((row) => row.includes("Search: example"));
     expect(searchRow).toBeGreaterThanOrEqual(0);
-    const searchEnd = teamPickerGrid[searchRow]!.indexOf("Search: play") + "Search: play".length;
+    const searchEnd =
+      teamPickerGrid[searchRow]!.indexOf("Search: example") + "Search: example".length;
     expect(session.cursorPosition()).toEqual({ row: searchRow, col: searchEnd });
     await session.sendKeys("Enter");
     await session.waitForText("Signed in to Vercel", TIMEOUT);
