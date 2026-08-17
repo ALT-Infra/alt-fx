@@ -781,13 +781,20 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         "after-dismiss-edit",
         "after-clear",
       ];
-      for (const label of historyLabels) {
+      const baselineScrollback = stripAnsi(
+        readFileSync(join(workDir, "after-response.ansi.txt"), "utf8"),
+      );
+      const expectedMarkerCopies = Array.from({ length: 82 }, (_, index) => {
+        const marker = `SLASH_FOOTER_E2E_${String(index + 1).padStart(3, "0")}`;
+        const copies = countOccurrences(baselineScrollback, marker);
+        expect(copies, `after-response: ${marker}`).toBeGreaterThanOrEqual(1);
+        expect(copies, `after-response: ${marker}`).toBeLessThanOrEqual(2);
+        return { marker, copies };
+      });
+      for (const label of historyLabels.slice(1)) {
         const scrollback = stripAnsi(readFileSync(join(workDir, `${label}.ansi.txt`), "utf8"));
-        for (let index = 1; index <= 82; index += 1) {
-          const marker = `SLASH_FOOTER_E2E_${String(index).padStart(3, "0")}`;
-          const copies = countOccurrences(scrollback, marker);
-          expect(copies, `${label}: ${marker}`).toBeGreaterThanOrEqual(1);
-          expect(copies, `${label}: ${marker}`).toBeLessThanOrEqual(2);
+        for (const { marker, copies } of expectedMarkerCopies) {
+          expect(countOccurrences(scrollback, marker), `${label}: ${marker}`).toBe(copies);
         }
       }
 
