@@ -17,7 +17,9 @@ const output = [];
 const streamedDecoder = new TextDecoder();
 let streamedText = "";
 const liveDraft = "queued draft";
+const queuedAnswer = "§";
 let draftVisibleAt;
+let queuedVisibleAt;
 const originalSetTimeout = globalThis.setTimeout;
 let observeZeroTimeouts = false;
 let zeroTimeoutCount = 0;
@@ -37,6 +39,7 @@ const terminal = {
     output.push(chunk);
     streamedText += streamedDecoder.decode(chunk, { stream: true });
     if (draftVisibleAt === undefined && streamedText.includes(liveDraft)) draftVisibleAt = performance.now();
+    if (queuedVisibleAt === undefined && streamedText.includes("queued 1")) queuedVisibleAt = performance.now();
     process.stdout.write(chunk);
   },
   async drain() {
@@ -63,26 +66,42 @@ const encoded = new TextEncoder();
 let requestedModel;
 let streamStartedAt;
 let streamFinishedAt;
+let releaseFirstStream;
+const firstStreamRelease = new Promise((resolve) => {
+  releaseFirstStream = resolve;
+});
+let secondRequestAt;
+let secondRequestBody;
+let requestCount = 0;
 const mockFetch = async (_url, init) => {
   requestedModel = new Headers(init.headers).get("ai-language-model-id");
-  return new Response(new ReadableStream({
-    start(controller) {
-      controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"hello"}\n'));
-      streamStartedAt = performance.now();
-      let emitted = 0;
-      const interval = setInterval(() => {
-        emitted += 1;
-        if (emitted < 30) {
-          controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"."}\n'));
-          return;
-        }
-        clearInterval(interval);
-        streamFinishedAt = performance.now();
-        controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":" world"}\n'));
+  requestCount += 1;
+  if (requestCount === 2) {
+    secondRequestAt = performance.now();
+    secondRequestBody = JSON.parse(new TextDecoder().decode(init.body));
+    return new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoded.encode(`data: {"type":"text-delta","delta":"${queuedAnswer}"}\n`));
         controller.enqueue(encoded.encode('data: {"type":"finish","finishReason":{"unified":"stop"},"usage":{"inputTokens":{"total":1},"outputTokens":{"total":2}}}\n'));
         controller.enqueue(encoded.encode("data: [DONE]\n"));
         controller.close();
+      },
+    }), { status: 200, headers: { "content-type": "text/event-stream" } });
+  }
+  return new Response(new ReadableStream({
+    async start(controller) {
+      controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"hello"}\n'));
+      streamStartedAt = performance.now();
+      const interval = setInterval(() => {
+        controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"."}\n'));
       }, 20);
+      await firstStreamRelease;
+      clearInterval(interval);
+      controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":" world"}\n'));
+      controller.enqueue(encoded.encode('data: {"type":"finish","finishReason":{"unified":"stop"},"usage":{"inputTokens":{"total":1},"outputTokens":{"total":2}}}\n'));
+      controller.enqueue(encoded.encode("data: [DONE]\n"));
+      controller.close();
+      streamFinishedAt = performance.now();
     },
   }), { status: 200, headers: { "content-type": "text/event-stream" } });
 };
@@ -127,13 +146,24 @@ while (draftVisibleAt === undefined) {
   if (performance.now() >= deadline) throw new Error("timed out waiting for live follow-up input");
   await new Promise((resolve) => setTimeout(resolve, 10));
 }
+runtime.write("\r");
+while (queuedVisibleAt === undefined) {
+  if (streamFinishedAt !== undefined) throw new Error("terminal did not queue follow-up input while the response was active");
+  if (performance.now() >= deadline) throw new Error("timed out waiting for queued follow-up input");
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
 observeZeroTimeouts = false;
+if (secondRequestAt !== undefined) throw new Error("queued follow-up started before the active response finished");
+releaseFirstStream();
 while (streamFinishedAt === undefined) {
   if (performance.now() >= deadline) throw new Error("timed out waiting for streamed fx-term response");
   await new Promise((resolve) => setTimeout(resolve, 10));
 }
-await new Promise((resolve) => setTimeout(resolve, 100));
-runtime.write("\x7f".repeat(liveDraft.length));
+const queuedDeadline = performance.now() + 5000;
+while (secondRequestAt === undefined || !streamedText.includes(queuedAnswer)) {
+  if (performance.now() >= queuedDeadline) throw new Error("timed out waiting for queued fx-term response");
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
 runtime.write("/exit\r");
 const exitCode = await Promise.race([
   runtime.exited,
@@ -148,6 +178,14 @@ if (!text.includes("Run /help for commands")) throw new Error("shared Fx welcome
 if (requestedModel !== "sdk/term-model") throw new Error(`terminal prompt did not use the host-restored model: ${requestedModel}`);
 if (!(streamStartedAt < streamFinishedAt)) throw new Error("terminal fetch did not remain active for continuous streaming");
 if (!(draftVisibleAt < streamFinishedAt)) throw new Error("terminal rendered follow-up input only after continuous streaming finished");
+if (!(queuedVisibleAt < streamFinishedAt)) throw new Error("terminal queued follow-up input only after continuous streaming finished");
+if (!(secondRequestAt >= streamFinishedAt)) throw new Error("terminal started queued follow-up before continuous streaming finished");
+const queuedUser = secondRequestBody.prompt?.filter((message) => message.role === "user").at(-1);
+const queuedText = queuedUser?.content?.filter((part) => part.type === "text").map((part) => part.text);
+if (queuedText?.length !== 1 || queuedText[0] !== liveDraft) {
+  throw new Error(`queued follow-up request changed the submitted draft: ${JSON.stringify(queuedText)}`);
+}
+if (requestCount !== 2) throw new Error(`terminal sent ${requestCount} requests instead of the active and queued turns`);
 if (zeroTimeoutCount !== 0) throw new Error(`terminal allocated ${zeroTimeoutCount} zero-timeout poll timer(s)`);
 if (!events.some((event) => event.type === "config.restore" && event.configId === "model")) throw new Error("terminal model restore event was not emitted");
 if (!events.some((event) => event.type === "config.restore" && event.configId === "mode")) throw new Error("terminal mode restore event was not emitted");

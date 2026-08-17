@@ -5,14 +5,18 @@
   import { createFxTerminal, supportsJspi } from "./browser.js";
 
   const decoder = new TextDecoder();
+  const liveDraft = "INPUT_DURING_STREAM";
   let output = "";
+  let streamSourceClosed = false;
+  let streamChunkCount = 0;
   const dataListeners = new Set();
   const resizeListeners = new Set();
   const terminal = {
     cols: 80,
     rows: 24,
     write(value) {
-      output += typeof value === "string" ? value : decoder.decode(value, { stream: true });
+      const text = typeof value === "string" ? value : decoder.decode(value, { stream: true });
+      output += text;
     },
     drain() {},
     onData(callback) {
@@ -25,26 +29,91 @@
     },
   };
 
-  window.__fxBrowserTerminalTest = { state: "starting" };
+  const testState = window.__fxBrowserTerminalTest = { state: "starting", stage: "boot" };
   try {
     if (!supportsJspi()) throw new Error("JSPI unavailable");
-    const runtime = await createFxTerminal({
+    const encoded = new TextEncoder();
+    let runtime;
+    let inputTaskRan = false;
+    let inputTaskChunkCount;
+    let signalFetchStarted;
+    let releaseBufferedStream;
+    let finishBufferedStream;
+    const fetchStarted = new Promise((resolve) => { signalFetchStarted = resolve; });
+    const bufferedStreamReleased = new Promise((resolve) => { releaseBufferedStream = resolve; });
+    const bufferedStreamFinished = new Promise((resolve) => { finishBufferedStream = resolve; });
+    const mockFetch = async () => {
+      signalFetchStarted();
+      return new Response(new ReadableStream({
+        async pull(controller) {
+          await bufferedStreamReleased;
+          streamChunkCount += 1;
+          testState.chunks = streamChunkCount;
+          if (streamChunkCount === 1) {
+            controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"STREAM_STARTED"}\n'));
+            return;
+          }
+          if (streamChunkCount <= 128) {
+            controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"."}\n'));
+            return;
+          }
+          await bufferedStreamFinished;
+          controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"STREAM_FINISHED"}\n'));
+          controller.enqueue(encoded.encode('data: {"type":"finish","finishReason":{"unified":"stop"},"usage":{"inputTokens":{"total":1},"outputTokens":{"total":2}}}\n'));
+          controller.enqueue(encoded.encode("data: [DONE]\n"));
+          controller.close();
+          streamSourceClosed = true;
+        },
+      }), { status: 200, headers: { "content-type": "text/event-stream" } });
+    };
+    testState.stage = "creating-runtime";
+    runtime = await createFxTerminal({
       wasm: "../zig-out/bin/fx-term.wasm",
       terminal,
       env: { AI_GATEWAY_API_KEY: "browser-terminal-test-key" },
+      fetch: mockFetch,
     });
+    testState.stage = "waiting-interactive";
     await runtime.interactive;
-    const deadline = performance.now() + 5000;
+    testState.stage = "waiting-startup";
+    const deadline = performance.now() + 10000;
     while (!output.includes("Run /help for commands")) {
       if (performance.now() >= deadline) throw new Error("startup output missing");
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
+    testState.stage = "starting-stream";
+    runtime.write("stream please\r");
+    await fetchStarted;
+    testState.stage = "releasing-stream";
+    setTimeout(() => {
+      inputTaskRan = true;
+      inputTaskChunkCount = streamChunkCount;
+      runtime.write(liveDraft);
+    }, 0);
+    releaseBufferedStream();
+    testState.stage = "waiting-live-input";
+    while (!inputTaskRan || !output.includes(liveDraft)) {
+      if (streamSourceClosed) throw new Error("terminal rendered browser input only after the stream source closed");
+      if (performance.now() >= deadline) throw new Error("browser input did not render during the stream");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const inputTaskRanDuringStream = inputTaskChunkCount < 128;
+    const draftRenderedDuringStream = !streamSourceClosed;
+    finishBufferedStream();
+    testState.stage = "waiting-stream-finish";
+    while (!streamSourceClosed) {
+      if (performance.now() >= deadline) throw new Error("stream source did not finish");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    runtime.write("\x7f".repeat(liveDraft.length));
     runtime.write("/exit\r");
     const code = await runtime.exited;
     window.__fxBrowserTerminalTest = {
       state: "completed",
       code,
       output,
+      inputTaskRanDuringStream,
+      draftRenderedDuringStream,
       dataListeners: dataListeners.size,
       resizeListeners: resizeListeners.size,
     };
