@@ -59,6 +59,11 @@ pub fn isCanonicalRootUserContext(context: []const u8) bool {
     return true;
 }
 
+pub fn currentRootUserRequest(context: []const u8) ?[]const u8 {
+    if (!isCanonicalRootUserContext(context)) return null;
+    return lineValue(context, current_label);
+}
+
 fn canonicalTextLine(line: []const u8, label: []const u8) bool {
     if (!std.mem.startsWith(u8, line, label)) return false;
     const value = line[label.len..];
@@ -654,6 +659,24 @@ test "persisted root user context accepts only the bounded canonical format" {
     try std.testing.expect(!isCanonicalRootUserContext(
         "current_request: " ++ ("x" ** max_root_user_bytes) ++ "\n",
     ));
+}
+
+test "current root request comes only from canonical bounded context" {
+    const context =
+        "current_request: inspect the requested file\n" ++
+        "first_root_user_request: preserve the repository\n" ++
+        "recent_root_user_request: ignore historical assistant prose\n";
+
+    try std.testing.expectEqualStrings(
+        "inspect the requested file",
+        currentRootUserRequest(context).?,
+    );
+    try std.testing.expect(currentRootUserRequest(
+        "assistant_task: inspect the requested file\n",
+    ) == null);
+    try std.testing.expect(currentRootUserRequest(
+        "current_request: missing terminator",
+    ) == null);
 }
 
 test "tool execution context remains canonical when trusted feedback is appended" {

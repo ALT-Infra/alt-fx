@@ -1943,6 +1943,10 @@ fn currentRootRequest(config: Config, current_prompt: []const u8) []const u8 {
         current_prompt
     else if (config.current_prompt_is_root_authority)
         current_prompt
+    else if (auto_classifier_context.currentRootUserRequest(
+        config.root_user_intent_context,
+    )) |request|
+        request
     else if (config.root_user_messages.len > 0)
         config.root_user_messages[config.root_user_messages.len - 1]
     else
@@ -5408,19 +5412,6 @@ fn processQueuedPromptLoop(
                 within_turn_suffix.items,
                 step_batch.pending_user_suffix.items,
             );
-            const execution_root_user_request = if (action_permission_mode == .auto and
-                std.mem.eql(u8, tool_call.name, "subagent"))
-                currentRootRequest(config, job.prompt)
-            else
-                "";
-            const execution_root_user_messages_storage = [_][]const u8{
-                execution_root_user_request,
-            };
-            const execution_root_user_messages: []const []const u8 =
-                if (execution_root_user_request.len > 0)
-                    &execution_root_user_messages_storage
-                else
-                    &.{};
             const permission_authority_generation = if (live_authority) |resolved|
                 resolved.authority.generation
             else
@@ -5896,8 +5887,8 @@ fn processQueuedPromptLoop(
                 .call = execution_call,
                 .authority = execution_authority,
                 .root_user_intent_context = tool_execution_root_user_context,
-                .root_user_messages = execution_root_user_messages,
-                .root_user_evidence_complete = execution_root_user_request.len > 0,
+                .root_user_messages = &.{},
+                .root_user_evidence_complete = true,
                 .authorized_image_catalog = job.authorized_image_catalog,
                 .current_turn_messages = within_turn_suffix.items,
                 .session_grants = execution_grants,
@@ -6323,8 +6314,8 @@ fn processQueuedPromptLoop(
                             .call = execution_call,
                             .authority = broader_authority,
                             .root_user_intent_context = tool_execution_root_user_context,
-                            .root_user_messages = execution_root_user_messages,
-                            .root_user_evidence_complete = execution_root_user_request.len > 0,
+                            .root_user_messages = &.{},
+                            .root_user_evidence_complete = true,
                             .authorized_image_catalog = job.authorized_image_catalog,
                             .current_turn_messages = within_turn_suffix.items,
                             .session_grants = if (live_authority) |resolved|

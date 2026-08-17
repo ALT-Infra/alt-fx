@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const permission_prompter = @import("../permissions/permission_prompter.zig");
+const session_permission_state = @import("../permissions/session_permission_state.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
 const runtime_assistant_stream = @import("../agent/runtime/assistant_stream.zig");
@@ -704,6 +705,10 @@ pub const TurnContext = struct {
             target,
             target_kind,
         );
+        // LiveToolAuthority is returned by value, so its state header cannot
+        // point at the local snapshot even though the rule storage uses alloc.
+        const permission_state = try alloc.create(session_permission_state.State);
+        permission_state.* = snapshot.permission_state;
         return .{
             .authority = .{
                 .generation = snapshot.generation,
@@ -713,7 +718,7 @@ pub const TurnContext = struct {
                 .integrations = snapshot.integrations,
                 .rules = snapshot.rules,
                 .grants = snapshot.grants,
-                .permission_state = &snapshot.permission_state,
+                .permission_state = permission_state,
                 .permission_mode = snapshot.permission_mode,
             },
             .decision = switch (decision) {

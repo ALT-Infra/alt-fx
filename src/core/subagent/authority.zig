@@ -344,7 +344,7 @@ pub const Snapshot = struct {
         self.* = undefined;
     }
 
-    pub fn view(self: Snapshot) communication.LiveAuthority {
+    pub fn view(self: *const Snapshot) communication.LiveAuthority {
         return .{
             .generation = self.generation,
             .root_id = self.root_id,

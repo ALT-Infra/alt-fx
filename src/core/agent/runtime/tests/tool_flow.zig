@@ -1320,7 +1320,7 @@ test "resumed persistent child review rejects child-authored authority provenanc
         "current_request: Inspect the repository only.\n",
         hooks.last_execute_root_user_intent_context.?,
     );
-    try std.testing.expect(!hooks.last_execute_root_user_evidence_complete);
+    try std.testing.expect(hooks.last_execute_root_user_evidence_complete);
     try std.testing.expectEqual(
         @as(usize, 0),
         hooks.last_execute_root_user_messages.items.len,
@@ -1352,12 +1352,12 @@ test "subagent turn with empty root context never promotes delegation to trusted
     try std.testing.expectEqual(@as(usize, 0), review_context.len);
 }
 
-test "subagent execution receives only the current root request" {
+test "compacted historical root authority stays out of tool execution" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall(
-        "call_create",
-        "subagent",
-        "{\"command\":{\"create\":{\"name\":\"child\",\"mode\":\"persistent\",\"prompt\":\"Inspect.\"}}}",
+        "call_read",
+        "read_file",
+        "{\"path\":\"README.md\"}",
     )};
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &calls },
@@ -1381,18 +1381,14 @@ test "subagent execution receives only the current root request" {
     var job = fixture.job();
     job.history = &history;
     job.prompt = @constCast("Stop if secrets are encountered.");
-    job.permission_mode = .auto;
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
     try std.testing.expectEqual(
-        @as(usize, 1),
+        @as(usize, 0),
         hooks.last_execute_root_user_messages.items.len,
     );
-    try std.testing.expectEqualStrings(
-        "Stop if secrets are encountered.",
-        hooks.last_execute_root_user_messages.items[0],
-    );
+    try std.testing.expect(hooks.last_execute_root_user_evidence_complete);
 }
 
 test "sandbox widening allow mints broader authority and retries exactly once" {

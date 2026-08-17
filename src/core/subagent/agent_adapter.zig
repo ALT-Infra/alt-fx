@@ -187,7 +187,7 @@ pub fn run(
             .workspace_root = config.tool_context.workspace_root,
             .access_scope = config.tool_context.access_scope,
             .origin = .subagent,
-            .root_user_intent_context = message.root_user_intent_context,
+            .root_user_intent_context = prompt.root_user_intent_context,
             .root_user_messages = message.root_user_messages,
             .root_user_evidence_complete = message.root_user_evidence_complete,
             .session_child_capability = turn.childCapability() catch null,
