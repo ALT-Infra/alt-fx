@@ -3823,7 +3823,7 @@ test "ACP prompt projection configures web search then blocks native execution" 
     try std.testing.expectEqual(@as(usize, 0), provider_state.calls);
 }
 
-test "ACP run_command admission preserves direct configured authority and falls back to approval without a reviewer" {
+test "ACP default user commands require configured authority or review" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -3837,10 +3837,8 @@ test "ACP run_command admission preserves direct configured authority and falls 
         .name = "terminal",
         .arguments_json = "{\"action\":\"exec\",\"command\":\"pwd\"}",
     }, .ask, &.{}, &.{}));
-    switch ((direct.execution_authority orelse return error.TestExpectedEqual).run_command) {
-        .direct_only => |fingerprint| try std.testing.expectEqualStrings("/tmp/workspace", fingerprint.resolved_cwd),
-        .shell_allowed => return error.TestExpectedDirectOnly,
-    }
+    try std.testing.expectEqual(ToolPermissionDecision.permission_required, direct.decision);
+    try std.testing.expect(direct.execution_authority == null);
 
     const blocked = (try requestToolPermissionOutcome(&ctx, arena, .{
         .id = "blocked",
@@ -3913,16 +3911,28 @@ test "ACP auto mode uses automatic review allow and ask without prompting" {
         ),
     };
 
-    const direct = try requestToolPermissionOutcome(&ctx, arena, .{
+    const direct_call: ToolCall = .{
         .id = "direct",
         .name = "terminal",
         .arguments_json = "{\"action\":\"exec\",\"command\":\"pwd\"}",
-    }, .auto, &.{}, &.{});
-    switch ((direct.execution_authority orelse return error.TestExpectedEqual).run_command) {
-        .direct_only => {},
-        .shell_allowed => return error.TestExpectedDirectOnly,
-    }
-    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    };
+    var direct_review = TestReviewTurn.init("Inspect the workspace.", direct_call);
+    const direct = try requestToolPermissionOutcomeWithRequest(
+        &ctx,
+        arena,
+        direct_call,
+        direct_review.context(),
+        .auto,
+        &.{},
+        null,
+        null,
+        &.{},
+    );
+    try std.testing.expectEqual(
+        command_admission.ShellAuthorizationSource.auto_classifier,
+        direct.execution_authority.?.run_command.shell_allowed.source,
+    );
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
 
     const accepted_call: ToolCall = .{
         .id = "accepted",
@@ -3938,7 +3948,7 @@ test "ACP auto mode uses automatic review allow and ask without prompting" {
             authority.source,
         ),
     }
-    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
     try std.testing.expectEqualStrings(
         "Create accepted.txt.",
         fake.root_text,
@@ -3955,7 +3965,7 @@ test "ACP auto mode uses automatic review allow and ask without prompting" {
     try std.testing.expectEqual(ToolPermissionDecision.permission_required, blocked.decision);
     try std.testing.expectEqual(types.ToolPermissionDenialReason.permission_required, blocked.denial_reason.?);
     try std.testing.expect(blocked.execution_authority == null);
-    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
     const blocked_classifier = blocked.auto_review_result orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(permission_auto_classifier.Decision.ask, blocked_classifier.decision);
     try std.testing.expectEqualStrings("test reviewer rationale", blocked_classifier.rationale);

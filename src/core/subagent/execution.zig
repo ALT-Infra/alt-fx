@@ -20,6 +20,7 @@ const session_event = @import("../session/session_event.zig");
 const session_store = @import("../session/session_store.zig");
 const permissions = @import("../permissions/permissions.zig");
 const tooling_tool_admission = @import("../tooling/tool_admission.zig");
+const shell_resolver = @import("../terminal/shell_resolver.zig");
 const background_runtime = @import("../background/background_runtime.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const types = @import("../shared/types.zig");
@@ -7855,6 +7856,9 @@ fn runProductionSandboxGenerationCase(
         .tool_name = "terminal",
         .sandbox_command = "npm test",
     };
+    var login_shell_buffer: [4096]u8 = undefined;
+    const login_shell = shell_resolver.configuredLoginShellInto(&login_shell_buffer) orelse
+        return error.SkipZigTest;
     var authority = authority_mod.Resolver{
         .sessions = &env.store,
         .host = .{ .context = &host, .resolve_fn = LiveRevalidationHost.resolve },
@@ -7899,6 +7903,7 @@ fn runProductionSandboxGenerationCase(
                     .background = false,
                     .resolved_backend = .macos,
                     .target_os = builtin.os.tag,
+                    .environment = .{ .user = login_shell },
                     .scope = .restricted,
                 },
             },
@@ -8032,6 +8037,9 @@ test "production child sandbox grant revocation requires a separate widening app
         .changed_command_action = .allow,
         .initial_sandbox_grant = true,
     };
+    var login_shell_buffer: [4096]u8 = undefined;
+    const login_shell = shell_resolver.configuredLoginShellInto(&login_shell_buffer) orelse
+        return error.SkipZigTest;
     var authority = authority_mod.Resolver{
         .sessions = &env.store,
         .host = .{ .context = &host, .resolve_fn = LiveRevalidationHost.resolve },
@@ -8078,6 +8086,7 @@ test "production child sandbox grant revocation requires a separate widening app
                     .background = false,
                     .resolved_backend = .macos,
                     .target_os = builtin.os.tag,
+                    .environment = .{ .user = login_shell },
                     .scope = .restricted,
                 },
             },
@@ -8179,10 +8188,12 @@ test "production child sandbox grant revocation requires a separate widening app
             ledger.approvals,
             widening_approval_id,
         ) orelse return error.TestApprovalNotRegistered;
-        try std.testing.expectEqualStrings(
-            "broader file access: # terminal.exec profile=omitted (legacy)\\x0anpm test",
+        try std.testing.expect(std.mem.startsWith(
+            u8,
             widening.label,
-        );
+            "broader file access: # terminal.exec profile=user shell=",
+        ));
+        try std.testing.expect(std.mem.endsWith(u8, widening.label, "\\x0anpm test"));
         try std.testing.expectEqual(
             communication.ApprovalStatus.pending,
             widening.status,

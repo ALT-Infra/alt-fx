@@ -2449,13 +2449,16 @@ test "interactive command approval keeps activity projection out of permission r
         "terminal.exec cat <<'EOF'\\x0aline one\\x0aEOF",
         request.label,
     );
-    try std.testing.expectEqualStrings(
-        "# terminal.exec profile=omitted (legacy)\n" ++ raw_command,
-        request.command orelse return error.TestExpectedEqual,
-    );
+    const approval_command = request.command orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        approval_command,
+        "# terminal.exec profile=user shell=",
+    ));
+    try std.testing.expect(std.mem.endsWith(u8, approval_command, "\n" ++ raw_command));
 }
 
-test "terminal exec session grants do not cross explicit profiles" {
+test "terminal exec omission shares user grants while clean stays isolated" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -2469,8 +2472,8 @@ test "terminal exec session grants do not cross explicit profiles" {
         permission_auto_classifier.Classifier.disabled(),
     );
 
-    const legacy = try permissionTargetForCall(input, arena, .{
-        .id = "legacy",
+    const omitted = try permissionTargetForCall(input, arena, .{
+        .id = "omitted",
         .name = "terminal",
         .arguments_json = "{\"action\":\"exec\",\"command\":\"printf scoped\"}",
     });
@@ -2488,7 +2491,8 @@ test "terminal exec session grants do not cross explicit profiles" {
         .arguments_json = "{\"action\":\"exec\",\"command\":\"printf scoped\",\"profile\":\"user\"}",
     });
 
-    try std.testing.expect(!std.mem.eql(u8, legacy, clean));
+    try std.testing.expectEqualStrings(omitted, user);
+    try std.testing.expect(!std.mem.eql(u8, omitted, clean));
     try std.testing.expect(!std.mem.eql(u8, clean, user));
     const grants = try permissions.suggestedSessionGrants(
         arena,
@@ -2499,7 +2503,7 @@ test "terminal exec session grants do not cross explicit profiles" {
     );
     try std.testing.expect(permissions.sessionGrantAllowed(grants, "run_command", clean));
     try std.testing.expect(!permissions.sessionGrantAllowed(grants, "run_command", user));
-    try std.testing.expect(!permissions.sessionGrantAllowed(grants, "run_command", legacy));
+    try std.testing.expect(!permissions.sessionGrantAllowed(grants, "run_command", omitted));
 
     const request = try interactivePermissionRequest(input, arena, .{
         .id = "user-prompt",
@@ -2597,25 +2601,30 @@ test "interactive command and sandbox grant offers retain explicit environment i
         "# terminal.exec profile=user shell=",
     ));
 
-    const legacy_call: ToolCall = .{
-        .id = "legacy-profile",
+    const omitted_call: ToolCall = .{
+        .id = "omitted-profile",
         .name = "terminal",
         .arguments_json = "{\"action\":\"exec\",\"command\":\"printf scoped\"}",
     };
-    const legacy_ctx = try runCommandContext(input, arena, legacy_call);
-    const calls_before_legacy = recording.calls;
+    const omitted_ctx = try runCommandContext(input, arena, omitted_call);
+    const calls_before_omitted = recording.calls;
     _ = try requestSandboxWideningOutcome(
         input,
         arena,
-        legacy_call,
+        omitted_call,
         .ask,
         &.{clean_sandbox_grant},
         .{
             .phase = .preflight,
-            .restricted_fingerprint = .init(legacy_ctx),
+            .restricted_fingerprint = .init(omitted_ctx),
         },
     );
-    try std.testing.expectEqual(calls_before_legacy + 1, recording.calls);
+    try std.testing.expectEqual(calls_before_omitted + 1, recording.calls);
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        recording.last_command.?,
+        "# terminal.exec profile=user shell=",
+    ));
 }
 
 test "interactive command approval keeps dangerous-command guidance" {
@@ -3607,9 +3616,12 @@ test "exact command approval remains valid across live authority revalidation" {
 
     try std.testing.expectEqual(@as(usize, 1), grants.len);
     try std.testing.expectEqualStrings("bash", grants[0].tool_name);
+    try std.testing.expect(command_environment.isExplicitPermissionCommandIdentity(
+        grants[0].target_path,
+    ));
     try std.testing.expectEqualStrings(
         "printf approved > marker.txt",
-        grants[0].target_path,
+        command_environment.commandFromPermissionIdentity(grants[0].target_path),
     );
     try std.testing.expect(sessionGrantsAllowAll(grants, "bash", targets.items));
 }
@@ -3693,7 +3705,13 @@ test "interactive admission routes prompts through the supplied prompter" {
     const grant_offer = recording.last_grant_offer orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(usize, 1), grant_offer.len);
     try std.testing.expectEqualStrings("bash", grant_offer[0].tool_name);
-    try std.testing.expectEqualStrings("touch generated.txt", grant_offer[0].target_path);
+    try std.testing.expect(command_environment.isExplicitPermissionCommandIdentity(
+        grant_offer[0].target_path,
+    ));
+    try std.testing.expectEqualStrings(
+        "touch generated.txt",
+        command_environment.commandFromPermissionIdentity(grant_offer[0].target_path),
+    );
     try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
     const authority = outcome.execution_authority.?.run_command;
     try std.testing.expectEqual(
@@ -4750,7 +4768,7 @@ test "invalid automatic review blocks without a prompter" {
     try std.testing.expect(outcome.auto_review_result == null);
 }
 
-test "automatic review is skipped for deterministic command authorities" {
+test "default user commands use automatic review unless configured rules allow them" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
@@ -4779,9 +4797,10 @@ test "automatic review is skipped for deterministic command authorities" {
         &.{},
     );
     try std.testing.expectEqual(
-        std.meta.Tag(command_admission.CommandExecutionAuthority).direct_only,
-        std.meta.activeTag(direct.execution_authority.?.run_command),
+        command_admission.ShellAuthorizationSource.auto_classifier,
+        direct.execution_authority.?.run_command.shell_allowed.source,
     );
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
 
     var rules = [_]types.PermissionRule{.{
         .permission = @constCast("bash"),
@@ -4804,7 +4823,7 @@ test "automatic review is skipped for deterministic command authorities" {
         command_admission.ShellAuthorizationSource.configured_rule,
         configured.execution_authority.?.run_command.shell_allowed.source,
     );
-    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
 }
 
 test "js host workspace sandbox default is lowest priority and prompt disables it" {
@@ -4949,13 +4968,19 @@ test "sandbox widening review carries the full broader command context" {
         fake.sandbox_restricted_command_result.?,
     );
     try std.testing.expectEqual(@as(usize, 2), fake.sandbox_target_count);
+    const command_target = fake.sandbox_command_target.?;
+    const command_separator = std.mem.find(u8, command_target, "::") orelse
+        return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("/tmp/workspace", command_target[0..command_separator]);
     try std.testing.expectEqualStrings(
-        "/tmp/workspace::npm install left-pad",
-        fake.sandbox_command_target.?,
+        "npm install left-pad",
+        command_environment.commandFromPermissionIdentity(
+            command_target[command_separator + 2 ..],
+        ),
     );
     try std.testing.expectEqualStrings(
         "npm install left-pad",
-        fake.sandbox_scope_target.?,
+        command_environment.commandFromPermissionIdentity(fake.sandbox_scope_target.?),
     );
     const authority = outcome.execution_authority.?.run_command.shell_allowed;
     try std.testing.expectEqual(permission_auto_classifier.SandboxScope.broader, authority.fingerprint.scope);
@@ -5078,9 +5103,14 @@ test "sandbox widening deny precedes grants and exact grants satisfy ask" {
     const restricted_fingerprint = command_admission.AdmissionFingerprint.init(
         try runCommandContext(input, arena_state.allocator(), call),
     );
+    const sandbox_identity = try command_environment.permissionCommandIdentity(
+        arena_state.allocator(),
+        restricted_fingerprint.environment,
+        restricted_fingerprint.command,
+    );
     var sandbox_grants = [_]PermissionGrant{.{
         .tool_name = @constCast("sandbox"),
-        .target_path = @constCast("npm install left-pad"),
+        .target_path = sandbox_identity,
     }};
     var rules = [_]types.PermissionRule{.{
         .permission = @constCast("sandbox"),

@@ -1551,13 +1551,16 @@ fn patternForRuleMatch(alloc: std.mem.Allocator, workspace_root: []const u8, too
         return alloc.dupe(u8, target_path);
     }
     if (std.mem.eql(u8, permission, "bash")) {
-        if (command_environment.isExplicitPermissionCommandIdentity(target_path)) {
-            return alloc.dupe(u8, target_path);
-        }
-        if (std.mem.find(u8, target_path, "::")) |separator| {
-            return alloc.dupe(u8, target_path[separator + 2 ..]);
-        }
-        return alloc.dupe(u8, target_path);
+        const identity = if (command_environment.isExplicitPermissionCommandIdentity(target_path))
+            target_path
+        else if (std.mem.find(u8, target_path, "::")) |separator|
+            target_path[separator + 2 ..]
+        else
+            target_path;
+        return alloc.dupe(u8, command_environment.commandFromPermissionIdentity(identity));
+    }
+    if (std.mem.eql(u8, permission, "sandbox")) {
+        return alloc.dupe(u8, command_environment.commandFromPermissionIdentity(target_path));
     }
 
     return displayTargetForPolicy(alloc, workspace_root, tool_name, target_path, target_kind);
@@ -2645,7 +2648,7 @@ test "permissionRulePatternForGrant preserves explicit command environment ident
     try std.testing.expectEqualStrings("/tmp/external/**", external);
 }
 
-test "configured legacy command rules do not authorize explicit environments" {
+test "configured command rules match explicit environments by command" {
     const alloc = std.testing.allocator;
     var rules_buf = [_]types.PermissionRule{
         .{ .permission = @constCast("bash"), .pattern = @constCast("zig *"), .action = .allow },
@@ -2662,17 +2665,23 @@ test "configured legacy command rules do not authorize explicit environments" {
     defer alloc.free(target);
 
     try std.testing.expectEqual(
-        RuleDecision.none,
+        RuleDecision.allow,
         try ruleDecisionFor(alloc, rules, "/tmp/workspace", "run_command", target, .command_cwd),
     );
 
-    var explicit_rules_buf = [_]types.PermissionRule{
-        .{ .permission = @constCast("bash"), .pattern = identity, .action = .allow },
+    var sandbox_rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("sandbox"), .pattern = @constCast("zig *"), .action = .deny },
     };
-    const explicit_rules: types.PermissionRuleSet = .{ .rules = &explicit_rules_buf };
     try std.testing.expectEqual(
-        RuleDecision.allow,
-        try ruleDecisionFor(alloc, explicit_rules, "/tmp/workspace", "run_command", target, .command_cwd),
+        RuleDecision.deny,
+        try ruleDecisionFor(
+            alloc,
+            .{ .rules = &sandbox_rules_buf },
+            "/tmp/workspace",
+            "sandbox",
+            identity,
+            .none,
+        ),
     );
 }
 

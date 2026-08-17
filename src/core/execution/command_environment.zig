@@ -38,8 +38,8 @@ pub fn isExplicitPermissionCommandIdentity(value: []const u8) bool {
     return std.mem.startsWith(u8, value, permission_identity_prefix);
 }
 
-/// Binds explicit shell startup to a retained command grant while preserving
-/// the shipped plain-command identity for omitted-profile compatibility.
+/// Binds shell startup to a retained command grant. Legacy callers keep the
+/// plain-command identity; terminal profile calls bind the selected shell.
 pub fn permissionCommandIdentity(
     alloc: std.mem.Allocator,
     environment: Environment,

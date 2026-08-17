@@ -115,7 +115,7 @@ pub fn environment(
     configured_login_shell: ?[]const u8,
     profile: ?Profile,
 ) (ResolveError || Allocator.Error)!Environment {
-    const selected = profile orelse return .legacy;
+    const selected = profile orelse .user;
     const path = configured_login_shell orelse return error.MissingLoginShell;
     _ = try resolve(path, switch (selected) {
         .clean => .{ .executable = .{ .path = path, .clean_start = true } },
@@ -363,11 +363,12 @@ test "captured invocation provider projection shell-quotes every argv word" {
     );
 }
 
-test "profile normalization defaults only captured execution to legacy" {
+test "profile normalization defaults captured and persistent execution to user" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    try std.testing.expectEqual(Environment.legacy, try environment(arena, "/bin/zsh", null));
+    try std.testing.expect((try environment(arena, "/bin/bash", null)).eql(.{ .user = "/bin/bash" }));
+    try std.testing.expect((try environment(arena, "/bin/zsh", null)).eql(.{ .user = "/bin/zsh" }));
     try std.testing.expect((try environment(arena, "/bin/zsh", .clean)).eql(.{ .clean = "/bin/zsh" }));
     try std.testing.expect((try environment(arena, "/bin/zsh", .user)).eql(.{ .user = "/bin/zsh" }));
     try std.testing.expectEqual(contracts.ShellSpec.user_login, try profileShell(arena, "/bin/zsh", .user));

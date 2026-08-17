@@ -3346,16 +3346,20 @@ test "run command compatibility returns installer failure without shell fallback
 
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const result = try executeTestRunCommand(rt.context(), arena_state.allocator(), .{
-        .id = "compatibility-failure",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"fx-compatibility-probe\"}",
-    });
+    const result = (try tool_dispatch.dispatchRunCommandCompatibility(
+        typedDispatchContext(rt.context(), arena_state.allocator()),
+        rt.tool_registry,
+        .{
+            .command = "fx-compatibility-probe",
+            .resolved_cwd = "/tmp",
+            .environment = .legacy,
+        },
+    )) orelse return error.TestExpectedEqual;
 
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
-    try expectToolErrorField(result.model_output, "type", "tool_execution_failed");
-    try expectToolErrorField(result.model_output, "tool_name", "terminal");
-    try expectToolErrorDetailString(result.model_output, "error", "SkillInstallFailed");
+    const failure = result.failure;
+    try expectToolErrorField(failure, "type", "tool_execution_failed");
+    try expectToolErrorField(failure, "tool_name", "terminal");
+    try expectToolErrorDetailString(failure, "error", "SkillInstallFailed");
 }
 
 fn unexpectedTestPrompt(
@@ -4750,7 +4754,7 @@ test "CLI headless ordinary admission preserves multi-target deny precedence" {
     }
 }
 
-test "run_command admission emits exact authority for deterministic and reviewed sources" {
+test "run_command default user profile requires configured or reviewed shell authority" {
     const alloc = std.testing.allocator;
     var reviewer = TestAutoReview{};
     var rt = TestRuntime{
@@ -4768,14 +4772,8 @@ test "run_command admission emits exact authority for deterministic and reviewed
         .name = "terminal",
         .arguments_json = "{\"action\":\"exec\",\"command\":\"pwd\"}",
     }, .ask, &.{}));
-    try std.testing.expectEqual(ToolPermissionDecision.once, direct.decision);
-    switch ((direct.execution_authority orelse return error.TestExpectedEqual).run_command) {
-        .direct_only => |fingerprint| {
-            try std.testing.expectEqualStrings("pwd", fingerprint.command);
-            try std.testing.expectEqualStrings(rt.workspace_root, fingerprint.resolved_cwd);
-        },
-        .shell_allowed => return error.TestExpectedDirectOnly,
-    }
+    try std.testing.expectEqual(ToolPermissionDecision.permission_required, direct.decision);
+    try std.testing.expect(direct.execution_authority == null);
 
     const blocked = (try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena, .{
         .id = "blocked",
@@ -6846,60 +6844,6 @@ test "run_command propagates output callback failure" {
     );
 }
 
-test "primary run_command executes direct-only authority with canonical capacity and no artifact" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
-
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    try tmp.dir.createDirPath(io_mod.getIo(), "artifacts");
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(workspace);
-    const artifacts = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "artifacts");
-    defer alloc.free(artifacts);
-
-    var rt = TestRuntime{
-        .workspace_root = workspace,
-        .max_command_output_bytes = 1,
-        .command_artifact_dir = artifacts,
-        .sandbox_backend = .none,
-        .interactive = false,
-    };
-    defer rt.deinit(alloc);
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const call = ToolCall{
-        .id = "direct",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf x | wc -c\"}",
-    };
-    const outcome = try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena, call, .ask, &.{});
-    const authority = outcome.execution_authority orelse return error.TestExpectedEqual;
-
-    const result = try executeToolCallAuthorized(rt.context(), .{
-        .call_allocator = arena,
-        .result_allocator = arena,
-        .call = call,
-        .authority = authority,
-        .session_grants = &.{},
-        .advertised_dynamic_tool_names = &.{},
-        .max_tool_result_bytes = rt.max_tool_result_bytes,
-    });
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
-    try expectContains(result.model_output, "<stdout>\n1\n</stdout>\n");
-    const structured = result.command_result_json orelse return error.TestExpectedEqual;
-    try expectCommandResultNull(structured, "output_file");
-    try expectCommandResultNull(structured, "stdout_file");
-    try expectCommandResultNull(structured, "stderr_file");
-
-    var artifact_dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), artifacts, .{ .iterate = true });
-    defer artifact_dir.close(io_mod.getIo());
-    var iterator = artifact_dir.iterate();
-    try std.testing.expect((try iterator.next(io_mod.getIo())) == null);
-}
-
 test "run_command returns model output and structured metadata" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
 
@@ -7030,7 +6974,7 @@ test "run_command reactive sandbox widening preserves the restricted attempt" {
     const result = try executeTestRunCommand(rt.context(), arena_state.allocator(), .{
         .id = "cmd",
         .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf 'Operation not permitted\\\\n' >&2; exit 1\"}",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf 'Operation not permitted\\\\n' >&2; exit 1\",\"profile\":\"clean\"}",
     });
 
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
@@ -7950,76 +7894,6 @@ test "memory tool uses isolated HOME and preserves outputs" {
 
     try expectToolOutput(ctx, "memory", "{\"action\":\"clear\"}", "memories cleared");
     try expectToolOutput(ctx, "memory", "{\"action\":\"list\"}", "No saved memories");
-}
-
-test "run_command executes registered compatibility before shell" {
-    const alloc = std.testing.allocator;
-    var rt = TestRuntime{
-        .workspace_root = "/tmp",
-        .tool_registry = test_compatibility_registry,
-    };
-    defer rt.deinit(alloc);
-
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const result = try executeTestRunCommand(rt.context(), arena_state.allocator(), .{
-        .id = "compatibility",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"fx-compatibility-probe\"}",
-    });
-
-    try expectContains(result.model_output, "registered compatibility");
-    try expectNotContains(result.model_output, "command not found");
-}
-
-test "run_command intercepts npx skills add into fx installer" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(io_mod.getIo(), "repo/workflow");
-    try tmp.dir.createDirPath(io_mod.getIo(), "skills");
-    {
-        var file = try tmp.dir.createFile(io_mod.getIo(), "repo/workflow/SKILL.md", .{});
-        defer file.close(io_mod.getIo());
-        try file.writeStreamingAll(io_mod.getIo(), "---\nname: workflow\ndescription: workflow helper\n---\n\nuse the workflow skill\n");
-    }
-
-    const repo_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "repo");
-    defer alloc.free(repo_root);
-    const skills_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "skills");
-    defer alloc.free(skills_dir);
-
-    const builtin_tools = @import("../../builtins/tools.zig");
-    var rt = TestRuntime{
-        .workspace_root = repo_root,
-        .skills_dir = skills_dir,
-        .tool_registry = builtin_tools.registry,
-    };
-    defer rt.deinit(alloc);
-    const args_json = try std.fmt.allocPrint(alloc, "{{\"action\":\"exec\",\"command\":\"npx skills add {s} --skill workflow -g -y\"}}", .{repo_root});
-    defer alloc.free(args_json);
-    var captured = TestCommandOutputCapture{ .alloc = alloc };
-    defer captured.deinit();
-    var ctx = rt.context();
-    ctx.output_chunk_ctx = @ptrCast(&captured);
-    ctx.on_output_chunk = TestCommandOutputCapture.onChunk;
-
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const result = try executeTestRunCommand(ctx, arena_state.allocator(), .{ .id = "1", .name = "terminal", .arguments_json = args_json });
-    try expectContains(result.model_output, "Installed 1 skill(s) into fx.");
-    try expectNotContains(result.model_output, "<skill");
-    try expectNotContains(result.model_output, "use the workflow skill");
-    try std.testing.expectEqualStrings(result.model_output, captured.bytes.items);
-    try std.testing.expectEqual(@as(usize, 1), captured.stdout_chunks);
-    try std.testing.expectEqual(@as(usize, 0), captured.stderr_chunks);
-    try std.testing.expect(result.command_replay_capture != null);
-
-    const installed = try std.fs.path.join(alloc, &.{ skills_dir, "workflow", "SKILL.md" });
-    defer alloc.free(installed);
-    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), installed, .{});
-    defer file.close(io_mod.getIo());
 }
 
 test "install_skill explicit tool installs local skill source" {

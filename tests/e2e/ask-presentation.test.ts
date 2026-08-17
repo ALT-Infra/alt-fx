@@ -137,32 +137,40 @@ function fakeGatewayStreamingText(lines: string[], delayMs: number) {
 }
 
 describe("fx ask presentation", () => {
-  test("fresh binary keeps omitted clean and user terminal exec environments distinct", async () => {
+  test("fresh binary defaults terminal exec and start to the user profile", async () => {
     const configuredShell = userInfo().shell;
     if (!configuredShell.endsWith("/bash") && !configuredShell.endsWith("/zsh")) return;
 
     const root = createRoot();
-    writeFileSync(join(root.home, ".profile"), "export FX_OMITTED_PROFILE=omitted\n");
     if (configuredShell.endsWith("/zsh")) {
-      writeFileSync(join(root.home, ".zprofile"), "export FX_PROFILE_LOGIN=login\n");
+      writeFileSync(
+        join(root.home, ".zprofile"),
+        "export FX_PROFILE_LOGIN=login\nexport PATH=\"$HOME/profile-bin:$PATH\"\n",
+      );
       writeFileSync(
         join(root.home, ".zshrc"),
-        "export FX_PROFILE_RC=rc\nfx_profile_function() { printf function-user; }\n",
+        "export FX_PROFILE_RC=rc\nalias fx_profile_alias='printf alias-user'\n" +
+          "fx_profile_function() { printf function-user; }\n",
       );
     } else {
       writeFileSync(
         join(root.home, ".bash_profile"),
-        "export FX_PROFILE_LOGIN=login\nexport FX_PROFILE_RC=rc\nfx_profile_function() { printf function-user; }\n",
+        "export FX_PROFILE_LOGIN=login\nexport FX_PROFILE_RC=rc\n" +
+          "export PATH=\"$HOME/profile-bin:$PATH\"\n" +
+          "alias fx_profile_alias='printf alias-user'\n" +
+          "fx_profile_function() { printf function-user; }\n",
       );
     }
 
     const profileCommand =
       "printf 'mode=%s:%s:' \"${FX_PROFILE_LOGIN-unset}\" \"${FX_PROFILE_RC-unset}\"; " +
+      "case :\"$PATH\": in *:\"$HOME/profile-bin\":*) printf 'path-user:';; *) printf 'path-clean:';; esac; " +
+      "if alias fx_profile_alias >/dev/null 2>&1; then fx_profile_alias; else printf no-alias; fi; printf ':'; " +
       "if command -v fx_profile_function >/dev/null; then fx_profile_function; else printf no-function; fi";
     const gateway = startFakeGateway([
       fakeGatewayToolCall("terminal-omitted", "terminal", {
         action: "exec",
-        command: "printf 'omitted=%s' \"${FX_OMITTED_PROFILE-unset}\"",
+        command: profileCommand,
       }),
       fakeGatewayToolCall("terminal-clean", "terminal", {
         action: "exec",
@@ -173,6 +181,26 @@ describe("fx ask presentation", () => {
         action: "exec",
         command: profileCommand,
         profile: "user",
+      }),
+      fakeGatewayToolCall("terminal-start-omitted", "terminal", {
+        action: "start",
+        command: profileCommand,
+        return_when: { kind: "exit" },
+        wait_ceiling_ms: 8_000,
+      }),
+      fakeGatewayToolCall("terminal-start-clean", "terminal", {
+        action: "start",
+        command: profileCommand,
+        profile: "clean",
+        return_when: { kind: "exit" },
+        wait_ceiling_ms: 8_000,
+      }),
+      fakeGatewayToolCall("terminal-start-user", "terminal", {
+        action: "start",
+        command: profileCommand,
+        profile: "user",
+        return_when: { kind: "exit" },
+        wait_ceiling_ms: 8_000,
       }),
       fakeGatewayFinalText("Terminal exec profiles verified.\n"),
     ]);
@@ -189,10 +217,24 @@ describe("fx ask presentation", () => {
 
     expect(result.code).toBe(0);
     expect(JSON.parse(result.stdout).output).toBe("Terminal exec profiles verified.\n");
-    expect(gateway.requests).toHaveLength(4);
-    expect(gateway.requests[1]!.body).toContain("omitted=omitted");
-    expect(gateway.requests[2]!.body).toContain("mode=unset:unset:no-function");
-    expect(gateway.requests[3]!.body).toContain("mode=login:rc:function-user");
+    expect(gateway.requests).toHaveLength(7);
+    expect(gateway.requests[0]!.body).toContain(
+      "omitting profile is identical to profile=user",
+    );
+    expect(gateway.requests[0]!.body).toContain(
+      "omission defaults to user, while clean skips user startup files",
+    );
+    expect(gateway.requests[0]!.body).not.toContain(
+      "omission preserves legacy command behavior",
+    );
+    for (const requestIndex of [1, 3, 4, 6]) {
+      expect(gateway.requests[requestIndex]!.body).toContain("mode=login:rc:path-user:");
+      expect(gateway.requests[requestIndex]!.body).toContain("alias-user:function-user");
+    }
+    for (const requestIndex of [2, 5]) {
+      expect(gateway.requests[requestIndex]!.body).toContain("mode=unset:unset:path-clean:");
+      expect(gateway.requests[requestIndex]!.body).toContain("no-alias:no-function");
+    }
   }, TIMEOUT);
 
   test.skipIf(!tmuxAvailable())(

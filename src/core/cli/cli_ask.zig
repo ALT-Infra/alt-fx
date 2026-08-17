@@ -5041,7 +5041,7 @@ test "cli ask admits default-safe web_search without a rule" {
     try std.testing.expectEqual(ToolPermissionDecision.once, (try requestToolPermissionOutcome(&ctx, arena, call, .auto, &.{}, &.{})).decision);
 }
 
-test "fx ask run_command admission preserves direct configured authority and blocks auto without a reviewer" {
+test "fx ask default user commands require configured authority or review" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -5053,15 +5053,11 @@ test "fx ask run_command admission preserves direct configured authority and blo
     var ctx = AskContext.init(alloc, testConfig(), testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup), "/tmp/workspace");
     defer ctx.deinit();
 
-    const direct = (try requestToolPermissionOutcome(&ctx, arena, .{
+    try std.testing.expectError(error.NonInteractivePermissionRequired, requestToolPermissionOutcome(&ctx, arena, .{
         .id = "direct",
         .name = "terminal",
         .arguments_json = "{\"action\":\"exec\",\"command\":\"pwd\"}",
     }, .ask, &.{}, &.{}));
-    switch ((direct.execution_authority orelse return error.TestExpectedEqual).run_command) {
-        .direct_only => |fingerprint| try std.testing.expectEqualStrings("/tmp/workspace", fingerprint.resolved_cwd),
-        .shell_allowed => return error.TestExpectedDirectOnly,
-    }
 
     try std.testing.expectError(error.NonInteractivePermissionRequired, requestToolPermissionOutcome(&ctx, arena, .{
         .id = "blocked",
@@ -5629,16 +5625,28 @@ test "fx ask auto mode applies automatic allow and ask without a prompt" {
         FakeClassifier.classify,
     );
 
-    const direct = try requestToolPermissionOutcome(&ctx, arena, .{
+    const direct_call: ToolCall = .{
         .id = "direct",
         .name = "terminal",
         .arguments_json = "{\"action\":\"exec\",\"command\":\"pwd\"}",
-    }, .auto, &.{}, &.{});
-    switch ((direct.execution_authority orelse return error.TestExpectedEqual).run_command) {
-        .direct_only => {},
-        .shell_allowed => return error.TestExpectedDirectOnly,
-    }
-    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    };
+    var direct_review = TestReviewTurn.init("Inspect the workspace.", direct_call);
+    const direct = try requestToolPermissionOutcomeWithRequest(
+        &ctx,
+        arena,
+        direct_call,
+        direct_review.context(),
+        .auto,
+        &.{},
+        null,
+        null,
+        &.{},
+    );
+    try std.testing.expectEqual(
+        command_admission.ShellAuthorizationSource.auto_classifier,
+        direct.execution_authority.?.run_command.shell_allowed.source,
+    );
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
 
     const accepted_call: ToolCall = .{
         .id = "accepted",
@@ -5664,7 +5672,7 @@ test "fx ask auto mode applies automatic allow and ask without a prompt" {
             authority.source,
         ),
     }
-    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
 
     fake.decision = .ask;
     const check_call: ToolCall = .{
@@ -5684,7 +5692,7 @@ test "fx ask auto mode applies automatic allow and ask without a prompt" {
         null,
         &.{},
     ));
-    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
     try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "noninteractive_permission_prompt_unavailable") != null);
 }
 
