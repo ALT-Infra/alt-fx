@@ -1298,6 +1298,7 @@ test "resumed persistent child review rejects child-authored authority provenanc
     var job = fixture.job();
     job.history = &history;
     job.prompt = @constCast("Inspect the repository only.");
+    job.permission_mode = .auto;
     var config = fixture.config();
     config.origin = .subagent;
     config.root_user_intent_context = "current_request: Inspect the repository only.\n";
@@ -1380,6 +1381,7 @@ test "tool execution receives only the current root request" {
     var job = fixture.job();
     job.history = &history;
     job.prompt = @constCast("Stop if secrets are encountered.");
+    job.permission_mode = .auto;
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 

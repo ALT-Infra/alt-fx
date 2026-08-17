@@ -5408,7 +5408,10 @@ fn processQueuedPromptLoop(
                 within_turn_suffix.items,
                 step_batch.pending_user_suffix.items,
             );
-            const execution_root_user_request = currentRootRequest(config, job.prompt);
+            const execution_root_user_request = if (action_permission_mode == .auto)
+                currentRootRequest(config, job.prompt)
+            else
+                "";
             const execution_root_user_messages_storage = [_][]const u8{
                 execution_root_user_request,
             };
