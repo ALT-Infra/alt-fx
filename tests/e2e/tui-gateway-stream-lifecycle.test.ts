@@ -7587,8 +7587,11 @@ describe.skipIf(!tmuxAvailable())("transcript scrollback release", () => {
           [
             {
               id: "group-b-command",
-              name: "run_command",
-              input: { command: "sleep 5; printf HELD_COMMAND_DONE" },
+              name: "terminal",
+              input: {
+                action: "exec",
+                command: "sleep 5; printf HELD_COMMAND_DONE",
+              },
             },
           ],
           "SECOND_GROUP_INTRO",
