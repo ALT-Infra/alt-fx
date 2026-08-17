@@ -434,6 +434,14 @@ const App = struct {
 
     pub fn cooperativeTransportPulse(self: *Self) !void {
         if (comptime !host_target.is_wasm) return;
+        if (try event_loop.pump_ready_input(
+            self.terminal,
+            &self.should_exit,
+            RenderAppRuntime.eventLoopCallbacks(self),
+        )) |exit_cause| {
+            if (exit_cause == .input_closed) self.should_exit = true;
+            return;
+        }
         try WorkerAppRuntime.tick(
             self,
             app_callbacks.Bindings(App).onTaskCompletion,
@@ -3868,4 +3876,5 @@ test {
     _ = @import("ui/transcript/runtime_tests.zig");
     _ = @import("core/agent/worker_runtime.zig");
     _ = @import("gateway/client.zig");
+    _ = @import("gateway/host_stream_provider.zig");
 }

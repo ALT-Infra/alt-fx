@@ -98,3 +98,7 @@ Run the test suite with `zig build test`. See [CONTRIBUTING.md](CONTRIBUTING.md)
 ## License
 
 [Apache-2.0](LICENSE)
+
+## Credits
+
+Interface sounds by [cuelume](https://github.com/Danilaa1/cuelume).
