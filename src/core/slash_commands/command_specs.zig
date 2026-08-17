@@ -1492,11 +1492,11 @@ fn writeStyleEnd(writer: *std.Io.Writer, style: HelpStyle) !void {
 fn styleStart(style: HelpStyle, role: HelpRole) []const u8 {
     if (style == .plain) return "";
     return switch (role) {
-        .brand => "\x1b[1;97m",
+        .brand => "\x1b[1m",
         .heading, .label => "\x1b[1m",
-        .syntax => "\x1b[38;5;252m",
-        .muted => "\x1b[38;5;245m",
-        .link => "\x1b[4;38;5;252m",
+        .syntax => "\x1b[39m",
+        .muted => "\x1b[38;5;243m",
+        .link => "\x1b[4m",
     };
 }
 
@@ -1715,11 +1715,14 @@ test "terminal top-level help adds styling without changing visible content" {
     defer std.testing.allocator.free(stripped);
 
     try std.testing.expect(std.mem.find(u8, plain, "\x1b[") == null);
-    try std.testing.expect(std.mem.startsWith(u8, terminal, "\x1b[1;97m𝒇x\x1b[0m"));
+    try std.testing.expect(std.mem.startsWith(u8, terminal, "\x1b[1m𝒇x\x1b[0m"));
     try std.testing.expect(std.mem.find(u8, terminal, "\x1b[1mUsage:\x1b[0m") != null);
-    try std.testing.expect(std.mem.find(u8, terminal, "\x1b[38;5;252mask <prompt>\x1b[0m") != null);
-    try std.testing.expect(std.mem.find(u8, terminal, "\x1b[4;38;5;252mhttps://fx.sh/docs\x1b[0m") != null);
-    try std.testing.expect(std.mem.find(u8, terminal, "\x1b[38;5;252mrun `/feedback` inside 𝒇x\x1b[0m") != null);
+    try std.testing.expect(std.mem.find(u8, terminal, "\x1b[39mask <prompt>\x1b[0m") != null);
+    try std.testing.expect(std.mem.find(u8, terminal, "\x1b[38;5;243mFast, native coding agent") != null);
+    try std.testing.expect(std.mem.find(u8, terminal, "\x1b[4mhttps://fx.sh/docs\x1b[0m") != null);
+    try std.testing.expect(std.mem.find(u8, terminal, "\x1b[39mrun `/feedback` inside 𝒇x\x1b[0m") != null);
+    try std.testing.expect(std.mem.find(u8, terminal, "\x1b[38;5;252m") == null);
+    try std.testing.expect(std.mem.find(u8, terminal, "\x1b[38;5;245m") == null);
     try std.testing.expectEqualStrings(plain, stripped);
 }
 
