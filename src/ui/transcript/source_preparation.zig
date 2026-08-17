@@ -6,6 +6,7 @@ const tool_group_projection = @import("tool_group_projection.zig");
 const render_engine = @import("../render_engine.zig");
 const user_message_card = @import("../assistant/user_message_card.zig");
 const ui_render = @import("../render.zig");
+const types = @import("../../core/shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 const transcript_blocks = render_engine.transcript_blocks;
@@ -68,6 +69,17 @@ const FinalityNomination = struct {
     turn_id: u64 = 0,
 };
 
+const ToolFinalityIdentity = struct {
+    turn_id: u64,
+    presentation_group_id: ?types.ToolPresentationGroupId,
+};
+
+const ToolTurnNomination = struct {
+    earliest_entry_id: u32,
+    selected_entry_id: u32,
+    selected_group_id: ?types.ToolPresentationGroupId,
+};
+
 fn entryHiddenByActions(
     entry_actions: []const transcript_blocks.EntryRenderAction,
     index: usize,
@@ -89,51 +101,82 @@ fn collectFinalityNominations(
     var nominations: std.ArrayList(FinalityNomination) = .empty;
     errdefer nominations.deinit(alloc);
 
-    var entry_turn_ids: std.AutoHashMapUnmanaged(u32, u64) = .empty;
-    defer entry_turn_ids.deinit(alloc);
+    var entry_tool_identities: std.AutoHashMapUnmanaged(u32, ToolFinalityIdentity) = .empty;
+    defer entry_tool_identities.deinit(alloc);
     for (self.tool_details.items) |detail| {
-        const turn_id: u64 = if (detail.presentation_group_id) |group|
-            group.turn_id
+        const identity: ToolFinalityIdentity = if (detail.presentation_group_id) |group|
+            .{ .turn_id = group.turn_id, .presentation_group_id = group }
         else if (detail.lifecycle_id) |lifecycle|
-            lifecycle.turn_id
+            .{ .turn_id = lifecycle.turn_id, .presentation_group_id = null }
         else
             continue;
-        try entry_turn_ids.put(alloc, detail.entry_id, turn_id);
+        try entry_tool_identities.put(alloc, detail.entry_id, identity);
     }
 
-    var pin_nominated = false;
-    var seen_turns: std.AutoHashMapUnmanaged(u64, void) = .empty;
-    defer seen_turns.deinit(alloc);
+    var mutation_pin_entry_id: ?u32 = null;
+    var turn_nominations: std.AutoHashMapUnmanaged(u64, ToolTurnNomination) = .empty;
+    defer turn_nominations.deinit(alloc);
     for (self.entries.items, 0..) |entry, index| {
         const entry_id = entry.id();
         if (omitted_entry_id == entry_id) continue;
         if (entryHiddenByActions(entry_actions, index)) continue;
-        if (!pin_nominated) {
+        const tool_identity = if (entry == .raw_bytes and entry.raw_bytes.class == .tool_status)
+            entry_tool_identities.get(entry_id)
+        else
+            null;
+        if (mutation_pin_entry_id == null) {
             const pinned = switch (entry) {
-                .raw_bytes => |raw| raw.lifecycle_pinned,
+                .raw_bytes => |raw| raw.lifecycle_pinned and tool_identity == null,
                 .semantic_notice => |notice| notice.pending_replacement,
                 else => false,
             };
-            if (pinned) {
-                try nominations.append(alloc, .{
-                    .entry_id = entry_id,
-                    .kind = .mutation_pin,
-                });
-                pin_nominated = true;
+            if (pinned) mutation_pin_entry_id = entry_id;
+        }
+
+        if (tool_identity) |identity| {
+            const result = try turn_nominations.getOrPut(alloc, identity.turn_id);
+            if (!result.found_existing) {
+                result.value_ptr.* = .{
+                    .earliest_entry_id = entry_id,
+                    .selected_entry_id = entry_id,
+                    .selected_group_id = identity.presentation_group_id,
+                };
+                continue;
+            }
+            const turn = result.value_ptr;
+            if (turn.selected_group_id == null) continue;
+            const group_id = identity.presentation_group_id orelse {
+                turn.selected_entry_id = turn.earliest_entry_id;
+                turn.selected_group_id = null;
+                continue;
+            };
+            const selected_group = turn.selected_group_id.?;
+            if (group_id.anchor_step_id > selected_group.anchor_step_id) {
+                turn.selected_entry_id = entry_id;
+                turn.selected_group_id = group_id;
             }
         }
-        if (entry == .raw_bytes and entry.raw_bytes.class == .tool_status) {
-            if (entry_turn_ids.get(entry_id)) |turn_id| {
-                const seen = try seen_turns.getOrPut(alloc, turn_id);
-                if (!seen.found_existing) {
-                    try nominations.append(alloc, .{
-                        .entry_id = entry_id,
-                        .kind = .tool_turn,
-                        .turn_id = turn_id,
-                    });
-                }
-            }
+    }
+
+    for (self.entries.items, 0..) |entry, index| {
+        const entry_id = entry.id();
+        if (omitted_entry_id == entry_id) continue;
+        if (entryHiddenByActions(entry_actions, index)) continue;
+        if (mutation_pin_entry_id == entry_id) {
+            try nominations.append(alloc, .{
+                .entry_id = entry_id,
+                .kind = .mutation_pin,
+            });
         }
+        if (entry != .raw_bytes or entry.raw_bytes.class != .tool_status) continue;
+        const identity = entry_tool_identities.get(entry_id) orelse continue;
+        const turn = turn_nominations.get(identity.turn_id).?;
+        if (turn.selected_entry_id != entry_id) continue;
+        try nominations.append(alloc, .{
+            .entry_id = entry_id,
+            .kind = .tool_turn,
+            .turn_id = identity.turn_id,
+        });
     }
     if (self.entries.items.len > 0) {
         const tail = self.entries.items[self.entries.items.len - 1];
