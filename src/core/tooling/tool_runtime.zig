@@ -6064,7 +6064,7 @@ test "run_command timeout returns model-visible failure" {
     const tool_call: ToolCall = .{
         .id = "cmd",
         .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf 'PRE-TIMEOUT-OUT\\n'; printf 'PRE-TIMEOUT-ERR\\n' >&2; sleep 5\"}",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf 'PRE-TIMEOUT-OUT\\n'; printf 'PRE-TIMEOUT-ERR\\n' >&2; sleep 5\",\"profile\":\"clean\"}",
     };
 
     const result = try executeTestRunCommand(rt.context(), arena, tool_call);
