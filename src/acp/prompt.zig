@@ -30,6 +30,7 @@ const session_usage = @import("../core/session/session_usage.zig");
 const subagent_agent_adapter = @import("../core/subagent/agent_adapter.zig");
 const subagent_domain = @import("../core/subagent/domain.zig");
 const subagent_execution = @import("../core/subagent/execution.zig");
+const subagent_resume_admission = @import("../core/subagent/resume_admission.zig");
 const parent_delivery_projector = @import("../core/subagent/parent_delivery_projector.zig");
 const usage_recovery = @import("../core/session/usage_recovery.zig");
 const skill_runtime = @import("../core/skills/skill_runtime.zig");
@@ -737,6 +738,22 @@ fn buildAgentConfig(state: *server.ServerState, session: *server.ActiveSessionSt
         .first_call_tool_choice = session.first_call_tool_choice,
         .workspace_root = state.workspace_root,
         .access_scope = state.workspace_access.scope(state.workspace_root),
+        .origin = if (session.writable) |writable|
+            if (writable.external_prompt_origin == .persistent_child) .subagent else .root
+        else
+            .root,
+        .root_user_messages = if (session.writable) |writable|
+            writable.external_root_user_messages
+        else
+            &.{},
+        .root_user_evidence_complete = if (session.writable) |writable|
+            writable.external_root_user_evidence_complete
+        else
+            false,
+        .current_prompt_is_root_authority = if (session.writable) |writable|
+            writable.external_prompt_origin == .persistent_child
+        else
+            false,
         .context_limits = state.context_limits,
     };
 }
@@ -1220,26 +1237,23 @@ fn requestToolPermissionOutcomeWithRequest(raw_ctx: *anyopaque, arena: Allocator
 }
 
 const TestReviewTurn = struct {
-    request_messages: [1]ChatMessage,
     tool_calls: [1]ToolCall,
-    root_bindings: [1]permission_auto_classifier.RootTextBinding,
+    root_messages: [1][]const u8,
 
     fn init(root_text: []const u8, call: ToolCall) TestReviewTurn {
         return .{
-            .request_messages = .{.{ .role = .user, .content = root_text }},
             .tool_calls = .{call},
-            .root_bindings = .{.{ .message_index = 0, .text = root_text }},
+            .root_messages = .{root_text},
         };
     }
 
     fn context(self: *const TestReviewTurn) permission_auto_classifier.ReviewTurnContext {
         return .{
             .model = "openai/gpt-5",
-            .request_messages = &self.request_messages,
             .pending_assistant = .{ .role = .assistant, .tool_calls = &self.tool_calls },
             .target_call_id = self.tool_calls[0].id,
             .origin = .root,
-            .root_text_bindings = &self.root_bindings,
+            .current_root_request = self.root_messages[0],
         };
     }
 };
@@ -1385,6 +1399,8 @@ fn executeToolCall(
     defer elicitation_responder.deinit();
     tool_ctx.mcp_input_responder = elicitation_responder.responder();
     tool_ctx.root_user_intent_context = request.root_user_intent_context;
+    tool_ctx.root_user_messages = request.root_user_messages;
+    tool_ctx.root_user_evidence_complete = request.root_user_evidence_complete;
     var progress_ctx = AcpWebSearchProgressContext{ .ctx = ctx, .tool_call_id = acp_id };
     var fetch_progress_ctx = AcpWebFetchProgressContext{ .ctx = ctx, .tool_call_id = acp_id };
     tool_ctx.web_search_progress_ctx = @ptrCast(&progress_ctx);
@@ -1579,6 +1595,11 @@ fn persistAcpHistoryTurn(
         return;
     }
     const writable = if (session.writable) |*value| value else return;
+    try subagent_resume_admission.retainExternalRootUserTurn(
+        alloc,
+        writable,
+        turn,
+    );
     if (writable.degradedTail() != null) {
         const now_ms = io_mod.milliTimestamp();
         var current = try currentAcpState(alloc, session, writable, now_ms);
@@ -1745,6 +1766,9 @@ fn currentAcpState(
     const history = try session.session_rt.snapshotHistory(alloc);
     types.freeHistoryTurnSlice(alloc, state.history);
     state.history = history;
+    const permission_state = try session.session_rt.snapshotPermissionState(alloc);
+    state.permission_state.deinit(alloc);
+    state.permission_state = permission_state;
     state.conversation_language = session.session_rt.languageSnapshot();
     state.updated_at_ms = now_ms;
     const usage = try session.session_rt.usage.snapshot(alloc);
@@ -3866,8 +3890,8 @@ test "ACP default user commands require configured authority or review" {
         .name = "terminal",
         .arguments_json = "{\"action\":\"exec\",\"command\":\"touch automatic.txt\"}",
     }, .auto, &.{}, &.{}));
-    try std.testing.expectEqual(ToolPermissionDecision.permission_required, automatic.decision);
-    try std.testing.expectEqual(types.ToolPermissionDenialReason.permission_required, automatic.denial_reason.?);
+    try std.testing.expectEqual(ToolPermissionDecision.deny, automatic.decision);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, automatic.denial_reason.?);
     try std.testing.expect(automatic.execution_authority == null);
 }
 
@@ -3884,7 +3908,7 @@ test "ACP auto mode uses automatic review allow and ask without prompting" {
         ) anyerror!permission_auto_classifier.ParseOutcome {
             const self: *@This() = @ptrCast(@alignCast(raw_ctx));
             self.calls += 1;
-            self.root_text = request.review_turn.root_text_bindings[0].text;
+            self.root_text = request.review_turn.current_root_request;
             return .{ .valid = .{
                 .risk = if (self.decision == .allow) .low else .high,
                 .authorization = if (self.decision == .allow) .medium else .low,
@@ -3962,8 +3986,8 @@ test "ACP auto mode uses automatic review allow and ask without prompting" {
     };
     var blocked_review = TestReviewTurn.init("Check whether this is allowed.", blocked_call);
     const blocked = try requestToolPermissionOutcomeWithRequest(&ctx, arena, blocked_call, blocked_review.context(), .auto, &.{}, null, null, &.{});
-    try std.testing.expectEqual(ToolPermissionDecision.permission_required, blocked.decision);
-    try std.testing.expectEqual(types.ToolPermissionDenialReason.permission_required, blocked.denial_reason.?);
+    try std.testing.expectEqual(ToolPermissionDecision.deny, blocked.decision);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, blocked.denial_reason.?);
     try std.testing.expect(blocked.execution_authority == null);
     try std.testing.expectEqual(@as(usize, 3), fake.calls);
     const blocked_classifier = blocked.auto_review_result orelse return error.TestExpectedEqual;
@@ -3985,7 +4009,7 @@ test "ACP auto mode automatic review allows or asks prepared external file mutat
         ) anyerror!permission_auto_classifier.ParseOutcome {
             const self: *@This() = @ptrCast(@alignCast(raw_ctx));
             self.calls += 1;
-            self.root_text = request.review_turn.root_text_bindings[0].text;
+            self.root_text = request.review_turn.current_root_request;
             self.saw_file_mutation_context = std.meta.activeTag(request.action) == .file_mutation;
             return .{ .valid = .{
                 .risk = if (self.decision == .allow) .low else .high,
@@ -4059,8 +4083,8 @@ test "ACP auto mode automatic review allows or asks prepared external file mutat
     var blocked_review = TestReviewTurn.init("Create desktop-test.txt with hello.", blocked_call);
     const blocked = try requestToolPermissionOutcomeWithRequest(&ctx, arena, blocked_call, blocked_review.context(), .auto, &.{}, null, null, &.{});
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
-    try std.testing.expectEqual(ToolPermissionDecision.permission_required, blocked.decision);
-    try std.testing.expectEqual(types.ToolPermissionDenialReason.permission_required, blocked.denial_reason.?);
+    try std.testing.expectEqual(ToolPermissionDecision.deny, blocked.decision);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, blocked.denial_reason.?);
     try std.testing.expect(blocked.execution_authority == null);
     const blocked_classifier = blocked.auto_review_result orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(permission_auto_classifier.Decision.ask, blocked_classifier.decision);
@@ -4132,7 +4156,7 @@ test "ACP auto mode requires review when only one copy target is configured" {
         .arguments_json = args,
     }, .auto, &.{}, &.{})).decision;
 
-    try std.testing.expectEqual(ToolPermissionDecision.permission_required, decision);
+    try std.testing.expectEqual(ToolPermissionDecision.deny, decision);
 }
 
 test "ACP permission rejects semantic_search outside workspace target" {

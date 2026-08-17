@@ -439,16 +439,8 @@ fn captureReviewAuthority(
 ) ![]u8 {
     var captured: std.ArrayList(u8) = .empty;
     errdefer captured.deinit(alloc);
-    for (review_turn.root_text_bindings) |binding| {
-        try captured.appendSlice(alloc, binding.text);
-        try captured.append(alloc, '\n');
-    }
-    if (review_turn.inherited_root_context.len > 0) {
-        try captured.appendSlice(alloc, review_turn.inherited_root_context);
-        try captured.append(alloc, '\n');
-    }
-    for (review_turn.trusted_permission_feedback) |feedback| {
-        try captured.appendSlice(alloc, feedback);
+    if (review_turn.current_root_request.len > 0) {
+        try captured.appendSlice(alloc, review_turn.current_root_request);
         try captured.append(alloc, '\n');
     }
     return captured.toOwnedSlice(alloc);
@@ -468,7 +460,6 @@ pub const FakeAgentRuntimeDeps = struct {
     system_notices: std.ArrayList([]u8) = .empty,
     interactive_notices: std.ArrayList(types.SemanticNotice) = .empty,
     context_notices: std.ArrayList([]u8) = .empty,
-    auto_permission_notices: std.ArrayList([]u8) = .empty,
     route_recovery_statuses: std.ArrayList(types.RouteRecoveryStatus) = .empty,
     permission_names: std.ArrayList([]u8) = .empty,
     permission_call_ids: std.ArrayList([]u8) = .empty,
@@ -476,9 +467,8 @@ pub const FakeAgentRuntimeDeps = struct {
     permission_review_models: std.ArrayList([]u8) = .empty,
     permission_review_target_call_ids: std.ArrayList([]u8) = .empty,
     permission_review_origins: std.ArrayList(permission_auto_classifier.ReviewOrigin) = .empty,
-    permission_review_root_binding_counts: std.ArrayList(usize) = .empty,
+    permission_review_root_authority_counts: std.ArrayList(usize) = .empty,
     permission_review_feedback_counts: std.ArrayList(usize) = .empty,
-    permission_review_message_counts: std.ArrayList(usize) = .empty,
     permission_review_pending_call_counts: std.ArrayList(usize) = .empty,
     sandbox_widening_user_intent_contexts: std.ArrayList([]u8) = .empty,
     executed_names: std.ArrayList([]u8) = .empty,
@@ -493,6 +483,8 @@ pub const FakeAgentRuntimeDeps = struct {
     last_permission_arguments: ?[]u8 = null,
     last_executed_arguments: ?[]u8 = null,
     last_execute_root_user_intent_context: ?[]u8 = null,
+    last_execute_root_user_messages: std.ArrayList([]u8) = .empty,
+    last_execute_root_user_evidence_complete: bool = false,
     propagated_grants: std.ArrayList(PermissionGrant) = .empty,
     event_grants: std.ArrayList(PermissionGrant) = .empty,
     last_execute_grants: std.ArrayList(PermissionGrant) = .empty,
@@ -607,7 +599,6 @@ pub const FakeAgentRuntimeDeps = struct {
         .tracker = .published,
     },
     stream_output_token_error: ?anyerror = null,
-    auto_permission_notice_error: ?anyerror = null,
     fail_status_finished: bool = false,
     command_replay_output: ?[]const u8 = null,
     command_replay_capability: ?*session_child_store.SessionChildCapability = null,
@@ -649,7 +640,6 @@ pub const FakeAgentRuntimeDeps = struct {
         for (self.interactive_notices.items) |notice| types.freeSemanticNotice(self.alloc, notice);
         self.interactive_notices.deinit(self.alloc);
         freeStringList(self.alloc, &self.context_notices);
-        freeStringList(self.alloc, &self.auto_permission_notices);
         self.route_recovery_statuses.deinit(self.alloc);
         freeStringList(self.alloc, &self.permission_names);
         freeStringList(self.alloc, &self.permission_call_ids);
@@ -657,9 +647,8 @@ pub const FakeAgentRuntimeDeps = struct {
         freeStringList(self.alloc, &self.permission_review_models);
         freeStringList(self.alloc, &self.permission_review_target_call_ids);
         self.permission_review_origins.deinit(self.alloc);
-        self.permission_review_root_binding_counts.deinit(self.alloc);
+        self.permission_review_root_authority_counts.deinit(self.alloc);
         self.permission_review_feedback_counts.deinit(self.alloc);
-        self.permission_review_message_counts.deinit(self.alloc);
         self.permission_review_pending_call_counts.deinit(self.alloc);
         freeStringList(self.alloc, &self.sandbox_widening_user_intent_contexts);
         freeStringList(self.alloc, &self.executed_names);
@@ -674,6 +663,7 @@ pub const FakeAgentRuntimeDeps = struct {
         if (self.last_permission_arguments) |value| self.alloc.free(value);
         if (self.last_executed_arguments) |value| self.alloc.free(value);
         if (self.last_execute_root_user_intent_context) |value| self.alloc.free(value);
+        freeStringList(self.alloc, &self.last_execute_root_user_messages);
         freeGrantList(self.alloc, &self.propagated_grants);
         freeGrantList(self.alloc, &self.event_grants);
         freeGrantList(self.alloc, &self.last_execute_grants);
@@ -737,7 +727,6 @@ pub const FakeAgentRuntimeDeps = struct {
             .push_system_notice = systemNotice,
             .push_interactive_notice = if (self.enable_interactive_notices) interactiveNotice else null,
             .push_context_notice = contextNotice,
-            .push_auto_permission_notice = autoPermissionNotice,
             .push_route_recovery_status = routeRecoveryStatus,
             .push_command_output_complete = commandOutputComplete,
             .push_http_error = httpError,
@@ -993,17 +982,13 @@ pub const FakeAgentRuntimeDeps = struct {
             try self.alloc.dupe(u8, review_turn.target_call_id),
         );
         try self.permission_review_origins.append(self.alloc, review_turn.origin);
-        try self.permission_review_root_binding_counts.append(
+        try self.permission_review_root_authority_counts.append(
             self.alloc,
-            review_turn.root_text_bindings.len,
+            @intFromBool(review_turn.current_root_request.len > 0),
         );
         try self.permission_review_feedback_counts.append(
             self.alloc,
-            review_turn.trusted_permission_feedback.len,
-        );
-        try self.permission_review_message_counts.append(
-            self.alloc,
-            review_turn.request_messages.len,
+            0,
         );
         try self.permission_review_pending_call_counts.append(
             self.alloc,
@@ -1369,6 +1354,16 @@ pub const FakeAgentRuntimeDeps = struct {
                 u8,
                 request.root_user_intent_context,
             );
+            freeStringList(self.alloc, &self.last_execute_root_user_messages);
+            self.last_execute_root_user_messages = .empty;
+            for (request.root_user_messages) |message| {
+                try self.last_execute_root_user_messages.append(
+                    self.alloc,
+                    try self.alloc.dupe(u8, message),
+                );
+            }
+            self.last_execute_root_user_evidence_complete =
+                request.root_user_evidence_complete;
             try self.record("execute:{s}", .{call.name});
             self.last_execute_grant_count = request.session_grants.len;
             for (self.last_execute_grants.items) |grant| {
@@ -1676,13 +1671,6 @@ pub const FakeAgentRuntimeDeps = struct {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         try self.context_notices.append(self.alloc, try self.alloc.dupe(u8, text));
         try self.record("context_notice:{s}", .{text});
-    }
-
-    fn autoPermissionNotice(raw: *anyopaque, text: []const u8) !void {
-        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        if (self.auto_permission_notice_error) |err| return err;
-        try self.auto_permission_notices.append(self.alloc, try self.alloc.dupe(u8, text));
-        try self.record("auto_permission_notice:{s}", .{text});
     }
 
     fn routeRecoveryStatus(raw: *anyopaque, status: types.RouteRecoveryStatus) !void {

@@ -725,6 +725,8 @@ const notifications_arg_completions = [_][]const u8{
 const permissions_arg_completions = [_][]const u8{
     "/permissions ask",
     "/permissions auto",
+    "/permissions remember",
+    "/permissions revoke",
     "/permissions yolo",
     "/permissions reset",
 };
@@ -2126,12 +2128,14 @@ test "slash completions include sound controls" {
     try std.testing.expectEqual(@as(usize, "/sound ".len), argCompletionAnchor("/sound "));
 }
 
-test "slash completions list permission modes as arguments" {
-    try std.testing.expectEqual(@as(usize, 4), slashCompletionCount(testSlashRegistry(), "/permissions "));
+test "slash completions list permission modes and rule management" {
+    try std.testing.expectEqual(@as(usize, 6), slashCompletionCount(testSlashRegistry(), "/permissions "));
     try std.testing.expectEqualStrings("/permissions ask", nthSlashCompletion(testSlashRegistry(), "/permissions ", 0).?);
     try std.testing.expectEqualStrings("/permissions auto", nthSlashCompletion(testSlashRegistry(), "/permissions ", 1).?);
-    try std.testing.expectEqualStrings("/permissions yolo", nthSlashCompletion(testSlashRegistry(), "/permissions ", 2).?);
-    try std.testing.expectEqualStrings("/permissions reset", nthSlashCompletion(testSlashRegistry(), "/permissions ", 3).?);
+    try std.testing.expectEqualStrings("/permissions remember", nthSlashCompletion(testSlashRegistry(), "/permissions ", 2).?);
+    try std.testing.expectEqualStrings("/permissions revoke", nthSlashCompletion(testSlashRegistry(), "/permissions ", 3).?);
+    try std.testing.expectEqualStrings("/permissions yolo", nthSlashCompletion(testSlashRegistry(), "/permissions ", 4).?);
+    try std.testing.expectEqualStrings("/permissions reset", nthSlashCompletion(testSlashRegistry(), "/permissions ", 5).?);
     try std.testing.expectEqual(@as(usize, 2), slashCompletionCount(testSlashRegistry(), "/permissions a"));
     try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(testSlashRegistry(), "/permissions as"));
     try std.testing.expectEqualStrings("/permissions ask", nthSlashCompletion(testSlashRegistry(), "/permissions as", 0).?);
@@ -2139,8 +2143,10 @@ test "slash completions list permission modes as arguments" {
     try std.testing.expectEqualStrings("/permissions auto", nthSlashCompletion(testSlashRegistry(), "/permissions au", 0).?);
     try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(testSlashRegistry(), "/permissions y"));
     try std.testing.expectEqualStrings("/permissions yolo", nthSlashCompletion(testSlashRegistry(), "/permissions y", 0).?);
-    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(testSlashRegistry(), "/permissions r"));
-    try std.testing.expectEqualStrings("/permissions reset", nthSlashCompletion(testSlashRegistry(), "/permissions r", 0).?);
+    try std.testing.expectEqual(@as(usize, 3), slashCompletionCount(testSlashRegistry(), "/permissions r"));
+    try std.testing.expectEqualStrings("/permissions remember", nthSlashCompletion(testSlashRegistry(), "/permissions r", 0).?);
+    try std.testing.expectEqualStrings("/permissions revoke", nthSlashCompletion(testSlashRegistry(), "/permissions r", 1).?);
+    try std.testing.expectEqualStrings("/permissions reset", nthSlashCompletion(testSlashRegistry(), "/permissions r", 2).?);
     try std.testing.expectEqual(@as(usize, 0), slashCompletionCount(testSlashRegistry(), "/permissions x"));
 }
 
@@ -2186,8 +2192,10 @@ test "slash completion labels strip argument prefixes" {
     try std.testing.expectEqualStrings("none", nthSlashCompletionLabel(testSlashRegistry(), "/sandbox ", 1).?);
     try std.testing.expectEqualStrings("ask", nthSlashCompletionLabel(testSlashRegistry(), "/permissions ", 0).?);
     try std.testing.expectEqualStrings("auto", nthSlashCompletionLabel(testSlashRegistry(), "/permissions ", 1).?);
-    try std.testing.expectEqualStrings("yolo", nthSlashCompletionLabel(testSlashRegistry(), "/permissions ", 2).?);
-    try std.testing.expectEqualStrings("reset", nthSlashCompletionLabel(testSlashRegistry(), "/permissions ", 3).?);
+    try std.testing.expectEqualStrings("remember", nthSlashCompletionLabel(testSlashRegistry(), "/permissions ", 2).?);
+    try std.testing.expectEqualStrings("revoke", nthSlashCompletionLabel(testSlashRegistry(), "/permissions ", 3).?);
+    try std.testing.expectEqualStrings("yolo", nthSlashCompletionLabel(testSlashRegistry(), "/permissions ", 4).?);
+    try std.testing.expectEqualStrings("reset", nthSlashCompletionLabel(testSlashRegistry(), "/permissions ", 5).?);
     try std.testing.expectEqualStrings("view", nthSlashCompletionLabel(testSlashRegistry(), "/allowlist ", 0).?);
     try std.testing.expectEqualStrings("add", nthSlashCompletionLabel(testSlashRegistry(), "/allowlist ", 1).?);
     try std.testing.expectEqualStrings("command", nthSlashCompletionLabel(testSlashRegistry(), "/allowlist add ", 0).?);

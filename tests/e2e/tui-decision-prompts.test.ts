@@ -19,7 +19,6 @@ import {
   visibleText,
 } from "./tui-render-assertions";
 import {
-  classifierEvidenceFromRequest,
   fakeGatewayFinalText,
   fakeGatewayPermissionDecision,
   fakeGatewaySerializedToolCall,
@@ -392,7 +391,10 @@ function startFakeGateway(
   };
 }
 
-function createIsolatedRoot(permissionMode: "ask" | "auto" = "ask") {
+function createIsolatedRoot(
+  permissionMode: "ask" | "auto" = "ask",
+  permission: Record<string, unknown> = {},
+) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-decision-e2e-")));
   const home = join(root, "home");
   const workspace = join(root, "workspace");
@@ -400,7 +402,7 @@ function createIsolatedRoot(permissionMode: "ask" | "auto" = "ask") {
   mkdirSync(workspace, { recursive: true });
   writeFileSync(
     join(home, ".fx", "settings.json"),
-    JSON.stringify({ permission_mode: permissionMode, permission: {}, maxxing_mode: "legacy" }),
+    JSON.stringify({ permission_mode: permissionMode, permission, maxxing_mode: "legacy" }),
   );
   roots.push(root);
   return { root, home, workspace: realpathSync(workspace) };
@@ -435,8 +437,9 @@ async function launchScenario(
   env: Record<string, string | undefined> = {},
   permissionMode: "ask" | "auto" = "ask",
   classifierDecision: ClassifierDecision = () => "allow",
+  permission: Record<string, unknown> = {},
 ) {
-  const root = createIsolatedRoot(permissionMode);
+  const root = createIsolatedRoot(permissionMode, permission);
   const gateway = startFakeGateway(responses, classifierDecision);
   gateways.push(gateway);
   const tracePath = join(root.root, "trace.log");
@@ -1491,20 +1494,20 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
         },
-        "auto",
-        (body) => {
-          const evidence = classifierEvidenceFromRequest(body);
-          return evidence.includes("command: touch generic-preview-accepted.txt")
-            ? "ask"
-            : "allow";
-        },
+        "ask",
+        () => "allow",
+        { bash: { "i=1; while *": "allow" } },
       );
       await ctx.session.resizeWindow(120, 36);
 
       await ctx.session.sendText("Seed the approval scrollback fixture.");
-      await ctx.session.waitForText(markers.at(-1)!, 90_000);
-      const beforeApproval = visibleText(
-        await ctx.session.captureFullScrollbackEscapes(),
+      const beforeApproval = await waitForVisibleScrollback(
+        ctx.session,
+        "complete approval scrollback seed",
+        (scrollback) => markers.every((marker) =>
+          scrollback.split(marker).length - 1 === 1
+        ),
+        90_000,
       );
       for (const marker of markers) {
         expect(beforeApproval.split(marker).length - 1).toBe(1);
@@ -1528,8 +1531,13 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       expect(pane).toContain("touch generic-preview-accepted.txt");
       expectApprovalSelection(pane, 1, COMMAND_YES_CHOICE);
 
-      const activeApproval = visibleText(
-        await ctx.session.captureFullScrollbackEscapes(),
+      const activeApproval = await waitForVisibleScrollback(
+        ctx.session,
+        "complete approval scrollback replay",
+        (scrollback) => markers.every((marker) =>
+          scrollback.split(marker).length - 1 === 1
+        ),
+        TIMEOUT,
       );
       for (const marker of markers) {
         expect(activeApproval.split(marker).length - 1).toBe(1);
@@ -1562,7 +1570,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       expect(promptCommit).toMatch(
         /planned_scroll_rows=([1-9][0-9]*) committed_scroll_rows=\1 .*unplanned_scroll_rows=0/,
       );
-      expect(ctx.gateway.classifierRequests).toHaveLength(2);
+      expect(ctx.gateway.classifierRequests).toHaveLength(0);
       expect(ctx.gateway.requests).toHaveLength(3);
 
       await ctx.session.sendLiteralText("1");
@@ -1571,8 +1579,13 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       expect(await ctx.session.capturePane()).not.toContain(APPROVAL_PROMPT);
       expect(ctx.gateway.requests).toHaveLength(4);
 
-      const afterApproval = visibleText(
-        await ctx.session.captureFullScrollbackEscapes(),
+      const afterApproval = await waitForVisibleScrollback(
+        ctx.session,
+        "complete post-approval scrollback",
+        (scrollback) => markers.every((marker) =>
+          scrollback.split(marker).length - 1 === 1
+        ),
+        TIMEOUT,
       );
       for (const marker of markers) {
         expect(afterApproval.split(marker).length - 1).toBe(1);

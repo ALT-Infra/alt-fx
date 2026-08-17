@@ -1619,6 +1619,29 @@ const App = struct {
         return self.permissionTargetForCall(arena, call, advertised_dynamic_tool_names);
     }
 
+    pub fn preparePermissionStateAction(
+        self: *App,
+        arena: Allocator,
+        call: ToolCall,
+    ) !tool_admission.PreparedPermissionStateAction {
+        const ctx = AgentAppRuntime.toolContext(
+            self,
+            &ignored_list_entries,
+            max_list_entries,
+            max_read_file_bytes,
+            max_read_file_lines,
+            max_read_file_line_len,
+            max_command_output_bytes,
+            builtin_gateway.retry_count,
+            builtin_gateway.defaultChatUrl(),
+        );
+        return tool_admission.preparePermissionStateAction(
+            ctx.admissionInput(),
+            arena,
+            call,
+        );
+    }
+
     pub fn writeSubagentSnapshot(self: *App) !void {
         try RenderAppRuntime.toggleSubagentView(self);
     }

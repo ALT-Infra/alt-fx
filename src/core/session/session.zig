@@ -5,6 +5,7 @@ const io_mod = @import("../shared/io.zig");
 const message = @import("../shared/message.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
+const session_permission_state = @import("../permissions/session_permission_state.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const generation_usage_provider = @import("generation_usage_provider.zig");
 const web_fetch_artifacts = @import("web_fetch_artifacts.zig");
@@ -1586,6 +1587,8 @@ pub const SessionRuntime = struct {
     conversation_language: ConversationLanguage = ConversationLanguage.default(),
     usage: session_usage.Usage = session_usage.Usage.initFresh(),
     profile_usage: profile_usage_runtime.Runtime = .{},
+    permission_state_lock: std.Io.Mutex = .init,
+    permission_state: session_permission_state.State = .{},
     /// Count limit for owned model-context snapshots; canonical history is not truncated.
     max_history_turns: usize,
     context_history_start: usize = 0,
@@ -1606,6 +1609,7 @@ pub const SessionRuntime = struct {
         self.usage.configureCheckpointSink(null);
         self.usage.deinit(alloc);
         self.profile_usage.deinit(alloc);
+        self.permission_state.deinit(alloc);
         self.clearHistory(alloc);
         self.history.deinit(alloc);
         self.context_notice_hashes.deinit(alloc);
@@ -1646,6 +1650,7 @@ pub const SessionRuntime = struct {
     pub fn reset(self: *SessionRuntime, alloc: Allocator) void {
         self.clearWebFetchArtifacts();
         self.usage.resetFresh(alloc);
+        self.clearPermissionState(alloc);
         self.clearHistory(alloc);
         self.clearContextNotices();
         self.setConversationLanguage(ConversationLanguage.default());
@@ -1654,6 +1659,7 @@ pub const SessionRuntime = struct {
     pub fn restore(self: *SessionRuntime, alloc: Allocator, language: ConversationLanguage, history: []const HistoryTurn) !void {
         self.clearWebFetchArtifacts();
         self.usage.resetLegacy(alloc);
+        self.clearPermissionState(alloc);
         self.clearHistory(alloc);
         self.clearContextNotices();
         self.setConversationLanguage(language);
@@ -1673,6 +1679,85 @@ pub const SessionRuntime = struct {
         if (context_history_start > history.len) return error.InvalidContextHistoryStart;
         try self.restore(alloc, language, history);
         self.context_history_start = context_history_start;
+    }
+
+    pub fn restoreWithPermissionState(
+        self: *SessionRuntime,
+        alloc: Allocator,
+        language: ConversationLanguage,
+        history: []const HistoryTurn,
+        context_history_start: usize,
+        permission_state: session_permission_state.State,
+    ) !void {
+        if (context_history_start > history.len) {
+            return error.InvalidContextHistoryStart;
+        }
+        var permission_copy = try session_permission_state.dupe(
+            alloc,
+            permission_state,
+        );
+        errdefer permission_copy.deinit(alloc);
+        try self.restoreWithContextHistoryStart(
+            alloc,
+            language,
+            history,
+            context_history_start,
+        );
+        self.permission_state_lock.lockUncancelable(io_mod.getIo());
+        defer self.permission_state_lock.unlock(io_mod.getIo());
+        self.permission_state.deinit(alloc);
+        self.permission_state = permission_copy;
+    }
+
+    pub fn snapshotPermissionState(
+        self: *SessionRuntime,
+        alloc: Allocator,
+    ) !session_permission_state.State {
+        self.permission_state_lock.lockUncancelable(io_mod.getIo());
+        defer self.permission_state_lock.unlock(io_mod.getIo());
+        return session_permission_state.dupe(alloc, self.permission_state);
+    }
+
+    pub fn applyPermissionEvent(
+        self: *SessionRuntime,
+        alloc: Allocator,
+        event: session_permission_state.ConfirmedRuleEvent,
+    ) !session_permission_state.ApplyStatus {
+        self.permission_state_lock.lockUncancelable(io_mod.getIo());
+        defer self.permission_state_lock.unlock(io_mod.getIo());
+        const result = try session_permission_state.apply(
+            alloc,
+            self.permission_state,
+            event,
+        );
+        return switch (result) {
+            .applied => |next| blk: {
+                self.permission_state.deinit(alloc);
+                self.permission_state = next;
+                break :blk .applied;
+            },
+            .stale => .stale,
+            .full => .full,
+            .invalid => .invalid,
+        };
+    }
+
+    pub fn replacePermissionStateOwned(
+        self: *SessionRuntime,
+        alloc: Allocator,
+        state: *session_permission_state.State,
+    ) void {
+        self.permission_state_lock.lockUncancelable(io_mod.getIo());
+        defer self.permission_state_lock.unlock(io_mod.getIo());
+        self.permission_state.deinit(alloc);
+        self.permission_state = state.*;
+        state.* = .{};
+    }
+
+    fn clearPermissionState(self: *SessionRuntime, alloc: Allocator) void {
+        self.permission_state_lock.lockUncancelable(io_mod.getIo());
+        defer self.permission_state_lock.unlock(io_mod.getIo());
+        self.permission_state.deinit(alloc);
     }
 
     pub fn configureWebFetchArtifacts(self: *SessionRuntime, alloc: Allocator, session_dir: []const u8) void {
@@ -2016,10 +2101,24 @@ pub fn dupeHistoryTurn(alloc: Allocator, turn: HistoryTurn) !HistoryTurn {
     switch (turn) {
         .compacted_summary => |entry| {
             const summary = try alloc.dupe(u8, entry.summary);
+            errdefer alloc.free(summary);
+            const root_user_messages = try core_types.dupeCompletedToolNames(
+                alloc,
+                entry.root_user_messages,
+            );
+            errdefer core_types.freeCompletedToolNames(alloc, root_user_messages);
+            const permission_feedback = try core_types.dupePermissionFeedback(
+                alloc,
+                entry.permission_feedback,
+            );
             return .{ .compacted_summary = .{
                 .summary = summary,
                 .removed_turn_count = entry.removed_turn_count,
                 .compaction_count = entry.compaction_count,
+                .root_user_messages = root_user_messages,
+                .root_user_messages_complete = entry.root_user_messages_complete,
+                .permission_feedback = permission_feedback,
+                .permission_feedback_complete = entry.permission_feedback_complete,
             } };
         },
         .assistant => |entry| {
@@ -2926,7 +3025,110 @@ fn buildCompactedSummaryTurn(
         .summary = try buildCompactedSummaryText(alloc, existing, removed),
         .removed_turn_count = (if (existing) |entry| entry.removed_turn_count else 0) + removed.len,
         .compaction_count = (if (existing) |entry| entry.compaction_count else 0) + 1,
+        .root_user_messages = &.{},
+        .root_user_messages_complete = false,
+        .permission_feedback = &.{},
+        .permission_feedback_complete = false,
     };
+}
+
+test "history compaction discards root-user authority text" {
+    const alloc = std.testing.allocator;
+    const removed = [_]HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("first exact request") },
+            .assistant = @constCast("first response"),
+        } },
+        .{ .interrupted = .{
+            .user = .{ .text = @constCast("second exact request") },
+        } },
+    };
+    const first = try buildCompactedSummaryTurn(alloc, null, &removed);
+    defer freeHistoryTurn(alloc, .{ .compacted_summary = first });
+    try std.testing.expectEqual(@as(usize, 0), first.root_user_messages.len);
+    try std.testing.expect(!first.root_user_messages_complete);
+
+    const later = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("third exact request") },
+        .assistant = @constCast("third response"),
+    } }};
+    const second = try buildCompactedSummaryTurn(alloc, first, &later);
+    defer freeHistoryTurn(alloc, .{ .compacted_summary = second });
+    try std.testing.expectEqual(@as(usize, 0), second.root_user_messages.len);
+    try std.testing.expect(!second.root_user_messages_complete);
+}
+
+test "repeated compaction keeps historical authority discarded" {
+    const alloc = std.testing.allocator;
+    const legacy: CompactedSummaryHistoryTurn = .{
+        .summary = @constCast("legacy summary without exact authority"),
+        .removed_turn_count = 4,
+        .compaction_count = 1,
+        .root_user_messages_complete = false,
+        .permission_feedback_complete = false,
+    };
+    const first_removed = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("newer exact request") },
+        .assistant = @constCast("response"),
+    } }};
+    const first = try buildCompactedSummaryTurn(alloc, legacy, &first_removed);
+    defer freeHistoryTurn(alloc, .{ .compacted_summary = first });
+    try std.testing.expect(!first.root_user_messages_complete);
+    try std.testing.expect(!first.permission_feedback_complete);
+    try std.testing.expectEqual(@as(usize, 0), first.root_user_messages.len);
+
+    const second_removed = [_]HistoryTurn{.{ .interrupted = .{
+        .user = .{ .text = @constCast("latest exact request") },
+    } }};
+    const second = try buildCompactedSummaryTurn(alloc, first, &second_removed);
+    defer freeHistoryTurn(alloc, .{ .compacted_summary = second });
+    try std.testing.expect(!second.root_user_messages_complete);
+    try std.testing.expect(!second.permission_feedback_complete);
+    try std.testing.expectEqual(@as(usize, 0), second.root_user_messages.len);
+}
+
+test "repeated compaction discards historical permission feedback" {
+    const alloc = std.testing.allocator;
+    var first_feedback = [_][]u8{@constCast("Do not write outside the workspace.")};
+    var first_results = [_]PersistedToolResult{.{
+        .tool_call_id = @constCast("first"),
+        .tool_name = @constCast("write_file"),
+        .status = .failure,
+        .output = @constCast("denied"),
+        .output_bytes = 6,
+        .stored_output_bytes = 6,
+        .permission_feedback = &first_feedback,
+    }};
+    var first_steps = [_]ToolExecutionStep{.{ .tool_results = &first_results }};
+    const first_removed = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("Prepare the report.") },
+        .assistant = @constCast("I need to write a file."),
+        .execution = .{ .tool_steps = &first_steps },
+    } }};
+    const first = try buildCompactedSummaryTurn(alloc, null, &first_removed);
+    defer freeHistoryTurn(alloc, .{ .compacted_summary = first });
+    try std.testing.expect(!first.permission_feedback_complete);
+    try std.testing.expectEqual(@as(usize, 0), first.permission_feedback.len);
+
+    var second_feedback = [_][]u8{@constCast("README changes require approval.")};
+    var second_results = [_]PersistedToolResult{.{
+        .tool_call_id = @constCast("second"),
+        .tool_name = @constCast("edit_file"),
+        .status = .failure,
+        .output = @constCast("denied"),
+        .output_bytes = 6,
+        .stored_output_bytes = 6,
+        .permission_feedback = &second_feedback,
+    }};
+    var second_steps = [_]ToolExecutionStep{.{ .tool_results = &second_results }};
+    const later = [_]HistoryTurn{.{ .interrupted = .{
+        .user = .{ .text = @constCast("Continue with the report.") },
+        .execution = .{ .tool_steps = &second_steps },
+    } }};
+    const repeated = try buildCompactedSummaryTurn(alloc, first, &later);
+    defer freeHistoryTurn(alloc, .{ .compacted_summary = repeated });
+    try std.testing.expect(!repeated.permission_feedback_complete);
+    try std.testing.expectEqual(@as(usize, 0), repeated.permission_feedback.len);
 }
 
 fn buildCompactedSummaryText(
@@ -5898,6 +6100,48 @@ test "SessionRuntime restores a durable context boundary without deleting canoni
             history,
             history.len + 1,
         ),
+    );
+}
+
+test "SessionRuntime owns permission transitions and immutable snapshots" {
+    const alloc = std.testing.allocator;
+    var runtime: SessionRuntime = .{ .max_history_turns = 8 };
+    defer runtime.deinit(alloc);
+    const key = try session_permission_state.RuleKey.init(
+        .command,
+        "command\x00/workspace\x00git status",
+    );
+
+    try std.testing.expectEqual(
+        session_permission_state.ApplyStatus.applied,
+        try runtime.applyPermissionEvent(alloc, .{ .set = .{
+            .key = key,
+            .display_identity = "git status in /workspace",
+            .decision = .deny,
+            .expected_generation = null,
+        } }),
+    );
+    var snapshot = try runtime.snapshotPermissionState(alloc);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(
+        session_permission_state.StateDecision.deny,
+        session_permission_state.decide(snapshot, key),
+    );
+
+    var restored: SessionRuntime = .{ .max_history_turns = 8 };
+    defer restored.deinit(alloc);
+    try restored.restoreWithPermissionState(
+        alloc,
+        ConversationLanguage.literal("en"),
+        &.{},
+        0,
+        snapshot,
+    );
+    var restored_snapshot = try restored.snapshotPermissionState(alloc);
+    defer restored_snapshot.deinit(alloc);
+    try std.testing.expectEqual(
+        session_permission_state.StateDecision.deny,
+        session_permission_state.decide(restored_snapshot, key),
     );
 }
 

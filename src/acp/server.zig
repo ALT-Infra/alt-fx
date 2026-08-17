@@ -410,6 +410,11 @@ fn resolveSubagentAuthority(
     else
         null;
     defer if (mcp_view) |*view| view.deinit(alloc);
+    var permission_state = active.session_rt.snapshotPermissionState(alloc) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.HostAuthorityUnavailable,
+    };
+    defer permission_state.deinit(alloc);
     return subagent_tool_host.captureHostAuthorityWithMcpView(
         alloc,
         .{
@@ -425,6 +430,7 @@ fn resolveSubagentAuthority(
         owned_integrations,
         active.permission_rules,
         active.session_grants,
+        permission_state,
         if (mcp_view) |*view| view else null,
     );
 }
@@ -452,6 +458,9 @@ fn flushActiveSessionUsage(state: *ServerState) !void {
     const history = try active.session_rt.snapshotHistory(state.alloc);
     types.freeHistoryTurnSlice(state.alloc, current.history);
     current.history = history;
+    const permission_state = try active.session_rt.snapshotPermissionState(state.alloc);
+    current.permission_state.deinit(state.alloc);
+    current.permission_state = permission_state;
     current.conversation_language = active.session_rt.languageSnapshot();
     const usage_snapshot = try active.session_rt.usage.snapshot(state.alloc);
     if (current.usage) |*old| old.deinit(state.alloc);

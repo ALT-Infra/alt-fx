@@ -38,6 +38,7 @@ pub const PermissionRequest = struct {
     command: ?[]const u8 = null,
     file: ?FileApprovalRequest = null,
     amendment_allowed: bool = true,
+    confirmation_only: bool = false,
 
     pub fn eql(a: PermissionRequest, b: PermissionRequest) bool {
         if (a.id != b.id) return false;
@@ -50,6 +51,7 @@ pub const PermissionRequest = struct {
         if ((a.command == null) != (b.command == null)) return false;
         if (a.command) |command| if (!std.mem.eql(u8, command, b.command.?)) return false;
         if (a.amendment_allowed != b.amendment_allowed) return false;
+        if (a.confirmation_only != b.confirmation_only) return false;
         if (a.file) |a_file| {
             const b_file = b.file orelse return false;
             return fileApprovalRequestEql(a_file, b_file);
@@ -185,6 +187,7 @@ pub const OwnedPermissionRequest = struct {
     command: ?[]u8 = null,
     file: ?FileApprovalRequest = null,
     amendment_allowed: bool = true,
+    confirmation_only: bool = false,
 
     pub fn dupe(
         alloc: Allocator,
@@ -219,6 +222,7 @@ pub const OwnedPermissionRequest = struct {
             .command = command,
             .file = file,
             .amendment_allowed = request.amendment_allowed,
+            .confirmation_only = request.confirmation_only,
         };
     }
 
@@ -232,6 +236,7 @@ pub const OwnedPermissionRequest = struct {
             .command = self.command,
             .file = self.file,
             .amendment_allowed = self.amendment_allowed,
+            .confirmation_only = self.confirmation_only,
         };
     }
 

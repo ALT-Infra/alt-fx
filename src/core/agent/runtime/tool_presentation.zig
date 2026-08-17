@@ -669,32 +669,6 @@ pub fn activityKind(registry: tool_dispatch.Registry, tool_name: []const u8) typ
     return tool_dispatch.toolActivityKind(registry, tool_name);
 }
 
-pub fn presentAutoPermissionOutcome(
-    hooks: *const AgentRuntimeDeps,
-    arena: Allocator,
-    call: ToolCall,
-    permission_mode: types.PermissionMode,
-    outcome: command_admission.PermissionOutcome,
-) !bool {
-    const notice = try tooling_presentation.formatAutoPermissionNotice(
-        arena,
-        hooks.tool_registry,
-        call,
-        permission_mode,
-        outcome,
-    ) orelse return false;
-    if (outcome.auto_review_result) |result| {
-        if (result.decision == .allow) {
-            if (hooks.push_auto_permission_notice) |push_notice| {
-                try push_notice(hooks.ctx, notice);
-                return true;
-            }
-        }
-    }
-    try hooks.push_system_notice(hooks.ctx, notice);
-    return true;
-}
-
 fn formatProvisionalProgressLabel(
     buf: []u8,
     tool_name: []const u8,
@@ -743,49 +717,6 @@ pub noinline fn startToolVisibleLifecycle(
     file_display_path: ?[]const u8,
     advertised_dynamic_tool_names: []const []const u8,
 ) !bool {
-    return startToolVisibleLifecycleWithPlacement(
-        hooks,
-        arena,
-        turn_id,
-        presentation_group_id,
-        call,
-        file_display_path,
-        advertised_dynamic_tool_names,
-        false,
-    );
-}
-
-pub fn startToolVisibleLifecycleAfterCurrentTranscript(
-    hooks: *const AgentRuntimeDeps,
-    arena: Allocator,
-    turn_id: u64,
-    presentation_group_id: ?types.ToolPresentationGroupId,
-    call: ToolCall,
-    file_display_path: ?[]const u8,
-    advertised_dynamic_tool_names: []const []const u8,
-) !bool {
-    return startToolVisibleLifecycleWithPlacement(
-        hooks,
-        arena,
-        turn_id,
-        presentation_group_id,
-        call,
-        file_display_path,
-        advertised_dynamic_tool_names,
-        true,
-    );
-}
-
-fn startToolVisibleLifecycleWithPlacement(
-    hooks: *const AgentRuntimeDeps,
-    arena: Allocator,
-    turn_id: u64,
-    presentation_group_id: ?types.ToolPresentationGroupId,
-    call: ToolCall,
-    file_display_path: ?[]const u8,
-    advertised_dynamic_tool_names: []const []const u8,
-    place_after_current_transcript: bool,
-) !bool {
     const activity_kind = activityKind(hooks.tool_registry, call.name);
     if (activity_kind == .ask) return false;
     const redacted_arguments = try text_utils.maskSecrets(arena, call.arguments_json);
@@ -803,7 +734,7 @@ fn startToolVisibleLifecycleWithPlacement(
         .tool_name = call.name,
         .activity_kind = activity_kind,
         .arguments_json = redacted_arguments,
-        .place_after_current_transcript = place_after_current_transcript,
+        .place_after_current_transcript = false,
     } });
     try hooks.push_tool_lifecycle(hooks.ctx, .{ .progress = .{
         .id = .{ .turn_id = turn_id, .call_id = call.id },

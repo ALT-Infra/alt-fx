@@ -436,7 +436,17 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
             const pending_request = worker_pending_request orelse child_pending_request;
-            const approval_changed = app.approval_prompt.syncRequest(app.alloc, pending_request) catch false;
+            const management_active = if (comptime @hasField(
+                @TypeOf(app.approval_prompt),
+                "rule_management",
+            ))
+                app.approval_prompt.rule_management != null
+            else
+                false;
+            const approval_changed = if (management_active and pending_request == null)
+                false
+            else
+                app.approval_prompt.syncRequest(app.alloc, pending_request) catch false;
             const review_changed = if (comptime @hasDecl(@TypeOf(app.approval_prompt), "syncReview")) blk: {
                 const review = if (comptime @hasField(@TypeOf(snapshot), "pending_permission_review"))
                     if (snapshot.pending_permission_review) |pending|

@@ -41,6 +41,7 @@ const subagent_tool_host = @import("../subagent/tool_host.zig");
 const subagent_tool_provider = @import("../subagent/tool_provider.zig");
 const subagent_tool_result = @import("../subagent/tool_result.zig");
 const session_runtime = @import("../session/session.zig");
+const session_permission_state = @import("../permissions/session_permission_state.zig");
 const session_codec_mod = @import("../session/session_codec.zig");
 const task_helpers = @import("../tasks/task_helpers.zig");
 const session_child_store = @import("../session/session_child_store.zig");
@@ -138,6 +139,8 @@ pub const Context = struct {
     model: []const u8,
     permission_review_turn: ?permission_auto_classifier.ReviewTurnContext = null,
     root_user_intent_context: []const u8 = "",
+    root_user_messages: []const []const u8 = &.{},
+    root_user_evidence_complete: bool = false,
     current_turn_messages: []const ChatMessage = &.{},
     gateway_retry_count: usize,
     gateway_chat_url: []const u8,
@@ -153,6 +156,7 @@ pub const Context = struct {
     permission_grants: []const PermissionGrant,
     session_grants: []const PermissionGrant = &.{},
     permission_rules: types.PermissionRuleSet,
+    permission_state_override: ?*const session_permission_state.State = null,
     worker: *WorkerRuntime,
     /// Sole prompt capability admission consults. When null, admission never
     /// prompts: it resolves by rule, automatic review, or fail-closed denial
@@ -221,12 +225,17 @@ pub const Context = struct {
 
     /// Projects only the borrowed capabilities consumed by admission.
     pub fn admissionInput(self: Context) tool_admission.Input {
-        return .{
+        var input: tool_admission.Input = .{
             .workspace_root = self.workspace_root,
             .access_scope = self.access_scope,
             .permission_review_turn = self.permission_review_turn,
             .permission_grants = self.permission_grants,
             .permission_rules = self.permission_rules,
+            .session_permission_state = self.permission_state_override,
+            .session_permission_state_provider = .{
+                .context = @ptrCast(self.session),
+                .snapshot_fn = snapshotSessionPermissionState,
+            },
             .tool_registry = self.tool_registry,
             .worker = self.worker,
             .permission_prompter = self.permission_prompter,
@@ -238,6 +247,10 @@ pub const Context = struct {
             .auto_classifier = self.admissionAutoClassifier(),
             .host_sandbox_default = self.host_sandbox_default,
         };
+        if (self.permission_state_override != null) {
+            input.session_permission_state_provider = null;
+        }
+        return input;
     }
 
     pub fn admissionInputWithLiveAuthority(
@@ -248,6 +261,10 @@ pub const Context = struct {
         if (authority) |live| {
             input.permission_grants = live.grants;
             input.permission_rules = live.rules;
+            input.session_permission_state = live.permission_state;
+            if (live.permission_state != null) {
+                input.session_permission_state_provider = null;
+            }
             input.sandbox_backend = live.sandbox_backend;
             input.advertised_dynamic_tool_names = live.integrations;
         }
@@ -268,6 +285,14 @@ pub const Context = struct {
         });
     }
 };
+
+fn snapshotSessionPermissionState(
+    raw_session: *anyopaque,
+    alloc: Allocator,
+) !session_permission_state.State {
+    const session: *SessionRuntime = @ptrCast(@alignCast(raw_session));
+    return session.snapshotPermissionState(alloc);
+}
 
 fn registeredToolSpec(ctx: Context, name: []const u8) ?*const tool_specs.ToolSpec {
     return ctx.tool_registry.lookup(name);
@@ -1705,6 +1730,8 @@ fn executeSubagentProvider(
         .invocation_id = invocation_id,
         .parent_permission_mode = ctx.permission_mode,
         .root_user_intent_context = ctx.root_user_intent_context,
+        .root_user_messages = ctx.root_user_messages,
+        .root_user_evidence_complete = ctx.root_user_evidence_complete,
         .defaults = .{
             .model = ctx.model,
             .effort = ctx.effort,
@@ -2053,24 +2080,18 @@ const test_context_registry = context_contract.Registry{ .default_provider = .{
     .append_transient_fn = appendNoopTestTransientContext,
 } };
 
-const test_review_messages = [_]types.ChatMessage{
-    .{ .role = .user, .content = "test root request" },
-};
 const test_review_calls = [_]ToolCall{
     .{ .id = "test-review", .name = "terminal", .arguments_json = "{\"action\":\"exec\",\"command\":\"printf test\"}" },
 };
-const test_review_bindings = [_]permission_auto_classifier.RootTextBinding{
-    .{ .message_index = 0, .text = "test root request" },
-};
+const test_review_root_messages = [_][]const u8{"test root request"};
 
 fn testReviewTurn() permission_auto_classifier.ReviewTurnContext {
     return .{
         .model = "openai/gpt-5",
-        .request_messages = &test_review_messages,
         .pending_assistant = .{ .role = .assistant, .tool_calls = &test_review_calls },
         .target_call_id = "test-review",
         .origin = .root,
-        .root_text_bindings = &test_review_bindings,
+        .current_root_request = test_review_root_messages[0],
     };
 }
 
@@ -4658,7 +4679,7 @@ test "non-web_fetch tool-call metrics retain bounded args and result" {
     try expectContains(buf[0].result(), "normal result");
 }
 
-test "request tool permission keeps safe defaults while unresolved local writes require review" {
+test "request tool permission keeps safe defaults while local writes bypass review" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4677,7 +4698,7 @@ test "request tool permission keeps safe defaults while unresolved local writes 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    try std.testing.expectEqual(ToolPermissionDecision.permission_required, (try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena, .{
+    try std.testing.expectEqual(ToolPermissionDecision.once, (try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena, .{
         .id = "1",
         .name = "write_file",
         .arguments_json = "{\"path\":\"fx-permission-test.txt\",\"content\":\"hello\"}",
@@ -4834,7 +4855,51 @@ test "run_command default user profile requires configured or reviewed shell aut
     try std.testing.expectEqualStrings("touch automatic.txt", reviewer.exact_command.?);
 }
 
-test "local and external file mutations use the same automatic review reason" {
+test "tool context projects immutable session permission state into admission" {
+    const alloc = std.testing.allocator;
+    var rt = TestRuntime{ .workspace_root = "/tmp/workspace", .interactive = false };
+    defer rt.deinit(alloc);
+    var rules = [_]types.PermissionRule{.{
+        .permission = @constCast("bash"),
+        .pattern = @constCast("touch *"),
+        .action = .allow,
+    }};
+    rt.permission_rules = .{ .rules = &rules };
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const call = ToolCall{
+        .id = "runtime-session-deny",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"touch configured.txt\"}",
+    };
+    const key = try tool_admission.permissionStateKeyForCall(
+        rt.context().admissionInput(),
+        arena,
+        call,
+    );
+    try std.testing.expectEqual(
+        session_permission_state.ApplyStatus.applied,
+        try rt.session.applyPermissionEvent(alloc, .{ .set = .{
+            .key = key,
+            .display_identity = "touch configured.txt",
+            .decision = .deny,
+            .expected_generation = null,
+        } }),
+    );
+
+    const outcome = try tool_admission.requestPermissionOutcome(
+        rt.context().admissionInput(),
+        arena,
+        call,
+        .auto,
+        &.{},
+    );
+    try std.testing.expectEqual(ToolPermissionDecision.policy_denied, outcome.decision);
+    try std.testing.expect(outcome.execution_authority == null);
+}
+
+test "local file mutations bypass review while external mutations use exact review" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4888,17 +4953,21 @@ test "local and external file mutations use the same automatic review reason" {
         const prepared = authority.prepared orelse return error.TestExpectedEqual;
         try std.testing.expectEqual(@as(usize, 2), prepared.review.additions);
         try std.testing.expectEqual(@as(usize, 0), prepared.review.deletions);
-        try std.testing.expectEqual(index + 1, reviewer.calls);
-        try std.testing.expectEqual(
-            std.meta.Tag(permission_auto_classifier.Action).file_mutation,
-            reviewer.action_tag.?,
-        );
-        try std.testing.expectEqualStrings("tool_requires_approval", reviewer.escalation_reason.?);
-        try std.testing.expectEqualStrings(target, reviewer.target_path.?);
-        try std.testing.expectEqualStrings(target, reviewer.file_display_path.?);
-        try std.testing.expectEqual(@as(usize, 2), reviewer.file_additions);
-        try std.testing.expectEqual(@as(usize, 0), reviewer.file_deletions);
-        try std.testing.expectEqual(@as(usize, 2), reviewer.file_review_rows);
+        if (index == 0) {
+            try std.testing.expectEqual(@as(usize, 0), reviewer.calls);
+        } else {
+            try std.testing.expectEqual(@as(usize, 1), reviewer.calls);
+            try std.testing.expectEqual(
+                std.meta.Tag(permission_auto_classifier.Action).file_mutation,
+                reviewer.action_tag.?,
+            );
+            try std.testing.expectEqualStrings("tool_requires_approval", reviewer.escalation_reason.?);
+            try std.testing.expectEqualStrings(target, reviewer.target_path.?);
+            try std.testing.expectEqualStrings(target, reviewer.file_display_path.?);
+            try std.testing.expectEqual(@as(usize, 2), reviewer.file_additions);
+            try std.testing.expectEqual(@as(usize, 0), reviewer.file_deletions);
+            try std.testing.expectEqual(@as(usize, 2), reviewer.file_review_rows);
+        }
         try std.testing.expect(rt.worker.pending_permission_request_shared == null);
         try std.testing.expect(!absolutePathExists(target));
     }
@@ -5588,7 +5657,7 @@ test "request tool permission combines configured external copy target with work
     try std.testing.expect(rt.worker.pending_permission_request_shared == null);
 }
 
-test "disabled automatic reviewer blocks for approval without a human prompt" {
+test "disabled automatic reviewer returns a recoverable denial without a human prompt" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5613,9 +5682,9 @@ test "disabled automatic reviewer blocks for approval without a human prompt" {
         .name = "write_file",
         .arguments_json = args,
     }, .auto, &.{});
-    try std.testing.expectEqual(ToolPermissionDecision.permission_required, outcome.decision);
-    try std.testing.expectEqual(types.ToolPermissionDenialReason.permission_required, outcome.denial_reason.?);
-    try std.testing.expectEqual(command_admission.PermissionRequirement.approval_required, outcome.requirement.?);
+    try std.testing.expectEqual(ToolPermissionDecision.deny, outcome.decision);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, outcome.denial_reason.?);
+    try std.testing.expect(outcome.requirement == null);
     try std.testing.expect(outcome.execution_authority == null);
     try std.testing.expect(outcome.auto_review_result == null);
     try std.testing.expect(rt.worker.pending_permission_request_shared == null);

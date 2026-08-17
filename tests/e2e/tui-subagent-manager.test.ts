@@ -1361,7 +1361,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
   );
 
   test(
-    "persistent auto child classifies its first new-file write without approval",
+    "persistent auto child bypasses review for its first new-file write",
     async () => {
       const fixture = createFixture();
       writeFileSync(
@@ -1428,10 +1428,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         }
         expect(existsSync(marker)).toBe(true);
         expect(readFileSync(marker, "utf8")).toBe("classified child write\n");
-        expect(gateway.classifierRequests).toHaveLength(1);
-        expect(gateway.classifierRequests[0]?.body).toContain(
-          "Create the auto-write child.",
-        );
+        expect(gateway.classifierRequests).toHaveLength(0);
         expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
       } finally {
         gateway.stop();
@@ -3073,7 +3070,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         expect(completed.match(new RegExp(resumedText, "g"))).toHaveLength(1);
         expect(childAttempts).toBe(2);
         expect(gateway.requestCount()).toBe(requestsAfterCrash + 2);
-        expect(gateway.classifierRequests).toHaveLength(1);
+        expect(gateway.classifierRequests).toHaveLength(0);
         expect(readFileSync(resumedMarker, "utf8")).toBe(
           "restored auto context\n",
         );
@@ -3723,7 +3720,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await active.sendKeys("Tab");
         await pasteVisibleText(active, initialPrompt);
         for (let index = 0; index < 5; index += 1) await active.sendKeys("Tab");
-        await active.sendLiteralText("  ");
+        await active.sendLiteralText(" ");
         await active.sendKeys("Enter");
         await active.waitForPane(
           (pane) =>
@@ -3885,7 +3882,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await active.waitForText("CHECKPOINT2_CHILD_APPROVAL_COMPLETE", TIMEOUT);
         expect(await active.capturePaneGrid()).toEqual(childGrid);
         expect(active.cursorPosition()).toEqual(childCursor);
-        expect(gateway.classifierRequests).toHaveLength(1);
+        expect(gateway.classifierRequests).toHaveLength(0);
 
         await active.sendText(filePrompt);
         await active.waitForText("child-approval-file-effect.txt", TIMEOUT);
@@ -5906,7 +5903,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await active.sendKeys("Tab");
         await pasteVisibleText(active, firstPrompt);
         for (let index = 0; index < 5; index += 1) await active.sendKeys("Tab");
-        await active.sendLiteralText("  ");
+        await active.sendLiteralText(" ");
         await active.sendKeys("Enter");
         await active.waitForPane(
           (pane) => pane.includes("approval-first") && pane.includes("status: approval"),
@@ -5927,7 +5924,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await active.sendKeys("Tab");
         await pasteVisibleText(active, secondPrompt);
         for (let index = 0; index < 5; index += 1) await active.sendKeys("Tab");
-        await active.sendLiteralText("  ");
+        await active.sendLiteralText(" ");
         await active.sendKeys("Enter");
         await active.waitForPane(
           (pane) => pane.includes("approval-second") && pane.includes("status: approval"),
@@ -6038,7 +6035,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         expect(restored).not.toContain("Agents & processes");
         expect(restored).not.toContain("approval pending");
         expect(active.cursorPosition()).toEqual(mainCursor);
-        expect(gateway.classifierRequests).toHaveLength(2);
+        expect(gateway.classifierRequests).toHaveLength(0);
         expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
       } finally {
         gateway.stop();

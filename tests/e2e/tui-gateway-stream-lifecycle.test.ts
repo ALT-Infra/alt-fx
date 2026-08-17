@@ -1486,7 +1486,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     async () => {
       const hold: ToolPayloadHoldState = { started: false, cancelled: false };
       const payloadPath = "payload-progress.md";
-      const payloadContent = "staged tool payload content\n".repeat(512);
+      // Preserve two substantial streamed input chunks for the live
+      // activity-row assertions.
+      const payloadContent = "staged tool payload content\n".repeat(64);
       const assistantText = "I will write the staged payload now.";
       const finalSentinel = "FX_TOOL_PAYLOAD_PROGRESS_COMPLETE";
       const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
@@ -1529,6 +1531,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       hold.finish?.();
       await session!.waitForText(finalSentinel, TIMEOUT);
+      expect(queuedGateway.classifierRequests).toHaveLength(0);
       const writtenPath = join(root!, "workspace", payloadPath);
       await waitForCondition(
         () => existsSync(writtenPath),

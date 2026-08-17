@@ -242,30 +242,27 @@ describe("fx ask presentation", () => {
     async () => {
       const root = createShortRoot();
       const toolCallId = "ask_terminal_tmux_1";
-      const gateway = startFakeGateway(
-        [
-          fakeGatewayToolCall(toolCallId, "terminal", {
-            action: "start",
-            cwd: root.workspace,
-            command: "printf ASK_PUBLIC_TERMINAL_TMUX",
-            shell: {
-              kind: "executable",
-              path: TERMINAL_FIXTURE_SHELL,
-              clean_start: true,
-            },
-            backend: "tmux",
-            return_when: { kind: "exit" },
-            wait_ceiling_ms: 8_000,
-            dimensions: { rows: 24, columns: 80 },
-          }),
-          fakeGatewayFinalText("Ask public terminal complete.\n"),
-        ],
-        { classifierResponses: [fakeGatewayPermissionDecision()] },
-      );
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall(toolCallId, "terminal", {
+          action: "start",
+          cwd: root.workspace,
+          command: "printf ASK_PUBLIC_TERMINAL_TMUX",
+          shell: {
+            kind: "executable",
+            path: TERMINAL_FIXTURE_SHELL,
+            clean_start: true,
+          },
+          backend: "tmux",
+          return_when: { kind: "exit" },
+          wait_ceiling_ms: 8_000,
+          dimensions: { rows: 24, columns: 80 },
+        }),
+        fakeGatewayFinalText("Ask public terminal complete.\n"),
+      ]);
       gateways.push(gateway);
 
       const result = await runFx(
-        ["ask", "--auto", "Run the tmux public terminal fixture."],
+        ["ask", "--yolo", "Run the tmux public terminal fixture."],
         {
           cwd: root.workspace,
           env: {

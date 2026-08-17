@@ -1978,211 +1978,210 @@ fn containsImageId(image_ids: []const usize, candidate: usize) bool {
     return false;
 }
 
-const ReviewAuthority = struct {
-    root_text_bindings: []const permission_auto_classifier.RootTextBinding,
-    trusted_permission_feedback: []const []const u8,
-};
-
-/// Length-changing projections copy retained messages, so borrowed content
-/// identity proves which projected user message came from the canonical source.
-fn projectedSourceUserIndex(
-    projected_messages: []const ChatMessage,
-    source_messages: []const ChatMessage,
-    source_index: usize,
-) ?usize {
-    if (source_index >= source_messages.len) return null;
-    const source = source_messages[source_index];
-    if (source.role != .user) return null;
-    if (projected_messages.len == source_messages.len) {
-        if (source_index >= projected_messages.len or projected_messages[source_index].role != .user) {
-            return null;
-        }
-        return source_index;
-    }
-
-    const source_content = source.content orelse return null;
-    var matched_index: ?usize = null;
-    for (projected_messages, 0..) |projected, index| {
-        if (projected.role != .user or
-            projected.permission_feedback != source.permission_feedback)
-        {
-            continue;
-        }
-        const projected_content = projected.content orelse continue;
-        if (projected_content.ptr != source_content.ptr or
-            projected_content.len != source_content.len)
-        {
-            continue;
-        }
-        if (matched_index != null) return null;
-        matched_index = index;
-    }
-    return matched_index;
-}
-
-noinline fn buildReviewAuthority(
-    alloc: Allocator,
-    origin: runtime_config.TurnOrigin,
-    projected_messages: []const ChatMessage,
-    source_messages: []const ChatMessage,
-    history_start_index: usize,
-    current_user_message_index: usize,
-    history: []const HistoryTurn,
-    current_root_prompt: []const u8,
-    pending_user_suffix: []const ChatMessage,
-) !ReviewAuthority {
-    var bindings: std.ArrayList(permission_auto_classifier.RootTextBinding) = .empty;
-    errdefer bindings.deinit(alloc);
-    var trusted_permission_feedback: std.ArrayList([]const u8) = .empty;
-    errdefer trusted_permission_feedback.deinit(alloc);
-
-    const projected_current_user_index = projectedSourceUserIndex(
-        projected_messages,
-        source_messages,
-        current_user_message_index,
-    );
-    if (projected_current_user_index) |projected_current| {
-        const projected_history_start = if (projected_messages.len <= source_messages.len)
-            @min(history_start_index, projected_current)
-        else
-            projected_current;
-        var message_index = projected_history_start;
-        while (message_index < projected_current) : (message_index += 1) {
-            const projected = projected_messages[message_index];
-            if (projected.role != .user) continue;
-            const content = projected.content orelse continue;
-            if (findHistoryPermissionFeedback(content, history)) |feedback| {
-                try trusted_permission_feedback.append(alloc, feedback);
-                continue;
-            }
-            if (origin == .root) {
-                if (findHistoryRootText(content, history)) |root_text| {
-                    try bindings.append(alloc, .{
-                        .message_index = message_index,
-                        .text = root_text,
-                    });
-                    continue;
-                }
-            }
-        }
-
-        if (origin == .root and current_root_prompt.len > 0) {
-            const current = projected_messages[projected_current];
-            if (current.role == .user and
-                permission_auto_classifier.rootTextAligned(current.content orelse "", current_root_prompt))
-            {
-                try bindings.append(alloc, .{
-                    .message_index = projected_current,
-                    .text = current_root_prompt,
-                });
-            }
-        }
-
-        for (source_messages, 0..) |source, source_index| {
-            if (source_index <= current_user_message_index or
-                source.role != .user or
-                !source.permission_feedback)
-            {
-                continue;
-            }
-            const feedback = source.content orelse continue;
-            if (feedback.len == 0) continue;
-            const projected_index = projectedSourceUserIndex(
-                projected_messages,
-                source_messages,
-                source_index,
-            ) orelse continue;
-            if (projected_index <= projected_current) continue;
-            if (!std.mem.eql(u8, projected_messages[projected_index].content orelse "", feedback)) continue;
-            try trusted_permission_feedback.append(alloc, feedback);
-        }
-    }
-    try appendTrustedPermissionFeedback(alloc, &trusted_permission_feedback, pending_user_suffix);
-
-    const owned_bindings = try bindings.toOwnedSlice(alloc);
-    errdefer alloc.free(owned_bindings);
-    return .{
-        .root_text_bindings = owned_bindings,
-        .trusted_permission_feedback = try trusted_permission_feedback.toOwnedSlice(alloc),
-    };
-}
-
-fn findHistoryRootText(content: []const u8, history: []const HistoryTurn) ?[]const u8 {
-    for (history) |turn| {
-        const root_text = switch (turn) {
-            .assistant => |entry| entry.user.text,
-            .background_command => |entry| entry.user.text,
-            .interrupted => |entry| entry.user.text,
-            .compacted_summary => continue,
-        };
-        if (root_text.len > 0 and permission_auto_classifier.rootTextAligned(content, root_text)) {
-            return root_text;
-        }
-    }
-    return null;
-}
-
-fn findHistoryPermissionFeedback(content: []const u8, history: []const HistoryTurn) ?[]const u8 {
-    for (history) |turn| {
-        const execution = switch (turn) {
-            .assistant => |entry| entry.execution,
-            .background_command => |entry| entry.execution,
-            .interrupted => |entry| entry.execution,
-            .compacted_summary => continue,
-        };
-        for (execution.tool_steps) |step| {
-            for (step.tool_results) |result| {
-                for (result.permission_feedback) |feedback| {
-                    if (feedback.len > 0 and std.mem.eql(u8, content, feedback)) return feedback;
-                }
-            }
-        }
-    }
-    return null;
-}
-
 fn buildReviewTurnContext(
-    alloc: Allocator,
     config: Config,
     model: []const u8,
-    projected_messages: []const ChatMessage,
-    source_messages: []const ChatMessage,
-    history_start_index: usize,
-    current_user_message_index: usize,
-    history: []const HistoryTurn,
     current_prompt: []const u8,
-    inherited_root_context: []const u8,
-    pending_user_suffix: []const ChatMessage,
     pending_assistant: ChatMessage,
     target_call_id: []const u8,
-) !permission_auto_classifier.ReviewTurnContext {
-    const authority = try buildReviewAuthority(
-        alloc,
-        config.origin,
-        projected_messages,
-        source_messages,
-        history_start_index,
-        current_user_message_index,
-        history,
-        current_prompt,
-        pending_user_suffix,
-    );
+) permission_auto_classifier.ReviewTurnContext {
+    const current_root_request = currentRootRequest(config, current_prompt);
     return .{
         .model = model,
-        .request_messages = projected_messages,
         .pending_assistant = pending_assistant,
         .target_call_id = target_call_id,
         .origin = switch (config.origin) {
             .root => .root,
             .subagent => .subagent,
         },
-        .root_text_bindings = authority.root_text_bindings,
-        .inherited_root_context = if (config.origin == .subagent)
-            inherited_root_context
-        else
-            "",
-        .trusted_permission_feedback = authority.trusted_permission_feedback,
+        .current_root_request = current_root_request,
     };
+}
+
+fn currentRootRequest(config: Config, current_prompt: []const u8) []const u8 {
+    return if (config.origin == .root)
+        current_prompt
+    else if (config.current_prompt_is_root_authority)
+        current_prompt
+    else if (auto_classifier_context.currentRootUserRequest(
+        config.root_user_intent_context,
+    )) |request|
+        request
+    else if (config.root_user_messages.len > 0)
+        config.root_user_messages[config.root_user_messages.len - 1]
+    else
+        "";
+}
+
+const max_automatic_non_allow_response_groups: usize = 3;
+const permission_recovery_fallback = "The blocked action was not run. No safe alternative completed within the configured agent step limit. Provide direction to continue.";
+const permission_recovery_final_guidance = "Permission recovery reached its action limit. Do not call tools. Explain that the blocked action did not run, then ask the user for direction or finish honestly.";
+
+fn automaticRecoveryExhausted(messages: []const ChatMessage) bool {
+    var blocked_groups: usize = 0;
+    var index: usize = 0;
+    while (index < messages.len) : (index += 1) {
+        const assistant = messages[index];
+        if (assistant.role != .assistant or assistant.tool_calls.len == 0) continue;
+        var group_end = index + 1;
+        while (group_end < messages.len and messages[group_end].role != .assistant) {
+            group_end += 1;
+        }
+        if (!responseGroupComplete(messages[index + 1 .. group_end], assistant.tool_calls)) {
+            index = group_end -| 1;
+            continue;
+        }
+        var has_permission_denial = false;
+        var has_success = false;
+        for (messages[index + 1 .. group_end]) |message| {
+            if (message.role != .tool) continue;
+            if (message.tool_result_status == .success) has_success = true;
+            const output = message.content orelse continue;
+            if (tool_result_errors.toolPermissionDenialReason(output) != null) {
+                has_permission_denial = true;
+            }
+        }
+        if (has_permission_denial) {
+            blocked_groups +|= 1;
+        } else if (has_success) {
+            blocked_groups = 0;
+        }
+        index = group_end -| 1;
+    }
+    return blocked_groups >= max_automatic_non_allow_response_groups;
+}
+
+fn responseGroupComplete(
+    results: []const ChatMessage,
+    calls: []const ToolCall,
+) bool {
+    for (calls) |call| {
+        var found = false;
+        for (results) |result| {
+            if (result.role == .tool and
+                result.tool_call_id != null and
+                std.mem.eql(u8, result.tool_call_id.?, call.id))
+            {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+const PermissionRecoveryPlan = enum {
+    continue_with_tools,
+    final_model_response,
+    local_fallback,
+};
+
+fn permissionRecoveryPlan(
+    messages: []const ChatMessage,
+    step_limit: usize,
+    completed_steps: usize,
+) PermissionRecoveryPlan {
+    if (!automaticRecoveryExhausted(messages)) return .continue_with_tools;
+    if (agent_steps.allowsStep(step_limit, completed_steps)) {
+        return .final_model_response;
+    }
+    return .local_fallback;
+}
+
+test "automatic recovery counts completed response groups and resets after success" {
+    const denied = "{\"error\":{\"type\":\"tool_permission_denied\",\"reason\":\"auto_denied\"}}";
+    const blocked_group = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &.{.{ .id = "blocked", .name = "run_command", .arguments_json = "{}" }} },
+        .{ .role = .tool, .content = denied, .tool_call_id = "blocked", .tool_result_status = .failure },
+    };
+    var three_then_current: [7]ChatMessage = undefined;
+    @memcpy(three_then_current[0..2], &blocked_group);
+    @memcpy(three_then_current[2..4], &blocked_group);
+    @memcpy(three_then_current[4..6], &blocked_group);
+    three_then_current[6] = .{ .role = .assistant, .tool_calls = &.{.{ .id = "current", .name = "run_command", .arguments_json = "{}" }} };
+    try std.testing.expect(automaticRecoveryExhausted(&three_then_current));
+
+    const success = ChatMessage{
+        .role = .tool,
+        .content = "ok",
+        .tool_call_id = "safe",
+        .tool_result_status = .success,
+    };
+    var reset: [10]ChatMessage = undefined;
+    @memcpy(reset[0..6], three_then_current[0..6]);
+    reset[6] = .{ .role = .assistant, .tool_calls = &.{.{ .id = "safe", .name = "run_command", .arguments_json = "{}" }} };
+    reset[7] = success;
+    reset[8] = blocked_group[0];
+    reset[9] = blocked_group[1];
+    try std.testing.expect(!automaticRecoveryExhausted(&reset));
+}
+
+test "parallel automatic denials count as one response group" {
+    const denied = "{\"error\":{\"type\":\"tool_permission_denied\",\"reason\":\"auto_denied\"}}";
+    const calls = [_]ToolCall{
+        .{ .id = "one", .name = "run_command", .arguments_json = "{}" },
+        .{ .id = "two", .name = "run_command", .arguments_json = "{}" },
+    };
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .content = denied, .tool_call_id = "one", .tool_result_status = .failure },
+        .{ .role = .tool, .content = denied, .tool_call_id = "two", .tool_result_status = .failure },
+        .{ .role = .assistant, .tool_calls = &calls },
+    };
+    try std.testing.expect(!automaticRecoveryExhausted(&messages));
+}
+
+test "a mixed parallel response group is blocked regardless result order" {
+    const denied = "{\"error\":{\"type\":\"tool_permission_denied\",\"reason\":\"auto_denied\"}}";
+    const calls = [_]ToolCall{
+        .{ .id = "safe", .name = "run_command", .arguments_json = "{}" },
+        .{ .id = "blocked", .name = "run_command", .arguments_json = "{}" },
+    };
+    const current = ChatMessage{
+        .role = .assistant,
+        .tool_calls = &.{.{ .id = "current", .name = "run_command", .arguments_json = "{}" }},
+    };
+    var success_first: [10]ChatMessage = undefined;
+    var denial_first: [10]ChatMessage = undefined;
+    for (0..3) |group_index| {
+        const start = group_index * 3;
+        success_first[start] = .{ .role = .assistant, .tool_calls = &calls };
+        success_first[start + 1] = .{ .role = .tool, .content = "ok", .tool_call_id = "safe", .tool_result_status = .success };
+        success_first[start + 2] = .{ .role = .tool, .content = denied, .tool_call_id = "blocked", .tool_result_status = .failure };
+        denial_first[start] = success_first[start];
+        denial_first[start + 1] = success_first[start + 2];
+        denial_first[start + 2] = success_first[start + 1];
+    }
+    success_first[9] = current;
+    denial_first[9] = current;
+    try std.testing.expect(automaticRecoveryExhausted(&success_first));
+    try std.testing.expect(automaticRecoveryExhausted(&denial_first));
+}
+
+test "permission recovery plan respects the ordinary step budget" {
+    const denied = "{\"error\":{\"type\":\"tool_permission_denied\",\"reason\":\"auto_denied\"}}";
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &.{.{ .id = "one", .name = "run_command", .arguments_json = "{}" }} },
+        .{ .role = .tool, .content = denied, .tool_call_id = "one", .tool_result_status = .failure },
+        .{ .role = .assistant, .tool_calls = &.{.{ .id = "two", .name = "run_command", .arguments_json = "{}" }} },
+        .{ .role = .tool, .content = denied, .tool_call_id = "two", .tool_result_status = .failure },
+        .{ .role = .assistant, .tool_calls = &.{.{ .id = "three", .name = "run_command", .arguments_json = "{}" }} },
+        .{ .role = .tool, .content = denied, .tool_call_id = "three", .tool_result_status = .failure },
+    };
+
+    try std.testing.expectEqual(
+        PermissionRecoveryPlan.final_model_response,
+        permissionRecoveryPlan(&messages, 0, 3),
+    );
+    try std.testing.expectEqual(
+        PermissionRecoveryPlan.final_model_response,
+        permissionRecoveryPlan(&messages, 4, 3),
+    );
+    try std.testing.expectEqual(
+        PermissionRecoveryPlan.local_fallback,
+        permissionRecoveryPlan(&messages, 3, 3),
+    );
 }
 
 fn appendTrustedPermissionFeedback(
@@ -2338,6 +2337,14 @@ fn processQueuedPromptLoop(
     var restore_recovery_source = job.recovery_checkpoint != null;
     var step: usize = 0;
     while (agent_steps.allowsStep(config.agent_step_limit, step)) : (step += 1) {
+        const permission_recovery_plan = permissionRecoveryPlan(
+            within_turn_suffix.items,
+            config.agent_step_limit,
+            step,
+        );
+        std.debug.assert(permission_recovery_plan != .local_fallback);
+        const final_permission_response =
+            permission_recovery_plan == .final_model_response;
         current_step_index = step + 1;
         const step_ctx: TraceContext = .{ .turn_id = turn_id, .step_id = debug_trace.nextStepId(), .subagent_id = config.subagent_id };
         const presentation_group_id = runtime_tool_presentation.presentationGroupForStep(
@@ -2357,6 +2364,12 @@ fn processQueuedPromptLoop(
         var ephemeral_overlay: std.ArrayList(ChatMessage) = .empty;
         if (config.explicit_skills_prompt_section.len > 0) {
             try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = config.explicit_skills_prompt_section });
+        }
+        if (final_permission_response) {
+            try ephemeral_overlay.append(overlay_arena, .{
+                .role = .system,
+                .content = permission_recovery_final_guidance,
+            });
         }
         try deps.append_runtime_context(deps.ctx, overlay_arena, &ephemeral_overlay);
         var parent_turn_delivery = try appendPreparedParentTurnContext(
@@ -2537,7 +2550,9 @@ fn processQueuedPromptLoop(
             );
             debug_trace.eventf("gateway", "before_payload_build", step_ctx, "model={s} gateway_messages={d}", .{ gateway_model, gateway_messages.items.len });
             var vision_route: runtime_vision_contracts.VisionRoute = .native_images;
-            var vision_mode: runtime_gateway_step.VisionToolMode = if (deps.tool_registry.lookup("vision") != null)
+            var vision_mode: runtime_gateway_step.VisionToolMode = if (final_permission_response)
+                .unavailable
+            else if (deps.tool_registry.lookup("vision") != null)
                 .optional
             else
                 .unavailable;
@@ -2578,7 +2593,9 @@ fn processQueuedPromptLoop(
             last_gateway_message_count = request_messages.len;
             const provider_opts = model_capabilities.resolveProviderOptionsForCapabilities(request_capabilities, config.effort, route_fast_mode);
             runtime_telemetry.traceGatewayProviderOptions(step_ctx, gateway_model, route_fast_mode, config.effort, provider_opts);
-            const tool_choice: types.ToolChoice = if (recovery_strategy == .reconcile_tool)
+            const tool_choice: types.ToolChoice = if (final_permission_response)
+                .none
+            else if (recovery_strategy == .reconcile_tool)
                 .none
             else if (configured_first_tool_choice_pending and vision_mode != .required)
                 config.first_call_tool_choice
@@ -2587,11 +2604,20 @@ fn processQueuedPromptLoop(
             const request_payload = deps.agent_stream_provider.build(
                 overlay_arena,
                 .{
-                    .tool_registry = deps.tool_registry,
-                    .serialized_tools = config.gateway_tools_json,
+                    .tool_registry = if (final_permission_response)
+                        .{ .tools = &.{} }
+                    else
+                        deps.tool_registry,
+                    .serialized_tools = if (final_permission_response)
+                        "[]"
+                    else
+                        config.gateway_tools_json,
                     .messages = request_messages,
                     .tool_choice = tool_choice,
-                    .selected_dynamic_tool_schemas = selected_dynamic_tool_schemas.items,
+                    .selected_dynamic_tool_schemas = if (final_permission_response)
+                        &.{}
+                    else
+                        selected_dynamic_tool_schemas.items,
                     .vision_mode = vision_mode,
                     .provider_options = provider_opts,
                     .max_output_tokens = request_capabilities.max_output_tokens,
@@ -2624,7 +2650,13 @@ fn processQueuedPromptLoop(
                 debug_trace.logf("agent", "token progress publication failed source=gateway_prepare err={s}", .{@errorName(progress_err)});
             };
             debug_trace.eventf("gateway", "after_payload_build", step_ctx, "payload_bytes={d} model={s} gateway_messages={d}", .{ request_payload.len, gateway_model, request_messages.len });
-            runtime_telemetry.traceGatewayRequestBuilt(step_ctx, gateway_model, request_payload.len, request_messages.len, config.gateway_tools_json);
+            runtime_telemetry.traceGatewayRequestBuilt(
+                step_ctx,
+                gateway_model,
+                request_payload.len,
+                request_messages.len,
+                if (final_permission_response) "[]" else config.gateway_tools_json,
+            );
             try persistRecoveryCheckpoint(
                 deps,
                 arena,
@@ -3738,6 +3770,36 @@ fn processQueuedPromptLoop(
             }
         }
 
+        if (final_permission_response and completion.tool_calls.len > 0) {
+            try stream_ctx.provisional_statuses.finishRejectedCompletions(
+                deps,
+                arena,
+                turn_id,
+                completion.tool_calls,
+                advertised_dynamic_tool_names,
+            );
+            debug_trace.eventf(
+                "permission",
+                "permission_recovery_final_tool_rejected",
+                step_ctx,
+                "tool_call_count={d}",
+                .{completion.tool_calls.len},
+            );
+            try finishFailedTurnWithNotice(
+                deps,
+                finalization,
+                arena,
+                job,
+                within_turn_suffix.items,
+                &summary_accumulator,
+                stop_state,
+                &finish_trace,
+                permission_recovery_fallback,
+                "permission_recovery_fallback",
+            );
+            return;
+        }
+
         if (disposition == .completed and completion.tool_calls.len > 0) {
             const admission = types.authoritativeToolAdmission(completion);
             switch (admission) {
@@ -3891,6 +3953,21 @@ fn processQueuedPromptLoop(
         if (completion.tool_calls.len == 0) {
             const has_content =
                 std.mem.trim(u8, partial_assistant, " \t\r\n").len > 0;
+            if (final_permission_response and !has_content) {
+                try finishFailedTurnWithNotice(
+                    deps,
+                    finalization,
+                    arena,
+                    job,
+                    within_turn_suffix.items,
+                    &summary_accumulator,
+                    stop_state,
+                    &finish_trace,
+                    permission_recovery_fallback,
+                    "permission_recovery_fallback",
+                );
+                return;
+            }
             const needs_continuation =
                 disposition == .completed and
                 !continuation_injected and
@@ -4417,11 +4494,6 @@ fn processQueuedPromptLoop(
                 const parallel_prepared = prepared_tool_calls[tool_call_index .. tool_call_index + parallel_len];
                 const precomputed_results = try arena.alloc(?ToolExecutionResult, parallel_calls.len);
                 @memset(precomputed_results, null);
-                const parallel_permission_outcomes = try arena.alloc(
-                    ?command_admission.PermissionOutcome,
-                    parallel_calls.len,
-                );
-                @memset(parallel_permission_outcomes, null);
                 const parallel_status_started = try arena.alloc(bool, parallel_calls.len);
                 @memset(parallel_status_started, false);
                 const parallel_status_terminalized = try arena.alloc(bool, parallel_calls.len);
@@ -4535,18 +4607,10 @@ fn processQueuedPromptLoop(
                         parallel_status_started[group_index] = try runtime_tool_presentation.startToolVisibleLifecycle(deps, arena, turn_id, stream_ctx.provisional_statuses.presentation_group_id, parallel_call, null, advertised_dynamic_tool_names);
                     }
 
-                    const parallel_review_context = try buildReviewTurnContext(
-                        arena,
+                    const parallel_review_context = buildReviewTurnContext(
                         config,
                         successful_gateway_model,
-                        successful_request_messages,
-                        successful_source_messages,
-                        history_start_index,
-                        current_user_message_index,
-                        job.history,
                         job.prompt,
-                        root_user_intent_context,
-                        step_batch.pending_user_suffix.items,
                         pending_assistant,
                         parallel_call.id,
                     );
@@ -4603,17 +4667,8 @@ fn processQueuedPromptLoop(
                         tool_dispatch.traceDeniedWebSearch(step_ctx, parallel_call, reason);
                         debug_trace.eventf("tool", "execution_result", step_ctx, "call_id={s} name={s} result_kind=permission_denied reason={s} model_output_bytes={d}", .{ parallel_call.id, parallel_call.name, @tagName(reason), denied_output.len });
                         precomputed_results[group_index] = .{ .status = .failure, .model_output = denied_output };
-                        parallel_permission_outcomes[group_index] = permission_outcome;
                         continue;
                     }
-
-                    _ = try runtime_tool_presentation.presentAutoPermissionOutcome(
-                        deps,
-                        arena,
-                        parallel_call,
-                        job.permission_mode,
-                        permission_outcome,
-                    );
 
                     if (decision == .always) {
                         const target_path = try deps.permission_target_for_call(deps.ctx, arena, parallel_call, advertised_dynamic_tool_names);
@@ -4742,8 +4797,7 @@ fn processQueuedPromptLoop(
                 for (
                     admitted_parallel_calls,
                     admitted_precomputed_results,
-                    parallel_permission_outcomes,
-                ) |parallel_call, precomputed, maybe_permission_outcome| {
+                ) |parallel_call, precomputed| {
                     const execution = precomputed orelse continue;
                     if (parallel_call.argument_integrity == .malformed_json) continue;
                     try runtime_tool_admission.recordRejectedToolCall(
@@ -4753,15 +4807,6 @@ fn processQueuedPromptLoop(
                         execution.model_output,
                         null,
                     );
-                    if (maybe_permission_outcome) |permission_outcome| {
-                        _ = try runtime_tool_presentation.presentAutoPermissionOutcome(
-                            deps,
-                            arena,
-                            parallel_call,
-                            job.permission_mode,
-                            permission_outcome,
-                        );
-                    }
                 }
                 const cancelled_call = try runtime_tool_batch.assembleParallelToolResults(
                     arena,
@@ -5546,18 +5591,10 @@ fn processQueuedPromptLoop(
                 try types.dupeToolCall(call_allocator, tool_call)
             else
                 tool_call;
-            const review_context = try buildReviewTurnContext(
-                call_allocator,
+            const review_context = buildReviewTurnContext(
                 config,
                 successful_gateway_model,
-                successful_request_messages,
-                successful_source_messages,
-                history_start_index,
-                current_user_message_index,
-                job.history,
                 job.prompt,
-                root_user_intent_context,
-                step_batch.pending_user_suffix.items,
                 pending_assistant,
                 execution_call.id,
             );
@@ -5879,13 +5916,6 @@ fn processQueuedPromptLoop(
                     denied_output,
                     null,
                 );
-                _ = try runtime_tool_presentation.presentAutoPermissionOutcome(
-                    deps,
-                    call_allocator,
-                    execution_call,
-                    action_permission_mode,
-                    permission_outcome,
-                );
                 if (deps.tool_activity_recorder) |recorder| {
                     recorder.record(tool_call.id, tool_call.name, .denied) catch |err| {
                         debug_trace.eventf(
@@ -5899,14 +5929,6 @@ fn processQueuedPromptLoop(
                 }
                 continue;
             }
-
-            const auto_permission_notice_presented = try runtime_tool_presentation.presentAutoPermissionOutcome(
-                deps,
-                call_allocator,
-                execution_call,
-                action_permission_mode,
-                permission_outcome,
-            );
 
             const execution_authority = permission_outcome.execution_authority orelse {
                 debug_trace.eventf(
@@ -5942,26 +5964,15 @@ fn processQueuedPromptLoop(
             );
 
             if (!status_started) {
-                status_started = if (defer_auto_command_lifecycle and auto_permission_notice_presented)
-                    try runtime_tool_presentation.startToolVisibleLifecycleAfterCurrentTranscript(
-                        deps,
-                        call_allocator,
-                        turn_id,
-                        stream_ctx.provisional_statuses.presentation_group_id,
-                        execution_call,
-                        file_display_path,
-                        advertised_dynamic_tool_names,
-                    )
-                else
-                    try runtime_tool_presentation.startToolVisibleLifecycle(
-                        deps,
-                        call_allocator,
-                        turn_id,
-                        stream_ctx.provisional_statuses.presentation_group_id,
-                        execution_call,
-                        file_display_path,
-                        advertised_dynamic_tool_names,
-                    );
+                status_started = try runtime_tool_presentation.startToolVisibleLifecycle(
+                    deps,
+                    call_allocator,
+                    turn_id,
+                    stream_ctx.provisional_statuses.presentation_group_id,
+                    execution_call,
+                    file_display_path,
+                    advertised_dynamic_tool_names,
+                );
             }
 
             if (decision == .always and live_authority == null) {
@@ -6072,6 +6083,8 @@ fn processQueuedPromptLoop(
                 .call = execution_call,
                 .authority = execution_authority,
                 .root_user_intent_context = tool_execution_root_user_context,
+                .root_user_messages = &.{},
+                .root_user_evidence_complete = true,
                 .authorized_image_catalog = job.authorized_image_catalog,
                 .current_turn_messages = within_turn_suffix.items,
                 .session_grants = execution_grants,
@@ -6441,13 +6454,6 @@ fn processQueuedPromptLoop(
                             prepared_denial.model_output,
                             denied_execution.command_result_json,
                         );
-                        _ = try runtime_tool_presentation.presentAutoPermissionOutcome(
-                            deps,
-                            arena,
-                            tool_call,
-                            action_permission_mode,
-                            widening_outcome,
-                        );
                         if (widening_outcome.feedback) |feedback| {
                             try appendPermissionFeedbackAfterToolResult(
                                 deps,
@@ -6459,14 +6465,6 @@ fn processQueuedPromptLoop(
                         }
                         continue;
                     }
-
-                    _ = try runtime_tool_presentation.presentAutoPermissionOutcome(
-                        deps,
-                        arena,
-                        tool_call,
-                        action_permission_mode,
-                        widening_outcome,
-                    );
 
                     const broader_authority = widening_outcome.execution_authority orelse
                         return error.MissingToolExecutionAuthority;
@@ -6517,6 +6515,8 @@ fn processQueuedPromptLoop(
                             .call = execution_call,
                             .authority = broader_authority,
                             .root_user_intent_context = tool_execution_root_user_context,
+                            .root_user_messages = &.{},
+                            .root_user_evidence_complete = true,
                             .authorized_image_catalog = job.authorized_image_catalog,
                             .current_turn_messages = within_turn_suffix.items,
                             .session_grants = if (live_authority) |resolved|
@@ -7099,6 +7099,15 @@ fn processQueuedPromptLoop(
         }
     }
 
+    const exhausted_recovery_plan = permissionRecoveryPlan(
+        within_turn_suffix.items,
+        config.agent_step_limit,
+        step,
+    );
+    const final_notice = if (exhausted_recovery_plan == .local_fallback)
+        permission_recovery_fallback
+    else
+        config.step_limit_notice;
     runtime_telemetry.traceStepLimitReached(.{
         .ctx = last_step_ctx,
         .step_index = current_step_index,
@@ -7117,8 +7126,11 @@ fn processQueuedPromptLoop(
         &summary_accumulator,
         stop_state,
         &finish_trace,
-        config.step_limit_notice,
-        "step_limit",
+        final_notice,
+        if (exhausted_recovery_plan == .local_fallback)
+            "permission_recovery_fallback"
+        else
+            "step_limit",
     );
 }
 
@@ -7282,305 +7294,6 @@ pub fn copyLatestStopPartial(
         null
     else
         try alloc.dupe(u8, partial);
-}
-
-test "review authority binds current root across a shorter native projection" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const first_vision_calls = [_]ToolCall{
-        .{ .id = "vision_1", .name = "vision", .arguments_json = "{}" },
-        .{ .id = "vision_2", .name = "vision", .arguments_json = "{}" },
-    };
-    const second_vision_calls = [_]ToolCall{
-        .{ .id = "vision_3", .name = "vision", .arguments_json = "{}" },
-        .{ .id = "vision_4", .name = "vision", .arguments_json = "{}" },
-    };
-    var source = [_]ChatMessage{.{ .role = .assistant, .content = "historical response" }} ** 77;
-    source[10] = .{ .role = .assistant, .tool_calls = &first_vision_calls };
-    source[11] = .{ .role = .tool, .content = "failed", .tool_call_id = "vision_1", .tool_name = "vision" };
-    source[12] = .{ .role = .tool, .content = "failed", .tool_call_id = "vision_2", .tool_name = "vision" };
-    source[20] = .{ .role = .assistant, .tool_calls = &second_vision_calls };
-    source[21] = .{ .role = .tool, .content = "failed", .tool_call_id = "vision_3", .tool_name = "vision" };
-    source[22] = .{ .role = .tool, .content = "failed", .tool_call_id = "vision_4", .tool_name = "vision" };
-    source[76] = .{ .role = .user, .content = "Investigate the failed request." };
-    const projected = try runtime_vision_contracts.project_native_messages(arena, &source, 76);
-    try std.testing.expectEqual(@as(usize, 71), projected.len);
-
-    const authority = try buildReviewAuthority(
-        arena,
-        .root,
-        projected,
-        &source,
-        7,
-        76,
-        &.{},
-        "Investigate the failed request.",
-        &.{},
-    );
-
-    try std.testing.expectEqual(@as(usize, 1), authority.root_text_bindings.len);
-    try std.testing.expectEqual(@as(usize, 70), authority.root_text_bindings[0].message_index);
-    try std.testing.expectEqualStrings(
-        "Investigate the failed request.",
-        authority.root_text_bindings[0].text,
-    );
-}
-
-test "review authority fails closed when a shorter projection omits current root identity" {
-    const alloc = std.testing.allocator;
-    const source_text = try alloc.dupe(u8, "Repeated request text.");
-    defer alloc.free(source_text);
-    const projected_text = try alloc.dupe(u8, source_text);
-    defer alloc.free(projected_text);
-    try std.testing.expect(source_text.ptr != projected_text.ptr);
-
-    const source = [_]ChatMessage{
-        .{ .role = .assistant, .content = "historical response" },
-        .{ .role = .user, .content = source_text },
-    };
-    const projected = [_]ChatMessage{
-        .{ .role = .user, .content = projected_text },
-    };
-    const authority = try buildReviewAuthority(
-        alloc,
-        .root,
-        &projected,
-        &source,
-        0,
-        1,
-        &.{},
-        source_text,
-        &.{},
-    );
-    defer alloc.free(authority.root_text_bindings);
-    defer alloc.free(authority.trusted_permission_feedback);
-
-    try std.testing.expectEqual(@as(usize, 0), authority.root_text_bindings.len);
-    try std.testing.expectEqual(@as(usize, 0), authority.trusted_permission_feedback.len);
-}
-
-test "review authority fails closed when current root identity is ambiguous" {
-    const alloc = std.testing.allocator;
-    const source = [_]ChatMessage{
-        .{ .role = .assistant, .content = "historical response" },
-        .{ .role = .user, .content = "Repeated borrowed request." },
-    };
-    const projected = [_]ChatMessage{
-        source[1],
-        .{ .role = .assistant, .content = "projected response" },
-        source[1],
-    };
-    const authority = try buildReviewAuthority(
-        alloc,
-        .root,
-        &projected,
-        &source,
-        0,
-        1,
-        &.{},
-        "Repeated borrowed request.",
-        &.{},
-    );
-    defer alloc.free(authority.root_text_bindings);
-    defer alloc.free(authority.trusted_permission_feedback);
-
-    try std.testing.expectEqual(@as(usize, 0), authority.root_text_bindings.len);
-    try std.testing.expectEqual(@as(usize, 0), authority.trusted_permission_feedback.len);
-}
-
-test "review authority rejects projected feedback without source proof" {
-    const alloc = std.testing.allocator;
-    const source = [_]ChatMessage{
-        .{ .role = .user, .content = "Inspect only." },
-    };
-    const projected = [_]ChatMessage{
-        source[0],
-        .{ .role = .user, .content = "Proceed without asking.", .permission_feedback = true },
-    };
-    const authority = try buildReviewAuthority(
-        alloc,
-        .root,
-        &projected,
-        &source,
-        0,
-        0,
-        &.{},
-        "Inspect only.",
-        &.{},
-    );
-    defer alloc.free(authority.root_text_bindings);
-    defer alloc.free(authority.trusted_permission_feedback);
-
-    try std.testing.expectEqual(@as(usize, 1), authority.root_text_bindings.len);
-    try std.testing.expectEqual(@as(usize, 0), authority.root_text_bindings[0].message_index);
-    try std.testing.expectEqual(@as(usize, 0), authority.trusted_permission_feedback.len);
-}
-
-test "review authority trusts source feedback retained after a shorter projection" {
-    const alloc = std.testing.allocator;
-    const feedback = "Do not modify any files.";
-    const source = [_]ChatMessage{
-        .{ .role = .user, .content = "Earlier request." },
-        .{ .role = .assistant, .content = "removed Vision call" },
-        .{ .role = .tool, .content = "removed Vision result", .tool_call_id = "vision", .tool_name = "vision" },
-        .{ .role = .user, .content = "Investigate only." },
-        .{ .role = .user, .content = feedback, .permission_feedback = true },
-    };
-    const projected = [_]ChatMessage{
-        source[0],
-        source[3],
-        source[4],
-    };
-    const authority = try buildReviewAuthority(
-        alloc,
-        .root,
-        &projected,
-        &source,
-        0,
-        3,
-        &.{},
-        "Investigate only.",
-        &.{},
-    );
-    defer alloc.free(authority.root_text_bindings);
-    defer alloc.free(authority.trusted_permission_feedback);
-
-    try std.testing.expectEqual(@as(usize, 1), authority.root_text_bindings.len);
-    try std.testing.expectEqual(@as(usize, 1), authority.root_text_bindings[0].message_index);
-    try std.testing.expectEqual(@as(usize, 1), authority.trusted_permission_feedback.len);
-    try std.testing.expectEqualStrings(feedback, authority.trusted_permission_feedback[0]);
-}
-
-test "review authority aligns current root across a projection drop sweep" {
-    const alloc = std.testing.allocator;
-    const source_len: usize = 80;
-
-    for (1..65) |dropped_count| {
-        const source = try alloc.alloc(ChatMessage, source_len);
-        defer alloc.free(source);
-        const projected = try alloc.alloc(ChatMessage, source_len - dropped_count);
-        defer alloc.free(projected);
-        @memset(source, .{ .role = .assistant, .content = "historical response" });
-        @memset(projected, .{ .role = .assistant, .content = "historical response" });
-        source[source.len - 1] = .{ .role = .user, .content = "Current root request." };
-        projected[projected.len - 1] = source[source.len - 1];
-
-        const authority = try buildReviewAuthority(
-            alloc,
-            .root,
-            projected,
-            source,
-            7,
-            source.len - 1,
-            &.{},
-            "Current root request.",
-            &.{},
-        );
-        defer alloc.free(authority.root_text_bindings);
-        defer alloc.free(authority.trusted_permission_feedback);
-
-        try std.testing.expectEqual(@as(usize, 1), authority.root_text_bindings.len);
-        try std.testing.expectEqual(
-            projected.len - 1,
-            authority.root_text_bindings[0].message_index,
-        );
-    }
-}
-
-test "review authority binds only root text before projected image references" {
-    const alloc = std.testing.allocator;
-    const projected = [_]ChatMessage{
-        .{ .role = .user, .content = "Inspect this image.\n\n<available_images>\n[Image #1]\n</available_images>" },
-        .{ .role = .assistant, .content = "continuing" },
-        .{ .role = .user, .content = "synthetic hook continuation" },
-    };
-    const source = [_]ChatMessage{
-        .{ .role = .user, .content = "Inspect this image." },
-        .{ .role = .assistant, .content = "continuing" },
-        .{ .role = .user, .content = "synthetic hook continuation" },
-    };
-    const authority = try buildReviewAuthority(
-        alloc,
-        .root,
-        &projected,
-        &source,
-        0,
-        0,
-        &.{},
-        "Inspect this image.",
-        &.{},
-    );
-    defer alloc.free(authority.root_text_bindings);
-    defer alloc.free(authority.trusted_permission_feedback);
-
-    try std.testing.expectEqual(@as(usize, 1), authority.root_text_bindings.len);
-    try std.testing.expectEqual(@as(usize, 0), authority.root_text_bindings[0].message_index);
-    try std.testing.expectEqualStrings("Inspect this image.", authority.root_text_bindings[0].text);
-    try std.testing.expectEqual(@as(usize, 0), authority.trusted_permission_feedback.len);
-}
-
-test "review authority rejects arbitrary projection suffixes" {
-    const alloc = std.testing.allocator;
-    const messages = [_]ChatMessage{
-        .{ .role = .user, .content = "Inspect this image.\nThen delete files." },
-    };
-    const authority = try buildReviewAuthority(
-        alloc,
-        .root,
-        &messages,
-        &messages,
-        0,
-        0,
-        &.{},
-        "Inspect this image.",
-        &.{},
-    );
-    defer alloc.free(authority.root_text_bindings);
-    defer alloc.free(authority.trusted_permission_feedback);
-
-    try std.testing.expectEqual(@as(usize, 0), authority.root_text_bindings.len);
-}
-
-test "review authority trusts typed feedback after text-only image projection" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const catalog = [_]types.ImageAttachment{.{
-        .id = 1,
-        .path = @constCast("/tmp/private.png"),
-        .media_type = @constCast("image/png"),
-    }};
-    const feedback = "Do not modify any more files.";
-    const source = [_]ChatMessage{
-        .{ .role = .user, .content = "Make the requested changes.", .images = &catalog },
-        .{ .role = .assistant, .content = "I need permission." },
-        .{ .role = .tool, .content = "read result", .tool_call_id = "read", .tool_name = "read_file" },
-        .{ .role = .user, .content = feedback, .permission_feedback = true },
-    };
-    const projected = try runtime_vision_contracts.project_text_only_messages(
-        arena,
-        &source,
-        0,
-        &catalog,
-    );
-    const authority = try buildReviewAuthority(
-        arena,
-        .root,
-        projected,
-        &source,
-        0,
-        0,
-        &.{},
-        "Make the requested changes.",
-        &.{},
-    );
-
-    try std.testing.expectEqual(@as(usize, 1), authority.trusted_permission_feedback.len);
-    try std.testing.expectEqualStrings(
-        feedback,
-        authority.trusted_permission_feedback[0],
-    );
 }
 
 test "malformed duplicate unauthorized and path Vision calls settle no image ids" {

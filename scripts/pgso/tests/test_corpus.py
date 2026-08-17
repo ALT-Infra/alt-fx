@@ -53,6 +53,7 @@ TRAINING_E2E_TESTS = (
 )
 
 VERIFICATION_E2E_TESTS = (
+    "auto-mode-reliability.test.ts",
     "tui-auth-source-selection.test.ts",
     "tui-composer-edit-contracts.test.ts",
     "tui-cost.test.ts",
@@ -340,7 +341,7 @@ class PgsoCorpusTests(unittest.TestCase):
             tuple(test_file for test_file, _ in corpus.intentional_exclusions),
         )
         self.assertEqual(36, len(corpus.scenarios))
-        self.assertEqual(51, len(corpus.candidate_scenarios))
+        self.assertEqual(52, len(corpus.candidate_scenarios))
         self.assertEqual(
             ("e2e-cli", "e2e-mcp-auth"),
             tuple(

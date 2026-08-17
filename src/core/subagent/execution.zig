@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const permission_prompter = @import("../permissions/permission_prompter.zig");
+const session_permission_state = @import("../permissions/session_permission_state.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
 const runtime_assistant_stream = @import("../agent/runtime/assistant_stream.zig");
@@ -522,11 +523,12 @@ pub const TurnContext = struct {
     ) !TurnContext {
         var runtime = session.SessionRuntime{ .max_history_turns = max_history_turns };
         errdefer runtime.deinit(alloc);
-        try runtime.restoreWithContextHistoryStart(
+        try runtime.restoreWithPermissionState(
             alloc,
             loaded.state.conversation_language,
             loaded.state.history,
             loaded.state.context_history_start,
+            loaded.state.permission_state,
         );
         return .{ .alloc = alloc, .runtime = runtime, .loaded = loaded };
     }
@@ -704,6 +706,10 @@ pub const TurnContext = struct {
             target,
             target_kind,
         );
+        // LiveToolAuthority is returned by value, so its state header cannot
+        // point at the local snapshot even though the rule storage uses alloc.
+        const permission_state = try alloc.create(session_permission_state.State);
+        permission_state.* = snapshot.permission_state;
         return .{
             .authority = .{
                 .generation = snapshot.generation,
@@ -713,6 +719,7 @@ pub const TurnContext = struct {
                 .integrations = snapshot.integrations,
                 .rules = snapshot.rules,
                 .grants = snapshot.grants,
+                .permission_state = permission_state,
                 .permission_mode = snapshot.permission_mode,
             },
             .decision = switch (decision) {
@@ -7634,7 +7641,7 @@ fn runProductionActionGenerationCase(
         types.ReasoningEffort.literal("medium"),
         &.{"permission-work"},
     );
-    try env.setPermissionMode(alloc, "permission-child", .auto);
+    try env.setPermissionMode(alloc, "permission-child", .ask);
     {
         var capability = try env.store.openSubagentControlCapabilityWritable(
             alloc,
@@ -7747,7 +7754,9 @@ fn runProductionActionGenerationCase(
     defer gateway.deinit();
     var fixture = agent_test_support.PromptFixture{ .workspace_root = env.workspace };
     var job = fixture.job();
-    job.permission_mode = .auto;
+    // This fixture exercises live human-approval revalidation, not automatic
+    // recovery. Start it in ask mode so the initial approval is intentional.
+    job.permission_mode = .ask;
     var config = fixture.config();
     config.origin = .subagent;
     config.session_child_capability = try turn.childCapability();
@@ -7832,7 +7841,7 @@ fn runProductionSandboxGenerationCase(
         types.ReasoningEffort.literal("medium"),
         &.{"sandbox-work"},
     );
-    try env.setPermissionMode(alloc, "sandbox-child", .auto);
+    try env.setPermissionMode(alloc, "sandbox-child", .ask);
     {
         var capability = try env.store.openSubagentControlCapabilityWritable(
             alloc,
@@ -7938,7 +7947,9 @@ fn runProductionSandboxGenerationCase(
     defer gateway.deinit();
     var fixture = agent_test_support.PromptFixture{ .workspace_root = env.workspace };
     var job = fixture.job();
-    job.permission_mode = .auto;
+    // This fixture exercises human-approved sandbox revalidation. Keep it in
+    // ask mode so automatic recovery does not intentionally bypass the prompt.
+    job.permission_mode = .ask;
     var config = fixture.config();
     config.origin = .subagent;
     config.session_child_capability = try turn.childCapability();

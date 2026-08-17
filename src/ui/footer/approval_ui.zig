@@ -1522,7 +1522,7 @@ fn buildApprovalPanelLineWithLabel(
             4 => approvalActionLine(buf, label, target),
             5 => "",
             6 => approvalChoiceLine(buf, approval.choice_index == 0, approvalChoiceLabel(approval, 0)),
-            7 => approvalChoiceLine(buf, approval.choice_index == 1, approvalAlwaysChoice(approval, label)),
+            7 => approvalChoiceLine(buf, approval.choice_index == 1, approvalChoiceLabel(approval, 1)),
             8 => approvalChoiceLine(buf, approval.choice_index == 2, approvalChoiceLabel(approval, 2)),
             9 => "",
             10 => std.fmt.bufPrint(buf, "  {s}{s}{s}", .{ dim, approvalHint(approval, width -| 2), r }) catch interaction_state.approval_hint,
@@ -1536,7 +1536,7 @@ fn buildApprovalPanelLineWithLabel(
         2 => approvalReasonLine(buf, label, target, explanation, dynamic_mcp),
         3 => approvalActionLine(buf, label, target),
         4 => approvalChoiceLine(buf, approval.choice_index == 0, approvalChoiceLabel(approval, 0)),
-        5 => approvalChoiceLine(buf, approval.choice_index == 1, approvalAlwaysChoice(approval, label)),
+        5 => approvalChoiceLine(buf, approval.choice_index == 1, approvalChoiceLabel(approval, 1)),
         6 => approvalChoiceLine(buf, approval.choice_index == 2, approvalChoiceLabel(approval, 2)),
         7 => std.fmt.bufPrint(buf, "  {s}{s}{s}", .{ dim, approvalHint(approval, width -| 2), r }) catch interaction_state.approval_hint,
         else => "",
@@ -1690,16 +1690,23 @@ fn writeApprovalPlaceholder(writer: *std.Io.Writer, placeholder: []const u8) !vo
 }
 
 fn approvalChoiceLabel(approval: ApprovalProjection, choice: u8) []const u8 {
+    if (approval.request.confirmation_only) return switch (choice) {
+        0 => "1. Confirm",
+        1 => "2. Cancel",
+        else => "",
+    };
     if (approval.amendmentChoice() == choice) return approvalAmendmentLabel(choice);
     if (approval.request.tool_arguments_preview != null) {
         return switch (choice) {
             0 => "1. Allow once",
+            1 => approvalAlwaysChoice(approval, approval.request.label),
             2 => "3. Deny",
             else => "",
         };
     }
     return switch (choice) {
         0 => interaction_state.approval_once_label,
+        1 => approvalAlwaysChoice(approval, approval.request.label),
         2 => interaction_state.approval_deny_label,
         else => "",
     };
@@ -1730,6 +1737,13 @@ fn approvalChoicePrefix(choice: u8) []const u8 {
 }
 
 fn approvalHint(approval: ApprovalProjection, width: u16) []const u8 {
+    if (approval.request.confirmation_only) {
+        const confirmation_variants = [_][]const u8{
+            "1–2 Choose    Enter Confirm    Esc Cancel",
+            "Enter Confirm    Esc Cancel",
+        };
+        return display_width.widestFitting(&confirmation_variants, width);
+    }
     const variants: []const []const u8 = if (approval.can_amend_selected_choice())
         &interaction_state.approval_amendment_hint_variants
     else
@@ -1830,6 +1844,8 @@ fn approvalTitle(
 }
 
 fn approvalKind(label: []const u8, dynamic_mcp: bool) []const u8 {
+    if (std.mem.startsWith(u8, label, "Remember ") or
+        std.mem.startsWith(u8, label, "Revoke saved-session")) return "Permission rule";
     if (dynamic_mcp) return "MCP tool";
     if (std.mem.startsWith(u8, label, "terminal.exec ")) return "Command";
     if (std.mem.startsWith(u8, label, "write_file ")) return "Write file";
@@ -1844,6 +1860,15 @@ fn approvalKind(label: []const u8, dynamic_mcp: bool) []const u8 {
 }
 
 fn approvalQuestion(label: []const u8, dynamic_mcp: bool) []const u8 {
+    if (std.mem.eql(u8, label, "Remember allow for this saved session")) {
+        return "Remember allow for this saved session?";
+    }
+    if (std.mem.eql(u8, label, "Remember deny for this saved session")) {
+        return "Remember deny for this saved session?";
+    }
+    if (std.mem.eql(u8, label, "Revoke saved-session permission rule")) {
+        return "Revoke this saved-session permission rule?";
+    }
     if (dynamic_mcp) return "Allow this MCP tool call?";
     if (std.mem.startsWith(u8, label, "terminal.exec ")) return "Would you like to run the following command?";
     if (std.mem.startsWith(u8, label, "write_file ")) return "Would you like to create or update this file?";

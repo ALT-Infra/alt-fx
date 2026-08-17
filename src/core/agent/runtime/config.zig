@@ -44,6 +44,14 @@ pub const Config = struct {
     origin: TurnOrigin = .root,
     /// Root-user evidence inherited by a subagent turn. Unused for root turns.
     root_user_intent_context: []const u8 = "",
+    /// Exact ordered root-user authority inherited by a child. The child task
+    /// prompt is intentionally excluded.
+    root_user_messages: []const []const u8 = &.{},
+    root_user_evidence_complete: bool = false,
+    /// True only for a real external user prompt appended to a resumed
+    /// persistent child. Internal assistant-authored delegations leave this
+    /// false.
+    current_prompt_is_root_authority: bool = false,
     tool_result_dir: ?[]const u8 = null,
     session_child_capability: ?*session_child_store.SessionChildCapability = null,
     subagent_id: u64 = 0,

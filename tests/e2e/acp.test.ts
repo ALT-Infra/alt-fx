@@ -1404,6 +1404,7 @@ describe("acp: model-independent", () => {
         });
         client.setPermissionOption("allow_once");
         await startCodeSession(client);
+        await client.request("session/set_mode", { modeId: "ask" }, 4);
         const result = await runPrompt(
           client,
           "Run the native public terminal fixture.",
@@ -4183,7 +4184,7 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "ACP automatic ask requests permission and returns user denial",
+    "ACP automatic ask returns to the agent before requesting permission",
     async () => {
       const acceptedRoot = createIsolatedRoot("fx-acp-auto-file-accepted-");
       const blockedRoot = createIsolatedRoot("fx-acp-auto-file-check-");
@@ -4209,7 +4210,7 @@ describe("acp: model-independent", () => {
           await startCodeSession(client);
           const accepted = await runPrompt(client, acceptedPrompt, TIMEOUT);
           expect(JSON.stringify(accepted)).toContain("ACP external write accepted");
-          expect(JSON.stringify(accepted.messages)).toContain(
+          expect(JSON.stringify(accepted.messages)).not.toContain(
             "Auto agent approved this request: Writing file.",
           );
           expect(readFileSync(acceptedTarget, "utf-8")).toBe("FX_ACP_AUTO_ACCEPTED");
@@ -4251,9 +4252,9 @@ describe("acp: model-independent", () => {
           const serialized = JSON.stringify(blocked);
           expect(
             blocked.messages.some((message: any) => message.method === "session/request_permission"),
-          ).toBe(true);
-          expect(serialized).not.toContain("auto_denied");
-          expect(serialized).toContain("user_denied");
+          ).toBe(false);
+          expect(serialized).toContain("auto_denied");
+          expect(serialized).not.toContain("user_denied");
           expect(serialized).toContain('"status":"failed"');
           const failedUpdateIndex = blocked.messages.findIndex((message: any) =>
             message.method === "session/update" &&
