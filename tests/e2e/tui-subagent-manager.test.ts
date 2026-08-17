@@ -1348,7 +1348,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
   );
 
   test(
-    "persistent auto child classifies its first new-file write without approval",
+    "persistent auto child bypasses review for its first new-file write",
     async () => {
       const fixture = createFixture();
       writeFileSync(
@@ -1415,10 +1415,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         }
         expect(existsSync(marker)).toBe(true);
         expect(readFileSync(marker, "utf8")).toBe("classified child write\n");
-        expect(gateway.classifierRequests).toHaveLength(1);
-        expect(gateway.classifierRequests[0]?.body).toContain(
-          "Create the auto-write child.",
-        );
+        expect(gateway.classifierRequests).toHaveLength(0);
         expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
       } finally {
         gateway.stop();
@@ -3055,7 +3052,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         expect(completed.match(new RegExp(resumedText, "g"))).toHaveLength(1);
         expect(childAttempts).toBe(2);
         expect(gateway.requestCount()).toBe(requestsAfterCrash + 2);
-        expect(gateway.classifierRequests).toHaveLength(1);
+        expect(gateway.classifierRequests).toHaveLength(0);
         expect(readFileSync(resumedMarker, "utf8")).toBe(
           "restored auto context\n",
         );
