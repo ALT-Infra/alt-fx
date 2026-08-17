@@ -492,6 +492,21 @@ function handle(message) {
   }
   if (message.method === "tools/call") {
     if (mode === "stall_operation") return;
+    if (mode === "tool_failure") {
+      send({
+        jsonrpc: "2.0",
+        id: message.id,
+        result: {
+          resultType: "complete",
+          isError: true,
+          content: [{
+            type: "text",
+            text: "Invalid input: labels require at least one item",
+          }],
+        },
+      });
+      return;
+    }
     if (mode === "crash_always") process.exit(42);
     if (
       [

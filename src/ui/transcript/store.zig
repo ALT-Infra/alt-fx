@@ -2088,6 +2088,7 @@ fn cloneToolDetail(alloc: Allocator, source: ToolDetailRecord) !ToolDetailRecord
     return .{
         .entry_id = source.entry_id,
         .tool_name = tool_name,
+        .captured_command = source.captured_command,
         .activity_kind = source.activity_kind,
         .arguments_json = arguments_json,
         .result = result,

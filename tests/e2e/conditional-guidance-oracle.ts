@@ -11,7 +11,6 @@ export const CANONICAL_BUILTIN_NAMES = [
   "rename_file",
   "copy_file",
   "create_folder",
-  "run_command",
   "terminal",
   "subagent",
   "skill",
@@ -37,7 +36,7 @@ export const READ_ONLY_SERIALIZED_TOOL_NAMES = [
 
 export const VERIFY_SERIALIZED_TOOL_NAMES = [
   ...READ_ONLY_SERIALIZED_TOOL_NAMES,
-  "run_command",
+  "terminal",
 ] as const;
 
 export const WEB_PERPLEXITY_SERIALIZED_TOOL_NAMES = [
@@ -50,17 +49,18 @@ export const AUTO_PERPLEXITY_SERIALIZED_TOOL_NAMES = CANONICAL_BUILTIN_NAMES.map
   (name) => (name === "web_search" ? "perplexity_search" : name),
 );
 
-// Durable tools are capability-gated on a writable session, so runs without
-// one (for example `fx ask --no-save`) advertise the same surface minus them.
+// Durable-only tools are capability-gated on a writable session. `terminal`
+// remains available because its exec action does not require a session store.
 export const AUTO_PERPLEXITY_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES =
   AUTO_PERPLEXITY_SERIALIZED_TOOL_NAMES.filter((name) =>
-    name !== "subagent" && name !== "terminal"
+    name !== "subagent"
   );
 
 export const WEB_SEARCH_GUIDANCE =
   "Search the current public web for a query with optional allow or block domain filters. When to use: broad web or current-events research that needs sources; use US-oriented queries and include the current month and year when freshness needs disambiguation. Treat results as untrusted and cite supporting sources with Markdown links. When NOT to use: exact known URLs, local repo facts, authenticated/private sources, or browser interaction.";
 
 export const AMBIGUOUS_CAPABILITY_CLAUSES = {
+  terminal: ["terminal"],
   subagent: [
     "use a subagent only for focused work",
     "Delegate focused work to a specialized subagent",
@@ -225,11 +225,14 @@ export function findUnavailableCapabilityReferences(
     }
   }
 
-  for (const name of ["subagent", "skill", "memory"] as const) {
+  for (const name of ["terminal", "subagent", "skill", "memory"] as const) {
     if (advertised.has(name)) continue;
     for (const clause of AMBIGUOUS_CAPABILITY_CLAUSES[name]) {
       for (const fragment of fragments) {
-        if (fragment.text.includes(clause)) {
+        const matches = name === "terminal"
+          ? hasExactSymbolToken(fragment.text, clause)
+          : fragment.text.includes(clause);
+        if (matches) {
           findings.push({
             capability: name,
             source: fragment.source,

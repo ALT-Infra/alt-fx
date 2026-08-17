@@ -3,6 +3,7 @@ const client = @import("client.zig");
 const contracts = @import("contracts.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const operation = @import("operation.zig");
+const shell_resolver = @import("shell_resolver.zig");
 const protocol = @import("protocol.zig");
 
 const Allocator = std.mem.Allocator;
@@ -165,7 +166,7 @@ pub const Runtime = struct {
         const request = contracts.ActionRequest{ .start = .{
             .cwd = input.workspace_root,
             .command = input.command,
-            .shell = .user_login,
+            .shell = try shell_resolver.profileShell(input.alloc, null, .user),
             .backend = .native,
             .return_when = .started,
             .wait_ceiling_ms = start_wait_ceiling_ms,

@@ -237,7 +237,7 @@ pub fn finalizeCommandReplay(
     capture: ?*command_replay_store.Capture,
 ) void {
     const candidate = capture orelse return;
-    if (!std.mem.eql(u8, tool_call.name, "run_command")) {
+    if (!isCapturedCommandCall(arena, tool_call)) {
         candidate.abort(arena);
         return;
     }
@@ -300,6 +300,16 @@ pub fn finalizeCommandReplay(
         return;
     }
     retainCommandReplay(arena, candidate, &prepared.memory);
+}
+
+fn isCapturedCommandCall(arena: Allocator, call: ToolCall) bool {
+    if (std.mem.eql(u8, call.name, "run_command")) return true;
+    if (!std.mem.eql(u8, call.name, "terminal")) return false;
+    var parsed = std.json.parseFromSlice(std.json.Value, arena, call.arguments_json, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const action = parsed.value.object.get("action") orelse return false;
+    return action == .string and std.mem.eql(u8, action.string, "exec");
 }
 
 fn selectedCommandSource(

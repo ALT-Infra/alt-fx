@@ -154,6 +154,50 @@ pub const Credentials = struct {
     }
 };
 
+pub const IssuerMismatch = struct {
+    owner_alloc: Allocator,
+    expected: []u8,
+    returned: []u8,
+
+    pub fn init(
+        alloc: Allocator,
+        expected: []const u8,
+        returned: []const u8,
+    ) !IssuerMismatch {
+        const owned_expected = try alloc.dupe(u8, expected);
+        errdefer alloc.free(owned_expected);
+        return .{
+            .owner_alloc = alloc,
+            .expected = owned_expected,
+            .returned = try alloc.dupe(u8, returned),
+        };
+    }
+
+    pub fn deinit(self: *IssuerMismatch) void {
+        self.owner_alloc.free(self.expected);
+        self.owner_alloc.free(self.returned);
+        self.* = undefined;
+    }
+};
+
+pub const AuthorizationResult = union(enum) {
+    credentials: Credentials,
+    issuer_mismatch: IssuerMismatch,
+};
+
+pub const AuthenticationResult = union(enum) {
+    authenticated,
+    issuer_mismatch: IssuerMismatch,
+
+    pub fn deinit(self: *AuthenticationResult) void {
+        switch (self.*) {
+            .authenticated => {},
+            .issuer_mismatch => |*mismatch| mismatch.deinit(),
+        }
+        self.* = undefined;
+    }
+};
+
 pub const AutomatedAuthorizationOptions = struct {
     endpoint: []const u8,
     challenge: Challenge,
@@ -499,13 +543,41 @@ pub fn parseAuthorizationMetadata(
     bytes: []const u8,
     expected_issuer: []const u8,
 ) !AuthorizationMetadata {
+    return switch (try parseAuthorizationMetadataOutcome(
+        alloc,
+        bytes,
+        expected_issuer,
+    )) {
+        .metadata => |metadata| metadata,
+        .issuer_mismatch => |owned_mismatch| {
+            var mismatch = owned_mismatch;
+            mismatch.deinit();
+            return error.AuthorizationMetadataIssuerMismatch;
+        },
+    };
+}
+
+const AuthorizationMetadataOutcome = union(enum) {
+    metadata: AuthorizationMetadata,
+    issuer_mismatch: IssuerMismatch,
+};
+
+fn parseAuthorizationMetadataOutcome(
+    alloc: Allocator,
+    bytes: []const u8,
+    expected_issuer: []const u8,
+) !AuthorizationMetadataOutcome {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidAuthorizationMetadata;
     const object = parsed.value.object;
     const issuer = try requiredString(object, "issuer");
     if (!std.mem.eql(u8, issuer, expected_issuer)) {
-        return error.AuthorizationMetadataIssuerMismatch;
+        return .{ .issuer_mismatch = try IssuerMismatch.init(
+            alloc,
+            expected_issuer,
+            issuer,
+        ) };
     }
     const authorization_endpoint = try dupeRequiredUrl(alloc, object, "authorization_endpoint");
     errdefer alloc.free(authorization_endpoint);
@@ -532,7 +604,7 @@ pub fn parseAuthorizationMetadata(
         "code_challenge_methods_supported",
     );
     errdefer freeStrings(alloc, code_challenge_methods_supported);
-    return .{
+    return .{ .metadata = .{
         .issuer = try alloc.dupe(u8, issuer),
         .authorization_endpoint = authorization_endpoint,
         .token_endpoint = token_endpoint,
@@ -550,7 +622,7 @@ pub fn parseAuthorizationMetadata(
             object,
             "authorization_response_iss_parameter_supported",
         ) orelse false,
-    };
+    } };
 }
 
 pub fn requestedScope(
@@ -857,7 +929,7 @@ pub fn revokeCredentials(alloc: Allocator, credentials: Credentials) !void {
 pub fn authorizeAutomated(
     alloc: Allocator,
     options: AutomatedAuthorizationOptions,
-) !Credentials {
+) !AuthorizationResult {
     return authorizeWithRedirect(
         alloc,
         options,
@@ -870,7 +942,7 @@ pub fn authorizeAutomated(
 pub fn authorizeInteractive(
     alloc: Allocator,
     options: InteractiveAuthorizationOptions,
-) !Credentials {
+) !AuthorizationResult {
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
         return error.InteractiveMcpAuthorizationUnsupported;
     }
@@ -917,7 +989,7 @@ fn authorizeWithRedirect(
     redirect_uri: []const u8,
     authorization_ctx: ?*anyopaque,
     request_authorization: AuthorizationRequestFn,
-) !Credentials {
+) !AuthorizationResult {
     try checkAuthorizationCancellation(options.lifecycle_cancel_flag);
     const endpoint = try canonicalResource(alloc, options.endpoint);
     errdefer alloc.free(endpoint);
@@ -940,7 +1012,10 @@ fn authorizeWithRedirect(
     }
     const issuer = options.config.issuer orelse prm.authorization_servers[0];
     try validateOAuthUrlForResource(issuer, resource);
-    var metadata = try discoverAuthorizationMetadata(alloc, issuer);
+    var metadata = switch (try discoverAuthorizationMetadata(alloc, issuer)) {
+        .metadata => |value| value,
+        .issuer_mismatch => |mismatch| return .{ .issuer_mismatch = mismatch },
+    };
     defer metadata.deinit(alloc);
     try checkAuthorizationCancellation(options.lifecycle_cancel_flag);
     try validateAuthorizationMetadataUrls(metadata, resource);
@@ -1008,12 +1083,21 @@ fn authorizeWithRedirect(
     );
     defer callback.deinit(alloc);
     try checkAuthorizationCancellation(options.lifecycle_cancel_flag);
-    try validateAuthorizationResponse(
+    validateAuthorizationResponse(
         state,
         metadata.issuer,
         metadata.authorization_response_iss_parameter_supported,
         callback,
-    );
+    ) catch |err| switch (err) {
+        error.AuthorizationResponseIssuerMismatch => return .{
+            .issuer_mismatch = try IssuerMismatch.init(
+                alloc,
+                metadata.issuer,
+                callback.issuer.?,
+            ),
+        },
+        else => return err,
+    };
 
     var grant = try exchangeAuthorizationCode(
         alloc,
@@ -1054,7 +1138,7 @@ fn authorizeWithRedirect(
         .revocation_endpoint = revocation_endpoint,
     };
     grant = undefined;
-    return credentials;
+    return .{ .credentials = credentials };
 }
 
 fn requestAutomatedAuthorization(
@@ -1244,7 +1328,7 @@ fn discoverResourceMetadata(
 fn discoverAuthorizationMetadata(
     alloc: Allocator,
     issuer: []const u8,
-) !AuthorizationMetadata {
+) !AuthorizationMetadataOutcome {
     const urls = try authorizationMetadataUrls(alloc, issuer);
     defer freeStrings(alloc, urls);
     for (urls) |url| {
@@ -1252,7 +1336,7 @@ fn discoverAuthorizationMetadata(
         defer response.deinit(alloc);
         if (response.status != .ok) continue;
         try validateJsonContentType(response.content_type);
-        return parseAuthorizationMetadata(alloc, response.body, issuer);
+        return parseAuthorizationMetadataOutcome(alloc, response.body, issuer);
     }
     return error.AuthorizationMetadataUnavailable;
 }
@@ -2169,6 +2253,43 @@ test "authorization metadata defaults omitted token endpoint authentication to c
     try std.testing.expectEqualStrings(
         "client_secret_basic",
         try chooseTokenEndpointAuthMethod(metadata, false),
+    );
+}
+
+test "authorization metadata mismatch retains exact issuer values and fails closed" {
+    const alloc = std.testing.allocator;
+    const bytes =
+        "{\"issuer\":\"https://login.example.com\",\"authorization_endpoint\":\"https://login.example.com/authorize\",\"token_endpoint\":\"https://login.example.com/token\"}";
+
+    var outcome = try parseAuthorizationMetadataOutcome(
+        alloc,
+        bytes,
+        "https://login.example.com/",
+    );
+    defer switch (outcome) {
+        .metadata => |*metadata| metadata.deinit(alloc),
+        .issuer_mismatch => |*mismatch| mismatch.deinit(),
+    };
+    switch (outcome) {
+        .metadata => return error.TestUnexpectedResult,
+        .issuer_mismatch => |mismatch| {
+            try std.testing.expectEqualStrings(
+                "https://login.example.com/",
+                mismatch.expected,
+            );
+            try std.testing.expectEqualStrings(
+                "https://login.example.com",
+                mismatch.returned,
+            );
+        },
+    }
+    try std.testing.expectError(
+        error.AuthorizationMetadataIssuerMismatch,
+        parseAuthorizationMetadata(
+            alloc,
+            bytes,
+            "https://login.example.com/",
+        ),
     );
 }
 

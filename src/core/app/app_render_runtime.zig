@@ -5650,7 +5650,7 @@ test "core.app_render_runtime generic approval exits the full transcript screen 
 
     try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
         .id = 42,
-        .label = "run_command sh -c 'printf approval'",
+        .label = "terminal.exec sh -c 'printf approval'",
     }));
     app.shell.render_requests.request(.modal);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
@@ -6330,7 +6330,7 @@ test "child approval arrival closes review and full transcript depths before ren
         defer app.deinit();
         try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
             .id = 91,
-            .label = "run_command npm test",
+            .label = "terminal.exec npm test",
         }));
 
         try std.testing.expect(try Runtime(ChildApprovalReconcileApp)
