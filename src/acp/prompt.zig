@@ -15,6 +15,7 @@ const diff_mod = @import("../core/output/diff.zig");
 const file_mutation = @import("../core/tooling/file_mutation.zig");
 const file_mutation_contract = @import("../core/tooling/file_mutation_contract.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
+const mcp_model_catalog = @import("../core/mcp/model_catalog.zig");
 const mcp_elicitation = @import("../core/mcp/elicitation.zig");
 const mrtr = @import("../core/mcp/mrtr.zig");
 const permission_auto_classifier = @import("../core/permissions/auto_classifier.zig");
@@ -1130,6 +1131,20 @@ fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Arr
     try ctx.state.cfg.context_registry.appendDefaultStatic(.{
         .project_context = ctx.modelVisibleProjectContext(),
     }, arena, messages);
+    const active_session = if (ctx.state.active_session) |*session| session else null;
+    var snapshot = if (active_session) |session|
+        if (session.mcp) |mcp|
+            try mcp.snapshotModelCatalog(arena, session.permission_rules, false)
+        else
+            try mcp_model_catalog.Snapshot.empty(arena)
+    else
+        try mcp_model_catalog.Snapshot.empty(arena);
+    defer snapshot.deinit(arena);
+    const section = try mcp_model_catalog.render(arena, snapshot);
+    if (section.text.len > 0) {
+        try messages.append(arena, .{ .role = .system, .content = section.text });
+    }
+    if (section.notice) |notice| try pushContextNotice(raw_ctx, notice);
 }
 
 fn validateToolCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !agent_runtime.ToolCallValidationResult {
@@ -3620,10 +3635,11 @@ test "ACP registry callbacks preserve snapshot bytes before transient context" {
     try deps.append_static_context.?(deps.ctx, arena, &messages);
     try deps.append_runtime_context(deps.ctx, arena, &messages);
 
-    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
+    try std.testing.expectEqual(@as(usize, 4), messages.items.len);
     try std.testing.expectEqualStrings("base system", messages.items[0].content.?);
     try std.testing.expectEqualStrings("ACP registry context 1", messages.items[1].content.?);
-    try std.testing.expectEqualStrings("ACP registry transient", messages.items[2].content.?);
+    try std.testing.expect(std.mem.find(u8, messages.items[2].content.?, "<mcp_servers>") != null);
+    try std.testing.expectEqualStrings("ACP registry transient", messages.items[3].content.?);
     try std.testing.expectEqualStrings("ACP registry context 1", AcpContextRegistryFixture.static_context.?);
     try std.testing.expectEqual(@as(usize, 1), AcpContextRegistryFixture.transient_calls);
     try std.testing.expectEqual(

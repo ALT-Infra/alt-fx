@@ -31,6 +31,7 @@ const streamable_http = @import("streamable_http.zig");
 const feature_cache = @import("feature_cache.zig");
 const access_policy = @import("access_policy.zig");
 const health = @import("health.zig");
+const model_catalog = @import("model_catalog.zig");
 const startup_admission = @import("startup_admission.zig");
 const tool_subscription = @import("tool_subscription.zig");
 const completion_feature = @import("features/completion.zig");
@@ -3121,12 +3122,7 @@ fn snapshotServerHealthBeforeDiscoveryPublication(
         .connecting
     else
         .disconnected;
-    const authentication: health.AuthenticationState = if (server.config.auth != null or
-        server.config.bearer_token_env != null or
-        server.config.header_env.len > 0)
-        .configured
-    else
-        .none;
+    const authentication = configuredAuthenticationState(server);
     const failure = try healthFailureForState(
         alloc,
         server.config.required,
@@ -3193,16 +3189,7 @@ fn snapshotServerHealth(
         published_connection,
         transport_running,
     );
-    const authentication: health.AuthenticationState = if (server.auth_credentials_present.load(.acquire))
-        .authenticated
-    else if (server.auth_challenge_present.load(.acquire))
-        .required
-    else if (server.config.auth != null or
-        server.config.bearer_token_env != null or
-        server.config.header_env.len > 0)
-        .configured
-    else
-        .none;
+    const authentication = serverAuthenticationState(server);
     const failure = try healthFailureForState(
         alloc,
         server.config.required,
@@ -3254,6 +3241,69 @@ fn snapshotServerHealth(
         ),
         .last_successful_discovery_ms = server.last_successful_discovery_ms,
         .failure = failure,
+    };
+}
+
+fn configuredAuthenticationState(server: *const McpServer) health.AuthenticationState {
+    return if (server.config.auth != null or
+        server.config.bearer_token_env != null or
+        server.config.header_env.len > 0)
+        .configured
+    else
+        .none;
+}
+
+fn serverAuthenticationState(server: *const McpServer) health.AuthenticationState {
+    if (server.auth_credentials_present.load(.acquire)) return .authenticated;
+    if (server.auth_challenge_present.load(.acquire)) return .required;
+    return configuredAuthenticationState(server);
+}
+
+fn snapshotServerModelSummary(
+    alloc: Allocator,
+    server: *const McpServer,
+    permission_rules: types.PermissionRuleSet,
+    deferred_pending: bool,
+) !model_catalog.ServerSummary {
+    const name = try alloc.dupe(u8, server.config.name);
+    errdefer alloc.free(name);
+    const published_connection: health.ConnectionState = switch (server.state) {
+        .disconnected => .disconnected,
+        .disabled => .disabled,
+        .ready => .ready,
+        .failed => .failed,
+    };
+    const transport_running: ?bool = if (server.config.transport == .stdio)
+        if (server.dispatcher) |dispatcher| dispatcher.isRunning() else false
+    else
+        null;
+    const connection = health.observedConnection(published_connection, transport_running);
+    const deferred_for_ask = deferred_pending and
+        startup_admission.decide(
+            server.config.enabled,
+            server.config.required,
+            .ask_startup,
+        ) == .deferred;
+    var tool_count: ?usize = null;
+    if (connection == .ready and serverCatalogAvailable(server)) {
+        var visible_count: usize = 0;
+        for (server.tool_catalog.tools.items) |tool| {
+            if (permissions.rulesDenyAllTargetsForPermission(
+                permission_rules,
+                tool.prefixed_name,
+            )) continue;
+            visible_count += 1;
+        }
+        tool_count = visible_count;
+    }
+    return .{
+        .name = name,
+        .availability = model_catalog.classifyAvailability(
+            connection,
+            serverAuthenticationState(server),
+            deferred_for_ask,
+        ),
+        .tool_count = tool_count,
     };
 }
 
@@ -4832,6 +4882,65 @@ pub const McpRuntime = struct {
         return .{ .captured_at_ms = captured_at_ms, .servers = items };
     }
 
+    /// Returns an owned model-safe catalog snapshot. The caller releases it with `deinit`.
+    pub fn snapshotModelCatalog(
+        self: *McpRuntime,
+        alloc: Allocator,
+        permission_rules: types.PermissionRuleSet,
+        include_ask_deferred: bool,
+    ) !model_catalog.Snapshot {
+        const servers = try alloc.alloc(model_catalog.ServerSummary, self.servers.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (servers[0..initialized]) |server| alloc.free(server.name);
+            alloc.free(servers);
+        }
+
+        const discovery_state = self.discovery_state.load(.acquire);
+        const deferred_pending = include_ask_deferred and
+            self.deferred_discovery_state.load(.acquire) != .complete;
+        for (self.servers.items, 0..) |*server, index| {
+            if (discovery_state != .complete) {
+                const connection: health.ConnectionState = if (!server.config.enabled)
+                    .disabled
+                else if (discovery_state == .loading)
+                    .connecting
+                else
+                    .disconnected;
+                servers[index] = .{
+                    .name = try alloc.dupe(u8, server.config.name),
+                    .availability = model_catalog.classifyAvailability(
+                        connection,
+                        configuredAuthenticationState(server),
+                        false,
+                    ),
+                };
+                initialized += 1;
+                continue;
+            }
+
+            server.connection_lock.lockSharedUncancelable(io_mod.getIo());
+            self.catalog_mutex.lockSharedUncancelable(io_mod.getIo());
+            server.status_lock.lockUncancelable(io_mod.getIo());
+            servers[index] = snapshotServerModelSummary(
+                alloc,
+                server,
+                permission_rules,
+                deferred_pending,
+            ) catch |err| {
+                server.status_lock.unlock(io_mod.getIo());
+                self.catalog_mutex.unlockShared(io_mod.getIo());
+                server.connection_lock.unlockShared(io_mod.getIo());
+                return err;
+            };
+            server.status_lock.unlock(io_mod.getIo());
+            self.catalog_mutex.unlockShared(io_mod.getIo());
+            server.connection_lock.unlockShared(io_mod.getIo());
+            initialized += 1;
+        }
+        return .{ .servers = servers };
+    }
+
     pub fn requiredStartupFailure(
         self: *McpRuntime,
         alloc: Allocator,
@@ -5785,7 +5894,8 @@ pub const McpRuntime = struct {
             defer matches.deinit(alloc);
             var auth_witnesses: std.ArrayList(CatalogAuthWitness) = .empty;
             defer auth_witnesses.deinit(alloc);
-            for (self.servers.items) |*server| {
+            var more_available = false;
+            server_loop: for (self.servers.items) |*server| {
                 if (server.state != .ready) continue;
                 if (!serverCatalogAvailable(server)) continue;
                 if (!operation_access.allows(.{ .tool_server = server.config.name })) continue;
@@ -5793,15 +5903,19 @@ pub const McpRuntime = struct {
                     instructions[0..context_limits.utf8PrefixLength(instructions, mcp_server_instruction_search_bytes)]
                 else
                     "";
-                const match_count_before = matches.items.len;
+                var server_matched = false;
                 for (server.tool_catalog.tools.items) |tool| {
                     if (!operation_access.allows(.{ .tool = tool.prefixed_name })) continue;
                     if (permissions.rulesDenyAllTargetsForPermission(permission_rules, tool.prefixed_name)) continue;
                     if (!toolMatchesQuery(tool, searchable_instructions, query)) continue;
+                    server_matched = true;
+                    if (matches.items.len >= capped_limit) {
+                        more_available = true;
+                        break;
+                    }
                     try matches.append(alloc, tool);
-                    if (matches.items.len >= capped_limit) break;
                 }
-                if (matches.items.len > match_count_before) {
+                if (server_matched) {
                     if (catalogAuthWitness(server)) |generation| {
                         try auth_witnesses.append(alloc, .{
                             .server = server,
@@ -5809,7 +5923,7 @@ pub const McpRuntime = struct {
                         });
                     }
                 }
-                if (matches.items.len >= capped_limit) break;
+                if (more_available) break :server_loop;
             }
             if (matches.items.len == 0) {
                 if (try renderAuthenticationRequired(
@@ -5829,6 +5943,7 @@ pub const McpRuntime = struct {
                 limits.mcp_search_result_bytes,
                 0,
                 false,
+                more_available,
             );
             const observed_bytes = full.len;
             const effective_bytes = limits.mcp_search_result_bytes.effectiveBytes();
@@ -5852,6 +5967,7 @@ pub const McpRuntime = struct {
                     limits.mcp_search_result_bytes,
                     observed_bytes,
                     true,
+                    more_available,
                 );
                 if (candidate.len <= effective_bytes) {
                     model_output = candidate;
@@ -11120,6 +11236,7 @@ fn renderSearchResult(
     result_limit: context_limits.Resolved,
     observed_bytes: usize,
     limit_triggered: bool,
+    more_available: bool,
 ) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -11129,6 +11246,7 @@ fn renderSearchResult(
         try writeToolMetadataJson(alloc, &out.writer, tool, description_limit);
     }
     try out.writer.print("],\"count\":{d}", .{selected_count});
+    if (more_available) try out.writer.writeAll(",\"more_available\":true");
     if (limit_triggered) {
         try out.writer.print(
             ",\"context_limit\":{{\"name\":\"mcp_search_result_bytes\",\"action\":\"omitted\",\"omitted_count\":{d},\"observed_bytes\":{d},\"effective_bytes\":{d},\"source\":",
@@ -16937,6 +17055,89 @@ test "MCP health snapshot cleans up every partial allocation" {
     );
 }
 
+test "model catalog reports deferred ask servers without connecting and counts only visible tools" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "required"),
+        .transport = .http,
+        .url = try alloc.dupe(u8, "https://required.example/mcp"),
+        .required = true,
+    });
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "optional"),
+        .transport = .http,
+        .url = try alloc.dupe(u8, "https://optional.example/mcp"),
+    });
+    runtime.discovery_state.store(.complete, .seq_cst);
+    runtime.servers.items[0].state = .ready;
+
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+    const response =
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"one","inputSchema":{"type":"object"}},{"name":"two","inputSchema":{"type":"object"}}]}}
+    ;
+    try parseAndStoreTools(alloc, &runtime.servers.items[0], .{}, response, &used);
+
+    var denied_rules = [_]types.PermissionRule{.{
+        .permission = @constCast("mcp_required_two"),
+        .pattern = @constCast("*"),
+        .action = .deny,
+    }};
+    var before = try runtime.snapshotModelCatalog(
+        alloc,
+        .{ .rules = &denied_rules },
+        true,
+    );
+    defer before.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), before.servers.len);
+    try std.testing.expectEqual(model_catalog.Availability.ready, before.servers[0].availability);
+    try std.testing.expectEqual(@as(?usize, 1), before.servers[0].tool_count);
+    try std.testing.expectEqual(model_catalog.Availability.available_on_demand, before.servers[1].availability);
+    try std.testing.expectEqual(@as(?usize, null), before.servers[1].tool_count);
+    try std.testing.expectEqual(ServerState.disconnected, runtime.servers.items[1].state);
+    try std.testing.expectEqual(DiscoveryState.idle, runtime.deferred_discovery_state.load(.acquire));
+
+    runtime.servers.items[1].state = .ready;
+    try parseAndStoreTools(alloc, &runtime.servers.items[1], .{}, response, &used);
+    runtime.deferred_discovery_state.store(.complete, .release);
+    var after = try runtime.snapshotModelCatalog(alloc, .{}, true);
+    defer after.deinit(alloc);
+
+    try std.testing.expectEqual(model_catalog.Availability.ready, after.servers[1].availability);
+    try std.testing.expectEqual(@as(?usize, 2), after.servers[1].tool_count);
+}
+
+fn checkModelCatalogSnapshotAllocationFailures(alloc: Allocator) !void {
+    var runtime = McpRuntime.init(std.testing.allocator);
+    defer runtime.deinit();
+    try runtime.addServer(.{
+        .name = try std.testing.allocator.dupe(u8, "one"),
+        .command = try std.testing.allocator.dupe(u8, "fixture"),
+        .enabled = false,
+    });
+    try runtime.addServer(.{
+        .name = try std.testing.allocator.dupe(u8, "two"),
+        .command = try std.testing.allocator.dupe(u8, "fixture"),
+        .enabled = false,
+    });
+    runtime.discovery_state.store(.complete, .release);
+    for (runtime.servers.items) |*server| server.state = .disabled;
+
+    var snapshot = try runtime.snapshotModelCatalog(alloc, .{}, false);
+    snapshot.deinit(alloc);
+}
+
+test "model catalog snapshot cleans up every partial allocation" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkModelCatalogSnapshotAllocationFailures,
+        .{},
+    );
+}
+
 fn checkHealthSnapshotAllocationFailures(alloc: Allocator) !void {
     var runtime = McpRuntime.init(std.testing.allocator);
     defer runtime.deinit();
@@ -17400,6 +17601,53 @@ test "MCP search returns metadata without advertising every executable schema" {
     try std.testing.expect(std.mem.find(u8, results.model_output, "inputSchema") == null);
     try std.testing.expect(std.mem.find(u8, results.model_output, "Repository name") == null);
     try std.testing.expect(std.mem.find(u8, results.model_output, "server_instructions") == null);
+}
+
+test "MCP search reports an authorized match beyond the count cap" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "chrome"),
+        .command = try alloc.dupe(u8, "fixture"),
+    });
+    runtime.discovery_state.store(.complete, .seq_cst);
+    runtime.servers.items[0].state = .ready;
+
+    var response: std.Io.Writer.Allocating = .init(alloc);
+    defer response.deinit();
+    try response.writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[");
+    for (0..21) |index| {
+        if (index > 0) try response.writer.writeByte(',');
+        try response.writer.print(
+            "{{\"name\":\"item{d:0>2}\",\"description\":\"Chrome item {d}\",\"inputSchema\":{{\"type\":\"object\"}}}}",
+            .{ index, index },
+        );
+    }
+    try response.writer.writeAll("]}}");
+
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+    try parseAndStoreTools(
+        alloc,
+        &runtime.servers.items[0],
+        .{},
+        response.written(),
+        &used,
+    );
+
+    var broad = try runtime.searchTools(alloc, "chrome", 20, .{}, .{}, .unrestricted);
+    defer broad.deinit(alloc);
+    var broad_json = try std.json.parseFromSlice(std.json.Value, alloc, broad.model_output, .{});
+    defer broad_json.deinit();
+    try std.testing.expectEqual(@as(i64, 20), broad_json.value.object.get("count").?.integer);
+    try std.testing.expect(broad_json.value.object.get("more_available").?.bool);
+
+    var targeted = try runtime.searchTools(alloc, "item00", 20, .{}, .{}, .unrestricted);
+    defer targeted.deinit(alloc);
+    var targeted_json = try std.json.parseFromSlice(std.json.Value, alloc, targeted.model_output, .{});
+    defer targeted_json.deinit();
+    try std.testing.expect(targeted_json.value.object.get("more_available") == null);
 }
 
 test "scoped MCP cached tool and feature operations reject authority revoked after admission" {

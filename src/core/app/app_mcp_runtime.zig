@@ -5,6 +5,7 @@ const mcp_access = @import("../mcp/access_policy.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 const elicitation = @import("../mcp/elicitation.zig");
 const mcp_health = @import("../mcp/health.zig");
+const mcp_model_catalog = @import("../mcp/model_catalog.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
 const context_limits = @import("../config/context_limits.zig");
 const tool_advertisement = @import("../tooling/tool_advertisement.zig");
@@ -269,6 +270,21 @@ pub const State = struct {
             features_visible,
         );
         return view;
+    }
+
+    pub fn snapshotModelCatalog(
+        self: *State,
+        alloc: Allocator,
+        permission_rules: types.PermissionRuleSet,
+        include_ask_deferred: bool,
+    ) !mcp_model_catalog.Snapshot {
+        var lease = self.acquire() orelse return mcp_model_catalog.Snapshot.empty(alloc);
+        defer lease.deinit();
+        return lease.runtime.snapshotModelCatalog(
+            alloc,
+            permission_rules,
+            include_ask_deferred,
+        );
     }
 
     pub fn waitForRequired(
