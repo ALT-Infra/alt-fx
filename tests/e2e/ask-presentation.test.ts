@@ -319,7 +319,7 @@ describe("fx ask presentation", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "light theme uses readable syntax colors in TTY code blocks",
+    "light theme uses readable syntax colors in TTY code blocks with redirected stdin",
     async () => {
       const root = createRoot();
       const gateway = startFakeGateway([fakeGatewayFinalText(MARKDOWN)]);
@@ -328,11 +328,11 @@ describe("fx ask presentation", () => {
       writeFileSync(stderrPath, "");
 
       const session = await TmuxSession.create({
-        cmd: terminalCommand([
+        cmd: `${terminalCommand([
           "ask",
           "--no-save",
           "Render the light-theme fixture.",
-        ]),
+        ])} </dev/null`,
         cwd: root.workspace,
         env: {
           ...gatewayEnv(root.home, gateway),

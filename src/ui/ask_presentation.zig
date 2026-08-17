@@ -356,23 +356,14 @@ fn probeTerminal(
     no_color: bool,
 ) shell_runtime.CursorPosition {
     const fallback = shell_runtime.CursorPosition{ .row = layout.rows, .col = 1 };
-    if (std.c.isatty(std.posix.STDIN_FILENO) == 0) {
-        ui_render.initTheme(false, null);
-        return fallback;
-    }
-    terminal.captureOriginalTermios() catch {
-        ui_render.initTheme(false, null);
-        return fallback;
-    };
-    terminal.enableRawMode() catch {
-        ui_render.initTheme(false, null);
-        return fallback;
-    };
+    const fallback_light = if (no_color) false else ui_render.explicitThemeOverride() orelse false;
+    ui_render.initTheme(fallback_light, null);
+    if (std.c.isatty(std.posix.STDIN_FILENO) == 0) return fallback;
+    terminal.captureOriginalTermios() catch return fallback;
+    terminal.enableRawMode() catch return fallback;
     defer terminal.disableRawMode();
 
-    if (no_color) {
-        ui_render.initTheme(false, null);
-    } else {
+    if (!no_color) {
         const theme = ui_render.detectTheme(std.heap.c_allocator, terminal);
         ui_render.initTheme(theme.light, theme.rgb);
     }
