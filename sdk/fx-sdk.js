@@ -4,6 +4,7 @@ const strictDecoder = new TextDecoder("utf-8", { fatal: true });
 const workspaceInfoLimit = 4 * 1024;
 const workspaceCommandLimit = 64 * 1024;
 const workspaceOutputLimit = 64 * 1024;
+const streamReadsPerTaskYield = 32;
 
 function validWorkspacePath(path) {
   if (typeof path !== "string" || !path.startsWith("/") || path.includes("\0")) return false;
@@ -205,6 +206,13 @@ function raceWithTimeout(promise, timeoutMs, timeoutValue) {
   });
 }
 
+function yieldToHostTask() {
+  if (typeof globalThis.setImmediate === "function") {
+    return new Promise((resolve) => globalThis.setImmediate(resolve));
+  }
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 function createRuntime(options) {
   const stdin = new ByteQueue();
   const streams = new Map();
@@ -356,6 +364,7 @@ function createRuntime(options) {
       pendingRead: null,
       readResult: null,
       readError: null,
+      readsSinceTaskYield: 0,
     };
     streams.set(handle, state);
     state.responseSettled = Promise.resolve().then(() => options.fetch(text(urlPtr, urlLen), {
@@ -390,6 +399,13 @@ function createRuntime(options) {
   function streamNext(handle, outPtr, outCap) {
     const state = streams.get(handle);
     if (!state) return -1;
+    const yieldAfterReadyResult = (result) => {
+      if (result <= 0) return result;
+      state.readsSinceTaskYield += 1;
+      if (state.readsSinceTaskYield < streamReadsPerTaskYield) return result;
+      state.readsSinceTaskYield = 0;
+      return yieldToHostTask().then(() => result);
+    };
     const copy = (chunk) => {
       const written = chunk.subarray(0, outCap);
       bytes(outPtr, written.length).set(written);
@@ -407,7 +423,7 @@ function createRuntime(options) {
       return copy(value);
     };
     const immediate = consume();
-    if (immediate !== null) return immediate;
+    if (immediate !== null) return yieldAfterReadyResult(immediate);
     if (!state.reader) return 0;
     if (!state.pendingRead) {
       state.pendingRead = state.reader.read().then((result) => {
@@ -421,7 +437,7 @@ function createRuntime(options) {
     return raceWithTimeout(state.pendingRead.then(() => true), 50, false).then((ready) => {
       if (!ready) return -3;
       const result = consume();
-      return result === null ? -3 : result;
+      return result === null ? -3 : yieldAfterReadyResult(result);
     });
   }
 
