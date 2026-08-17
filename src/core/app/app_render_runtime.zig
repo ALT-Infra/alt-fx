@@ -29,6 +29,7 @@ const activity_runtime = @import("../output/activity_runtime.zig");
 const transcript_presentation = @import("../output/transcript_presentation.zig");
 const event_loop = @import("../../ui/event_loop.zig");
 const surface_frame = @import("../../ui/footer/surface_frame.zig");
+const surface_invalidation = @import("../../ui/footer/surface_invalidation.zig");
 const interaction_state = @import("../../ui/footer/interaction_state.zig");
 const approval_prompt = @import("../permissions/approval_prompt.zig");
 const render_input = @import("../../ui/footer/render_input.zig");
@@ -363,6 +364,7 @@ pub fn Runtime(comptime App: type) type {
                 .notice_warning_style = ui_render.warning_style,
                 .notice_error_style = ui_render.red_style,
                 .notice_cancelled_style = ui_render.dim_style,
+                .code_highlight_theme = if (ui_render.is_light) .light else .dark,
             };
         }
 
@@ -1784,6 +1786,7 @@ pub fn Runtime(comptime App: type) type {
             var footer_frame_initialized = false;
             defer if (footer_frame_initialized) footer_frame.deinit(app.alloc);
             var solved_layout: ?render_engine.frame_layout.FrameLayout = null;
+            var resolved_transcript_target: ?transcript_runtime.TranscriptRuntime.ResolvedTranscriptTarget = null;
             var scroll_plan = render_engine.frame_scroll_plan.FrameScrollPlan.none(
                 presentation_shell.layout.rows,
                 presentation_shell.owned_top_row,
@@ -1807,14 +1810,31 @@ pub fn Runtime(comptime App: type) type {
                     frameActivityStateFromMeasurement(presentation_shell, measurement)
                 else
                     activityStateFromPlacement(footer_frame.paint.activity);
+                const target_activity_projection: activity_runtime.ActivityProjection = if (footer_measurement) |*measurement|
+                    measurement.activity_projection
+                else
+                    .{ .turn_thinking = .{ .label = footer_frame.label() } };
                 var fixed_point_ctx = FixedPointTranscriptContext(App){
                     .app = app,
                     .presentation_shell = presentation_shell,
                     .prepare_transcript = !presentation_shell.fullTranscriptActive(),
                     .source = transcript_source,
                     .prepared_transcript = &prepared_transcript,
+                    .resolved_target = &resolved_transcript_target,
                     .footer_reservation_changed = footer_reservation_changed,
                     .replay_displaced_footer_history = replay_displaced_footer_history,
+                    .footer_measurement = if (footer_measurement) |*measurement| measurement else null,
+                    .fallback_footer_rows = if (footer_measurement == null)
+                        footer_frame.paint.footer
+                    else
+                        null,
+                    .activity_projection = target_activity_projection,
+                    .frame_activity = frame_activity,
+                    .base_invalidation = if (footer_measurement != null)
+                        render_engine.paint_plan.FrameInvalidationSet.empty()
+                    else
+                        footer_frame.paint.invalidation,
+                    .attempt_invalidations = attempt_invalidations,
                 };
                 const fixed_point = try render_engine.frame_fixed_point.solve(
                     FixedPointTranscriptContext(App),
@@ -1829,6 +1849,7 @@ pub fn Runtime(comptime App: type) type {
                         .prior = active_committed_layout,
                     },
                     FixedPointTranscriptContext(App).prepareCandidate,
+                    FixedPointTranscriptContext(App).resolveCandidate,
                 );
                 const solved = fixed_point.layout;
                 solved_layout = solved;
@@ -1850,7 +1871,9 @@ pub fn Runtime(comptime App: type) type {
                     measurement.frameLayoutRows(presentation_shell.layout.rows, solved.footer_area.top)
                 else
                     footer_frame.paint.footer;
-                const solved_viewport = if (prepared_transcript) |*prepared|
+                const solved_viewport = if (resolved_transcript_target) |target|
+                    target.selection()
+                else if (prepared_transcript) |*prepared|
                     prepared.selection
                 else if (footer_measurement != null)
                     surface_frame.currentSurfaceFooterTranscriptState(presentation_shell).selection
@@ -1878,7 +1901,13 @@ pub fn Runtime(comptime App: type) type {
                     .transient_row => false,
                     .none, .overlay_entry => true,
                 };
-                const solved_cursor_target = if (prepared_transcript) |*prepared|
+                const solved_cursor_target = if (resolved_transcript_target) |target|
+                    render_engine.paint_plan.FrameCursorTarget{
+                        .row = target.cursorRow(),
+                        .col = target.cursorCol(),
+                        .visible = solved_cursor_visible,
+                    }
+                else if (prepared_transcript) |*prepared|
                     render_engine.paint_plan.FrameCursorTarget{
                         .row = prepared.cursor.cursor_row,
                         .col = prepared.cursor.cursor_col,
@@ -1949,7 +1978,10 @@ pub fn Runtime(comptime App: type) type {
                 try footer_frame.paint.validate();
                 if (prepared_transcript) |*prepared| {
                     try validatePreparedTranscriptFitsPlan(prepared, footer_frame.paint);
-                    planned_scroll_next_start_line = prepared.selection.start_line;
+                    planned_scroll_next_start_line = if (resolved_transcript_target) |target|
+                        target.selection().start_line
+                    else
+                        prepared.selection.start_line;
                 }
                 if (full_transcript_projection) |projection| {
                     const area = footer_frame.paint.transcript_band;
@@ -1977,17 +2009,30 @@ pub fn Runtime(comptime App: type) type {
             if (presentation_commits_transcript) {
                 if (transcript_source) |source| {
                     if (prepared_transcript) |*prepared| {
-                        const layout = solved_layout orelse return error.MissingSolvedFrameLayout;
-                        transcript_transition = try presentation_shell.finalizeTranscriptTransitionForFrame(
-                            app.alloc,
-                            source,
-                            prepared,
-                            render_engine.frame_layout.CommittedLayoutSnapshot.fromLayout(layout),
-                            &footer_frame.paint,
-                            scroll_plan,
-                            footer_reservation_changed,
-                            replay_displaced_footer_history,
-                        );
+                        if (presentation_shell.fullTranscriptActive()) {
+                            if (child_view == null) return error.InvalidFullTranscriptRoute;
+                            const layout = solved_layout orelse return error.MissingSolvedFrameLayout;
+                            transcript_transition = try presentation_shell.finalizeTranscriptTransitionForFrame(
+                                app.alloc,
+                                source,
+                                prepared,
+                                render_engine.frame_layout.CommittedLayoutSnapshot.fromLayout(layout),
+                                &footer_frame.paint,
+                                scroll_plan,
+                                footer_reservation_changed,
+                                replay_displaced_footer_history,
+                            );
+                        } else {
+                            const target = resolved_transcript_target orelse
+                                return error.MissingResolvedTranscriptTarget;
+                            transcript_transition = try presentation_shell.sealTranscriptTransition(
+                                app.alloc,
+                                source,
+                                prepared,
+                                &footer_frame.paint,
+                                target,
+                            );
+                        }
                     }
                 }
             }
@@ -3264,8 +3309,16 @@ fn FixedPointTranscriptContext(comptime App: type) type {
         prepare_transcript: bool,
         source: ?*const transcript_runtime.TranscriptPreparationSource,
         prepared_transcript: *?transcript_painter.PreparedTranscriptSurfacePaint,
+        resolved_target: *?transcript_runtime.TranscriptRuntime.ResolvedTranscriptTarget,
         footer_reservation_changed: bool,
         replay_displaced_footer_history: bool,
+        footer_measurement: ?*const surface_frame.SurfaceFooterMeasurement,
+        fallback_footer_rows: ?render_engine.footer_layout.FooterRows,
+        activity_projection: activity_runtime.ActivityProjection,
+        frame_activity: render_engine.frame_layout.ActivityState,
+        base_invalidation: render_engine.paint_plan.FrameInvalidationSet,
+        attempt_invalidations: render_engine.paint_plan.FrameInvalidationSet,
+        scroll_facts: ?transcript_runtime.TranscriptScrollFacts = null,
 
         fn prepareCandidate(
             self: *@This(),
@@ -3275,10 +3328,11 @@ fn FixedPointTranscriptContext(comptime App: type) type {
                 prepared.deinit(self.app.alloc);
                 self.prepared_transcript.* = null;
             }
-            const candidate_rows = candidate.transcript_area.height();
+            self.resolved_target.* = null;
+            self.scroll_facts = null;
             if (!self.prepare_transcript or candidate.transcript_area.isEmpty()) return .{
                 .inline_advance_rows = 0,
-                .occupied_transcript_rows = candidate_rows,
+                .occupied_transcript_rows = candidate.transcript_area.height(),
             };
             const source = self.source orelse return error.MissingTranscriptPreparationSource;
 
@@ -3290,23 +3344,14 @@ fn FixedPointTranscriptContext(comptime App: type) type {
                 self.footer_reservation_changed,
             );
             const prepared = &self.prepared_transcript.*.?;
-            var scroll_facts = self.presentation_shell.planTranscriptScrollForFrame(
+            const scroll_facts = try self.presentation_shell.prepareTranscriptScrollFactsForFrame(
+                self.app.alloc,
+                source,
                 prepared,
                 self.footer_reservation_changed,
                 self.replay_displaced_footer_history,
             );
-            if (try self.presentation_shell.stagePreparedHistoryFloorForFrame(
-                self.app.alloc,
-                prepared,
-                candidate.transcript_area,
-                scroll_facts,
-            )) {
-                scroll_facts = self.presentation_shell.planTranscriptScrollForFrame(
-                    prepared,
-                    self.footer_reservation_changed,
-                    self.replay_displaced_footer_history,
-                );
-            }
+            self.scroll_facts = scroll_facts;
             const occupied_transcript_rows = if (prepared.selection.last_visible_row >= candidate.transcript_area.top)
                 prepared.selection.last_visible_row - candidate.transcript_area.top + 1
             else
@@ -3315,6 +3360,68 @@ fn FixedPointTranscriptContext(comptime App: type) type {
                 .inline_advance_rows = scroll_facts.planned_rows,
                 .occupied_transcript_rows = occupied_transcript_rows,
             };
+        }
+
+        fn resolveCandidate(
+            self: *@This(),
+            candidate: render_engine.frame_layout.FrameLayout,
+            scroll_plan: render_engine.frame_scroll_plan.FrameScrollPlan,
+        ) !render_engine.frame_fixed_point.CandidateResolution {
+            const candidate_rows = candidate.transcript_area.height();
+            if (!self.prepare_transcript or candidate.transcript_area.isEmpty()) {
+                return .{ .occupied_transcript_rows = candidate_rows };
+            }
+            const source = self.source orelse return error.MissingTranscriptPreparationSource;
+            const prepared = if (self.prepared_transcript.*) |*value| value else return error.MissingTranscriptPaint;
+            const scroll_facts = self.scroll_facts orelse return error.MissingTranscriptScrollFacts;
+            const footer_rows = if (self.footer_measurement) |measurement|
+                measurement.frameLayoutRows(
+                    self.presentation_shell.layout.rows,
+                    candidate.footer_area.top,
+                )
+            else
+                self.fallback_footer_rows orelse return error.MissingFooterRows;
+            const activity = render_engine.activity_placement.resolve(
+                self.activity_projection,
+                self.frame_activity,
+                candidate,
+            );
+            var candidate_plan = candidate.toPaintPlan(.{
+                .footer_rows = footer_rows,
+                .viewport = prepared.selection,
+                .activity = activity,
+                .invalidation = self.base_invalidation,
+                .cursor_target = .{
+                    .row = prepared.cursor.cursor_row,
+                    .col = prepared.cursor.cursor_col,
+                    .visible = true,
+                },
+            });
+            candidate_plan.invalidation = try surface_invalidation.resolveCandidateFrameInvalidations(
+                self.presentation_shell,
+                candidate_plan,
+                if (self.footer_measurement) |measurement|
+                    measurement.frameInvalidationUpdate()
+                else
+                    null,
+                self.attempt_invalidations,
+            );
+            const destructive_invalidation = render_engine.frame_retention.transcriptAreaHasDestructiveInvalidation(
+                self.presentation_shell.committed_frame_layout.transcript_area,
+                candidate_plan.invalidation,
+            );
+            const target = try self.presentation_shell.resolveTranscriptTransitionTargetForFrame(
+                self.app.alloc,
+                source,
+                prepared,
+                render_engine.frame_layout.CommittedLayoutSnapshot.fromLayout(candidate),
+                scroll_plan,
+                scroll_facts,
+                destructive_invalidation,
+                activity == .overlay_entry,
+            );
+            self.resolved_target.* = target;
+            return .{ .occupied_transcript_rows = target.occupiedTranscriptRows() };
         }
     };
 }
@@ -3476,6 +3583,17 @@ const FixedPointTestContext = struct {
     ) !render_engine.frame_fixed_point.CandidatePreparation {
         return .{
             .inline_advance_rows = self.inline_advance_rows,
+            .occupied_transcript_rows = layout.transcript_area.height(),
+        };
+    }
+
+    fn resolveCandidate(
+        self: *FixedPointTestContext,
+        layout: render_engine.frame_layout.FrameLayout,
+        scroll_plan: render_engine.frame_scroll_plan.FrameScrollPlan,
+    ) !render_engine.frame_fixed_point.CandidateResolution {
+        _ = scroll_plan;
+        return .{
             .occupied_transcript_rows = self.prepared_occupied_rows orelse layout.transcript_area.height(),
         };
     }
@@ -3518,6 +3636,7 @@ fn solveFixedPointForTest(
         ctx,
         input,
         FixedPointTestContext.prepareCandidate,
+        FixedPointTestContext.resolveCandidate,
     );
 }
 

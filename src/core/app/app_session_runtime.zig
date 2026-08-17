@@ -3560,6 +3560,7 @@ pub fn Runtime(comptime App: type) type {
             if (try writeCommittedFilePresentation(app, sink, call, result)) return;
 
             const is_command = std.mem.eql(u8, result.tool_name, "run_command");
+            const context_deferred = types.isContextDeferredToolResult(result);
             const deferred = types.isDeferredToolResult(result);
             const process_ran = is_command and
                 result.command_process_presentation != null;
@@ -3571,7 +3572,10 @@ pub fn Runtime(comptime App: type) type {
                     action_arena.allocator(),
                     call,
                     null,
-                    types.deferred_tool_result_output,
+                    if (context_deferred)
+                        types.context_deferred_tool_status_label
+                    else
+                        types.deferred_tool_result_output,
                     &.{},
                 )
             else if (result.status == .success or process_ran)
@@ -3592,7 +3596,9 @@ pub fn Runtime(comptime App: type) type {
             const action = try app.alloc.dupe(u8, formatted_action);
             defer app.alloc.free(action);
 
-            const outcome: types.ToolOutcomeKind = if (deferred)
+            const outcome: types.ToolOutcomeKind = if (context_deferred)
+                .deferred
+            else if (deferred)
                 .denied
             else if (result.status == .success or process_ran)
                 .completed
@@ -6590,28 +6596,41 @@ test "execution replay preserves paired deferred tools without command output" {
             .name = "run_command",
             .arguments_json = "{\"command\":\"cat nested/input.txt\"}",
         },
+        .{
+            .id = "call_legacy",
+            .name = "read_file",
+            .arguments_json = "{\"path\":\"stale.txt\"}",
+        },
     };
     var results = [_]types.PersistedToolResult{
         .{
             .tool_call_id = @constCast("call_read"),
             .tool_name = @constCast("read_file"),
             .status = .failure,
-            .output = @constCast("Not executed"),
-            .output_bytes = 12,
-            .stored_output_bytes = 12,
+            .output = @constCast(types.context_deferred_tool_result_output),
+            .output_bytes = types.context_deferred_tool_result_output.len,
+            .stored_output_bytes = types.context_deferred_tool_result_output.len,
         },
         .{
             .tool_call_id = @constCast("call_command"),
             .tool_name = @constCast("run_command"),
             .status = .failure,
-            .output = @constCast("Not executed"),
+            .output = @constCast(types.context_deferred_tool_result_output),
             .output_handle = @constCast("should-not-be-read.txt"),
             .preview = @constCast("should not be rendered"),
-            .output_bytes = 12,
-            .stored_output_bytes = 12,
+            .output_bytes = types.context_deferred_tool_result_output.len,
+            .stored_output_bytes = types.context_deferred_tool_result_output.len,
             .truncated = true,
             .command_output_replay = .unavailable,
             .command_process_presentation = .{ .exit_code = 7 },
+        },
+        .{
+            .tool_call_id = @constCast("call_legacy"),
+            .tool_name = @constCast("read_file"),
+            .status = .failure,
+            .output = @constCast(types.deferred_tool_result_output),
+            .output_bytes = types.deferred_tool_result_output.len,
+            .stored_output_bytes = types.deferred_tool_result_output.len,
         },
     };
     var steps = [_]types.ToolExecutionStep{.{
@@ -6623,13 +6642,14 @@ test "execution replay preserves paired deferred tools without command output" {
 
     try std.testing.expectEqualSlices(
         types.ToolOutcomeKind,
-        &.{ .denied, .denied },
+        &.{ .deferred, .deferred, .denied },
         app.completed_tool_outcomes.items,
     );
-    try std.testing.expectEqual(@as(usize, 2), app.completed_tool_statuses.items.len);
-    try std.testing.expectEqualStrings("● Not executed read_file\n", app.completed_tool_statuses.items[0]);
-    try std.testing.expectEqualStrings("● Not executed run_command\n", app.completed_tool_statuses.items[1]);
-    try std.testing.expectEqual(@as(usize, 2), app.historical_tool_detail_entry_ids.items.len);
+    try std.testing.expectEqual(@as(usize, 3), app.completed_tool_statuses.items.len);
+    try std.testing.expectEqualStrings("● Context updated read_file\n", app.completed_tool_statuses.items[0]);
+    try std.testing.expectEqualStrings("● Context updated run_command\n", app.completed_tool_statuses.items[1]);
+    try std.testing.expectEqualStrings("● Not executed read_file\n", app.completed_tool_statuses.items[2]);
+    try std.testing.expectEqual(@as(usize, 3), app.historical_tool_detail_entry_ids.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.command_output_writes.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.command_stdout.items.len);
@@ -6637,7 +6657,7 @@ test "execution replay preserves paired deferred tools without command output" {
     try std.testing.expectEqual(@as(usize, 0), app.command_output_flush_count);
     try std.testing.expectEqualSlices(
         ReplayEvent,
-        &.{ .completed_tool_status, .completed_tool_status },
+        &.{ .completed_tool_status, .completed_tool_status, .completed_tool_status },
         app.replay_events.items,
     );
 }

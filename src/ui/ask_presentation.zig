@@ -72,6 +72,9 @@ pub const Runtime = struct {
 
         try self.shell.initBacking(alloc);
         try self.shell.enableShadowVt(alloc);
+        self.shell.setCommandOutputRenderPolicy(.{
+            .code_highlight_theme = if (ui_render.is_light) .light else .dark,
+        });
         const start = normalizeStartCursor(layout, cursor);
         self.shell.shadow_vt.?.cursor_row = start.row;
         self.shell.shadow_vt.?.cursor_col = start.col;
@@ -210,11 +213,16 @@ pub const Runtime = struct {
         defer source.deinit(self.alloc);
         var prepared: ?transcript_painter.PreparedTranscriptSurfacePaint = null;
         defer if (prepared) |*paint| paint.deinit(self.alloc);
+        var resolved_target: ?transcript_runtime.TranscriptRuntime.ResolvedTranscriptTarget = null;
+        var invalidations = attempt.snapshot.invalidations;
+        self.shell.normalizeFrameInvalidations(&invalidations);
 
         var solve_context = SolveContext{
             .runtime = self,
             .source = &source,
             .prepared = &prepared,
+            .resolved_target = &resolved_target,
+            .invalidations = invalidations,
         };
         const fixed = try render_engine.frame_fixed_point.solve(
             SolveContext,
@@ -227,31 +235,30 @@ pub const Runtime = struct {
                 .prior = self.shell.committed_frame_layout,
             },
             SolveContext.prepareCandidate,
+            SolveContext.resolveCandidate,
         );
         const paint = if (prepared) |*value| value else return error.MissingTranscriptPaint;
+        const target = resolved_target orelse return error.MissingResolvedTranscriptTarget;
 
-        var invalidations = attempt.snapshot.invalidations;
-        self.shell.normalizeFrameInvalidations(&invalidations);
         var plan = fixed.layout.toPaintPlan(.{
             .footer_rows = zeroFooterRows(self.shell.layout.rows),
-            .viewport = paint.selection,
+            .viewport = target.selection(),
             .invalidation = invalidations,
             .synchronized_update = self.shell.sync_updates_enabled,
             .cursor_target = .{
-                .row = paint.cursor.cursor_row,
-                .col = paint.cursor.cursor_col,
+                .row = target.cursorRow(),
+                .col = target.cursorCol(),
                 .visible = true,
             },
             .preserve_scrollback = !self.shell.pending_scroll_compact,
             .reset_terminal = self.shell.terminal_reset_pending,
         });
-        var transition = try self.shell.finalizeTranscriptTransition(
+        var transition = try self.shell.sealTranscriptTransition(
             self.alloc,
             &source,
             paint,
-            render_engine.frame_layout.CommittedLayoutSnapshot.fromLayout(fixed.layout),
             &plan,
-            fixed.scroll_plan,
+            target,
         );
         defer transition.deinit(self.alloc);
         var paint_context = PaintContext{ .runtime = self, .prepared = paint };
@@ -299,8 +306,11 @@ pub const Runtime = struct {
 
 const SolveContext = struct {
     runtime: *Runtime,
-    source: *const transcript_runtime.TranscriptPreparationSource,
+    source: *transcript_runtime.TranscriptPreparationSource,
     prepared: *?transcript_painter.PreparedTranscriptSurfacePaint,
+    resolved_target: *?transcript_runtime.TranscriptRuntime.ResolvedTranscriptTarget,
+    invalidations: render_engine.paint_plan.FrameInvalidationSet,
+    scroll_facts: ?transcript_runtime.TranscriptScrollFacts = null,
 
     fn prepareCandidate(
         self: *SolveContext,
@@ -310,6 +320,8 @@ const SolveContext = struct {
             paint.deinit(self.runtime.alloc);
             self.prepared.* = null;
         }
+        self.resolved_target.* = null;
+        self.scroll_facts = null;
         if (candidate.transcript_area.isEmpty()) return .{
             .inline_advance_rows = 0,
             .occupied_transcript_rows = 0,
@@ -321,14 +333,49 @@ const SolveContext = struct {
             candidate.transcript_area,
         );
         const paint = &self.prepared.*.?;
-        const occupied_rows = if (paint.selection.last_visible_row >= candidate.transcript_area.top)
+        const scroll_facts = try self.runtime.shell.prepareTranscriptScrollFactsForFrame(
+            self.runtime.alloc,
+            self.source,
+            paint,
+            false,
+            false,
+        );
+        self.scroll_facts = scroll_facts;
+        const occupied_transcript_rows = if (paint.selection.last_visible_row >= candidate.transcript_area.top)
             paint.selection.last_visible_row - candidate.transcript_area.top + 1
         else
             0;
         return .{
-            .inline_advance_rows = self.runtime.shell.planTranscriptScroll(paint).planned_rows,
-            .occupied_transcript_rows = occupied_rows,
+            .inline_advance_rows = scroll_facts.planned_rows,
+            .occupied_transcript_rows = occupied_transcript_rows,
         };
+    }
+
+    fn resolveCandidate(
+        self: *SolveContext,
+        candidate: render_engine.frame_layout.FrameLayout,
+        scroll_plan: render_engine.frame_scroll_plan.FrameScrollPlan,
+    ) !render_engine.frame_fixed_point.CandidateResolution {
+        if (candidate.transcript_area.isEmpty()) return .{ .occupied_transcript_rows = 0 };
+        const paint = if (self.prepared.*) |*value| value else return error.MissingTranscriptPaint;
+        const scroll_facts = self.scroll_facts orelse return error.MissingTranscriptScrollFacts;
+        const target_layout = render_engine.frame_layout.CommittedLayoutSnapshot.fromLayout(candidate);
+        const destructive_invalidation = render_engine.frame_retention.transcriptAreaHasDestructiveInvalidation(
+            self.runtime.shell.committed_frame_layout.transcript_area,
+            self.invalidations,
+        );
+        const target = try self.runtime.shell.resolveTranscriptTransitionTargetForFrame(
+            self.runtime.alloc,
+            self.source,
+            paint,
+            target_layout,
+            scroll_plan,
+            scroll_facts,
+            destructive_invalidation,
+            false,
+        );
+        self.resolved_target.* = target;
+        return .{ .occupied_transcript_rows = target.occupiedTranscriptRows() };
     }
 };
 
@@ -353,23 +400,14 @@ fn probeTerminal(
     no_color: bool,
 ) shell_runtime.CursorPosition {
     const fallback = shell_runtime.CursorPosition{ .row = layout.rows, .col = 1 };
-    if (std.c.isatty(std.posix.STDIN_FILENO) == 0) {
-        ui_render.initTheme(false, null);
-        return fallback;
-    }
-    terminal.captureOriginalTermios() catch {
-        ui_render.initTheme(false, null);
-        return fallback;
-    };
-    terminal.enableRawMode() catch {
-        ui_render.initTheme(false, null);
-        return fallback;
-    };
+    const fallback_light = if (no_color) false else ui_render.explicitThemeOverride() orelse false;
+    ui_render.initTheme(fallback_light, null);
+    if (std.c.isatty(std.posix.STDIN_FILENO) == 0) return fallback;
+    terminal.captureOriginalTermios() catch return fallback;
+    terminal.enableRawMode() catch return fallback;
     defer terminal.disableRawMode();
 
-    if (no_color) {
-        ui_render.initTheme(false, null);
-    } else {
+    if (!no_color) {
         const theme = ui_render.detectTheme(std.heap.c_allocator, terminal);
         ui_render.initTheme(theme.light, theme.rgb);
     }
@@ -451,9 +489,52 @@ test "ask presentation paints Minimal prompt and assistant into a footerless fra
     );
     try std.testing.expect(runtime.shell.entries.items[1] == .user_turn);
     try std.testing.expect(runtime.shell.committed_frame_layout.footer_area.isEmpty());
+    try std.testing.expectEqual(
+        transcript_runtime.TranscriptCommitDiagnosticState.stable,
+        runtime.shell.transcriptCommitDiagnostic().state,
+    );
+    const committed = runtime.shell.stableTranscriptProjectionForFlow(
+        runtime.shell.transcript.items,
+    ) orelse return error.TestExpectedStableTranscript;
+    try std.testing.expect(
+        committed.selection.last_visible_row <=
+            runtime.shell.committed_frame_layout.transcript_area.bottom,
+    );
     try std.testing.expect(runtime.shell.shadow_vt.?.cellAt(1, 1) != null);
     const length = try output.length(io_mod.getIo());
     try std.testing.expect(length > restore_terminal_sequence.len);
+}
+
+test "ask presentation carries the light theme into semantic code blocks" {
+    const alloc = std.testing.allocator;
+    ui_render.initTheme(true, null);
+    defer ui_render.initTheme(false, null);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var output = try tmp.dir.createFile(std.testing.io, "ask-light-frame.log", .{ .read = true });
+    defer output.close(io_mod.getIo());
+
+    var runtime = try Runtime.initConfigured(
+        alloc,
+        .{ .text = @constCast("show code") },
+        false,
+        output,
+        zeroFooterLayout(.{
+            .rows = 12,
+            .cols = 48,
+            .content_bottom = 12,
+            .divider_top_row = 12,
+            .input_row = 12,
+            .divider_bottom_row = 12,
+            .hint_row = 12,
+        }),
+        .{ .row = 1, .col = 1 },
+        true,
+    );
+    defer runtime.deinit();
+
+    try std.testing.expect(runtime.shell.retainedTranscriptStyles().code_highlight_theme == .light);
 }
 
 test "ask presentation retains a streaming write failure until finish" {

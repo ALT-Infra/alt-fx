@@ -8,6 +8,7 @@ const generation_usage_provider = @import("core/session/generation_usage_provide
 const host = @import("core/hosts/host.zig");
 const debug_trace = @import("core/shared/debug_trace.zig");
 const io_mod = @import("core/shared/io.zig");
+const fetch_state = @import("napi_fetch_state.zig");
 const streamable_http = @import("core/mcp/streamable_http.zig");
 const host_stream_provider = @import("gateway/host_stream_provider.zig");
 const oauth_transport = @import("core/auth/oauth_transport.zig");
@@ -152,19 +153,29 @@ const FetchBridge = struct {
     request: std.ArrayList(u8) = .empty,
     response: std.ArrayList(u8) = .empty,
     response_offset: usize = 0,
-    request_pending: bool = false,
-    response_started: bool = false,
-    response_done: bool = false,
-    failed: bool = false,
-    aborted: bool = false,
-    shutting_down: bool = false,
+    phase: fetch_state.Phase = .idle,
+    next_handle: fetch_state.Handle = 1,
     status: u16 = 0,
 
     fn clearPendingRequest(self: *FetchBridge, reason: []const u8) void {
-        if (!self.request_pending) return;
+        if (self.request.items.len == 0) return;
         debug_trace.logf("napi", "dropping pending host fetch reason={s} bytes={d}", .{ reason, self.request.items.len });
         self.request.clearRetainingCapacity();
-        self.request_pending = false;
+    }
+
+    fn trace_stale(operation: []const u8, handle: fetch_state.Handle, reason: fetch_state.StaleReason) void {
+        debug_trace.logf(
+            "napi",
+            "dropping stale host fetch operation={s} handle={d} reason={s}",
+            .{ operation, handle, @tagName(reason) },
+        );
+    }
+
+    fn advance_handle(self: *FetchBridge) void {
+        self.next_handle = if (self.next_handle == std.math.maxInt(fetch_state.Handle))
+            0
+        else
+            self.next_handle + 1;
     }
 
     fn open(raw: ?*anyopaque, method: []const u8, url: []const u8, headers: []const u8, body: []const u8) !i32 {
@@ -172,15 +183,18 @@ const FetchBridge = struct {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        if (self.shutting_down) return error.HostStreamUnavailable;
-        if (self.aborted) {
-            self.clearPendingRequest("open_after_abort");
-            self.aborted = false;
-            return error.Cancelled;
+        if (self.next_handle == 0) return error.HostStreamUnavailable;
+        const handle = self.next_handle;
+        const decision = fetch_state.decide(self.phase, .{ .open = handle });
+        switch (decision.action) {
+            .cancelled => {
+                self.phase = decision.phase;
+                return error.Cancelled;
+            },
+            .unavailable, .shutting_down => return error.HostStreamUnavailable,
+            .applied => {},
+            else => unreachable,
         }
-        if (self.request_pending or self.response_started) return error.HostStreamUnavailable;
-        self.failed = false;
-        self.response_done = false;
         self.response_offset = 0;
         self.response.clearRetainingCapacity();
         var writer: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
@@ -189,82 +203,128 @@ const FetchBridge = struct {
         const body_base64 = try std.heap.c_allocator.alloc(u8, encoded_body);
         defer std.heap.c_allocator.free(body_base64);
         _ = std.base64.standard.Encoder.encode(body_base64, body);
-        try std.json.Stringify.value(.{ .method = method, .url = url, .headers = headers, .body = body_base64 }, .{}, &writer.writer);
+        try std.json.Stringify.value(.{
+            .handle = handle,
+            .method = method,
+            .url = url,
+            .headers = headers,
+            .body = body_base64,
+        }, .{}, &writer.writer);
         const bytes = writer.writer.buffered();
         if (bytes.len > max_fetch_request_bytes) return error.HostStreamBackpressure;
+        self.request.clearRetainingCapacity();
         try self.request.appendSlice(std.heap.c_allocator, bytes);
-        self.request_pending = true;
+        self.phase = decision.phase;
+        self.advance_handle();
         self.wake.broadcast(io);
-        return 1;
+        return handle;
     }
 
-    fn statusFn(raw: ?*anyopaque, _: i32, status_out: *u16) i32 {
+    fn statusFn(raw: ?*anyopaque, handle: i32, status_out: *u16) i32 {
         const self: *FetchBridge = @ptrCast(@alignCast(raw.?));
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        while (!self.response_started and !self.aborted) self.wake.waitUncancelable(io, &self.mutex);
-        if (self.aborted) return -2;
-        if (self.failed) return -1;
-        status_out.* = self.status;
-        return 1;
+        while (true) switch (self.phase) {
+            .request_pending, .awaiting_response => |active| {
+                if (active != handle) return -2;
+                self.wake.waitUncancelable(io, &self.mutex);
+            },
+            .streaming => |active| {
+                if (active != handle) return -2;
+                status_out.* = self.status;
+                return 1;
+            },
+            .terminal => |terminal| {
+                if (terminal.handle != handle) return -2;
+                return switch (terminal.kind) {
+                    .success => result: {
+                        status_out.* = self.status;
+                        break :result 1;
+                    },
+                    .failure => -1,
+                    .aborted => -2,
+                };
+            },
+            else => return -2,
+        };
     }
 
-    fn next(raw: ?*anyopaque, _: i32, out: []u8) i32 {
+    fn next(raw: ?*anyopaque, handle: i32, out: []u8) i32 {
         const self: *FetchBridge = @ptrCast(@alignCast(raw.?));
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        while (self.response_offset == self.response.items.len and !self.response_done and !self.aborted) {
+        while (true) {
+            const terminal_kind: ?fetch_state.TerminalKind = switch (self.phase) {
+                .streaming => |active| if (active == handle) null else return -2,
+                .terminal => |terminal| if (terminal.handle == handle) terminal.kind else return -2,
+                else => return -2,
+            };
+            if (terminal_kind) |kind| switch (kind) {
+                .failure => return -1,
+                .aborted => return -2,
+                .success => {},
+            };
+            const available = self.response.items.len - self.response_offset;
+            if (available > 0) {
+                const len = @min(out.len, available);
+                @memcpy(out[0..len], self.response.items[self.response_offset..][0..len]);
+                self.response_offset += len;
+                self.wake.broadcast(io);
+                return @intCast(len);
+            }
             self.response.clearRetainingCapacity();
             self.response_offset = 0;
+            if (terminal_kind != null) return 0;
             self.wake.waitUncancelable(io, &self.mutex);
         }
-        if (self.aborted) return -2;
-        if (self.failed) return -1;
-        const available = self.response.items.len - self.response_offset;
-        if (available == 0) return 0;
-        const len = @min(out.len, available);
-        @memcpy(out[0..len], self.response.items[self.response_offset..][0..len]);
-        self.response_offset += len;
-        self.wake.broadcast(io);
-        return @intCast(len);
     }
 
-    fn close(raw: ?*anyopaque, _: i32) void {
+    fn close(raw: ?*anyopaque, handle: i32) void {
         const self: *FetchBridge = @ptrCast(@alignCast(raw.?));
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const decision = fetch_state.decide(self.phase, .{ .close = handle });
+        if (decision.action == .stale) {
+            trace_stale("close", handle, decision.stale_reason.?);
+            return;
+        }
         self.clearPendingRequest("stream_close");
-        self.response_started = false;
-        self.response_done = false;
-        self.failed = false;
-        self.aborted = false;
+        self.phase = decision.phase;
+        self.status = 0;
         self.response.clearRetainingCapacity();
         self.response_offset = 0;
         self.wake.broadcast(io);
-        self.mutex.unlock(io);
     }
 
-    fn startResponse(self: *FetchBridge, status: u16) !void {
+    fn startResponse(self: *FetchBridge, handle: fetch_state.Handle, status: u16) FetchOperationResult {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        if (self.aborted) return error.FetchAborted;
-        if (self.response_started) return error.ResponseAlreadyStarted;
+        const decision = fetch_state.decide(self.phase, .{ .start = handle });
+        if (decision.action == .stale) {
+            trace_stale("start", handle, decision.stale_reason.?);
+            return .stale;
+        }
         self.status = status;
-        self.response_started = true;
+        self.phase = decision.phase;
         self.wake.broadcast(io);
+        return .applied;
     }
 
-    fn pushResponse(self: *FetchBridge, data: []const u8) !void {
+    fn pushResponse(self: *FetchBridge, handle: fetch_state.Handle, data: []const u8) !FetchOperationResult {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        if (self.aborted) return error.FetchAborted;
-        if (!self.response_started or self.response_done) return error.InvalidResponseState;
+        const decision = fetch_state.decide(self.phase, .{ .push = handle });
+        if (decision.action == .stale) {
+            trace_stale("push", handle, decision.stale_reason.?);
+            return .stale;
+        }
         const queued = self.response.items.len - self.response_offset;
-        if (data.len > max_fetch_response_bytes or queued > max_fetch_response_bytes - data.len) return error.ResponseQueueFull;
+        if (data.len > max_fetch_response_bytes or queued > max_fetch_response_bytes - data.len) return .backpressure;
         if (self.response_offset > 0) {
             std.mem.copyForwards(u8, self.response.items[0..queued], self.response.items[self.response_offset..]);
             self.response.items.len = queued;
@@ -272,49 +332,74 @@ const FetchBridge = struct {
         }
         try self.response.appendSlice(std.heap.c_allocator, data);
         self.wake.broadcast(io);
+        return .applied;
     }
 
-    fn finishResponse(self: *FetchBridge) void {
+    fn finishResponse(self: *FetchBridge, handle: fetch_state.Handle) FetchOperationResult {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
-        self.response_done = true;
+        defer self.mutex.unlock(io);
+        const decision = fetch_state.decide(self.phase, .{ .finish = handle });
+        if (decision.action == .stale) {
+            trace_stale("finish", handle, decision.stale_reason.?);
+            return .stale;
+        }
+        self.phase = decision.phase;
         self.wake.broadcast(io);
-        self.mutex.unlock(io);
+        return .applied;
     }
 
-    fn failResponse(self: *FetchBridge) void {
+    fn failResponse(self: *FetchBridge, handle: fetch_state.Handle) FetchOperationResult {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
-        self.failed = true;
-        self.response_started = true;
-        self.response_done = true;
+        defer self.mutex.unlock(io);
+        const decision = fetch_state.decide(self.phase, .{ .fail = handle });
+        if (decision.action == .stale) {
+            trace_stale("fail", handle, decision.stale_reason.?);
+            return .stale;
+        }
+        self.phase = decision.phase;
         self.wake.broadcast(io);
-        self.mutex.unlock(io);
+        return .applied;
+    }
+
+    fn is_active(self: *FetchBridge, handle: fetch_state.Handle) bool {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return fetch_state.is_active(self.phase, handle);
     }
 
     fn abort(self: *FetchBridge) void {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const decision = fetch_state.decide(self.phase, .cancel);
         self.clearPendingRequest("abort");
-        self.aborted = true;
+        self.phase = decision.phase;
         self.wake.broadcast(io);
-        self.mutex.unlock(io);
     }
 
     fn shutdown(self: *FetchBridge) void {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const decision = fetch_state.decide(self.phase, .shutdown);
         self.clearPendingRequest("shutdown");
-        self.shutting_down = true;
-        self.aborted = true;
+        self.phase = decision.phase;
         self.wake.broadcast(io);
-        self.mutex.unlock(io);
     }
 
     fn deinit(self: *FetchBridge) void {
         self.request.deinit(std.heap.c_allocator);
         self.response.deinit(std.heap.c_allocator);
     }
+};
+
+const FetchOperationResult = enum(u8) {
+    stale = 0,
+    applied = 1,
+    backpressure = 2,
 };
 
 const Runtime = struct {
@@ -456,6 +541,11 @@ fn ensureThreadedIo() void {
     if (threaded_io_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) == null) {
         threaded_io = std.Io.Threaded.init(std.heap.c_allocator, .{});
         io_mod.setIo(threaded_io.?.io());
+        const raw_environ: io_mod.RawEnviron = @ptrCast(std.c.environ);
+        io_mod.setRawEnviron(raw_environ);
+        const workspace_root = io_mod.realpathAlloc(std.heap.c_allocator, ".") catch null;
+        defer if (workspace_root) |path| std.heap.c_allocator.free(path);
+        debug_trace.configureFromEnv(std.heap.c_allocator, workspace_root orelse ".");
         threaded_io_state.store(2, .release);
         return;
     }
@@ -657,6 +747,26 @@ fn unlockRuntime(handle: *RuntimeHandle) void {
     handle.mutex.unlock(io_mod.getIo());
 }
 
+fn fetch_handle_arg(env: c.napi_env, value: c.napi_value) ?fetch_state.Handle {
+    var number: f64 = 0;
+    if (c.napi_get_value_double(env, value, &number) != c.napi_ok or
+        !std.math.isFinite(number) or
+        number < 1 or
+        number > @as(f64, @floatFromInt(std.math.maxInt(fetch_state.Handle))) or
+        @floor(number) != number)
+    {
+        _ = c.napi_throw_type_error(env, "LIBFX_INVALID_ARGUMENT", "fetch handle must be a positive int32");
+        return null;
+    }
+    return @intFromFloat(number);
+}
+
+fn fetch_operation_value(env: c.napi_env, result: FetchOperationResult) c.napi_value {
+    var value: c.napi_value = undefined;
+    if (!statusOk(env, c.napi_create_uint32(env, @intFromEnum(result), &value), "could not create fetch operation result")) return null;
+    return value;
+}
+
 fn writeCore(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
     var argv: [2]c.napi_value = undefined;
     const handle = runtimeHandleArg(env, info, &argv) orelse return null;
@@ -710,7 +820,8 @@ fn takeCoreFetch(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.nap
     const io = io_mod.getIo();
     runtime.fetch.mutex.lockUncancelable(io);
     defer runtime.fetch.mutex.unlock(io);
-    if (!runtime.fetch.request_pending) {
+    const decision = fetch_state.decide(runtime.fetch.phase, .take_request);
+    if (decision.action != .applied) {
         var value: c.napi_value = undefined;
         _ = c.napi_get_null(env, &value);
         return value;
@@ -721,67 +832,64 @@ fn takeCoreFetch(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.nap
     if (!statusOk(env, c.napi_create_buffer(env, len, &data, &value), "could not allocate fetch request Buffer")) return null;
     if (len > 0) @memcpy(@as([*]u8, @ptrCast(data.?))[0..len], runtime.fetch.request.items);
     runtime.fetch.request.clearRetainingCapacity();
-    runtime.fetch.request_pending = false;
+    runtime.fetch.phase = decision.phase;
+    return value;
+}
+
+fn coreFetchActive(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argv: [2]c.napi_value = undefined;
+    const runtime_handle = runtimeHandleArg(env, info, &argv) orelse return null;
+    const fetch_handle = fetch_handle_arg(env, argv[1]) orelse return null;
+    const runtime = lockRuntime(env, runtime_handle) orelse return null;
+    defer unlockRuntime(runtime_handle);
+    var value: c.napi_value = undefined;
+    _ = c.napi_get_boolean(env, runtime.fetch.is_active(fetch_handle), &value);
     return value;
 }
 
 fn startCoreFetchResponse(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
-    var argv: [2]c.napi_value = undefined;
-    const handle = runtimeHandleArg(env, info, &argv) orelse return null;
-    const runtime = lockRuntime(env, handle) orelse return null;
-    defer unlockRuntime(handle);
+    var argv: [3]c.napi_value = undefined;
+    const runtime_handle = runtimeHandleArg(env, info, &argv) orelse return null;
+    const fetch_handle = fetch_handle_arg(env, argv[1]) orelse return null;
+    const runtime = lockRuntime(env, runtime_handle) orelse return null;
+    defer unlockRuntime(runtime_handle);
     var status: u32 = 0;
-    if (c.napi_get_value_uint32(env, argv[1], &status) != c.napi_ok or status > std.math.maxInt(u16))
+    if (c.napi_get_value_uint32(env, argv[2], &status) != c.napi_ok or status > std.math.maxInt(u16))
         return throw(env, "LIBFX_INVALID_ARGUMENT", "fetch response status must be a uint16");
-    runtime.fetch.startResponse(@intCast(status)) catch return throw(env, "LIBFX_NATIVE_CLOSED", "native fetch is closed");
-    var value: c.napi_value = undefined;
-    _ = c.napi_get_undefined(env, &value);
-    return value;
+    return fetch_operation_value(env, runtime.fetch.startResponse(fetch_handle, @intCast(status)));
 }
 
 fn pushCoreFetchResponse(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
-    var argv: [2]c.napi_value = undefined;
-    const handle = runtimeHandleArg(env, info, &argv) orelse return null;
-    const runtime = lockRuntime(env, handle) orelse return null;
-    defer unlockRuntime(handle);
+    var argv: [3]c.napi_value = undefined;
+    const runtime_handle = runtimeHandleArg(env, info, &argv) orelse return null;
+    const fetch_handle = fetch_handle_arg(env, argv[1]) orelse return null;
+    const runtime = lockRuntime(env, runtime_handle) orelse return null;
+    defer unlockRuntime(runtime_handle);
     var data: ?*anyopaque = null;
     var len: usize = 0;
-    if (!statusOk(env, c.napi_get_buffer_info(env, argv[1], &data, &len), "fetch response chunk requires a Buffer")) return null;
+    if (!statusOk(env, c.napi_get_buffer_info(env, argv[2], &data, &len), "fetch response chunk requires a Buffer")) return null;
     const bytes = if (len == 0) &.{} else @as([*]const u8, @ptrCast(data.?))[0..len];
-    runtime.fetch.pushResponse(bytes) catch |err| switch (err) {
-        error.ResponseQueueFull => {
-            var value: c.napi_value = undefined;
-            _ = c.napi_get_boolean(env, false, &value);
-            return value;
-        },
-        error.OutOfMemory => return throw(env, "LIBFX_NATIVE_OOM", "could not queue fetch response"),
-        else => return throw(env, "LIBFX_NATIVE_CLOSED", "native fetch is closed"),
-    };
-    var value: c.napi_value = undefined;
-    _ = c.napi_get_boolean(env, true, &value);
-    return value;
+    const result = runtime.fetch.pushResponse(fetch_handle, bytes) catch
+        return throw(env, "LIBFX_NATIVE_OOM", "could not queue fetch response");
+    return fetch_operation_value(env, result);
 }
 
 fn finishCoreFetch(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
-    var argv: [1]c.napi_value = undefined;
-    const handle = runtimeHandleArg(env, info, &argv) orelse return null;
-    const runtime = lockRuntime(env, handle) orelse return null;
-    defer unlockRuntime(handle);
-    runtime.fetch.finishResponse();
-    var value: c.napi_value = undefined;
-    _ = c.napi_get_undefined(env, &value);
-    return value;
+    var argv: [2]c.napi_value = undefined;
+    const runtime_handle = runtimeHandleArg(env, info, &argv) orelse return null;
+    const fetch_handle = fetch_handle_arg(env, argv[1]) orelse return null;
+    const runtime = lockRuntime(env, runtime_handle) orelse return null;
+    defer unlockRuntime(runtime_handle);
+    return fetch_operation_value(env, runtime.fetch.finishResponse(fetch_handle));
 }
 
 fn failCoreFetch(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
-    var argv: [1]c.napi_value = undefined;
-    const handle = runtimeHandleArg(env, info, &argv) orelse return null;
-    const runtime = lockRuntime(env, handle) orelse return null;
-    defer unlockRuntime(handle);
-    runtime.fetch.failResponse();
-    var value: c.napi_value = undefined;
-    _ = c.napi_get_undefined(env, &value);
-    return value;
+    var argv: [2]c.napi_value = undefined;
+    const runtime_handle = runtimeHandleArg(env, info, &argv) orelse return null;
+    const fetch_handle = fetch_handle_arg(env, argv[1]) orelse return null;
+    const runtime = lockRuntime(env, runtime_handle) orelse return null;
+    defer unlockRuntime(runtime_handle);
+    return fetch_operation_value(env, runtime.fetch.failResponse(fetch_handle));
 }
 
 fn abortCoreFetch(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
@@ -833,13 +941,14 @@ fn exportFunction(env: c.napi_env, exports: c.napi_value, name: [*:0]const u8, c
 export fn napi_register_module_v1(env: c.napi_env, exports: c.napi_value) callconv(.c) c.napi_value {
     ensureThreadedIo();
     var api_version: c.napi_value = undefined;
-    if (!statusOk(env, c.napi_create_uint32(env, 1, &api_version), "could not create API version")) return null;
+    if (!statusOk(env, c.napi_create_uint32(env, 2, &api_version), "could not create API version")) return null;
     if (!statusOk(env, c.napi_set_named_property(env, exports, "libfxApiVersion", api_version), "could not export API version")) return null;
     if (!exportFunction(env, exports, "createCore", createCore)) return null;
     if (!exportFunction(env, exports, "writeCore", writeCore)) return null;
     if (!exportFunction(env, exports, "closeCore", closeCore)) return null;
     if (!exportFunction(env, exports, "drainCore", drainCore)) return null;
     if (!exportFunction(env, exports, "takeCoreFetch", takeCoreFetch)) return null;
+    if (!exportFunction(env, exports, "coreFetchActive", coreFetchActive)) return null;
     if (!exportFunction(env, exports, "startCoreFetchResponse", startCoreFetchResponse)) return null;
     if (!exportFunction(env, exports, "pushCoreFetchResponse", pushCoreFetchResponse)) return null;
     if (!exportFunction(env, exports, "finishCoreFetch", finishCoreFetch)) return null;

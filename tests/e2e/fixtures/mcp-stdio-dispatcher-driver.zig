@@ -758,13 +758,15 @@ const InteractiveAuthAttempt = struct {
             return;
         }
         defer if (self.acquire_lease) self.runtime.releaseUse();
-        self.runtime.authenticateServer(
+        var result = self.runtime.authenticateServer(
             "fixture",
             @ptrCast(self.opener),
             InteractiveAuthOpener.open,
         ) catch |err| {
             self.err = err;
+            return;
         };
+        result.deinit();
     }
 };
 

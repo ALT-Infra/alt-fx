@@ -558,6 +558,7 @@ pub const ChildChat = struct {
                         .tone = switch (value.outcome.kind) {
                             .completed => .success,
                             .denied, .cancelled, .failed => .danger,
+                            .deferred => .thinking,
                         },
                     } },
                     .turn_finished => {},

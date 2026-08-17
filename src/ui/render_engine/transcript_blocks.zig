@@ -27,6 +27,8 @@ pub const CommandOutputDisplayState = struct {
     open_command_block: ?usize = null,
 };
 
+pub const CodeHighlightTheme = code_highlight.Theme;
+
 pub const Styles = struct {
     system_notice_label_style: []const u8 = "",
     system_notice_text_style: []const u8 = "",
@@ -39,6 +41,7 @@ pub const Styles = struct {
     notice_warning_style: []const u8 = "",
     notice_error_style: []const u8 = "",
     notice_cancelled_style: []const u8 = "",
+    code_highlight_theme: CodeHighlightTheme = .dark,
 };
 
 pub const ToolFallbackDisposition = enum {
@@ -597,33 +600,60 @@ fn appendToolStatusSgrReplay(alloc: Allocator, out: *std.ArrayList(u8), text: []
     }
 }
 
-const CompactDiffPrefix = struct {
+const DiffPrefix = struct {
     text_start: usize,
     width: u16,
 };
 
-fn compactDiffPrefix(line: []const u8) ?CompactDiffPrefix {
-    const gutter_start = std.mem.indexOf(u8, line, "  │ ") orelse return null;
-    var prefix_index: usize = 0;
-    while (prefix_index < gutter_start) {
-        if (line[prefix_index] != 0x1b) return null;
-        const end = display_width.ansiSequenceEnd(line, prefix_index);
-        if (end <= prefix_index) return null;
-        prefix_index = end;
+fn skipDiffPrefixAnsi(line: []const u8, index: *usize) bool {
+    while (index.* < line.len and line[index.*] == 0x1b) {
+        const end = display_width.ansiSequenceEnd(line, index.*);
+        if (end <= index.*) return false;
+        index.* = end;
     }
+    return true;
+}
 
-    var number_end = gutter_start + "  │ ".len;
-    while (number_end < line.len and line[number_end] == ' ') : (number_end += 1) {}
-    const digit_start = number_end;
-    while (number_end < line.len and std.ascii.isDigit(line[number_end])) : (number_end += 1) {}
-    if (digit_start == number_end or number_end + 2 >= line.len) return null;
-    if (line[number_end] != ' ' or line[number_end + 2] != ' ') return null;
-    switch (line[number_end + 1]) {
+fn consumeDiffPrefixByte(line: []const u8, index: *usize, expected: u8) bool {
+    if (!skipDiffPrefixAnsi(line, index)) return false;
+    if (index.* >= line.len or line[index.*] != expected) return false;
+    index.* += 1;
+    return true;
+}
+
+fn diffPrefix(line: []const u8) ?DiffPrefix {
+    var index: usize = 0;
+    if (!consumeDiffPrefixByte(line, &index, ' ')) return null;
+    if (!consumeDiffPrefixByte(line, &index, ' ')) return null;
+    if (!skipDiffPrefixAnsi(line, &index)) return null;
+    if (!std.mem.startsWith(u8, line[index..], "│")) return null;
+    index += "│".len;
+    if (!consumeDiffPrefixByte(line, &index, ' ')) return null;
+
+    while (true) {
+        if (!skipDiffPrefixAnsi(line, &index)) return null;
+        if (index >= line.len or line[index] != ' ') break;
+        index += 1;
+    }
+    var digit_count: usize = 0;
+    while (true) {
+        if (!skipDiffPrefixAnsi(line, &index)) return null;
+        if (index >= line.len or !std.ascii.isDigit(line[index])) break;
+        digit_count += 1;
+        index += 1;
+    }
+    if (digit_count == 0) return null;
+    if (!consumeDiffPrefixByte(line, &index, ' ')) return null;
+    if (!skipDiffPrefixAnsi(line, &index) or index >= line.len) return null;
+    switch (line[index]) {
         '+', '-', ' ' => {},
         else => return null,
     }
+    index += 1;
+    if (!consumeDiffPrefixByte(line, &index, ' ')) return null;
+    if (!skipDiffPrefixAnsi(line, &index)) return null;
 
-    const text_start = number_end + 3;
+    const text_start = index;
     const width = std.math.cast(u16, display_width.visibleWidthIgnoringAnsi(line[0..text_start])) orelse return null;
     if (width < 4) return null;
     return .{ .text_start = text_start, .width = width };
@@ -652,11 +682,11 @@ fn appendSgrTransitions(
     }
 }
 
-fn reflowCompactDiffRow(
+fn reflowDiffRow(
     alloc: Allocator,
     out: *std.ArrayList(u8),
     line: []const u8,
-    prefix: CompactDiffPrefix,
+    prefix: DiffPrefix,
     cols: u16,
 ) !void {
     try out.appendSlice(alloc, line[0..prefix.text_start]);
@@ -702,7 +732,9 @@ fn reflowCompactDiffRow(
     }
 }
 
-fn reflowCompactDiffBlock(alloc: Allocator, text: []const u8, cols: u16) ![]u8 {
+/// Reflows logical diff rows for the current terminal width. The caller owns
+/// the returned bytes.
+pub fn reflowDiffBlock(alloc: Allocator, text: []const u8, cols: u16) ![]u8 {
     if (cols == 0 or text.len == 0) return alloc.dupe(u8, text);
 
     var out: std.ArrayList(u8) = .empty;
@@ -712,9 +744,9 @@ fn reflowCompactDiffBlock(alloc: Allocator, text: []const u8, cols: u16) ![]u8 {
         const newline = std.mem.indexOfScalarPos(u8, text, start, '\n');
         const end = newline orelse text.len;
         const line = text[start..end];
-        if (compactDiffPrefix(line)) |prefix| {
+        if (diffPrefix(line)) |prefix| {
             if (prefix.width < cols) {
-                try reflowCompactDiffRow(alloc, &out, line, prefix, cols);
+                try reflowDiffRow(alloc, &out, line, prefix, cols);
             } else {
                 try out.appendSlice(alloc, line);
             }
@@ -865,6 +897,15 @@ pub fn renderCodeBlockForTranscript(
     block: assistant_presentation.CodeBlockPayload,
     cols: u16,
 ) ![]u8 {
+    return renderCodeBlockForTranscriptWithTheme(alloc, block, cols, .dark);
+}
+
+fn renderCodeBlockForTranscriptWithTheme(
+    alloc: Allocator,
+    block: assistant_presentation.CodeBlockPayload,
+    cols: u16,
+    theme: CodeHighlightTheme,
+) ![]u8 {
     var rendered: std.ArrayList(u8) = .empty;
     errdefer rendered.deinit(alloc);
     if (cols == 0) return rendered.toOwnedSlice(alloc);
@@ -880,7 +921,7 @@ pub fn renderCodeBlockForTranscript(
     else
         "";
     const styled_code = if (profile) |resolved|
-        try code_highlight.highlight(alloc, block.code, resolved)
+        try code_highlight.highlight(alloc, block.code, resolved, theme)
     else
         null;
     defer if (styled_code) |code| alloc.free(code);
@@ -1518,7 +1559,7 @@ fn renderEntryToBlockForPresentationInterruptible(
             const preview = try formatToolStatusPreview(alloc, e.bytes, cols);
             break :blk try normalizeOwnedRenderedBlock(alloc, kind, preview);
         } else if (e.class == .diff_block and presentation == .compact) blk: {
-            const compact = try reflowCompactDiffBlock(alloc, e.bytes, cols);
+            const compact = try reflowDiffBlock(alloc, e.bytes, cols);
             break :blk try normalizeOwnedRenderedBlock(alloc, kind, compact);
         } else try normalizeRenderedBlockTail(alloc, kind, e.bytes),
         .semantic_notice => |e| blk: {
@@ -1570,7 +1611,12 @@ fn renderEntryToBlockForPresentationInterruptible(
         },
         .assistant_code_block => |e| blk: {
             const gutter = assistant_wrap.gutterWidth(cols);
-            const rendered = try renderCodeBlockForTranscript(alloc, e.block, cols -| gutter);
+            const rendered = try renderCodeBlockForTranscriptWithTheme(
+                alloc,
+                e.block,
+                cols -| gutter,
+                styles.code_highlight_theme,
+            );
             defer alloc.free(rendered);
             const prefixed = try assistant_wrap.prefixStructuralRows(alloc, rendered, gutter);
             break :blk try normalizeOwnedRenderedBlock(alloc, kind, prefixed);
@@ -3052,6 +3098,30 @@ test "renderCodeBlockForTranscript highlights registered profiles without stylin
     try std.testing.expect(std.mem.indexOf(u8, raw, "+++[>+++<-]") != null);
 }
 
+test "semantic code blocks use the light syntax palette when requested" {
+    const alloc = std.testing.allocator;
+    const language = try alloc.dupe(u8, "zig");
+    defer alloc.free(language);
+    const code = try alloc.dupe(u8, "const value = \"ready\"; // comment");
+    defer alloc.free(code);
+    const entry = TranscriptEntry{ .assistant_code_block = .{
+        .id = 1,
+        .block = .{
+            .language = language,
+            .code = code,
+        },
+    } };
+
+    const rendered = try renderEntryToBlock(alloc, entry, 80, .{
+        .code_highlight_theme = .light,
+    });
+    defer rendered.deinit(alloc);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered.bytes, "\x1b[38;5;238mconst\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered.bytes, "\x1b[38;5;241m\"ready\"\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered.bytes, "\x1b[38;5;243m// comment\x1b[39m") != null);
+}
+
 test "renderCodeBlockForTranscript infers registered high-confidence code blocks" {
     const alloc = std.testing.allocator;
     const unlabeled_language = try alloc.dupe(u8, "");
@@ -3399,8 +3469,8 @@ test "compact diff blocks reflow styled rows inside their gutters" {
     const source =
         "\x1b]9050;17\x07" ++
         "\x1b[38;5;245m  │ 2   CONTEXT_ROW_MARKER with a deliberately long value that must wrap inside the gutter\x1b[0m\n" ++
-        "\x1b[38;5;252m  │ 3 - REMOVED_ROW_MARKER with a deliberately long value that must wrap inside the gutter\x1b[0m\n" ++
-        "\x1b[38;5;252m  │ 3 + MUTATION_NEW_MARKER with a deliberately long replacement value that must wrap correctly in the diff preview\x1b[0m\n" ++
+        "\x1b[38;5;252m  │ \x1b[38;5;203m3 -\x1b[38;5;252m REMOVED_ROW_MARKER with a deliberately long value that must wrap inside the gutter\x1b[0m\n" ++
+        "\x1b[38;5;252m  │ \x1b[38;5;77m3 +\x1b[38;5;252m MUTATION_NEW_MARKER with a deliberately long replacement value that must wrap correctly in the diff preview\x1b[0m\n" ++
         "\x1b]9051;17\x07";
     var entries: std.ArrayList(TranscriptEntry) = .empty;
     defer deinitTestEntries(&entries, alloc);
@@ -3409,8 +3479,8 @@ test "compact diff blocks reflow styled rows inside their gutters" {
     const narrow = try renderEntriesToBytes(alloc, entries.items, 48, .{});
     defer alloc.free(narrow);
     try std.testing.expect(std.mem.indexOf(u8, narrow, "\x1b[0m\n\x1b[38;5;245m  │     ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, narrow, "\x1b[0m\n\x1b[38;5;252m  │     ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, narrow, "\x1b[0m\n\x1b[38;5;252m  │     ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, narrow, "\x1b[0m\n\x1b[38;5;252m\x1b[38;5;203m\x1b[38;5;252m  │     ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, narrow, "\x1b[0m\n\x1b[38;5;252m\x1b[38;5;77m\x1b[38;5;252m  │     ") != null);
     try std.testing.expect(std.mem.indexOf(u8, narrow, "CONTEXT_ROW_MARKER") != null);
     try std.testing.expect(std.mem.indexOf(u8, narrow, "REMOVED_ROW_MARKER") != null);
     try std.testing.expect(std.mem.indexOf(u8, narrow, "MUTATION_NEW_MARKER") != null);
@@ -3422,6 +3492,30 @@ test "compact diff blocks reflow styled rows inside their gutters" {
         try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 48);
     }
     try std.testing.expectEqualStrings(source, entries.items[0].raw_bytes.bytes);
+}
+
+test "diff block reflow preserves fitting malformed and unicode rows" {
+    const alloc = std.testing.allocator;
+    const fitting = "\x1b[38;5;252m  │ \x1b[38;5;203m1 -\x1b[38;5;252m short λ value\x1b[0m\n";
+    const wide = try reflowDiffBlock(alloc, fitting, 80);
+    defer alloc.free(wide);
+    try std.testing.expectEqualStrings(fitting, wide);
+
+    const malformed = "\x1b[38;5;252m  │ not-a-diff-row that remains byte-identical\x1b[0m\n";
+    const unchanged = try reflowDiffBlock(alloc, malformed, 16);
+    defer alloc.free(unchanged);
+    try std.testing.expectEqualStrings(malformed, unchanged);
+
+    const unicode = "\x1b[38;5;252m  │ \x1b[38;5;77m2 +\x1b[38;5;252m 😀😀😀😀UNICODE_TAIL\x1b[0m\n";
+    const narrow = try reflowDiffBlock(alloc, unicode, 16);
+    defer alloc.free(narrow);
+    try std.testing.expect(std.mem.indexOf(u8, narrow, "  │     UNICODE_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, narrow, "TAIL") != null);
+    var lines = std.mem.splitScalar(u8, narrow, '\n');
+    while (lines.next()) |line| {
+        if (display_width.visibleWidthIgnoringAnsi(line) == 0) continue;
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 16);
+    }
 }
 
 test "renderEntriesToBytes normalizes raw byte entry tails and inserts block gaps" {

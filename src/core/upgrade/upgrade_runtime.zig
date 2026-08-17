@@ -83,7 +83,7 @@ fn completeRunResult(
     const latest = target.version();
     const latest_revision = target.revision() orelse "";
 
-    if (target.isCurrent(current)) {
+    if (!target.shouldInstall(current)) {
         return .{
             .snapshot = .{
                 .current = versionLabel(current.version),
@@ -177,14 +177,15 @@ fn upgradeWorkerInner(
     progress: *ProgressState,
     show_progress: bool,
 ) !void {
-    const fetched_target = helpers.fetchTarget(alloc, channel, helpers.cdn_base) catch {
+    const cdn_base = helpers.resolveCdnBase();
+    const fetched_target = helpers.fetchTarget(alloc, channel, cdn_base) catch {
         result.err = .fetch_failed;
         return;
     };
     result.target_owned = fetched_target;
     const target = result.target_owned.?;
 
-    if (target.isCurrent(current)) return;
+    if (!target.shouldInstall(current)) return;
     progress.markUpdateFound();
     if (show_progress) io_mod.sleep(found_hold_ns);
 
@@ -204,7 +205,7 @@ fn upgradeWorkerInner(
     const archive_path = try std.fmt.allocPrint(alloc, "{s}/fx.tar.gz", .{tmp_dir});
     defer alloc.free(archive_path);
 
-    const archive_url = try std.fmt.allocPrint(alloc, "{s}/{s}/fx-{s}.tar.gz", .{ helpers.cdn_base, target.artifactRef(), helpers.platform });
+    const archive_url = try std.fmt.allocPrint(alloc, "{s}/{s}/fx-{s}.tar.gz", .{ cdn_base, target.artifactRef(), helpers.platform });
     defer alloc.free(archive_url);
 
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
@@ -220,7 +221,7 @@ fn upgradeWorkerInner(
     };
     progress.markFinishing();
 
-    const checksum_url = try std.fmt.allocPrint(alloc, "{s}/{s}/fx-{s}.tar.gz.sha256", .{ helpers.cdn_base, target.artifactRef(), helpers.platform });
+    const checksum_url = try std.fmt.allocPrint(alloc, "{s}/{s}/fx-{s}.tar.gz.sha256", .{ cdn_base, target.artifactRef(), helpers.platform });
     defer alloc.free(checksum_url);
 
     helpers.verifyChecksum(&client, archive_path, checksum_url) catch |err| {
@@ -442,6 +443,22 @@ test "completeRunResult reports upgraded when latest differs" {
     try std.testing.expectEqual(output_contracts.UpgradeSnapshot.Status.upgraded, result.snapshot.status);
     try std.testing.expectEqualStrings("0.2.10", result.snapshot.current);
     try std.testing.expectEqualStrings("0.2.11", result.snapshot.latest);
+}
+
+test "completeRunResult reports no update for an older stable target" {
+    const alloc = std.testing.allocator;
+    const target = try update_target.Target.initStable(alloc, "v0.0.1");
+
+    var result = try completeRunResult(alloc, .{
+        .channel = .stable,
+        .version = "0.0.2",
+        .revision = "0123456789ab",
+    }, .stable, .{ .target_owned = target });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(output_contracts.UpgradeSnapshot.Status.up_to_date, result.snapshot.status);
+    try std.testing.expectEqualStrings("0.0.2", result.snapshot.current);
+    try std.testing.expectEqualStrings("0.0.1", result.snapshot.latest);
 }
 
 test "completeRunResult maps worker errors and frees latest version" {

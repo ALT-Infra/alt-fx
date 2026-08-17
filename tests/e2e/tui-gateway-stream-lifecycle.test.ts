@@ -2480,10 +2480,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       mkdirSync(workspacePath, { recursive: true });
       writeFileSync(join(home, ".fx", "settings.json"), "{}");
       writeFileSync(
-        join(workspacePath, "CLAUDE.md"),
-        "# Workspace instructions\n",
+        join(root, "outside-instructions.md"),
+        "# Outside instructions\n",
       );
-      symlinkSync("CLAUDE.md", join(workspacePath, "AGENTS.md"));
+      symlinkSync("../outside-instructions.md", join(workspacePath, "AGENTS.md"));
       const workspace = realpathSync(workspacePath);
 
       const heldGateway = startFakeGateway([
@@ -5117,12 +5117,13 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "dynamic MCP approval shows exact arguments and gates deny and allow",
+    "dynamic MCP approval shows exact arguments and preserves deny once and session scope",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-mcp-approval-")));
       const dynamicToolName = "mcp_fixture_echo";
       const argumentSentinel = "FXC194_ARGUMENT_SENTINEL";
-      for (const decision of ["deny", "allow"] as const) {
+      const secondArgumentSentinel = "FXC194_SECOND_ARGUMENT_SENTINEL";
+      for (const decision of ["deny", "allow", "session"] as const) {
         const runRoot = join(root, decision);
         const home = join(runRoot, "home");
         const workspace = join(runRoot, "workspace");
@@ -5160,6 +5161,20 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
               finishReason: { unified: "tool-calls", raw: "tool-calls" },
             },
           ]),
+          ...(decision === "session"
+            ? [fakeGatewaySse([
+              {
+                type: "tool-call",
+                toolCallId: "call_approval_mcp_session_second",
+                toolName: dynamicToolName,
+                input: { text: secondArgumentSentinel },
+              },
+              {
+                type: "finish",
+                finishReason: { unified: "tool-calls", raw: "tool-calls" },
+              },
+            ])]
+            : []),
           fakeGatewayFinalText(finalText),
         ]);
         gateway = mcpGateway;
@@ -5185,19 +5200,32 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
           await session.waitForComposer(TIMEOUT);
           await session.sendText("Run the MCP fixture with the exact sentinel.");
-          const approval = await session.waitForText(APPROVAL_PROMPT, TIMEOUT);
+          const approval = await session.waitForText(
+            "Allow this MCP tool call?",
+            TIMEOUT,
+          );
+          expect(approval).toContain("MCP tool");
+          expect(approval).toContain("Arguments for this request");
+          expect(approval).toContain("Allow once");
+          expect(approval).toContain("Allow this MCP tool for this session");
+          expect(approval).toContain("Deny");
           expect(approval).toContain(dynamicToolName);
           expect(approval).toContain(`{"text":"${argumentSentinel}"}`);
           expect(existsSync(fixture.callStartedPath)).toBe(false);
 
-          await session.sendLiteralText(decision === "deny" ? "3" : "1");
+          await session.sendLiteralText(
+            decision === "deny" ? "3" : decision === "session" ? "2" : "1",
+          );
           await session.waitForText(finalText, TIMEOUT);
           if (decision === "deny") {
             expect(existsSync(fixture.callStartedPath)).toBe(false);
           } else {
             const calls = readDelayedMcpCalls(fixture.callStartedPath);
-            expect(calls).toHaveLength(1);
+            expect(calls).toHaveLength(decision === "session" ? 2 : 1);
             expect(calls[0]?.arguments).toEqual({ text: argumentSentinel });
+            if (decision === "session") {
+              expect(calls[1]?.arguments).toEqual({ text: secondArgumentSentinel });
+            }
           }
           expect(readFileSync(stderrPath, "utf8")).toBe("");
         } finally {
@@ -5306,7 +5334,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
           await session.waitForComposer(TIMEOUT);
           await session.sendText(parentPrompt);
-          const approval = await session.waitForText(APPROVAL_PROMPT, TIMEOUT);
+          const approval = await session.waitForText(
+            "Allow this MCP tool call?",
+            TIMEOUT,
+          );
           expect(approval).toContain(dynamicToolName);
           expect(approval).toContain(`{"text":"${argumentSentinel}"}`);
           expect(existsSync(fixture.callStartedPath)).toBe(false);
@@ -5411,7 +5442,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Run the MCP fixture with overlong arguments.");
-      const approval = await session.waitForText(APPROVAL_PROMPT, TIMEOUT);
+      const approval = await session.waitForText(
+        "Allow this MCP tool call?",
+        TIMEOUT,
+      );
       expect(approval).toContain(dynamicToolName);
       expect(approval).toContain("FXC194_OVER");
       expect(approval).toContain("…");
@@ -5501,7 +5535,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       let mcpStatus = "";
       const readyStatus = "fixture source=profile scope=profile policy=optional transport=stdio state=ready";
       while (Date.now() < readyDeadline) {
-        await session.sendText("/mcp");
+        await session.sendText("/mcp list");
         mcpStatus = await session.captureFullScrollback();
         if (mcpStatus.includes(readyStatus)) break;
         await Bun.sleep(100);
@@ -5804,8 +5838,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.sendKeys("Right");
       const full = await session.waitForText("Full detail · ←/→ switch · ctrl o close", TIMEOUT);
-      expect(full).toContain("● 3 tool calls · 3 commands");
-      expect(full).not.toContain(workspace);
+      expect(full).toContain(finalText);
+      await session.sendKeys("PPage");
+      const fullAtSummary = await session.waitForText("● 3 tool calls · 3 commands", TIMEOUT);
+      expect(fullAtSummary).toContain("● 3 tool calls · 3 commands");
+      expect(fullAtSummary).not.toContain(workspace);
 
       const trace = readFileSync(tracePath, "utf8");
       for (const callId of [
@@ -7521,6 +7558,107 @@ describe.skipIf(!tmuxAvailable())("transcript scrollback release", () => {
       yolo_acknowledged: true,
     });
   }
+
+  test(
+    "closed tool groups enter native scrollback before the turn finishes",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-sb-tool-groups-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      for (let index = 1; index <= 3; index += 1) {
+        writeFileSync(join(workspace, `source-${index}.txt`), `source ${index}\n`);
+      }
+      writeFileSync(join(home, ".fx", "settings.json"), sbSettings());
+      writeFileSync(stderrPath, "");
+
+      const finalText = "TOOL_GROUP_SCROLLBACK_FINAL";
+      gateway = startFakeGateway([
+        sbToolCallBatch(
+          Array.from({ length: 3 }, (_, index) => ({
+            id: `group-a-read-${index + 1}`,
+            name: "read_file",
+            input: { path: `source-${index + 1}.txt` },
+          })),
+          "FIRST_GROUP_INTRO",
+        ),
+        sbToolCallBatch(
+          [
+            {
+              id: "group-b-command",
+              name: "run_command",
+              input: { command: "sleep 5; printf HELD_COMMAND_DONE" },
+            },
+          ],
+          "SECOND_GROUP_INTRO",
+        ),
+        fakeGatewayFinalText(finalText),
+      ]);
+      const fakeGateway = gateway as ReturnType<typeof startFakeGateway>;
+
+      session = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: workspace,
+        width: 80,
+        height: 14,
+        minimumHistoryLines: 10_000,
+        stderrPath,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-sb-tool-groups-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_GATEWAY_BASE_URL: fakeGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: fakeGateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: fakeGateway.chatUrl,
+          FX_MODEL: MODEL,
+          FX_MAX_AGENT_STEPS: "4",
+        },
+      });
+
+      const assertClosedGroupOnce = (scrollback: string, label: string) => {
+        expect(
+          countOccurrences(scrollback, "FIRST_GROUP_INTRO"),
+          `${label}: first intro`,
+        ).toBe(1);
+        expect(
+          countOccurrences(scrollback, "● 3 tool calls · 3 read"),
+          `${label}: first header`,
+        ).toBe(1);
+        for (let index = 1; index <= 3; index += 1) {
+          expect(
+            countOccurrences(scrollback, `Read source-${index}.txt`),
+            `${label}: source ${index}`,
+          ).toBe(1);
+        }
+      };
+
+      await session.waitForComposer(SB_TIMEOUT);
+      await session.sendText("Run the two prepared groups.");
+      await session.waitForText("Running sleep 5; printf HELD_COMMAND_DONE", SB_TIMEOUT);
+      await Bun.sleep(150);
+
+      const beforeResize = await session.captureFullScrollback();
+      assertClosedGroupOnce(beforeResize, "before resize");
+      expect(beforeResize).toContain("SECOND_GROUP_INTRO");
+
+      await session.resizeWindow(81, 15, 500);
+      const afterResize = await session.captureFullScrollback();
+      assertClosedGroupOnce(afterResize, "after resize");
+      expect(afterResize).toContain("SECOND_GROUP_INTRO");
+
+      await session.waitForText(finalText, SB_TIMEOUT);
+      await session.waitForPane(hasEmptyComposer, SB_TIMEOUT);
+      const completed = await session.captureFullScrollback();
+      assertClosedGroupOnce(completed, "after completion");
+      expect(countOccurrences(completed, finalText)).toBe(1);
+      expect(fakeGateway.requests).toHaveLength(3);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    SB_TIMEOUT + 30_000,
+  );
 
   test(
     "sequential tool group and streamed markdown keep native scrollback final",

@@ -5421,6 +5421,7 @@ describe("effect-aware command permissions", () => {
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Create interactive 64 KiB delivery fixture.");
       await activeSession.waitForText("INTERACTIVE_64K_PARENT_FIRST_DONE", TIMEOUT);
+      await waitForGatewayRequestCount(gateway, 4);
       expect(gateway.requests).toHaveLength(4);
       expect(childId.length).toBeGreaterThan(0);
       expect(messageEventId.length).toBeGreaterThan(0);
@@ -5500,7 +5501,23 @@ describe("effect-aware command permissions", () => {
         [...scrollback.matchAll(/PERMISSIONS_SCROLLBACK_LINE_\d{2}/g)].map(
           (match) => match[0],
         );
-      const beforeScrollback = await activeSession.captureFullScrollback();
+      const waitForExpectedScrollback = async () => {
+        const deadline = Date.now() + TIMEOUT;
+        let latest = "";
+        while (Date.now() < deadline) {
+          latest = await activeSession!.captureFullScrollback();
+          const markers = extractMarkers(latest);
+          if (
+            markers.length === expectedMarkers.length &&
+            markers.every((marker, index) => marker === expectedMarkers[index])
+          ) return latest;
+          await Bun.sleep(100);
+        }
+        throw new Error(
+          `Timed out waiting for complete permissions scrollback.\nScrollback:\n${latest}`,
+        );
+      };
+      const beforeScrollback = await waitForExpectedScrollback();
       expect(extractMarkers(beforeScrollback)).toEqual(expectedMarkers);
       const traceOffset = readFileSync(tracePath, "utf8").length;
 
@@ -5530,7 +5547,7 @@ describe("effect-aware command permissions", () => {
         45_000,
       );
 
-      const afterScrollback = await activeSession.captureFullScrollback();
+      const afterScrollback = await waitForExpectedScrollback();
       expect(extractMarkers(afterScrollback)).toEqual(expectedMarkers);
       expect([...afterScrollback.matchAll(/mode set to ask/g)]).toHaveLength(1);
       expect(afterScrollback.indexOf("mode set to ask")).toBeGreaterThan(

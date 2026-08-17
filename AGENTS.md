@@ -336,6 +336,21 @@ process baseline is diagnostic only and is never subtracted.
 
 When adding features, consider their impact on startup latency. The `fx help` path is the baseline cold-start benchmark.
 
+## Binary Size Observability
+
+Every pull request runs `.github/workflows/binary-size.yml` across Linux x86_64,
+Linux arm64, macOS x86_64, and macOS arm64. Each matrix job builds the pull
+request merge commit and its base commit as stripped ReleaseSafe binaries on
+the same native runner, then reports the exact byte and MiB delta plus ELF or
+Mach-O section changes.
+
+Each platform check is informational. An increase of at least 52,429 bytes
+(0.050000 MiB) emits a warning and retains that platform's binaries for
+investigation, but does not reject the pull request. Investigate notable
+unexplained growth before changing the threshold. The full macOS arm64 PGSO
+release qualification remains authoritative for the 7.800 MiB production
+ceiling and performance gates.
+
 ## Documentation
 
 When adding or changing user-facing features, update **all** relevant files:

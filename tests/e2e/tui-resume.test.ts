@@ -54,6 +54,7 @@ function shellQuote(value: string): string {
 function startUpgradeServer(
   root: string,
   argvLogPath: string,
+  version = "v9.9.9",
 ): { baseUrl: string; stop: () => void } {
   const artifactDir = join(root, "release-artifact");
   const wrapperPath = join(artifactDir, "fx");
@@ -77,13 +78,13 @@ exec ${shellQuote(FX_BIN)} "$@"
   const archive = readFileSync(archivePath);
   const checksum = createHash("sha256").update(archive).digest("hex");
   const platform = `${process.platform === "darwin" ? "macos" : "linux"}-${process.arch === "arm64" ? "aarch64" : "x86_64"}`;
-  const archiveRoute = `/v9.9.9/fx-${platform}.tar.gz`;
+  const archiveRoute = `/${version}/fx-${platform}.tar.gz`;
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
     fetch(request) {
       const path = new URL(request.url).pathname;
-      if (path === "/latest.txt") return new Response("v9.9.9\n");
+      if (path === "/latest.txt") return new Response(`${version}\n`);
       if (path === archiveRoute) return new Response(archive);
       if (path === `${archiveRoute}.sha256`) return new Response(`${checksum}\n`);
       return new Response("not found", { status: 404 });
@@ -124,6 +125,23 @@ async function waitForScrollback(
     await Bun.sleep(100);
   }
   throw new Error(`Timed out waiting for ${marker}.\nScrollback:\n${latest}`);
+}
+
+async function waitForScrollbackMarkers(
+  session: TmuxSession,
+  markers: readonly string[],
+  timeout = TIMEOUT,
+): Promise<string> {
+  const deadline = Date.now() + timeout;
+  let latest = "";
+  while (Date.now() < deadline) {
+    latest = await session.captureFullScrollback();
+    if (markers.every((marker) => latest.includes(marker))) return latest;
+    await Bun.sleep(100);
+  }
+  throw new Error(
+    `Timed out waiting for scrollback markers ${markers.join(", ")}.\nScrollback:\n${latest}`,
+  );
 }
 
 function countOccurrences(text: string, needle: string): number {
@@ -1010,11 +1028,16 @@ test.skipIf(!tmuxAvailable())(
 
       await active.sendKeys("Right");
       await active.waitForText("Full detail · ←/→ switch · ctrl o close · PgUp/PgDn scroll · Esc close", TIMEOUT);
-      const expandedAtReviewAnchor = await active.capturePane();
-      expect(expandedAtReviewAnchor).toContain("command: awk");
-      expect(expandedAtReviewAnchor).toContain(commandArgumentTail);
-      expect(expandedAtReviewAnchor).toContain("FULL_CTRL_O_LINE_0001");
-      expect(expandedAtReviewAnchor).not.toContain(tailMarker);
+      const expandedAtTail = await active.capturePane();
+      expect(expandedAtTail).toContain(tailMarker);
+      expect(expandedAtTail).not.toContain("FULL_CTRL_O_LINE_0001");
+
+      await active.sendKeys(Array.from({ length: 140 }, () => "PPage").join(" "));
+      const expandedAtHead = await active.waitForText("command: awk", TIMEOUT);
+      expect(expandedAtHead).toContain(commandArgumentTail);
+      expect(expandedAtHead).toContain("FULL_CTRL_O_LINE_0001");
+      expect(expandedAtHead).not.toContain(tailMarker);
+
       await active.sendKeys(Array.from({ length: 140 }, () => "NPage").join(" "));
       await active.waitForText(tailMarker, TIMEOUT);
       const full = await active.capturePane();
@@ -2794,8 +2817,17 @@ test.skipIf(!tmuxAvailable())(
       }
 
       await active.sendKeys("C-o");
-      await active.waitForText(afterMarker, TIMEOUT);
-      const grid = await active.capturePaneGrid();
+      const fullTranscript = await active.waitForPane(
+        (pane) =>
+          pane.includes(beforeMarker) &&
+          pane.includes("1 tool call") &&
+          pane.includes("Ran ") &&
+          pane.includes("1 output line") &&
+          pane.includes(outputMarker) &&
+          pane.includes(afterMarker),
+        TIMEOUT,
+      );
+      const grid = fullTranscript.replace(/\n$/, "").split("\n");
       const before = grid.findIndex((line) => line.includes(beforeMarker));
       const header = grid.findIndex((line) => line.includes("1 tool call"));
       const tool = grid.findIndex((line) => line.includes("Ran "));
@@ -3521,7 +3553,12 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText("Would you like to run the following command?", TIMEOUT);
       await active.sendKeys("1");
       await active.sendKeys("Enter");
-      const setupScrollback = await waitForScrollback(active, setupSentinel);
+      const setupScrollback = await waitForScrollbackMarkers(active, [
+        assistantHead,
+        assistantTail,
+        setupCompactLine,
+        setupSentinel,
+      ]);
       expect(setupScrollback).toContain(assistantHead);
       expect(setupScrollback).toContain(assistantTail);
       expect(setupScrollback).toContain(setupCompactLine);
@@ -4001,7 +4038,7 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
-  "deferred scoped tools remain not executed after resume",
+  "context-deferred scoped tools remain deferred after resume",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-resume-deferred-tools-")));
     const home = join(root, "home");
@@ -4022,7 +4059,7 @@ test.skipIf(!tmuxAvailable())(
     writeFileSync(resumeStderrPath, "");
 
     const workspaceRoot = realpathSync(workspace);
-    const command = "cat nested/input.txt";
+    const command = "printf 'effectful payload\\n' > output.txt";
     const failureCommand = "printf 'ordinary-failure-control\\n' >&2; exit 7";
     const finalMarker = "DEFERRED_TOOL_RESUME_COMPLETE";
     const gateway = startFakeGateway([
@@ -4038,7 +4075,7 @@ test.skipIf(!tmuxAvailable())(
         {
           type: "tool-input-delta",
           id: "deferred-command",
-          delta: JSON.stringify({ command }),
+          delta: JSON.stringify({ command, cwd: "nested" }),
         },
         { type: "tool-input-end", id: "deferred-command" },
         {
@@ -4051,7 +4088,7 @@ test.skipIf(!tmuxAvailable())(
           type: "tool-call",
           toolCallId: "deferred-command",
           toolName: "run_command",
-          input: { command },
+          input: { command, cwd: "nested" },
         },
         { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
       ]),
@@ -4066,7 +4103,7 @@ test.skipIf(!tmuxAvailable())(
           type: "tool-call",
           toolCallId: "reissued-command",
           toolName: "run_command",
-          input: { command },
+          input: { command, cwd: "nested" },
         },
         {
           type: "tool-call",
@@ -4082,14 +4119,13 @@ test.skipIf(!tmuxAvailable())(
     let active: TmuxSession | null = null;
 
     function expectDeferredPresentation(scrollback: string): void {
-      expect(scrollback).toContain("⊘ Not executed nested/input.txt");
-      expect(scrollback).toContain("⊘ Not executed cat nested/input.txt");
-      expect(countOccurrences(scrollback, "Not executed")).toBe(2);
+      expect(scrollback).toContain(`↻ Context updated ${command}`);
+      expect(countOccurrences(scrollback, "Context updated")).toBe(1);
+      expect(scrollback).not.toContain("Not executed");
       expect(scrollback).not.toContain("● Failed nested/input.txt");
-      expect(scrollback).not.toContain("● Failed cat nested/input.txt");
-      expect(scrollback).not.toContain("\nNot executed\n");
+      expect(scrollback).not.toContain(`● Failed ${command}`);
       expect(scrollback).toContain("● Read nested/input.txt");
-      expect(scrollback).toContain("● Ran cat nested/input.txt");
+      expect(scrollback).toContain(`● Ran ${command}`);
       expect(scrollback).toContain(`● Ran ${failureCommand}`);
       expect(scrollback).toContain("│ exit code 7");
     }
@@ -4105,7 +4141,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText(
-        "Read nested/input.txt, run cat nested/input.txt, and exercise the failure control.",
+        "Read nested/input.txt, write nested/output.txt from that directory, and exercise the failure control.",
       );
       await waitForScrollback(active, finalMarker);
       await waitForCondition(
@@ -4136,16 +4172,16 @@ test.skipIf(!tmuxAvailable())(
       await active.sendKeys("C-o");
       const detail = await active.waitForPane(
         (pane) =>
-          pane.includes("⊘ Not executed nested/input.txt") &&
-          pane.includes("⊘ Not executed cat nested/input.txt") &&
+          pane.includes(`↻ Context updated ${command}`) &&
           pane.includes("ordinary-failure-control"),
         TIMEOUT,
       );
-      expect(countOccurrences(detail, "Not executed")).toBe(2);
-      expect(detail).not.toContain("\nNot executed\n");
+      expect(countOccurrences(detail, "Context updated")).toBe(1);
+      expect(detail).not.toContain("Not executed");
       expect(detail).not.toContain('{"path":"nested/input.txt"}');
-      expect(detail).not.toContain('{"command":"cat nested/input.txt"}');
+      expect(detail).not.toContain(JSON.stringify({ command, cwd: "nested" }));
       expect(detail).toContain(failureCommand);
+      expect(detail).toContain("1 deferred");
       expect(detail).toContain("1 failed");
       expect(readFileSync(resumeStderrPath, "utf8")).toBe("");
 
@@ -5340,19 +5376,21 @@ printf '${stdoutTail2}\\n'
       await session.waitForText("┃ Review · ←/→ switch · ctrl o close", TIMEOUT);
       await session.sendKeys("Right");
       await session.waitForText("┃ Full detail · ←/→ switch · ctrl o close", TIMEOUT);
-      const beforePageDown = await session.capturePane();
-      expect(beforePageDown).toContain(`│ ${firstMarker}`);
-      expect(countOccurrences(beforePageDown, firstMarker)).toBe(1);
-      expect(beforePageDown).not.toContain(stdoutTail2);
-      const pages = [beforePageDown];
-      for (let page = 0; page < 8 && !pages.at(-1)!.includes(stdoutTail2); page += 1) {
-        await session.sendHexBytes(["1b", "5b", "36", "7e"]);
+      const tail = await session.capturePane();
+      expect(tail).toContain(stdoutTail2);
+      expect(tail).not.toContain(firstMarker);
+
+      const pages = [tail];
+      for (let page = 0; page < 8 && !pages.at(-1)!.includes(firstMarker); page += 1) {
+        await session.sendHexBytes(["1b", "5b", "35", "7e"]);
         const next = await waitForChangedPane(session, pages.at(-1)!);
         if (next === null) break;
         pages.push(next);
       }
-      const tail = pages.at(-1)!;
-      const output = pages.join("\n").split("\n").filter((line) =>
+      const head = pages.at(-1)!;
+      expect(head).toContain(`│ ${firstMarker}`);
+      expect(countOccurrences(head, firstMarker)).toBe(1);
+      const output = [...pages].reverse().join("\n").split("\n").filter((line) =>
         line.trimStart().startsWith("│ ") && !line.includes("command:")
       ).join("\n");
       for (const marker of orderedTailMarkers) {

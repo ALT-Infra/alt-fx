@@ -131,18 +131,11 @@ pub const Target = union(Channel) {
         };
     }
 
-    pub fn isCurrent(self: Target, current: CurrentBuild) bool {
-        if (self.channel() != current.channel) return false;
-        return switch (self) {
-            .stable => |stable| versionsEqual(stable.version, current.version),
-            .dev => |dev| revisionsEqual(dev.revision, current.revision),
-        };
-    }
-
-    pub fn shouldInstallAutomatically(self: Target, current: CurrentBuild) bool {
+    pub fn shouldInstall(self: Target, current: CurrentBuild) bool {
         if (self.channel() != current.channel) return true;
         return switch (self) {
-            .stable => |stable| compareVersions(stable.version, current.version) == .gt,
+            .stable => |stable| compareVersions(stable.version, current.version) == .gt or
+                isPublicResetBridge(current.version, stable.version),
             .dev => |dev| !revisionsEqual(dev.revision, current.revision),
         };
     }
@@ -212,6 +205,10 @@ fn shortRevision(revision: []const u8) []const u8 {
     return revision[0..@min(revision.len, 12)];
 }
 
+fn isPublicResetBridge(current: []const u8, target: []const u8) bool {
+    return versionsEqual(current, "0.4.5") and versionsEqual(target, "0.0.1");
+}
+
 test "channel parsing accepts only stable and dev" {
     try std.testing.expectEqual(Channel.stable, Channel.parse("stable").?);
     try std.testing.expectEqual(Channel.dev, Channel.parse("DEV").?);
@@ -252,6 +249,48 @@ test "dev manifest rejects malformed and oversized external data" {
     );
 }
 
+test "stable ordering permits only the exact public reset from the bridge" {
+    const alloc = std.testing.allocator;
+    var reset = try Target.initStable(alloc, "v0.0.1");
+    defer reset.deinit(alloc);
+    var other_reset = try Target.initStable(alloc, "v0.0.2");
+    defer other_reset.deinit(alloc);
+
+    try std.testing.expect(reset.shouldInstall(.{
+        .channel = .stable,
+        .version = "0.4.5",
+        .revision = "0123456789ab",
+    }));
+    try std.testing.expect(!reset.shouldInstall(.{
+        .channel = .stable,
+        .version = "0.4.4",
+        .revision = "0123456789ab",
+    }));
+    try std.testing.expect(!other_reset.shouldInstall(.{
+        .channel = .stable,
+        .version = "0.4.5",
+        .revision = "0123456789ab",
+    }));
+}
+
+test "stable release ordering rejects older targets and preserves channel switching" {
+    const alloc = std.testing.allocator;
+    var older = try Target.initStable(alloc, "v0.0.1");
+    defer older.deinit(alloc);
+    const newer_current = CurrentBuild{
+        .channel = .stable,
+        .version = "0.0.2",
+        .revision = "0123456789ab",
+    };
+
+    try std.testing.expect(!older.shouldInstall(newer_current));
+    try std.testing.expect(older.shouldInstall(.{
+        .channel = .dev,
+        .version = "0.0.2",
+        .revision = "abcdef012345",
+    }));
+}
+
 test "target freshness uses version for stable and revision for dev" {
     const alloc = std.testing.allocator;
     var stable = try Target.initStable(alloc, "v0.3.63");
@@ -261,15 +300,15 @@ test "target freshness uses version for stable and revision for dev" {
         .version = "0.3.62",
         .revision = "0123456789ab",
     };
-    try std.testing.expect(stable.shouldInstallAutomatically(stable_current));
+    try std.testing.expect(stable.shouldInstall(stable_current));
 
     var dev = try Target.parseDevManifest(
         alloc,
         "{\"version\":\"0.3.62\",\"commit\":\"abcdef0123456789abcdef0123456789abcdef01\"}",
     );
     defer dev.deinit(alloc);
-    try std.testing.expect(dev.shouldInstallAutomatically(stable_current));
-    try std.testing.expect(dev.isCurrent(.{
+    try std.testing.expect(dev.shouldInstall(stable_current));
+    try std.testing.expect(!dev.shouldInstall(.{
         .channel = .dev,
         .version = "0.3.62",
         .revision = "abcdef012345",

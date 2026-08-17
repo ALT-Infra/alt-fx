@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("core/shared/io.zig");
 
-pub const version = "0.4.4";
+pub const version = "0.0.1";
 
 const app_lifecycle = @import("core/app/app_lifecycle.zig");
 const auth_runtime = @import("core/auth/auth_runtime.zig");
@@ -1357,14 +1357,18 @@ const App = struct {
         );
     }
 
-    pub fn reloadMcp(self: *App) !app_mcp_runtime.ReloadOutcome {
-        return self.mcp.reload(
+    pub fn beginMcpReload(self: *App) !void {
+        return self.mcp.beginReload(
             self.alloc,
             .{ .form = true, .url = true },
             if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
             self.toolRegistry(),
             @intCast(@max(io_mod.milliTimestamp(), 0)),
         );
+    }
+
+    pub fn takeMcpReloadCompletion(self: *App) !?app_mcp_runtime.ReloadCompletion {
+        return self.mcp.takeReloadCompletion();
     }
 
     pub fn startMcpDiscovery(self: *App) void {
@@ -1424,6 +1428,10 @@ const App = struct {
 
     pub fn listMcpServersAndTools(self: *App, alloc: Allocator) ![]u8 {
         return self.mcp.renderHealth(alloc);
+    }
+
+    pub fn summarizeMcpServers(self: *App, alloc: Allocator) ![]u8 {
+        return self.mcp.renderHealthSummary(alloc);
     }
 
     pub fn snapshotMcpToolNames(self: *App, alloc: Allocator) ![][]u8 {
@@ -2432,6 +2440,7 @@ const App = struct {
         if (try self.model_cache.pollLoadTransition()) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }
+        try app_commands.Handlers(App).collectMcpReloadFacts(self);
         if (comptime host_profile.native_auth or host_profile.js_host_auth) {
             try AuthAppRuntime.collectSignInFacts(self);
         }
@@ -3677,6 +3686,7 @@ test "semantic code block preserves indentation on wrapped continuation rows" {
 }
 
 test {
+    _ = @import("napi_fetch_state.zig");
     _ = @import("acp/prompt.zig");
     _ = @import("core/output/activity_status.zig");
     _ = @import("core/agent/agent_runtime.zig");
@@ -3854,9 +3864,11 @@ test {
     _ = @import("ui/input/visual_layout.zig");
     _ = @import("ui/input/runtime.zig");
     _ = @import("ui/approval_screen.zig");
+    _ = @import("ui/ask_presentation.zig");
     _ = @import("ui/footer/approval_ui.zig");
     _ = @import("ui/footer/surface_invalidation.zig");
     _ = @import("ui/full_transcript_screen.zig");
+    _ = @import("ui/render_engine/frame_fixed_point.zig");
     _ = @import("ui/transcript/runtime.zig");
     _ = @import("ui/transcript/runtime_tests.zig");
     _ = @import("core/agent/worker_runtime.zig");

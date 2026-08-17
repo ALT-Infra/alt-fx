@@ -220,7 +220,7 @@ pub const State = struct {
 
     fn queue_bookmark(self: State) State {
         var next = self;
-        next.bookmark_pending = next.bookmark_entry_id != null;
+        next.bookmark_pending = !next.follow_tail and next.bookmark_entry_id != null;
         return next;
     }
 
@@ -311,27 +311,54 @@ test "transcript presentation scroll saturates and leaves follow tail" {
     try std.testing.expectEqual(std.math.maxInt(u32), at_end.scroll_rows);
 }
 
-test "transcript presentation preserves semantic item across depth and width" {
-    const initial = State{
-        .depth = .review,
-        .scroll_rows = 6,
-        .follow_tail = false,
-        .bookmark_entry_id = 20,
-        .bookmark_intra_row = 2,
-        .projection_cols = 80,
-    };
-    const resized = initial.with_depth(.full).prepare_projection(40);
-    try std.testing.expect(resized.bookmark_pending);
-
-    const selected = resized.select_visual_offset(20, 5, &.{
+test "transcript presentation depth changes preserve viewport intent" {
+    const item_rows = [_]ItemRow{
         .{ .entry_id = 10, .row = 0 },
         .{ .entry_id = 20, .row = 4 },
         .{ .entry_id = 30, .row = 10 },
-    });
-    try std.testing.expectEqual(@as(u32, 6), selected.offset);
-    try std.testing.expectEqual(@as(?u32, 20), selected.state.bookmark_entry_id);
-    try std.testing.expectEqual(@as(u32, 2), selected.state.bookmark_intra_row);
-    try std.testing.expect(!selected.state.bookmark_pending);
+    };
+
+    for ([_]struct { from: Depth, to: Depth }{
+        .{ .from = .review, .to = .full },
+        .{ .from = .full, .to = .review },
+    }) |transition| {
+        const tail = (State{
+            .depth = transition.from,
+            .scroll_rows = 4,
+            .follow_tail = true,
+            .bookmark_entry_id = 20,
+            .bookmark_intra_row = 2,
+        }).with_depth(transition.to);
+        try std.testing.expect(!tail.bookmark_pending);
+
+        const tail_selected = tail.select_visual_offset(20, 5, &item_rows);
+        try std.testing.expectEqual(@as(u32, 15), tail_selected.offset);
+        try std.testing.expect(tail_selected.state.follow_tail);
+
+        const history = (State{
+            .depth = transition.from,
+            .scroll_rows = 6,
+            .follow_tail = false,
+            .bookmark_entry_id = 20,
+            .bookmark_intra_row = 2,
+        }).with_depth(transition.to);
+        try std.testing.expect(history.bookmark_pending);
+
+        const history_selected = history.select_visual_offset(20, 5, &item_rows);
+        try std.testing.expectEqual(@as(u32, 6), history_selected.offset);
+        try std.testing.expectEqual(@as(?u32, 20), history_selected.state.bookmark_entry_id);
+        try std.testing.expectEqual(@as(u32, 2), history_selected.state.bookmark_intra_row);
+        try std.testing.expect(!history_selected.state.bookmark_pending);
+    }
+
+    const no_bookmark = (State{
+        .depth = .review,
+        .scroll_rows = 99,
+        .follow_tail = false,
+    }).with_depth(.full);
+    try std.testing.expect(!no_bookmark.bookmark_pending);
+    const clamped = no_bookmark.select_visual_offset(20, 5, &item_rows);
+    try std.testing.expectEqual(@as(u32, 15), clamped.offset);
 }
 
 test "transcript presentation clamps bookmarks and selects retained neighbor" {

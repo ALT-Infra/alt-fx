@@ -22,6 +22,7 @@ const output_contracts = @import("../output/output_contracts.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
 const image_commands = @import("../images/image_commands.zig");
+const mcp_auth = @import("../mcp/mcp_auth.zig");
 const mcp_command_provider = @import("../mcp/command_provider.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
 const app_mcp_runtime = @import("app_mcp_runtime.zig");
@@ -313,6 +314,56 @@ pub fn Handlers(comptime App: type) type {
                 .show_version = commandShowVersion,
                 .unknown = commandUnknown,
             };
+        }
+
+        pub fn collectMcpReloadFacts(app: *App) !void {
+            if (comptime !@hasDecl(App, "takeMcpReloadCompletion")) return;
+            var completion = (try app.takeMcpReloadCompletion()) orelse return;
+            defer completion.deinit(app.alloc);
+            var warning = false;
+            const body = switch (completion) {
+                .outcome => |outcome| switch (outcome) {
+                    .published => |published| if (published.generation) |generation|
+                        try std.fmt.allocPrint(
+                            app.alloc,
+                            "MCP profile reloaded ({s}, runtime {d}).",
+                            .{ @tagName(published.health), generation },
+                        )
+                    else
+                        try std.fmt.allocPrint(
+                            app.alloc,
+                            "MCP profile reloaded ({s}; no servers configured).",
+                            .{@tagName(published.health)},
+                        ),
+                    .retained_required_failure => |failure| retained: {
+                        warning = true;
+                        break :retained try std.fmt.allocPrint(
+                            app.alloc,
+                            "MCP reload rejected; the existing runtime was retained. {s}",
+                            .{failure},
+                        );
+                    },
+                },
+                .failed => |err| failed: {
+                    warning = true;
+                    debug_trace.logf(
+                        "mcp",
+                        "profile reload retained current runtime err={s}",
+                        .{@errorName(err)},
+                    );
+                    break :failed try std.fmt.allocPrint(
+                        app.alloc,
+                        "MCP reload rejected; the existing runtime was retained. Fix the trusted profile configuration ({s}) and retry.",
+                        .{@errorName(err)},
+                    );
+                },
+            };
+            defer app.alloc.free(body);
+            try app.writeDomainNotice(.{
+                .topic = "mcp",
+                .tone = if (warning) .warning else .neutral,
+                .body = body,
+            }, true);
         }
 
         fn handleFeedback(app: *App) !void {
@@ -925,6 +976,7 @@ pub fn Handlers(comptime App: type) type {
             const result = try app.mcpCommandProvider().handle(app.alloc, rest, .{
                 .home = io_mod.getenv("HOME"),
                 .list_ctx = @ptrCast(app),
+                .summarize_servers = summarizeMcpServers,
                 .list_servers_and_tools = listMcpServersAndTools,
                 .auth_ctx = @ptrCast(app),
                 .validate_authentication_server = validateMcpAuthenticationServer,
@@ -948,7 +1000,7 @@ pub fn Handlers(comptime App: type) type {
             defer if (reload_notice) |notice| app.alloc.free(notice);
             var reload_warning = false;
             if (result.reload) {
-                var outcome = app.reloadMcp() catch |err| {
+                app.beginMcpReload() catch |err| {
                     reload_warning = true;
                     reload_notice = if (result.report_reload)
                         try std.fmt.allocPrint(
@@ -959,7 +1011,7 @@ pub fn Handlers(comptime App: type) type {
                     else
                         try std.fmt.allocPrint(
                             app.alloc,
-                            "{s}\nWarning: MCP runtime reload was rejected; the previous runtime remains active. Fix the trusted profile configuration ({s}) and run /mcp reload.",
+                            "{s}\nMCP reload rejected; the existing runtime was retained. Fix the trusted profile configuration ({s}) and run /mcp reload.",
                             .{ command_body, @errorName(err) },
                         );
                     debug_trace.logf("mcp", "profile reload retained current runtime err={s}", .{@errorName(err)});
@@ -967,41 +1019,15 @@ pub fn Handlers(comptime App: type) type {
                     try app.writeDomainNotice(.{ .topic = "mcp", .tone = .warning, .body = notice }, true);
                     return;
                 };
-                defer outcome.deinit(app.alloc);
-                if (result.report_reload) {
-                    reload_notice = switch (outcome) {
-                        .published => |published| if (published.generation) |generation|
-                            try std.fmt.allocPrint(
-                                app.alloc,
-                                "MCP profile reloaded ({s}, runtime {d}).",
-                                .{ @tagName(published.health), generation },
-                            )
-                        else
-                            try std.fmt.allocPrint(
-                                app.alloc,
-                                "MCP profile reloaded ({s}; no servers configured).",
-                                .{@tagName(published.health)},
-                            ),
-                        .retained_required_failure => |failure| retained: {
-                            reload_warning = true;
-                            break :retained try std.fmt.allocPrint(
-                                app.alloc,
-                                "MCP reload rejected; the existing runtime was retained. {s}",
-                                .{failure},
-                            );
-                        },
-                    };
-                } else switch (outcome) {
-                    .published => {},
-                    .retained_required_failure => |failure| {
-                        reload_warning = true;
-                        reload_notice = try std.fmt.allocPrint(
-                            app.alloc,
-                            "{s}\nWarning: MCP runtime reload was rejected; the previous runtime remains active. {s} Fix the trusted profile configuration and run /mcp reload.",
-                            .{ command_body, failure },
-                        );
-                    },
-                }
+                const started = "MCP reconnection started. The existing runtime remains active until replacement completes.";
+                reload_notice = if (result.report_reload)
+                    try app.alloc.dupe(u8, started)
+                else
+                    try std.fmt.allocPrint(
+                        app.alloc,
+                        "{s}\n{s}",
+                        .{ command_body, started },
+                    );
             }
             const body = reload_notice orelse command_body;
             try app.writeDomainNotice(.{
@@ -1014,6 +1040,11 @@ pub fn Handlers(comptime App: type) type {
         fn listMcpServersAndTools(ctx: *anyopaque, alloc: std.mem.Allocator) ![]u8 {
             const app: *App = @ptrCast(@alignCast(ctx));
             return app.listMcpServersAndTools(alloc);
+        }
+
+        fn summarizeMcpServers(ctx: *anyopaque, alloc: std.mem.Allocator) ![]u8 {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            return app.summarizeMcpServers(alloc);
         }
 
         fn listMcpResources(
@@ -1225,7 +1256,10 @@ pub fn Handlers(comptime App: type) type {
             return try out.toOwnedSlice();
         }
 
-        fn authenticateMcpServer(ctx: *anyopaque, name: []const u8) !void {
+        fn authenticateMcpServer(
+            ctx: *anyopaque,
+            name: []const u8,
+        ) !mcp_auth.AuthenticationResult {
             if (comptime !@hasDecl(App, "acquireMcpRuntime") or
                 !@hasDecl(App, "urlOpener"))
             {
@@ -1234,7 +1268,7 @@ pub fn Handlers(comptime App: type) type {
             const app: *App = @ptrCast(@alignCast(ctx));
             var lease = app.acquireMcpRuntime() orelse return error.McpServerNotFound;
             defer lease.deinit();
-            try lease.runtime.authenticateServer(name, app, openMcpAuthUrl);
+            return lease.runtime.authenticateServer(name, app, openMcpAuthUrl);
         }
 
         fn validateMcpAuthenticationServer(ctx: *anyopaque, name: []const u8) !void {
@@ -3538,6 +3572,7 @@ const McpCommandFakeApp = struct {
     last_topic: ?[]const u8 = null,
     last_tone: ?types.NoticeTone = null,
     reload_behavior: ReloadBehavior = .published,
+    reload_pending: bool = false,
 
     fn deinit(self: *McpCommandFakeApp) void {
         self.notice_body.deinit(self.alloc);
@@ -3576,17 +3611,28 @@ const McpCommandFakeApp = struct {
         return alloc.dupe(u8, "configured server and tool\n");
     }
 
-    fn reloadMcp(self: *McpCommandFakeApp) !app_mcp_runtime.ReloadOutcome {
+    fn summarizeMcpServers(self: *McpCommandFakeApp, alloc: std.mem.Allocator) ![]u8 {
+        return self.listMcpServersAndTools(alloc);
+    }
+
+    fn beginMcpReload(self: *McpCommandFakeApp) !void {
         self.reload_count += 1;
+        if (self.reload_behavior == .failed) return error.TestReloadFailed;
+        self.reload_pending = true;
+    }
+
+    fn takeMcpReloadCompletion(self: *McpCommandFakeApp) !?app_mcp_runtime.ReloadCompletion {
+        if (!self.reload_pending) return null;
+        self.reload_pending = false;
         return switch (self.reload_behavior) {
-            .published => .{ .published = .{ .generation = null, .health = .ready } },
-            .retained => .{
+            .published => .{ .outcome = .{ .published = .{ .generation = null, .health = .ready } } },
+            .retained => .{ .outcome = .{
                 .retained_required_failure = try self.alloc.dupe(
                     u8,
                     "Required MCP server 'fixture' failed to start.",
                 ),
-            },
-            .failed => error.TestReloadFailed,
+            } },
+            .failed => unreachable,
         };
     }
 
@@ -4267,9 +4313,16 @@ test "app_commands renders transactional status for explicit MCP reload" {
     try std.testing.expectEqualStrings("mcp", app.last_topic.?);
     try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
     try std.testing.expectEqualStrings(
-        "MCP profile reloaded (ready; no servers configured).",
+        "MCP reconnection started. The existing runtime remains active until replacement completes.",
         app.notice_body.items,
     );
+    try Handlers(McpCommandFakeApp).collectMcpReloadFacts(&app);
+    try std.testing.expectEqual(@as(usize, 2), app.notice_count);
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        app.notice_body.items,
+        "MCP profile reloaded (ready; no servers configured).",
+    ));
 }
 
 test "app_commands preserves command display after implicit MCP reload" {
@@ -4282,7 +4335,12 @@ test "app_commands preserves command display after implicit MCP reload" {
     try std.testing.expectEqual(@as(usize, 1), app.notice_count);
     try std.testing.expectEqualStrings("mcp", app.last_topic.?);
     try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
-    try std.testing.expectEqualStrings("Authenticated MCP server 'fixture'.", app.notice_body.items);
+    try std.testing.expectEqualStrings(
+        "Authenticated MCP server 'fixture'.\nMCP reconnection started. The existing runtime remains active until replacement completes.",
+        app.notice_body.items,
+    );
+    try Handlers(McpCommandFakeApp).collectMcpReloadFacts(&app);
+    try std.testing.expectEqual(@as(usize, 2), app.notice_count);
 }
 
 test "app_commands warns when implicit MCP reload retains the active runtime" {
@@ -4298,12 +4356,24 @@ test "app_commands warns when implicit MCP reload retains the active runtime" {
         try std.testing.expectEqual(@as(usize, 1), app.reload_count);
         try std.testing.expectEqual(@as(usize, 1), app.notice_count);
         try std.testing.expectEqualStrings("mcp", app.last_topic.?);
-        try std.testing.expectEqual(types.NoticeTone.warning, app.last_tone.?);
-        try std.testing.expect(std.mem.startsWith(
-            u8,
-            app.notice_body.items,
-            "Authenticated MCP server 'fixture'.\nWarning: MCP runtime reload was rejected; the previous runtime remains active.",
-        ));
+        if (behavior == .retained) {
+            try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
+            try Handlers(McpCommandFakeApp).collectMcpReloadFacts(&app);
+            try std.testing.expectEqual(@as(usize, 2), app.notice_count);
+            try std.testing.expectEqual(types.NoticeTone.warning, app.last_tone.?);
+            try std.testing.expect(std.mem.find(
+                u8,
+                app.notice_body.items,
+                "MCP reload rejected; the existing runtime was retained.",
+            ) != null);
+        } else {
+            try std.testing.expectEqual(types.NoticeTone.warning, app.last_tone.?);
+            try std.testing.expect(std.mem.find(
+                u8,
+                app.notice_body.items,
+                "MCP reload rejected; the existing runtime was retained.",
+            ) != null);
+        }
     }
 }
 

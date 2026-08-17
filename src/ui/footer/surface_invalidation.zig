@@ -112,17 +112,20 @@ fn appendVisibleFooterInvalidation(
     reason: paint_plan.FrameInvalidationReason,
     top: u16,
     rows: u16,
+    trace_skips: bool,
 ) GeometryError!void {
     const range = try visibleFooterInvalidation(reason, top, rows) orelse {
-        logSkippedFooterInvalidation(reason, top, rows);
+        if (trace_skips) logSkippedFooterInvalidation(reason, top, rows);
         return;
     };
     if (reason == .external_clear and !paint_plan.invalidationIntersectsOwnedBand(plan.*, range)) {
-        debug_trace.logf(
-            "frame_plan",
-            "footer_extra_invalidation_skip reason={s} top={d} rows={d} skip=outside_current_owned_bands",
-            .{ @tagName(reason), top, rows },
-        );
+        if (trace_skips) {
+            debug_trace.logf(
+                "frame_plan",
+                "footer_extra_invalidation_skip reason={s} top={d} rows={d} skip=outside_current_owned_bands",
+                .{ @tagName(reason), top, rows },
+            );
+        }
         return;
     }
     footer_paint_plan.appendFooterFrameInvalidation(&plan.invalidation, range);
@@ -154,6 +157,7 @@ pub fn appendMeasuredFooterExtraInvalidation(
         footerExtraInvalidationReason(shell, change.update),
         change.top,
         shell.layout.rows,
+        true,
     );
     plan.footer_clean_allowed = false;
     force_redraw.* = true;
@@ -207,6 +211,30 @@ pub fn mergeAttemptInvalidations(invalidations: FrameInvalidationSet, plan: *Pai
         }
     }
     plan.footer_clean_allowed = plan.invalidation.isEmpty();
+}
+
+pub fn resolveCandidateFrameInvalidations(
+    shell: *const TranscriptRuntime,
+    plan: PaintPlan,
+    footer_update: ?FooterExtraUpdate,
+    attempt_invalidations: FrameInvalidationSet,
+) GeometryError!FrameInvalidationSet {
+    var candidate = plan;
+    if (footer_update) |update| {
+        if (detectFooterExtraChange(shell, update)) |change| {
+            try appendVisibleFooterInvalidation(
+                &candidate,
+                footerExtraInvalidationReason(shell, change.update),
+                change.top,
+                shell.layout.rows,
+                false,
+            );
+        }
+    }
+    for (attempt_invalidations.ranges()) |range| {
+        _ = mergeAttemptInvalidation(&candidate.invalidation, range);
+    }
+    return candidate.invalidation;
 }
 
 fn mergeAttemptInvalidation(
@@ -317,12 +345,12 @@ test "visible footer invalidation skips only stale off-screen footer rows" {
 
 test "footer invalidation wrappers skip stale rows and record visible ranges" {
     var plan = surfaceTestPlan();
-    try appendVisibleFooterInvalidation(&plan, .reserved_gap_clear, 9, 6);
+    try appendVisibleFooterInvalidation(&plan, .reserved_gap_clear, 9, 6, true);
     try std.testing.expect(plan.invalidation.isEmpty());
 
-    try appendVisibleFooterInvalidation(&plan, .reserved_gap_clear, 5, 6);
+    try appendVisibleFooterInvalidation(&plan, .reserved_gap_clear, 5, 6, true);
     try std.testing.expect(surfaceHasInvalidation(plan.invalidation, .reserved_gap_clear, 5, 6));
-    try std.testing.expectError(error.InvalidFooterInvalidationGeometry, appendVisibleFooterInvalidation(&plan, .reserved_gap_clear, 0, 6));
+    try std.testing.expectError(error.InvalidFooterInvalidationGeometry, appendVisibleFooterInvalidation(&plan, .reserved_gap_clear, 0, 6, true));
 
     var shell = TranscriptRuntime{};
     defer shell.deinit(std.testing.allocator);
@@ -371,7 +399,7 @@ test "footer clear below a compact frame defers to owned band invalidation" {
     plan.cursor_target = .{ .row = 3, .col = 1, .visible = true };
     try plan.validate();
 
-    try appendVisibleFooterInvalidation(&plan, .external_clear, 6, plan.layout.rows);
+    try appendVisibleFooterInvalidation(&plan, .external_clear, 6, plan.layout.rows, true);
 
     try std.testing.expect(plan.invalidation.isEmpty());
     try plan.validate();
@@ -477,7 +505,7 @@ test "reserved gap invalidation collapses instead of dropping when the plan is f
         });
     }
 
-    try appendVisibleFooterInvalidation(&plan, .reserved_gap_clear, 1, 8);
+    try appendVisibleFooterInvalidation(&plan, .reserved_gap_clear, 1, 8, true);
 
     try plan.validate();
     try std.testing.expectEqual(@as(u8, 1), plan.invalidation.len);
@@ -566,6 +594,55 @@ test "footer picker collapse destructively clears the previous footer band" {
     try std.testing.expectEqual(paint_plan.FrameInvalidationReason.external_clear, invalidation.reason);
     try std.testing.expectEqual(@as(u16, 12), invalidation.top);
     try std.testing.expectEqual(@as(u16, 24), invalidation.bottom);
+}
+
+test "candidate invalidations match final footer invalidations" {
+    var shell = TranscriptRuntime{
+        .layout = surfaceTestPlan().layout,
+        .extra_input_rows = 3,
+        .footer_reserved_base_rows = 2,
+    };
+    defer shell.deinit(std.testing.allocator);
+    shell.footer_viewport.has_frame = true;
+    shell.footer_viewport.geometry.top = 5;
+
+    const update: FooterExtraUpdate = .{
+        .footer_extra = 0,
+        .footer_reserved_base_rows = 2,
+        .input_extra = 0,
+        .banner_active = false,
+        .picker_rows = 0,
+        .show_picker = false,
+    };
+    var attempt = FrameInvalidationSet.empty();
+    try attempt.append(.{
+        .reason = .owned_band_change,
+        .top = 2,
+        .bottom = 4,
+    });
+
+    const candidate = try resolveCandidateFrameInvalidations(
+        &shell,
+        surfaceTestPlan(),
+        update,
+        attempt,
+    );
+
+    var final_plan = surfaceTestPlan();
+    var force_redraw = false;
+    try appendMeasuredFooterExtraInvalidation(
+        &shell,
+        &final_plan,
+        &force_redraw,
+        update,
+    );
+    mergeAttemptInvalidations(attempt, &final_plan);
+
+    try std.testing.expectEqualSlices(
+        paint_plan.FrameInvalidationRange,
+        candidate.ranges(),
+        final_plan.invalidation.ranges(),
+    );
 }
 
 test "measured footer picker collapse destructively clears the previous footer band" {

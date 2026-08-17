@@ -738,6 +738,17 @@ pub const SurfaceFooterMeasurement = struct {
         return measured_rows > committed_rows;
     }
 
+    pub fn frameInvalidationUpdate(self: *const SurfaceFooterMeasurement) surface_invalidation.FooterExtraUpdate {
+        return .{
+            .footer_extra = self.footer_extra,
+            .footer_reserved_base_rows = self.footerReservedBaseRows(),
+            .input_extra = self.input_extra,
+            .banner_active = self.banner_active,
+            .picker_rows = self.picker_rows,
+            .show_picker = self.show_picker,
+        };
+    }
+
     pub noinline fn footerReservedBaseRows(self: *const SurfaceFooterMeasurement) u16 {
         return footer_layout.reservedBaseRows(self.input_visible, self.composer_top_chrome_rows);
     }
@@ -990,14 +1001,12 @@ pub noinline fn prepareMeasuredSurfaceFooterFrameForPlan(
 ) !SurfaceFooterFrame {
     var paint = plan;
     const footer_reservation_changed = measurement.changesFooterReservation(shell);
-    try surface_invalidation.appendMeasuredFooterExtraInvalidation(shell, &paint, force_redraw, .{
-        .footer_extra = measurement.footer_extra,
-        .footer_reserved_base_rows = measurement.footerReservedBaseRows(),
-        .input_extra = measurement.input_extra,
-        .banner_active = measurement.banner_active,
-        .picker_rows = measurement.picker_rows,
-        .show_picker = measurement.show_picker,
-    });
+    try surface_invalidation.appendMeasuredFooterExtraInvalidation(
+        shell,
+        &paint,
+        force_redraw,
+        measurement.frameInvalidationUpdate(),
+    );
     surface_invalidation.mergeAttemptInvalidations(attempt_invalidations, &paint);
     if (footer_reservation_changed) paint.footer_clean_allowed = false;
     try paint.validate();

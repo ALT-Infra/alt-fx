@@ -1348,19 +1348,16 @@ async function forceCloseTerminalFixture(
   correlation: number,
   sessionId: string,
 ): Promise<void> {
-  let frame: WireFrame | undefined;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    frame = await requestAction(
+  success(
+    await requestAction(
       client,
       revision,
-      correlation + attempt * 10_000,
+      correlation,
       "close",
       { session_id: sessionId, policy: "force" },
-    );
-    if (failureCode(frame) !== "invalid_request" || attempt === 1) break;
-    await Bun.sleep(100);
-  }
-  success(frame!, "close");
+    ),
+    "close",
+  );
 }
 
 type StartedFixtureCleanup = {
