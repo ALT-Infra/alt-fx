@@ -45,6 +45,14 @@ Standard PR CI labels Debug and ReleaseSafe Build & Test and deterministic E2E r
 
 Changes to `build.zig` or `scripts/pgso/` also run the native macOS arm64 PGSO candidate workflow. That lane produces retained size, behavior, and performance evidence but does not alter any release artifact or update channel. Its pinned toolchain, local reproduction command, corpus exclusions, and failure rules are documented in [`scripts/pgso/README.md`](scripts/pgso/README.md).
 
+Every pull request also receives informational ReleaseSafe binary-size
+comparisons for Linux x86_64, Linux arm64, macOS x86_64, and macOS arm64. Each
+comparison builds the pull request merge commit and base commit on the same
+native runner, reports exact file and ELF or Mach-O section deltas, and emits a
+warning at increases of 52,429 bytes (0.050000 MiB) or more. The warning requests
+investigation but does not replace the full PGSO release gate or reject a valid
+feature solely for adding code.
+
 ## Pull Requests
 
 Every PR must carry exactly one label that describes its primary intent:
