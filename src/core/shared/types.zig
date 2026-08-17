@@ -1434,18 +1434,15 @@ pub const CompactedSummaryHistoryTurn = struct {
     summary: []u8,
     removed_turn_count: usize,
     compaction_count: usize,
-    /// Exact root-user text retained by machine-owned compaction. This is
-    /// authority evidence; `summary` remains untrusted model context.
+    /// Legacy compacted root text retained for storage compatibility. It is
+    /// model context only and never permission authority.
     root_user_messages: [][]u8 = &.{},
-    /// False when an older compacted record proves turns were removed but did
-    /// not persist their exact root-user text.
+    /// Legacy completeness marker retained for storage compatibility.
     root_user_messages_complete: bool = true,
-    /// Exact human permission feedback created by fx and retained from the
-    /// removed turns. This remains typed authority evidence; it is never
-    /// reconstructed from `summary` prose.
+    /// Legacy compacted feedback retained for storage compatibility. It is not
+    /// permission authority.
     permission_feedback: [][]u8 = &.{},
-    /// False when removed turns may contain typed feedback that an older
-    /// compacted record did not preserve.
+    /// Legacy completeness marker retained for storage compatibility.
     permission_feedback_complete: bool = true,
 };
 
