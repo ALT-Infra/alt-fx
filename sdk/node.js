@@ -13,7 +13,11 @@ import {
 } from "./fx-sdk.js";
 
 export { encodeXtermKeyEvent, fxSdkApiVersion, supportsJspi, xtermAdapter };
-export const libfxApiVersion = 1;
+export const libfxApiVersion = 2;
+
+const fetchOperationStale = 0;
+const fetchOperationApplied = 1;
+const fetchOperationBackpressure = 2;
 
 const require = createRequire(import.meta.url);
 const defaultCoreWasm = new URL("./fx-core.wasm", import.meta.url);
@@ -56,8 +60,11 @@ async function loadNativeCandidate(candidate) {
 
 function validateNativeBackend(backend) {
   if (!backend) return null;
-  if (backend.libfxApiVersion !== undefined && backend.libfxApiVersion !== libfxApiVersion) {
-    throw new Error(`native addon API version ${backend.libfxApiVersion} is incompatible with libfx API version ${libfxApiVersion}`);
+  const hasLowLevelCore = typeof backend.createCore === "function";
+  if ((hasLowLevelCore && backend.libfxApiVersion !== libfxApiVersion) ||
+    (!hasLowLevelCore && backend.libfxApiVersion !== undefined && backend.libfxApiVersion !== libfxApiVersion)) {
+    const actualVersion = backend.libfxApiVersion ?? "missing";
+    throw new Error(`native addon API version ${actualVersion} is incompatible with libfx API version ${libfxApiVersion}`);
   }
   if (typeof backend.createFxAgent !== "function" && typeof backend.createCore !== "function" &&
     typeof backend.createFxTerminal !== "function") {
@@ -150,7 +157,7 @@ function createNativeCoreRuntime(addon, options) {
   };
   const pumpFetch = async (request) => {
     const controller = new AbortController();
-    const state = { controller };
+    const state = { handle: request.handle, controller };
     fetchState = state;
     try {
       const response = await (options.fetch ?? globalThis.fetch)(request.url, {
@@ -159,25 +166,35 @@ function createNativeCoreRuntime(addon, options) {
         body: request.body?.length ? Buffer.from(request.body, "base64") : undefined,
         signal: controller.signal,
       });
-      addon.startCoreFetchResponse(core, response.status);
+      const started = addon.startCoreFetchResponse(core, state.handle, response.status);
+      if (started === fetchOperationStale) return;
+      if (started !== fetchOperationApplied) throw new Error(`invalid native fetch start result ${started}`);
       if (response.body) {
         for await (const chunk of response.body) {
           const buffer = Buffer.from(chunk);
           let offset = 0;
           while (offset < buffer.length) {
             const end = Math.min(offset + 64 * 1024, buffer.length);
-            if (addon.pushCoreFetchResponse(core, buffer.subarray(offset, end))) {
+            const pushed = addon.pushCoreFetchResponse(core, state.handle, buffer.subarray(offset, end));
+            if (pushed === fetchOperationApplied) {
               offset = end;
-            } else {
-              await new Promise((resolve) => setTimeout(resolve, 2));
+              continue;
             }
+            if (pushed === fetchOperationStale) return;
+            if (pushed !== fetchOperationBackpressure) throw new Error(`invalid native fetch push result ${pushed}`);
+            await new Promise((resolve) => setTimeout(resolve, 2));
           }
         }
       }
-      addon.finishCoreFetch(core);
+      const finished = addon.finishCoreFetch(core, state.handle);
+      if (finished !== fetchOperationApplied && finished !== fetchOperationStale) {
+        throw new Error(`invalid native fetch finish result ${finished}`);
+      }
     } catch (error) {
       if (error?.name !== "AbortError" || !controller.signal.aborted) {
-        try { addon.failCoreFetch(core); } catch {}
+        try {
+          if (addon.coreFetchActive(core, state.handle)) addon.failCoreFetch(core, state.handle);
+        } catch {}
       }
     } finally {
       if (fetchState === state) fetchState = null;
@@ -185,8 +202,14 @@ function createNativeCoreRuntime(addon, options) {
   };
   const timer = setInterval(() => {
     try {
-      const fetchRequest = addon.takeCoreFetch(core);
-      if (fetchRequest && !fetchState) void pumpFetch(JSON.parse(fetchRequest.toString("utf8")));
+      if (fetchState) {
+        if (!fetchState.controller.signal.aborted && !addon.coreFetchActive(core, fetchState.handle)) {
+          fetchState.controller.abort();
+        }
+      } else {
+        const fetchRequest = addon.takeCoreFetch(core);
+        if (fetchRequest) void pumpFetch(JSON.parse(fetchRequest.toString("utf8")));
+      }
       const chunk = addon.drainCore(core);
       if (chunk.length && lineHandler) {
         lineBuffer += chunk.toString("utf8");
