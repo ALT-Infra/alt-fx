@@ -1365,8 +1365,8 @@ test.skipIf(!tmuxAvailable())(
     expect(countOccurrences(scrollback, "Used terminal start")).toBe(1);
     expect(scrollback).toContain("Used terminal close");
     await active.sendKeys("C-o");
-    await Bun.sleep(250);
-    const expanded = await active.capturePane();
+    await active.sendKeys("PPage");
+    const expanded = await active.waitForText("missing_fields", TIMEOUT);
     expect(expanded).toContain("missing_fields");
     expect(expanded).toContain("allowed_fields");
     expect(expanded).toContain("conflicts");
@@ -2014,10 +2014,11 @@ test.skipIf(!tmuxAvailable())(
     expect(terminalSchema).toBeDefined();
     expect(terminalSchema!.type).toBe("object");
     expect(terminalSchema!.oneOf).toBeUndefined();
-    expect(terminalSchema!.required).toEqual(["action"]);
     expect(terminalSchema!.additionalProperties).toBe(false);
     expect(terminalSchema!.properties?.action?.enum).toContain("wait");
     const terminalProperties = Object.keys(terminalSchema!.properties ?? {});
+    expect(terminalProperties).toHaveLength(25);
+    expect(terminalSchema!.required).toEqual(terminalProperties);
     expect(
       terminalProperties.filter((name) => name === "wait_ceiling_ms"),
     ).toHaveLength(1);
