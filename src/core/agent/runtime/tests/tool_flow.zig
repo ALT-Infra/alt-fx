@@ -1320,14 +1320,10 @@ test "resumed persistent child review rejects child-authored authority provenanc
         "current_request: Inspect the repository only.\n",
         hooks.last_execute_root_user_intent_context.?,
     );
-    try std.testing.expect(hooks.last_execute_root_user_evidence_complete);
+    try std.testing.expect(!hooks.last_execute_root_user_evidence_complete);
     try std.testing.expectEqual(
-        @as(usize, 1),
+        @as(usize, 0),
         hooks.last_execute_root_user_messages.items.len,
-    );
-    try std.testing.expectEqualStrings(
-        "Inspect the repository only.",
-        hooks.last_execute_root_user_messages.items[0],
     );
 }
 
@@ -1356,9 +1352,13 @@ test "subagent turn with empty root context never promotes delegation to trusted
     try std.testing.expectEqual(@as(usize, 0), review_context.len);
 }
 
-test "tool execution receives only the current root request" {
+test "subagent execution receives only the current root request" {
     const alloc = std.testing.allocator;
-    const calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"README.md\"}")};
+    const calls = [_]ToolCall{toolCall(
+        "call_create",
+        "subagent",
+        "{\"command\":{\"create\":{\"name\":\"child\",\"mode\":\"persistent\",\"prompt\":\"Inspect.\"}}}",
+    )};
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &calls },
         .{ .content = "Final" },

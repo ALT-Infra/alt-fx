@@ -5408,7 +5408,8 @@ fn processQueuedPromptLoop(
                 within_turn_suffix.items,
                 step_batch.pending_user_suffix.items,
             );
-            const execution_root_user_request = if (action_permission_mode == .auto)
+            const execution_root_user_request = if (action_permission_mode == .auto and
+                std.mem.eql(u8, tool_call.name, "subagent"))
                 currentRootRequest(config, job.prompt)
             else
                 "";
