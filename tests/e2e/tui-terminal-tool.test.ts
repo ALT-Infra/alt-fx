@@ -16,6 +16,7 @@ import { userInfo } from "node:os";
 import { join } from "node:path";
 import { FX_BIN } from "../evals/eval-helpers";
 import {
+  classifierEvidenceFromRequest,
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   fakeGatewayToolCall,
@@ -1477,7 +1478,7 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
-  "TUI executes public native terminal start and owner-scoped list",
+  "TUI auto mode reviews terminal start but not owner-scoped list",
   async () => {
     const fixture = createFixture("fx-tui-terminal-public-");
     let startedSessionId = "";
@@ -1512,7 +1513,11 @@ test.skipIf(!tmuxAvailable())(
       fakeGatewayFinalText("TUI public terminal complete"),
     ]);
     gateways.push(gateway);
-    const active = await launch(fixture, gateway);
+    const active = await launch(fixture, gateway, {
+      FX_PERMISSION_MODE: "auto",
+      FX_TRACE_SCOPES:
+        "input,terminal,terminal_client,terminal_store,terminal_host,agent,worker,gateway,permission",
+    });
 
     await active.sendText("Run and list the native terminal fixture.");
     const pane = await active.waitForText("TUI public terminal complete", TIMEOUT);
@@ -1541,6 +1546,112 @@ test.skipIf(!tmuxAvailable())(
     expect(listResult).toContain('"lifecycle":"exited"');
     expect(listResult).not.toContain("owner_authority");
     expect(listResult).not.toContain("proof");
+    expect(gateway.classifierRequests).toHaveLength(1);
+    expect(classifierEvidenceFromRequest(gateway.classifierRequests[0]!.body))
+      .toContain('"action":"start"');
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "TUI public terminal controls reject encoded bytes and deliver key designators",
+  async () => {
+    const fixture = createFixture("fx-tui-terminal-public-controls-");
+    const bytePath = join(fixture.root, "control-byte.txt");
+    let terminalSessionId = "";
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("tui_terminal_controls_start", "terminal", {
+        action: "start",
+        cwd: fixture.workspace,
+        command:
+          "printf 'TUI_PUBLIC_CONTROLS_READY\\n'; stty raw -echo; " +
+          `od -An -tu1 -N1 | tr -d '[:space:]' > ${JSON.stringify(bytePath)}; ` +
+          "printf '\\nTUI_PUBLIC_CONTROLS_DONE\\n'; " +
+          holdUntilCleanup(fixture.root),
+        shell: {
+          kind: "executable",
+          path: TERMINAL_FIXTURE_SHELL,
+          clean_start: true,
+        },
+        backend: "native",
+        return_when: { kind: "match", pattern: "TUI_PUBLIC_CONTROLS_READY" },
+        wait_ceiling_ms: 20_000,
+        dimensions: { rows: 24, columns: 80 },
+      }),
+      (body) => {
+        const result = JSON.parse(
+          toolResultText(body, "tui_terminal_controls_start"),
+        ) as {
+          success: { start: { session: { session_id: string } } };
+        };
+        terminalSessionId = result.success.start.session.session_id;
+        return fakeGatewayToolCall(
+          "tui_terminal_controls_acquire",
+          "terminal",
+          {
+            action: "write",
+            session_id: terminalSessionId,
+            lease: "acquire",
+          },
+        );
+      },
+      (body) => {
+        expect(toolResultText(body, "tui_terminal_controls_acquire"))
+          .toContain('"write_lease":"agent"');
+        return fakeGatewayToolCall(
+          "tui_terminal_controls_encoded_byte",
+          "terminal",
+          {
+            action: "write",
+            session_id: terminalSessionId,
+            lease: "use",
+            write: { kind: "controls", controls: [12] },
+          },
+        );
+      },
+      (body) => {
+        expect(toolResultText(body, "tui_terminal_controls_encoded_byte"))
+          .toContain("InvalidWritePayload");
+        return fakeGatewayToolCall(
+          "tui_terminal_controls_designator",
+          "terminal",
+          {
+            action: "write",
+            session_id: terminalSessionId,
+            lease: "use",
+            write: { kind: "controls", controls: [108] },
+          },
+        );
+      },
+      async (body) => {
+        expect(toolResultText(body, "tui_terminal_controls_designator"))
+          .toContain('"accepted_bytes":1');
+        expect((await waitForTrace(bytePath, "12")).trim()).toBe("12");
+        return fakeGatewayToolCall("tui_terminal_controls_close", "terminal", {
+          action: "close",
+          session_id: terminalSessionId,
+          close_policy: "force",
+        });
+      },
+      (body) => {
+        expect(toolResultText(body, "tui_terminal_controls_close"))
+          .toContain('"lifecycle":"closed"');
+        return fakeGatewayFinalText("TUI public terminal controls complete");
+      },
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway);
+
+    await active.sendText("Exercise public terminal Ctrl+L input.");
+    const pane = await active.waitForText(
+      "TUI public terminal controls complete",
+      TIMEOUT,
+    );
+    expect(pane).toContain("Failed write");
+    expect(pane).toContain("Used terminal write");
+    expect(gateway.requests).toHaveLength(6);
+    expect(readFileSync(bytePath, "utf8").trim()).toBe("12");
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
   TIMEOUT,

@@ -5544,11 +5544,18 @@ fn closeAction(
         session.lifecycle == .running;
     session.mutex.unlock(zio);
     if (still_live) {
-        const requested_signal: contracts.Signal = if (request.policy == .force)
-            .kill
+        const delivered = if (request.policy == .force)
+            session.signalTerminalProcesses(.kill) catch |err| blk: {
+                debug_trace.logf(
+                    "terminal_host",
+                    "force close tree signal failed id={s} err={s}; falling back to shell group",
+                    .{ session.id, @errorName(err) },
+                );
+                break :blk session.signalProcess(.kill);
+            }
         else
-            .terminate;
-        if (!session.signalProcess(requested_signal)) session.markLost();
+            session.signalProcess(.terminate);
+        if (!delivered) session.markLost();
     }
     if (request.policy == .graceful and still_live) {
         const started = io_mod.milliTimestamp();

@@ -7630,6 +7630,85 @@ while [ ! -e ${JSON.stringify(stopPath)} ]; do sleep 0.05; done
   }
 }, NATIVE_STARTUP_OBSERVATION_BUDGET_MS * 3 + 30_000);
 
+test("force close reaches a background job outside the shell process group", async () => {
+  if (!existsSync("/bin/zsh")) return;
+  const home = makeHome();
+  const paths = hostPaths(home);
+  const proofPath = join(home, "background-force-close.proof");
+  const stopPath = join(home, "background-force-close.stop");
+  const scriptPath = join(home, "background-force-close.sh");
+  writeFileSync(
+    scriptPath,
+    `#!/bin/sh
+printf '%s %s %s\n' "$$" "$PPID" "$(ps -o pgid= -p $$ | tr -d ' ')" > ${JSON.stringify(proofPath)}
+while [ ! -e ${JSON.stringify(stopPath)} ]; do sleep 0.05; done
+`,
+  );
+  chmodSync(scriptPath, 0o700);
+
+  const host = startHost(home, undefined, 200);
+  await waitFor(() => existsSync(paths.socket));
+  const control = await handshake(paths.socket, { minimum: 4, current: 5 });
+  let shellPid = 0;
+  let targetPid = 0;
+
+  try {
+    const started = await startNativeCommandFixture(
+      control.client,
+      control.revision!,
+      313_020,
+      {
+        cwd: home,
+        command:
+          `${JSON.stringify(scriptPath)} & child=$!; ` +
+          `while [ ! -s ${JSON.stringify(proofPath)} ]; do sleep 0.05; done; ` +
+          "printf 'background-force-close-ready\\n'; wait \"$child\"",
+        shell: { executable: { path: "/bin/zsh", clean_start: true } },
+        returnWhen: { match: "background-force-close-ready" },
+      },
+    );
+    const sessionId = (started.session as { session_id: string }).session_id;
+    const [pidText, parentText, pgidText] = readFileSync(proofPath, "utf8")
+      .trim()
+      .split(/\s+/);
+    targetPid = Number(pidText);
+    const targetParentPid = Number(parentText);
+    const targetPgid = Number(pgidText);
+    shellPid = Number(durableTerminalRecordFor(home, sessionId).pid);
+    expect(targetPid).toBeGreaterThan(0);
+    expect(targetParentPid).toBe(shellPid);
+    expect(targetPgid).toBe(processGroupId(targetPid));
+    expect(targetPgid).not.toBe(processGroupId(shellPid));
+
+    const closed = await requestAction(
+      control.client,
+      control.revision!,
+      313_030,
+      "close",
+      { session_id: sessionId, policy: "force" },
+    );
+    expect(success(closed, "close").session).toMatchObject({
+      lifecycle: "closed",
+    });
+    await waitFor(() => !processExists(shellPid), 5_000);
+    await waitFor(() => !processExists(targetPid), 5_000);
+  } finally {
+    writeFileSync(stopPath, "");
+    if (targetPid > 0 && processExists(targetPid)) {
+      try {
+        process.kill(targetPid, "SIGKILL");
+      } catch {}
+    }
+    if (shellPid > 0 && processExists(shellPid)) {
+      try {
+        process.kill(shellPid, "SIGKILL");
+      } catch {}
+    }
+    control.client.close();
+    if (host.exitCode === null) await waitForExit(host);
+  }
+}, NATIVE_STARTUP_OBSERVATION_BUDGET_MS * 3 + 30_000);
+
 test.skipIf(!tmuxAvailable())(
   "malformed close recovery cleans only its tmux owner and preserves a live sibling",
   async () => {

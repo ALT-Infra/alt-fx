@@ -167,7 +167,7 @@ const terminal_write_schema = gateway_schema.ObjectSchema{
         .{ .name = "kind", .json_type = .string, .enum_values = &.{ "text", "keys", "controls", "paste" } },
         .{ .name = "text", .json_type = .string, .description = "Required for text or paste." },
         .{ .name = "keys", .json_type = .array, .item_json_type = .string, .item_enum_values = &.{ "enter", "tab", "escape", "backspace", "delete", "insert", "arrow_up", "arrow_down", "arrow_left", "arrow_right", "home", "end", "page_up", "page_down" } },
-        .{ .name = "controls", .json_type = .array, .item_json_type = .integer, .description = "ASCII byte values for control characters, such as 99 for Ctrl+C." },
+        .{ .name = "controls", .json_type = .array, .item_json_type = .integer, .description = "ASCII code of the printable key designator used with Ctrl; for example, 108 (`l`) for Ctrl+L. Send the printable key code, not the resulting control byte." },
     },
     .required = &.{"kind"},
     .additional_properties = false,
@@ -1537,6 +1537,11 @@ test "terminal gateway advertisement projects a provider-compatible object schem
     try std.testing.expectEqual(false, input_schema.get("additionalProperties").?.bool);
     const properties = input_schema.get("properties").?.object;
     try std.testing.expectEqual(terminal_gateway_properties.len, properties.count());
+    const write_properties = properties.get("write").?.object.get("properties").?.object;
+    try std.testing.expectEqualStrings(
+        "ASCII code of the printable key designator used with Ctrl; for example, 108 (`l`) for Ctrl+L. Send the printable key code, not the resulting control byte.",
+        write_properties.get("controls").?.object.get("description").?.string,
+    );
     try std.testing.expectEqual(
         terminal_actions.len,
         properties.get("action").?.object.get("enum").?.array.items.len,

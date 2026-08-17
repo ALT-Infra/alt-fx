@@ -86,6 +86,37 @@ fn toolRequiresApproval(input: Input, name: []const u8) bool {
     return if (registeredTool(input, name)) |spec| spec.requires_approval else false;
 }
 
+fn registeredTerminalCallReadsOnly(
+    input: Input,
+    arena: Allocator,
+    call: ToolCall,
+) !bool {
+    const tool = registeredTool(input, call.name) orelse return false;
+    if (tool.executor_kind != .terminal) return false;
+    const decode_ctx = tool_dispatch.DispatchContext{
+        .allocator = arena,
+        .workspace_root = input.workspace_root,
+        .access_scope = input.access_scope,
+    };
+    const decoded = try tool.decode(decode_ctx, call.arguments_json);
+    return switch (decoded) {
+        .failure => |reason| blk: {
+            arena.free(reason);
+            break :blk false;
+        },
+        .input => |tool_input| blk: {
+            defer tool_input.deinit(arena);
+            if (tool.validate) |validate| {
+                if (try validate(decode_ctx, tool_input)) |reason| {
+                    arena.free(reason);
+                    break :blk false;
+                }
+            }
+            break :blk tool.reads_only_fn(tool_input);
+        },
+    };
+}
+
 fn toolApprovalPolicy(input: Input, name: []const u8) tool_dispatch.ApprovalPolicy {
     return if (registeredTool(input, name)) |spec| spec.approval_policy else .standard;
 }
@@ -824,6 +855,13 @@ fn resolveOrdinaryPermissionOutcome(
             ordinaryPermissionOutcome(.once)
         else
             .{ .decision = .permission_required };
+    }
+    if (permission_mode == .auto and
+        !command_call and
+        !is_dynamic_tool and
+        try registeredTerminalCallReadsOnly(input, arena, call))
+    {
+        return ordinaryPermissionOutcome(.once);
     }
     if (!command_call and !toolRequiresApproval(input, call.name) and !is_dynamic_tool) {
         return ordinaryPermissionOutcome(.once);
@@ -3913,6 +3951,72 @@ test "ask-only policy bypasses prompt and reviewer in auto and uses the ordinary
     try std.testing.expect(denied.execution_authority == null);
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
     try std.testing.expectEqual(@as(usize, 2), recording.calls);
+}
+
+test "automatic terminal admission reviews only sensitive typed input" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var background: BackgroundRuntime = .{};
+    defer background.deinit(std.testing.allocator);
+    var fake = FakeAutoClassifier{};
+    var input = testInputWithClassifier(
+        &worker,
+        &background,
+        permission_auto_classifier.Classifier.withOverride(
+            @ptrCast(&fake),
+            FakeAutoClassifier.classify,
+        ),
+    );
+    const list_call = ToolCall{
+        .id = "terminal-list",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"list\"}",
+    };
+
+    const list = try requestPermissionOutcome(input, arena, list_call, .auto, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.once, list.decision);
+    try std.testing.expectEqual(command_admission.ToolExecutionAuthority.ordinary, list.execution_authority.?);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+
+    const start = try requestPermissionOutcome(input, arena, .{
+        .id = "terminal-start",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"start\"}",
+    }, .auto, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.once, start.decision);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+
+    const asked = try requestPermissionOutcome(input, arena, list_call, .ask, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.permission_required, asked.decision);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+
+    var rules = [_]types.PermissionRule{.{
+        .permission = @constCast("terminal"),
+        .pattern = @constCast("terminal"),
+        .action = .deny,
+    }};
+    input.permission_rules = .{ .rules = &rules };
+    const denied = try requestPermissionOutcome(input, arena, list_call, .auto, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.policy_denied, denied.decision);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+
+    rules[0].action = .ask;
+    const configured_ask = try requestPermissionOutcome(input, arena, list_call, .auto, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.permission_required, configured_ask.decision);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+
+    try std.testing.expectError(
+        error.UnexpectedEndOfInput,
+        requestPermissionOutcome(input, arena, .{
+            .id = "malformed-terminal-list",
+            .name = "terminal",
+            .arguments_json = "{",
+        }, .auto, &.{}),
+    );
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
 }
 
 test "existing tool approval policies retain the standard default" {
