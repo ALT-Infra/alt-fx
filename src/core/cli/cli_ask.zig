@@ -2753,7 +2753,20 @@ fn pushRouteRecoveryStatus(raw_ctx: *anyopaque, status: types.RouteRecoveryStatu
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     ctx.last_recovery_status = status;
     const terminal = status.kind == .terminal_provider_error;
-    if (ctx.output_mode == .json or (ctx.output_mode == .quiet and !terminal)) return;
+    const json_progress = switch (status.kind) {
+        .auto_retry,
+        .auto_recovered,
+        .manual_retry_without_fast,
+        .manual_recovered_without_fast,
+        .terminal_provider_error,
+        => true,
+        .unsafe_assistant_output,
+        .unsafe_tool_start,
+        .content_filter,
+        => false,
+    };
+    if ((ctx.output_mode == .json and !json_progress) or
+        (ctx.output_mode == .quiet and !terminal)) return;
     var label_buf: [types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
     try pushSystemNotice(raw_ctx, status.label(&label_buf));
     if (terminal and ctx.writable == null) {
@@ -8643,7 +8656,7 @@ test "quiet suppresses streaming while quiet json captures final output" {
     try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
 }
 
-test "fx ask JSON recovery lifecycle stays structured and clears after recovery" {
+test "fx ask JSON recovery keeps stdout structured and reports progress on stderr" {
     const alloc = std.testing.allocator;
     var stdout_capture: TestCapture = .{};
     defer stdout_capture.deinit(alloc);
@@ -8661,7 +8674,10 @@ test "fx ask JSON recovery lifecycle stays structured and clears after recovery"
     defer parsed.deinit();
     try std.testing.expectEqualStrings("assistant text", parsed.value.object.get("output").?.string);
     try std.testing.expect(parsed.value.object.get("recovery") == null);
-    try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
+    try std.testing.expectEqualStrings(
+        "[notice] ⚠ Network interrupted · waiting for connection · attempt 1/10\n",
+        stderr_capture.bytes.items,
+    );
 }
 
 test "fx ask JSON preserves partial output on prompt failure" {
