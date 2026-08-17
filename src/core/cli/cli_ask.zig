@@ -2634,8 +2634,11 @@ fn settlePendingToolProgress(ctx: *AskContext, call_id: []const u8, outcome: typ
     defer ctx.pending_tool_progress_mutex.unlock(io_mod.getIo());
     var pending = takePendingToolProgressLocked(ctx, call_id) orelse return;
     defer pending.deinit(ctx.alloc);
-    if (outcome.kind != .denied or
-        !std.mem.startsWith(u8, outcome.summary, types.deferred_tool_result_output ++ ": ")) return;
+    const context_deferred = outcome.kind == .deferred and
+        std.mem.startsWith(u8, outcome.summary, types.context_deferred_tool_status_label ++ ": ");
+    const legacy_deferred = outcome.kind == .denied and
+        std.mem.startsWith(u8, outcome.summary, types.deferred_tool_result_output ++ ": ");
+    if (!context_deferred and !legacy_deferred) return;
     if (!pending.visible) return;
     const text = pending.text orelse return;
     try ctx.deferred_tool_progress.append(ctx.alloc, text);
@@ -8833,7 +8836,7 @@ test "CLI nonterminal progress preserves distinct deferred labels without duplic
     } });
     try deps.push_tool_lifecycle(deps.ctx, .{ .terminal = .{
         .id = .{ .turn_id = 1, .call_id = "deferred_write" },
-        .outcome = .{ .kind = .denied, .summary = "Not executed: Writing file" },
+        .outcome = .{ .kind = .deferred, .summary = "Context updated: Writing file" },
     } });
     try std.testing.expectEqualStrings("Writing file\n", stderr_capture.bytes.items);
 
@@ -8850,7 +8853,7 @@ test "CLI nonterminal progress preserves distinct deferred labels without duplic
     try std.testing.expectEqualStrings("Writing file\n", stderr_capture.bytes.items);
     try deps.push_tool_lifecycle(deps.ctx, .{ .terminal = .{
         .id = .{ .turn_id = 2, .call_id = "retry_write" },
-        .outcome = .{ .kind = .denied, .summary = "Not executed: Writing file" },
+        .outcome = .{ .kind = .deferred, .summary = "Context updated: Writing file" },
     } });
 
     try deps.push_tool_lifecycle(deps.ctx, .{ .authoritative_started = .{
@@ -8906,6 +8909,40 @@ test "CLI nonterminal progress preserves distinct deferred labels without duplic
     } });
     try std.testing.expectEqualStrings(
         "Writing file\nWriting build/pkg/proof.txt\nReading streamed input\n",
+        stderr_capture.bytes.items,
+    );
+
+    try deps.push_tool_lifecycle(deps.ctx, .{ .authoritative_started = .{
+        .id = .{ .turn_id = 7, .call_id = "legacy_deferred_write" },
+        .reconciles_provisional_call_id = null,
+        .tool_name = "write_file",
+        .activity_kind = .write,
+    } });
+    try deps.push_tool_lifecycle(deps.ctx, .{ .progress = .{
+        .id = .{ .turn_id = 7, .call_id = "legacy_deferred_write" },
+        .text = "Writing legacy file",
+    } });
+    try deps.push_tool_lifecycle(deps.ctx, .{ .terminal = .{
+        .id = .{ .turn_id = 7, .call_id = "legacy_deferred_write" },
+        .outcome = .{ .kind = .denied, .summary = "Not executed: Writing legacy file" },
+    } });
+    try std.testing.expectEqualStrings(
+        "Writing file\nWriting build/pkg/proof.txt\nReading streamed input\nWriting legacy file\n",
+        stderr_capture.bytes.items,
+    );
+
+    try deps.push_tool_lifecycle(deps.ctx, .{ .authoritative_started = .{
+        .id = .{ .turn_id = 8, .call_id = "legacy_retry_write" },
+        .reconciles_provisional_call_id = null,
+        .tool_name = "write_file",
+        .activity_kind = .write,
+    } });
+    try deps.push_tool_lifecycle(deps.ctx, .{ .progress = .{
+        .id = .{ .turn_id = 8, .call_id = "legacy_retry_write" },
+        .text = "Writing legacy file",
+    } });
+    try std.testing.expectEqualStrings(
+        "Writing file\nWriting build/pkg/proof.txt\nReading streamed input\nWriting legacy file\n",
         stderr_capture.bytes.items,
     );
 }

@@ -2004,7 +2004,9 @@ describe("gateway stream lifecycle", () => {
         expect(deferredBody).toContain(buildRule);
         expect(deferredBody).not.toContain(siblingRule);
         expect(deferredBody.indexOf(rootRule)).toBeLessThan(deferredBody.indexOf(buildRule));
-        expect(toolResultOutput(deferredBody, firstCallId)).toContain("Not executed");
+        expect(toolResultOutput(deferredBody, firstCallId)).toBe(
+          "Scoped project instructions were added before execution. Review them and reissue this tool call if it is still appropriate.",
+        );
         expect(existsSync(targetPath)).toBe(true);
 
         const executedBody = gateway.requests[2]!.body;

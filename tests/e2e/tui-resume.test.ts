@@ -4007,7 +4007,7 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
-  "deferred scoped tools remain not executed after resume",
+  "context-deferred scoped tools remain deferred after resume",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-resume-deferred-tools-")));
     const home = join(root, "home");
@@ -4028,7 +4028,7 @@ test.skipIf(!tmuxAvailable())(
     writeFileSync(resumeStderrPath, "");
 
     const workspaceRoot = realpathSync(workspace);
-    const command = "cat nested/input.txt";
+    const command = "printf 'effectful payload\\n' > output.txt";
     const failureCommand = "printf 'ordinary-failure-control\\n' >&2; exit 7";
     const finalMarker = "DEFERRED_TOOL_RESUME_COMPLETE";
     const gateway = startFakeGateway([
@@ -4044,7 +4044,7 @@ test.skipIf(!tmuxAvailable())(
         {
           type: "tool-input-delta",
           id: "deferred-command",
-          delta: JSON.stringify({ command }),
+          delta: JSON.stringify({ command, cwd: "nested" }),
         },
         { type: "tool-input-end", id: "deferred-command" },
         {
@@ -4057,7 +4057,7 @@ test.skipIf(!tmuxAvailable())(
           type: "tool-call",
           toolCallId: "deferred-command",
           toolName: "run_command",
-          input: { command },
+          input: { command, cwd: "nested" },
         },
         { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
       ]),
@@ -4072,7 +4072,7 @@ test.skipIf(!tmuxAvailable())(
           type: "tool-call",
           toolCallId: "reissued-command",
           toolName: "run_command",
-          input: { command },
+          input: { command, cwd: "nested" },
         },
         {
           type: "tool-call",
@@ -4088,14 +4088,13 @@ test.skipIf(!tmuxAvailable())(
     let active: TmuxSession | null = null;
 
     function expectDeferredPresentation(scrollback: string): void {
-      expect(scrollback).toContain("⊘ Not executed nested/input.txt");
-      expect(scrollback).toContain("⊘ Not executed cat nested/input.txt");
-      expect(countOccurrences(scrollback, "Not executed")).toBe(2);
+      expect(scrollback).toContain(`↻ Context updated ${command}`);
+      expect(countOccurrences(scrollback, "Context updated")).toBe(1);
+      expect(scrollback).not.toContain("Not executed");
       expect(scrollback).not.toContain("● Failed nested/input.txt");
-      expect(scrollback).not.toContain("● Failed cat nested/input.txt");
-      expect(scrollback).not.toContain("\nNot executed\n");
+      expect(scrollback).not.toContain(`● Failed ${command}`);
       expect(scrollback).toContain("● Read nested/input.txt");
-      expect(scrollback).toContain("● Ran cat nested/input.txt");
+      expect(scrollback).toContain(`● Ran ${command}`);
       expect(scrollback).toContain(`● Ran ${failureCommand}`);
       expect(scrollback).toContain("│ exit code 7");
     }
@@ -4111,7 +4110,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText(
-        "Read nested/input.txt, run cat nested/input.txt, and exercise the failure control.",
+        "Read nested/input.txt, write nested/output.txt from that directory, and exercise the failure control.",
       );
       await waitForScrollback(active, finalMarker);
       await waitForCondition(
@@ -4142,16 +4141,16 @@ test.skipIf(!tmuxAvailable())(
       await active.sendKeys("C-o");
       const detail = await active.waitForPane(
         (pane) =>
-          pane.includes("⊘ Not executed nested/input.txt") &&
-          pane.includes("⊘ Not executed cat nested/input.txt") &&
+          pane.includes(`↻ Context updated ${command}`) &&
           pane.includes("ordinary-failure-control"),
         TIMEOUT,
       );
-      expect(countOccurrences(detail, "Not executed")).toBe(2);
-      expect(detail).not.toContain("\nNot executed\n");
+      expect(countOccurrences(detail, "Context updated")).toBe(1);
+      expect(detail).not.toContain("Not executed");
       expect(detail).not.toContain('{"path":"nested/input.txt"}');
-      expect(detail).not.toContain('{"command":"cat nested/input.txt"}');
+      expect(detail).not.toContain(JSON.stringify({ command, cwd: "nested" }));
       expect(detail).toContain(failureCommand);
+      expect(detail).toContain("1 deferred");
       expect(detail).toContain("1 failed");
       expect(readFileSync(resumeStderrPath, "utf8")).toBe("");
 

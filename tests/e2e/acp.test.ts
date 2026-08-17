@@ -5717,8 +5717,8 @@ describe("acp: model-independent", () => {
         expect(deferredBody).not.toContain(siblingRule);
         expect(occurrenceCount(deferredBody, rootRule)).toBe(1);
         expect(occurrenceCount(deferredBody, nestedRule)).toBe(1);
-        expect(acpToolResultText(deferredBody, firstCallId)).toContain(
-          "Not executed",
+        expect(acpToolResultText(deferredBody, firstCallId)).toBe(
+          "Scoped project instructions were added before execution. Review them and reissue this tool call if it is still appropriate.",
         );
 
         const executedBody = gateway.requests[2]!.body;

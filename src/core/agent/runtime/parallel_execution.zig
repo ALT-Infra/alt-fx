@@ -13,7 +13,7 @@ const ToolCall = types.ToolCall;
 const AgentRuntimeDeps = runtime_deps.AgentRuntimeDeps;
 const ToolExecutionResult = runtime_tool_contracts.ToolExecutionResult;
 
-fn isParallelReadOnlyCall(registry: tool_dispatch.Registry, call: ToolCall) bool {
+pub fn isReadOnlyCall(registry: tool_dispatch.Registry, call: ToolCall) bool {
     if (call.provider_result != null) return false;
 
     const tool = registry.lookup(call.name) orelse return false;
@@ -24,6 +24,7 @@ fn isParallelReadOnlyCall(registry: tool_dispatch.Registry, call: ToolCall) bool
         .semantic_search,
         .grep_files,
         .file_info,
+        .skill,
         .web_fetch,
         .web_search,
         => tool.activity_kind == .read,
@@ -33,7 +34,7 @@ fn isParallelReadOnlyCall(registry: tool_dispatch.Registry, call: ToolCall) bool
 
 pub fn parallelReadOnlyPrefixLen(registry: tool_dispatch.Registry, calls: []const ToolCall) usize {
     var len: usize = 0;
-    while (len < calls.len and isParallelReadOnlyCall(registry, calls[len])) : (len += 1) {}
+    while (len < calls.len and isReadOnlyCall(registry, calls[len])) : (len += 1) {}
     return len;
 }
 
@@ -501,9 +502,9 @@ test "parallel classifier keeps only a leading safe read-only group" {
     };
 
     try std.testing.expectEqual(@as(usize, 2), parallelReadOnlyPrefixLen(registry, &calls));
-    try std.testing.expect(isParallelReadOnlyCall(registry, calls[0]));
-    try std.testing.expect(isParallelReadOnlyCall(registry, calls[1]));
-    try std.testing.expect(!isParallelReadOnlyCall(registry, calls[2]));
+    try std.testing.expect(isReadOnlyCall(registry, calls[0]));
+    try std.testing.expect(isReadOnlyCall(registry, calls[1]));
+    try std.testing.expect(!isReadOnlyCall(registry, calls[2]));
 }
 
 test "parallel classifier admits approval-bearing web fetch read groups" {
@@ -519,6 +520,20 @@ test "parallel classifier admits approval-bearing web fetch read groups" {
     };
 
     try std.testing.expectEqual(@as(usize, 2), parallelReadOnlyPrefixLen(registry, &calls));
+}
+
+test "parallel classifier admits installed skill reads" {
+    const builtin_tools = @import("../../../builtins/tools.zig");
+    const tools = [_]tool_dispatch.Tool{builtin_tools.skill};
+    const registry = tool_dispatch.Registry{ .tools = &tools };
+    const calls = [_]ToolCall{toolCall(
+        "skill_1",
+        "skill",
+        "{\"name\":\"demo\",\"location\":\"/tmp/demo\",\"resource\":\"SKILL.md\"}",
+    )};
+
+    try std.testing.expectEqual(@as(usize, 1), parallelReadOnlyPrefixLen(registry, &calls));
+    try std.testing.expect(isReadOnlyCall(registry, calls[0]));
 }
 
 test "parallel classifier rejects prompts approvals dynamic tools and mutations" {
@@ -543,12 +558,12 @@ test "parallel classifier rejects prompts approvals dynamic tools and mutations"
     };
 
     for (cases) |call| {
-        try std.testing.expect(!isParallelReadOnlyCall(registry, call));
+        try std.testing.expect(!isReadOnlyCall(registry, call));
     }
 
     var provider_call = toolCall("provider_1", "read_file", "{\"path\":\"README.md\"}");
     provider_call.provider_result = "provider result";
-    try std.testing.expect(!isParallelReadOnlyCall(registry, provider_call));
+    try std.testing.expect(!isReadOnlyCall(registry, provider_call));
 }
 
 test "parallel read-only execution preserves order and failure fan-in" {

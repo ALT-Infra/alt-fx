@@ -216,6 +216,41 @@ pub const ProvisionalToolStatuses = struct {
         );
     }
 
+    pub fn settleDeferredCall(
+        self: *ProvisionalToolStatuses,
+        hooks: *const AgentRuntimeDeps,
+        alloc: Allocator,
+        arena: Allocator,
+        turn_id: u64,
+        call: ToolCall,
+        advertised_dynamic_tool_names: []const []const u8,
+    ) !bool {
+        const recorded_terminal = try self.recordTerminal(alloc, call.id);
+        if (!recorded_terminal) return false;
+        errdefer self.forgetTerminal(alloc, call.id);
+        const target = try self.ensureTerminalTarget(
+            hooks,
+            arena,
+            turn_id,
+            call,
+            false,
+            null,
+            advertised_dynamic_tool_names,
+        ) orelse {
+            self.forgetTerminal(alloc, call.id);
+            return false;
+        };
+        try finishDeferredToolStatus(
+            hooks,
+            arena,
+            turn_id,
+            target.call,
+            advertised_dynamic_tool_names,
+        );
+        if (target.tracked_id) |tracked_id| self.forget(alloc, tracked_id);
+        return true;
+    }
+
     pub fn finishDeniedCall(
         self: *ProvisionalToolStatuses,
         hooks: *const AgentRuntimeDeps,
@@ -794,6 +829,30 @@ pub fn finishDeniedToolStatus(
         null,
         null,
     );
+}
+
+fn finishDeferredToolStatus(
+    hooks: *const AgentRuntimeDeps,
+    arena: Allocator,
+    turn_id: u64,
+    call: ToolCall,
+    advertised_dynamic_tool_names: []const []const u8,
+) !void {
+    const line = try hooks.describe_tool_action_denied(
+        hooks.ctx,
+        arena,
+        call,
+        null,
+        types.context_deferred_tool_status_label,
+        advertised_dynamic_tool_names,
+    );
+    try hooks.push_tool_lifecycle(hooks.ctx, .{ .terminal = .{
+        .id = .{ .turn_id = turn_id, .call_id = call.id },
+        .outcome = .{
+            .kind = .deferred,
+            .summary = line,
+        },
+    } });
 }
 
 pub fn finishDeniedToolStatusWithResultMemory(

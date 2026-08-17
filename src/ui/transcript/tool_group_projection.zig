@@ -137,6 +137,7 @@ const Summary = struct {
     failed: usize = 0,
     denied: usize = 0,
     cancelled: usize = 0,
+    deferred: usize = 0,
     completion_unreported: usize = 0,
     not_executed: usize = 0,
 };
@@ -263,6 +264,7 @@ fn observeTool(summary: *Summary, detail: ?*const ToolDetailRecord) void {
             .failed => summary.failed += 1,
             .denied => summary.denied += 1,
             .cancelled => summary.cancelled += 1,
+            .deferred => summary.deferred += 1,
         }
     }
 }
@@ -404,6 +406,7 @@ fn formatGroupHeader(
     try appendSegment(&out.writer, summary.failed, "failed");
     try appendSegment(&out.writer, summary.denied, "denied");
     try appendSegment(&out.writer, summary.cancelled, "cancelled");
+    try appendSegment(&out.writer, summary.deferred, "deferred");
 
     const plain = try out.toOwnedSlice();
     defer alloc.free(plain);

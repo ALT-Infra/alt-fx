@@ -475,6 +475,7 @@ fn lifecycleMarker(kind: types.ToolOutcomeKind) LifecycleMarker {
         .failed => .{ .style = ui_render.red_style, .glyph = "●" },
         .denied => .{ .style = ui_render.red_style, .glyph = "⊘" },
         .cancelled => .{ .style = ui_render.warning_style, .glyph = "■" },
+        .deferred => .{ .style = ui_render.warning_style, .glyph = "↻" },
     };
 }
 
@@ -2364,8 +2365,8 @@ test "historical deferred tool detail keeps the call without result evidence" {
     const entry_id = try runtime.writeCompletedToolStatusReturningEntryId(
         alloc,
         &metrics,
-        .denied,
-        "Not executed cat nested/input.txt",
+        .deferred,
+        "Context updated: Running cat nested/input.txt",
         true,
     );
     try runtime.attachHistoricalToolDetail(
@@ -2381,11 +2382,11 @@ test "historical deferred tool detail keeps the call without result evidence" {
             .tool_call_id = @constCast("deferred-command"),
             .tool_name = @constCast("run_command"),
             .status = .failure,
-            .output = @constCast("Not executed"),
+            .output = @constCast(types.context_deferred_tool_result_output),
             .output_handle = @constCast("should-not-be-exposed.txt"),
             .preview = @constCast("should not be exposed"),
-            .output_bytes = 12,
-            .stored_output_bytes = 12,
+            .output_bytes = types.context_deferred_tool_result_output.len,
+            .stored_output_bytes = types.context_deferred_tool_result_output.len,
             .truncated = true,
             .command_output_replay = .unavailable,
             .command_process_presentation = .{ .exit_code = 7 },
@@ -2395,13 +2396,42 @@ test "historical deferred tool detail keeps the call without result evidence" {
     const detail = runtime.toolDetailForEntry(entry_id).?;
     try std.testing.expectEqualStrings("run_command", detail.tool_name);
     try std.testing.expectEqualStrings("{\"command\":\"cat nested/input.txt\"}", detail.arguments_json.?);
-    try std.testing.expectEqual(types.ToolOutcomeKind.denied, detail.outcome.?);
+    try std.testing.expectEqual(types.ToolOutcomeKind.deferred, detail.outcome.?);
     try std.testing.expect(detail.result == null);
     try std.testing.expect(detail.result_handle == null);
     try std.testing.expect(detail.command_artifact_handle == null);
     try std.testing.expect(detail.command_output_replay == null);
     try std.testing.expect(detail.command_process_presentation == null);
     try std.testing.expect(detail.command_output_entry_id == null);
+
+    const legacy_entry_id = try runtime.writeCompletedToolStatusReturningEntryId(
+        alloc,
+        &metrics,
+        .denied,
+        "Not executed: Reading stale.txt",
+        true,
+    );
+    try runtime.attachHistoricalToolDetail(
+        alloc,
+        legacy_entry_id,
+        .{
+            .id = "legacy-deferred-read",
+            .name = "read_file",
+            .arguments_json = "{\"path\":\"stale.txt\"}",
+        },
+        .read,
+        .{
+            .tool_call_id = @constCast("legacy-deferred-read"),
+            .tool_name = @constCast("read_file"),
+            .status = .failure,
+            .output = @constCast(types.deferred_tool_result_output),
+            .output_bytes = types.deferred_tool_result_output.len,
+            .stored_output_bytes = types.deferred_tool_result_output.len,
+        },
+    );
+    const legacy_detail = runtime.toolDetailForEntry(legacy_entry_id).?;
+    try std.testing.expectEqual(types.ToolOutcomeKind.denied, legacy_detail.outcome.?);
+    try std.testing.expect(legacy_detail.result == null);
 
     const failed_entry_id = try runtime.writeCompletedToolStatusReturningEntryId(
         alloc,
@@ -5183,6 +5213,7 @@ pub const TranscriptRuntime = struct {
         lifecycle_id: ?types.ToolLifecycleId,
         command_output_entry_id: ?u32,
     ) !void {
+        const context_deferred = types.isContextDeferredToolResult(result);
         const deferred = types.isDeferredToolResult(result);
         const command_artifact_handle = if (!deferred and activity_kind == .command)
             command_output_runtime.commandArtifactHandleFromResult(result.output)
@@ -5195,7 +5226,9 @@ pub const TranscriptRuntime = struct {
             lifecycle_id,
             call.name,
             activity_kind,
-            if (deferred)
+            if (context_deferred)
+                .deferred
+            else if (deferred)
                 .denied
             else if (result.status == .success or
                 (activity_kind == .command and
