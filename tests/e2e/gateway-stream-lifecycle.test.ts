@@ -745,6 +745,53 @@ describe("gateway stream lifecycle", () => {
     }
   }, 30_000);
 
+  test("memory clear deletion failure remains failed and preserves state", async () => {
+    const root = createFixtureRoot("memory-clear-failure");
+    const tracePath = join(root.root, "trace.log");
+    const memoriesPath = join(root.home, ".fx", "memories.json");
+    const survivorPath = join(memoriesPath, "must-survive.txt");
+    mkdirSync(memoriesPath);
+    writeFileSync(survivorPath, "still present\n");
+
+    const callId = "memory_clear_failure_1";
+    const responses = [
+      fakeGatewayToolCall(callId, "memory", { action: "clear" }),
+      fakeGatewayFinalText("Memory clear failure handled."),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+
+    try {
+      const result = await runFx(
+        ["ask", "--yolo", "--json", "--no-save", "Clear saved memories."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+
+      expect(result.code).toBe(0);
+      expect(json.exit_code).toBe(0);
+      expect(json.error).toBeUndefined();
+      expect(json.output).toContain("Memory clear failure handled.");
+      expect(json.tool_calls).toContainEqual({
+        name: "memory",
+        status: "error",
+      });
+      expect(gateway.requestCount()).toBe(2);
+      expect(toolResultOutput(gateway.requests[1]!.body, callId)).toContain(
+        "memory clear failed: saved memories were not removed; ensure ~/.fx/memories.json is a removable file and retry",
+      );
+      expect(readFileSync(survivorPath, "utf8")).toBe("still present\n");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("ask keeps the GLM default model identity while enabling fast mode", async () => {
     const root = createFixtureRoot("default-model-fast");
     const tracePath = join(root.root, "trace.log");

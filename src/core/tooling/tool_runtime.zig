@@ -8349,7 +8349,32 @@ test "memory tool uses isolated HOME and preserves outputs" {
     try std.testing.expectEqualStrings("likes Zig", parsed.value.array.items[0].string);
 
     try expectToolOutput(ctx, "memory", "{\"action\":\"clear\"}", "memories cleared");
+    try expectToolOutput(ctx, "memory", "{\"action\":\"clear\"}", "memories cleared");
     try expectToolOutput(ctx, "memory", "{\"action\":\"list\"}", "No saved memories");
+
+    try std.Io.Dir.createDirAbsolute(io_mod.getIo(), memories_path, .default_dir);
+    const survivor_path = try std.fs.path.join(alloc, &.{ memories_path, "must-survive.txt" });
+    defer alloc.free(survivor_path);
+    {
+        var survivor = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), survivor_path, .{});
+        survivor.close(io_mod.getIo());
+    }
+
+    var failed_clear_arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer failed_clear_arena_state.deinit();
+    const failed_clear = try executeToolCall(ctx, failed_clear_arena_state.allocator(), .{
+        .id = "failed-memory-clear",
+        .name = "memory",
+        .arguments_json = "{\"action\":\"clear\"}",
+    });
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, failed_clear.status);
+    try std.testing.expectEqualStrings(
+        "memory clear failed: saved memories were not removed; ensure ~/.fx/memories.json is a removable file and retry",
+        failed_clear.model_output,
+    );
+
+    var survivor = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), survivor_path, .{});
+    survivor.close(io_mod.getIo());
 }
 
 test "run_command executes registered compatibility before shell" {

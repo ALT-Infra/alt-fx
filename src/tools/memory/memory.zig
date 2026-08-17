@@ -69,6 +69,10 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
     const input = erased.as(Input);
     const output = runMemory(ctx.allocator, input.action, input.fact) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
+        error.MemoryClearFailed => return .{ .failure = try ctx.allocator.dupe(
+            u8,
+            "memory clear failed: saved memories were not removed; ensure ~/.fx/memories.json is a removable file and retry",
+        ) },
         else => return .{ .failure = try std.fmt.allocPrint(ctx.allocator, "memory failed: {s}", .{@errorName(err)}) },
     };
     return .{ .success = output };
@@ -117,7 +121,10 @@ fn runMemory(alloc: Allocator, action: []const u8, fact: ?[]const u8) ![]u8 {
     }
 
     if (std.mem.eql(u8, action, "clear")) {
-        std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), memories_path) catch {};
+        std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), memories_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return error.MemoryClearFailed,
+        };
         return std.fmt.allocPrint(alloc, "memories cleared", .{});
     }
 
@@ -258,6 +265,40 @@ test "memory owner rejects unsupported actions before execution" {
         error.UnsupportedMemoryAction,
         execute(arena_state.allocator(), "{\"action\":\"replace\"}"),
     );
+}
+
+test "memory clear fails closed when state cannot be deleted" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/memories.json");
+    {
+        var survivor = try tmp.dir.createFile(
+            io_mod.getIo(),
+            "home/.fx/memories.json/must-survive.txt",
+            .{},
+        );
+        survivor.close(io_mod.getIo());
+    }
+
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    try setTestHome(home);
+    defer setTestHome(null) catch {};
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    try std.testing.expectError(
+        error.MemoryClearFailed,
+        execute(arena_state.allocator(), "{\"action\":\"clear\"}"),
+    );
+
+    var survivor = try tmp.dir.openFile(
+        io_mod.getIo(),
+        "home/.fx/memories.json/must-survive.txt",
+        .{},
+    );
+    survivor.close(io_mod.getIo());
 }
 
 test "memory owner preserves active output behavior" {
