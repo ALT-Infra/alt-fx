@@ -3,6 +3,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const list_window = @import("../shared/list_window.zig");
 const model_context_encoding = @import("../shared/model_context_encoding.zig");
+const pathing = @import("../workspace/pathing.zig");
 const skill_contract = @import("skill_contract.zig");
 const context_limits = @import("../config/context_limits.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
@@ -18,6 +19,8 @@ pub const Skill = struct {
     description: []const u8,
     path: []const u8,
     source: SkillSource,
+    /// Owned with discovered catalog entries. Null keeps managed skills strict.
+    read_authority: ?[]const u8 = null,
 };
 
 pub const BoundedPromptSection = struct {
@@ -260,6 +263,12 @@ pub const SkillMenuTarget = struct {
 const SkillRoot = struct {
     path: []const u8,
     source: SkillSource,
+    read_authority: ?[]const u8,
+};
+
+const SkillEntry = struct {
+    name: []u8,
+    linked: bool,
 };
 
 pub fn loadVisibleSkills(
@@ -333,14 +342,20 @@ fn appendWorkspaceRoots(
 }
 
 fn appendSpecRoot(alloc: Allocator, roots: *std.ArrayList(SkillRoot), base: []const u8, spec: skill_contract.RootSpec) !void {
-    try appendOwnedRoot(alloc, roots, try std.fs.path.join(alloc, &.{ base, spec.path }), spec.source);
+    try appendOwnedRoot(alloc, roots, try std.fs.path.join(alloc, &.{ base, spec.path }), spec.source, base);
 }
 
 fn appendDupeRoot(alloc: Allocator, roots: *std.ArrayList(SkillRoot), source: SkillSource, path: []const u8) !void {
-    try appendOwnedRoot(alloc, roots, try alloc.dupe(u8, path), source);
+    try appendOwnedRoot(alloc, roots, try alloc.dupe(u8, path), source, null);
 }
 
-fn appendOwnedRoot(alloc: Allocator, roots: *std.ArrayList(SkillRoot), path: []u8, source: SkillSource) !void {
+fn appendOwnedRoot(
+    alloc: Allocator,
+    roots: *std.ArrayList(SkillRoot),
+    path: []u8,
+    source: SkillSource,
+    read_authority: ?[]const u8,
+) !void {
     if (containsRootPath(roots.items, path)) {
         alloc.free(path);
         return;
@@ -349,10 +364,23 @@ fn appendOwnedRoot(alloc: Allocator, roots: *std.ArrayList(SkillRoot), path: []u
     roots.append(alloc, .{
         .path = path,
         .source = source,
+        .read_authority = read_authority,
     }) catch |err| {
         alloc.free(path);
         return err;
     };
+}
+
+fn openContainedDir(
+    alloc: Allocator,
+    logical_path: []const u8,
+    read_authority: []const u8,
+    options: std.Io.Dir.OpenOptions,
+) !std.Io.Dir {
+    const canonical_path = try io_mod.realpathAlloc(alloc, logical_path);
+    defer alloc.free(canonical_path);
+    if (!pathing.pathInside(read_authority, canonical_path)) return error.PathOutsideReadAuthority;
+    return io_mod.openDirAbsoluteNoFollow(canonical_path, options);
 }
 
 fn containsRootPath(roots: []const SkillRoot, path: []const u8) bool {
@@ -362,57 +390,27 @@ fn containsRootPath(roots: []const SkillRoot, path: []const u8) bool {
     return false;
 }
 
-pub fn openDirAbsoluteNoFollow(path: []const u8, options: std.Io.Dir.OpenOptions) !std.Io.Dir {
-    if (!std.fs.path.isAbsolute(path)) return error.InvalidSkillRoot;
-    var components = std.fs.path.componentIterator(path);
-    const root = components.root() orelse return error.InvalidSkillRoot;
-    var component = components.next() orelse {
-        var root_options = options;
-        root_options.follow_symlinks = false;
-        return std.Io.Dir.openDirAbsolute(io_mod.getIo(), root, root_options);
-    };
-
-    var dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), root, .{ .follow_symlinks = false });
-    errdefer dir.close(io_mod.getIo());
-    while (components.next()) |next_component| {
-        if (std.mem.eql(u8, component.name, ".") or std.mem.eql(u8, component.name, "..")) {
-            return error.InvalidSkillRoot;
-        }
-        const next_dir = try dir.openDir(io_mod.getIo(), component.name, .{ .follow_symlinks = false });
-        dir.close(io_mod.getIo());
-        dir = next_dir;
-        component = next_component;
-    }
-    if (std.mem.eql(u8, component.name, ".") or std.mem.eql(u8, component.name, "..")) {
-        return error.InvalidSkillRoot;
-    }
-    var final_options = options;
-    final_options.follow_symlinks = false;
-    const result = try dir.openDir(io_mod.getIo(), component.name, final_options);
-    dir.close(io_mod.getIo());
-    return result;
-}
-
 fn appendSkillsFromDir(
     alloc: Allocator,
     skills: *std.ArrayList(Skill),
     diagnostics: ?*std.ArrayList(SkillDiagnostic),
     root: SkillRoot,
 ) !void {
-    var dir = openDirAbsoluteNoFollow(root.path, .{
-        .iterate = true,
-    }) catch |err| {
-        if (err == error.FileNotFound or (err == error.NotDir and rootPathIsMissing(root.path))) return;
+    var dir = (if (root.read_authority) |read_authority|
+        openContainedDir(alloc, root.path, read_authority, .{ .iterate = true })
+    else
+        io_mod.openDirAbsoluteNoFollow(root.path, .{ .iterate = true })) catch |err| {
+        if ((err == error.FileNotFound or err == error.NotDir) and rootPathIsMissing(root.path)) return;
         if (err == error.OutOfMemory) return error.OutOfMemory;
         if (diagnostics) |items| try appendSkillDiagnostic(alloc, items, root.path, root.source, .root, .unreadable);
         return;
     };
     defer dir.close(io_mod.getIo());
 
-    var entry_names: std.ArrayList([]u8) = .empty;
+    var entries: std.ArrayList(SkillEntry) = .empty;
     defer {
-        for (entry_names.items) |name| alloc.free(name);
-        entry_names.deinit(alloc);
+        for (entries.items) |entry| alloc.free(entry.name);
+        entries.deinit(alloc);
     }
 
     var it = dir.iterate();
@@ -422,23 +420,24 @@ fn appendSkillsFromDir(
             if (diagnostics) |items| try appendSkillDiagnostic(alloc, items, root.path, root.source, .root, .unreadable);
             return;
         } orelse break;
-        if (entry.kind != .directory) continue;
+        const linked = entry.kind == .sym_link;
+        if (entry.kind != .directory and !(linked and root.read_authority != null)) continue;
 
         const owned_name = try alloc.dupe(u8, entry.name);
-        entry_names.append(alloc, owned_name) catch |err| {
+        entries.append(alloc, .{ .name = owned_name, .linked = linked }) catch |err| {
             alloc.free(owned_name);
             return err;
         };
     }
 
-    sort_utils.sort([]u8, entry_names.items, {}, struct {
-        fn lessThan(_: void, left: []u8, right: []u8) bool {
-            return std.mem.order(u8, left, right) == .lt;
+    sort_utils.sort(SkillEntry, entries.items, {}, struct {
+        fn lessThan(_: void, left: SkillEntry, right: SkillEntry) bool {
+            return std.mem.order(u8, left.name, right.name) == .lt;
         }
     }.lessThan);
 
-    for (entry_names.items) |entry_name| {
-        try appendSkillCandidate(alloc, skills, diagnostics, root, &dir, entry_name);
+    for (entries.items) |entry| {
+        try appendSkillCandidate(alloc, skills, diagnostics, root, &dir, entry.name, entry.linked);
     }
 }
 
@@ -471,11 +470,19 @@ fn appendSkillCandidate(
     root: SkillRoot,
     root_dir: *std.Io.Dir,
     entry_name: []const u8,
+    linked: bool,
 ) !void {
     const candidate_path = try std.fs.path.join(alloc, &.{ root.path, entry_name });
     defer alloc.free(candidate_path);
 
-    var candidate_dir = root_dir.openDir(io_mod.getIo(), entry_name, .{ .follow_symlinks = false }) catch |err| {
+    var candidate_dir = if (linked) linked_candidate: {
+        const read_authority = root.read_authority orelse return;
+        break :linked_candidate openContainedDir(alloc, candidate_path, read_authority, .{}) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            if (diagnostics) |items| try appendSkillDiagnostic(alloc, items, candidate_path, root.source, .candidate, .unreadable);
+            return;
+        };
+    } else root_dir.openDir(io_mod.getIo(), entry_name, .{ .follow_symlinks = false }) catch |err| {
         if (err == error.FileNotFound) return;
         if (err == error.OutOfMemory) return error.OutOfMemory;
         if (diagnostics) |items| try appendSkillDiagnostic(alloc, items, candidate_path, root.source, .candidate, .unreadable);
@@ -532,12 +539,18 @@ fn appendSkillCandidate(
     candidate.metadata.write_description(description);
     const path = try alloc.dupe(u8, candidate_path);
     errdefer alloc.free(path);
+    const read_authority = if (root.read_authority) |authority|
+        try alloc.dupe(u8, authority)
+    else
+        null;
+    errdefer if (read_authority) |authority| alloc.free(authority);
 
     try skills.append(alloc, .{
         .name = skill_name,
         .description = description,
         .path = path,
         .source = root.source,
+        .read_authority = read_authority,
     });
 }
 
@@ -588,18 +601,25 @@ fn inspectSkillCandidateFile(
 /// Opens and validates the exact advertised candidate without rescanning skill roots.
 /// The caller must deinitialize a `.current` candidate.
 pub fn openValidatedSkillCandidate(alloc: Allocator, skill: Skill) error{OutOfMemory}!SkillCandidateOpenResult {
-    const parent_path = std.fs.path.dirname(skill.path) orelse return .{ .skipped = .unreadable };
     const candidate_name = std.fs.path.basename(skill.path);
     if (candidate_name.len == 0) return .{ .skipped = .unreadable };
 
-    var parent_dir = openDirAbsoluteNoFollow(parent_path, .{}) catch |err| {
-        if (err == error.OutOfMemory) return error.OutOfMemory;
-        return if (err == error.FileNotFound) .missing else .{ .skipped = .unreadable };
-    };
-    defer parent_dir.close(io_mod.getIo());
-    var candidate_dir = parent_dir.openDir(io_mod.getIo(), candidate_name, .{ .follow_symlinks = false }) catch |err| {
-        if (err == error.OutOfMemory) return error.OutOfMemory;
-        return if (err == error.FileNotFound) .missing else .{ .skipped = .unreadable };
+    var candidate_dir = if (skill.read_authority) |read_authority| authorized: {
+        break :authorized openContainedDir(alloc, skill.path, read_authority, .{}) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return if (err == error.FileNotFound) .missing else .{ .skipped = .unreadable };
+        };
+    } else strict: {
+        const parent_path = std.fs.path.dirname(skill.path) orelse return .{ .skipped = .unreadable };
+        var parent_dir = io_mod.openDirAbsoluteNoFollow(parent_path, .{}) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return if (err == error.FileNotFound) .missing else .{ .skipped = .unreadable };
+        };
+        defer parent_dir.close(io_mod.getIo());
+        break :strict parent_dir.openDir(io_mod.getIo(), candidate_name, .{ .follow_symlinks = false }) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return if (err == error.FileNotFound) .missing else .{ .skipped = .unreadable };
+        };
     };
     var file = candidate_dir.openFile(io_mod.getIo(), "SKILL.md", .{
         .allow_directory = false,
@@ -1557,6 +1577,7 @@ pub fn freeSkill(alloc: Allocator, skill: Skill) void {
     alloc.free(skill.name);
     alloc.free(skill.description);
     alloc.free(skill.path);
+    if (skill.read_authority) |read_authority| alloc.free(read_authority);
 }
 
 pub fn freeSkills(alloc: Allocator, skills: []Skill) void {
@@ -2469,6 +2490,181 @@ test "loadVisibleSkills discovers workspace and global codex roots" {
     try std.testing.expectEqual(@as(usize, 2), skills.len);
     try std.testing.expectEqual(SkillSource.workspace_codex, findSkillByName(skills, "local-codex").?.source);
     try std.testing.expectEqual(SkillSource.global_codex, findSkillByName(skills, "global-codex").?.source);
+}
+
+test "loadVisibleSkills discovers and reopens a contained linked workspace candidate" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTempFile(
+        &tmp,
+        "home/workspace/skill-source/linked-skill/SKILL.md",
+        "---\nname: linked-skill\ndescription: contained link\n---\n\nLINKED_SKILL_BODY\n",
+    );
+    try createTempSymlinkOrSkip(
+        &tmp,
+        "../../skill-source/linked-skill",
+        "home/workspace/.codex/skills/linked-skill",
+    );
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/skills");
+
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace");
+    defer alloc.free(workspace_root);
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    defer alloc.free(managed_root);
+    const logical_path = try std.fs.path.join(alloc, &.{ workspace_root, ".codex/skills/linked-skill" });
+    defer alloc.free(logical_path);
+
+    var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, test_root_policy);
+    defer discovery.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), discovery.skills.len);
+    try std.testing.expectEqualStrings("linked-skill", discovery.skills[0].name);
+    try std.testing.expectEqualStrings(logical_path, discovery.skills[0].path);
+    try std.testing.expectEqual(SkillSource.workspace_codex, discovery.skills[0].source);
+    try std.testing.expectEqual(@as(usize, 0), discovery.diagnostics.len);
+
+    var candidate = switch (try openValidatedSkillCandidate(alloc, discovery.skills[0])) {
+        .current => |current| current,
+        .missing, .name_mismatch, .skipped => return error.TestExpectedCurrentSkill,
+    };
+    candidate.deinit();
+
+    try writeTempFile(
+        &tmp,
+        "home/outside-skill/SKILL.md",
+        "---\nname: linked-skill\ndescription: outside\n---\n\nOUTSIDE_BODY_MUST_NOT_LOAD\n",
+    );
+    try tmp.dir.deleteFile(io_mod.getIo(), "home/workspace/.codex/skills/linked-skill");
+    try createTempSymlinkOrSkip(
+        &tmp,
+        "../../../outside-skill",
+        "home/workspace/.codex/skills/linked-skill",
+    );
+    switch (try openValidatedSkillCandidate(alloc, discovery.skills[0])) {
+        .skipped => |cause| try std.testing.expectEqual(SkillDiagnosticCause.unreadable, cause),
+        .current => |current_value| {
+            var current = current_value;
+            current.deinit();
+            return error.TestExpectedSkippedSkill;
+        },
+        .missing, .name_mismatch => return error.TestExpectedSkippedSkill,
+    }
+}
+
+test "loadVisibleSkills discovers a contained linked workspace root" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTempFile(
+        &tmp,
+        "home/workspace/skill-root/root-linked/SKILL.md",
+        "---\nname: root-linked\ndescription: linked root\n---\n\nROOT_LINKED_BODY\n",
+    );
+    try createTempSymlinkOrSkip(
+        &tmp,
+        "../skill-root",
+        "home/workspace/.codex/skills",
+    );
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/skills");
+
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace");
+    defer alloc.free(workspace_root);
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    defer alloc.free(managed_root);
+
+    var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, test_root_policy);
+    defer discovery.deinit(alloc);
+
+    const skill = findSkillByName(discovery.skills, "root-linked") orelse return error.TestExpectedSkill;
+    try std.testing.expectEqual(SkillSource.workspace_codex, skill.source);
+    try std.testing.expectEqualStrings(workspace_root, skill.read_authority.?);
+    try std.testing.expectEqual(@as(usize, 0), discovery.diagnostics.len);
+}
+
+test "loadVisibleSkills diagnoses an escaping linked workspace candidate" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTempFile(
+        &tmp,
+        "home/outside-skill/SKILL.md",
+        "---\nname: escaping-skill\ndescription: outside\n---\n\nOUTSIDE_BODY_MUST_NOT_LOAD\n",
+    );
+    try createTempSymlinkOrSkip(
+        &tmp,
+        "../../../outside-skill",
+        "home/workspace/.codex/skills/escaping-skill",
+    );
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/skills");
+
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace");
+    defer alloc.free(workspace_root);
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    defer alloc.free(managed_root);
+    const logical_path = try std.fs.path.join(alloc, &.{ workspace_root, ".codex/skills/escaping-skill" });
+    defer alloc.free(logical_path);
+
+    var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, test_root_policy);
+    defer discovery.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), discovery.skills.len);
+    try std.testing.expectEqual(@as(usize, 1), discovery.diagnostics.len);
+    try std.testing.expectEqualStrings(logical_path, discovery.diagnostics[0].path);
+    try std.testing.expectEqual(SkillDiagnosticScope.candidate, discovery.diagnostics[0].scope);
+    try std.testing.expectEqual(SkillDiagnosticCause.unreadable, discovery.diagnostics[0].cause);
+}
+
+fn checkContainedLinkedSkillAllocationFailures(
+    alloc: Allocator,
+    workspace_root: []const u8,
+    home_root: []const u8,
+    managed_root: []const u8,
+) !void {
+    var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, test_root_policy);
+    defer discovery.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), discovery.skills.len);
+    try std.testing.expect(discovery.skills[0].read_authority != null);
+}
+
+test "loadVisibleSkills cleans contained-link authority allocation failures" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTempFile(
+        &tmp,
+        "home/workspace/skill-source/linked-skill/SKILL.md",
+        "---\nname: linked-skill\ndescription: allocation cleanup\n---\n\nbody\n",
+    );
+    try createTempSymlinkOrSkip(
+        &tmp,
+        "../../skill-source/linked-skill",
+        "home/workspace/.codex/skills/linked-skill",
+    );
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/skills");
+
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace");
+    defer alloc.free(workspace_root);
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    defer alloc.free(managed_root);
+
+    try std.testing.checkAllAllocationFailures(
+        alloc,
+        checkContainedLinkedSkillAllocationFailures,
+        .{ workspace_root, home_root, managed_root },
+    );
 }
 
 test "loadVisibleSkills skips missing or unreadable skill files without failing" {

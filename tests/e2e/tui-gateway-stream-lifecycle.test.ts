@@ -2477,10 +2477,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       mkdirSync(workspacePath, { recursive: true });
       writeFileSync(join(home, ".fx", "settings.json"), "{}");
       writeFileSync(
-        join(workspacePath, "CLAUDE.md"),
-        "# Workspace instructions\n",
+        join(root, "outside-instructions.md"),
+        "# Outside instructions\n",
       );
-      symlinkSync("CLAUDE.md", join(workspacePath, "AGENTS.md"));
+      symlinkSync("../outside-instructions.md", join(workspacePath, "AGENTS.md"));
       const workspace = realpathSync(workspacePath);
 
       const heldGateway = startFakeGateway([
