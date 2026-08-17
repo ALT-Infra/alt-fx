@@ -27,6 +27,8 @@ pub const CommandOutputDisplayState = struct {
     open_command_block: ?usize = null,
 };
 
+pub const CodeHighlightTheme = code_highlight.Theme;
+
 pub const Styles = struct {
     system_notice_label_style: []const u8 = "",
     system_notice_text_style: []const u8 = "",
@@ -39,6 +41,7 @@ pub const Styles = struct {
     notice_warning_style: []const u8 = "",
     notice_error_style: []const u8 = "",
     notice_cancelled_style: []const u8 = "",
+    code_highlight_theme: CodeHighlightTheme = .dark,
 };
 
 pub const ToolFallbackDisposition = enum {
@@ -865,6 +868,15 @@ pub fn renderCodeBlockForTranscript(
     block: assistant_presentation.CodeBlockPayload,
     cols: u16,
 ) ![]u8 {
+    return renderCodeBlockForTranscriptWithTheme(alloc, block, cols, .dark);
+}
+
+fn renderCodeBlockForTranscriptWithTheme(
+    alloc: Allocator,
+    block: assistant_presentation.CodeBlockPayload,
+    cols: u16,
+    theme: CodeHighlightTheme,
+) ![]u8 {
     var rendered: std.ArrayList(u8) = .empty;
     errdefer rendered.deinit(alloc);
     if (cols == 0) return rendered.toOwnedSlice(alloc);
@@ -880,7 +892,7 @@ pub fn renderCodeBlockForTranscript(
     else
         "";
     const styled_code = if (profile) |resolved|
-        try code_highlight.highlight(alloc, block.code, resolved)
+        try code_highlight.highlight(alloc, block.code, resolved, theme)
     else
         null;
     defer if (styled_code) |code| alloc.free(code);
@@ -1570,7 +1582,12 @@ fn renderEntryToBlockForPresentationInterruptible(
         },
         .assistant_code_block => |e| blk: {
             const gutter = assistant_wrap.gutterWidth(cols);
-            const rendered = try renderCodeBlockForTranscript(alloc, e.block, cols -| gutter);
+            const rendered = try renderCodeBlockForTranscriptWithTheme(
+                alloc,
+                e.block,
+                cols -| gutter,
+                styles.code_highlight_theme,
+            );
             defer alloc.free(rendered);
             const prefixed = try assistant_wrap.prefixStructuralRows(alloc, rendered, gutter);
             break :blk try normalizeOwnedRenderedBlock(alloc, kind, prefixed);
@@ -3050,6 +3067,30 @@ test "renderCodeBlockForTranscript highlights registered profiles without stylin
     defer alloc.free(raw);
     try std.testing.expect(std.mem.indexOf(u8, raw, "\x1b[38;5;") == null);
     try std.testing.expect(std.mem.indexOf(u8, raw, "+++[>+++<-]") != null);
+}
+
+test "semantic code blocks use the light syntax palette when requested" {
+    const alloc = std.testing.allocator;
+    const language = try alloc.dupe(u8, "zig");
+    defer alloc.free(language);
+    const code = try alloc.dupe(u8, "const value = \"ready\"; // comment");
+    defer alloc.free(code);
+    const entry = TranscriptEntry{ .assistant_code_block = .{
+        .id = 1,
+        .block = .{
+            .language = language,
+            .code = code,
+        },
+    } };
+
+    const rendered = try renderEntryToBlock(alloc, entry, 80, .{
+        .code_highlight_theme = .light,
+    });
+    defer rendered.deinit(alloc);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered.bytes, "\x1b[38;5;238mconst\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered.bytes, "\x1b[38;5;241m\"ready\"\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered.bytes, "\x1b[38;5;243m// comment\x1b[39m") != null);
 }
 
 test "renderCodeBlockForTranscript infers registered high-confidence code blocks" {

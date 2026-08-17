@@ -1830,6 +1830,35 @@ test "semantic code block colors source and keeps structural rows default throug
     try std.testing.expect(resized_footer_cell.style.fg.eql(.default));
 }
 
+test "semantic code block keeps readable light theme colors through resize" {
+    var h = try Harness.init(std.testing.allocator, 40, 40, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+    h.shell.setCommandOutputRenderPolicy(.{ .code_highlight_theme = .light });
+
+    {
+        var block = assistant_presentation.CodeBlockPayload{
+            .language = try h.alloc.dupe(u8, "zig"),
+            .code = try h.alloc.dupe(u8, "const value = \"ready\"; // comment\n"),
+        };
+        errdefer block.deinit(h.alloc);
+        _ = try h.shell.appendAssistantCodeBlockOwned(h.alloc, block);
+    }
+    try h.renderTranscriptFrame();
+    try h.flush();
+
+    var code_row = try findRowContaining(&h, "const value");
+    var keyword_cell = h.vt.cellAt(code_row, 5) orelse return error.TestMissingCodeCell;
+    try std.testing.expectEqual(@as(u21, 'c'), keyword_cell.codepoint);
+    try std.testing.expect(keyword_cell.style.fg.eql(.{ .indexed = 238 }));
+
+    try h.driveResize(20, 40, 4, true);
+    code_row = try findRowContaining(&h, "const value");
+    keyword_cell = h.vt.cellAt(code_row, 5) orelse return error.TestMissingCodeCell;
+    try std.testing.expectEqual(@as(u21, 'c'), keyword_cell.codepoint);
+    try std.testing.expect(keyword_cell.style.fg.eql(.{ .indexed = 238 }));
+}
+
 test "semantic code block drops its frame before wrapping source that fits" {
     var h = try Harness.init(std.testing.allocator, 44, 40, 4);
     defer h.deinit();
