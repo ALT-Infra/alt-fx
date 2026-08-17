@@ -8,6 +8,7 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   truncateSync,
   writeFileSync,
 } from "node:fs";
@@ -975,6 +976,75 @@ describe("gateway stream lifecycle", () => {
         "<skill_content name=\"oversized-context\"",
       );
       expect(negatedPrompt).not.toContain("SKILL_FIRST_LINE");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("contained instruction and skill links reach one ask request", async () => {
+    const root = createFixtureRoot("contained-links-ask");
+    const tracePath = join(root.root, "trace.log");
+    const skillSource = join(
+      root.workspace,
+      "skill-source",
+      "linked-skill",
+    );
+    const skillsRoot = join(root.workspace, ".codex", "skills");
+    mkdirSync(skillSource, { recursive: true });
+    mkdirSync(skillsRoot, { recursive: true });
+    writeFileSync(
+      join(root.workspace, "CLAUDE.md"),
+      "LINKED_INSTRUCTION_SENTINEL\n",
+    );
+    symlinkSync("CLAUDE.md", join(root.workspace, "AGENTS.md"));
+    writeFileSync(
+      join(skillSource, "SKILL.md"),
+      "---\nname: linked-skill\ndescription: contained linked skill\n---\n\nLINKED_SKILL_SENTINEL\n",
+    );
+    symlinkSync(
+      "../../skill-source/linked-skill",
+      join(skillsRoot, "linked-skill"),
+      "dir",
+    );
+
+    const gateway = startGateway(() =>
+      fakeGatewayFinalText("CONTAINED_LINKS_COMPLETE")
+    );
+    try {
+      const result = await runFx(
+        [
+          "ask",
+          "--json",
+          "--auto",
+          "--no-save",
+          "$linked-skill apply the linked instructions and skill.",
+        ],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 30_000,
+        },
+      );
+      const output = parseAskJson(result.stdout);
+      const prompt = promptText(gateway.requests[0]!.body);
+
+      expect(result.code).toBe(0);
+      expect(output.output).toContain("CONTAINED_LINKS_COMPLETE");
+      expect(gateway.requestCount()).toBe(1);
+      expect(prompt).toContain("LINKED_INSTRUCTION_SENTINEL");
+      expect(prompt).toContain(
+        `<project-rules from="${join(root.workspace, "AGENTS.md")}">`,
+      );
+      expect(prompt).toContain("LINKED_SKILL_SENTINEL");
+      expect(prompt).toContain(
+        '<skill_content name="linked-skill" resource="SKILL.md"',
+      );
+      expect(prompt).toContain(
+        `<location>${join(root.workspace, ".codex", "skills", "linked-skill")}</location>`,
+      );
+      expect(prompt).not.toContain("symlinked rule file");
+      expect(result.stderr).not.toContain("symlinked rule file");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });

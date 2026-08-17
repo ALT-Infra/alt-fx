@@ -29,6 +29,39 @@ pub fn getIo() std.Io {
     return process_io_for(builtin.os.tag, fallback_threaded.io());
 }
 
+/// Opens an absolute directory path without following any path component.
+/// The caller owns the returned directory handle.
+pub fn openDirAbsoluteNoFollow(path: []const u8, options: std.Io.Dir.OpenOptions) !std.Io.Dir {
+    if (!std.fs.path.isAbsolute(path)) return error.InvalidPath;
+    var components = std.fs.path.componentIterator(path);
+    const root = components.root() orelse return error.InvalidPath;
+    var component = components.next() orelse {
+        var root_options = options;
+        root_options.follow_symlinks = false;
+        return std.Io.Dir.openDirAbsolute(getIo(), root, root_options);
+    };
+
+    var dir = try std.Io.Dir.openDirAbsolute(getIo(), root, .{ .follow_symlinks = false });
+    errdefer dir.close(getIo());
+    while (components.next()) |next_component| {
+        if (std.mem.eql(u8, component.name, ".") or std.mem.eql(u8, component.name, "..")) {
+            return error.InvalidPath;
+        }
+        const next_dir = try dir.openDir(getIo(), component.name, .{ .follow_symlinks = false });
+        dir.close(getIo());
+        dir = next_dir;
+        component = next_component;
+    }
+    if (std.mem.eql(u8, component.name, ".") or std.mem.eql(u8, component.name, "..")) {
+        return error.InvalidPath;
+    }
+    var final_options = options;
+    final_options.follow_symlinks = false;
+    const result = try dir.openDir(getIo(), component.name, final_options);
+    dir.close(getIo());
+    return result;
+}
+
 test "Darwin process I/O replaces only processSpawn with stable storage" {
     const original = std.testing.io;
     const selected = process_io_for(.macos, original);
@@ -86,6 +119,38 @@ test "non-Darwin process I/O keeps the original vtable" {
 
     try std.testing.expect(selected.userdata == original.userdata);
     try std.testing.expect(selected.vtable == original.vtable);
+}
+
+test "openDirAbsoluteNoFollow rejects unsafe path components" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(getIo(), "real/child");
+    try writeTempFile(tmp.dir, "plain-file", "not a directory");
+    tmp.dir.symLink(std.testing.io, "real", "linked", .{ .is_directory = true }) catch |err| {
+        if (err == error.AccessDenied or err == error.FileSystem) return error.SkipZigTest;
+        return err;
+    };
+
+    const root = try dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const linked_child = try std.fs.path.join(alloc, &.{ root, "linked/child" });
+    defer alloc.free(linked_child);
+    const missing = try std.fs.path.join(alloc, &.{ root, "missing" });
+    defer alloc.free(missing);
+    const wrong_kind = try std.fs.path.join(alloc, &.{ root, "plain-file" });
+    defer alloc.free(wrong_kind);
+
+    if (openDirAbsoluteNoFollow(linked_child, .{})) |dir| {
+        dir.close(getIo());
+        return error.TestExpectedError;
+    } else |err| switch (err) {
+        error.NotDir, error.SymLinkLoop => {},
+        else => return err,
+    }
+    try std.testing.expectError(error.FileNotFound, openDirAbsoluteNoFollow(missing, .{}));
+    try std.testing.expectError(error.NotDir, openDirAbsoluteNoFollow(wrong_kind, .{}));
 }
 
 /// Opens an existing regular file without following the final symlink and
