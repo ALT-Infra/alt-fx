@@ -5801,8 +5801,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.sendKeys("Right");
       const full = await session.waitForText("Full detail · ←/→ switch · ctrl o close", TIMEOUT);
-      expect(full).toContain("● 3 tool calls · 3 commands");
-      expect(full).not.toContain(workspace);
+      expect(full).toContain(finalText);
+      await session.sendKeys("PPage");
+      const fullAtSummary = await session.waitForText("● 3 tool calls · 3 commands", TIMEOUT);
+      expect(fullAtSummary).toContain("● 3 tool calls · 3 commands");
+      expect(fullAtSummary).not.toContain(workspace);
 
       const trace = readFileSync(tracePath, "utf8");
       for (const callId of [

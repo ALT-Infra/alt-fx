@@ -1113,10 +1113,10 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
       await session.waitForComposer(TIMEOUT);
       const resumedScrollback = await waitForScrollback(
         session,
-        HISTORY_DONE,
+        LIVE_DONE,
         TIMEOUT * 2,
       );
-      expect(resumedScrollback).toContain(LIVE_DONE);
+      expect(resumedScrollback).toContain(HISTORY_DONE);
       await session.sendLiteralText(RESUME_DRAFT);
       await waitForMode(session, "main", RESUME_DRAFT);
       const resumedPid = fxProcessId(session);
