@@ -293,7 +293,9 @@ pub fn validateToolCall(ctx: Context, arena: Allocator, call: ToolCall) !tool_co
         else => {},
     }
 
-    return switch (try tool_dispatch.validateRegisteredToolCall(typedDispatchContext(ctx, arena), ctx.tool_registry, call)) {
+    var dispatch_ctx = typedDispatchContext(ctx, arena);
+    dispatch_ctx.captured_command_host = spec.captured_command_host;
+    return switch (try tool_dispatch.validateRegisteredToolCall(dispatch_ctx, ctx.tool_registry, call)) {
         .not_registered => .not_registered,
         .valid => .valid,
         .failure => |reason| .{ .failure = reason },
@@ -4371,6 +4373,22 @@ test "validateToolCall rejects malformed registered input without claiming unkno
         .name = "dynamic_tool",
         .arguments_json = "{}",
     }));
+}
+
+test "validateToolCall preserves the registered captured command host" {
+    var rt = TestRuntime{ .tool_registry = test_browser_workspace_tools.registry };
+    defer rt.deinit(std.testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    try std.testing.expectEqual(
+        tool_contracts.ToolCallValidationResult.valid,
+        try validateToolCall(rt.context(), arena_state.allocator(), .{
+            .id = "workspace-terminal",
+            .name = "terminal",
+            .arguments_json = "{\"action\":\"exec\",\"command\":\"printf ok\"}",
+        }),
+    );
 }
 
 test "validateToolCall rejects selected MCP arguments through runtime capability" {
