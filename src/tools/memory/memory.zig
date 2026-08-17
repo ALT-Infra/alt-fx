@@ -57,7 +57,11 @@ fn inputDeinit(ptr: *anyopaque, alloc: Allocator) void {
     alloc.destroy(input);
 }
 
-pub fn validate(_: tool_dispatch.DispatchContext, _: tool_dispatch.ToolInput) tool_dispatch.DispatchError!?[]u8 {
+pub fn validate(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput) tool_dispatch.DispatchError!?[]u8 {
+    const input = erased.as(Input);
+    if (!isSupportedAction(input.action)) {
+        return try ctx.allocator.dupe(u8, "memory field \"action\" must be one of: save, list, clear");
+    }
     return null;
 }
 
@@ -78,6 +82,8 @@ pub fn execute(arena: Allocator, args_json: []const u8) ![]u8 {
 }
 
 fn runMemory(alloc: Allocator, action: []const u8, fact: ?[]const u8) ![]u8 {
+    if (!isSupportedAction(action)) return error.UnsupportedMemoryAction;
+
     const home = io_mod.getenv("HOME") orelse return std.fmt.allocPrint(alloc, "memory unavailable: HOME not set", .{});
     const memories_path = try profile_paths.memoriesPath(alloc, home);
     defer alloc.free(memories_path);
@@ -115,7 +121,13 @@ fn runMemory(alloc: Allocator, action: []const u8, fact: ?[]const u8) ![]u8 {
         return std.fmt.allocPrint(alloc, "memories cleared", .{});
     }
 
-    return std.fmt.allocPrint(alloc, "unknown memory action: {s}", .{action});
+    return error.UnsupportedMemoryAction;
+}
+
+fn isSupportedAction(action: []const u8) bool {
+    return std.mem.eql(u8, action, "save") or
+        std.mem.eql(u8, action, "list") or
+        std.mem.eql(u8, action, "clear");
 }
 
 fn loadMemories(alloc: Allocator, path: []const u8) std.ArrayList([]u8) {
@@ -200,6 +212,26 @@ fn expectMemoryOutput(args_json: []const u8, expected: []const u8) !void {
     try std.testing.expectEqualStrings(expected, output);
 }
 
+fn expectValidationFailure(args_json: []const u8, expected: []const u8) !void {
+    const alloc = std.testing.allocator;
+    const decoded = try decode(.{ .allocator = alloc }, args_json);
+    switch (decoded) {
+        .failure => |body| {
+            defer alloc.free(body);
+            try std.testing.expect(false);
+        },
+        .input => |input| {
+            defer input.deinit(alloc);
+            const reason = (try validate(.{ .allocator = alloc }, input)) orelse {
+                try std.testing.expect(false);
+                return;
+            };
+            defer alloc.free(reason);
+            try std.testing.expectEqualStrings(expected, reason);
+        },
+    }
+}
+
 fn setTestHome(home: ?[]const u8) !void {
     const map = try std.heap.c_allocator.create(std.process.Environ.Map);
     map.* = std.process.Environ.Map.init(std.heap.c_allocator);
@@ -212,6 +244,20 @@ test "memory owner rejects invalid JSON and action shape" {
     try expectDecodeFailure("[]", "memory arguments must be an object");
     try expectDecodeFailure("{}", "memory field \"action\" is required");
     try expectDecodeFailure("{\"action\":1}", "memory field \"action\" must be a string");
+}
+
+test "memory owner rejects unsupported actions before execution" {
+    try expectValidationFailure(
+        "{\"action\":\"replace\",\"fact\":\"new value\"}",
+        "memory field \"action\" must be one of: save, list, clear",
+    );
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    try std.testing.expectError(
+        error.UnsupportedMemoryAction,
+        execute(arena_state.allocator(), "{\"action\":\"replace\"}"),
+    );
 }
 
 test "memory owner preserves active output behavior" {
@@ -229,7 +275,6 @@ test "memory owner preserves active output behavior" {
 
     try expectMemoryOutput("{\"action\":\"list\"}", "No saved memories");
     try expectMemoryOutput("{\"action\":\"save\"}", "no fact provided");
-    try expectMemoryOutput("{\"action\":\"unknown\"}", "unknown memory action: unknown");
     try expectMemoryOutput("{\"action\":\"save\",\"fact\":\"likes Zig\"}", "remembered");
     try expectMemoryOutput("{\"action\":\"save\",\"fact\":\"likes Zig\"}", "remembered");
     try expectMemoryOutput("{\"action\":\"list\"}", "- likes Zig\n");

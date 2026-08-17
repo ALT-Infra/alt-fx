@@ -8317,6 +8317,20 @@ test "memory tool uses isolated HOME and preserves outputs" {
     defer rt.deinit(alloc);
     const ctx = rt.context();
     try expectToolOutput(ctx, "memory", "{\"action\":\"list\"}", "No saved memories");
+
+    var rejected_arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer rejected_arena_state.deinit();
+    const rejected = try executeToolCall(ctx, rejected_arena_state.allocator(), .{
+        .id = "invalid-memory-action",
+        .name = "memory",
+        .arguments_json = "{\"action\":\"replace\",\"fact\":\"new value\"}",
+    });
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, rejected.status);
+    try std.testing.expectEqualStrings(
+        "memory field \"action\" must be one of: save, list, clear",
+        rejected.model_output,
+    );
+
     try expectToolOutput(ctx, "memory", "{\"action\":\"save\",\"fact\":\"likes Zig\"}", "remembered");
     try expectToolOutput(ctx, "memory", "{\"action\":\"save\",\"fact\":\"likes Zig\"}", "remembered");
     try expectToolOutput(ctx, "memory", "{\"action\":\"list\"}", "- likes Zig\n");
