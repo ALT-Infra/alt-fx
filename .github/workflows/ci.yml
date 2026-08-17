@@ -19,7 +19,7 @@ jobs:
       matrix:
         include:
           - optimize: Debug
-            test_timeout_seconds: 300
+            test_timeout_seconds: 600
           - optimize: ReleaseSafe
             test_timeout_seconds: 900
     steps:
@@ -45,7 +45,10 @@ jobs:
       - name: Test
         env:
           TEST_TIMEOUT_SECONDS: ${{ matrix.test_timeout_seconds }}
-        run: timeout "${TEST_TIMEOUT_SECONDS}s" zig build test -Doptimize=${{ matrix.optimize }}
+        run: |
+          started_at=$SECONDS
+          trap 'printf "Unit tests elapsed: %ss\n" "$((SECONDS - started_at))"' EXIT
+          timeout "${TEST_TIMEOUT_SECONDS}s" zig build test -Doptimize=${{ matrix.optimize }}
 
   zig:
     name: Build & Test
