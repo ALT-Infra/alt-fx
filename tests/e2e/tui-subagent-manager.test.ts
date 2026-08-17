@@ -97,9 +97,18 @@ function normalizeVolatileTokenRows(grid: string[]): string[] {
   );
 }
 
+function normalizeVolatileMainGrid(grid: string[]): string[] {
+  return normalizeVolatileTokenRows(grid).map((line) =>
+    line.replace(/ · ⚡︎\s*$/, "")
+  );
+}
+
 test("volatile token rows normalize before restored subagent comparison", () => {
   expect(normalizeVolatileTokenRows(["  (↑7 ↓5)"])).toEqual(["<status>"]);
   expect(normalizeVolatileTokenRows(["  0s (↑7 ↓5)"])).toEqual(["<status>"]);
+  expect(normalizeVolatileMainGrid(["run /login · auto · glm-5.2 · ⚡︎"])).toEqual([
+    "run /login · auto · glm-5.2",
+  ]);
 });
 
 function controlledTextResponse(initialText: string) {
@@ -431,7 +440,9 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           pane.includes("MANAGER_COMPOSER_SENTINEL"),
         TIMEOUT,
       );
-      expect(await active.capturePaneGrid()).toEqual(gridBefore);
+      expect(normalizeVolatileMainGrid(await active.capturePaneGrid())).toEqual(
+        normalizeVolatileMainGrid(gridBefore),
+      );
       expect(active.cursorPosition()).toEqual(cursorBefore);
       await active.sendKeys("C-x");
       await active.waitForText("Agents & processes", TIMEOUT);
@@ -448,7 +459,9 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           pane.includes("MANAGER_COMPOSER_SENTINEL"),
         TIMEOUT,
       );
-      expect(await active.capturePaneGrid()).toEqual(gridBefore);
+      expect(normalizeVolatileMainGrid(await active.capturePaneGrid())).toEqual(
+        normalizeVolatileMainGrid(gridBefore),
+      );
       expect(active.cursorPosition()).toEqual(cursorBefore);
 
       await active.sendKeys("Escape");
@@ -456,7 +469,9 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
       await active.waitForText("Agents & processes", TIMEOUT);
       await active.sendKeys("C-x");
       await active.waitForText("MANAGER_COMPOSER_SENTINEL", TIMEOUT);
-      expect(await active.capturePaneGrid()).toEqual(gridBefore);
+      expect(normalizeVolatileMainGrid(await active.capturePaneGrid())).toEqual(
+        normalizeVolatileMainGrid(gridBefore),
+      );
       expect(active.cursorPosition()).toEqual(cursorBefore);
 
       for (let cycle = 0; cycle < 3; cycle++) {
@@ -465,7 +480,9 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await active.sendKeys("C-x");
         await active.waitForText("MANAGER_COMPOSER_SENTINEL", TIMEOUT);
       }
-      expect(await active.capturePaneGrid()).toEqual(gridBefore);
+      expect(normalizeVolatileMainGrid(await active.capturePaneGrid())).toEqual(
+        normalizeVolatileMainGrid(gridBefore),
+      );
       expect(active.cursorPosition()).toEqual(cursorBefore);
 
       await active.sendKeys("C-x");
@@ -6027,6 +6044,25 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
       const persistentPrompt = "CHECKPOINT3_PERSISTENT_CREATES_NESTED";
       const nestedPrompt = "CHECKPOINT3_NESTED_ONE_OFF";
       const oneOffPrompt = "CHECKPOINT3_ROOT_ONE_OFF";
+      type Control = {
+        child_id: string;
+        parent_id: string;
+        mode: "persistent" | "one_off";
+        state: string;
+        configuration: {
+          name: string;
+          notifications: { milestones: string[]; stop_conditions: string[] };
+        };
+        queue: Array<{ content: string; status: string }>;
+      };
+      const sessionsDir = join(fixture.home, ".fx", "sessions");
+      const readControls = (): Control[] => {
+        if (!existsSync(sessionsDir)) return [];
+        return readdirSync(sessionsDir)
+          .map((id) => join(sessionsDir, id, "subagent", "control.json"))
+          .filter((path) => existsSync(path))
+          .map((path) => JSON.parse(readFileSync(path, "utf8")) as Control);
+      };
       const gateway = startDynamicFakeGateway((body) => {
         if (body.includes('"toolCallId":"checkpoint3_nested_create"')) {
           return fakeGatewayFinalText("CHECKPOINT3_PERSISTENT_COMPLETE");
@@ -6103,6 +6139,18 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await active.waitForComposer(TIMEOUT);
         await active.sendText("Build the checkpoint three assembled tree.");
         await active.waitForText("CHECKPOINT3_ASSEMBLED_PARENT_COMPLETE", TIMEOUT);
+        let controls = readControls();
+        const controlsDeadline = Date.now() + TIMEOUT;
+        while (Date.now() < controlsDeadline) {
+          const states = new Map(
+            controls.map((control) => [control.configuration.name, control.state]),
+          );
+          if (states.get("assembled-persistent") === "idle" &&
+              states.get("assembled-nested") === "completed" &&
+              states.get("assembled-one-off") === "completed") break;
+          await Bun.sleep(25);
+          controls = readControls();
+        }
         await active.sendKeys("C-x");
         const tree = await active.waitForPane(
           (pane) =>
@@ -6147,34 +6195,6 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         }
         expect(selectedAssembledName(nestedTree)).toBe("assembled-persistent");
 
-        type Control = {
-          child_id: string;
-          parent_id: string;
-          mode: "persistent" | "one_off";
-          state: string;
-          configuration: {
-            name: string;
-            notifications: { milestones: string[]; stop_conditions: string[] };
-          };
-          queue: Array<{ content: string; status: string }>;
-        };
-        const sessionsDir = join(fixture.home, ".fx", "sessions");
-        const readControls = () => readdirSync(sessionsDir)
-          .map((id) => join(sessionsDir, id, "subagent", "control.json"))
-          .filter((path) => existsSync(path))
-          .map((path) => JSON.parse(readFileSync(path, "utf8")) as Control);
-        let controls = readControls();
-        const controlsDeadline = Date.now() + TIMEOUT;
-        while (Date.now() < controlsDeadline) {
-          const states = new Map(
-            controls.map((control) => [control.configuration.name, control.state]),
-          );
-          if (states.get("assembled-persistent") === "idle" &&
-              states.get("assembled-nested") === "completed" &&
-              states.get("assembled-one-off") === "completed") break;
-          await Bun.sleep(25);
-          controls = readControls();
-        }
         const byName = new Map(
           controls.map((control) => [control.configuration.name, control]),
         );
