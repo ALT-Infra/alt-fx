@@ -1925,14 +1925,7 @@ fn buildReviewTurnContext(
     pending_assistant: ChatMessage,
     target_call_id: []const u8,
 ) permission_auto_classifier.ReviewTurnContext {
-    const current_root_request = if (config.origin == .root)
-        current_prompt
-    else if (config.current_prompt_is_root_authority)
-        current_prompt
-    else if (config.root_user_messages.len > 0)
-        config.root_user_messages[config.root_user_messages.len - 1]
-    else
-        "";
+    const current_root_request = currentRootRequest(config, current_prompt);
     return .{
         .model = model,
         .pending_assistant = pending_assistant,
@@ -1943,6 +1936,17 @@ fn buildReviewTurnContext(
         },
         .current_root_request = current_root_request,
     };
+}
+
+fn currentRootRequest(config: Config, current_prompt: []const u8) []const u8 {
+    return if (config.origin == .root)
+        current_prompt
+    else if (config.current_prompt_is_root_authority)
+        current_prompt
+    else if (config.root_user_messages.len > 0)
+        config.root_user_messages[config.root_user_messages.len - 1]
+    else
+        "";
 }
 
 const max_automatic_non_allow_response_groups: usize = 3;
@@ -5404,6 +5408,15 @@ fn processQueuedPromptLoop(
                 within_turn_suffix.items,
                 step_batch.pending_user_suffix.items,
             );
+            const execution_root_user_request = currentRootRequest(config, job.prompt);
+            const execution_root_user_messages_storage = [_][]const u8{
+                execution_root_user_request,
+            };
+            const execution_root_user_messages: []const []const u8 =
+                if (execution_root_user_request.len > 0)
+                    &execution_root_user_messages_storage
+                else
+                    &.{};
             const permission_authority_generation = if (live_authority) |resolved|
                 resolved.authority.generation
             else
@@ -5879,8 +5892,8 @@ fn processQueuedPromptLoop(
                 .call = execution_call,
                 .authority = execution_authority,
                 .root_user_intent_context = tool_execution_root_user_context,
-                .root_user_messages = &.{},
-                .root_user_evidence_complete = true,
+                .root_user_messages = execution_root_user_messages,
+                .root_user_evidence_complete = execution_root_user_request.len > 0,
                 .authorized_image_catalog = job.authorized_image_catalog,
                 .current_turn_messages = within_turn_suffix.items,
                 .session_grants = execution_grants,
@@ -6306,8 +6319,8 @@ fn processQueuedPromptLoop(
                             .call = execution_call,
                             .authority = broader_authority,
                             .root_user_intent_context = tool_execution_root_user_context,
-                            .root_user_messages = &.{},
-                            .root_user_evidence_complete = true,
+                            .root_user_messages = execution_root_user_messages,
+                            .root_user_evidence_complete = execution_root_user_request.len > 0,
                             .authorized_image_catalog = job.authorized_image_catalog,
                             .current_turn_messages = within_turn_suffix.items,
                             .session_grants = if (live_authority) |resolved|

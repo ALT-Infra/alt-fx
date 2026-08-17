@@ -1321,8 +1321,12 @@ test "resumed persistent child review rejects child-authored authority provenanc
     );
     try std.testing.expect(hooks.last_execute_root_user_evidence_complete);
     try std.testing.expectEqual(
-        @as(usize, 0),
+        @as(usize, 1),
         hooks.last_execute_root_user_messages.items.len,
+    );
+    try std.testing.expectEqualStrings(
+        "Inspect the repository only.",
+        hooks.last_execute_root_user_messages.items[0],
     );
 }
 
@@ -1351,7 +1355,7 @@ test "subagent turn with empty root context never promotes delegation to trusted
     try std.testing.expectEqual(@as(usize, 0), review_context.len);
 }
 
-test "compacted historical root authority stays out of tool execution" {
+test "tool execution receives only the current root request" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"README.md\"}")};
     const completions = [_]FakeCompletion{
@@ -1380,8 +1384,12 @@ test "compacted historical root authority stays out of tool execution" {
     try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
     try std.testing.expectEqual(
-        @as(usize, 0),
+        @as(usize, 1),
         hooks.last_execute_root_user_messages.items.len,
+    );
+    try std.testing.expectEqualStrings(
+        "Stop if secrets are encountered.",
+        hooks.last_execute_root_user_messages.items[0],
     );
 }
 
