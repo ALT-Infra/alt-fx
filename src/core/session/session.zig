@@ -1742,19 +1742,6 @@ pub const SessionRuntime = struct {
         };
     }
 
-    pub fn replacePermissionState(
-        self: *SessionRuntime,
-        alloc: Allocator,
-        state: session_permission_state.State,
-    ) !void {
-        var copy = try session_permission_state.dupe(alloc, state);
-        errdefer copy.deinit(alloc);
-        self.permission_state_lock.lockUncancelable(io_mod.getIo());
-        defer self.permission_state_lock.unlock(io_mod.getIo());
-        self.permission_state.deinit(alloc);
-        self.permission_state = copy;
-    }
-
     pub fn replacePermissionStateOwned(
         self: *SessionRuntime,
         alloc: Allocator,

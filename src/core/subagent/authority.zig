@@ -115,27 +115,6 @@ pub const HostAuthority = struct {
         );
     }
 
-    pub fn captureWithMcpView(
-        alloc: Allocator,
-        tools: []const []const u8,
-        sandbox_backend: types.BackendKind,
-        integrations: []const []const u8,
-        rules: types.PermissionRuleSet,
-        grants: []const types.PermissionGrant,
-        mcp_view: ?*const mcp_access.View,
-    ) !HostAuthority {
-        return captureWithPermissionStateAndMcpView(
-            alloc,
-            tools,
-            sandbox_backend,
-            integrations,
-            rules,
-            grants,
-            .{},
-            mcp_view,
-        );
-    }
-
     pub fn captureWithPermissionStateAndMcpView(
         alloc: Allocator,
         tools: []const []const u8,
