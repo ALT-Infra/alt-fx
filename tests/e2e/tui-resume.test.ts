@@ -2834,22 +2834,21 @@ test.skipIf(!tmuxAvailable())(
       );
       const grid = fullTranscript.replace(/\n$/, "").split("\n");
       const before = grid.findIndex((line) => line.includes(beforeMarker));
-      const permission = grid.findIndex((line) =>
-        line.includes("Permissions: Auto agent approved this request")
-      );
       const header = grid.findIndex((line) => line.includes("1 tool call"));
       const tool = grid.findIndex((line) => line.includes("Ran "));
       const metadata = grid.findIndex((line) => line.includes("1 output line"));
       const output = grid.findIndex((line) => line.trimStart().startsWith(`│ ${outputMarker}`));
       const after = grid.findIndex((line) => line.includes(afterMarker));
       if (
-        before < 0 || permission < 0 || header < 0 || tool < 0 ||
+        before < 0 || header < 0 || tool < 0 ||
         metadata < 0 || output < 0 || after < 0
       ) {
         throw new Error(`missing full transcript rows:\n${grid.join("\n")}`);
       }
-      expect(permission).toBe(before + 2);
-      expect(header).toBe(permission + 2);
+      expect(fullTranscript).not.toContain(
+        "Permissions: Auto agent approved this request",
+      );
+      expect(header).toBe(before + 2);
       expect(tool).toBe(header + 1);
       expect(metadata).toBe(tool + 1);
       expect(output).toBe(metadata + 1);

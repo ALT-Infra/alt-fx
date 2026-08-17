@@ -7,7 +7,6 @@ const command_admission = @import("../permissions/command_admission.zig");
 const command_environment = @import("../execution/command_environment.zig");
 const file_mutation = @import("file_mutation.zig");
 const file_mutation_contract = @import("file_mutation_contract.zig");
-const gateway_schema = @import("gateway_schema.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -740,27 +739,21 @@ fn schemaForReview(
     call: ToolCall,
     is_dynamic_tool: bool,
 ) !?[]const u8 {
-    if (is_dynamic_tool) {
-        const context = input.mcp_runtime.context orelse return null;
-        const tool_schema = input.mcp_runtime.tool_schema orelse return null;
-        const result = (try tool_schema(
-            context,
-            arena,
-            call.name,
-            input.permission_rules,
-            input.context_limits,
-            input.mcp_runtime.access,
-        )) orelse return null;
-        return switch (result) {
-            .selected => |payload| payload.model_output,
-            .rejected => null,
-        };
-    }
-    const tool = registeredTool(input, call.name) orelse return null;
-    return try gateway_schema.builtinFunctionSchemaJsonAlloc(
+    if (!is_dynamic_tool) return null;
+    const context = input.mcp_runtime.context orelse return null;
+    const tool_schema = input.mcp_runtime.tool_schema orelse return null;
+    const result = (try tool_schema(
+        context,
         arena,
-        tool.gateway_schema,
-    );
+        call.name,
+        input.permission_rules,
+        input.context_limits,
+        input.mcp_runtime.access,
+    )) orelse return null;
+    return switch (result) {
+        .selected => |payload| payload.model_output,
+        .rejected => null,
+    };
 }
 
 fn reviewRequestForCall(
@@ -5794,6 +5787,43 @@ test "sandbox widening prompt bounds oversized command labels" {
     try std.testing.expectEqual(@as(usize, 1), recording.calls);
     try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
     try std.testing.expect(recording.last_label_len <= 160);
+}
+
+test "built-in structured review sends exact arguments without redundant schema" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var background: BackgroundRuntime = .{};
+    defer background.deinit(std.testing.allocator);
+    var fake = FakeAutoClassifier{};
+    var input = testInputWithClassifier(
+        &worker,
+        &background,
+        permission_auto_classifier.Classifier.withOverride(
+            @ptrCast(&fake),
+            FakeAutoClassifier.classify,
+        ),
+    );
+    input.permission_review_turn = testReviewTurn();
+
+    const arguments = "{\"action\":\"start\",\"command\":\"printf ready\",\"backend\":\"native\"}";
+    const outcome = try requestPermissionOutcome(
+        input,
+        arena_state.allocator(),
+        .{
+            .id = "terminal-start-review",
+            .name = "terminal",
+            .arguments_json = arguments,
+        },
+        .auto,
+        &.{},
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqualStrings(arguments, fake.exact_arguments_json.?);
+    try std.testing.expect(fake.schema_json == null);
+    try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
 }
 
 test "selected dynamic MCP review receives exact arguments and advertised schema" {
