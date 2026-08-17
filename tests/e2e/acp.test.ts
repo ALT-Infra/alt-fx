@@ -1404,6 +1404,7 @@ describe("acp: model-independent", () => {
         });
         client.setPermissionOption("allow_once");
         await startCodeSession(client);
+        await client.request("session/set_mode", { modeId: "ask" }, 4);
         const result = await runPrompt(
           client,
           "Run the native public terminal fixture.",
