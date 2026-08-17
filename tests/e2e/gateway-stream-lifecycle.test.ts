@@ -3180,8 +3180,8 @@ describe("gateway stream lifecycle", () => {
 
         expect(result.code).toBe(0);
         expect(result.signal).toBeNull();
-        expect(result.stderr).toContain(
-          "Network interrupted · ReadFailed · retrying request · attempt 1/10",
+        expect(result.stderr).toMatch(
+          /^\[notice\] ⚠ Network interrupted · [^\n]+ · retrying request · attempt 1\/10$/m,
         );
         expect(result.stderr).toContain("recovered · succeeded on attempt 2/10");
         expect(json.exit_code).toBe(0);
