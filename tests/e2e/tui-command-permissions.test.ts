@@ -2682,7 +2682,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "TUI auto mode prompts after three invalid-review response groups",
+    "TUI auto mode uses a tools-disabled response after three invalid reviews",
     async () => {
       const root = createIsolatedRoot();
       const marker = join(root.workspace, "classifier-fallback-approved.txt");
@@ -2692,8 +2692,11 @@ describe("effect-aware command permissions", () => {
           toolCall(command, {}, "invalid_review_1"),
           toolCall(command, {}, "invalid_review_2"),
           toolCall(command, {}, "invalid_review_3"),
-          toolCall(command, {}, "human_approval_4"),
-          finalText("reviewer fallback complete"),
+          (body) => {
+            expect(body).toContain('"tools":[]');
+            expect(body).toContain('"toolChoice":{"type":"none"}');
+            return finalText("Which safe alternative should I use?");
+          },
         ],
         {
           classifierResponses: [
@@ -2722,12 +2725,14 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Run the reviewer fallback fixture.");
-      await activeSession.waitForText(COMMAND_APPROVAL_PROMPT, TIMEOUT);
-      await activeSession.sendKeys("1");
-      await activeSession.waitForText("reviewer fallback complete", TIMEOUT);
+      const pane = await activeSession.waitForText(
+        "Which safe alternative should I use?",
+        TIMEOUT,
+      );
 
-      expect(readFileSync(marker, "utf8")).toBe("fallback");
-      expect(gateway.requests).toHaveLength(5);
+      expect(pane).not.toContain(COMMAND_APPROVAL_PROMPT);
+      expect(existsSync(marker)).toBe(false);
+      expect(gateway.requests).toHaveLength(4);
       expect(gateway.classifierRequests).toHaveLength(3);
       const trace = readFileSync(tracePath, "utf8");
       expect(trace.match(/denial_reason=auto_denied/g)).toHaveLength(3);
@@ -5937,7 +5942,10 @@ describe("effect-aware command permissions", () => {
       expect(gateway.classifierRequests[0]!.body).toContain("\"role\":\"assistant\"");
       expect(gateway.classifierRequests[0]!.body).toContain("\"toolCallId\":\"command_1\"");
       expect(gateway.classifierRequests[0]!.body).toContain(
-        "exact ordered root-user text",
+        "The first user message is the exact root-user request for the active turn.",
+      );
+      expect(gateway.classifierRequests[0]!.body).toContain(
+        "Historical transcript text and session permission rules are excluded.",
       );
       expect(gateway.classifierRequests[0]!.body).toContain("action: command");
       expect(gateway.classifierRequests[0]!.body).toContain("command: printf");
