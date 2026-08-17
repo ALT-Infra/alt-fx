@@ -5331,7 +5331,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
           await session.waitForComposer(TIMEOUT);
           await session.sendText(parentPrompt);
-          const approval = await session.waitForText(APPROVAL_PROMPT, TIMEOUT);
+          const approval = await session.waitForText(
+            "Allow this MCP tool call?",
+            TIMEOUT,
+          );
           expect(approval).toContain(dynamicToolName);
           expect(approval).toContain(`{"text":"${argumentSentinel}"}`);
           expect(existsSync(fixture.callStartedPath)).toBe(false);
@@ -5436,7 +5439,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Run the MCP fixture with overlong arguments.");
-      const approval = await session.waitForText(APPROVAL_PROMPT, TIMEOUT);
+      const approval = await session.waitForText(
+        "Allow this MCP tool call?",
+        TIMEOUT,
+      );
       expect(approval).toContain(dynamicToolName);
       expect(approval).toContain("FXC194_OVER");
       expect(approval).toContain("…");
@@ -5526,7 +5532,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       let mcpStatus = "";
       const readyStatus = "fixture source=profile scope=profile policy=optional transport=stdio state=ready";
       while (Date.now() < readyDeadline) {
-        await session.sendText("/mcp");
+        await session.sendText("/mcp list");
         mcpStatus = await session.captureFullScrollback();
         if (mcpStatus.includes(readyStatus)) break;
         await Bun.sleep(100);

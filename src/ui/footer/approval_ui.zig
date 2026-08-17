@@ -1448,6 +1448,7 @@ pub fn composeApprovalPanelRow(alloc: Allocator, approval: ApprovalProjection, w
             &action_line.writer,
             label.bytes,
             if (preview) |value| value.bytes else null,
+            width,
         );
 
         var action_row: std.ArrayList(u8) = .empty;
@@ -1926,6 +1927,7 @@ fn writeApprovalActionLine(
     writer: *std.Io.Writer,
     label: []const u8,
     tool_arguments_preview: ?[]const u8,
+    width: u16,
 ) !void {
     const target = approvalActionTarget(approvalTarget(label));
     if (std.mem.startsWith(u8, label, "run_command ")) {
@@ -1933,10 +1935,15 @@ fn writeApprovalActionLine(
         return;
     }
     if (tool_arguments_preview) |preview| {
-        try writer.print(
-            "  {s} · Arguments for this request: {s}",
-            .{ target, preview },
-        );
+        const verbose_prefix_bytes = 2 + target.len + " · Arguments for this request: ".len;
+        if (width < verbose_prefix_bytes + 16) {
+            try writer.print("  {s} · {s}", .{ target, preview });
+        } else {
+            try writer.print(
+                "  {s} · Arguments for this request: {s}",
+                .{ target, preview },
+            );
+        }
         return;
     }
     try writer.print("  {s}", .{target});
