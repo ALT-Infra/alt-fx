@@ -33,6 +33,46 @@ fn renderEntriesToBytes(alloc: Allocator, entries: []const transcript_blocks.Tra
 }
 const visualRowsForLine = transcript_blocks.visualRowsForLine;
 
+fn resolveAndSealTranscriptTransitionForTest(
+    runtime: *TranscriptRuntime,
+    alloc: Allocator,
+    source: *TranscriptPreparationSource,
+    prepared: *transcript_painter.PreparedTranscriptSurfacePaint,
+    target_layout: render_engine.frame_layout.CommittedLayoutSnapshot,
+    plan: *render_engine.paint_plan.PaintPlan,
+    scroll_plan: render_engine.frame_scroll_plan.FrameScrollPlan,
+) !transcript_runtime.TranscriptTransition {
+    const scroll_facts = try runtime.prepareTranscriptScrollFactsForFrame(
+        alloc,
+        source,
+        prepared,
+        false,
+        false,
+    );
+    const destructive_invalidation = render_engine.frame_retention.transcriptAreaHasDestructiveInvalidation(
+        runtime.committed_frame_layout.transcript_area,
+        plan.invalidation,
+    );
+    const resolved = try runtime.resolveTranscriptTransitionTargetForFrame(
+        alloc,
+        source,
+        prepared,
+        target_layout,
+        scroll_plan,
+        scroll_facts,
+        destructive_invalidation,
+        plan.activity == .overlay_entry,
+    );
+    resolved.applyToPaintPlan(plan);
+    return runtime.sealTranscriptTransition(
+        alloc,
+        source,
+        prepared,
+        plan,
+        resolved,
+    );
+}
+
 fn resolveVisibleLineForTest(line: VisibleTranscriptLine, buf: TranscriptBuffer) []const u8 {
     return switch (line) {
         .transcript => |t| t.ref.resolve(buf),
@@ -544,7 +584,8 @@ test "finalize transcript transition rejects frame inline row mismatch" {
     var plan = testPaintPlan(&runtime, prepared.selection);
     try std.testing.expectError(
         error.InvalidFrameScrollPlan,
-        runtime.finalizeTranscriptTransition(
+        resolveAndSealTranscriptTransitionForTest(
+            &runtime,
             alloc,
             &source,
             &prepared,
@@ -552,6 +593,67 @@ test "finalize transcript transition rejects frame inline row mismatch" {
             &plan,
             scroll_plan,
         ),
+    );
+}
+
+test "child full transcript finalizer consumes one complete transition" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(20, 8, 4),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try std.testing.expect(
+        try runtime.setTranscriptPresentationDepth(alloc, .full),
+    );
+
+    var source = try testSource(alloc, "child full transcript\n", runtime.layout.cols);
+    defer source.deinit(alloc);
+    var prepared = try prepareTestSourceForCurrentArea(
+        &runtime,
+        alloc,
+        &source,
+    );
+    defer prepared.deinit(alloc);
+    const facts = runtime.planTranscriptScrollForFrame(&prepared, false, false);
+    const scroll_plan = render_engine.frame_scroll_plan.merge(
+        runtime.layout.rows,
+        runtime.owned_top_row,
+        0,
+        facts.planned_rows,
+    );
+    var plan = testPaintPlan(&runtime, prepared.selection);
+    var transition = try runtime.finalizeTranscriptTransitionForFrame(
+        alloc,
+        &source,
+        &prepared,
+        render_engine.frame_layout.CommittedLayoutSnapshot.fromPaintPlan(plan),
+        &plan,
+        scroll_plan,
+        false,
+        false,
+    );
+    defer transition.deinit(alloc);
+
+    runtime.consumeFrameScrollCommit(alloc, scroll_plan, .{
+        .bytes_written = 1,
+        .changed_cells = 1,
+        .full_repaint = true,
+        .terminal_scroll_rows_committed = scroll_plan.terminal_scroll_rows,
+        .document_append_committed = !transition.document_append.isEmpty(),
+        .committed_cursor_row = transition.cursor_row,
+        .committed_cursor_col = transition.cursor_col,
+        .shadow_state = .committed,
+        .next_invalidation = render_engine.paint_plan.FrameInvalidationSet.empty(),
+    }, &transition);
+
+    try std.testing.expectEqual(
+        transcript_runtime.TranscriptCommitDiagnosticState.stable,
+        runtime.transcriptCommitDiagnostic().state,
+    );
+    try std.testing.expectEqual(
+        transition.target_layout.layout_id,
+        runtime.committed_frame_layout.layout_id,
     );
 }
 
@@ -569,7 +671,8 @@ fn commitPreparedForTest(
         facts.planned_rows,
     );
     var plan = testPaintPlan(runtime, prepared.selection);
-    var transition = try runtime.finalizeTranscriptTransition(
+    var transition = try resolveAndSealTranscriptTransitionForTest(
+        runtime,
         alloc,
         source,
         prepared,
@@ -605,7 +708,8 @@ fn commitPreparedPartiallyForTest(
         facts.planned_rows,
     );
     var plan = testPaintPlan(runtime, prepared.selection);
-    var transition = try runtime.finalizeTranscriptTransition(
+    var transition = try resolveAndSealTranscriptTransitionForTest(
+        runtime,
         alloc,
         source,
         prepared,
@@ -892,7 +996,8 @@ fn enterRendererDerivedSemanticRecovery(
         attempt_facts.planned_rows,
     );
     var plan = testPaintPlan(runtime, attempt_prepared.selection);
-    var transition = try runtime.finalizeTranscriptTransition(
+    var transition = try resolveAndSealTranscriptTransitionForTest(
+        runtime,
         alloc,
         &attempt_source,
         &attempt_prepared,
@@ -1142,7 +1247,8 @@ fn createProductionCappedFoldedRecoveryTransition(
         stable_paint.cursor.cursor_row,
         stable_paint.cursor.cursor_col,
     );
-    var stable_transition = try runtime.finalizeTranscriptTransition(
+    var stable_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &stable_source,
         stable_paint,
@@ -1244,7 +1350,8 @@ fn createProductionCappedFoldedRecoveryTransition(
         paint.cursor.cursor_row,
         paint.cursor.cursor_col,
     );
-    var transition = try runtime.finalizeTranscriptTransition(
+    var transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &source,
         paint,
@@ -1383,7 +1490,8 @@ fn enterSemanticAppendRecovery(
     var plan = testPaintPlan(runtime, prepared.selection);
     const target_layout =
         render_engine.frame_layout.CommittedLayoutSnapshot.fromPaintPlan(plan);
-    var transition = try runtime.finalizeTranscriptTransition(
+    var transition = try resolveAndSealTranscriptTransitionForTest(
+        runtime,
         alloc,
         &source,
         &prepared,
@@ -1456,7 +1564,8 @@ fn consumeUnacceptedSemanticRecoveryRetry(
         facts.planned_rows,
     );
     var plan = testPaintPlan(runtime, prepared.selection);
-    var transition = try runtime.finalizeTranscriptTransition(
+    var transition = try resolveAndSealTranscriptTransitionForTest(
+        runtime,
         alloc,
         &source,
         &prepared,
@@ -1547,7 +1656,8 @@ fn enterResizeReflowRecoveryWithAcceptedRows(
     var plan = testPaintPlan(runtime, prepared.selection);
     const target_layout =
         render_engine.frame_layout.CommittedLayoutSnapshot.fromPaintPlan(plan);
-    var transition = try runtime.finalizeTranscriptTransition(
+    var transition = try resolveAndSealTranscriptTransitionForTest(
+        runtime,
         alloc,
         &source,
         &prepared,
@@ -1635,7 +1745,8 @@ fn consumeRendererRecoveryAttempt(
     );
     try std.testing.expect(committed_inline_rows <= scroll_plan.terminal_scroll_rows);
     var plan = testPaintPlan(runtime, prepared.selection);
-    var transition = try runtime.finalizeTranscriptTransition(
+    var transition = try resolveAndSealTranscriptTransitionForTest(
+        runtime,
         alloc,
         &source,
         &prepared,
@@ -1705,7 +1816,8 @@ fn expectRendererAppendRestored(
         facts.planned_rows,
     );
     var plan = testPaintPlan(runtime, prepared.selection);
-    var transition = try runtime.finalizeTranscriptTransition(
+    var transition = try resolveAndSealTranscriptTransitionForTest(
+        runtime,
         alloc,
         &source,
         &prepared,
@@ -1744,7 +1856,8 @@ fn checkTranscriptTransitionStagingAllocationFailures(alloc: Allocator) !void {
     const scroll_plan = render_engine.frame_scroll_plan.merge(runtime.layout.rows, 1, 0, 1);
     var plan = testPaintPlan(&runtime, prepared.selection);
     const target_layout = render_engine.frame_layout.CommittedLayoutSnapshot.fromPaintPlan(plan);
-    var transition = runtime.finalizeTranscriptTransition(
+    var transition = resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &source,
         &prepared,
@@ -2241,7 +2354,8 @@ test "oversized compatible growth materializes only each accepted projection" {
         first_facts.planned_rows,
     );
     var first_plan = testPaintPlan(&runtime, first_prepared.selection);
-    var first_transition = try runtime.finalizeTranscriptTransition(
+    var first_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &first_source,
         &first_prepared,
@@ -2335,7 +2449,8 @@ test "oversized compatible growth materializes only each accepted projection" {
         retry_facts.planned_rows,
     );
     var retry_plan = testPaintPlan(&runtime, retry_prepared.selection);
-    var retry_transition = try runtime.finalizeTranscriptTransition(
+    var retry_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &retry_source,
         &retry_prepared,
@@ -2510,7 +2625,8 @@ test "folded inexact growth advances only materialized viewport rows" {
         stable_fixed.cursor.cursor_row,
         stable_fixed.cursor.cursor_col,
     );
-    var stable_transition = try runtime.finalizeTranscriptTransition(
+    var stable_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &stable_source,
         stable_fixed,
@@ -2784,7 +2900,8 @@ test "folded inexact growth advances only materialized viewport rows" {
             paint.cursor.cursor_row,
             paint.cursor.cursor_col,
         );
-        var transition = try runtime.finalizeTranscriptTransition(
+        var transition = try resolveAndSealTranscriptTransitionForTest(
+            &runtime,
             alloc,
             &source,
             paint,
@@ -2893,7 +3010,8 @@ test "folded inexact growth advances only materialized viewport rows" {
         followup_paint.cursor.cursor_row,
         followup_paint.cursor.cursor_col,
     );
-    var followup_transition = try runtime.finalizeTranscriptTransition(
+    var followup_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &followup_source,
         followup_paint,
@@ -3115,7 +3233,8 @@ test "staged soft-wrapped presentation resumes across committed projections" {
         first_facts.planned_rows,
     );
     var first_plan = testPaintPlan(&runtime, first_prepared.selection);
-    var first_transition = try runtime.finalizeTranscriptTransition(
+    var first_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &first_source,
         &first_prepared,
@@ -3211,7 +3330,8 @@ test "staged soft-wrapped presentation resumes across committed projections" {
         retry_facts.planned_rows,
     );
     var retry_plan = testPaintPlan(&runtime, retry_prepared.selection);
-    var retry_transition = try runtime.finalizeTranscriptTransition(
+    var retry_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &retry_source,
         &retry_prepared,
@@ -3336,7 +3456,8 @@ test "uncommitted stable-origin append retries from the materialized source endp
         first_facts.planned_rows,
     );
     var first_plan = testPaintPlan(&runtime, first_prepared.selection);
-    var first_transition = try runtime.finalizeTranscriptTransition(
+    var first_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &first_source,
         &first_prepared,
@@ -3379,7 +3500,8 @@ test "uncommitted stable-origin append retries from the materialized source endp
         retry_facts.planned_rows,
     );
     var retry_plan = testPaintPlan(&runtime, retry_prepared.selection);
-    var retry_transition = try runtime.finalizeTranscriptTransition(
+    var retry_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &retry_source,
         &retry_prepared,
@@ -3541,7 +3663,8 @@ test "stable origin projection rebase narrow to wide survives repeated partial a
         first_facts.planned_rows,
     );
     var first_plan = testPaintPlan(&runtime, first_prepared.selection);
-    var first_transition = try runtime.finalizeTranscriptTransition(
+    var first_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &first_source,
         &first_prepared,
@@ -3592,7 +3715,8 @@ test "stable origin projection rebase narrow to wide survives repeated partial a
         repeated_facts.planned_rows,
     );
     var repeated_plan = testPaintPlan(&runtime, repeated_prepared.selection);
-    var repeated_transition = try runtime.finalizeTranscriptTransition(
+    var repeated_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &repeated_source,
         &repeated_prepared,
@@ -3637,7 +3761,8 @@ test "stable origin projection rebase narrow to wide survives repeated partial a
         complete_facts.planned_rows,
     );
     var complete_plan = testPaintPlan(&runtime, complete_prepared.selection);
-    var complete_transition = try runtime.finalizeTranscriptTransition(
+    var complete_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &complete_source,
         &complete_prepared,
@@ -3683,7 +3808,8 @@ test "stable origin projection rebase narrow to wide survives repeated partial a
         append_facts.planned_rows,
     );
     var append_plan = testPaintPlan(&runtime, append_prepared.selection);
-    var append_transition = try runtime.finalizeTranscriptTransition(
+    var append_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &append_source,
         &append_prepared,
@@ -3735,7 +3861,8 @@ test "stable origin projection rebase wide to narrow retains debt until exhauste
         repeated_facts.planned_rows,
     );
     var repeated_plan = testPaintPlan(&runtime, repeated_prepared.selection);
-    var repeated_transition = try runtime.finalizeTranscriptTransition(
+    var repeated_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &repeated_source,
         &repeated_prepared,
@@ -3783,7 +3910,8 @@ test "stable origin projection rebase wide to narrow retains debt until exhauste
         complete_facts.planned_rows,
     );
     var complete_plan = testPaintPlan(&runtime, complete_prepared.selection);
-    var complete_transition = try runtime.finalizeTranscriptTransition(
+    var complete_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &complete_source,
         &complete_prepared,
@@ -3829,7 +3957,8 @@ test "stable origin projection rebase wide to narrow retains debt until exhauste
         append_facts.planned_rows,
     );
     var append_plan = testPaintPlan(&runtime, append_prepared.selection);
-    var append_transition = try runtime.finalizeTranscriptTransition(
+    var append_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &append_source,
         &append_prepared,
@@ -3899,7 +4028,8 @@ test "stable origin projection rebase measured history is not semantic debt" {
         first_facts.planned_rows,
     );
     var first_plan = testPaintPlan(&runtime, first_prepared.selection);
-    var first_transition = try runtime.finalizeTranscriptTransition(
+    var first_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &first_source,
         &first_prepared,
@@ -3944,7 +4074,8 @@ test "stable origin projection rebase measured history is not semantic debt" {
         repeated_facts.planned_rows,
     );
     var repeated_plan = testPaintPlan(&runtime, repeated_prepared.selection);
-    var repeated_transition = try runtime.finalizeTranscriptTransition(
+    var repeated_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &repeated_source,
         &repeated_prepared,
@@ -4019,7 +4150,8 @@ test "overlay frame retains an exact-end measured history floor after reset" {
         0,
         facts.planned_rows,
     );
-    var transition = try runtime.finalizeTranscriptTransition(
+    var transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &source,
         &prepared,
@@ -5277,7 +5409,8 @@ test "finalized transcript transition owns append suffix and commits one anchor"
     const scroll_plan = render_engine.frame_scroll_plan.merge(runtime.layout.rows, 1, 0, 1);
     var plan = testPaintPlan(&runtime, prepared.selection);
     const target_layout = render_engine.frame_layout.CommittedLayoutSnapshot.fromPaintPlan(plan);
-    var transition = try runtime.finalizeTranscriptTransition(
+    var transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &source,
         &prepared,
@@ -5345,7 +5478,8 @@ test "committed transcript transition installation performs no allocation" {
     const scroll_plan = render_engine.frame_scroll_plan.merge(runtime.layout.rows, 1, 0, 1);
     var plan = testPaintPlan(&runtime, prepared.selection);
     const target_layout = render_engine.frame_layout.CommittedLayoutSnapshot.fromPaintPlan(plan);
-    var transition = try runtime.finalizeTranscriptTransition(
+    var transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &source,
         &prepared,
@@ -5397,7 +5531,8 @@ test "partial transcript transition records exact recovery debt" {
     const scroll_plan = render_engine.frame_scroll_plan.merge(runtime.layout.rows, 1, 0, 5);
     var plan = testPaintPlan(&runtime, prepared.selection);
     const target_layout = render_engine.frame_layout.CommittedLayoutSnapshot.fromPaintPlan(plan);
-    var transition = try runtime.finalizeTranscriptTransition(
+    var transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &source,
         &prepared,
@@ -5469,7 +5604,8 @@ test "transcript recovery debt does not double count unmaterialized inline rows"
     try std.testing.expectEqual(@as(u16, 1), scroll_plan.remaining_inline_advance_rows);
     var plan = testPaintPlan(&runtime, prepared.selection);
     const target_layout = render_engine.frame_layout.CommittedLayoutSnapshot.fromPaintPlan(plan);
-    var transition = try runtime.finalizeTranscriptTransition(
+    var transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &source,
         &prepared,
@@ -5519,7 +5655,8 @@ test "transcript recovery debt does not double count unmaterialized inline rows"
     var recovery_plan = testPaintPlan(&runtime, recovery_prepared.selection);
     const recovery_layout =
         render_engine.frame_layout.CommittedLayoutSnapshot.fromPaintPlan(recovery_plan);
-    var recovery_transition = try runtime.finalizeTranscriptTransition(
+    var recovery_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &recovery_source,
         &recovery_prepared,
@@ -5658,7 +5795,8 @@ test "recovery consumes resize reflow before semantic debt across partial result
     var plan = testPaintPlan(&runtime, prepared.selection);
     const target_layout =
         render_engine.frame_layout.CommittedLayoutSnapshot.fromPaintPlan(plan);
-    var transition = try runtime.finalizeTranscriptTransition(
+    var transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &source,
         &prepared,
@@ -5738,7 +5876,8 @@ test "committed resize cleanup retains fallback recovery reflow debt" {
     var plan = testPaintPlan(&runtime, prepared.selection);
     const target_layout =
         render_engine.frame_layout.CommittedLayoutSnapshot.fromPaintPlan(plan);
-    var transition = try runtime.finalizeTranscriptTransition(
+    var transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &source,
         &prepared,
@@ -5788,7 +5927,8 @@ test "committed resize cleanup retains fallback recovery reflow debt" {
         complete_facts.planned_rows,
     );
     var complete_plan = testPaintPlan(&runtime, complete_prepared.selection);
-    var complete_transition = try runtime.finalizeTranscriptTransition(
+    var complete_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &complete_source,
         &complete_prepared,
@@ -5863,7 +6003,8 @@ test "incompatible recovery source stays on rebase path after partial repaint" {
         replacement_facts.planned_rows,
     );
     var replacement_plan = testPaintPlan(&runtime, replacement_prepared.selection);
-    var replacement_transition = try runtime.finalizeTranscriptTransition(
+    var replacement_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &replacement_source,
         &replacement_prepared,
@@ -5962,7 +6103,8 @@ test "structured replacement preserves reflow debt and drops old semantic debt" 
         old_facts.planned_rows,
     );
     var old_plan = testPaintPlan(&runtime, old_prepared.selection);
-    var old_transition = try runtime.finalizeTranscriptTransition(
+    var old_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &old_source,
         &old_prepared,
@@ -6028,7 +6170,8 @@ test "structured replacement preserves reflow debt and drops old semantic debt" 
         &runtime,
         replacement_prepared.selection,
     );
-    var replacement_transition = try runtime.finalizeTranscriptTransition(
+    var replacement_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &replacement_source,
         &replacement_prepared,
@@ -6078,7 +6221,8 @@ test "structured replacement preserves reflow debt and drops old semantic debt" 
         repeated_facts.planned_rows,
     );
     var repeated_plan = testPaintPlan(&runtime, repeated_prepared.selection);
-    var repeated_transition = try runtime.finalizeTranscriptTransition(
+    var repeated_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &repeated_source,
         &repeated_prepared,
@@ -6124,7 +6268,8 @@ test "structured replacement preserves reflow debt and drops old semantic debt" 
         complete_facts.planned_rows,
     );
     var complete_plan = testPaintPlan(&runtime, complete_prepared.selection);
-    var complete_transition = try runtime.finalizeTranscriptTransition(
+    var complete_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &complete_source,
         &complete_prepared,
@@ -6187,7 +6332,8 @@ test "structured replacement preserves reflow debt and drops old semantic debt" 
         append_facts.planned_rows,
     );
     var append_plan = testPaintPlan(&runtime, append_prepared.selection);
-    var append_transition = try runtime.finalizeTranscriptTransition(
+    var append_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &append_source,
         &append_prepared,
@@ -6282,7 +6428,8 @@ test "invalid origin partial recovery rebases until complete repaint then append
         first_facts.planned_rows,
     );
     var first_plan = testPaintPlan(&runtime, first_prepared.selection);
-    var first_transition = try runtime.finalizeTranscriptTransition(
+    var first_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &first_source,
         &first_prepared,
@@ -6344,7 +6491,8 @@ test "invalid origin partial recovery rebases until complete repaint then append
         repeated_facts.planned_rows,
     );
     var repeated_plan = testPaintPlan(&runtime, repeated_prepared.selection);
-    var repeated_transition = try runtime.finalizeTranscriptTransition(
+    var repeated_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &repeated_source,
         &repeated_prepared,
@@ -6392,7 +6540,8 @@ test "invalid origin partial recovery rebases until complete repaint then append
         complete_facts.planned_rows,
     );
     var complete_plan = testPaintPlan(&runtime, complete_prepared.selection);
-    var complete_transition = try runtime.finalizeTranscriptTransition(
+    var complete_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &complete_source,
         &complete_prepared,
@@ -6444,7 +6593,8 @@ test "invalid origin partial recovery rebases until complete repaint then append
         append_facts.planned_rows,
     );
     var append_plan = testPaintPlan(&runtime, append_prepared.selection);
-    var append_transition = try runtime.finalizeTranscriptTransition(
+    var append_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &append_source,
         &append_prepared,
@@ -6504,7 +6654,8 @@ test "recovery projection paints wrapped partial blank tail from acknowledged en
         facts.planned_rows,
     );
     var plan = testPaintPlan(&runtime, prepared.selection);
-    var transition = try runtime.finalizeTranscriptTransition(
+    var transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &source,
         &prepared,
@@ -6566,7 +6717,8 @@ test "recovery projection moves cursor for zero-row trailing newline growth" {
         facts.planned_rows,
     );
     var plan = testPaintPlan(&runtime, prepared.selection);
-    var transition = try runtime.finalizeTranscriptTransition(
+    var transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &source,
         &prepared,
@@ -6632,7 +6784,8 @@ test "recovery projection relocates replaceable row through production painter" 
         facts.planned_rows,
     );
     var plan = testPaintPlan(&runtime, prepared.selection);
-    var transition = try runtime.finalizeTranscriptTransition(
+    var transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &source,
         &prepared,
@@ -6693,7 +6846,8 @@ test "row-only shrink defers wrapped recovery projection and later converges" {
         facts.planned_rows,
     );
     var plan = testPaintPlan(&runtime, prepared.selection);
-    var transition = try runtime.finalizeTranscriptTransition(
+    var transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &source,
         &prepared,
@@ -6753,7 +6907,8 @@ test "row-only shrink defers wrapped recovery projection and later converges" {
         recovery_facts.planned_rows,
     );
     var recovery_plan = testPaintPlan(&runtime, recovery_prepared.selection);
-    var recovery_transition = try runtime.finalizeTranscriptTransition(
+    var recovery_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &recovery_source,
         &recovery_prepared,
@@ -6853,7 +7008,8 @@ test "committed deferred shrink installs target geometry before recovery stabili
         attempt_facts.planned_rows,
     );
     var attempt_plan = testPaintPlan(&runtime, attempt_prepared.selection);
-    var attempt_transition = try runtime.finalizeTranscriptTransition(
+    var attempt_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &attempt_source,
         &attempt_prepared,
@@ -6908,7 +7064,8 @@ test "committed deferred shrink installs target geometry before recovery stabili
     var deferred_plan = testPaintPlan(&runtime, deferred_prepared.selection);
     const target_layout =
         render_engine.frame_layout.CommittedLayoutSnapshot.fromPaintPlan(deferred_plan);
-    var deferred_transition = try runtime.finalizeTranscriptTransition(
+    var deferred_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &deferred_source,
         &deferred_prepared,
@@ -7007,7 +7164,8 @@ test "recovery forward area movement stabilizes at acknowledged semantic endpoin
         first_facts.planned_rows,
     );
     var first_plan = testPaintPlan(&runtime, first_prepared.selection);
-    var first_transition = try runtime.finalizeTranscriptTransition(
+    var first_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &first_source,
         &first_prepared,
@@ -7055,7 +7213,8 @@ test "recovery forward area movement stabilizes at acknowledged semantic endpoin
         second_facts.planned_rows,
     );
     var second_plan = testPaintPlan(&runtime, second_prepared.selection);
-    var second_transition = try runtime.finalizeTranscriptTransition(
+    var second_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &second_source,
         &second_prepared,
@@ -7103,7 +7262,8 @@ test "recovery forward area movement stabilizes at acknowledged semantic endpoin
         final_facts.planned_rows,
     );
     var final_plan = testPaintPlan(&runtime, final_prepared.selection);
-    var final_transition = try runtime.finalizeTranscriptTransition(
+    var final_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &final_source,
         &final_prepared,
@@ -7214,7 +7374,8 @@ test "recovery backward area movement stabilizes at acknowledged semantic endpoi
         final_facts.planned_rows,
     );
     var final_plan = testPaintPlan(&runtime, final_prepared.selection);
-    var final_transition = try runtime.finalizeTranscriptTransition(
+    var final_transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &final_source,
         &final_prepared,
@@ -7330,13 +7491,39 @@ test "same-width backward footer candidate retains one coherent stable anchor" {
         .viewport = prepared.selection,
         .cursor_target = .{ .row = 32, .col = 1, .visible = true },
     });
-    var transition = try runtime.finalizeTranscriptTransition(
+    const scroll_plan = render_engine.frame_scroll_plan.FrameScrollPlan.none(
+        runtime.layout.rows,
+        1,
+    );
+    const scroll_facts = try runtime.prepareTranscriptScrollFactsForFrame(
+        alloc,
+        &source,
+        &prepared,
+        false,
+        false,
+    );
+    const resolved = try runtime.resolveTranscriptTransitionTargetForFrame(
         alloc,
         &source,
         &prepared,
         render_engine.frame_layout.CommittedLayoutSnapshot.fromLayout(layout),
+        scroll_plan,
+        scroll_facts,
+        false,
+        false,
+    );
+    try std.testing.expectEqual(@as(usize, 85), prepared.selection.start_line);
+    try std.testing.expectEqual(@as(u16, 30), prepared.cursor.cursor_row);
+    try std.testing.expectEqual(@as(usize, 88), resolved.selection().start_line);
+    try std.testing.expectEqual(@as(u16, 19), resolved.cursorRow());
+    try std.testing.expect(resolved.bodyDisposition() == .retain_committed);
+    resolved.applyToPaintPlan(&plan);
+    var transition = try runtime.sealTranscriptTransition(
+        alloc,
+        &source,
+        &prepared,
         &plan,
-        render_engine.frame_scroll_plan.FrameScrollPlan.none(runtime.layout.rows, 1),
+        resolved,
     );
     defer transition.deinit(alloc);
     try std.testing.expect(transition.body_disposition == .retain_committed);
@@ -10872,7 +11059,8 @@ test "recorded user prompt card admission preserves an authoritative committed a
         facts.planned_rows,
     );
     var plan = testPaintPlan(&runtime, appended_prepared.selection);
-    var transition = try runtime.finalizeTranscriptTransition(
+    var transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &appended_source,
         &appended_prepared,
@@ -13650,7 +13838,8 @@ test "untrimmed pinned status replacement preserves anchor through scroll transi
     );
     try std.testing.expectEqual(@as(u16, 2), scroll_plan.terminal_scroll_rows);
     var plan = testPaintPlan(&runtime, prepared.selection);
-    var transition = try runtime.finalizeTranscriptTransition(
+    var transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &source,
         &prepared,
@@ -15321,7 +15510,8 @@ test "catch-up release materializes history before staging a larger finality hol
         facts.planned_rows,
     );
     var plan = testPaintPlan(&runtime, prepared.selection);
-    var transition = try runtime.finalizeTranscriptTransition(
+    var transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &source,
         &prepared,
@@ -15398,7 +15588,8 @@ test "partial finality release bounds append before staging withheld viewport" {
         facts.planned_rows,
     );
     var plan = testPaintPlan(&runtime, prepared.selection);
-    var transition = try runtime.finalizeTranscriptTransition(
+    var transition = try resolveAndSealTranscriptTransitionForTest(
+        &runtime,
         alloc,
         &source,
         &prepared,

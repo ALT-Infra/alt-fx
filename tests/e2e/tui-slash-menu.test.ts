@@ -6,6 +6,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -530,7 +531,7 @@ function assertNoBlankGapBetweenTranscriptAndComposer(grid: string[]) {
 }
 
 function longAssistantResponse(): string {
-  return Array.from({ length: 96 }, (_, index) => {
+  return Array.from({ length: 82 }, (_, index) => {
     const line = String(index + 1).padStart(3, "0");
     return `SLASH_FOOTER_E2E_${line} markdown transcript content that should fill the viewport above the composer.`;
   }).join("\n");
@@ -589,12 +590,54 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ sandbox: "none", permission: {} }));
 
       const tracePath = join(workDir, "trace.log");
-      const tapePath = join(workDir, "session.fxtape");
+      const tapePath = join(workDir, "resumed.fxtape");
       const stderrPath = join(workDir, "stderr.log");
+      const resumedStderrPath = join(workDir, "resumed-stderr.log");
       gateway = startFakeGateway([fakeGatewayFinalText(longAssistantResponse())]);
 
       session = await TmuxSession.create({
         cmd: FX_BIN,
+        cwd: workspace,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-slash-footer-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: "openai/gpt-5",
+          FX_AUTO_UPGRADE: "0",
+          NO_COLOR: "1",
+        },
+        stderrPath,
+        width: 124,
+        height: 75,
+        isolated: true,
+        minimumHistoryLines: 500,
+      });
+      await session.waitForComposer(10_000);
+      await session.sendText("Print the deterministic slash footer transcript fixture.");
+      await session.waitForText("SLASH_FOOTER_E2E_082", 30_000);
+      await session.waitForPane(
+        (pane) => !pane.includes("esc interrupt") && !pane.includes("Thinking"),
+        5_000,
+      );
+      await Bun.sleep(300);
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(10_000)).toBe(true);
+      await session.kill();
+      session = null;
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      const sessionIds = readdirSync(join(home, ".fx", "sessions"), {
+        withFileTypes: true,
+      })
+        .filter((entry) => entry.name !== "latest" && entry.isDirectory())
+        .map((entry) => entry.name);
+      expect(sessionIds).toHaveLength(1);
+      gateway.stop();
+      gateway = startFakeGateway([]);
+      session = await TmuxSession.create({
+        cmd: `${FX_BIN} resume ${sessionIds[0]}`,
         cwd: workspace,
         env: {
           HOME: home,
@@ -610,13 +653,14 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
           FX_TRACE_SCOPES: "frame_plan,frame_layout,scroll,render,paint,frame_diff,frame_commit",
           NO_COLOR: "1",
         },
-        stderrPath,
-        width: 118,
-        height: 66,
+        stderrPath: resumedStderrPath,
+        width: 124,
+        height: 75,
+        isolated: true,
+        minimumHistoryLines: 500,
       });
       await session.waitForComposer(10_000);
-      await session.sendText("Print the deterministic slash footer transcript fixture.");
-      await session.waitForText("SLASH_FOOTER_E2E_096", 30_000);
+      await session.waitForText("SLASH_FOOTER_E2E_082", 30_000);
 
       async function capture(label: string): Promise<string[]> {
         const deadline = Date.now() + 5_000;
@@ -624,7 +668,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         let viewportAnsi = "";
         let stableSamples = 0;
         while (Date.now() < deadline && stableSamples < 5) {
-          viewportAnsi = captureViewportEscapes(session!);
+          viewportAnsi = await session!.capturePaneEscapes();
           if (viewportAnsi === previous) {
             stableSamples += 1;
           } else {
@@ -645,9 +689,16 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       const afterResponse = await capture("after-response");
       const closedComposerRow = composerRow(afterResponse);
+      expect(
+        visibleTranscriptTailRow(afterResponse),
+        `resumed baseline grid:\n${afterResponse.join("\n")}`,
+      ).toBe(71);
+      expect(closedComposerRow).toBe(73);
       await session.sendLiteralText("/");
       await session.waitForText("Commands 39", 5_000);
       const afterSlash = await capture("after-slash");
+      expect(visibleTranscriptTailRow(afterSlash)).toBe(62);
+      expect(composerRow(afterSlash)).toBe(64);
       await session.sendLiteralText("f");
       await session.waitForText("/feedback", 5_000);
       const afterSlashF = await capture("after-slash-f");
@@ -666,6 +717,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         5_000,
       );
       const afterDismiss = await capture("after-dismiss");
+      expect(visibleTranscriptTailRow(afterDismiss)).toBe(62);
+      expect(composerRow(afterDismiss)).toBe(64);
+      expect(footerStatusRow(afterDismiss)).toBe(66);
       await session.sendLiteralText("x");
       await session.waitForPane(
         (pane) =>
@@ -674,6 +728,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         5_000,
       );
       const afterDismissEdit = await capture("after-dismiss-edit");
+      expect(visibleTranscriptTailRow(afterDismissEdit)).toBe(62);
+      expect(composerRow(afterDismissEdit)).toBe(64);
+      expect(footerStatusRow(afterDismissEdit)).toBe(66);
 
       await session.sendKeys("C-u");
       await session.waitForPane(hasEmptyComposer, 5_000);
@@ -724,11 +781,20 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         "after-dismiss-edit",
         "after-clear",
       ];
-      for (const label of historyLabels) {
+      const baselineScrollback = stripAnsi(
+        readFileSync(join(workDir, "after-response.ansi.txt"), "utf8"),
+      );
+      const expectedMarkerCopies = Array.from({ length: 82 }, (_, index) => {
+        const marker = `SLASH_FOOTER_E2E_${String(index + 1).padStart(3, "0")}`;
+        const copies = countOccurrences(baselineScrollback, marker);
+        expect(copies, `after-response: ${marker}`).toBeGreaterThanOrEqual(1);
+        expect(copies, `after-response: ${marker}`).toBeLessThanOrEqual(2);
+        return { marker, copies };
+      });
+      for (const label of historyLabels.slice(1)) {
         const scrollback = stripAnsi(readFileSync(join(workDir, `${label}.ansi.txt`), "utf8"));
-        for (let index = 1; index <= 96; index += 1) {
-          const marker = `SLASH_FOOTER_E2E_${String(index).padStart(3, "0")}`;
-          expect(countOccurrences(scrollback, marker), `${label}: ${marker}`).toBe(1);
+        for (const { marker, copies } of expectedMarkerCopies) {
+          expect(countOccurrences(scrollback, marker), `${label}: ${marker}`).toBe(copies);
         }
       }
 
@@ -744,7 +810,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(footerUpdates.some((line) => /show_picker=true/.test(line) && /new=[1-8](?:\s|$)/.test(line))).toBe(false);
       const openUpdateIndex = traceLines.findIndex((line) => /footer_extra_update old=0 new=9 /.test(line));
       expect(openUpdateIndex).toBeGreaterThanOrEqual(0);
-      const openPlan = traceLines.slice(openUpdateIndex + 1).find((line) =>
+      const openPlan = traceLines.slice(0, openUpdateIndex).reverse().find((line) =>
         line.includes("transcript_transition_plan") &&
         line.includes("replay_displaced_footer_history=true") &&
         /planned_rows=[1-9][0-9]*/.test(line)
@@ -759,14 +825,14 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       );
       const closeUpdateIndex = traceLines.findIndex((line) => /footer_extra_update old=9 new=0 /.test(line));
       expect(closeUpdateIndex).toBeGreaterThanOrEqual(0);
-      const closePlan = traceLines.slice(closeUpdateIndex + 1).find((line) =>
+      const closePlan = traceLines.slice(openUpdateIndex + 1, closeUpdateIndex).reverse().find((line) =>
         line.includes("transcript_transition_plan") &&
         line.includes("replay_displaced_footer_history=false")
       );
       expect(closePlan).toContain("planned_rows=0");
       const closeFrame = traceLines.slice(closeUpdateIndex + 1).find((line) => line.includes("[frame_diff] result"));
       expect(closeFrame).toMatch(/full_repaint=true invalidation=external_clear/);
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
 
       const replayOutput = execFileSync(FX_BIN, ["replay", tapePath, "--json"], {
         encoding: "utf8",
