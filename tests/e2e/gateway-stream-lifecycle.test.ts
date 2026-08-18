@@ -3160,7 +3160,7 @@ describe("gateway stream lifecycle", () => {
           },
         );
         const trace = readFileSync(tracePath, "utf8");
-        if (result.code !== 0 || result.signal !== null || result.stderr !== "") {
+        if (result.code !== 0 || result.signal !== null) {
           throw new Error(
             `peer-reset iteration ${iteration} failed: code=${result.code} signal=${result.signal}\n` +
               `stdout:\n${result.stdout}\nstderr:\n${result.stderr}\ntrace:\n${trace}`,
@@ -3173,7 +3173,10 @@ describe("gateway stream lifecycle", () => {
 
         expect(result.code).toBe(0);
         expect(result.signal).toBeNull();
-        expect(result.stderr).toBe("");
+        expect(result.stderr).toMatch(
+          /^\[notice\] ⚠ Network interrupted · [^\n]+ · retrying request · attempt 1\/10$/m,
+        );
+        expect(result.stderr).toContain("recovered · succeeded on attempt 2/10");
         expect(json.exit_code).toBe(0);
         expect(json.output).toBe(expectedOutput);
         expect(json.recovery?.state).toBe("recovered");
@@ -4406,7 +4409,10 @@ describe("gateway stream lifecycle", () => {
       expect(json.tool_calls).toEqual([]);
       expect(existsSync(sentinelPath)).toBe(false);
       expect(gateway.requestCount()).toBe(2);
-      expect(result.stderr).toBe("");
+      expect(result.stderr).toContain(
+        "Provider unavailable · provider_error · checking uncertain tool state · attempt 1/10",
+      );
+      expect(result.stderr).toContain("recovered · succeeded on attempt 2/10");
       expect(trace).toContain("termination cause=valid_finish finish_reason=error");
       expect(trace).toContain("event=route_failure");
       expect(trace).toContain("retry=true");
@@ -4496,7 +4502,13 @@ describe("gateway stream lifecycle", () => {
       expect(json.recovery?.attempt).toBe(3);
       expect(json.recovery?.message).not.toContain("provider_error");
       expect(json.recovery?.message).not.toContain("first route failure");
-      expect(result.stderr).toBe("");
+      expect(result.stderr).toContain(
+        "Provider unavailable · provider_error: first route failure · retrying request · attempt 1/10",
+      );
+      expect(result.stderr).toContain(
+        "Provider unavailable · provider_error: second route failure · retrying request in 1s · attempt 2/10",
+      );
+      expect(result.stderr).toContain("recovered · succeeded on attempt 3/10");
       expect(gateway.requestCount()).toBe(3);
       expect(trace).toContain("event=route_failure");
       expect(trace).toContain(`selected_model=${MODEL}`);
@@ -4539,7 +4551,8 @@ describe("gateway stream lifecycle", () => {
       expect(json.recovery?.message).toContain(
         "HTTP 503 · provider temporarily unavailable",
       );
-      expect(result.stderr).toBe("");
+      expect(result.stderr).toContain("retrying request · attempt 1/10");
+      expect(result.stderr).toContain("recovery paused after 10/10 attempts");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -4904,14 +4917,14 @@ describe("gateway stream lifecycle", () => {
         requestIndex++ === 0 ? fixture.response() : fakeGatewayFinalText(recoveredText)
       );
       try {
-        const args = fixture.streamedText
-          ? ["ask", "--auto", "--no-save", "Return the fixture response."]
-          : ["ask", "--json", "--auto", "--no-save", "Return the fixture response."];
-        const result = await runFx(args, {
-          cwd: root.workspace,
-          env: fixtureEnv(root, gateway, tracePath),
-          timeoutMs: 15_000,
-        });
+        const result = await runFx(
+          ["ask", "--json", "--auto", "--no-save", "Return the fixture response."],
+          {
+            cwd: root.workspace,
+            env: fixtureEnv(root, gateway, tracePath),
+            timeoutMs: 15_000,
+          },
+        );
         const trace = readFileSync(tracePath, "utf8");
 
         expect(result.code).toBe(0);
@@ -4924,19 +4937,20 @@ describe("gateway stream lifecycle", () => {
         expect(gateway.requests[1]!.body).toContain("<network_recovery>");
         expect(trace).toContain("event=prompt_finish");
         expect(trace).toContain("outcome_kind=assistant");
+        expect(result.stderr).toContain("Response ended early");
+        expect(result.stderr).toContain(
+          fixture.streamedText ? "continuing response" : "retrying request",
+        );
+        expect(result.stderr).toContain("attempt 1/10");
+        expect(result.stderr).toContain("recovered · succeeded on attempt 2/10");
 
-        if (fixture.streamedText) {
-          expect(result.stdout).toContain(recoveredText);
-          expect(result.stdout.split(fixture.streamedText).length - 1).toBe(1);
-        } else {
-          const json = parseAskJson(result.stdout);
-          expect(json.exit_code).toBe(0);
-          expect(json.error).toBeUndefined();
-          expect(json.output).toBe(recoveredText);
-          expect(json.tool_calls).toEqual([]);
-          expect(json.recovery?.state).toBe("recovered");
-          expect(json.recovery?.attempt).toBe(2);
-        }
+        const json = parseAskJson(result.stdout);
+        expect(json.exit_code).toBe(0);
+        expect(json.error).toBeUndefined();
+        expect(json.output).toBe(recoveredText);
+        expect(json.tool_calls).toEqual([]);
+        expect(json.recovery?.state).toBe("recovered");
+        expect(json.recovery?.attempt).toBe(2);
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
