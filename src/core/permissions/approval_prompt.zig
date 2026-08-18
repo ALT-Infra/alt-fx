@@ -2,6 +2,7 @@ const std = @import("std");
 const diff_mod = @import("../output/diff.zig");
 const approval_decision = @import("approval_decision.zig");
 const permission_request = @import("permission_request.zig");
+const session_permission_state = @import("session_permission_state.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -50,6 +51,7 @@ pub const ApprovalPrompt = struct {
     decision: approval_decision.State = .{},
     review: ?*const diff_mod.FileReview = null,
     review_request_id: u64 = 0,
+    rule_management: ?session_permission_state.OwnedConfirmedRuleEvent = null,
 
     pub fn deinit(self: *ApprovalPrompt, alloc: Allocator) void {
         self.clearWithReason(alloc, "deinit");
@@ -81,6 +83,8 @@ pub const ApprovalPrompt = struct {
 
     pub fn clearWithReason(self: *ApprovalPrompt, alloc: Allocator, reason: []const u8) void {
         if (self.request) |*request| request.deinit(alloc);
+        if (self.rule_management) |*event| event.deinit(alloc);
+        self.rule_management = null;
         self.request = null;
         self.decision.reset(alloc, reason);
         self.clearReview();
@@ -102,12 +106,42 @@ pub const ApprovalPrompt = struct {
                 if (self.request != null) "request_replaced" else "request_started",
             );
             self.request = owned;
+            self.decision.setConfirmationOnly(value.confirmation_only);
             return true;
         }
 
         if (self.request == null) return false;
         self.clearWithReason(alloc, "request_cleared");
         return true;
+    }
+
+    pub fn syncRuleManagement(
+        self: *ApprovalPrompt,
+        alloc: Allocator,
+        request: permission_request.PermissionRequest,
+        event: session_permission_state.ConfirmedRuleEvent,
+    ) !void {
+        if (!request.confirmation_only or request.file != null) {
+            return error.InvalidRuleManagementRequest;
+        }
+        const owned_request = try permission_request.OwnedPermissionRequest.dupe(
+            alloc,
+            request,
+        );
+        var request_owned = true;
+        errdefer if (request_owned) {
+            var value = owned_request;
+            value.deinit(alloc);
+        };
+        const owned_event = try session_permission_state.OwnedConfirmedRuleEvent.dupe(
+            alloc,
+            event,
+        );
+        self.clearWithReason(alloc, "rule_management_started");
+        self.request = owned_request;
+        request_owned = false;
+        self.rule_management = owned_event;
+        self.decision.setConfirmationOnly(true);
     }
 
     pub fn syncReview(self: *ApprovalPrompt, review: ?*const diff_mod.FileReview) bool {
@@ -157,6 +191,8 @@ pub const ApprovalPrompt = struct {
 
     pub fn clearAfterAcceptedSubmission(self: *ApprovalPrompt, alloc: Allocator) void {
         if (self.request) |*request| request.deinit(alloc);
+        if (self.rule_management) |*event| event.deinit(alloc);
+        self.rule_management = null;
         self.request = null;
         self.decision.resetAfterSubmission(alloc);
         self.clearReview();
@@ -217,9 +253,9 @@ test "approval prompt owns replaces and clears structured requests" {
 
     try std.testing.expect(try prompt.syncRequest(
         alloc,
-        .{ .label = "run_command npm test" },
+        .{ .label = "terminal.exec npm test" },
     ));
-    try std.testing.expectEqualStrings("run_command npm test", prompt.request.?.label);
+    try std.testing.expectEqualStrings("terminal.exec npm test", prompt.request.?.label);
     try std.testing.expect(prompt.request.?.file == null);
     try std.testing.expectEqual(@as(u8, 0), prompt.decision.choice_index);
 
@@ -313,7 +349,7 @@ test "command approval ignores absent file review" {
     defer prompt.deinit(alloc);
     try std.testing.expect(try prompt.syncRequest(alloc, .{
         .id = 21,
-        .label = "run_command printf '%s' command-review",
+        .label = "terminal.exec printf '%s' command-review",
     }));
 
     try std.testing.expect(!prompt.syncReview(null));

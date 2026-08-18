@@ -78,7 +78,7 @@ It drives one tmux shell through this shape:
 Command:
 
 ```bash
-cd /Users/faxes/Developer/Fx/fx-worktree-rendering
+cd /Users/example/Developer/Fx/fx-worktree-rendering
 zig build
 cd tests/e2e
 bun run render-lab -- --scenario same-shell-relaunch --runs 1 --out /private/tmp/fx-render-lab
@@ -87,7 +87,7 @@ bun run render-lab -- --scenario same-shell-relaunch --runs 1 --out /private/tmp
 Default test wrapper:
 
 ```bash
-cd /Users/faxes/Developer/Fx/fx-worktree-rendering/tests/e2e
+cd /Users/example/Developer/Fx/fx-worktree-rendering/tests/e2e
 bun test tui-render-lab.test.ts
 ```
 
@@ -98,7 +98,7 @@ This wrapper is CI-safe apart from requiring tmux. It does not require `AI_GATEW
 List available scenarios:
 
 ```bash
-cd /Users/faxes/Developer/Fx/fx-worktree-rendering/tests/e2e
+cd /Users/example/Developer/Fx/fx-worktree-rendering/tests/e2e
 bun run render-lab -- --list-scenarios
 ```
 

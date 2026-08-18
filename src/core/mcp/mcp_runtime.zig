@@ -31,6 +31,7 @@ const streamable_http = @import("streamable_http.zig");
 const feature_cache = @import("feature_cache.zig");
 const access_policy = @import("access_policy.zig");
 const health = @import("health.zig");
+const model_catalog = @import("model_catalog.zig");
 const startup_admission = @import("startup_admission.zig");
 const tool_subscription = @import("tool_subscription.zig");
 const completion_feature = @import("features/completion.zig");
@@ -3121,12 +3122,7 @@ fn snapshotServerHealthBeforeDiscoveryPublication(
         .connecting
     else
         .disconnected;
-    const authentication: health.AuthenticationState = if (server.config.auth != null or
-        server.config.bearer_token_env != null or
-        server.config.header_env.len > 0)
-        .configured
-    else
-        .none;
+    const authentication = configuredAuthenticationState(server);
     const failure = try healthFailureForState(
         alloc,
         server.config.required,
@@ -3193,16 +3189,7 @@ fn snapshotServerHealth(
         published_connection,
         transport_running,
     );
-    const authentication: health.AuthenticationState = if (server.auth_credentials_present.load(.acquire))
-        .authenticated
-    else if (server.auth_challenge_present.load(.acquire))
-        .required
-    else if (server.config.auth != null or
-        server.config.bearer_token_env != null or
-        server.config.header_env.len > 0)
-        .configured
-    else
-        .none;
+    const authentication = serverAuthenticationState(server);
     const failure = try healthFailureForState(
         alloc,
         server.config.required,
@@ -3254,6 +3241,69 @@ fn snapshotServerHealth(
         ),
         .last_successful_discovery_ms = server.last_successful_discovery_ms,
         .failure = failure,
+    };
+}
+
+fn configuredAuthenticationState(server: *const McpServer) health.AuthenticationState {
+    return if (server.config.auth != null or
+        server.config.bearer_token_env != null or
+        server.config.header_env.len > 0)
+        .configured
+    else
+        .none;
+}
+
+fn serverAuthenticationState(server: *const McpServer) health.AuthenticationState {
+    if (server.auth_credentials_present.load(.acquire)) return .authenticated;
+    if (server.auth_challenge_present.load(.acquire)) return .required;
+    return configuredAuthenticationState(server);
+}
+
+fn snapshotServerModelSummary(
+    alloc: Allocator,
+    server: *const McpServer,
+    permission_rules: types.PermissionRuleSet,
+    deferred_pending: bool,
+) !model_catalog.ServerSummary {
+    const name = try alloc.dupe(u8, server.config.name);
+    errdefer alloc.free(name);
+    const published_connection: health.ConnectionState = switch (server.state) {
+        .disconnected => .disconnected,
+        .disabled => .disabled,
+        .ready => .ready,
+        .failed => .failed,
+    };
+    const transport_running: ?bool = if (server.config.transport == .stdio)
+        if (server.dispatcher) |dispatcher| dispatcher.isRunning() else false
+    else
+        null;
+    const connection = health.observedConnection(published_connection, transport_running);
+    const deferred_for_ask = deferred_pending and
+        startup_admission.decide(
+            server.config.enabled,
+            server.config.required,
+            .ask_startup,
+        ) == .deferred;
+    var tool_count: ?usize = null;
+    if (connection == .ready and serverCatalogAvailable(server)) {
+        var visible_count: usize = 0;
+        for (server.tool_catalog.tools.items) |tool| {
+            if (permissions.rulesDenyAllTargetsForPermission(
+                permission_rules,
+                tool.prefixed_name,
+            )) continue;
+            visible_count += 1;
+        }
+        tool_count = visible_count;
+    }
+    return .{
+        .name = name,
+        .availability = model_catalog.classifyAvailability(
+            connection,
+            serverAuthenticationState(server),
+            deferred_for_ask,
+        ),
+        .tool_count = tool_count,
     };
 }
 
@@ -4832,6 +4882,65 @@ pub const McpRuntime = struct {
         return .{ .captured_at_ms = captured_at_ms, .servers = items };
     }
 
+    /// Returns an owned model-safe catalog snapshot. The caller releases it with `deinit`.
+    pub fn snapshotModelCatalog(
+        self: *McpRuntime,
+        alloc: Allocator,
+        permission_rules: types.PermissionRuleSet,
+        include_ask_deferred: bool,
+    ) !model_catalog.Snapshot {
+        const servers = try alloc.alloc(model_catalog.ServerSummary, self.servers.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (servers[0..initialized]) |server| alloc.free(server.name);
+            alloc.free(servers);
+        }
+
+        const discovery_state = self.discovery_state.load(.acquire);
+        const deferred_pending = include_ask_deferred and
+            self.deferred_discovery_state.load(.acquire) != .complete;
+        for (self.servers.items, 0..) |*server, index| {
+            if (discovery_state != .complete) {
+                const connection: health.ConnectionState = if (!server.config.enabled)
+                    .disabled
+                else if (discovery_state == .loading)
+                    .connecting
+                else
+                    .disconnected;
+                servers[index] = .{
+                    .name = try alloc.dupe(u8, server.config.name),
+                    .availability = model_catalog.classifyAvailability(
+                        connection,
+                        configuredAuthenticationState(server),
+                        false,
+                    ),
+                };
+                initialized += 1;
+                continue;
+            }
+
+            server.connection_lock.lockSharedUncancelable(io_mod.getIo());
+            self.catalog_mutex.lockSharedUncancelable(io_mod.getIo());
+            server.status_lock.lockUncancelable(io_mod.getIo());
+            servers[index] = snapshotServerModelSummary(
+                alloc,
+                server,
+                permission_rules,
+                deferred_pending,
+            ) catch |err| {
+                server.status_lock.unlock(io_mod.getIo());
+                self.catalog_mutex.unlockShared(io_mod.getIo());
+                server.connection_lock.unlockShared(io_mod.getIo());
+                return err;
+            };
+            server.status_lock.unlock(io_mod.getIo());
+            self.catalog_mutex.unlockShared(io_mod.getIo());
+            server.connection_lock.unlockShared(io_mod.getIo());
+            initialized += 1;
+        }
+        return .{ .servers = servers };
+    }
+
     pub fn requiredStartupFailure(
         self: *McpRuntime,
         alloc: Allocator,
@@ -4937,9 +5046,17 @@ pub const McpRuntime = struct {
     }
 
     pub fn connectAll(self: *McpRuntime, tool_registry: tool_dispatch.Registry) void {
-        if (self.discovery_state.cmpxchgStrong(.idle, .loading, .seq_cst, .seq_cst) != null) return;
         self.discovery_cancel_requested.store(false, .seq_cst);
-        self.connectAllControlled(tool_registry, null, .all);
+        self.connectAllCancellable(tool_registry, &self.discovery_cancel_requested);
+    }
+
+    pub fn connectAllCancellable(
+        self: *McpRuntime,
+        tool_registry: tool_dispatch.Registry,
+        cancel_requested: *std.atomic.Value(bool),
+    ) void {
+        if (self.discovery_state.cmpxchgStrong(.idle, .loading, .seq_cst, .seq_cst) != null) return;
+        self.connectAllControlled(tool_registry, cancel_requested, null, .all);
         self.finishDeferredDiscovery();
         self.discovery_state.store(.complete, .seq_cst);
     }
@@ -4953,7 +5070,12 @@ pub const McpRuntime = struct {
     ) void {
         if (self.discovery_state.cmpxchgStrong(.idle, .loading, .seq_cst, .seq_cst) != null) return;
         self.discovery_cancel_requested.store(false, .seq_cst);
-        self.connectAllControlled(tool_registry, null, .ask_startup);
+        self.connectAllControlled(
+            tool_registry,
+            &self.discovery_cancel_requested,
+            null,
+            .ask_startup,
+        );
         self.discovery_state.store(.complete, .seq_cst);
     }
 
@@ -4974,7 +5096,12 @@ pub const McpRuntime = struct {
                         .acq_rel,
                         .acquire,
                     ) != null) continue;
-                    self.connectAllControlled(tool_registry, null, .ask_deferred);
+                    self.connectAllControlled(
+                        tool_registry,
+                        &self.discovery_cancel_requested,
+                        null,
+                        .ask_deferred,
+                    );
                     self.finishDeferredDiscovery();
                     return;
                 },
@@ -5028,7 +5155,12 @@ pub const McpRuntime = struct {
         tool_registry: tool_dispatch.Registry,
         server_timeout: ?std.Io.Duration,
     ) void {
-        self.connectAllControlled(tool_registry, server_timeout, .all);
+        self.connectAllControlled(
+            tool_registry,
+            &self.discovery_cancel_requested,
+            server_timeout,
+            .all,
+        );
         self.finishDeferredDiscovery();
         self.discovery_state.store(.complete, .seq_cst);
     }
@@ -5036,6 +5168,7 @@ pub const McpRuntime = struct {
     fn connectAllControlled(
         self: *McpRuntime,
         tool_registry: tool_dispatch.Registry,
+        cancel_requested: *std.atomic.Value(bool),
         server_timeout: ?std.Io.Duration,
         phase: startup_admission.Phase,
     ) void {
@@ -5066,7 +5199,7 @@ pub const McpRuntime = struct {
         self.catalog_mutex.unlockShared(io_mod.getIo());
 
         for (self.servers.items) |*server| {
-            if (self.discovery_cancel_requested.load(.seq_cst)) return;
+            if (cancel_requested.load(.acquire)) return;
             switch (startup_admission.decide(
                 server.config.enabled,
                 server.config.required,
@@ -5084,10 +5217,10 @@ pub const McpRuntime = struct {
                 self,
                 server,
                 &used_tool_names,
-                &self.discovery_cancel_requested,
+                cancel_requested,
                 server_timeout,
             ) catch |err| {
-                if (self.discovery_cancel_requested.load(.seq_cst)) return;
+                if (cancel_requested.load(.acquire)) return;
                 debug_trace.logf("mcp", "connection failed for server {s}: {s}", .{ server.config.name, @errorName(err) });
                 if (server.last_error == null) {
                     server.setFailed(self.alloc, @errorName(err));
@@ -5103,7 +5236,7 @@ pub const McpRuntime = struct {
         name: []const u8,
         open_ctx: ?*anyopaque,
         open_url: mcp_auth.OpenUrlFn,
-    ) !void {
+    ) !mcp_auth.AuthenticationResult {
         const server = try self.authenticationServer(name);
         server.connection_lock.lockSharedUncancelable(io_mod.getIo());
         var connection_locked = true;
@@ -5136,7 +5269,7 @@ pub const McpRuntime = struct {
         };
         defer source.challenge.deinit(self.alloc);
         defer if (source.previous_scope) |value| self.alloc.free(value);
-        var credentials = try mcp_auth.authorizeInteractive(self.alloc, .{
+        var credentials = switch (try mcp_auth.authorizeInteractive(self.alloc, .{
             .endpoint = try server.config.remoteUrl(),
             .challenge = source.challenge,
             .config = .{
@@ -5151,7 +5284,10 @@ pub const McpRuntime = struct {
             .open_ctx = open_ctx,
             .open_url = open_url,
             .lifecycle_cancel_flag = &self.retiring,
-        });
+        })) {
+            .credentials => |credentials| credentials,
+            .issuer_mismatch => |mismatch| return .{ .issuer_mismatch = mismatch },
+        };
         var transferred = false;
         defer if (!transferred) credentials.deinit(self.alloc);
         {
@@ -5180,6 +5316,7 @@ pub const McpRuntime = struct {
         server.connection_lock.unlockShared(io_mod.getIo());
         connection_locked = false;
         try resumeToolSubscriptionAfterAuthentication(self, server, deadline);
+        return .authenticated;
     }
 
     pub fn validateAuthenticationServer(self: *McpRuntime, name: []const u8) !void {
@@ -5736,7 +5873,10 @@ pub const McpRuntime = struct {
         access: tool_mcp_runtime.Access,
     ) !tool_mcp_runtime.SearchResult {
         if (self.isDiscovering()) {
-            return .{ .model_output = try alloc.dupe(u8, "{\"tools\":[],\"count\":0}") };
+            return .{ .model_output = try alloc.dupe(
+                u8,
+                "{\"tools\":[],\"count\":0,\"state\":\"discovering\",\"retryable\":true}",
+            ) };
         }
         var operation_access = try OperationAccessGuard.init(
             self.alloc,
@@ -5754,7 +5894,8 @@ pub const McpRuntime = struct {
             defer matches.deinit(alloc);
             var auth_witnesses: std.ArrayList(CatalogAuthWitness) = .empty;
             defer auth_witnesses.deinit(alloc);
-            for (self.servers.items) |*server| {
+            var more_available = false;
+            server_loop: for (self.servers.items) |*server| {
                 if (server.state != .ready) continue;
                 if (!serverCatalogAvailable(server)) continue;
                 if (!operation_access.allows(.{ .tool_server = server.config.name })) continue;
@@ -5762,15 +5903,19 @@ pub const McpRuntime = struct {
                     instructions[0..context_limits.utf8PrefixLength(instructions, mcp_server_instruction_search_bytes)]
                 else
                     "";
-                const match_count_before = matches.items.len;
+                var server_matched = false;
                 for (server.tool_catalog.tools.items) |tool| {
                     if (!operation_access.allows(.{ .tool = tool.prefixed_name })) continue;
                     if (permissions.rulesDenyAllTargetsForPermission(permission_rules, tool.prefixed_name)) continue;
                     if (!toolMatchesQuery(tool, searchable_instructions, query)) continue;
+                    server_matched = true;
+                    if (matches.items.len >= capped_limit) {
+                        more_available = true;
+                        break;
+                    }
                     try matches.append(alloc, tool);
-                    if (matches.items.len >= capped_limit) break;
                 }
-                if (matches.items.len > match_count_before) {
+                if (server_matched) {
                     if (catalogAuthWitness(server)) |generation| {
                         try auth_witnesses.append(alloc, .{
                             .server = server,
@@ -5778,7 +5923,7 @@ pub const McpRuntime = struct {
                         });
                     }
                 }
-                if (matches.items.len >= capped_limit) break;
+                if (more_available) break :server_loop;
             }
             if (matches.items.len == 0) {
                 if (try renderAuthenticationRequired(
@@ -5798,6 +5943,7 @@ pub const McpRuntime = struct {
                 limits.mcp_search_result_bytes,
                 0,
                 false,
+                more_available,
             );
             const observed_bytes = full.len;
             const effective_bytes = limits.mcp_search_result_bytes.effectiveBytes();
@@ -5821,6 +5967,7 @@ pub const McpRuntime = struct {
                     limits.mcp_search_result_bytes,
                     observed_bytes,
                     true,
+                    more_available,
                 );
                 if (candidate.len <= effective_bytes) {
                     model_output = candidate;
@@ -8408,7 +8555,12 @@ fn renderAuthenticationRequired(
     return null;
 }
 
-fn loadStoredCredentials(alloc: Allocator, server: *McpServer) !void {
+fn loadStoredCredentials(
+    alloc: Allocator,
+    server: *McpServer,
+    control: ConnectionControl,
+) !void {
+    try checkConnectionControl(control);
     if (server.config.transport == .stdio or
         !server.config.allow_stored_credentials or
         server.auth_credentials != null)
@@ -8416,13 +8568,27 @@ fn loadStoredCredentials(alloc: Allocator, server: *McpServer) !void {
         return;
     }
     const auth = server.config.auth orelse mcp_contract.McpAuthConfig{};
-    server.auth_credentials = try mcp_auth_store.load(
-        alloc,
-        server.config.name,
-        try server.config.remoteUrl(),
-        auth.resource,
-        auth.issuer,
-    );
+    var credentials = if (control.cancel_flag) |cancel_flag|
+        try mcp_auth_store.loadCancellable(
+            alloc,
+            server.config.name,
+            try server.config.remoteUrl(),
+            auth.resource,
+            auth.issuer,
+            cancel_flag,
+        )
+    else
+        try mcp_auth_store.load(
+            alloc,
+            server.config.name,
+            try server.config.remoteUrl(),
+            auth.resource,
+            auth.issuer,
+        );
+    errdefer if (credentials) |*owned| owned.deinit(alloc);
+    try checkConnectionControl(control);
+    server.auth_credentials = credentials;
+    credentials = null;
     server.auth_credentials_present.store(
         server.auth_credentials != null,
         .release,
@@ -9498,7 +9664,8 @@ fn connectServerForDiscovery(
     used_tool_names: *std.StringHashMap(void),
     control: ConnectionControl,
 ) !void {
-    loadStoredCredentials(runtime.alloc, server) catch |err| {
+    loadStoredCredentials(runtime.alloc, server, control) catch |err| {
+        if (err == error.Cancelled) return err;
         debug_trace.logf(
             "mcp",
             "credential load failed server={s} err={s}",
@@ -11069,6 +11236,7 @@ fn renderSearchResult(
     result_limit: context_limits.Resolved,
     observed_bytes: usize,
     limit_triggered: bool,
+    more_available: bool,
 ) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -11078,6 +11246,7 @@ fn renderSearchResult(
         try writeToolMetadataJson(alloc, &out.writer, tool, description_limit);
     }
     try out.writer.print("],\"count\":{d}", .{selected_count});
+    if (more_available) try out.writer.writeAll(",\"more_available\":true");
     if (limit_triggered) {
         try out.writer.print(
             ",\"context_limit\":{{\"name\":\"mcp_search_result_bytes\",\"action\":\"omitted\",\"omitted_count\":{d},\"observed_bytes\":{d},\"effective_bytes\":{d},\"source\":",
@@ -11780,7 +11949,7 @@ fn authorizeForChallenge(
         };
     };
     defer if (source.previous_scope) |value| alloc.free(value);
-    var credentials = try mcp_auth.authorizeAutomated(alloc, .{
+    var credentials = switch (try mcp_auth.authorizeAutomated(alloc, .{
         .endpoint = try server.config.remoteUrl(),
         .challenge = challenge,
         .config = .{
@@ -11792,7 +11961,14 @@ fn authorizeForChallenge(
             .scopes = auth_config.scopes,
         },
         .previous_scope = source.previous_scope,
-    });
+    })) {
+        .credentials => |credentials| credentials,
+        .issuer_mismatch => |owned_mismatch| {
+            var mismatch = owned_mismatch;
+            mismatch.deinit();
+            return error.AuthorizationMetadataIssuerMismatch;
+        },
+    };
     var credentials_transferred = false;
     errdefer if (!credentials_transferred) credentials.deinit(alloc);
     try lockMutexWithControl(&server.auth_lock, control);
@@ -15482,7 +15658,10 @@ test "discovery classification separates modern negotiation from legacy fallback
     );
     defer invalid_params.deinit();
     switch (try classifyDiscoveryResponse(invalid_params.value)) {
-        .modern_protocol_error => |protocol_error| try std.testing.expectEqual(@as(i64, -32602), protocol_error.code),
+        .legacy_fallback => |version| try std.testing.expectEqual(
+            LegacyStdioVersion.v2025_11_25,
+            version,
+        ),
         else => return error.TestUnexpectedResult,
     }
 
@@ -16798,12 +16977,52 @@ test "McpRuntime cancels blocked stdio discovery without exposing partial state"
 
     var results = try runtime.searchTools(alloc, "echo", 5, .{}, .{}, .unrestricted);
     defer results.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"tools\":[],\"count\":0}", results.model_output);
+    try std.testing.expectEqualStrings(
+        "{\"tools\":[],\"count\":0,\"state\":\"discovering\",\"retryable\":true}",
+        results.model_output,
+    );
 
     const started_ms = io_mod.milliTimestamp();
     runtime.deinit();
     runtime_deinitialized = true;
     try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1000);
+}
+
+test "caller cancellation interrupts blocked candidate connection" {
+    const Connector = struct {
+        runtime: *McpRuntime,
+        cancel: *std.atomic.Value(bool),
+        started: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.started.store(true, .release);
+            self.runtime.connectAllCancellable(.{}, self.cancel);
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    const args = try alloc.alloc([]const u8, 1);
+    args[0] = try alloc.dupe(u8, "{}");
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "candidate"),
+        .command = try alloc.dupe(u8, "awk"),
+        .args = args,
+        .startup_timeout_ms = 60_000,
+    });
+    var cancel = std.atomic.Value(bool).init(false);
+    var connector = Connector{ .runtime = &runtime, .cancel = &cancel };
+    const thread = try std.Thread.spawn(.{}, Connector.run, .{&connector});
+    while (!connector.started.load(.acquire)) io_mod.sleep(std.time.ns_per_ms);
+    io_mod.sleep(25 * std.time.ns_per_ms);
+    const started_ms = io_mod.milliTimestamp();
+    cancel.store(true, .release);
+    thread.join();
+
+    try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1_000);
+    try std.testing.expectEqual(ServerState.disconnected, runtime.servers.items[0].state);
+    try std.testing.expect(runtime.servers.items[0].last_error == null);
 }
 
 test "MCP health terminal-encodes external identity and omits secret-bearing configuration" {
@@ -16832,6 +17051,89 @@ test "MCP health snapshot cleans up every partial allocation" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         checkHealthSnapshotAllocationFailures,
+        .{},
+    );
+}
+
+test "model catalog reports deferred ask servers without connecting and counts only visible tools" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "required"),
+        .transport = .http,
+        .url = try alloc.dupe(u8, "https://required.example/mcp"),
+        .required = true,
+    });
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "optional"),
+        .transport = .http,
+        .url = try alloc.dupe(u8, "https://optional.example/mcp"),
+    });
+    runtime.discovery_state.store(.complete, .seq_cst);
+    runtime.servers.items[0].state = .ready;
+
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+    const response =
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"one","inputSchema":{"type":"object"}},{"name":"two","inputSchema":{"type":"object"}}]}}
+    ;
+    try parseAndStoreTools(alloc, &runtime.servers.items[0], .{}, response, &used);
+
+    var denied_rules = [_]types.PermissionRule{.{
+        .permission = @constCast("mcp_required_two"),
+        .pattern = @constCast("*"),
+        .action = .deny,
+    }};
+    var before = try runtime.snapshotModelCatalog(
+        alloc,
+        .{ .rules = &denied_rules },
+        true,
+    );
+    defer before.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), before.servers.len);
+    try std.testing.expectEqual(model_catalog.Availability.ready, before.servers[0].availability);
+    try std.testing.expectEqual(@as(?usize, 1), before.servers[0].tool_count);
+    try std.testing.expectEqual(model_catalog.Availability.available_on_demand, before.servers[1].availability);
+    try std.testing.expectEqual(@as(?usize, null), before.servers[1].tool_count);
+    try std.testing.expectEqual(ServerState.disconnected, runtime.servers.items[1].state);
+    try std.testing.expectEqual(DiscoveryState.idle, runtime.deferred_discovery_state.load(.acquire));
+
+    runtime.servers.items[1].state = .ready;
+    try parseAndStoreTools(alloc, &runtime.servers.items[1], .{}, response, &used);
+    runtime.deferred_discovery_state.store(.complete, .release);
+    var after = try runtime.snapshotModelCatalog(alloc, .{}, true);
+    defer after.deinit(alloc);
+
+    try std.testing.expectEqual(model_catalog.Availability.ready, after.servers[1].availability);
+    try std.testing.expectEqual(@as(?usize, 2), after.servers[1].tool_count);
+}
+
+fn checkModelCatalogSnapshotAllocationFailures(alloc: Allocator) !void {
+    var runtime = McpRuntime.init(std.testing.allocator);
+    defer runtime.deinit();
+    try runtime.addServer(.{
+        .name = try std.testing.allocator.dupe(u8, "one"),
+        .command = try std.testing.allocator.dupe(u8, "fixture"),
+        .enabled = false,
+    });
+    try runtime.addServer(.{
+        .name = try std.testing.allocator.dupe(u8, "two"),
+        .command = try std.testing.allocator.dupe(u8, "fixture"),
+        .enabled = false,
+    });
+    runtime.discovery_state.store(.complete, .release);
+    for (runtime.servers.items) |*server| server.state = .disabled;
+
+    var snapshot = try runtime.snapshotModelCatalog(alloc, .{}, false);
+    snapshot.deinit(alloc);
+}
+
+test "model catalog snapshot cleans up every partial allocation" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkModelCatalogSnapshotAllocationFailures,
         .{},
     );
 }
@@ -17299,6 +17601,53 @@ test "MCP search returns metadata without advertising every executable schema" {
     try std.testing.expect(std.mem.find(u8, results.model_output, "inputSchema") == null);
     try std.testing.expect(std.mem.find(u8, results.model_output, "Repository name") == null);
     try std.testing.expect(std.mem.find(u8, results.model_output, "server_instructions") == null);
+}
+
+test "MCP search reports an authorized match beyond the count cap" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "chrome"),
+        .command = try alloc.dupe(u8, "fixture"),
+    });
+    runtime.discovery_state.store(.complete, .seq_cst);
+    runtime.servers.items[0].state = .ready;
+
+    var response: std.Io.Writer.Allocating = .init(alloc);
+    defer response.deinit();
+    try response.writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[");
+    for (0..21) |index| {
+        if (index > 0) try response.writer.writeByte(',');
+        try response.writer.print(
+            "{{\"name\":\"item{d:0>2}\",\"description\":\"Chrome item {d}\",\"inputSchema\":{{\"type\":\"object\"}}}}",
+            .{ index, index },
+        );
+    }
+    try response.writer.writeAll("]}}");
+
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+    try parseAndStoreTools(
+        alloc,
+        &runtime.servers.items[0],
+        .{},
+        response.written(),
+        &used,
+    );
+
+    var broad = try runtime.searchTools(alloc, "chrome", 20, .{}, .{}, .unrestricted);
+    defer broad.deinit(alloc);
+    var broad_json = try std.json.parseFromSlice(std.json.Value, alloc, broad.model_output, .{});
+    defer broad_json.deinit();
+    try std.testing.expectEqual(@as(i64, 20), broad_json.value.object.get("count").?.integer);
+    try std.testing.expect(broad_json.value.object.get("more_available").?.bool);
+
+    var targeted = try runtime.searchTools(alloc, "item00", 20, .{}, .{}, .unrestricted);
+    defer targeted.deinit(alloc);
+    var targeted_json = try std.json.parseFromSlice(std.json.Value, alloc, targeted.model_output, .{});
+    defer targeted_json.deinit();
+    try std.testing.expect(targeted_json.value.object.get("more_available") == null);
 }
 
 test "scoped MCP cached tool and feature operations reject authority revoked after admission" {

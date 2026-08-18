@@ -19,7 +19,6 @@ import {
   visibleText,
 } from "./tui-render-assertions";
 import {
-  classifierEvidenceFromRequest,
   fakeGatewayFinalText,
   fakeGatewayPermissionDecision,
   fakeGatewaySerializedToolCall,
@@ -167,8 +166,8 @@ function outerCommandCall() {
   return outerToolCalls([
     {
       id: "command_outer_1",
-      name: "run_command",
-      input: { command: "touch generic-preview-accepted.txt" },
+      name: "terminal",
+      input: { action: "exec", command: "touch generic-preview-accepted.txt" },
     },
   ]);
 }
@@ -180,8 +179,9 @@ function outerProjectionChangingCommandCall() {
   return outerToolCalls([
     {
       id: "projection_command_outer_1",
-      name: "run_command",
+      name: "terminal",
       input: {
+        action: "exec",
         command:
           `i=1; while [ "$i" -le 5000 ]; do printf 'PROJECTION_FIXTURE_%04d\\n' "$i"; i=$((i + 1)); done; ` +
           `: > ${PROJECTION_READY}; while [ ! -e ${PROJECTION_RELEASE} ]; do sleep 0.01; done`,
@@ -203,8 +203,8 @@ function outerLongCommandCall() {
   return outerToolCalls([
     {
       id: "long_command_outer_1",
-      name: "run_command",
-      input: { command },
+      name: "terminal",
+      input: { action: "exec", command },
     },
   ]);
 }
@@ -220,8 +220,8 @@ function outerScrollableLongCommandCall() {
   return outerToolCalls([
     {
       id: "scrollable_long_command_outer_1",
-      name: "run_command",
-      input: { command },
+      name: "terminal",
+      input: { action: "exec", command },
     },
   ]);
 }
@@ -233,18 +233,8 @@ function outerFittingCommandCall() {
   return outerToolCalls([
     {
       id: "fitting_command_outer_1",
-      name: "run_command",
-      input: { command },
-    },
-  ]);
-}
-
-function outerBackgroundCommandCall() {
-  return outerToolCalls([
-    {
-      id: "background_command_outer_1",
-      name: "run_command",
-      input: { command: "sleep 1", background: true },
+      name: "terminal",
+      input: { action: "exec", command },
     },
   ]);
 }
@@ -401,7 +391,10 @@ function startFakeGateway(
   };
 }
 
-function createIsolatedRoot(permissionMode: "ask" | "auto" = "ask") {
+function createIsolatedRoot(
+  permissionMode: "ask" | "auto" = "ask",
+  permission: Record<string, unknown> = {},
+) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-decision-e2e-")));
   const home = join(root, "home");
   const workspace = join(root, "workspace");
@@ -409,7 +402,7 @@ function createIsolatedRoot(permissionMode: "ask" | "auto" = "ask") {
   mkdirSync(workspace, { recursive: true });
   writeFileSync(
     join(home, ".fx", "settings.json"),
-    JSON.stringify({ permission_mode: permissionMode, permission: {}, maxxing_mode: "legacy" }),
+    JSON.stringify({ permission_mode: permissionMode, permission, maxxing_mode: "legacy" }),
   );
   roots.push(root);
   return { root, home, workspace: realpathSync(workspace) };
@@ -444,8 +437,9 @@ async function launchScenario(
   env: Record<string, string | undefined> = {},
   permissionMode: "ask" | "auto" = "ask",
   classifierDecision: ClassifierDecision = () => "allow",
+  permission: Record<string, unknown> = {},
 ) {
-  const root = createIsolatedRoot(permissionMode);
+  const root = createIsolatedRoot(permissionMode, permission);
   const gateway = startFakeGateway(responses, classifierDecision);
   gateways.push(gateway);
   const tracePath = join(root.root, "trace.log");
@@ -1500,23 +1494,18 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
         },
-        "auto",
-        (body) => {
-          const evidence = classifierEvidenceFromRequest(body);
-          return evidence.includes("command: touch generic-preview-accepted.txt")
-            ? "ask"
-            : "allow";
-        },
+        "ask",
+        () => "allow",
+        { bash: { "i=1; while *": "allow" } },
       );
       await ctx.session.resizeWindow(120, 36);
 
       await ctx.session.sendText("Seed the approval scrollback fixture.");
-      await ctx.session.waitForText(markers.at(-1)!, 90_000);
       const beforeApproval = await waitForVisibleScrollback(
         ctx.session,
-        "approval fixture history",
-        (scrollback) => markers.every(
-          (marker) => scrollback.split(marker).length - 1 === 1,
+        "complete approval scrollback seed",
+        (scrollback) => markers.every((marker) =>
+          scrollback.split(marker).length - 1 === 1
         ),
         90_000,
       );
@@ -1538,15 +1527,17 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         "Would you like to run the following command?",
         TIMEOUT,
       );
-      expect(pane).toContain("$ touch generic-preview-accepted.txt");
+      expect(pane).toContain("# terminal.exec profile=user shell=");
+      expect(pane).toContain("touch generic-preview-accepted.txt");
       expectApprovalSelection(pane, 1, COMMAND_YES_CHOICE);
 
       const activeApproval = await waitForVisibleScrollback(
         ctx.session,
-        "active approval history",
-        (scrollback) => markers.every(
-          (marker) => scrollback.split(marker).length - 1 === 1,
+        "complete approval scrollback replay",
+        (scrollback) => markers.every((marker) =>
+          scrollback.split(marker).length - 1 === 1
         ),
+        TIMEOUT,
       );
       for (const marker of markers) {
         expect(activeApproval.split(marker).length - 1).toBe(1);
@@ -1579,7 +1570,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       expect(promptCommit).toMatch(
         /planned_scroll_rows=([1-9][0-9]*) committed_scroll_rows=\1 .*unplanned_scroll_rows=0/,
       );
-      expect(ctx.gateway.classifierRequests).toHaveLength(2);
+      expect(ctx.gateway.classifierRequests).toHaveLength(0);
       expect(ctx.gateway.requests).toHaveLength(3);
 
       await ctx.session.sendLiteralText("1");
@@ -1590,10 +1581,11 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
 
       const afterApproval = await waitForVisibleScrollback(
         ctx.session,
-        "completed approval history",
-        (scrollback) => markers.every(
-          (marker) => scrollback.split(marker).length - 1 === 1,
+        "complete post-approval scrollback",
+        (scrollback) => markers.every((marker) =>
+          scrollback.split(marker).length - 1 === 1
         ),
+        TIMEOUT,
       );
       for (const marker of markers) {
         expect(afterApproval.split(marker).length - 1).toBe(1);
@@ -1729,31 +1721,6 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         ctx.gateway.requests[1]!.body,
         "use a safer command",
       )).toBe(true);
-      await assertProcessAliveAndClean(ctx);
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "background command approvals keep legacy Tab navigation and terminal completion",
-    async () => {
-      const ctx = await launchScenario([outerBackgroundCommandCall()]);
-      await ctx.session.sendText("Start the background command fixture.");
-      let pane = await ctx.session.waitForText(APPROVAL_PROMPT, TIMEOUT);
-      expectApprovalSelection(pane, 1, COMMAND_YES_CHOICE);
-      expect(pane).not.toContain("Tab Amend");
-
-      await ctx.session.sendKeys("Tab");
-      pane = await waitForPaneState(ctx.session, "background tab navigation", (value) =>
-        hasApprovalSelection(value, 2, COMMAND_ALWAYS_CHOICE),
-      );
-      expectApprovalSelection(pane, 2, COMMAND_ALWAYS_CHOICE);
-
-      await ctx.session.sendKeys("Up");
-      await ctx.session.sendLiteralText("1");
-      await ctx.session.waitForText("● Background: Command #", TIMEOUT);
-      expect(ctx.gateway.requests).toHaveLength(1);
-      expect(await ctx.session.capturePane()).not.toContain(APPROVAL_PROMPT);
       await assertProcessAliveAndClean(ctx);
     },
     TIMEOUT,

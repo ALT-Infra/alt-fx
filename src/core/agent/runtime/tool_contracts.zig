@@ -5,6 +5,7 @@ const types = @import("../../shared/types.zig");
 const diff = @import("../../output/diff.zig");
 const file_mutation = @import("../../tooling/file_mutation.zig");
 const tool_admission = @import("../../tooling/tool_admission.zig");
+const session_permission_state = @import("../../permissions/session_permission_state.zig");
 const command_replay_store = @import("../../session/command_replay_store.zig");
 
 pub const vision = @import("vision_contracts.zig");
@@ -28,6 +29,7 @@ pub const LiveToolAuthority = struct {
     integrations: []const []const u8,
     rules: types.PermissionRuleSet,
     grants: []const PermissionGrant,
+    permission_state: ?*const session_permission_state.State = null,
     permission_mode: types.PermissionMode = .yolo,
 };
 
@@ -150,6 +152,8 @@ pub const ToolExecutionRequest = struct {
     /// Borrowed root-user evidence for subagent execution. This is never
     /// populated from an assistant-authored task prompt.
     root_user_intent_context: []const u8 = "",
+    root_user_messages: []const []const u8 = &.{},
+    root_user_evidence_complete: bool = false,
     /// Borrowed caller-owned catalog of images authorized for this call. The
     /// executor must not retain this slice or any attachment pointer.
     authorized_image_catalog: []const types.ImageAttachment = &.{},

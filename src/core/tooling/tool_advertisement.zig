@@ -13,7 +13,6 @@ pub const Options = struct {
     permission_rules: types.PermissionRuleSet = .{},
     mcp_runtime: ?*mcp_runtime.McpRuntime = null,
     subagent_available: bool = false,
-    terminal_available: bool = false,
 };
 
 const BuildKind = enum { full, read_only };
@@ -449,41 +448,30 @@ const test_web_search = blk: {
     break :blk spec;
 };
 
-const test_run_command = blk: {
-    var spec = test_read_file;
-    spec.name = "run_command";
-    spec.description = "Test command. When to use: exercise registered command projection. When NOT to use: assert product-specific shell behavior.";
-    spec.gateway_schema = .{
-        .name = "run_command",
-        .description = spec.description,
-        .input_schema = .{
-            .properties = &.{
-                .{ .name = "command", .json_type = .string },
-                .{ .name = "background", .json_type = .boolean },
-            },
-            .required = &.{"command"},
-        },
-    };
-    spec.executor_kind = .run_command;
-    spec.activity_kind = .command;
-    spec.requires_approval = true;
-    spec.action_label = "Running";
-    spec.completed_action_label = "Ran";
-    spec.label_arg_kind = .command;
-    spec.label_arg_default = "command";
-    spec.permission_target_kind = .command_cwd;
-    break :blk spec;
-};
-
 const test_terminal = blk: {
-    var spec = test_run_command;
+    var spec = test_read_file;
     spec.name = "terminal";
-    spec.description = "Test durable terminal projection. When to use: exercise terminal capability filtering. When NOT to use: assert terminal runtime behavior.";
+    spec.description = "Test terminal. When to use: exercise registered terminal projection. When NOT to use: assert product-specific terminal behavior.";
     spec.gateway_schema = .{
         .name = "terminal",
         .description = spec.description,
+        .input_schema = .{
+            .properties = &.{
+                .{ .name = "action", .json_type = .string, .enum_values = &.{"exec"} },
+                .{ .name = "command", .json_type = .string },
+            },
+            .required = &.{ "action", "command" },
+            .additional_properties = false,
+        },
     };
     spec.executor_kind = .terminal;
+    spec.activity_kind = .command;
+    spec.requires_approval = true;
+    spec.action_label = "Using terminal";
+    spec.completed_action_label = "Used terminal";
+    spec.label_arg_kind = .action;
+    spec.label_arg_default = "session";
+    spec.permission_target_kind = .none;
     break :blk spec;
 };
 
@@ -695,7 +683,6 @@ const test_all_tools = [_]tool_dispatch.Tool{
     test_open_file,
     test_web_fetch,
     test_web_search,
-    test_run_command,
     test_terminal,
     test_skill,
     test_install_skill,
@@ -720,7 +707,6 @@ const test_order = [_][]const u8{
     "rename_file",
     "copy_file",
     "create_folder",
-    "run_command",
     "terminal",
     "subagent",
     "skill",
@@ -886,7 +872,6 @@ fn writeBuiltinTool(
 ) !void {
     if (!includeBuiltinForKind(tool.name, kind, tool_set)) return;
     if (std.mem.eql(u8, tool.name, "subagent") and !options.subagent_available) return;
-    if (std.mem.eql(u8, tool.name, "terminal") and !options.terminal_available) return;
     if (std.mem.eql(u8, tool.name, "vision")) return;
     if (options.permission_mode != .yolo) {
         if (tool.provider_executed and !providerExecutionIsAllowed(tool.name, options.permission_rules)) return;
@@ -1171,7 +1156,7 @@ test "yolo advertisement ignores permission filtering" {
 
     var names = try collectToolNames(std.testing.allocator, projection.tools_json);
     defer freeNames(std.testing.allocator, &names);
-    try expectContainsName(names.items, "run_command");
+    try expectContainsName(names.items, "terminal");
     try expectContainsName(names.items, "write_file");
     try expectContainsName(names.items, "perplexity_search");
 }
@@ -1207,7 +1192,7 @@ test "later allow or ask after category deny keeps tools advertised" {
 
     try expectContainsName(names.items, "edit_file");
     try expectContainsName(names.items, "write_file");
-    try expectContainsName(names.items, "run_command");
+    try expectContainsName(names.items, "terminal");
 }
 
 test "later category deny hides earlier target-specific overrides" {
@@ -1257,7 +1242,7 @@ test "target-specific edit and bash denies keep tools advertised" {
 
     try expectContainsName(names.items, "edit_file");
     try expectContainsName(names.items, "write_file");
-    try expectContainsName(names.items, "run_command");
+    try expectContainsName(names.items, "terminal");
 }
 
 fn writeTestRegisteredProviderAdvertisement(
@@ -1296,7 +1281,6 @@ test "effective tool projection cleans up every partial allocation failure" {
 test "full advertisement uses active structured builtin schemas" {
     var projection = try buildTestGatewayToolProjection(std.testing.allocator, .{
         .subagent_available = true,
-        .terminal_available = true,
     });
     defer projection.deinit(std.testing.allocator);
     const json = projection.tools_json;
@@ -1412,16 +1396,14 @@ test "subagent advertisement follows writable host capability and task never app
     try expectNotContainsName(available_names.items, "task");
 }
 
-test "terminal advertisement follows the complete host capability" {
+test "terminal advertisement remains available for captured execution" {
     var unavailable = try buildTestGatewayToolProjection(std.testing.allocator, .{});
     defer unavailable.deinit(std.testing.allocator);
     var unavailable_names = try collectToolNames(std.testing.allocator, unavailable.tools_json);
     defer freeNames(std.testing.allocator, &unavailable_names);
-    try expectNotContainsName(unavailable_names.items, "terminal");
+    try expectContainsName(unavailable_names.items, "terminal");
 
-    var available = try buildTestGatewayToolProjection(std.testing.allocator, .{
-        .terminal_available = true,
-    });
+    var available = try buildTestGatewayToolProjection(std.testing.allocator, .{});
     defer available.deinit(std.testing.allocator);
     var available_names = try collectToolNames(std.testing.allocator, available.tools_json);
     defer freeNames(std.testing.allocator, &available_names);

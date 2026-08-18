@@ -68,7 +68,7 @@ pub const Foreground = struct {
         return .{
             .status = .failure,
             .model_output = try tool_result_errors.toolExecutionFailureJson(arena, .{
-                .tool_name = "run_command",
+                .tool_name = "terminal",
                 .message = if (foreground.exit_code != null) "Command exited with non-zero status" else "Command terminated before completing successfully",
                 .details = details[0..count],
                 .suggestion = "Inspect stderr and the command context, then fix the command or explain the blocker rather than retrying unchanged.",

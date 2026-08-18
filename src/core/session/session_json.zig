@@ -607,10 +607,40 @@ fn parseLegacyHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Hist
     const kind = try requireString(object, "kind");
 
     if (std.mem.eql(u8, kind, "compacted_summary")) {
+        const root_user_messages: [][]u8 = if (object.get("root_user_messages")) |messages_value| blk: {
+            if (messages_value != .array) return error.InvalidSessionFormat;
+            const messages = try alloc.alloc([]u8, messages_value.array.items.len);
+            errdefer alloc.free(messages);
+            var copied: usize = 0;
+            errdefer for (messages[0..copied]) |message| alloc.free(message);
+            for (messages_value.array.items, 0..) |item, index| {
+                if (item != .string) return error.InvalidSessionFormat;
+                messages[index] = try alloc.dupe(u8, item.string);
+                copied += 1;
+            }
+            break :blk messages;
+        } else &.{};
+        errdefer session.freeCompletedToolNames(alloc, root_user_messages);
+        const permission_feedback = try parseOptionalStringArray(
+            alloc,
+            object.get("permission_feedback"),
+        );
+        errdefer types.freePermissionFeedback(alloc, permission_feedback);
+        const removed_turn_count = try requireUsize(object, "removed_turn_count");
         return .{ .compacted_summary = .{
             .summary = try alloc.dupe(u8, try requireString(object, "summary")),
-            .removed_turn_count = try requireUsize(object, "removed_turn_count"),
+            .removed_turn_count = removed_turn_count,
             .compaction_count = try requireUsize(object, "compaction_count"),
+            .root_user_messages = root_user_messages,
+            .root_user_messages_complete = if (object.get("root_user_messages_complete") != null)
+                try requireBool(object, "root_user_messages_complete")
+            else
+                object.get("root_user_messages") != null or removed_turn_count == 0,
+            .permission_feedback = permission_feedback,
+            .permission_feedback_complete = if (object.get("permission_feedback_complete") != null)
+                try requireBool(object, "permission_feedback_complete")
+            else
+                removed_turn_count == 0,
         } };
     }
     if (std.mem.eql(u8, kind, "assistant")) {
@@ -1392,6 +1422,7 @@ test "session JSON round-trips images summaries and background commands" {
         .snapshot_sha256 = @constCast("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
     }};
     var completed_tool_names = [_][]u8{ @constCast("list_files"), @constCast("glob_files") };
+    var root_user_messages = [_][]u8{ @constCast("first exact request"), @constCast("second exact request") };
     const history = [_]session.HistoryTurn{
         .{ .assistant = .{
             .user = .{ .text = @constCast("hello"), .images = &images },
@@ -1401,6 +1432,7 @@ test "session JSON round-trips images summaries and background commands" {
             .summary = @constCast("summary text"),
             .removed_turn_count = 5,
             .compaction_count = 2,
+            .root_user_messages = &root_user_messages,
         } },
         .{ .background_command = .{
             .user = .{ .text = @constCast("run dev") },
@@ -1461,6 +1493,8 @@ test "session JSON round-trips images summaries and background commands" {
     try std.testing.expectEqualStrings("summary text", loaded.history[1].compacted_summary.summary);
     try std.testing.expectEqual(@as(usize, 5), loaded.history[1].compacted_summary.removed_turn_count);
     try std.testing.expectEqual(@as(usize, 2), loaded.history[1].compacted_summary.compaction_count);
+    try std.testing.expect(!loaded.history[1].compacted_summary.root_user_messages_complete);
+    try std.testing.expectEqual(@as(usize, 0), loaded.history[1].compacted_summary.root_user_messages.len);
     try std.testing.expectEqualStrings("run dev", loaded.history[2].background_command.user.text);
     try std.testing.expectEqualStrings("/tmp/server.log", loaded.history[2].background_command.log_path);
     try std.testing.expect(loaded.history[2].background_command.expect_url);
@@ -1507,6 +1541,38 @@ test "session JSON round-trips images summaries and background commands" {
     try std.testing.expectEqual(@as(usize, 1), summary_count);
     try std.testing.expectEqual(@as(usize, 1), background_count);
     try std.testing.expectEqual(@as(usize, 1), interruption_count);
+}
+
+test "legacy session migration keeps missing compacted authority incomplete" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"kind\":\"compacted_summary\",\"summary\":\"legacy\",\"removed_turn_count\":2,\"compaction_count\":1}",
+        .{},
+    );
+    defer parsed.deinit();
+    const migrated = try parseLegacyHistoryTurn(alloc, parsed.value);
+    defer session.freeHistoryTurn(alloc, migrated);
+    try std.testing.expect(!migrated.compacted_summary.root_user_messages_complete);
+    try std.testing.expect(!migrated.compacted_summary.permission_feedback_complete);
+
+    const history = [_]session.HistoryTurn{migrated};
+    const json = try renderSessionJson(
+        alloc,
+        "legacy-incomplete",
+        1,
+        2,
+        session.ConversationLanguage.literal("und-Latn"),
+        "/tmp/workspace",
+        &history,
+        .{},
+    );
+    defer alloc.free(json);
+    var reloaded = try parseStoredSession(TestStoredSession, alloc, json);
+    defer reloaded.deinit(alloc);
+    try std.testing.expect(!reloaded.history[0].compacted_summary.root_user_messages_complete);
+    try std.testing.expect(!reloaded.history[0].compacted_summary.permission_feedback_complete);
 }
 
 test "session JSON round-trips assistant execution memory" {

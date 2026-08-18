@@ -177,6 +177,7 @@ function startAuthFixture(
     rotateOnResourceReadCall?: number;
     failFeatureRefreshAfterRotation?: boolean;
     rejectResourceTemplateAuth?: boolean;
+    authorizationServerTrailingSlash?: boolean;
   } = {},
 ) {
   const transport = options.transport ?? "http";
@@ -371,7 +372,9 @@ function startAuthFixture(
       ) {
         return Response.json({
           resource,
-          authorization_servers: [origin],
+          authorization_servers: [
+            options.authorizationServerTrailingSlash ? `${origin}/` : origin,
+          ],
           scopes_supported: ["tools.read", "tools.call", "offline_access"],
         });
       }
@@ -1712,6 +1715,9 @@ describe("MCP remote authentication lifecycle", () => {
       });
       await tui.waitForComposer(15_000);
       await tui.sendText("/mcp");
+      const summary = await tui.waitForText("1 ready", 5_000);
+      expect(summary).toContain("Use /mcp list for details.");
+      await tui.sendText("/mcp list");
       const status = await tui.waitForText("auth=authenticated", 5_000);
       expect(status).not.toContain(ACCESS_REFRESHED);
       await tui.sendText("/mcp logout fixture");
@@ -1740,6 +1746,57 @@ describe("MCP remote authentication lifecycle", () => {
       }
     },
     60_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "issuer mismatch stays exact and reports the configuration override",
+    async () => {
+      upstream = startModernMcpHttpFixture("json");
+      auth = startAuthFixture(upstream.url, {
+        authorizationServerTrailingSlash: true,
+      });
+      const root = createRoot(auth);
+      gateway = startFakeGateway([], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        env: {
+          ...baseEnv(root),
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        },
+        width: 120,
+        height: 34,
+      });
+      await tui.waitForComposer(15_000);
+
+      await tui.sendText("/mcp auth fixture --open");
+      const mismatch = await tui.waitForText(
+        "Add \"oauth\":{\"issuer\":",
+        15_000,
+      );
+      const origin = new URL(auth.url).origin;
+      const compactMismatch = mismatch.replace(/\s+/g, " ");
+      expect(compactMismatch).toContain(`expected issuer "${origin}/"`);
+      expect(compactMismatch).toContain(`metadata returned "${origin}"`);
+      expect(compactMismatch).toContain(`\"issuer\":\"${origin}\"`);
+      expect(auth.authorizationRequests).toBe(0);
+      expect(auth.tokenExchanges).toBe(0);
+
+      const profilePath = join(root.home, ".fx", "mcp.json");
+      const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+      profile.mcp.fixture.oauth.issuer = origin;
+      writeFileSync(profilePath, JSON.stringify(profile));
+      await tui.sendText("/mcp reload");
+      await tui.waitForText("MCP profile reloaded", 15_000);
+      await tui.sendText("/mcp auth fixture --open");
+      await tui.waitForText("Authenticated MCP server 'fixture'.", 15_000);
+      expect(auth.authorizationRequests).toBe(1);
+      expect(auth.tokenExchanges).toBe(1);
+    },
+    45_000,
   );
 
   test.skipIf(!tmuxAvailable())(

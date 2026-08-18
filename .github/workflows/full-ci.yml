@@ -48,6 +48,10 @@ jobs:
         if: matrix.optimize == 'Debug'
         run: zig fmt --check src/
 
+      - name: Audit public surface
+        if: matrix.optimize == 'Debug'
+        run: ./scripts/check-public-surface.sh
+
       - name: Build
         run: zig build -Doptimize=${{ matrix.optimize }}
 

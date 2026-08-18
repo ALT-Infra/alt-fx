@@ -467,6 +467,11 @@ pub const CommitLifecycle = struct {
 };
 
 pub const LoadedWritableSession = struct {
+    pub const ExternalPromptOrigin = enum {
+        root,
+        persistent_child,
+    };
+
     active_id: []u8,
     state: session_codec.DurableSessionState,
     log: WritableSessionDir,
@@ -488,6 +493,11 @@ pub const LoadedWritableSession = struct {
     migration_source_bytes: ?u64 = null,
     usage_sidecar_reseal_pending: bool = false,
     resume_view_stale: bool = false,
+    /// Runtime-only provenance installed by subagent resume admission. These
+    /// fields are never written into the session event log.
+    external_prompt_origin: ExternalPromptOrigin = .root,
+    external_root_user_messages: [][]u8 = &.{},
+    external_root_user_evidence_complete: bool = false,
 
     pub fn deinit(self: *LoadedWritableSession, alloc: Allocator) void {
         if (self.degraded_tail) |*tail| tail.deinit(alloc);
@@ -495,6 +505,10 @@ pub const LoadedWritableSession = struct {
         if (self.child_capability) |capability| {
             capability.deinit();
             alloc.destroy(capability);
+        }
+        for (self.external_root_user_messages) |message| alloc.free(message);
+        if (self.external_root_user_messages.len > 0) {
+            alloc.free(self.external_root_user_messages);
         }
         alloc.free(self.active_id);
         self.state.deinit(alloc);

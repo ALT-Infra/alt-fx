@@ -262,7 +262,7 @@ test "processQueuedPrompt cancellation after valid tool finish settles streamed 
 test "processQueuedPrompt in-stream cancellation settles every provisional start" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{
-        toolCall("call_command", "run_command", "{}"),
+        toolCall("call_command", "terminal", "{}"),
         toolCall("call_read", "read_file", "{}"),
     };
     const completions = [_]FakeCompletion{.{
@@ -500,7 +500,7 @@ test "processQueuedPrompt retains cancelled command artifact for presentation on
     const result_output = "RESULT-ONLY-OUTPUT-SENTINEL\nTERM-TAIL-SENTINEL\n";
     const result_json =
         "{\"kind\":\"foreground\",\"command\":\"sleep 5\",\"cwd\":\"/tmp/RESULT-JSON-ONLY-SENTINEL\",\"exit_code\":null,\"signal\":15,\"timed_out\":false,\"duration_ms\":7,\"stdout_bytes\":49,\"stderr_bytes\":0,\"truncated\":false,\"output_file\":\"" ++ artifact_path ++ "\",\"stdout_file\":null,\"stderr_file\":null,\"sandbox_denied\":false}";
-    const calls = [_]ToolCall{toolCall("call_cancelled_command", "run_command", "{\"command\":\"sleep 5\"}")};
+    const calls = [_]ToolCall{toolCall("call_cancelled_command", "terminal", "{\"action\":\"exec\",\"command\":\"sleep 5\"}")};
     const completions = [_]FakeCompletion{.{ .tool_calls = &calls }};
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
@@ -523,11 +523,11 @@ test "processQueuedPrompt retains cancelled command artifact for presentation on
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, "event=cancel_observed"));
 
     try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
-    try std.testing.expectEqualStrings("run_command", hooks.executed_names.items[0]);
+    try std.testing.expectEqualStrings("terminal", hooks.executed_names.items[0]);
     try std.testing.expectEqual(@as(usize, 3), hooks.lifecycle_events.items.len);
     const terminal = hooks.lifecycle_events.items[2].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.cancelled, terminal.outcome.kind);
-    try std.testing.expectEqualStrings("Cancelled run_command", terminal.outcome.summary);
+    try std.testing.expectEqualStrings("Cancelled terminal", terminal.outcome.summary);
     try std.testing.expectEqualStrings(
         artifact_handle,
         terminal.command_artifact_handle orelse return error.TestExpectedArtifactHandle,
@@ -541,7 +541,7 @@ test "processQueuedPrompt retains cancelled command artifact for presentation on
     const interrupted = hooks.history_turns.items[0].interrupted;
     const interrupted_call = interrupted.tool_call orelse return error.TestExpectedInterruptedToolCall;
     try std.testing.expectEqualStrings("call_cancelled_command", interrupted_call.id);
-    try std.testing.expectEqualStrings("run_command", interrupted_call.name);
+    try std.testing.expectEqualStrings("terminal", interrupted_call.name);
     try std.testing.expectEqual(@as(usize, 0), interrupted.completed_tool_names.len);
     try std.testing.expect(interrupted.execution.isEmpty());
     try std.testing.expect(interrupted.cancelled_command == null);
@@ -552,7 +552,7 @@ test "processQueuedPrompt retains cancelled command artifact for presentation on
         .{terminal.id.turn_id},
     );
     defer alloc.free(complete_log);
-    const terminal_index = logIndex(&hooks, "status:finished:Cancelled run_command") orelse return error.TestMissingCancelledTerminal;
+    const terminal_index = logIndex(&hooks, "status:finished:Cancelled terminal") orelse return error.TestMissingCancelledTerminal;
     const complete_index = logIndex(&hooks, complete_log) orelse return error.TestMissingCommandCompletion;
     const history_index = logIndex(&hooks, "history:interrupted") orelse return error.TestMissingInterruptedHistory;
     const finalized_index = logIndex(&hooks, "event:turn_finished") orelse return error.TestMissingTurnFinalization;
@@ -574,7 +574,7 @@ test "processQueuedPrompt retains cancelled command artifact for presentation on
 
     try expectBodyContains(&follow_gateway, 0, "<turn_aborted>");
     try expectBodyContains(&follow_gateway, 0, session_runtime.aborted_tool_output);
-    try expectBodyContains(&follow_gateway, 0, "\"toolName\":\"run_command\"");
+    try expectBodyContains(&follow_gateway, 0, "\"toolName\":\"terminal\"");
     try expectBodyContains(&follow_gateway, 0, "\"toolCallId\":\"call_cancelled_command\"");
     try expectBodyNotContains(&follow_gateway, 0, "RESULT-ONLY-OUTPUT-SENTINEL");
     try expectBodyNotContains(&follow_gateway, 0, "RESULT-JSON-ONLY-SENTINEL");
@@ -586,7 +586,7 @@ test "processQueuedPrompt retains cancelled command artifact for presentation on
 
 test "processQueuedPrompt does not interrupt for an unconfirmed cancellation result" {
     const alloc = std.testing.allocator;
-    const calls = [_]ToolCall{toolCall("call_unconfirmed", "run_command", "{\"command\":\"sleep 5\"}")};
+    const calls = [_]ToolCall{toolCall("call_unconfirmed", "terminal", "{\"action\":\"exec\",\"command\":\"sleep 5\"}")};
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &calls },
         .{ .content = "Recovered after the failed command." },

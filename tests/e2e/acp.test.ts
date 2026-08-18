@@ -143,8 +143,8 @@ function lengthLimitedCommandCall(command: string) {
     {
       type: "tool-call",
       toolCallId: "command_1",
-      toolName: "run_command",
-      input: { command },
+      toolName: "terminal",
+      input: { action: "exec", command },
     },
     {
       type: "finish",
@@ -1183,7 +1183,7 @@ describe("acp: model-independent", () => {
           .map((message) => acpContentText(message.content))
           .join("\n");
         expect(prompt).toContain(submitted);
-        expect(request.tools).toHaveLength(27);
+        expect(request.tools).toHaveLength(26);
         const toolNames = serializedToolNames(oracleRequest);
         expect(toolNames).toEqual(
           AUTO_PERPLEXITY_SERIALIZED_TOOL_NAMES,
@@ -1193,7 +1193,7 @@ describe("acp: model-independent", () => {
           .toHaveLength(1);
         expect(findUnavailableCapabilityReferences(oracleRequest)).toEqual([]);
         expect(customProviderGuidanceState(oracleRequest)).toEqual({
-          providerToolIndices: [24],
+          providerToolIndices: [23],
           guidanceMessageIndices: [1],
         });
         expect(gateway.requests[0]!.body).not.toContain(
@@ -1404,6 +1404,7 @@ describe("acp: model-independent", () => {
         });
         client.setPermissionOption("allow_once");
         await startCodeSession(client);
+        await client.request("session/set_mode", { modeId: "ask" }, 4);
         const result = await runPrompt(
           client,
           "Run the native public terminal fixture.",
@@ -1807,6 +1808,14 @@ describe("acp: model-independent", () => {
           "call_http",
           `${MODERN_HTTP_TOOL_RESULT}:acp`,
         );
+
+        const initialPrompt = acpGatewayRequest(gateway.requests[0]!.body).prompt
+          .map((message) => acpContentText(message.content))
+          .join("\n");
+        expect(initialPrompt).toContain(
+          '<server name="fixture" state="ready" tools="1" />',
+        );
+        expect(gateway.requests[0]!.body).not.toContain(MCP_TOOL_NAME);
 
         expect(httpFixture.requests.map((entry) => entry.message.method))
           .toEqual(["server/discover", "tools/list", "tools/call"]);
@@ -4183,7 +4192,7 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "ACP automatic ask requests permission and returns user denial",
+    "ACP automatic ask returns to the agent before requesting permission",
     async () => {
       const acceptedRoot = createIsolatedRoot("fx-acp-auto-file-accepted-");
       const blockedRoot = createIsolatedRoot("fx-acp-auto-file-check-");
@@ -4209,7 +4218,7 @@ describe("acp: model-independent", () => {
           await startCodeSession(client);
           const accepted = await runPrompt(client, acceptedPrompt, TIMEOUT);
           expect(JSON.stringify(accepted)).toContain("ACP external write accepted");
-          expect(JSON.stringify(accepted.messages)).toContain(
+          expect(JSON.stringify(accepted.messages)).not.toContain(
             "Auto agent approved this request: Writing file.",
           );
           expect(readFileSync(acceptedTarget, "utf-8")).toBe("FX_ACP_AUTO_ACCEPTED");
@@ -4251,9 +4260,9 @@ describe("acp: model-independent", () => {
           const serialized = JSON.stringify(blocked);
           expect(
             blocked.messages.some((message: any) => message.method === "session/request_permission"),
-          ).toBe(true);
-          expect(serialized).not.toContain("auto_denied");
-          expect(serialized).toContain("user_denied");
+          ).toBe(false);
+          expect(serialized).toContain("auto_denied");
+          expect(serialized).not.toContain("user_denied");
           expect(serialized).toContain('"status":"failed"');
           const failedUpdateIndex = blocked.messages.findIndex((message: any) =>
             message.method === "session/update" &&
@@ -5867,7 +5876,8 @@ describe("acp: model-independent", () => {
         JSON.stringify({ permission: { bash: { "printf *": "ask" } } }),
       );
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("approved_command_1", "run_command", {
+        fakeGatewayToolCall("approved_command_1", "terminal", {
+          action: "exec",
           command: `printf approved > '${marker}'`,
         }),
         finalText("command approval complete"),
@@ -6593,7 +6603,8 @@ describe("acp: model-independent", () => {
       const heldReview = deferred<Response>();
       const gateway = startFakeGateway(
         [
-          fakeGatewayToolCall("cancelled_review_command", "run_command", {
+          fakeGatewayToolCall("cancelled_review_command", "terminal", {
+            action: "exec",
             command: `printf cancelled > ${JSON.stringify(marker)}`,
           }),
           finalText("follow-up after ACP review cancellation"),

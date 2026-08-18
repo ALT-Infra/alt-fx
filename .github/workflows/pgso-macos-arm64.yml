@@ -460,7 +460,10 @@ jobs:
         run: |
           python3 -m scripts.pgso report --output-dir "$RUNNER_TEMP/fx-pgso-aggregate" >/dev/null
           archive="$RUNNER_TEMP/fx-macos-aarch64.tar.gz"
-          tar -czf "$archive" -C "$RUNNER_TEMP/fx-pgso-aggregate/candidate" fx
+          package_dir="$RUNNER_TEMP/fx-release-package"
+          mkdir -p "$package_dir"
+          cp "$RUNNER_TEMP/fx-pgso-aggregate/candidate/fx" LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
+          tar -czf "$archive" -C "$package_dir" fx LICENSE THIRD_PARTY_NOTICES.md
           cd "$RUNNER_TEMP"
           shasum -a 256 fx-macos-aarch64.tar.gz > fx-macos-aarch64.tar.gz.sha256
 

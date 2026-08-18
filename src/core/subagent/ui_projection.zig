@@ -56,12 +56,14 @@ pub const Approval = struct {
     status: communication.ApprovalStatus,
     label: []u8,
     explanation: ?[]u8,
+    command: ?[]u8 = null,
     file: ?permission_request.FileApprovalRequest = null,
 
     pub fn deinit(self: *Approval, alloc: Allocator) void {
         alloc.free(self.id);
         alloc.free(self.label);
         if (self.explanation) |value| alloc.free(value);
+        if (self.command) |value| alloc.free(value);
         if (self.file) |value| {
             permission_request.deinitFileApprovalRequest(alloc, value);
         }
@@ -1480,6 +1482,11 @@ fn projectApproval(alloc: Allocator, approval: communication.Approval) !Approval
     else
         null;
     errdefer if (explanation) |value| alloc.free(value);
+    const command = if (approval.command) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    errdefer if (command) |value| alloc.free(value);
     const file = if (approval.file) |value|
         try permission_request.dupeFileApprovalRequest(alloc, value)
     else
@@ -1493,12 +1500,45 @@ fn projectApproval(alloc: Allocator, approval: communication.Approval) !Approval
         .status = approval.status,
         .label = label,
         .explanation = explanation,
+        .command = command,
         .file = file,
     };
 }
 
 fn dupeBounded(alloc: Allocator, value: []const u8) ![]u8 {
     return alloc.dupe(u8, value[0..@min(value.len, max_summary_bytes)]);
+}
+
+test "approval command projection preserves content beyond summary bounds" {
+    const alloc = std.testing.allocator;
+    const tail = "COMMAND_TAIL_MUST_REMAIN_VISIBLE";
+    const command = try std.fmt.allocPrint(
+        alloc,
+        "# terminal.exec profile=user shell=/bin/zsh\n{s}{s}",
+        .{ "x" ** max_summary_bytes, tail },
+    );
+    defer alloc.free(command);
+
+    var ledger = try communication.Ledger.init(alloc, "child");
+    defer ledger.deinit(alloc);
+    _ = try communication.registerApproval(alloc, &ledger, .{
+        .id = "long-command-projection",
+        .kind = .tool,
+        .child_id = "child",
+        .root_id = "root",
+        .work_id = "work",
+        .prepared_fingerprint = [_]u8{7} ** 32,
+        .label = "terminal.exec long command",
+        .explanation = null,
+        .command = command,
+        .grants = &.{},
+        .created_at_ms = 1,
+    });
+
+    var projected = try projectApproval(alloc, ledger.approvals[0]);
+    defer projected.deinit(alloc);
+    try std.testing.expectEqualStrings(command, projected.command.?);
+    try std.testing.expect(std.mem.endsWith(u8, projected.command.?, tail));
 }
 
 fn cloneDiagnostics(
@@ -1601,6 +1641,7 @@ fn snapshotContentHash(
             hashValue(&hash, approval.status);
             hash.update(approval.label);
             if (approval.explanation) |explanation| hash.update(explanation);
+            if (approval.command) |command| hash.update(command);
         }
     }
     for (pending_approvals) |approval| {
@@ -1611,6 +1652,7 @@ fn snapshotContentHash(
         hashValue(&hash, approval.request.status);
         hash.update(approval.request.label);
         if (approval.request.explanation) |explanation| hash.update(explanation);
+        if (approval.request.command) |command| hash.update(command);
         if (approval.tool_arguments_preview) |preview| hash.update(preview);
     }
     for (tree.diagnostics) |diagnostic| {

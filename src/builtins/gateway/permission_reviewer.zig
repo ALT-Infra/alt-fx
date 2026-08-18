@@ -276,7 +276,7 @@ const FakeStream = struct {
         const self: *FakeStream = @ptrCast(@alignCast(raw_ctx));
         if (self.calls < self.deadlines.len) self.deadlines[self.calls] = deadline;
         self.saw_single_attempt_only = self.saw_single_attempt_only and retry_count == 1;
-        self.saw_expected_model_only = self.saw_expected_model_only and std.mem.eql(u8, model, "openai/gpt-5.4");
+        self.saw_expected_model_only = self.saw_expected_model_only and std.mem.eql(u8, model, "zai/glm-5.2");
         self.saw_required_tool_payload = self.saw_required_tool_payload and
             std.mem.find(u8, payload, "permission_decision") != null;
         const outcome = self.outcomes[@min(self.calls, self.outcomes.len - 1)];
@@ -350,14 +350,10 @@ fn testRequest() permission_auto_classifier.ReviewRequest {
         .workspace_root = "/tmp/workspace",
         .review_turn = .{
             .model = "openai/gpt-5",
-            .request_messages = &.{.{ .role = .user, .content = "User asked to inspect the repository." }},
             .pending_assistant = pending,
             .target_call_id = "call_1",
             .origin = .root,
-            .root_text_bindings = &.{.{
-                .message_index = 0,
-                .text = "User asked to inspect the repository.",
-            }},
+            .current_root_request = "User asked to inspect the repository.",
         },
         .targets = &.{},
         .action = .{ .tool = .{
@@ -464,7 +460,7 @@ test "possibly sent automatic reviewer failure marks billing incomplete" {
     defer snapshot.deinit(alloc);
     try std.testing.expectEqual(session_usage.Availability.incomplete, snapshot.billing);
     try std.testing.expect(snapshot.api_duration_complete);
-    try std.testing.expectEqual(@as(u64, 2), snapshot.settled_through_sequence);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.settled_through_sequence);
 }
 
 test "terminal checkpoint failure releases automatic reviewer stream" {
@@ -507,7 +503,7 @@ test "terminal checkpoint failure releases automatic reviewer stream" {
     try std.testing.expectEqual(@as(usize, 2), checkpoint.calls);
 }
 
-test "permission reviewer owns the global two-send budget" {
+test "permission reviewer owns a single-send budget" {
     var fake = FakeStream{ .outcomes = &.{ .transient_error, .malformed } };
     const config = testConfig(&fake, null);
     const outcome = try reviewGatewayConfig(config, std.testing.allocator, testRequest());
@@ -516,9 +512,10 @@ test "permission reviewer owns the global two-send budget" {
         std.meta.Tag(permission_auto_classifier.ParseOutcome).invalid,
         std.meta.activeTag(outcome),
     );
-    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expect(fake.saw_single_attempt_only);
-    try std.testing.expect(std.meta.eql(fake.deadlines[0].?, fake.deadlines[1].?));
+    try std.testing.expect(fake.deadlines[0] != null);
+    try std.testing.expect(fake.deadlines[1] == null);
 }
 
 test "gateway automatic reviewer distinguishes transient and permanent HTTP failures" {
@@ -527,10 +524,10 @@ test "gateway automatic reviewer distinguishes transient and permanent HTTP fail
     var transient = try reviewGatewayConfig(transient_config, std.testing.allocator, testRequest());
     defer transient.deinit(std.testing.allocator);
     try std.testing.expectEqual(
-        std.meta.Tag(permission_auto_classifier.ParseOutcome).valid,
+        std.meta.Tag(permission_auto_classifier.ParseOutcome).invalid,
         std.meta.activeTag(transient),
     );
-    try std.testing.expectEqual(@as(usize, 2), transient_fake.calls);
+    try std.testing.expectEqual(@as(usize, 1), transient_fake.calls);
 
     var permanent_fake = FakeStream{ .outcomes = &.{ .permanent_http, .valid } };
     const permanent_config = testConfig(&permanent_fake, null);

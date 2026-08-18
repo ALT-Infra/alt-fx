@@ -1728,8 +1728,8 @@ test "surface footer places the cursor after the Vercel team query" {
     var shell = surfaceTestShell(24, 80);
     defer shell.deinit(alloc);
     var team_id = "team_123".*;
-    var team_slug = "vercel-internal-playground".*;
-    var team_name = "Internal Playground".*;
+    var team_slug = "example-internal-team".*;
+    var team_name = "Example Internal Team".*;
     const teams = [_]login_flow.Team{.{
         .id = &team_id,
         .slug = &team_slug,
@@ -2368,7 +2368,7 @@ test "command approval fit includes the queued prompt banner" {
         .divider_bottom_row = 10,
         .hint_row = 11,
     };
-    const label = "run_command 12345678901234567";
+    const label = "terminal.exec 12345678901234567";
 
     try std.testing.expect(try commandApprovalFitsInline(
         std.testing.allocator,
@@ -2394,7 +2394,7 @@ test "command approval footer sizing paths use the complete command" {
     var prompt = ApprovalPrompt{};
     defer prompt.deinit(alloc);
     try std.testing.expect(try prompt.syncRequest(alloc, .{
-        .label = "run_command printf 'SURFACE_COMMAND_START...",
+        .label = "terminal.exec printf 'SURFACE_COMMAND_START...",
         .command = command,
     }));
 

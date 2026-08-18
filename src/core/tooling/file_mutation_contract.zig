@@ -613,6 +613,7 @@ pub const FileExecutionAuthorization = struct {
     prepared: ?PreparedFileMutation = null,
     grant_offer: ?FileGrantOffer = null,
     approval_intent: ?FileApprovalIntent = null,
+    read_disclosure_required: bool = false,
 };
 
 fn sliceEql(comptime T: type, a: []const T, b: []const T) bool {
