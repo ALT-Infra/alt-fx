@@ -3346,6 +3346,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
 
       await session.sendKeys("Escape");
       await session.waitForPane((pane) => !pane.includes("Enter Open"), 5_000);
+      await session.waitForStableComposer(5_000);
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(5_000)).toBe(true);
       session = null;

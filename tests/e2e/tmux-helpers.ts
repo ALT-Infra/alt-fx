@@ -1102,6 +1102,35 @@ export class TmuxSession {
     return this.waitForPane(hasEmptyComposer, timeoutMs);
   }
 
+  async waitForStableComposer(
+    timeoutMs = 15_000,
+    stableMs = 100,
+  ): Promise<string> {
+    const deadline = Date.now() + timeoutMs;
+    let stableSince: number | null = null;
+    let previousPane = "";
+    let lastPane = "";
+    while (Date.now() < deadline) {
+      const pane = await this.capturePane();
+      lastPane = pane;
+      if (hasEmptyComposer(pane)) {
+        if (pane !== previousPane) {
+          previousPane = pane;
+          stableSince = Date.now();
+        } else if (stableSince !== null && Date.now() - stableSince >= stableMs) {
+          return pane;
+        }
+      } else {
+        previousPane = "";
+        stableSince = null;
+      }
+      await sleep(25);
+    }
+    throw new Error(
+      `Timed out waiting for stable composer in ${this.name}.\nLast pane:\n${lastPane}`,
+    );
+  }
+
   async waitForSessionEnd(timeoutMs = 10_000): Promise<boolean> {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
