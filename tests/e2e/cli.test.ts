@@ -3204,6 +3204,21 @@ describe("cli: models", () => {
       }),
       code: "MalformedResponse",
     },
+    {
+      name: "a malformed top-level catalog array",
+      response: () => Response.json([]),
+      code: "MalformedResponse",
+    },
+    {
+      name: "a catalog without data",
+      response: () => Response.json({}),
+      code: "MalformedResponse",
+    },
+    {
+      name: "a catalog with non-array data",
+      response: () => Response.json({ data: {} }),
+      code: "MalformedResponse",
+    },
   ]) {
     test(
       `fx models preserves ${scenario.name} without anonymous retry`,

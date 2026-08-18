@@ -2262,9 +2262,9 @@ fn parseSortedModelCatalog(alloc: std.mem.Allocator, json_text: []const u8) !std
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json_text, .{});
     defer parsed.deinit();
 
-    if (parsed.value != .object) return .empty;
-    const data_value = parsed.value.object.get("data") orelse return .empty;
-    if (data_value != .array) return .empty;
+    if (parsed.value != .object) return error.MalformedResponse;
+    const data_value = parsed.value.object.get("data") orelse return error.MalformedResponse;
+    if (data_value != .array) return error.MalformedResponse;
 
     for (data_value.array.items) |entry| {
         const candidate = (try parseModelCatalogEntry(alloc, entry)) orelse continue;
@@ -2584,6 +2584,28 @@ test "parsePickerModelIds features Fable as the top highlight" {
     try std.testing.expect(idsContain(ids.items, "anthropic/claude-opus-4.8"));
     try std.testing.expect(idsContain(ids.items, "anthropic/claude-sonnet-4.6"));
     try std.testing.expectEqual(@as(usize, 3), ids.items.len);
+}
+
+test "gateway catalog rejects malformed envelope shapes" {
+    const malformed_envelopes = [_][]const u8{
+        "[]",
+        "{}",
+        "{\"data\":{}}",
+    };
+
+    for (malformed_envelopes) |json_text| {
+        try std.testing.expectError(
+            error.MalformedResponse,
+            parseSortedModelCatalog(std.testing.allocator, json_text),
+        );
+    }
+}
+
+test "gateway catalog accepts an explicit empty data array" {
+    var catalog = try parseSortedModelCatalog(std.testing.allocator, "{\"data\":[]}");
+    defer freeModelCatalog(std.testing.allocator, &catalog);
+
+    try std.testing.expectEqual(@as(usize, 0), catalog.items.len);
 }
 
 test "gateway catalog retains broad capability metadata" {
