@@ -153,7 +153,7 @@ pub fn buildAgentRequest(
     if (request.verified_images) |images| {
         const response_format = request.response_format orelse
             return error.MissingStructuredResponseFormat;
-        return gateway_json.buildGatewayRequestBodyWithVerifiedImagesAndBudget(
+        const body = try gateway_json.buildGatewayRequestBodyWithVerifiedImagesAndBudget(
             alloc,
             request.serialized_tools,
             request.messages,
@@ -167,11 +167,12 @@ pub fn buildAgentRequest(
             },
             budget orelse .{},
         );
+        return finalizeAgentRequestBody(alloc, request.model, body);
     }
     if (request.response_format != null) return error.StructuredResponseRequiresVerifiedImages;
 
     if (request.vision_mode == .unavailable and request.selected_dynamic_tool_schemas.len == 0) {
-        return if (budget) |active|
+        const body = if (budget) |active|
             gateway_json.buildGatewayRequestBodyWithOptionsAndBudget(
                 alloc,
                 request.serialized_tools,
@@ -190,6 +191,7 @@ pub fn buildAgentRequest(
                 request.tool_choice,
                 request.max_output_tokens,
             );
+        return finalizeAgentRequestBody(alloc, request.model, try body);
     }
 
     const vision_schema = if (request.vision_mode != .unavailable)
@@ -201,7 +203,7 @@ pub fn buildAgentRequest(
     if (request.vision_mode == .required) {
         const tools_json = try std.fmt.allocPrint(alloc, "[{s}]", .{vision_schema.?});
         defer alloc.free(tools_json);
-        return if (budget) |active|
+        const body = if (budget) |active|
             gateway_json.buildGatewayRequiredToolRequestBodyWithOptionsAndBudget(
                 alloc,
                 tools_json,
@@ -218,6 +220,7 @@ pub fn buildAgentRequest(
                 request.provider_options,
                 request.max_output_tokens,
             );
+        return finalizeAgentRequestBody(alloc, request.model, try body);
     }
 
     var schemas: std.ArrayList([]const u8) = .empty;
@@ -230,7 +233,7 @@ pub fn buildAgentRequest(
         schemas.items,
     );
     defer alloc.free(tools_json);
-    return if (budget) |active|
+    const body = if (budget) |active|
         gateway_json.buildGatewayRequestBodyWithOptionsAndBudget(
             alloc,
             tools_json,
@@ -249,6 +252,24 @@ pub fn buildAgentRequest(
             request.tool_choice,
             request.max_output_tokens,
         );
+    return finalizeAgentRequestBody(alloc, request.model, try body);
+}
+
+fn finalizeAgentRequestBody(
+    alloc: Allocator,
+    model: []const u8,
+    body: []u8,
+) ![]u8 {
+    if (!std.mem.eql(u8, model, "zai/glm-5.2")) return body;
+
+    errdefer alloc.free(body);
+    const identified = try gateway_json.withRequestUserAgent(
+        alloc,
+        body,
+        gateway_client.user_agent,
+    );
+    alloc.free(body);
+    return identified;
 }
 
 fn writeVisionGatewaySchema(
@@ -265,6 +286,7 @@ fn writeVisionGatewaySchema(
 test "agent request builder keeps default reasoning silent and emits output limit" {
     const messages = [_]shared_types.ChatMessage{.{ .role = .user, .content = "question" }};
     const body = try agent_stream_provider.build(std.testing.allocator, .{
+        .model = "anthropic/claude-opus-4.8",
         .serialized_tools = "[]",
         .messages = &messages,
         .tool_choice = .auto,
@@ -282,10 +304,47 @@ test "agent request builder keeps default reasoning silent and emits output limi
     try std.testing.expect(std.mem.find(u8, body, "\"providerOptions\"") == null);
 }
 
+test "agent request builder scopes the product user agent to GLM 5.2" {
+    const alloc = std.testing.allocator;
+    const messages = [_]shared_types.ChatMessage{.{ .role = .user, .content = "question" }};
+    const cases = [_]struct {
+        model: []const u8,
+        include_user_agent: bool,
+    }{
+        .{ .model = "zai/glm-5.2", .include_user_agent = true },
+        .{ .model = "poolside/laguna-s-2.1-free", .include_user_agent = false },
+    };
+
+    for (cases) |case| {
+        const body = try agent_stream_provider.build(alloc, .{
+            .model = case.model,
+            .serialized_tools = "[]",
+            .messages = &messages,
+            .tool_choice = .auto,
+            .provider_options = model_capabilities.resolveProviderOptions(case.model, .auto, false),
+        });
+        defer alloc.free(body);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+        defer parsed.deinit();
+
+        const headers = parsed.value.object.get("headers");
+        if (!case.include_user_agent) {
+            try std.testing.expect(headers == null);
+            continue;
+        }
+        const user_agent = headers.?.object.get("user-agent") orelse
+            return error.TestExpectedGatewayUserAgent;
+        try std.testing.expect(user_agent == .string);
+        try std.testing.expectEqualStrings(gateway_client.user_agent, user_agent.string);
+    }
+}
+
 test "agent request builder overlays selected dynamic schemas" {
     const messages = [_]shared_types.ChatMessage{.{ .role = .user, .content = "question" }};
     const selected_schema = "{\"type\":\"function\",\"name\":\"mcp_fs_read\",\"description\":\"Read\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}";
     const body = try agent_stream_provider.build(std.testing.allocator, .{
+        .model = "anthropic/claude",
         .serialized_tools = "[]",
         .messages = &messages,
         .tool_choice = .auto,
@@ -337,6 +396,7 @@ test "required vision request contains only the registered vision schema" {
     };
     const registered_tools = [_]tool_dispatch.Tool{vision_tool};
     const body = try agent_stream_provider.build(std.testing.allocator, .{
+        .model = "zai/glm-5.2",
         .tool_registry = .{ .tools = registered_tools[0..] },
         .serialized_tools = "[{\"type\":\"function\",\"name\":\"read_file\",\"description\":\"Read\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]",
         .messages = &messages,

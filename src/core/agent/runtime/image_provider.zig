@@ -53,6 +53,7 @@ pub fn inspect(
     const payload = try request.stream_provider.build(
         alloc,
         .{
+            .model = model,
             .serialized_tools = "[]",
             .messages = &messages,
             .tool_choice = .none,

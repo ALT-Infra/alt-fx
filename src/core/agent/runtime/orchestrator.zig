@@ -2604,6 +2604,7 @@ fn processQueuedPromptLoop(
             const request_payload = deps.agent_stream_provider.build(
                 overlay_arena,
                 .{
+                    .model = gateway_model,
                     .tool_registry = if (final_permission_response)
                         .{ .tools = &.{} }
                     else

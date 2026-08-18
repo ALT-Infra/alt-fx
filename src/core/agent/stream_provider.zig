@@ -91,6 +91,7 @@ pub const StructuredResponseFormat = struct {
 };
 
 pub const BuildRequest = struct {
+    model: []const u8,
     tool_registry: tool_dispatch.Registry = .{},
     serialized_tools: []const u8,
     messages: []const types.ChatMessage,

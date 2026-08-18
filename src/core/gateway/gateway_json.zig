@@ -359,6 +359,24 @@ fn buildGatewayRequestBodyValidated(
     return try out.toOwnedSlice();
 }
 
+/// Returns a new request body with the provider-visible user agent added.
+/// The caller retains ownership of `body` and owns the returned slice.
+pub fn withRequestUserAgent(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    user_agent: []const u8,
+) ![]u8 {
+    if (body.len == 0 or body[body.len - 1] != '}') return error.InvalidGatewayRequestBody;
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try out.writer.writeAll(body[0 .. body.len - 1]);
+    try out.writer.writeAll(",\"headers\":{\"user-agent\":");
+    try std.json.Stringify.value(user_agent, .{}, &out.writer);
+    try out.writer.writeAll("}}");
+    return try out.toOwnedSlice();
+}
+
 fn writeStructuredResponseFormat(
     alloc: std.mem.Allocator,
     writer: *std.Io.Writer,
