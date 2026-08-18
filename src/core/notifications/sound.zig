@@ -15,7 +15,7 @@ pub const default_enabled: bool = builtin.os.tag == .macos;
 pub const Cue = notification_contract.Cue;
 pub const Kind = notification_contract.Kind;
 
-// Chimes derived from cuelume's MIT-licensed recipes by Daniel White, rendered
+// Chimes derived from cuelume's MIT-licensed recipes by Daniel Belyi, rendered
 // at 48kHz and encoded as AAC. `click` has no recipe to re-render from, so it
 // stays the original IMA4 CAF.
 fn embeddedChime(cue: Cue) []const u8 {
