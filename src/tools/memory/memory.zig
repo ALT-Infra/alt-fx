@@ -57,7 +57,11 @@ fn inputDeinit(ptr: *anyopaque, alloc: Allocator) void {
     alloc.destroy(input);
 }
 
-pub fn validate(_: tool_dispatch.DispatchContext, _: tool_dispatch.ToolInput) tool_dispatch.DispatchError!?[]u8 {
+pub fn validate(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput) tool_dispatch.DispatchError!?[]u8 {
+    const input = erased.as(Input);
+    if (!isSupportedAction(input.action)) {
+        return try ctx.allocator.dupe(u8, "memory field \"action\" must be one of: save, list, clear");
+    }
     return null;
 }
 
@@ -65,6 +69,10 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
     const input = erased.as(Input);
     const output = runMemory(ctx.allocator, input.action, input.fact) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
+        error.MemoryClearFailed => return .{ .failure = try ctx.allocator.dupe(
+            u8,
+            "memory clear failed: saved memories were not removed; ensure ~/.fx/memories.json is a removable file and retry",
+        ) },
         else => return .{ .failure = try std.fmt.allocPrint(ctx.allocator, "memory failed: {s}", .{@errorName(err)}) },
     };
     return .{ .success = output };
@@ -78,6 +86,8 @@ pub fn execute(arena: Allocator, args_json: []const u8) ![]u8 {
 }
 
 fn runMemory(alloc: Allocator, action: []const u8, fact: ?[]const u8) ![]u8 {
+    if (!isSupportedAction(action)) return error.UnsupportedMemoryAction;
+
     const home = io_mod.getenv("HOME") orelse return std.fmt.allocPrint(alloc, "memory unavailable: HOME not set", .{});
     const memories_path = try profile_paths.memoriesPath(alloc, home);
     defer alloc.free(memories_path);
@@ -111,11 +121,20 @@ fn runMemory(alloc: Allocator, action: []const u8, fact: ?[]const u8) ![]u8 {
     }
 
     if (std.mem.eql(u8, action, "clear")) {
-        std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), memories_path) catch {};
+        std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), memories_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return error.MemoryClearFailed,
+        };
         return std.fmt.allocPrint(alloc, "memories cleared", .{});
     }
 
-    return std.fmt.allocPrint(alloc, "unknown memory action: {s}", .{action});
+    return error.UnsupportedMemoryAction;
+}
+
+fn isSupportedAction(action: []const u8) bool {
+    return std.mem.eql(u8, action, "save") or
+        std.mem.eql(u8, action, "list") or
+        std.mem.eql(u8, action, "clear");
 }
 
 fn loadMemories(alloc: Allocator, path: []const u8) std.ArrayList([]u8) {
@@ -200,6 +219,26 @@ fn expectMemoryOutput(args_json: []const u8, expected: []const u8) !void {
     try std.testing.expectEqualStrings(expected, output);
 }
 
+fn expectValidationFailure(args_json: []const u8, expected: []const u8) !void {
+    const alloc = std.testing.allocator;
+    const decoded = try decode(.{ .allocator = alloc }, args_json);
+    switch (decoded) {
+        .failure => |body| {
+            defer alloc.free(body);
+            try std.testing.expect(false);
+        },
+        .input => |input| {
+            defer input.deinit(alloc);
+            const reason = (try validate(.{ .allocator = alloc }, input)) orelse {
+                try std.testing.expect(false);
+                return;
+            };
+            defer alloc.free(reason);
+            try std.testing.expectEqualStrings(expected, reason);
+        },
+    }
+}
+
 fn setTestHome(home: ?[]const u8) !void {
     const map = try std.heap.c_allocator.create(std.process.Environ.Map);
     map.* = std.process.Environ.Map.init(std.heap.c_allocator);
@@ -212,6 +251,54 @@ test "memory owner rejects invalid JSON and action shape" {
     try expectDecodeFailure("[]", "memory arguments must be an object");
     try expectDecodeFailure("{}", "memory field \"action\" is required");
     try expectDecodeFailure("{\"action\":1}", "memory field \"action\" must be a string");
+}
+
+test "memory owner rejects unsupported actions before execution" {
+    try expectValidationFailure(
+        "{\"action\":\"replace\",\"fact\":\"new value\"}",
+        "memory field \"action\" must be one of: save, list, clear",
+    );
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    try std.testing.expectError(
+        error.UnsupportedMemoryAction,
+        execute(arena_state.allocator(), "{\"action\":\"replace\"}"),
+    );
+}
+
+test "memory clear fails closed when state cannot be deleted" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/memories.json");
+    {
+        var survivor = try tmp.dir.createFile(
+            io_mod.getIo(),
+            "home/.fx/memories.json/must-survive.txt",
+            .{},
+        );
+        survivor.close(io_mod.getIo());
+    }
+
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    try setTestHome(home);
+    defer setTestHome(null) catch {};
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    try std.testing.expectError(
+        error.MemoryClearFailed,
+        execute(arena_state.allocator(), "{\"action\":\"clear\"}"),
+    );
+
+    var survivor = try tmp.dir.openFile(
+        io_mod.getIo(),
+        "home/.fx/memories.json/must-survive.txt",
+        .{},
+    );
+    survivor.close(io_mod.getIo());
 }
 
 test "memory owner preserves active output behavior" {
@@ -229,7 +316,6 @@ test "memory owner preserves active output behavior" {
 
     try expectMemoryOutput("{\"action\":\"list\"}", "No saved memories");
     try expectMemoryOutput("{\"action\":\"save\"}", "no fact provided");
-    try expectMemoryOutput("{\"action\":\"unknown\"}", "unknown memory action: unknown");
     try expectMemoryOutput("{\"action\":\"save\",\"fact\":\"likes Zig\"}", "remembered");
     try expectMemoryOutput("{\"action\":\"save\",\"fact\":\"likes Zig\"}", "remembered");
     try expectMemoryOutput("{\"action\":\"list\"}", "- likes Zig\n");

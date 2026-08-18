@@ -7964,6 +7964,20 @@ test "memory tool uses isolated HOME and preserves outputs" {
     defer rt.deinit(alloc);
     const ctx = rt.context();
     try expectToolOutput(ctx, "memory", "{\"action\":\"list\"}", "No saved memories");
+
+    var rejected_arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer rejected_arena_state.deinit();
+    const rejected = try executeToolCall(ctx, rejected_arena_state.allocator(), .{
+        .id = "invalid-memory-action",
+        .name = "memory",
+        .arguments_json = "{\"action\":\"replace\",\"fact\":\"new value\"}",
+    });
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, rejected.status);
+    try std.testing.expectEqualStrings(
+        "memory field \"action\" must be one of: save, list, clear",
+        rejected.model_output,
+    );
+
     try expectToolOutput(ctx, "memory", "{\"action\":\"save\",\"fact\":\"likes Zig\"}", "remembered");
     try expectToolOutput(ctx, "memory", "{\"action\":\"save\",\"fact\":\"likes Zig\"}", "remembered");
     try expectToolOutput(ctx, "memory", "{\"action\":\"list\"}", "- likes Zig\n");
@@ -7982,7 +7996,32 @@ test "memory tool uses isolated HOME and preserves outputs" {
     try std.testing.expectEqualStrings("likes Zig", parsed.value.array.items[0].string);
 
     try expectToolOutput(ctx, "memory", "{\"action\":\"clear\"}", "memories cleared");
+    try expectToolOutput(ctx, "memory", "{\"action\":\"clear\"}", "memories cleared");
     try expectToolOutput(ctx, "memory", "{\"action\":\"list\"}", "No saved memories");
+
+    try std.Io.Dir.createDirAbsolute(io_mod.getIo(), memories_path, .default_dir);
+    const survivor_path = try std.fs.path.join(alloc, &.{ memories_path, "must-survive.txt" });
+    defer alloc.free(survivor_path);
+    {
+        var survivor = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), survivor_path, .{});
+        survivor.close(io_mod.getIo());
+    }
+
+    var failed_clear_arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer failed_clear_arena_state.deinit();
+    const failed_clear = try executeToolCall(ctx, failed_clear_arena_state.allocator(), .{
+        .id = "failed-memory-clear",
+        .name = "memory",
+        .arguments_json = "{\"action\":\"clear\"}",
+    });
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, failed_clear.status);
+    try std.testing.expectEqualStrings(
+        "memory clear failed: saved memories were not removed; ensure ~/.fx/memories.json is a removable file and retry",
+        failed_clear.model_output,
+    );
+
+    var survivor = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), survivor_path, .{});
+    survivor.close(io_mod.getIo());
 }
 
 test "install_skill explicit tool installs local skill source" {
