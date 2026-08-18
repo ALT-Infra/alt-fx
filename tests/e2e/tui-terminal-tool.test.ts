@@ -44,7 +44,7 @@ const loginProfileName = (() => {
 afterEach(async () => {
   for (const root of roots) writeFileSync(join(root, ".terminal-stop"), "");
   for (const session of sessions.splice(0)) await session.kill();
-  await Promise.all(fixtureHomes.splice(0).map(waitForTerminalHostExit));
+  await Promise.all(fixtureHomes.splice(0).map(cleanupTerminalHost));
   for (const gateway of gateways.splice(0)) gateway.stop();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
   for (const root of transportRoots) rmSync(root, { recursive: true, force: true });
@@ -59,6 +59,54 @@ async function waitForTerminalHostExit(home: string): Promise<void> {
     await Bun.sleep(25);
   }
   throw new Error(`terminal host did not exit for ${home}`);
+}
+
+function terminalHostPid(home: string): number | null {
+  const identityPath = join(home, ".fx", "terminal-host", "host.json");
+  try {
+    const identity = JSON.parse(readFileSync(identityPath, "utf8")) as { pid?: unknown };
+    const pid = Number(identity.pid);
+    return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+async function cleanupTerminalHost(home: string): Promise<void> {
+  const identityPath = join(home, ".fx", "terminal-host", "host.json");
+  const naturalDeadline = Date.now() + 3_000;
+  while (Date.now() < naturalDeadline) {
+    if (!existsSync(identityPath)) return;
+    await Bun.sleep(25);
+  }
+
+  const pid = terminalHostPid(home);
+  if (pid === null || !processExists(pid)) return;
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch (error) {
+    if (!processExists(pid)) return;
+    throw error;
+  }
+
+  const termDeadline = Date.now() + 500;
+  while (Date.now() < termDeadline) {
+    if (!processExists(pid)) return;
+    await Bun.sleep(25);
+  }
+
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch (error) {
+    if (!processExists(pid)) return;
+    throw error;
+  }
+  const killDeadline = Date.now() + 500;
+  while (Date.now() < killDeadline) {
+    if (!processExists(pid)) return;
+    await Bun.sleep(25);
+  }
+  throw new Error(`terminal host cleanup could not stop pid ${pid} for ${home}`);
 }
 
 function processExists(pid: number): boolean {
@@ -214,11 +262,31 @@ async function waitForNewExactShellPrompt(
 async function waitForBackgroundProcessManager(
   active: TmuxSession,
 ): Promise<string> {
-  return active.waitForPane(
-    (pane) =>
+  const deadline = Date.now() + TIMEOUT;
+  let lastPane = "";
+  while (Date.now() < deadline) {
+    const pane = await active.capturePane();
+    lastPane = pane;
+    if (
       pane.includes("Background processes") &&
-      !pane.includes("No background processes"),
-    TIMEOUT,
+      !pane.includes("No background processes")
+    ) {
+      return pane;
+    }
+    if (
+      pane.includes("Agents & processes") &&
+      pane.includes("ctrl-x close") &&
+      (pane.includes("No active agents") || pane.includes("No background processes"))
+    ) {
+      await active.sendKeys("C-x");
+      await active.waitForPane((current) => !current.includes("ctrl-x close"), 2_000);
+      await active.sendKeys("C-x");
+      continue;
+    }
+    await Bun.sleep(25);
+  }
+  throw new Error(
+    `Timed out waiting for a background process in ${active.name}.\nLast pane:\n${lastPane}`,
   );
 }
 
@@ -330,18 +398,19 @@ guard_pid=$!
 trap 'kill $guard_pid 2>/dev/null || true' EXIT
 trap 'exit 130' INT
 redraw() {
-  local rows cols
+  local rows cols content_rows
   read rows cols <<< "$(stty size)"
-  printf '\033[2J\033[H'
+  content_rows=$((rows > 1 ? rows - 1 : 1))
+  printf '\\x1b[2J\\x1b[H'
   printf 'TAKEOVER_TOP\\nSIZE:%sx%s' "$cols" "$rows"
-  printf '\033[%s;1HTAKEOVER_BOTTOM' "$rows"
-  printf '\033[4;1H'
+  printf '\\x1b[%s;1HTAKEOVER_BOTTOM' "$content_rows"
+  printf '\\x1b[4;1H'
 }
 trap redraw WINCH
 redraw
 while IFS= read -r line; do
   redraw
-  printf '\033[4;1HECHO:%s\033[K' "$line"
+  printf '\\x1b[4;1HECHO:%s\\x1b[K' "$line"
 done
 `,
   );
