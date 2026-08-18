@@ -126,6 +126,10 @@ pub fn Commands(comptime App: type) type {
                 try app.writeDomainNotice(.{ .topic = "background", .tone = .neutral, .body = "background process has no known URL yet" }, true);
                 return;
             };
+            if (snapshot.state != .running) {
+                try app.writeDomainNotice(.{ .topic = "background", .tone = .neutral, .body = "background process is no longer running; saved URL is stale" }, true);
+                return;
+            }
 
             const result = try openUrlOutcome(
                 app.alloc,
@@ -242,13 +246,23 @@ const FakeApp = struct {
     background: FakeBackground = .{},
     transcript: std.ArrayList(u8) = .empty,
     last_tone: ?types.NoticeTone = null,
+    url_open_calls: usize = 0,
 
     fn deinit(self: *FakeApp) void {
         self.transcript.deinit(self.alloc);
     }
 
-    fn urlOpener(_: *const FakeApp) host.UrlOpener {
-        return host.unavailable_url_opener;
+    fn urlOpener(self: *FakeApp) host.UrlOpener {
+        return .{
+            .context = self,
+            .open_fn = openUrl,
+        };
+    }
+
+    fn openUrl(raw: ?*anyopaque, _: std.mem.Allocator, _: []const u8) host.UrlOpenError!bool {
+        const self: *FakeApp = @ptrCast(@alignCast(raw.?));
+        self.url_open_calls += 1;
+        return true;
     }
 
     fn writeDomainNotice(self: *FakeApp, notice: types.SemanticNotice, _: bool) !void {
@@ -419,6 +433,7 @@ test "open reports parse errors no match and missing URL without launching opene
             .command = "npm run dev",
             .cwd = "/tmp/app",
             .log_path = "/tmp/fx.log",
+            .state = .stopped,
         }};
         var app = FakeApp{ .alloc = alloc, .background = .{ .tasks = tasks[0..] } };
         defer app.deinit();
@@ -426,7 +441,53 @@ test "open reports parse errors no match and missing URL without launching opene
         const expected = try noticeText(alloc, "background process has no known URL yet");
         defer alloc.free(expected);
         try expectTranscript(&app, expected);
+        try std.testing.expectEqual(@as(usize, 0), app.url_open_calls);
     }
+}
+
+test "open rejects saved URLs for non-running tasks without launching opener" {
+    const alloc = std.testing.allocator;
+    const states = [_]task_helpers.TaskState{ .exited, .failed, .stopped, .dead, .stale };
+
+    for (states) |state| {
+        var tasks = [_]FakeTask{.{
+            .id = 7,
+            .command = "npm run dev",
+            .cwd = "/tmp/app",
+            .log_path = "/tmp/fx.log",
+            .server_url = "http://localhost:3000",
+            .state = state,
+        }};
+        var app = FakeApp{ .alloc = alloc, .background = .{ .tasks = tasks[0..] } };
+        defer app.deinit();
+
+        try Commands(FakeApp).open(&app, "7");
+
+        const expected = try noticeText(alloc, "background process is no longer running; saved URL is stale");
+        defer alloc.free(expected);
+        try expectTranscript(&app, expected);
+        try std.testing.expectEqual(@as(usize, 0), app.url_open_calls);
+    }
+}
+
+test "open launches a saved URL for a running task" {
+    const alloc = std.testing.allocator;
+    var tasks = [_]FakeTask{.{
+        .id = 7,
+        .command = "npm run dev",
+        .cwd = "/tmp/app",
+        .log_path = "/tmp/fx.log",
+        .server_url = "http://localhost:3000",
+    }};
+    var app = FakeApp{ .alloc = alloc, .background = .{ .tasks = tasks[0..] } };
+    defer app.deinit();
+
+    try Commands(FakeApp).open(&app, "7");
+
+    const expected = try noticeText(alloc, "opened http://localhost:3000");
+    defer alloc.free(expected);
+    try expectTranscript(&app, expected);
+    try std.testing.expectEqual(@as(usize, 1), app.url_open_calls);
 }
 
 test "background open result replays as one notice without outer newline" {
