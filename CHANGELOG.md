@@ -1,8 +1,25 @@
 # fx
 
-## 0.0.2
+## 0.0.3
 
 <!-- release:start -->
+
+### Improvements
+
+- **JSON recovery progress:** Report retry, recovery, and safety-pause status on stderr during `fx ask --json` while keeping stdout parseable
+- **Notification sounds:** Use clearer 48 kHz AAC cues with full tails and the intended volume differences between actions
+
+### Bug Fixes
+
+- **Memory clearing:** Succeed when memory is already absent, but report real deletion failures instead of claiming memories were cleared
+- **Background URLs:** Refuse `/background open` for stopped or stale tasks so saved URLs cannot open an unrelated process after port reuse
+- **Model catalogs:** Reject malformed catalog responses with a nonzero exit instead of treating them as an empty model list
+- **Skill creation:** Show invalid `/skills create` names inline and keep the current session, transcript, and composer usable
+- **GLM 5.2 responses:** Restore responses for fx login sessions without changing requests for other models
+
+<!-- release:end -->
+
+## 0.0.2
 
 ### New Features
 
@@ -23,8 +40,6 @@
 
 - **WebAssembly terminal input:** Keep input responsive during continuous streams, queue follow-up prompts until the active response completes, and preserve the queued prompt text
 - **Terminal job cleanup:** Force-close descendant jobs spawned by any Linux thread and return `session_lost` when fx cannot confirm complete cleanup
-
-<!-- release:end -->
 
 ## 0.0.1
 
