@@ -152,6 +152,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         await session.waitForText("● Input: switched to lines", TIMEOUT);
         await session.sendText("/appearance presentation normal");
         await session.waitForText("● Maxxing: switched to legacy", TIMEOUT);
+        await session.waitForStableComposer(TIMEOUT);
         await session.sendText("/quit");
         await session.waitForSessionEnd(TIMEOUT);
         session = null;
@@ -176,6 +177,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         await secondSession.waitForText("● Input: switched to tint", TIMEOUT);
         await secondSession.sendText("/appearance presentation minimal");
         await secondSession.waitForText("● Maxxing: switched to minimal", TIMEOUT);
+        await secondSession.waitForStableComposer(TIMEOUT);
         await secondSession.sendText("/quit");
         await secondSession.waitForSessionEnd(TIMEOUT);
         secondSession = null;
@@ -586,6 +588,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           "startup_scrollback: off (applies on next launch)",
           TIMEOUT,
         );
+        await session.waitForStableComposer(TIMEOUT);
         await session.sendText("/quit");
         await session.waitForSessionEnd(TIMEOUT);
         session = null;
