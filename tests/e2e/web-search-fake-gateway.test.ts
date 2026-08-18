@@ -983,16 +983,6 @@ describe("web_search Gateway fixture", () => {
           name: "write_file",
           input: { path: "env-proof.txt", content: "environment overrides applied" },
         }]),
-        outerToolCalls([{
-          id: "permission_outer_1",
-          name: "permission_decision",
-          input: {
-            risk: "low",
-            authorization: "medium",
-            decision: "allow",
-            rationale: "test fixture",
-          },
-        }]),
       ]);
       try {
         const result = await runFx(
@@ -1008,12 +998,11 @@ describe("web_search Gateway fixture", () => {
           },
         );
 
-        expect(gateway.requests).toHaveLength(2);
+        expect(gateway.requests).toHaveLength(1);
         expect(result.code).toBe(1);
         expect(result.stdout).toBe("");
         expect(result.stderr).toContain("Agent step limit reached");
         expect(gateway.requests[0].headers.get("ai-language-model-id")).toBe(PARALLEL_OUTER_MODEL);
-        expect(gateway.requests[1].body).toContain('"permission_decision"');
         expect(readFileSync(join(root.workspace, "env-proof.txt"), "utf8")).toBe(
           "environment overrides applied",
         );

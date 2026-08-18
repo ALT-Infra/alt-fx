@@ -60,6 +60,8 @@ fx ask "explain the changes in this repository"
 
 fx starts in `auto` permission mode, which reviews unresolved sensitive actions. See [Permissions](https://fx.sh/docs/configure-fx/permissions) for other modes and persistent rules.
 
+Inside a saved session, `/permissions remember <allow|deny> <tool-name> <arguments-json>` stores an exact confirmed rule without running the action. `/permissions` lists stable rule IDs, and `/permissions revoke <rule-id>` removes a stored rule even when its original workspace or file state has changed.
+
 ## Embed fx
 
 fx builds as a native binary or WebAssembly. Applications embedding fx can provide network transport, session storage, configuration, permission handling, and terminal I/O.
@@ -74,7 +76,7 @@ The WebAssembly SDK is experimental. See the [WebAssembly SDK](sdk/README.md) an
 
 ## Extend fx
 
-Add reusable instructions with [skills](https://fx.sh/docs/capabilities/skills), connect external tools through [MCP](https://fx.sh/docs/capabilities/mcp), or delegate independent work to [subagents](https://fx.sh/docs/capabilities/subagents). `fx status` and `fx doctor` report an invalid trusted MCP profile without starting its servers.
+Add reusable instructions with [skills](https://fx.sh/docs/capabilities/skills), connect external tools through [MCP](https://fx.sh/docs/capabilities/mcp), or delegate independent work to [subagents](https://fx.sh/docs/capabilities/subagents). Project instruction files may link within their scope, and read-only workspace or compatibility skill directories may link within their owning workspace or home; managed skills, `SKILL.md` files, resources, and escaping links remain no-follow. `fx status` and `fx doctor` report an invalid trusted MCP profile without starting its servers.
 
 ## Documentation
 
@@ -96,3 +98,10 @@ Run the test suite with `zig build test`. See [CONTRIBUTING.md](CONTRIBUTING.md)
 ## License
 
 [Apache-2.0](LICENSE)
+
+Third-party licenses and attributions are listed in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+## Credits
+
+Interface sounds by [cuelume](https://github.com/Danilaa1/cuelume).

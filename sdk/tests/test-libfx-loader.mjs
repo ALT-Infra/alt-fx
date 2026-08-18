@@ -12,16 +12,15 @@ import {
 } from "../node.js";
 import * as browser from "../browser.js";
 
-assert.equal(libfxApiVersion, 1);
+assert.equal(libfxApiVersion, 2);
 assert.equal(fxSdkApiVersion, 1);
-assert.equal(browser.libfxApiVersion, 1);
+assert.equal(browser.libfxApiVersion, 2);
 assert.equal(typeof browser.createFxAgent, "function");
 assert.equal(typeof browser.createFxTerminal, "function");
 
 const dir = await mkdtemp(resolve(tmpdir(), "libfx-loader-"));
 const nativePath = resolve(dir, "native.mjs");
 await writeFile(nativePath, `
-  export const libfxApiVersion = 1;
   export async function createFxAgent(options) { return { backend: "native-agent", options }; }
   export async function createFxTerminal(options) { return { backend: "native-terminal", options }; }
 `);
@@ -57,7 +56,7 @@ await assert.rejects(
 
 const coreOnlyPath = resolve(dir, "core-only.mjs");
 await writeFile(coreOnlyPath, `
-  export const libfxApiVersion = 1;
+  export const libfxApiVersion = 2;
   export async function createFxAgent() { return { backend: "core-only" }; }
 `);
 await assert.rejects(
@@ -68,7 +67,7 @@ await assert.rejects(
 
 const incompatiblePath = resolve(dir, "incompatible.mjs");
 await writeFile(incompatiblePath, `
-  export const libfxApiVersion = 2;
+  export const libfxApiVersion = 3;
   export async function createFxAgent() {}
 `);
 await assert.rejects(
@@ -77,4 +76,39 @@ await assert.rejects(
     error.message.includes("incompatible"),
 );
 
-console.log("libfx loader passed: browser exports, native preference, fallback diagnostics, and API validation");
+for (const [name, source] of [
+  ["missing-version", `
+    export function createCore() { throw new Error("missing-version createCore invoked"); }
+  `],
+  ["unequal-version", `
+    export const libfxApiVersion = 3;
+    export function createCore() { throw new Error("unequal-version createCore invoked"); }
+  `],
+]) {
+  const modulePath = resolve(dir, `${name}.mjs`);
+  await writeFile(modulePath, source);
+  await assert.rejects(
+    createFxAgent({ nativeAddon: pathToFileURL(modulePath), backend: "native" }),
+    (error) => error?.code === "LIBFX_NATIVE_UNAVAILABLE" &&
+      error.message.includes("incompatible") &&
+      !String(error.cause).includes("createCore invoked"),
+    `${name} low-level addon must fail before createCore invocation`,
+  );
+}
+
+const matchingVersionPath = resolve(dir, "matching-version.mjs");
+await writeFile(matchingVersionPath, `
+  export const libfxApiVersion = 2;
+  export function createCore() {
+    const error = new Error("matching-version createCore invoked");
+    error.code = "MATCHING_VERSION_INVOKED";
+    throw error;
+  }
+`);
+await assert.rejects(
+  createFxAgent({ nativeAddon: pathToFileURL(matchingVersionPath), backend: "native" }),
+  (error) => error?.code === "MATCHING_VERSION_INVOKED",
+  "matching v2 low-level addon must reach createCore",
+);
+
+console.log("libfx loader passed: browser exports, native preference, fallback diagnostics, and strict low-level API validation");

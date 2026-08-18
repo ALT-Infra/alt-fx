@@ -1,7 +1,9 @@
 const std = @import("std");
 const session = @import("session.zig");
 const session_usage = @import("session_usage.zig");
+const session_permission_state = @import("../permissions/session_permission_state.zig");
 const types = @import("../shared/types.zig");
+const captured_command = @import("../tooling/captured_command.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -95,6 +97,7 @@ pub const DurableSessionState = struct {
     context_history_start: usize = 0,
     total_input_tokens: u64,
     total_output_tokens: u64,
+    permission_state: session_permission_state.State = .{},
     /// Last ordinary history commit correlated to durable subagent work. This
     /// control-only marker is not included in model history.
     last_subagent_work_id: ?[]u8 = null,
@@ -110,6 +113,7 @@ pub const DurableSessionState = struct {
         alloc.free(self.workspace_root);
         self.preferences.deinit(alloc);
         session.freeHistoryTurnSlice(alloc, self.history);
+        self.permission_state.deinit(alloc);
         if (self.last_subagent_work_id) |id| alloc.free(id);
         if (self.usage) |*usage| usage.deinit(alloc);
         if (self.recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
@@ -144,6 +148,10 @@ pub const DurableSessionState = struct {
             try checkpoint.dupe(alloc)
         else
             null;
+        const permission_state = try session_permission_state.dupe(
+            alloc,
+            self.permission_state,
+        );
 
         return .{
             .id = id,
@@ -157,6 +165,7 @@ pub const DurableSessionState = struct {
             .context_history_start = self.context_history_start,
             .total_input_tokens = self.total_input_tokens,
             .total_output_tokens = self.total_output_tokens,
+            .permission_state = permission_state,
             .last_subagent_work_id = last_subagent_work_id,
             .usage = usage,
             .recovery_checkpoint = recovery_checkpoint,
@@ -336,18 +345,55 @@ pub fn writeHistoryTurn(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
 pub fn parseHistoryTurn(alloc: Allocator, value: std.json.Value) !session.HistoryTurn {
     const kind = try requireString(try requireObject(value), "kind");
     if (std.mem.eql(u8, kind, "compacted_summary")) {
-        const object = try exactObject(value, &.{
-            "kind",
-            "summary",
-            "removed_turn_count",
-            "compaction_count",
-        });
+        const raw_object = try requireObject(value);
+        const has_root_user_messages = raw_object.get("root_user_messages") != null;
+        const has_completeness = raw_object.get("root_user_messages_complete") != null;
+        const has_permission_feedback = raw_object.get("permission_feedback") != null;
+        const has_feedback_completeness = raw_object.get("permission_feedback_complete") != null;
+        if (has_permission_feedback != has_feedback_completeness) {
+            return error.InvalidSessionFormat;
+        }
+        const object = if (has_feedback_completeness)
+            try exactObject(value, &.{ "kind", "summary", "removed_turn_count", "compaction_count", "root_user_messages", "root_user_messages_complete", "permission_feedback", "permission_feedback_complete" })
+        else if (has_completeness)
+            try exactObject(value, &.{ "kind", "summary", "removed_turn_count", "compaction_count", "root_user_messages", "root_user_messages_complete" })
+        else if (has_root_user_messages)
+            try exactObject(value, &.{ "kind", "summary", "removed_turn_count", "compaction_count", "root_user_messages" })
+        else
+            try exactObject(value, &.{ "kind", "summary", "removed_turn_count", "compaction_count" });
         const summary = try parseRequiredDurableBytes(alloc, object, "summary");
         errdefer alloc.free(summary);
+        const root_user_messages: [][]u8 = if (has_root_user_messages)
+            try parseDurableBytesArray(
+                alloc,
+                object.get("root_user_messages") orelse return error.InvalidSessionFormat,
+            )
+        else
+            &.{};
+        errdefer types.freeCompletedToolNames(alloc, root_user_messages);
+        const permission_feedback: [][]u8 = if (has_permission_feedback)
+            try parseDurableBytesArray(
+                alloc,
+                object.get("permission_feedback") orelse return error.InvalidSessionFormat,
+            )
+        else
+            &.{};
+        errdefer types.freePermissionFeedback(alloc, permission_feedback);
+        const removed_turn_count = try requireUsize(object, "removed_turn_count");
         return .{ .compacted_summary = .{
             .summary = summary,
-            .removed_turn_count = try requireUsize(object, "removed_turn_count"),
+            .removed_turn_count = removed_turn_count,
             .compaction_count = try requireUsize(object, "compaction_count"),
+            .root_user_messages = root_user_messages,
+            .root_user_messages_complete = if (has_completeness)
+                try requireBool(object, "root_user_messages_complete")
+            else
+                has_root_user_messages or removed_turn_count == 0,
+            .permission_feedback = permission_feedback,
+            .permission_feedback_complete = if (has_feedback_completeness)
+                try requireBool(object, "permission_feedback_complete")
+            else
+                removed_turn_count == 0,
         } };
     }
     if (std.mem.eql(u8, kind, "assistant")) {
@@ -442,7 +488,7 @@ pub fn parseHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Histor
         if (cancelled_command != null and
             (terminal_reason != .cancelled or
                 tool_call == null or
-                !std.mem.eql(u8, tool_call.?.name, "run_command")))
+                !try isCapturedCommandToolCall(alloc, tool_call.?)))
         {
             return error.InvalidSessionFormat;
         }
@@ -457,6 +503,10 @@ pub fn parseHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Histor
         } };
     }
     return error.InvalidSessionFormat;
+}
+
+fn isCapturedCommandToolCall(alloc: Allocator, call: types.ToolCall) !bool {
+    return captured_command.isToolCall(alloc, call.name, call.arguments_json);
 }
 
 pub fn validateState(state: DurableSessionState) !void {
@@ -476,6 +526,8 @@ pub fn validateState(state: DurableSessionState) !void {
         }
     }
     if (state.usage) |usage| try session_usage.validateSnapshot(usage);
+    session_permission_state.validate(state.permission_state) catch
+        return error.InvalidDurableField;
     if (state.recovery_checkpoint) |checkpoint| {
         if (checkpoint.version != 1 or
             checkpoint.turn_id == 0 or
@@ -528,6 +580,8 @@ fn writeState(writer: *std.Io.Writer, state: DurableSessionState) !void {
         state.total_output_tokens,
         state.context_history_start,
     });
+    try writer.writeAll(",\"permission_state\":");
+    try writePermissionState(writer, state.permission_state);
     if (state.usage) |usage| {
         try writer.writeAll(",\"usage\":");
         try session_usage.writeSnapshot(writer, usage);
@@ -541,6 +595,104 @@ fn writeState(writer: *std.Io.Writer, state: DurableSessionState) !void {
         try writeRecoveryCheckpoint(writer, checkpoint);
     }
     try writer.writeByte('}');
+}
+
+fn writePermissionState(
+    writer: *std.Io.Writer,
+    state: session_permission_state.State,
+) !void {
+    try writer.print("{{\"schema_version\":{d},\"next_generation\":{d},\"rules\":[", .{
+        state.version,
+        state.next_generation,
+    });
+    for (state.rules.items, 0..) |rule, index| {
+        if (index > 0) try writer.writeByte(',');
+        try writer.print("{{\"id\":{d},\"kind\":", .{rule.id.value});
+        try writeJsonString(writer, @tagName(rule.key.kind));
+        try writer.writeAll(",\"canonical\":");
+        try writeDurableBytes(writer, rule.key.canonical);
+        try writer.writeAll(",\"display_identity\":");
+        try writeDurableBytes(writer, rule.display_identity);
+        try writer.writeAll(",\"decision\":");
+        try writeJsonString(writer, @tagName(rule.decision));
+        try writer.print(",\"generation\":{d}}}", .{rule.generation});
+    }
+    try writer.writeAll("]}");
+}
+
+fn parsePermissionState(
+    alloc: Allocator,
+    value: std.json.Value,
+) !session_permission_state.State {
+    const object = try exactObject(value, &.{
+        "schema_version",
+        "next_generation",
+        "rules",
+    });
+    const version = std.math.cast(
+        u8,
+        try requireU64(object, "schema_version"),
+    ) orelse return error.InvalidDurableField;
+    const rules_value = object.get("rules") orelse
+        return error.InvalidSessionFormat;
+    if (rules_value != .array) return error.InvalidSessionFormat;
+
+    var state: session_permission_state.State = .{
+        .version = version,
+        .next_generation = try requireU64(object, "next_generation"),
+    };
+    errdefer state.deinit(alloc);
+    try state.rules.ensureTotalCapacity(
+        alloc,
+        @min(rules_value.array.items.len, session_permission_state.max_rules),
+    );
+    for (rules_value.array.items) |rule_value| {
+        if (state.rules.items.len == session_permission_state.max_rules) {
+            return error.InvalidDurableField;
+        }
+        const rule_object = try exactObject(rule_value, &.{
+            "id",
+            "kind",
+            "canonical",
+            "display_identity",
+            "decision",
+            "generation",
+        });
+        const kind = std.meta.stringToEnum(
+            session_permission_state.RuleKey.Kind,
+            try requireString(rule_object, "kind"),
+        ) orelse return error.InvalidDurableField;
+        const canonical = try parseRequiredDurableBytes(
+            alloc,
+            rule_object,
+            "canonical",
+        );
+        errdefer alloc.free(canonical);
+        const key = session_permission_state.RuleKey.init(
+            kind,
+            canonical,
+        ) catch return error.InvalidDurableField;
+        const display_identity = try parseRequiredDurableBytes(
+            alloc,
+            rule_object,
+            "display_identity",
+        );
+        errdefer alloc.free(display_identity);
+        const decision = std.meta.stringToEnum(
+            session_permission_state.Decision,
+            try requireString(rule_object, "decision"),
+        ) orelse return error.InvalidDurableField;
+        try state.rules.append(alloc, .{
+            .id = .{ .value = try requireU64(rule_object, "id") },
+            .key = key,
+            .display_identity = display_identity,
+            .decision = decision,
+            .generation = try requireU64(rule_object, "generation"),
+        });
+    }
+    session_permission_state.validate(state) catch
+        return error.InvalidDurableField;
+    return state;
 }
 
 pub fn writeRecoveryCheckpoint(writer: *std.Io.Writer, checkpoint: RecoveryCheckpoint) !void {
@@ -635,6 +787,9 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
     const total_output_tokens = try readU64(&json_reader, alloc);
     var context_history_start: usize = 0;
     var context_seen = false;
+    var permission_state: session_permission_state.State = .{};
+    errdefer permission_state.deinit(alloc);
+    var permission_state_seen = false;
     var usage: ?session_usage.Snapshot = null;
     var usage_seen = false;
     var last_subagent_work_id: ?[]u8 = null;
@@ -645,13 +800,26 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
         const key = try readStringOwned(&json_reader, alloc, 64);
         defer alloc.free(key);
         if (std.mem.eql(u8, key, "context_history_start")) {
-            if (context_seen or usage_seen or last_subagent_work_id != null or recovery_checkpoint != null) {
+            if (context_seen or permission_state_seen or usage_seen or last_subagent_work_id != null or recovery_checkpoint != null) {
                 return error.InvalidSessionFormat;
             }
             const raw = try readU64(&json_reader, alloc);
             context_history_start = std.math.cast(usize, raw) orelse
                 return error.InvalidSessionFormat;
             context_seen = true;
+        } else if (std.mem.eql(u8, key, "permission_state")) {
+            if (permission_state_seen or usage_seen or last_subagent_work_id != null or recovery_checkpoint != null) {
+                return error.InvalidSessionFormat;
+            }
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const value = try std.json.Value.jsonParse(arena.allocator(), &json_reader, .{
+                .max_value_len = limits.max_value_bytes,
+                .allocate = .alloc_always,
+                .parse_numbers = false,
+            });
+            permission_state = try parsePermissionState(alloc, value);
+            permission_state_seen = true;
         } else if (std.mem.eql(u8, key, "usage")) {
             if (usage_seen or last_subagent_work_id != null or recovery_checkpoint != null) return error.InvalidSessionFormat;
             const parse_limit = @min(
@@ -705,6 +873,7 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
         .context_history_start = context_history_start,
         .total_input_tokens = total_input_tokens,
         .total_output_tokens = total_output_tokens,
+        .permission_state = permission_state,
         .last_subagent_work_id = last_subagent_work_id,
         .usage = usage,
         .recovery_checkpoint = recovery_checkpoint,
@@ -1965,7 +2134,7 @@ test "durable byte fields use canonical string or padded base64 representation" 
     }
 }
 
-test "durable state round trips every live history byte field exactly" {
+test "durable state round trips live history while discarding legacy authority" {
     const alloc = std.testing.allocator;
     const invalid_a = [_]u8{ 'a', 0xff };
     const invalid_b = [_]u8{ 0xfe, 'b', 0x00 };
@@ -2066,6 +2235,7 @@ test "durable state round trips every live history byte field exactly" {
             .summary = @constCast(invalid_b[0..]),
             .removed_turn_count = 3,
             .compaction_count = 2,
+            .root_user_messages = completed_tool_names[0..],
         } },
     };
     var usage_runtime = session_usage.Usage.initFresh();
@@ -2504,6 +2674,63 @@ test "durable history rejects unknown fields instead of silently dropping bytes"
     );
 }
 
+test "legacy compacted authority absence remains incomplete across durable reload" {
+    const alloc = std.testing.allocator;
+    var legacy_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"kind\":\"compacted_summary\",\"summary\":\"legacy\",\"removed_turn_count\":2,\"compaction_count\":1}",
+        .{},
+    );
+    defer legacy_parsed.deinit();
+    const legacy = try parseHistoryTurn(alloc, legacy_parsed.value);
+    defer session.freeHistoryTurn(alloc, legacy);
+    try std.testing.expect(!legacy.compacted_summary.root_user_messages_complete);
+    try std.testing.expect(!legacy.compacted_summary.permission_feedback_complete);
+
+    var known_messages = [_][]u8{@constCast("newer exact request")};
+    const incomplete: session.HistoryTurn = .{ .compacted_summary = .{
+        .summary = @constCast("legacy plus newer context"),
+        .removed_turn_count = 3,
+        .compaction_count = 2,
+        .root_user_messages = &known_messages,
+        .root_user_messages_complete = false,
+        .permission_feedback = &known_messages,
+        .permission_feedback_complete = false,
+    } };
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    try writeHistoryTurn(&encoded.writer, incomplete);
+    var reloaded_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        encoded.written(),
+        .{},
+    );
+    defer reloaded_parsed.deinit();
+    const reloaded = try parseHistoryTurn(alloc, reloaded_parsed.value);
+    defer session.freeHistoryTurn(alloc, reloaded);
+    try std.testing.expect(!reloaded.compacted_summary.root_user_messages_complete);
+    try std.testing.expect(!reloaded.compacted_summary.permission_feedback_complete);
+    try std.testing.expectEqual(@as(usize, 0), reloaded.compacted_summary.root_user_messages.len);
+
+    var first_generation_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"kind\":\"compacted_summary\",\"summary\":\"first generation\",\"removed_turn_count\":2,\"compaction_count\":1,\"root_user_messages\":[\"original request\"]}",
+        .{},
+    );
+    defer first_generation_parsed.deinit();
+    const first_generation = try parseHistoryTurn(alloc, first_generation_parsed.value);
+    defer session.freeHistoryTurn(alloc, first_generation);
+    try std.testing.expect(first_generation.compacted_summary.root_user_messages_complete);
+    try std.testing.expect(!first_generation.compacted_summary.permission_feedback_complete);
+    try std.testing.expectEqualStrings(
+        "original request",
+        first_generation.compacted_summary.root_user_messages[0],
+    );
+}
+
 fn persistedResultForTest(call_id: []const u8, tool_name: []const u8) session.PersistedToolResult {
     return .{
         .tool_call_id = @constCast(call_id),
@@ -2754,6 +2981,7 @@ fn expectStateEqual(expected: DurableSessionState, actual: DurableSessionState) 
     try std.testing.expectEqual(expected.context_history_start, actual.context_history_start);
     try std.testing.expectEqual(expected.total_input_tokens, actual.total_input_tokens);
     try std.testing.expectEqual(expected.total_output_tokens, actual.total_output_tokens);
+    try expectPermissionStateEqual(expected.permission_state, actual.permission_state);
     try std.testing.expectEqual(expected.last_subagent_work_id != null, actual.last_subagent_work_id != null);
     if (expected.last_subagent_work_id) |work_id| {
         try std.testing.expectEqualStrings(work_id, actual.last_subagent_work_id.?);
@@ -2774,6 +3002,24 @@ fn expectStateEqual(expected: DurableSessionState, actual: DurableSessionState) 
     }
 }
 
+fn expectPermissionStateEqual(
+    expected: session_permission_state.State,
+    actual: session_permission_state.State,
+) !void {
+    try std.testing.expectEqual(expected.version, actual.version);
+    try std.testing.expectEqual(expected.next_generation, actual.next_generation);
+    try std.testing.expectEqual(expected.rules.items.len, actual.rules.items.len);
+    for (expected.rules.items, actual.rules.items) |expected_rule, actual_rule| {
+        try std.testing.expectEqual(expected_rule.id, actual_rule.id);
+        try std.testing.expectEqual(expected_rule.key.kind, actual_rule.key.kind);
+        try std.testing.expectEqualSlices(u8, &expected_rule.key.digest, &actual_rule.key.digest);
+        try std.testing.expectEqualSlices(u8, expected_rule.key.canonical, actual_rule.key.canonical);
+        try std.testing.expectEqualStrings(expected_rule.display_identity, actual_rule.display_identity);
+        try std.testing.expectEqual(expected_rule.decision, actual_rule.decision);
+        try std.testing.expectEqual(expected_rule.generation, actual_rule.generation);
+    }
+}
+
 fn expectHistoryTurnEqual(expected: session.HistoryTurn, actual: session.HistoryTurn) !void {
     try std.testing.expectEqual(std.meta.activeTag(expected), std.meta.activeTag(actual));
     switch (expected) {
@@ -2781,6 +3027,16 @@ fn expectHistoryTurnEqual(expected: session.HistoryTurn, actual: session.History
             try std.testing.expectEqualSlices(u8, entry.summary, actual.compacted_summary.summary);
             try std.testing.expectEqual(entry.removed_turn_count, actual.compacted_summary.removed_turn_count);
             try std.testing.expectEqual(entry.compaction_count, actual.compacted_summary.compaction_count);
+            try std.testing.expect(!actual.compacted_summary.root_user_messages_complete);
+            try std.testing.expectEqual(
+                @as(usize, 0),
+                actual.compacted_summary.root_user_messages.len,
+            );
+            try std.testing.expect(!actual.compacted_summary.permission_feedback_complete);
+            try std.testing.expectEqual(
+                @as(usize, 0),
+                actual.compacted_summary.permission_feedback.len,
+            );
         },
         .assistant => |entry| {
             const got = actual.assistant;
@@ -3005,6 +3261,64 @@ test "recovery checkpoint round trips while legacy state stays absent" {
     var legacy_state = try decodeState(alloc, &legacy_source, .{});
     defer legacy_state.deinit(alloc);
     try std.testing.expectEqual(@as(?RecoveryCheckpoint, null), legacy_state.recovery_checkpoint);
+}
+
+test "session permission state round trips while legacy state stays empty" {
+    const alloc = std.testing.allocator;
+    const key = try session_permission_state.RuleKey.init(
+        .command,
+        "command\x00/workspace\x00git status",
+    );
+    var empty_permission_state: session_permission_state.State = .{};
+    defer empty_permission_state.deinit(alloc);
+    var applied = try session_permission_state.apply(
+        alloc,
+        empty_permission_state,
+        .{ .set = .{
+            .key = key,
+            .display_identity = "git status in /workspace",
+            .decision = .deny,
+            .expected_generation = null,
+        } },
+    );
+    var permission_state = applied.takeApplied() orelse
+        return error.TestExpectedAppliedState;
+    defer permission_state.deinit(alloc);
+
+    const state = DurableSessionState{
+        .id = @constCast("session-permission-state"),
+        .origin_workspace_root = @constCast("/tmp/origin"),
+        .workspace_root = @constCast("/tmp/current"),
+        .created_at_ms = 1,
+        .updated_at_ms = 2,
+        .conversation_language = session.ConversationLanguage.literal("en"),
+        .preferences = .{
+            .model = @constCast("openai/gpt-test"),
+            .effort = .auto,
+            .fast_mode = false,
+        },
+        .history = &.{},
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+        .permission_state = permission_state,
+    };
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    _ = try encodeState(state, &encoded.writer);
+    var source = std.Io.Reader.fixed(encoded.written());
+    var decoded = try decodeState(alloc, &source, .{});
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqual(
+        session_permission_state.StateDecision.deny,
+        session_permission_state.decide(decoded.permission_state, key),
+    );
+
+    const legacy =
+        "{\"id\":\"legacy-permission-state\",\"origin_workspace_root\":\"/tmp/origin\",\"workspace_root\":\"/tmp/current\",\"created_at_ms\":1,\"updated_at_ms\":2,\"conversation_language\":\"en\",\"preferences\":{\"model\":\"openai/gpt-test\",\"effort\":\"auto\",\"fast_mode\":false},\"history\":[],\"total_input_tokens\":0,\"total_output_tokens\":0}";
+    var legacy_source = std.Io.Reader.fixed(legacy);
+    var legacy_state = try decodeState(alloc, &legacy_source, .{});
+    defer legacy_state.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), legacy_state.permission_state.rules.items.len);
 }
 
 test "recovery checkpoint rejects an outstanding attempt beyond its budget" {

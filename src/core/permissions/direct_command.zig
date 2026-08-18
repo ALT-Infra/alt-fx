@@ -423,11 +423,19 @@ fn environmentForProfile(
     var environment = std.process.Environ.Map.init(alloc);
     errdefer environment.deinit();
     switch (profile) {
-        .basic_read_only => {
+        .basic_read_only, .git_read_only => {
             try environment.put("PATH", "/usr/bin:/bin");
             try environment.put("LC_ALL", "C");
             try environment.put("LANG", "C");
         },
+    }
+    if (profile == .git_read_only) {
+        try environment.put("GIT_CONFIG_NOSYSTEM", "1");
+        try environment.put("GIT_CONFIG_GLOBAL", "/dev/null");
+        try environment.put("GIT_OPTIONAL_LOCKS", "0");
+        try environment.put("GIT_TERMINAL_PROMPT", "0");
+        try environment.put("GIT_PAGER", "cat");
+        try environment.put("PAGER", "cat");
     }
     return environment;
 }
@@ -966,6 +974,19 @@ test "direct executor runs fixed argv with sanitized environment and no artifact
     try std.testing.expect(std.mem.find(u8, result.output, "LANG=C") != null);
     try std.testing.expect(std.mem.find(u8, result.output, "HOME=") == null);
     try std.testing.expectEqual(@as(?[]const u8, null), result.command_result.?.foreground.output_file);
+}
+
+test "git direct profile removes ambient authority and disables optional mutation" {
+    var environment = try environmentForProfile(std.testing.allocator, .git_read_only);
+    defer environment.deinit();
+
+    try std.testing.expectEqualStrings("/usr/bin:/bin", environment.get("PATH").?);
+    try std.testing.expectEqualStrings("1", environment.get("GIT_CONFIG_NOSYSTEM").?);
+    try std.testing.expectEqualStrings("/dev/null", environment.get("GIT_CONFIG_GLOBAL").?);
+    try std.testing.expectEqualStrings("0", environment.get("GIT_OPTIONAL_LOCKS").?);
+    try std.testing.expectEqualStrings("0", environment.get("GIT_TERMINAL_PROMPT").?);
+    try std.testing.expectEqualStrings("cat", environment.get("GIT_PAGER").?);
+    try std.testing.expect(environment.get("HOME") == null);
 }
 
 test "direct executor runs a supported pipeline and reports final output" {

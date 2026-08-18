@@ -5,6 +5,7 @@ const core_permissions = @import("../permissions/permissions.zig");
 const core_types = @import("../shared/types.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const devbox_executor = @import("../execution/devbox_executor.zig");
+const command_environment = @import("../execution/command_environment.zig");
 const file_mutation_contract = @import("file_mutation_contract.zig");
 const io_mod = @import("../shared/io.zig");
 const message = @import("../shared/message.zig");
@@ -165,8 +166,7 @@ pub const DispatchError = std.json.ParseError(std.json.Scanner) || error{
 pub const RunCommandRequest = struct {
     command: []const u8,
     resolved_cwd: []const u8,
-    background: bool,
-    expects_url: bool,
+    environment: command_environment.Environment,
 };
 
 pub const RunCommandBackendFn = *const fn (
@@ -222,11 +222,10 @@ pub const DispatchContext = struct {
     terminal_owner_session_id: ?[]const u8 = null,
     terminal_transport_role: terminal_contracts.TransportRole = .interactive,
     background_lifecycle_allocator: Allocator = std.heap.c_allocator,
-    background_launch_policy: background_runtime.BackgroundLaunchPolicy =
-        .process_local_long_lived,
     command_timeout_ms: ?usize = null,
     sandbox_backend: sandbox.BackendKind = .none,
     devbox_provider: ?devbox_executor.Provider = null,
+    captured_command_host: command_environment.Host = .native,
     run_command_backend: ?RunCommandBackend = null,
     subagent_provider: ?subagent_tool_provider.Provider = null,
     vision_provider: ?VisionProvider = null,
@@ -405,6 +404,8 @@ pub const RuntimeProviderKind = enum {
     vision,
 };
 
+pub const CapturedCommandFn = *const fn (ToolInput) bool;
+
 /// Descriptor for a core tool's model-facing metadata and runtime callbacks.
 pub const Tool = struct {
     name: []const u8,
@@ -428,6 +429,9 @@ pub const Tool = struct {
     validate: ?ValidateFn = null,
     call: CallFn,
     runtime_provider: RuntimeProviderKind = .none,
+    captured_command_host: command_environment.Host = .native,
+    captured_command_action: ?[]const u8 = null,
+    captured_command_fn: ?CapturedCommandFn = null,
     authorized_call_adapter: ?AuthorizedCallAdapterFn = null,
     authorized_result_mapper: ?AuthorizedResultMapperFn = null,
     cancel_if_requested_after_call: bool = false,
@@ -489,7 +493,7 @@ pub fn dispatchRunCommandCompatibility(
     registry: Registry,
     request: RunCommandRequest,
 ) (DispatchError || RunCommandCompatibilityMatchError)!?ToolResult {
-    if (request.background) return null;
+    if (std.meta.activeTag(request.environment) != .legacy) return null;
     const matched = (try matchRunCommandCompatibility(
         registry,
         request.command,
@@ -612,7 +616,7 @@ pub fn admitToolCall(ctx: DispatchContext, registry: Registry, call: message.Too
             var input_transferred = false;
             defer if (!input_transferred) input.value.deinit(call_ctx.allocator);
 
-            if (try localToolAvailabilityFailure(call_ctx, input.tool)) |reason| {
+            if (try localToolAvailabilityFailure(call_ctx, input.tool, input.value)) |reason| {
                 return .{ .failure = reason };
             }
 
@@ -632,14 +636,19 @@ pub fn admitToolCall(ctx: DispatchContext, registry: Registry, call: message.Too
                 },
             }
 
-            if (std.mem.eql(u8, input.tool.name, "run_command")) {
+            const captured_command = input.tool.executor_kind == .run_command or
+                if (input.tool.captured_command_fn) |classify|
+                    classify(input.value)
+                else
+                    false;
+            if (captured_command) {
                 const authority = decision.execution_authority orelse {
-                    return .{ .failure = try call_ctx.allocator.dupe(u8, "run_command permission allowed without execution authority") };
+                    return .{ .failure = try call_ctx.allocator.dupe(u8, "captured command permission allowed without execution authority") };
                 };
                 call_ctx.execution_authority = switch (authority) {
                     .run_command => |command_authority| .{ .run_command = command_authority },
                     else => {
-                        return .{ .failure = try call_ctx.allocator.dupe(u8, "run_command permission returned invalid execution authority") };
+                        return .{ .failure = try call_ctx.allocator.dupe(u8, "captured command permission returned invalid execution authority") };
                     },
                 };
             } else {
@@ -852,17 +861,38 @@ pub fn reportContextNotice(ctx: DispatchContext, notice: []const u8) error{OutOf
     try sink(ctx.context_notice_ctx, notice);
 }
 
-pub fn localToolAvailabilityFailure(ctx: DispatchContext, tool: *const Tool) DispatchError!?[]u8 {
+pub fn localToolAvailabilityFailure(
+    ctx: DispatchContext,
+    tool: *const Tool,
+    input: ToolInput,
+) DispatchError!?[]u8 {
     return switch (tool.executor_kind) {
         .web_search => if (ctx.tool_capabilities.web_search_runtime_ready)
             null
         else
             try ctx.allocator.dupe(u8, web_search_unavailable_message),
-        .terminal => if (ctx.tool_capabilities.terminalAvailable())
+        .terminal => if (tool.captured_command_fn != null and tool.captured_command_fn.?(input))
+            null
+        else if (ctx.tool_capabilities.terminalAvailable())
             null
         else
             try ctx.allocator.dupe(u8, terminal_unavailable_message),
         else => null,
+    };
+}
+
+pub fn localToolAvailabilityFailureForCall(
+    ctx: DispatchContext,
+    registry: Registry,
+    call: message.ToolCall,
+) DispatchError!?[]u8 {
+    const validated = try decodeAndValidateRegisteredToolCall(ctx, registry, call);
+    return switch (validated) {
+        .not_registered, .failure => null,
+        .input => |input| blk: {
+            defer input.value.deinit(ctx.allocator);
+            break :blk try localToolAvailabilityFailure(ctx, input.tool, input.value);
+        },
     };
 }
 

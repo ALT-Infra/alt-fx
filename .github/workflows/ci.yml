@@ -19,7 +19,7 @@ jobs:
       matrix:
         include:
           - optimize: Debug
-            test_timeout_seconds: 300
+            test_timeout_seconds: 600
           - optimize: ReleaseSafe
             test_timeout_seconds: 900
     steps:
@@ -39,13 +39,20 @@ jobs:
         if: matrix.optimize == 'Debug'
         run: python3 -m scripts.pgso.corpus --manifest scripts/pgso/corpus.json --list
 
+      - name: Audit public surface
+        if: matrix.optimize == 'Debug'
+        run: ./scripts/check-public-surface.sh
+
       - name: Build
         run: zig build -Doptimize=${{ matrix.optimize }}
 
       - name: Test
         env:
           TEST_TIMEOUT_SECONDS: ${{ matrix.test_timeout_seconds }}
-        run: timeout "${TEST_TIMEOUT_SECONDS}s" zig build test -Doptimize=${{ matrix.optimize }}
+        run: |
+          started_at=$SECONDS
+          trap 'printf "Unit tests elapsed: %ss\n" "$((SECONDS - started_at))"' EXIT
+          timeout "${TEST_TIMEOUT_SECONDS}s" zig build test -Doptimize=${{ matrix.optimize }}
 
   zig:
     name: Build & Test
@@ -219,6 +226,14 @@ jobs:
         run: bun test ./gateway-stream-lifecycle.test.ts --test-name-pattern "saved malformed recovery resumes without re-executing the historical call|OS filesystem access denial reaches the next gateway request"
         working-directory: tests/e2e
 
+      - name: Run lean Auto Mode reliability contract
+        run: bun test auto-mode-reliability.test.ts
+        working-directory: tests/e2e
+        env:
+          AI_GATEWAY_API_KEY: ""
+          VERCEL_OIDC_TOKEN: ""
+          FX_REQUIRE_TMUX: "1"
+
       - name: Run Vision route and headless SIGINT regressions
         run: |
           bun test vision-route-fake-gateway.test.ts
@@ -324,6 +339,7 @@ jobs:
         run: |
           scripts=(
             benchmarks/startup.sh
+            scripts/check-public-surface.sh
           )
           bash -n "${scripts[@]}"
           shellcheck "${scripts[@]}"

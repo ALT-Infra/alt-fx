@@ -543,7 +543,7 @@ test "parallel classifier rejects prompts approvals dynamic tools and mutations"
         builtin_tools.mcp_select_tool,
         builtin_tools.subagent,
         builtin_tools.install_skill,
-        builtin_tools.run_command,
+        builtin_tools.terminal,
         builtin_tools.read_file,
     };
     const registry = tool_dispatch.Registry{ .tools = &tools };

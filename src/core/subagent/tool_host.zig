@@ -22,6 +22,7 @@ const session_store = @import("../session/session_store.zig");
 const mcp_access = @import("../mcp/access_policy.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const permissions = @import("../permissions/permissions.zig");
+const session_permission_state = @import("../permissions/session_permission_state.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const types = @import("../shared/types.zig");
@@ -134,6 +135,8 @@ pub const ExecuteOptions = struct {
     invocation_id: []const u8,
     parent_permission_mode: types.PermissionMode = .yolo,
     root_user_intent_context: []const u8 = "",
+    root_user_messages: []const []const u8 = &.{},
+    root_user_evidence_complete: bool = false,
     defaults: Defaults,
     max_result_bytes: usize,
     timestamp_ms: i64,
@@ -170,14 +173,7 @@ fn buildHumanQueuedRootUserContext(
     alloc: Allocator,
     command: domain.Command,
 ) !?[]u8 {
-    const current_request: ?[]const u8 = switch (command) {
-        .create => |create| create.prompt,
-        .message => |message| switch (message) {
-            .send => |send| send.content,
-            .milestone => null,
-        },
-        .inspect, .relationship, .configure, .lifecycle => null,
-    };
+    const current_request = humanQueuedRootUserMessage(command);
     return if (current_request) |request|
         try auto_classifier_context.buildCanonicalRootUserContext(
             alloc,
@@ -186,6 +182,17 @@ fn buildHumanQueuedRootUserContext(
         )
     else
         null;
+}
+
+fn humanQueuedRootUserMessage(command: domain.Command) ?[]const u8 {
+    return switch (command) {
+        .create => |create| create.prompt,
+        .message => |message| switch (message) {
+            .send => |send| send.content,
+            .milestone => null,
+        },
+        .inspect, .relationship, .configure, .lifecycle => null,
+    };
 }
 
 const ModelCommandOutcome = union(enum) {
@@ -578,6 +585,8 @@ pub const Runtime = struct {
                 operation_id,
                 options.caller_id,
                 options.root_user_intent_context,
+                options.root_user_messages,
+                options.root_user_evidence_complete,
                 options.timestamp_ms,
                 .model,
                 identity_epoch,
@@ -631,6 +640,8 @@ pub const Runtime = struct {
         var context = manager_mod.Context{
             .actor_id = options.caller_id,
             .root_user_intent_context = options.root_user_intent_context,
+            .root_user_messages = options.root_user_messages,
+            .root_user_evidence_complete = options.root_user_evidence_complete,
             .operation_id = operation_id,
             .operation_identity_source = .model,
             .operation_identity_epoch = identity_epoch,
@@ -795,6 +806,11 @@ pub const Runtime = struct {
         );
         defer if (owned_root_user_intent_context) |context| alloc.free(context);
         const root_user_intent_context = owned_root_user_intent_context orelse "";
+        const root_user_message = humanQueuedRootUserMessage(command.*);
+        const root_user_messages: []const []const u8 = if (root_user_message) |message|
+            &.{message}
+        else
+            &.{};
         if (command.* == .message and command.message == .send) {
             return self.sendMessageWithOperation(
                 alloc,
@@ -802,6 +818,8 @@ pub const Runtime = struct {
                 operation_id,
                 self.root_id,
                 root_user_intent_context,
+                root_user_messages,
+                root_user_message != null,
                 options.timestamp_ms,
                 .human,
                 identity_epoch,
@@ -830,6 +848,8 @@ pub const Runtime = struct {
             .{
                 .actor_id = self.root_id,
                 .root_user_intent_context = root_user_intent_context,
+                .root_user_messages = root_user_messages,
+                .root_user_evidence_complete = root_user_message != null,
                 .operation_id = operation_id,
                 .operation_identity_source = .human,
                 .operation_identity_epoch = identity_epoch,
@@ -1325,12 +1345,15 @@ pub const Runtime = struct {
             command,
         );
         defer if (owned_root_user_intent_context) |context| alloc.free(context);
+        const root_user_messages = [_][]const u8{options.content};
         var result = try self.sendMessageWithOperation(
             alloc,
             command,
             operation_id,
             options.caller_id,
             owned_root_user_intent_context orelse "",
+            &root_user_messages,
+            true,
             options.timestamp_ms,
             .human,
             identity_epoch,
@@ -1348,6 +1371,8 @@ pub const Runtime = struct {
         operation_id: []const u8,
         caller_id: []const u8,
         root_user_intent_context: []const u8,
+        root_user_messages: []const []const u8,
+        root_user_evidence_complete: bool,
         timestamp_ms: i64,
         identity_source: domain.OperationIdentitySource,
         identity_epoch: u64,
@@ -1372,6 +1397,8 @@ pub const Runtime = struct {
         var context: manager_mod.Context = .{
             .actor_id = caller_id,
             .root_user_intent_context = root_user_intent_context,
+            .root_user_messages = root_user_messages,
+            .root_user_evidence_complete = root_user_evidence_complete,
             .operation_id = operation_id,
             .operation_identity_source = identity_source,
             .operation_identity_epoch = identity_epoch,
@@ -1837,6 +1864,7 @@ pub fn captureHostAuthority(
         integration_names,
         rules,
         grants,
+        .{},
         null,
     );
 }
@@ -1848,6 +1876,7 @@ pub fn captureHostAuthorityWithMcpView(
     integration_names: []const []const u8,
     rules: types.PermissionRuleSet,
     grants: []const types.PermissionGrant,
+    permission_state: session_permission_state.State,
     mcp_view: ?*const mcp_access.View,
 ) !authority.HostAuthority {
     var tool_names: std.ArrayList([]const u8) = .empty;
@@ -1857,13 +1886,14 @@ pub fn captureHostAuthorityWithMcpView(
         if (permissions.rulesDenyAllTargetsForTool(rules, registered_tool.name)) continue;
         try tool_names.append(alloc, registered_tool.name);
     }
-    return authority.HostAuthority.captureWithMcpView(
+    return authority.HostAuthority.captureWithPermissionStateAndMcpView(
         alloc,
         tool_names.items,
         sandbox_backend,
         integration_names,
         rules,
         grants,
+        permission_state,
         mcp_view,
     );
 }
@@ -2295,6 +2325,7 @@ fn captureAdmission(
         .tool_names = snapshot.tools,
         .rules = snapshot.rules,
         .grants = snapshot.grants,
+        .permission_state = snapshot.permission_state,
         .integration_names = snapshot.integrations,
         .authority_generation = if (snapshot.mcp_view) |view|
             mcp_access.authorityGeneration(view)
@@ -6895,6 +6926,11 @@ test "typed message send queues a busy child without steering active work" {
     var create_options = testOptions(root_id, "create-busy-worker");
     create_options.root_user_intent_context =
         "current_request: create the busy worker\n";
+    create_options.root_user_messages = &.{
+        "Do not modify files.",
+        "Create the busy worker for inspection.",
+    };
+    create_options.root_user_evidence_complete = true;
     const created = try host.execute(
         alloc,
         &create,
@@ -6962,11 +6998,23 @@ test "typed message send queues a busy child without steering active work" {
         "current_request: create the busy worker\n",
         record.queue[0].root_user_intent_context,
     );
+    try std.testing.expect(record.queue[0].root_user_evidence_complete);
+    try std.testing.expectEqual(@as(usize, 2), record.queue[0].root_user_messages.len);
+    try std.testing.expectEqualStrings(
+        "Do not modify files.",
+        record.queue[0].root_user_messages[0],
+    );
     try std.testing.expectEqualStrings(root_id, record.queue[1].source_id);
     try std.testing.expectEqualStrings("second queued turn", record.queue[1].content);
     try std.testing.expectEqualStrings(
         "current_request: second queued turn\n",
         record.queue[1].root_user_intent_context,
+    );
+    try std.testing.expect(record.queue[1].root_user_evidence_complete);
+    try std.testing.expectEqual(@as(usize, 1), record.queue[1].root_user_messages.len);
+    try std.testing.expectEqualStrings(
+        "second queued turn",
+        record.queue[1].root_user_messages[0],
     );
     try std.testing.expect(std.mem.find(u8, record.queue[1].content, "source") == null);
     try std.testing.expectEqual(@as(usize, 1), runner.entered.load(.seq_cst));

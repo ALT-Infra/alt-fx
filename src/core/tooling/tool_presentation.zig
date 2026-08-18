@@ -1,7 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const command_policy = @import("command_policy.zig");
-const command_admission = @import("../permissions/command_admission.zig");
 const file_mutation_contract = @import("file_mutation_contract.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_args = @import("tool_args.zig");
@@ -17,9 +16,6 @@ const ToolCall = types.ToolCall;
 const max_run_command_activity_bytes = 120;
 const max_run_command_activity_source_bytes = max_run_command_activity_bytes * max_run_command_activity_bytes;
 pub const max_auto_permission_reason_presentation_bytes: usize = 160;
-
-const auto_permission_approved_prefix = "Auto agent approved this request";
-const auto_permission_generic_explanation = "Auto agent could not review this request safely.";
 
 pub const ToolActionInput = struct {
     tool_registry: tool_dispatch.Registry,
@@ -124,8 +120,8 @@ pub fn formatRunCommandPermissionLabel(
         command,
         max_run_command_activity_bytes,
     );
-    const suffix = try commandApprovalLabelSuffix(scratch, "run_command", command);
-    return std.fmt.allocPrint(alloc, "run_command {s}{s}", .{ encoded.bytes, suffix });
+    const suffix = try commandApprovalLabelSuffix(scratch, "terminal", command);
+    return std.fmt.allocPrint(alloc, "terminal.exec {s}{s}", .{ encoded.bytes, suffix });
 }
 
 /// The caller owns the returned allocation and must free it with `alloc`.
@@ -162,13 +158,12 @@ pub fn formatRunCommandActivity(
     workspace_root: []const u8,
     call: ToolCall,
 ) !?RunCommandActivity {
-    if (!std.mem.eql(u8, call.name, "run_command")) return null;
-
     var scratch_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer scratch_state.deinit();
     const scratch = scratch_state.allocator();
 
     const args = tool_args.parseToolArgsObject(scratch, call.arguments_json) catch return null;
+    if (!isCapturedCommandCall(registry, call, args)) return null;
     const command = tool_args.optionalStringArg(args, "command") orelse return null;
     var projected_storage: [max_run_command_activity_bytes + 1]u8 = undefined;
     const projected = projectRunCommandActivitySource(command, workspace_root, &projected_storage);
@@ -235,6 +230,14 @@ pub fn formatPermissionLabel(alloc: Allocator, registry: tool_dispatch.Registry,
     if (try runCommandCompatibilitySource(scratch, registry, call)) |source| {
         return std.fmt.allocPrint(alloc, "{s} {s}", .{ source.tool.name, source.command });
     }
+    const args = tool_args.parseToolArgsObject(scratch, call.arguments_json) catch {
+        return try alloc.dupe(u8, call.name);
+    };
+    if (isCapturedCommandCall(registry, call, args)) {
+        const command = tool_args.optionalStringArg(args, "command") orelse
+            return try alloc.dupe(u8, call.name);
+        return formatRunCommandPermissionLabel(alloc, command);
+    }
     const spec = registry.lookup(call.name) orelse return try alloc.dupe(u8, call.name);
     if (file_mutation_contract.isToolName(call.name)) {
         return std.fmt.allocPrint(
@@ -243,10 +246,6 @@ pub fn formatPermissionLabel(alloc: Allocator, registry: tool_dispatch.Registry,
             .{ call.name, spec.label_arg_default },
         );
     }
-    const args = tool_args.parseToolArgsObject(scratch, call.arguments_json) catch {
-        return try alloc.dupe(u8, call.name);
-    };
-
     if (try copyRenameLabel(scratch, call.name, args)) |value| {
         return std.fmt.allocPrint(alloc, "{s} {s}", .{ call.name, value });
     }
@@ -261,40 +260,6 @@ pub fn formatPermissionLabel(alloc: Allocator, registry: tool_dispatch.Registry,
     }
 
     return std.fmt.allocPrint(alloc, "{s} {s}", .{ call.name, value });
-}
-
-/// Formats the single auto-permission result already carried by `outcome`.
-/// The caller owns the returned allocation and must free it with `alloc`.
-pub fn formatAutoPermissionNotice(
-    alloc: Allocator,
-    registry: tool_dispatch.Registry,
-    call: ToolCall,
-    permission_mode: types.PermissionMode,
-    outcome: command_admission.PermissionOutcome,
-) !?[]const u8 {
-    if (permission_mode != .auto) return null;
-
-    if (outcome.auto_review_result) |result| {
-        switch (result.decision) {
-            .allow => {
-                if (outcome.decision.isDenied() or outcome.execution_authority == null) return null;
-                const spec = registry.lookup(call.name) orelse {
-                    return @as(?[]const u8, try std.fmt.allocPrint(alloc, "{s}: Using requested tool.", .{auto_permission_approved_prefix}));
-                };
-                return @as(?[]const u8, try std.fmt.allocPrint(
-                    alloc,
-                    "{s}: {s} {s}.",
-                    .{ auto_permission_approved_prefix, spec.action_label, spec.label_arg_default },
-                ));
-            },
-            .ask => return null,
-        }
-    }
-
-    if (outcome.decision == .permission_required) {
-        return try alloc.dupe(u8, auto_permission_generic_explanation);
-    }
-    return null;
 }
 
 /// The caller owns the returned allocation and must free it with `alloc`.
@@ -353,7 +318,8 @@ fn appendWebSearchDomains(writer: *std.Io.Writer, label: []const u8, value: ?std
 }
 
 fn commandApprovalLabelSuffix(alloc: Allocator, tool_name: []const u8, command: []const u8) ![]const u8 {
-    if (!std.mem.eql(u8, tool_name, "run_command")) return "";
+    if (!std.mem.eql(u8, tool_name, "run_command") and
+        !std.mem.eql(u8, tool_name, "terminal")) return "";
     const risk = command_policy.command_risk_note_for(command);
     const safer = command_policy.command_safer_alternative_for(command);
     if (risk == null and safer == null) return "";
@@ -386,11 +352,27 @@ fn runCommandCompatibilitySource(
     registry: tool_dispatch.Registry,
     call: ToolCall,
 ) !?RunCommandCompatibilitySource {
-    if (!std.mem.eql(u8, call.name, "run_command")) return null;
     const args = tool_args.parseToolArgsObject(alloc, call.arguments_json) catch return null;
+    if (!isCapturedCommandCall(registry, call, args)) return null;
     const command = tool_args.optionalStringArg(args, "command") orelse return null;
     const matched = (try tool_dispatch.matchRunCommandCompatibility(registry, command)) orelse return null;
     return .{ .tool = matched.tool, .command = command };
+}
+
+fn isCapturedCommandCall(
+    registry: tool_dispatch.Registry,
+    call: ToolCall,
+    args: std.json.ObjectMap,
+) bool {
+    // Historical sessions retain their original tool name. Presentation may
+    // interpret those records, but execution remains unavailable because the
+    // registry no longer contains a `run_command` tool.
+    if (std.mem.eql(u8, call.name, "run_command")) return true;
+    const tool = registry.lookup(call.name) orelse return false;
+    if (tool.executor_kind == .run_command) return true;
+    const expected = tool.captured_command_action orelse return false;
+    const action = tool_args.optionalStringArg(args, "action") orelse return false;
+    return std.mem.eql(u8, action, expected);
 }
 
 fn copyRenameLabel(alloc: Allocator, tool_name: []const u8, args: std.json.ObjectMap) !?[]const u8 {
@@ -455,7 +437,7 @@ const test_tools = [_]tool_dispatch.Tool{
     test_builtin_tools.rename_file,
     test_builtin_tools.copy_file,
     test_web_search,
-    test_builtin_tools.run_command,
+    test_builtin_tools.terminal,
     test_builtin_tools.memory,
     test_builtin_tools.skill,
     test_install_skill,
@@ -652,7 +634,7 @@ test "run command activity abbreviates only active workspace paths" {
     });
     defer alloc.free(permission);
     try std.testing.expectEqualStrings(
-        "run_command cd /Users/example/workspace/packages/cli && pwd",
+        "terminal.exec cd /Users/example/workspace/packages/cli && pwd",
         permission,
     );
 }
@@ -716,7 +698,7 @@ test "tool presentation formats permission labels" {
         .arguments_json = "{\"command\":\"npm test\",\"cwd\":\"/tmp/fx\"}",
     });
     defer alloc.free(cwd);
-    try std.testing.expectEqualStrings("run_command npm test @ /tmp/fx", cwd);
+    try std.testing.expectEqualStrings("terminal.exec npm test", cwd);
 
     const risk = try formatPermissionLabel(alloc, test_tool_registry, .{
         .id = "risk",
@@ -726,105 +708,6 @@ test "tool presentation formats permission labels" {
     defer alloc.free(risk);
     try expectContains(risk, "risk: command may discard version-control state");
     try expectContains(risk, "safer: inspect git status first");
-}
-
-test "auto permission presentation uses safe actions for accepted requests" {
-    const alloc = std.testing.allocator;
-    const raw_secret = "AI_GATEWAY_API_KEY=should-never-be-presented";
-    const notice = (try formatAutoPermissionNotice(
-        alloc,
-        test_tool_registry,
-        .{
-            .id = "command",
-            .name = "run_command",
-            .arguments_json = "{\"command\":\"" ++ raw_secret ++ "\"}",
-        },
-        .auto,
-        .{
-            .decision = .once,
-            .execution_authority = .ordinary,
-            .auto_review_result = .{
-                .risk = .low,
-                .authorization = .low,
-                .decision = .allow,
-                .rationale = "safe",
-            },
-        },
-    )).?;
-    defer alloc.free(notice);
-
-    try std.testing.expectEqualStrings("Auto agent approved this request: Running command.", notice);
-    try std.testing.expect(std.mem.find(u8, notice, raw_secret) == null);
-}
-
-test "auto permission presentation propagates allocation failure" {
-    const alloc = std.testing.allocator;
-    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
-    try std.testing.expectError(
-        error.OutOfMemory,
-        formatAutoPermissionNotice(
-            failing.allocator(),
-            test_tool_registry,
-            .{
-                .id = "command",
-                .name = "run_command",
-                .arguments_json = "{\"command\":\"printf done\"}",
-            },
-            .auto,
-            .{
-                .decision = .once,
-                .execution_authority = .ordinary,
-                .auto_review_result = .{
-                    .risk = .low,
-                    .authorization = .high,
-                    .decision = .allow,
-                    .rationale = "safe",
-                },
-            },
-        ),
-    );
-}
-
-test "auto permission presentation omits notice for ask reviews" {
-    const alloc = std.testing.allocator;
-    const reason = "AI_GATEWAY_API_KEY=abcdefghijklmnop\n\x1b[31m" ++ ("x" ** 190);
-    try std.testing.expect((try formatAutoPermissionNotice(
-        alloc,
-        test_tool_registry,
-        .{ .id = "command", .name = "run_command", .arguments_json = "{}" },
-        .auto,
-        .{
-            .decision = .permission_required,
-            .denial_reason = .permission_required,
-            .auto_review_result = .{
-                .risk = .high,
-                .authorization = .unknown,
-                .decision = .ask,
-                .rationale = reason,
-            },
-        },
-    )) == null);
-}
-
-test "auto permission presentation uses one resultless fallback" {
-    const alloc = std.testing.allocator;
-    const notice = (try formatAutoPermissionNotice(
-        alloc,
-        test_tool_registry,
-        .{ .id = "command", .name = "run_command", .arguments_json = "{}" },
-        .auto,
-        .{ .decision = .permission_required },
-    )).?;
-    defer alloc.free(notice);
-
-    try std.testing.expectEqualStrings(auto_permission_generic_explanation, notice);
-    try std.testing.expect((try formatAutoPermissionNotice(
-        alloc,
-        test_tool_registry,
-        .{ .id = "command", .name = "run_command", .arguments_json = "{}" },
-        .ask,
-        .{ .decision = .permission_required },
-    )) == null);
 }
 
 test "tool presentation preserves plain action fallbacks" {

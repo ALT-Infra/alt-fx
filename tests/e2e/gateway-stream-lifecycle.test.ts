@@ -8,6 +8,7 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   truncateSync,
   writeFileSync,
 } from "node:fs";
@@ -177,11 +178,11 @@ function delayedSuccessfulResponse(): Response {
 function lengthLimitedCommandResponse(command: string): Response {
   return sse(
     'data: {"type":"text-delta","id":"answer","delta":"visible partial output"}\n\n' +
-      'data: {"type":"tool-input-start","id":"command_provisional","toolName":"run_command"}\n\n' +
+      'data: {"type":"tool-input-start","id":"command_provisional","toolName":"terminal"}\n\n' +
       `data: ${JSON.stringify({
         type: "tool-call",
-        toolName: "run_command",
-        input: { command },
+        toolName: "terminal",
+        input: { action: "exec", command },
       })}\n\n` +
       'data: {"type":"finish","finishReason":{"unified":"length","raw":"length"}}\n\n' +
       "data: [DONE]\n\n",
@@ -426,7 +427,11 @@ function occurrenceCount(text: string, needle: string): number {
   return text.split(needle).length - 1;
 }
 
-function writeMcpFixture(root: FixtureRoot) {
+function writeMcpFixture(
+  root: FixtureRoot,
+  options: { required?: boolean; toolCount?: number } = {},
+) {
+  const toolCount = options.toolCount ?? 1;
   const scriptPath = join(root.root, "mcp-fixture.js");
   const callLogPath = join(root.root, "mcp-calls.log");
   const pidPath = join(root.root, "mcp.pid");
@@ -465,19 +470,27 @@ function handle(message) {
     return;
   }
   if (message.method === "tools/list") {
+    const tools = Array.from({ length: ${toolCount} }, (_, index) => index === 0 ? {
+      name: "echo",
+      description: "Echo fixture input",
+      inputSchema: {
+        type: "object",
+        properties: { text: { type: "string", description: "EXACT_SCHEMA_QUERY_SENTINEL" } },
+        required: ["text"],
+      },
+    } : {
+      name: "network_tool_" + String(index).padStart(2, "0"),
+      description: "Inspect browser network use case " + index,
+      inputSchema: {
+        type: "object",
+        properties: { request: { type: "string" } },
+      },
+    });
     send({
       jsonrpc: "2.0",
       id: message.id,
       result: {
-        tools: [{
-          name: "echo",
-          description: "Echo fixture input",
-          inputSchema: {
-            type: "object",
-            properties: { text: { type: "string", description: "EXACT_SCHEMA_QUERY_SENTINEL" } },
-            required: ["text"],
-          },
-        }],
+        tools,
       },
     });
     writeFileSync(process.env.FX_MCP_READY_PATH, "ready\\n");
@@ -514,6 +527,7 @@ process.stdin.on("data", (chunk) => {
           type: "local",
           command: [process.execPath, scriptPath],
           enabled: true,
+          required: options.required ?? false,
           environment: {
             FX_MCP_CALL_LOG: callLogPath,
             FX_MCP_PID_PATH: pidPath,
@@ -572,7 +586,7 @@ async function waitForMcpServerReady(
     pane.split("\n").some((line) =>
       line.includes(`${serverName} `) && line.includes(` state=${state}`)
     );
-  await session.sendText("/mcp");
+  await session.sendText("/mcp list");
   const status = await session.waitForPane(
     (pane) => hasServerState(pane, "ready") || hasServerState(pane, "failed"),
     timeoutMs,
@@ -597,7 +611,7 @@ describe("gateway stream lifecycle", () => {
       ...extra,
     });
     const ordinary = fixture(
-      "Persist until the task is handled. Use the task clearly matches wording only as prose. Do not rely on memory or general knowledge. run_command_extra and prefixweb_searchsuffix are not capability symbols.",
+      "Persist until the task is handled. Use the task clearly matches wording only as prose. Do not rely on memory or general knowledge. terminal_extra and prefixweb_searchsuffix are not capability symbols.",
     );
     expect(findUnavailableCapabilityReferences(ordinary)).toEqual([]);
 
@@ -610,7 +624,7 @@ describe("gateway stream lifecycle", () => {
         });
       }
     }
-    for (const capability of ["run_command", "web_search", "ask_user_question"]) {
+    for (const capability of ["terminal", "web_search", "ask_user_question"]) {
       expect(
         findUnavailableCapabilityReferences(fixture(`Use ${capability} now.`)),
       ).toContainEqual({
@@ -666,7 +680,7 @@ describe("gateway stream lifecycle", () => {
     expect(findUnavailableCapabilityReferences(mcpSearchCurrent)).toEqual([]);
 
     const excludedText = [
-      "Use run_command and web_search.",
+      "Use terminal and web_search.",
       AMBIGUOUS_CAPABILITY_CLAUSES.subagent[0],
       AMBIGUOUS_CAPABILITY_CLAUSES.skill[0],
       AMBIGUOUS_CAPABILITY_CLAUSES.memory[0],
@@ -724,8 +738,8 @@ describe("gateway stream lifecycle", () => {
       expect(request.prompt[0]?.role).toBe("system");
       expect(request.prompt[1]?.role).toBe("system");
       expect(contentText(request.prompt[1]?.content)).toBe(WEB_SEARCH_GUIDANCE);
-      expect(toolByName(oracleRequest, "run_command")?.description).toContain(
-        "run gh commands for GitHub metadata that local files cannot answer",
+      expect(toolByName(oracleRequest, "terminal")?.description).toContain(
+        "Use exec for a foreground command",
       );
       expect(toolByName(oracleRequest, "skill")?.description).toContain(
         "the task clearly matches one",
@@ -792,11 +806,11 @@ describe("gateway stream lifecycle", () => {
     }
   }, 30_000);
 
-  test("ask keeps the GLM default model identity while enabling fast mode", async () => {
-    const root = createFixtureRoot("default-model-fast");
+  test("ask keeps the GLM default model identity without enabling fast mode", async () => {
+    const root = createFixtureRoot("default-model");
     const tracePath = join(root.root, "trace.log");
     const gateway = startDynamicFakeGateway(
-      () => fakeGatewayFinalText("DEFAULT_MODEL_FAST_COMPLETE"),
+      () => fakeGatewayFinalText("DEFAULT_MODEL_COMPLETE"),
       {
         models: [{
           id: DEFAULT_MODEL,
@@ -823,7 +837,7 @@ describe("gateway stream lifecycle", () => {
 
       expect(result.code).toBe(0);
       expect(parseAskJson(result.stdout).output).toContain(
-        "DEFAULT_MODEL_FAST_COMPLETE",
+        "DEFAULT_MODEL_COMPLETE",
       );
       expect(result.stderr).toBe("");
       expect(gateway.requests).toHaveLength(1);
@@ -832,9 +846,7 @@ describe("gateway stream lifecycle", () => {
       );
       const request = JSON.parse(gateway.requests[0]!.body);
       expect(request).not.toHaveProperty("fast");
-      expect(request).toMatchObject({
-        providerOptions: { gateway: { speed: "fast" } },
-      });
+      expect(request).not.toHaveProperty("providerOptions.gateway.speed");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -1022,6 +1034,75 @@ describe("gateway stream lifecycle", () => {
         "<skill_content name=\"oversized-context\"",
       );
       expect(negatedPrompt).not.toContain("SKILL_FIRST_LINE");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("contained instruction and skill links reach one ask request", async () => {
+    const root = createFixtureRoot("contained-links-ask");
+    const tracePath = join(root.root, "trace.log");
+    const skillSource = join(
+      root.workspace,
+      "skill-source",
+      "linked-skill",
+    );
+    const skillsRoot = join(root.workspace, ".codex", "skills");
+    mkdirSync(skillSource, { recursive: true });
+    mkdirSync(skillsRoot, { recursive: true });
+    writeFileSync(
+      join(root.workspace, "CLAUDE.md"),
+      "LINKED_INSTRUCTION_SENTINEL\n",
+    );
+    symlinkSync("CLAUDE.md", join(root.workspace, "AGENTS.md"));
+    writeFileSync(
+      join(skillSource, "SKILL.md"),
+      "---\nname: linked-skill\ndescription: contained linked skill\n---\n\nLINKED_SKILL_SENTINEL\n",
+    );
+    symlinkSync(
+      "../../skill-source/linked-skill",
+      join(skillsRoot, "linked-skill"),
+      "dir",
+    );
+
+    const gateway = startGateway(() =>
+      fakeGatewayFinalText("CONTAINED_LINKS_COMPLETE")
+    );
+    try {
+      const result = await runFx(
+        [
+          "ask",
+          "--json",
+          "--auto",
+          "--no-save",
+          "$linked-skill apply the linked instructions and skill.",
+        ],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 30_000,
+        },
+      );
+      const output = parseAskJson(result.stdout);
+      const prompt = promptText(gateway.requests[0]!.body);
+
+      expect(result.code).toBe(0);
+      expect(output.output).toContain("CONTAINED_LINKS_COMPLETE");
+      expect(gateway.requestCount()).toBe(1);
+      expect(prompt).toContain("LINKED_INSTRUCTION_SENTINEL");
+      expect(prompt).toContain(
+        `<project-rules from="${join(root.workspace, "AGENTS.md")}">`,
+      );
+      expect(prompt).toContain("LINKED_SKILL_SENTINEL");
+      expect(prompt).toContain(
+        '<skill_content name="linked-skill" resource="SKILL.md"',
+      );
+      expect(prompt).toContain(
+        `<location>${join(root.workspace, ".codex", "skills", "linked-skill")}</location>`,
+      );
+      expect(prompt).not.toContain("symlinked rule file");
+      expect(result.stderr).not.toContain("symlinked rule file");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -2031,7 +2112,6 @@ describe("gateway stream lifecycle", () => {
         expect(occurrenceCount(result.stderr, progressLine)).toBe(1);
         expect(result.stderr).toBe(
           "Writing file\n" +
-            "[notice] Auto agent approved this request: Writing file.\n" +
             progressLine,
         );
         const assistantOutput = variant.json
@@ -2390,7 +2470,7 @@ describe("gateway stream lifecycle", () => {
     const responses = [
       fakeGatewaySerializedToolCall(
         callId,
-        "run_command",
+        "terminal",
         malformedArguments,
         "Trying the saved command.",
       ),
@@ -2476,12 +2556,12 @@ describe("gateway stream lifecycle", () => {
       const historicalCalls = resumedParts.filter((part) =>
         part.type === "tool-call" &&
         part.toolCallId === callId &&
-        part.toolName === "run_command"
+        part.toolName === "terminal"
       );
       const historicalResults = resumedParts.filter((part) =>
         part.type === "tool-result" &&
         part.toolCallId === callId &&
-        part.toolName === "run_command"
+        part.toolName === "terminal"
       );
       expect(historicalCalls).toHaveLength(1);
       expect(historicalCalls[0]).toEqual(
@@ -2509,141 +2589,7 @@ describe("gateway stream lifecycle", () => {
     }
   });
 
-  test("saved background finish preserves typed execution memory", async () => {
-    const root = createFixtureRoot("saved-background-execution");
-    const tracePath = join(root.root, "trace.log");
-    const callId = "background_execution_1";
-    const gateway = startGateway(() =>
-      fakeGatewayToolCall(callId, "run_command", {
-        command: "printf background-fixture",
-        background: true,
-      })
-    );
-    try {
-      const result = await runFx(
-        ["ask", "--json", "--auto", "Start the background fixture."],
-        {
-          cwd: root.workspace,
-          env: fixtureEnv(root, gateway, tracePath),
-          timeoutMs: 15_000,
-        },
-      );
-      const json = parseAskJson(result.stdout) as ReturnType<typeof parseAskJson> & {
-        session_id: string;
-      };
-
-      expect(result.code).toBe(0);
-      expect(result.stderr).toContain("Running printf background-fixture");
-      expect(result.stderr).toContain("Background #1: command started");
-      expect(json.session_id.length).toBeGreaterThan(0);
-      expect(gateway.requestCount()).toBe(1);
-
-      const detailResult = await runFx(
-        ["session", "--id", json.session_id, "--json"],
-        {
-          cwd: root.workspace,
-          env: { HOME: root.home },
-        },
-      );
-      expect(detailResult.code).toBe(0);
-      const detail = JSON.parse(detailResult.stdout);
-      expect(detail.history_len).toBe(1);
-      expect(detail.history[0].kind).toBe("background_command");
-      const step = detail.history[0].execution.tool_steps[0];
-      expect(step.tool_calls[0]).toEqual(
-        expect.objectContaining({
-          id: callId,
-          name: "run_command",
-        }),
-      );
-      expect(JSON.parse(step.tool_calls[0].arguments_json)).toEqual(
-        expect.objectContaining({ background: true }),
-      );
-      expect(step.tool_results[0]).toEqual(
-        expect.objectContaining({
-          tool_call_id: callId,
-          tool_name: "run_command",
-          status: "success",
-        }),
-      );
-      expect(step.tool_results[0].output).toContain("started in background");
-    } finally {
-      gateway.stop();
-      await Bun.sleep(100);
-      rmSync(root.root, { recursive: true, force: true });
-    }
-  });
-
-  test("saved ask without session persistence rejects a background launch", async () => {
-    const root = createFixtureRoot("saved-background-no-session-store");
-    const tracePath = join(root.root, "trace.log");
-    const markerPath = join(root.workspace, "rejected-background-marker.txt");
-    const callId = "background_without_session_store_1";
-    const profileRoot = join(root.home, ".fx");
-    const sessionsPath = join(profileRoot, "sessions");
-    writeFileSync(sessionsPath, "not a directory");
-    const gateway = startGateway(() =>
-      fakeGatewayToolCall(callId, "run_command", {
-        command: "printf launched > rejected-background-marker.txt",
-        background: true,
-      })
-    );
-    try {
-      const result = await runFx(
-        ["ask", "--json", "--auto", "Start the background fixture."],
-        {
-          cwd: root.workspace,
-          env: {
-            ...fixtureEnv(root, gateway, tracePath),
-            FX_TRACE_SCOPES: "session",
-          },
-          timeoutMs: 15_000,
-        },
-      );
-      const json = parseAskJson(result.stdout) as ReturnType<typeof parseAskJson> & {
-        session_id: string;
-      };
-
-      expect(result.code).toBe(1);
-      expect(json.exit_code).toBe(1);
-      expect(json.session_id).toBe("");
-      expect(json.tool_calls).toContainEqual({
-        name: "run_command",
-        status: "error",
-      });
-      expect(result.stderr).toContain(
-        "fx ask: warning: session persistence unavailable; error=SessionPathUnsafe; continuing without saving",
-      );
-      expect(result.stderr).toContain("reason=session_store_unavailable");
-      expect(gateway.requestCount()).toBe(1);
-      expect(existsSync(markerPath)).toBe(false);
-      expect(readFileSync(sessionsPath, "utf8")).toBe("not a directory");
-
-      const trace = readFileSync(tracePath, "utf8");
-      expect(trace).toContain(
-        "event=ask_session_store_unavailable error=SessionPathUnsafe",
-      );
-      expect(trace).not.toContain(root.home);
-      expect(trace).not.toContain(root.workspace);
-
-      rmSync(sessionsPath, { force: true });
-      const backgroundResult = await runFx(["background", "--json"], {
-        cwd: root.workspace,
-        env: { HOME: root.home },
-      });
-      expect(backgroundResult.code).toBe(0);
-      expect(JSON.parse(backgroundResult.stdout)).toEqual({
-        kind: "background",
-        count: 0,
-        records: [],
-      });
-    } finally {
-      gateway.stop();
-      rmSync(root.root, { recursive: true, force: true });
-    }
-  });
-
-  test("approved long foreground run_command writes its heredoc without signal 9", async () => {
+  test("approved long foreground terminal writes its heredoc without signal 9", async () => {
     const root = createFixtureRoot("long-foreground-command");
     const tracePath = join(root.root, "trace.log");
     const outputPath = join(root.workspace, "long-command-output.txt");
@@ -2655,7 +2601,7 @@ describe("gateway stream lifecycle", () => {
     const command = `cat <<'FX_LONG_COMMAND' > long-command-output.txt\n${payload}\nFX_LONG_COMMAND\n`;
     expect(Buffer.byteLength(command)).toBeGreaterThan(20 * 1024);
     const responses = [
-      fakeGatewayToolCall(callId, "run_command", { command }),
+      fakeGatewayToolCall(callId, "terminal", { action: "exec", command }),
       fakeGatewayFinalText("Long command fixture written."),
     ];
     const gateway = startGateway(() =>
@@ -2663,7 +2609,7 @@ describe("gateway stream lifecycle", () => {
     );
     try {
       const result = await runFx(
-        ["ask", "--json", "--auto", "Write the long command fixture."],
+        ["ask", "--json", "--yolo", "Write the long command fixture."],
         {
           cwd: root.workspace,
           env: fixtureEnv(root, gateway, tracePath),
@@ -2677,7 +2623,7 @@ describe("gateway stream lifecycle", () => {
       expect(gateway.requestCount()).toBe(2);
       expect(json.tool_calls).toContainEqual(
         expect.objectContaining({
-          name: "run_command",
+          name: "terminal",
           status: "success",
         }),
       );
@@ -3410,7 +3356,8 @@ describe("gateway stream lifecycle", () => {
     let responseIndex = 0;
     const gateway = startGateway(() => {
       if (responseIndex++ === 0) {
-        return fakeGatewayToolCall("prompt_too_long_tool_1", "run_command", {
+        return fakeGatewayToolCall("prompt_too_long_tool_1", "terminal", {
+          action: "exec",
           command: `printf 'once\\n' >> '${sideEffectPath}'`,
         });
       }
@@ -3441,7 +3388,7 @@ describe("gateway stream lifecycle", () => {
       expect(serializedError).toContain("prompt_too_long=true");
       expect(serializedError).toContain("no local tool actions were replayed");
       expect(output.tool_calls).toHaveLength(1);
-      expect(output.tool_calls[0]?.name).toBe("run_command");
+      expect(output.tool_calls[0]?.name).toBe("terminal");
       expect(output.tool_calls[0]?.status).toBe("success");
       expect(readFileSync(sideEffectPath, "utf8")).toBe("once\n");
       expect(gateway.requestCount()).toBe(2);
@@ -3454,21 +3401,35 @@ describe("gateway stream lifecycle", () => {
   test("dynamic MCP search stays metadata-only and exact selection reveals instructions and schema", async () => {
     const root = createFixtureRoot("mcp-lazy-context");
     const tracePath = join(root.root, "trace.log");
-    const mcp = writeMcpFixture(root);
-    const searchCallId = "mcp_search_lazy_1";
+    const mcp = writeMcpFixture(root, { toolCount: 30 });
+    const searchCallId = "mcp_search_targeted_1";
+    const broadSearchCallId = "mcp_search_broad_1";
     const selectCallId = "mcp_select_lazy_1";
     const responses = [
       fakeGatewayToolCall(searchCallId, "mcp_search_tools", {
-        query: "SECRET_SERVER_INSTRUCTION_SENTINEL",
+        query: "fixture echo",
+      }),
+      fakeGatewayToolCall(broadSearchCallId, "mcp_search_tools", {
+        query: "fixture",
+        limit: 20,
       }),
       fakeGatewayToolCall(selectCallId, "mcp_select_tool", {
         name: DYNAMIC_MCP_TOOL_NAME,
       }),
+      fakeGatewayToolCall("mcp_call_lazy_1", DYNAMIC_MCP_TOOL_NAME, {
+        text: "lazy MCP proof",
+      }),
       fakeGatewayFinalText("MCP lazy context complete."),
     ];
-    const gateway = startGateway(() =>
-      responses.shift() ?? new Response("unexpected request", { status: 500 })
-    );
+    let requestIndex = 0;
+    const gateway = startDynamicFakeGateway(() => {
+      if (requestIndex === 0) expect(existsSync(mcp.pidPath)).toBe(false);
+      requestIndex += 1;
+      return responses.shift() ?? new Response("unexpected request", { status: 500 });
+    }, {
+      classifierDecision: "allow",
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
     try {
       const result = await runFx(
         ["ask", "--json", "--auto", "--no-save", "Discover the MCP fixture lazily."],
@@ -3483,10 +3444,17 @@ describe("gateway stream lifecycle", () => {
 
       expect(result.code).toBe(0);
       expect(json.output).toContain("MCP lazy context complete.");
-      expect(gateway.requestCount()).toBe(3);
+      expect(gateway.requestCount()).toBe(5);
+      const initialPrompt = promptText(gateway.requests[0]!.body);
+      const initialServer = initialPrompt.match(
+        /<server name="fixture" state="available_on_demand"[^>]*\/>/,
+      )?.[0];
+      expect(initialServer).toBeDefined();
+      expect(initialServer).not.toContain("tools=");
       expect(gateway.requests[0]!.body).not.toContain(DYNAMIC_MCP_TOOL_NAME);
       expect(gateway.requests[0]!.body).not.toContain("SECRET_SERVER_INSTRUCTION_SENTINEL");
       expect(gateway.requests[0]!.body).not.toContain("EXACT_SCHEMA_QUERY_SENTINEL");
+      expect(existsSync(mcp.readyPath)).toBe(true);
 
       const searchOutput = toolResultOutput(gateway.requests[1]!.body, searchCallId);
       const searchTools = JSON.stringify(JSON.parse(searchOutput).tools);
@@ -3495,7 +3463,13 @@ describe("gateway stream lifecycle", () => {
       expect(searchTools).not.toContain("SECRET_SERVER_INSTRUCTION_SENTINEL");
       expect(searchTools).not.toContain("EXACT_SCHEMA_QUERY_SENTINEL");
 
-      const selectedRequest = gatewayRequest(gateway.requests[2]!.body);
+      const broadSearchOutput = JSON.parse(
+        toolResultOutput(gateway.requests[2]!.body, broadSearchCallId),
+      );
+      expect(broadSearchOutput.count).toBe(20);
+      expect(broadSearchOutput.more_available).toBe(true);
+
+      const selectedRequest = gatewayRequest(gateway.requests[3]!.body);
       const selectedTool = selectedRequest.tools.find((tool) =>
         tool.name === DYNAMIC_MCP_TOOL_NAME
       );
@@ -3503,9 +3477,44 @@ describe("gateway stream lifecycle", () => {
       expect(selectedTool?.inputSchema.properties.text.description).toBe(
         "EXACT_SCHEMA_QUERY_SENTINEL",
       );
-      expect(gateway.requests[2]!.body).toContain(
+      expect(gateway.requests[3]!.body).toContain(
         "SECRET_SERVER_INSTRUCTION_SENTINEL",
       );
+      expect(toolResultOutput(gateway.requests[4]!.body, "mcp_call_lazy_1")).toContain(
+        "unexpected MCP call",
+      );
+      expect(readFileSync(mcp.callLogPath, "utf8").trim().split("\n")).toHaveLength(1);
+      await waitForProcessExit(pid);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("required MCP server advertises only its ready count before lazy search", async () => {
+    const root = createFixtureRoot("mcp-ready-server-summary");
+    const tracePath = join(root.root, "trace.log");
+    const mcp = writeMcpFixture(root, { required: true, toolCount: 30 });
+    const gateway = startGateway(() => fakeGatewayFinalText("MCP ready summary complete."));
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Inspect configured MCP availability."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 20_000,
+        },
+      );
+      const pid = Number.parseInt(readFileSync(mcp.pidPath, "utf8"), 10);
+      const initialPrompt = promptText(gateway.requests[0]!.body);
+
+      expect(result.code).toBe(0);
+      expect(initialPrompt).toContain(
+        '<server name="fixture" state="ready" tools="30" />',
+      );
+      expect(gateway.requests[0]!.body).not.toContain(DYNAMIC_MCP_TOOL_NAME);
+      expect(gateway.requests[0]!.body).not.toContain("SECRET_SERVER_INSTRUCTION_SENTINEL");
+      expect(gateway.requests[0]!.body).not.toContain("EXACT_SCHEMA_QUERY_SENTINEL");
       await waitForProcessExit(pid);
     } finally {
       gateway.stop();
@@ -3558,6 +3567,10 @@ describe("gateway stream lifecycle", () => {
         return parentCompletion;
       }
       if (body.includes(childPrompt)) {
+        expect(promptText(body)).toContain(
+          '<server name="fixture" state="ready" tools="1" />',
+        );
+        expect(body).not.toContain(DYNAMIC_MCP_TOOL_NAME);
         return fakeGatewayToolCall("child_mcp_select_1", "mcp_select_tool", {
           name: DYNAMIC_MCP_TOOL_NAME,
         });
@@ -4213,13 +4226,23 @@ describe("gateway stream lifecycle", () => {
         expect(gateway.classifierRequests[0]!.body).toContain("exact-");
         expect(gateway.classifierRequests[0]!.body).toContain("inputSchema");
         if (decision === "ask") {
-          // Noninteractive ask surfaces permission_required and exits 1 —
-          // never auto_denied, never executes the MCP tool.
-          expect(result.code).toBe(1);
-          expect(result.stdout).toContain("NonInteractivePermissionRequired");
+          // Headless automatic review returns a recoverable denial to the
+          // primary model without executing the MCP tool or asking the user.
+          expect(result.code).toBe(0);
+          expect(gateway.requests).toHaveLength(3);
+          expect(gateway.requests[2]!.body).toContain("tool_permission_denied");
+          expect(gateway.requests[2]!.body).toContain("auto_denied");
+          expect(gateway.requests[2]!.body).not.toContain("user_denied");
+          const json = parseAskJson(result.stdout);
+          expect(json.output).toContain("MCP ask handled.");
+          expect(json.tool_calls).toContainEqual({
+            name: DYNAMIC_MCP_TOOL_NAME,
+            status: "error",
+          });
+          expect(result.stdout).not.toContain("NonInteractivePermissionRequired");
           expect(trace).toContain("event=auto_review_result");
           expect(trace).toContain("decision=ask");
-          expect(trace).toContain("err=NonInteractivePermissionRequired");
+          expect(trace).not.toContain("err=NonInteractivePermissionRequired");
           expect(existsSync(mcp.callLogPath)).toBe(false);
         } else {
           expect(result.code).toBe(0);
@@ -4356,7 +4379,7 @@ describe("gateway stream lifecycle", () => {
     const sentinelPath = join(root.workspace, "command-must-not-run.txt");
     const responses = [
       sse(
-        'data: {"type":"tool-call","toolCallId":"command_1","toolName":"run_command","input":{"command":"printf executed > command-must-not-run.txt"}}\n\n' +
+        'data: {"type":"tool-call","toolCallId":"command_1","toolName":"terminal","input":{"action":"exec","command":"printf executed > command-must-not-run.txt"}}\n\n' +
           'data: {"type":"finish","finishReason":{"unified":"error","raw":"provider_error"}}\n\n' +
           "data: [DONE]\n\n",
       ),
@@ -4815,7 +4838,7 @@ describe("gateway stream lifecycle", () => {
     const sentinelPath = join(root.workspace, "command-must-not-run.txt");
     const gateway = startGateway(() =>
       sse(
-        'data: {"type":"tool-call","toolCallId":"command_1","toolName":"run_command","input":{"command":"printf executed > command-must-not-run.txt"}}\n\n' +
+        'data: {"type":"tool-call","toolCallId":"command_1","toolName":"terminal","input":{"action":"exec","command":"printf executed > command-must-not-run.txt"}}\n\n' +
           'data: {"type":"finish","finishReason":{"unified":"","raw":"provider_error"}}\n\n' +
           "data: [DONE]\n\n",
       ),

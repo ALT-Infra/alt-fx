@@ -376,6 +376,8 @@ const TargetAuthorization = union(enum) {
 pub const Context = struct {
     actor_id: []const u8,
     root_user_intent_context: []const u8 = "",
+    root_user_messages: []const []const u8 = &.{},
+    root_user_evidence_complete: bool = false,
     operation_id: ?[]const u8 = null,
     operation_identity_source: ?domain.OperationIdentitySource = null,
     operation_identity_epoch: ?u64 = null,
@@ -3396,6 +3398,8 @@ fn buildCreateRecord(
             context.actor_id,
             prompt,
             context.root_user_intent_context,
+            context.root_user_messages,
+            context.root_user_evidence_complete,
             context.timestamp_ms,
         );
         errdefer message.deinit(alloc);
@@ -3469,6 +3473,8 @@ fn reduceSend(
         context.actor_id,
         content,
         context.root_user_intent_context,
+        context.root_user_messages,
+        context.root_user_evidence_complete,
         context.timestamp_ms,
     );
     errdefer if (message) |*value| value.deinit(alloc);
@@ -3875,6 +3881,8 @@ fn makeQueuedMessage(
     source_id: []const u8,
     content: []const u8,
     root_user_intent_context: []const u8,
+    root_user_messages: []const []const u8,
+    root_user_evidence_complete: bool,
     timestamp_ms: i64,
 ) !domain.QueuedMessage {
     const id = try alloc.dupe(u8, operation_id);
@@ -3890,13 +3898,60 @@ fn makeQueuedMessage(
     errdefer if (owned_root_user_intent_context.len > 0) {
         alloc.free(owned_root_user_intent_context);
     };
+    const evidence_complete = rootUserEvidenceFits(
+        root_user_messages,
+        root_user_evidence_complete,
+    );
+    const owned_root_user_messages = if (evidence_complete)
+        try dupeRootUserMessages(alloc, root_user_messages)
+    else
+        try alloc.alloc([]u8, 0);
+    errdefer freeRootUserMessages(alloc, owned_root_user_messages);
     return .{
         .id = id,
         .source_id = source,
         .content = owned_content,
         .root_user_intent_context = owned_root_user_intent_context,
+        .root_user_messages = owned_root_user_messages,
+        .root_user_evidence_complete = evidence_complete,
         .created_at_ms = timestamp_ms,
     };
+}
+
+fn rootUserEvidenceFits(
+    messages: []const []const u8,
+    claimed_complete: bool,
+) bool {
+    if (!claimed_complete or messages.len == 0) return false;
+    var total_bytes: usize = 0;
+    for (messages) |message| {
+        if (message.len == 0) return false;
+        total_bytes = std.math.add(usize, total_bytes, message.len) catch return false;
+        if (total_bytes > domain.max_root_user_evidence_bytes) return false;
+    }
+    return true;
+}
+
+fn dupeRootUserMessages(
+    alloc: Allocator,
+    messages: []const []const u8,
+) ![][]u8 {
+    const owned = try alloc.alloc([]u8, messages.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (owned[0..initialized]) |message| alloc.free(message);
+        alloc.free(owned);
+    }
+    for (messages) |message| {
+        owned[initialized] = try alloc.dupe(u8, message);
+        initialized += 1;
+    }
+    return owned;
+}
+
+fn freeRootUserMessages(alloc: Allocator, messages: [][]u8) void {
+    for (messages) |message| alloc.free(message);
+    alloc.free(messages);
 }
 
 fn freeMessages(alloc: Allocator, messages: []domain.QueuedMessage) void {
@@ -5277,6 +5332,8 @@ test "manager persists inherited root context and replay keeps first admission" 
         .operation_id = "op-create",
         .created_child_id = "child-id",
         .root_user_intent_context = "current_request: inspect storage\n",
+        .root_user_messages = &.{ "Do not modify files.", "Inspect storage." },
+        .root_user_evidence_complete = true,
         .timestamp_ms = 1,
     });
     defer created.deinit(alloc);
@@ -5285,6 +5342,8 @@ test "manager persists inherited root context and replay keeps first admission" 
         .operation_id = "op-create",
         .created_child_id = "child-id",
         .root_user_intent_context = "current_request: replacement context\n",
+        .root_user_messages = &.{"Replacement must not win."},
+        .root_user_evidence_complete = true,
         .timestamp_ms = 2,
     });
     defer replayed.deinit(alloc);
@@ -5296,6 +5355,8 @@ test "manager persists inherited root context and replay keeps first admission" 
         .actor_id = "parent-id",
         .operation_id = "op-send",
         .root_user_intent_context = "current_request: continue\n",
+        .root_user_messages = &.{ "Do not modify files.", "Continue inspection." },
+        .root_user_evidence_complete = true,
         .timestamp_ms = 3,
     });
     defer sent.deinit(alloc);
@@ -5311,6 +5372,21 @@ test "manager persists inherited root context and replay keeps first admission" 
         "current_request: continue\n",
         record.queue[1].root_user_intent_context,
     );
+    try std.testing.expect(record.queue[0].root_user_evidence_complete);
+    try std.testing.expectEqual(@as(usize, 2), record.queue[0].root_user_messages.len);
+    try std.testing.expectEqualStrings(
+        "Do not modify files.",
+        record.queue[0].root_user_messages[0],
+    );
+    try std.testing.expectEqualStrings(
+        "Inspect storage.",
+        record.queue[0].root_user_messages[1],
+    );
+    try std.testing.expect(record.queue[1].root_user_evidence_complete);
+    try std.testing.expectEqualStrings(
+        "Continue inspection.",
+        record.queue[1].root_user_messages[1],
+    );
 
     var forged = try manager.execute(alloc, send, .{
         .actor_id = "parent-id",
@@ -5320,6 +5396,65 @@ test "manager persists inherited root context and replay keeps first admission" 
     });
     defer forged.deinit(alloc);
     try std.testing.expectEqual(FailureCode.store_failure, forged.failure.code);
+}
+
+test "manager preserves one-off authority and fails oversized child evidence closed" {
+    const alloc = std.testing.allocator;
+    var env = try TestEnvironment.init(alloc);
+    defer env.deinit(alloc);
+    try env.createSession(alloc, "parent-id");
+    try env.createSession(alloc, "one-off-child");
+    try env.createSession(alloc, "oversized-child");
+    var manager = Manager{ .sessions = &env.store };
+
+    var one_off = try domain.validateCommand(alloc, .{ .create = .{
+        .name = "one off inspection",
+        .mode = .one_off,
+        .prompt = "inspect README",
+    } });
+    defer one_off.deinit(alloc);
+    var created_one_off = try manager.execute(alloc, one_off, .{
+        .actor_id = "parent-id",
+        .operation_id = "op-one-off-authority",
+        .created_child_id = "one-off-child",
+        .root_user_messages = &.{ "Do not modify files.", "Inspect README only." },
+        .root_user_evidence_complete = true,
+        .timestamp_ms = 1,
+    });
+    defer created_one_off.deinit(alloc);
+    try std.testing.expect(created_one_off == .receipt);
+    var one_off_record = try env.loadControl(alloc, "one-off-child");
+    defer one_off_record.deinit(alloc);
+    try std.testing.expect(one_off_record.queue[0].root_user_evidence_complete);
+    try std.testing.expectEqualStrings(
+        "Do not modify files.",
+        one_off_record.queue[0].root_user_messages[0],
+    );
+
+    var oversized = try domain.validateCommand(alloc, .{ .create = .{
+        .name = "oversized authority",
+        .mode = .persistent,
+        .prompt = "continue safely",
+    } });
+    defer oversized.deinit(alloc);
+    const oversized_message = "x" ** (domain.max_root_user_evidence_bytes + 1);
+    var created_oversized = try manager.execute(alloc, oversized, .{
+        .actor_id = "parent-id",
+        .operation_id = "op-oversized-authority",
+        .created_child_id = "oversized-child",
+        .root_user_messages = &.{oversized_message},
+        .root_user_evidence_complete = true,
+        .timestamp_ms = 2,
+    });
+    defer created_oversized.deinit(alloc);
+    try std.testing.expect(created_oversized == .receipt);
+    var oversized_record = try env.loadControl(alloc, "oversized-child");
+    defer oversized_record.deinit(alloc);
+    try std.testing.expect(!oversized_record.queue[0].root_user_evidence_complete);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        oversized_record.queue[0].root_user_messages.len,
+    );
 }
 
 test "manager inspection preserves a bounded child failure reason" {

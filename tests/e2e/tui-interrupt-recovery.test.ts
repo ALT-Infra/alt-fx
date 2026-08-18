@@ -340,7 +340,8 @@ while :; do sleep 1; done
       chmodSync(scriptPath, 0o755);
 
       gateway = startFakeGateway([
-        fakeGatewayToolCall("workspace-cancel-hold", "run_command", {
+        fakeGatewayToolCall("workspace-cancel-hold", "terminal", {
+          action: "exec",
           command: "./hold-workspace-cancel.sh",
         }),
       ]);

@@ -9,7 +9,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import {
@@ -137,35 +137,141 @@ function fakeGatewayStreamingText(lines: string[], delayMs: number) {
 }
 
 describe("fx ask presentation", () => {
+  test("fresh binary defaults terminal exec and start to the user profile", async () => {
+    const configuredShell = userInfo().shell;
+    if (!configuredShell.endsWith("/bash") && !configuredShell.endsWith("/zsh")) return;
+
+    const root = createRoot();
+    if (configuredShell.endsWith("/zsh")) {
+      writeFileSync(
+        join(root.home, ".zprofile"),
+        "export FX_PROFILE_LOGIN=login\nexport PATH=\"$HOME/profile-bin:$PATH\"\n",
+      );
+      writeFileSync(
+        join(root.home, ".zshrc"),
+        "export FX_PROFILE_RC=rc\nalias fx_profile_alias='printf alias-user'\n" +
+          "fx_profile_function() { printf function-user; }\n",
+      );
+    } else {
+      writeFileSync(
+        join(root.home, ".bash_profile"),
+        "export FX_PROFILE_LOGIN=login\nexport PATH=\"$HOME/profile-bin:$PATH\"\n" +
+          "source \"$HOME/.bashrc\"\n",
+      );
+      writeFileSync(
+        join(root.home, ".bashrc"),
+        "export FX_PROFILE_RC=rc\nalias fx_profile_alias='printf alias-user'\n" +
+          "fx_profile_function() { printf function-user; }\n",
+      );
+    }
+
+    const profileCommand =
+      "printf 'mode=%s:%s:' \"${FX_PROFILE_LOGIN-unset}\" \"${FX_PROFILE_RC-unset}\"; " +
+      "case :\"$PATH\": in *:\"$HOME/profile-bin\":*) printf 'path-user:';; *) printf 'path-clean:';; esac; " +
+      "if alias fx_profile_alias >/dev/null 2>&1; then fx_profile_alias; else printf no-alias; fi; printf ':'; " +
+      "if command -v fx_profile_function >/dev/null; then fx_profile_function; else printf no-function; fi";
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("terminal-omitted", "terminal", {
+        action: "exec",
+        command: profileCommand,
+      }),
+      fakeGatewayToolCall("terminal-clean", "terminal", {
+        action: "exec",
+        command: profileCommand,
+        profile: "clean",
+      }),
+      fakeGatewayToolCall("terminal-user", "terminal", {
+        action: "exec",
+        command: profileCommand,
+        profile: "user",
+      }),
+      fakeGatewayToolCall("terminal-start-omitted", "terminal", {
+        action: "start",
+        command: profileCommand,
+        return_when: { kind: "exit" },
+        wait_ceiling_ms: 8_000,
+      }),
+      fakeGatewayToolCall("terminal-start-clean", "terminal", {
+        action: "start",
+        command: profileCommand,
+        profile: "clean",
+        return_when: { kind: "exit" },
+        wait_ceiling_ms: 8_000,
+      }),
+      fakeGatewayToolCall("terminal-start-user", "terminal", {
+        action: "start",
+        command: profileCommand,
+        profile: "user",
+        return_when: { kind: "exit" },
+        wait_ceiling_ms: 8_000,
+      }),
+      fakeGatewayFinalText("Terminal exec profiles verified.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--yolo", "--no-save", "Verify terminal exec profiles."],
+      {
+        cwd: root.workspace,
+        env: gatewayEnv(root.home, gateway),
+        timeoutMs: TIMEOUT,
+      },
+    );
+
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toBe("Terminal exec profiles verified.\n");
+    expect(gateway.requests).toHaveLength(7);
+    expect(gateway.requests[0]!.body).toContain(
+      "omitting profile is identical to profile=user",
+    );
+    expect(gateway.requests[0]!.body).toContain(
+      "omission defaults to user, while clean skips user startup files",
+    );
+    expect(gateway.requests[0]!.body).toContain(
+      "User-profile execution supports the configured Bash or zsh login shell",
+    );
+    expect(gateway.requests[0]!.body).toContain(
+      ".bashrc is available only when sourced by the login profile",
+    );
+    expect(gateway.requests[0]!.body).not.toContain(
+      "omission preserves legacy command behavior",
+    );
+    for (const requestIndex of [1, 3, 4, 6]) {
+      expect(gateway.requests[requestIndex]!.body).toContain("mode=login:rc:path-user:");
+      expect(gateway.requests[requestIndex]!.body).toContain("alias-user:function-user");
+    }
+    for (const requestIndex of [2, 5]) {
+      expect(gateway.requests[requestIndex]!.body).toContain("mode=unset:unset:path-clean:");
+      expect(gateway.requests[requestIndex]!.body).toContain("no-alias:no-function");
+    }
+  }, TIMEOUT);
+
   test.skipIf(!tmuxAvailable())(
     "fx ask executes the shared public terminal tool through the tmux backend",
     async () => {
       const root = createShortRoot();
       const toolCallId = "ask_terminal_tmux_1";
-      const gateway = startFakeGateway(
-        [
-          fakeGatewayToolCall(toolCallId, "terminal", {
-            action: "start",
-            cwd: root.workspace,
-            command: "printf ASK_PUBLIC_TERMINAL_TMUX",
-            shell: {
-              kind: "executable",
-              path: TERMINAL_FIXTURE_SHELL,
-              clean_start: true,
-            },
-            backend: "tmux",
-            return_when: { kind: "exit" },
-            wait_ceiling_ms: 8_000,
-            dimensions: { rows: 24, columns: 80 },
-          }),
-          fakeGatewayFinalText("Ask public terminal complete.\n"),
-        ],
-        { classifierResponses: [fakeGatewayPermissionDecision()] },
-      );
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall(toolCallId, "terminal", {
+          action: "start",
+          cwd: root.workspace,
+          command: "printf ASK_PUBLIC_TERMINAL_TMUX",
+          shell: {
+            kind: "executable",
+            path: TERMINAL_FIXTURE_SHELL,
+            clean_start: true,
+          },
+          backend: "tmux",
+          return_when: { kind: "exit" },
+          wait_ceiling_ms: 8_000,
+          dimensions: { rows: 24, columns: 80 },
+        }),
+        fakeGatewayFinalText("Ask public terminal complete.\n"),
+      ]);
       gateways.push(gateway);
 
       const result = await runFx(
-        ["ask", "--auto", "Run the tmux public terminal fixture."],
+        ["ask", "--yolo", "Run the tmux public terminal fixture."],
         {
           cwd: root.workspace,
           env: {
@@ -587,7 +693,8 @@ describe("fx ask presentation", () => {
       symlinkSync(instructions, join(root.workspace, "AGENTS.md"));
       const gateway = startFakeGateway(
         [
-          fakeGatewayToolCall("write_fixture", "run_command", {
+          fakeGatewayToolCall("write_fixture", "terminal", {
+            action: "exec",
             command: "printf notice-test > ask-notice.txt",
           }),
           fakeGatewayFinalText("Notice filtering complete.\n"),

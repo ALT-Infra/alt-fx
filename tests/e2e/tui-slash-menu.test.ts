@@ -374,6 +374,31 @@ function createSkillRankingFixture() {
   return { home, workspace, stderrPath };
 }
 
+function createLinkedSkillsMenuFixture() {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-linked-skills-menu-")));
+  workDirs.push(root);
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  const source = join(workspace, "skill-source", "linked-menu");
+  const skillsRoot = join(workspace, ".codex", "skills");
+  const stderrPath = join(root, "stderr.log");
+  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(source, { recursive: true });
+  mkdirSync(skillsRoot, { recursive: true });
+  writeFileSync(join(home, ".fx", "settings.json"), "{}\n");
+  writeFileSync(
+    join(source, "SKILL.md"),
+    "---\nname: linked-menu\ndescription: linked menu skill\n---\n\nLINKED_MENU_BODY\n",
+  );
+  symlinkSync(
+    "../../skill-source/linked-menu",
+    join(skillsRoot, "linked-menu"),
+    "dir",
+  );
+  writeFileSync(stderrPath, "");
+  return { home, workspace, stderrPath };
+}
+
 function createModelsMenuFixture() {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-models-menu-")));
   workDirs.push(root);
@@ -538,6 +563,56 @@ function longAssistantResponse(): string {
 }
 
 describe.skipIf(SKIP)("tui: slash menu", () => {
+  test(
+    "linked workspace skill is visible and usable from the skills menu",
+    async () => {
+      const fixture = createLinkedSkillsMenuFixture();
+      gateway = startFakeGateway([
+        fakeGatewayFinalText("LINKED_MENU_COMPLETE"),
+      ]);
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: "fake-linked-menu-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_AUTO_UPGRADE: "0",
+        },
+        width: 120,
+        height: 32,
+        stderrPath: fixture.stderrPath,
+      });
+      await session.waitForComposer(10_000);
+
+      await session.sendText("/skills");
+      const menu = await waitForSkillsMenu(session, 1);
+      expect(menu.join("\n")).toContain("linked-menu");
+      expect(menu.join("\n")).toContain("Codex · Workspace");
+      await session.sendKeys("Enter");
+      await session.waitForPane(
+        (pane) => composerContains(pane, "linked-menu"),
+        5_000,
+      );
+      await session.sendLiteralText(" apply it");
+      await session.sendKeys("Enter");
+      await session.waitForText("LINKED_MENU_COMPLETE", 10_000);
+
+      expect(gateway.requests).toHaveLength(1);
+      expect(gatewayPromptText(gateway.requests[0]!.body)).toContain(
+        "LINKED_MENU_BODY",
+      );
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
   test(
     "skill picker selects a name match before a metadata-only match",
     async () => {

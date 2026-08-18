@@ -4233,6 +4233,7 @@ fn deleteSnapshotFilesAddedByMigration(
 test "session snapshot locators resolve through their owning store" {
     const alloc = std.testing.allocator;
     var history = try alloc.alloc(session.HistoryTurn, 1);
+    errdefer alloc.free(history);
     history[0] = try session.makeAssistantTurn(alloc, "images", "done");
     defer session.freeHistoryTurnSlice(alloc, history);
     history[0].assistant.user.images = try session.dupeImageAttachmentSlice(alloc, &.{
@@ -4754,6 +4755,35 @@ fn writeLegacyFixture(
     alloc.free(path);
 }
 
+fn writeLegacyIncompleteAuthorityFixture(
+    alloc: Allocator,
+    store: Store,
+    id: []const u8,
+    workspace_root: []const u8,
+    updated_at_ms: i64,
+) !void {
+    const history = [_]session.HistoryTurn{.{ .compacted_summary = .{
+        .summary = @constCast("legacy summary"),
+        .removed_turn_count = 2,
+        .compaction_count = 1,
+        .root_user_messages_complete = false,
+        .permission_feedback_complete = false,
+    } }};
+    const rendered = try session_json.renderSessionJson(
+        alloc,
+        id,
+        10,
+        updated_at_ms,
+        session.ConversationLanguage.literal("en"),
+        workspace_root,
+        &history,
+        .{},
+    );
+    defer alloc.free(rendered);
+    const path = try writeSessionFixture(alloc, store, id, rendered);
+    alloc.free(path);
+}
+
 fn writeSummaryFixture(
     alloc: Allocator,
     store: Store,
@@ -4802,6 +4832,62 @@ fn writeWritableHistoryFixture(
 
     var history = try alloc.alloc(session.HistoryTurn, 1);
     history[0] = try session.makeAssistantTurn(alloc, prompt, "saved response");
+    defer session.freeHistoryTurnSlice(alloc, history);
+    const desired = session_codec.DurableSessionState{
+        .id = writable.state.id,
+        .origin_workspace_root = writable.state.origin_workspace_root,
+        .workspace_root = writable.state.workspace_root,
+        .created_at_ms = writable.state.created_at_ms,
+        .updated_at_ms = updated_at_ms,
+        .conversation_language = writable.state.conversation_language,
+        .preferences = writable.state.preferences,
+        .history = history,
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+    };
+    _ = try writable.commitStateReplacement(
+        alloc,
+        desired,
+        .recovery,
+        .retry_expected_tail,
+        .{},
+    );
+    writable.deinit(alloc);
+}
+
+fn writeWritableIncompleteAuthorityFixture(
+    alloc: Allocator,
+    store: Store,
+    id: []const u8,
+    workspace_root: []const u8,
+    updated_at_ms: i64,
+) !void {
+    var state = try testDurableState(alloc, id, workspace_root);
+    defer state.deinit(alloc);
+    var writable = try store.startWritableSession(alloc, state);
+    errdefer writable.deinit(alloc);
+
+    const history = blk: {
+        const owned = try alloc.alloc(session.HistoryTurn, 1);
+        errdefer alloc.free(owned);
+        const summary = try alloc.dupe(u8, "legacy summary");
+        errdefer alloc.free(summary);
+        const permission_feedback = try alloc.alloc([]u8, 1);
+        errdefer alloc.free(permission_feedback);
+        permission_feedback[0] = try alloc.dupe(
+            u8,
+            "Never mutate the production remote.",
+        );
+        owned[0] = .{ .compacted_summary = .{
+            .summary = summary,
+            .removed_turn_count = 2,
+            .compaction_count = 1,
+            .root_user_messages_complete = false,
+            .permission_feedback = permission_feedback,
+            .permission_feedback_complete = false,
+        } };
+        break :blk owned;
+    };
     defer session.freeHistoryTurnSlice(alloc, history);
     const desired = session_codec.DurableSessionState{
         .id = writable.state.id,
@@ -7793,6 +7879,67 @@ test "recovery copies the exact manifest boundary and leaves the source unchange
     try std.testing.expectEqualStrings(
         "saved prompt",
         resumed_last.state.history[0].assistant.user.text,
+    );
+}
+
+test "recovery copy preserves incomplete compacted authority" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    const source_id = "recover-incomplete-authority";
+    try writeWritableIncompleteAuthorityFixture(
+        alloc,
+        ctx.store,
+        source_id,
+        ctx.workspace,
+        20,
+    );
+    var source = try ctx.store.resumeForWrite(alloc, source_id);
+    try source.writeCheckpointIfDue(alloc, true, .{});
+    const generation = source.position.log_generation;
+    source.deinit(alloc);
+
+    const checkpoint_path = try std.fs.path.join(
+        alloc,
+        &.{ ctx.store.sessions_dir, source_id, "checkpoint.json" },
+    );
+    defer alloc.free(checkpoint_path);
+    try std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), checkpoint_path);
+    const generation_hex = std.fmt.bytesToHex(generation, .lower);
+    const watermark_name = try std.fmt.allocPrint(
+        alloc,
+        "commit.{s}.json",
+        .{generation_hex},
+    );
+    defer alloc.free(watermark_name);
+    try writeFixtureEntry(
+        alloc,
+        ctx.store,
+        source_id,
+        watermark_name,
+        "{}\n",
+    );
+
+    var result = try ctx.store.recoverSessionCopy(alloc, source_id, .{});
+    defer result.deinit(alloc);
+    var recovered = try ctx.store.resumeForWrite(
+        alloc,
+        result.recovered_session_id,
+    );
+    defer recovered.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), recovered.state.history.len);
+    try std.testing.expect(
+        !recovered.state.history[0].compacted_summary.root_user_messages_complete,
+    );
+    try std.testing.expect(
+        !recovered.state.history[0].compacted_summary.permission_feedback_complete,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        recovered.state.history[0].compacted_summary.permission_feedback.len,
     );
 }
 
@@ -11166,6 +11313,44 @@ test "writable resume migrates legacy storage" {
     defer alloc.free(stable_copy);
     try std.testing.expect(authority.len > 0);
     try std.testing.expect(stable_copy.len > 0);
+}
+
+test "writable legacy resume preserves incomplete authority through migration and reload" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    const session_id = "legacy-incomplete-authority";
+    try writeLegacyIncompleteAuthorityFixture(
+        alloc,
+        ctx.store,
+        session_id,
+        ctx.workspace,
+        20,
+    );
+
+    {
+        var resumed = try ctx.store.resumeForWrite(alloc, session_id);
+        defer resumed.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), resumed.state.history.len);
+        try std.testing.expect(
+            !resumed.state.history[0].compacted_summary.root_user_messages_complete,
+        );
+        try std.testing.expect(
+            !resumed.state.history[0].compacted_summary.permission_feedback_complete,
+        );
+    }
+
+    var reloaded = try ctx.store.loadReadOnly(alloc, session_id);
+    defer reloaded.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), reloaded.history.len);
+    try std.testing.expect(
+        !reloaded.history[0].compacted_summary.root_user_messages_complete,
+    );
+    try std.testing.expect(
+        !reloaded.history[0].compacted_summary.permission_feedback_complete,
+    );
 }
 
 test "legacy resume honors immediate session and commit lock deadlines" {

@@ -1,13 +1,18 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const contracts = @import("contracts.zig");
+const command_environment = @import("../execution/command_environment.zig");
 
 const Allocator = std.mem.Allocator;
 
-const ResolveError = error{
+pub const ResolveError = error{
     MissingLoginShell,
     RelativeShellPath,
     UnsupportedShell,
 };
+
+pub const Profile = command_environment.Profile;
+pub const Environment = command_environment.Environment;
 
 pub const Invocation = struct {
     path: []const u8,
@@ -81,6 +86,107 @@ pub fn resolve(
         },
     }
     return result;
+}
+
+pub fn configuredLoginShellInto(buffer: []u8) ?[]const u8 {
+    if (comptime !builtin.link_libc or builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return null;
+    }
+    var entry: std.c.passwd = undefined;
+    var scratch: [4096]u8 = undefined;
+    var found: ?*std.c.passwd = null;
+    if (std.c.getpwuid_r(
+        std.c.getuid(),
+        &entry,
+        &scratch,
+        scratch.len,
+        &found,
+    ) != 0) return null;
+    const record = found orelse return null;
+    const shell_ptr = record.shell orelse return null;
+    const shell = std.mem.span(shell_ptr);
+    if (shell.len == 0 or shell.len > buffer.len) return null;
+    @memcpy(buffer[0..shell.len], shell);
+    return buffer[0..shell.len];
+}
+
+pub fn environment(
+    alloc: Allocator,
+    configured_login_shell: ?[]const u8,
+    profile: ?Profile,
+) (ResolveError || Allocator.Error)!Environment {
+    const selected = profile orelse .user;
+    const path = configured_login_shell orelse return error.MissingLoginShell;
+    _ = try resolve(path, switch (selected) {
+        .clean => .{ .executable = .{ .path = path, .clean_start = true } },
+        .user => .user_login,
+    });
+    return switch (selected) {
+        .clean => .{ .clean = try alloc.dupe(u8, path) },
+        .user => .{ .user = try alloc.dupe(u8, path) },
+    };
+}
+
+pub fn profileShell(
+    alloc: Allocator,
+    configured_login_shell: ?[]const u8,
+    profile: Profile,
+) (ResolveError || Allocator.Error)!contracts.ShellSpec {
+    return switch (profile) {
+        .clean => blk: {
+            const path = configured_login_shell orelse return error.MissingLoginShell;
+            _ = try resolve(path, .{ .executable = .{ .path = path, .clean_start = true } });
+            break :blk .{ .executable = .{
+                .path = try alloc.dupe(u8, path),
+                .clean_start = true,
+            } };
+        },
+        .user => .user_login,
+    };
+}
+
+pub fn capturedInvocation(environment_value: Environment, command: []const u8) ResolveError!Invocation {
+    switch (environment_value) {
+        .legacy, .workspace_clean => return error.UnsupportedShell,
+        .clean => |path| {
+            var invocation = try resolve(null, .{ .executable = .{
+                .path = path,
+                .clean_start = true,
+            } });
+            removeInteractiveFlag(&invocation);
+            invocation.setCommand(command);
+            return invocation;
+        },
+        .user => |path| {
+            var invocation = try resolve(path, .user_login);
+            if (std.mem.eql(u8, std.fs.path.basename(path), "bash")) {
+                removeInteractiveFlag(&invocation);
+                invocation.append("-O");
+                invocation.append("expand_aliases");
+            }
+            invocation.setCommand(command);
+            return invocation;
+        },
+    }
+}
+
+pub fn formatInvocationCommand(
+    alloc: Allocator,
+    invocation: *const Invocation,
+) Allocator.Error![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(alloc);
+    for (invocation.argv(), 0..) |word, index| {
+        if (index != 0) try output.append(alloc, ' ');
+        try appendShellWord(&output, alloc, word);
+    }
+    return output.toOwnedSlice(alloc);
+}
+
+fn removeInteractiveFlag(invocation: *Invocation) void {
+    std.debug.assert(invocation.len > 0);
+    std.debug.assert(std.mem.eql(u8, invocation.values[invocation.len - 1], "-i"));
+    invocation.len -= 1;
 }
 
 pub fn buildBootstrap(
@@ -222,6 +328,58 @@ test "resolver rejects missing relative and unsupported shells" {
     try std.testing.expectError(
         error.UnsupportedShell,
         resolve(null, .{ .executable = .{ .path = "/bin/fish" } }),
+    );
+}
+
+test "captured profiles use exact non-PTY argv" {
+    const bash_clean = try capturedInvocation(.{ .clean = "/bin/bash" }, "printf clean");
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &.{ "/bin/bash", "--noprofile", "--norc", "-c", "printf clean" },
+        bash_clean.argv(),
+    );
+    const bash_user = try capturedInvocation(.{ .user = "/bin/bash" }, "printf user");
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &.{ "/bin/bash", "--login", "-O", "expand_aliases", "-c", "printf user" },
+        bash_user.argv(),
+    );
+    const zsh_clean = try capturedInvocation(.{ .clean = "/bin/zsh" }, "printf clean");
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &.{ "/bin/zsh", "-f", "-c", "printf clean" },
+        zsh_clean.argv(),
+    );
+    const zsh_user = try capturedInvocation(.{ .user = "/bin/zsh" }, "printf user");
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &.{ "/bin/zsh", "-l", "-i", "-c", "printf user" },
+        zsh_user.argv(),
+    );
+}
+
+test "captured invocation provider projection shell-quotes every argv word" {
+    const invocation = try capturedInvocation(.{ .clean = "/bin/zsh" }, "printf '%s' ok");
+    const command = try formatInvocationCommand(std.testing.allocator, &invocation);
+    defer std.testing.allocator.free(command);
+    try std.testing.expectEqualStrings(
+        "'/bin/zsh' '-f' '-c' 'printf '\"'\"'%s'\"'\"' ok'",
+        command,
+    );
+}
+
+test "profile normalization defaults captured and persistent execution to user" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expect((try environment(arena, "/bin/bash", null)).eql(.{ .user = "/bin/bash" }));
+    try std.testing.expect((try environment(arena, "/bin/zsh", null)).eql(.{ .user = "/bin/zsh" }));
+    try std.testing.expect((try environment(arena, "/bin/zsh", .clean)).eql(.{ .clean = "/bin/zsh" }));
+    try std.testing.expect((try environment(arena, "/bin/zsh", .user)).eql(.{ .user = "/bin/zsh" }));
+    try std.testing.expectEqual(contracts.ShellSpec.user_login, try profileShell(arena, "/bin/zsh", .user));
+    try std.testing.expectEqualStrings(
+        "/bin/zsh",
+        (try profileShell(arena, "/bin/zsh", .clean)).executable.path,
     );
 }
 

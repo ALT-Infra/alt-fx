@@ -15,6 +15,7 @@ const diff_mod = @import("../core/output/diff.zig");
 const file_mutation = @import("../core/tooling/file_mutation.zig");
 const file_mutation_contract = @import("../core/tooling/file_mutation_contract.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
+const mcp_model_catalog = @import("../core/mcp/model_catalog.zig");
 const mcp_elicitation = @import("../core/mcp/elicitation.zig");
 const mrtr = @import("../core/mcp/mrtr.zig");
 const permission_auto_classifier = @import("../core/permissions/auto_classifier.zig");
@@ -30,6 +31,7 @@ const session_usage = @import("../core/session/session_usage.zig");
 const subagent_agent_adapter = @import("../core/subagent/agent_adapter.zig");
 const subagent_domain = @import("../core/subagent/domain.zig");
 const subagent_execution = @import("../core/subagent/execution.zig");
+const subagent_resume_admission = @import("../core/subagent/resume_admission.zig");
 const parent_delivery_projector = @import("../core/subagent/parent_delivery_projector.zig");
 const usage_recovery = @import("../core/session/usage_recovery.zig");
 const skill_runtime = @import("../core/skills/skill_runtime.zig");
@@ -250,7 +252,6 @@ const AcpContext = struct {
             } else null,
             .cancel_flag = &session.cancel_flag,
             .background = &self.state.background,
-            .background_launch_policy = .durable_long_lived,
             .session = &session.session_rt,
             .session_allocator = self.alloc,
             .skills_dir = self.state.skills.dir,
@@ -515,8 +516,6 @@ pub fn handlePrompt(
         .permission_rules = session.permission_rules,
         .mcp_runtime = session.mcp,
         .subagent_available = state.subagent_host != null,
-        .terminal_available = state.subagent_host != null and
-            tool_dispatch.ToolCapabilities.for_host(host.current()).terminalAvailable(),
     });
     defer tool_projection.deinit(alloc);
 
@@ -660,7 +659,6 @@ pub fn runSubagentChild(
             .permission_rules = admission.rules,
             .mcp_runtime = mcp,
             .subagent_available = true,
-            .terminal_available = tool_dispatch.ToolCapabilities.for_host(host.current()).terminalAvailable(),
         },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(alloc);
@@ -741,6 +739,22 @@ fn buildAgentConfig(state: *server.ServerState, session: *server.ActiveSessionSt
         .first_call_tool_choice = session.first_call_tool_choice,
         .workspace_root = state.workspace_root,
         .access_scope = state.workspace_access.scope(state.workspace_root),
+        .origin = if (session.writable) |writable|
+            if (writable.external_prompt_origin == .persistent_child) .subagent else .root
+        else
+            .root,
+        .root_user_messages = if (session.writable) |writable|
+            writable.external_root_user_messages
+        else
+            &.{},
+        .root_user_evidence_complete = if (session.writable) |writable|
+            writable.external_root_user_evidence_complete
+        else
+            false,
+        .current_prompt_is_root_authority = if (session.writable) |writable|
+            writable.external_prompt_origin == .persistent_child
+        else
+            false,
         .context_limits = state.context_limits,
     };
 }
@@ -1117,6 +1131,20 @@ fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Arr
     try ctx.state.cfg.context_registry.appendDefaultStatic(.{
         .project_context = ctx.modelVisibleProjectContext(),
     }, arena, messages);
+    const active_session = if (ctx.state.active_session) |*session| session else null;
+    var snapshot = if (active_session) |session|
+        if (session.mcp) |mcp|
+            try mcp.snapshotModelCatalog(arena, session.permission_rules, false)
+        else
+            try mcp_model_catalog.Snapshot.empty(arena)
+    else
+        try mcp_model_catalog.Snapshot.empty(arena);
+    defer snapshot.deinit(arena);
+    const section = try mcp_model_catalog.render(arena, snapshot);
+    if (section.text.len > 0) {
+        try messages.append(arena, .{ .role = .system, .content = section.text });
+    }
+    if (section.notice) |notice| try pushContextNotice(raw_ctx, notice);
 }
 
 fn validateToolCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !agent_runtime.ToolCallValidationResult {
@@ -1224,26 +1252,23 @@ fn requestToolPermissionOutcomeWithRequest(raw_ctx: *anyopaque, arena: Allocator
 }
 
 const TestReviewTurn = struct {
-    request_messages: [1]ChatMessage,
     tool_calls: [1]ToolCall,
-    root_bindings: [1]permission_auto_classifier.RootTextBinding,
+    root_messages: [1][]const u8,
 
     fn init(root_text: []const u8, call: ToolCall) TestReviewTurn {
         return .{
-            .request_messages = .{.{ .role = .user, .content = root_text }},
             .tool_calls = .{call},
-            .root_bindings = .{.{ .message_index = 0, .text = root_text }},
+            .root_messages = .{root_text},
         };
     }
 
     fn context(self: *const TestReviewTurn) permission_auto_classifier.ReviewTurnContext {
         return .{
             .model = "openai/gpt-5",
-            .request_messages = &self.request_messages,
             .pending_assistant = .{ .role = .assistant, .tool_calls = &self.tool_calls },
             .target_call_id = self.tool_calls[0].id,
             .origin = .root,
-            .root_text_bindings = &self.root_bindings,
+            .current_root_request = self.root_messages[0],
         };
     }
 };
@@ -1389,6 +1414,8 @@ fn executeToolCall(
     defer elicitation_responder.deinit();
     tool_ctx.mcp_input_responder = elicitation_responder.responder();
     tool_ctx.root_user_intent_context = request.root_user_intent_context;
+    tool_ctx.root_user_messages = request.root_user_messages;
+    tool_ctx.root_user_evidence_complete = request.root_user_evidence_complete;
     var progress_ctx = AcpWebSearchProgressContext{ .ctx = ctx, .tool_call_id = acp_id };
     var fetch_progress_ctx = AcpWebFetchProgressContext{ .ctx = ctx, .tool_call_id = acp_id };
     tool_ctx.web_search_progress_ctx = @ptrCast(&progress_ctx);
@@ -1583,6 +1610,11 @@ fn persistAcpHistoryTurn(
         return;
     }
     const writable = if (session.writable) |*value| value else return;
+    try subagent_resume_admission.retainExternalRootUserTurn(
+        alloc,
+        writable,
+        turn,
+    );
     if (writable.degradedTail() != null) {
         const now_ms = io_mod.milliTimestamp();
         var current = try currentAcpState(alloc, session, writable, now_ms);
@@ -1749,6 +1781,9 @@ fn currentAcpState(
     const history = try session.session_rt.snapshotHistory(alloc);
     types.freeHistoryTurnSlice(alloc, state.history);
     state.history = history;
+    const permission_state = try session.session_rt.snapshotPermissionState(alloc);
+    state.permission_state.deinit(alloc);
+    state.permission_state = permission_state;
     state.conversation_language = session.session_rt.languageSnapshot();
     state.updated_at_ms = now_ms;
     const usage = try session.session_rt.usage.snapshot(alloc);
@@ -2365,6 +2400,7 @@ pub fn mapToolKind(tool_name: []const u8) acp_types.ToolCallKind {
     if (std.mem.eql(u8, tool_name, "rename_file")) return .move;
     if (std.mem.eql(u8, tool_name, "copy_file")) return .move;
     if (std.mem.eql(u8, tool_name, "create_folder")) return .edit;
+    if (std.mem.eql(u8, tool_name, "terminal")) return .execute;
     if (std.mem.eql(u8, tool_name, "run_command")) return .execute;
     if (std.mem.eql(u8, tool_name, "memory")) return .other;
     if (std.mem.eql(u8, tool_name, "skill")) return .other;
@@ -2405,7 +2441,7 @@ test "ACP lifecycle action preserves dynamic MCP availability boundaries" {
     defer alloc.free(missing_label);
     try std.testing.expectEqualStrings("Working: mcp_lookup", missing_label);
 
-    const builtin = dynamicMcpToolAvailable(builtin_tools.registry, "run_command", &.{"run_command"}, @ptrCast(&fixture), Fixture.hasTool, .unrestricted);
+    const builtin = dynamicMcpToolAvailable(builtin_tools.registry, "terminal", &.{"terminal"}, @ptrCast(&fixture), Fixture.hasTool, .unrestricted);
     try std.testing.expect(!builtin);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
 }
@@ -3342,8 +3378,8 @@ test "ACP pending tool_call updates keep provider ids stable and dedupe" {
 
     const call = ToolCall{
         .id = "provider_call_7",
-        .name = "run_command",
-        .arguments_json = "{\"command\":\"ls\"}",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"ls\"}",
     };
     const first = try ctx.sendToolCallPending(alloc, call);
     const second = try ctx.sendToolCallPending(alloc, call);
@@ -3386,8 +3422,8 @@ test "ACP defers cancelled sandbox retry to one combined failed update" {
 
     const call = ToolCall{
         .id = "retry_call",
-        .name = "run_command",
-        .arguments_json = "{\"command\":\"npm test\"}",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"npm test\"}",
     };
     const acp_id = try ctx.sendToolCallPending(alloc, call);
     const request: agent_runtime.ToolExecutionRequest = .{
@@ -3452,8 +3488,8 @@ test "ACP defers cancelled sandbox retry to one combined failed update" {
 
     const ordinary_call = ToolCall{
         .id = "ordinary_call",
-        .name = "run_command",
-        .arguments_json = "{\"command\":\"npm test\"}",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"npm test\"}",
     };
     const ordinary_acp_id = try ctx.sendToolCallPending(alloc, ordinary_call);
     var ordinary_request = request;
@@ -3599,10 +3635,11 @@ test "ACP registry callbacks preserve snapshot bytes before transient context" {
     try deps.append_static_context.?(deps.ctx, arena, &messages);
     try deps.append_runtime_context(deps.ctx, arena, &messages);
 
-    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
+    try std.testing.expectEqual(@as(usize, 4), messages.items.len);
     try std.testing.expectEqualStrings("base system", messages.items[0].content.?);
     try std.testing.expectEqualStrings("ACP registry context 1", messages.items[1].content.?);
-    try std.testing.expectEqualStrings("ACP registry transient", messages.items[2].content.?);
+    try std.testing.expect(std.mem.find(u8, messages.items[2].content.?, "<mcp_servers>") != null);
+    try std.testing.expectEqualStrings("ACP registry transient", messages.items[3].content.?);
     try std.testing.expectEqualStrings("ACP registry context 1", AcpContextRegistryFixture.static_context.?);
     try std.testing.expectEqual(@as(usize, 1), AcpContextRegistryFixture.transient_calls);
     try std.testing.expectEqual(
@@ -3826,7 +3863,7 @@ test "ACP prompt projection configures web search then blocks native execution" 
     try std.testing.expectEqual(@as(usize, 0), provider_state.calls);
 }
 
-test "ACP run_command admission preserves direct configured authority and falls back to approval without a reviewer" {
+test "ACP default user commands require configured authority or review" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -3837,18 +3874,16 @@ test "ACP run_command admission preserves direct configured authority and falls 
 
     const direct = (try requestToolPermissionOutcome(&ctx, arena, .{
         .id = "direct",
-        .name = "run_command",
-        .arguments_json = "{\"command\":\"pwd\"}",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"pwd\"}",
     }, .ask, &.{}, &.{}));
-    switch ((direct.execution_authority orelse return error.TestExpectedEqual).run_command) {
-        .direct_only => |fingerprint| try std.testing.expectEqualStrings("/tmp/workspace", fingerprint.resolved_cwd),
-        .shell_allowed => return error.TestExpectedDirectOnly,
-    }
+    try std.testing.expectEqual(ToolPermissionDecision.permission_required, direct.decision);
+    try std.testing.expect(direct.execution_authority == null);
 
     const blocked = (try requestToolPermissionOutcome(&ctx, arena, .{
         .id = "blocked",
-        .name = "run_command",
-        .arguments_json = "{\"command\":\"touch blocked.txt\"}",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"touch blocked.txt\"}",
     }, .ask, &.{}, &.{}));
     try std.testing.expectEqual(ToolPermissionDecision.permission_required, blocked.decision);
     try std.testing.expect(blocked.execution_authority == null);
@@ -3856,8 +3891,8 @@ test "ACP run_command admission preserves direct configured authority and falls 
     state.active_session.?.permission_rules = try testPermissionRuleSet(alloc, "bash", "touch *", .allow);
     const configured = (try requestToolPermissionOutcome(&ctx, arena, .{
         .id = "configured",
-        .name = "run_command",
-        .arguments_json = "{\"command\":\"touch configured.txt\"}",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"touch configured.txt\"}",
     }, .ask, &.{}, &.{}));
     switch ((configured.execution_authority orelse return error.TestExpectedEqual).run_command) {
         .direct_only => return error.TestExpectedShellAllowed,
@@ -3868,11 +3903,11 @@ test "ACP run_command admission preserves direct configured authority and falls 
     state.active_session.?.permission_rules = .{};
     const automatic = (try requestToolPermissionOutcome(&ctx, arena, .{
         .id = "automatic",
-        .name = "run_command",
-        .arguments_json = "{\"command\":\"touch automatic.txt\"}",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"touch automatic.txt\"}",
     }, .auto, &.{}, &.{}));
-    try std.testing.expectEqual(ToolPermissionDecision.permission_required, automatic.decision);
-    try std.testing.expectEqual(types.ToolPermissionDenialReason.permission_required, automatic.denial_reason.?);
+    try std.testing.expectEqual(ToolPermissionDecision.deny, automatic.decision);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, automatic.denial_reason.?);
     try std.testing.expect(automatic.execution_authority == null);
 }
 
@@ -3889,7 +3924,7 @@ test "ACP auto mode uses automatic review allow and ask without prompting" {
         ) anyerror!permission_auto_classifier.ParseOutcome {
             const self: *@This() = @ptrCast(@alignCast(raw_ctx));
             self.calls += 1;
-            self.root_text = request.review_turn.root_text_bindings[0].text;
+            self.root_text = request.review_turn.current_root_request;
             return .{ .valid = .{
                 .risk = if (self.decision == .allow) .low else .high,
                 .authorization = if (self.decision == .allow) .medium else .low,
@@ -3916,21 +3951,33 @@ test "ACP auto mode uses automatic review allow and ask without prompting" {
         ),
     };
 
-    const direct = try requestToolPermissionOutcome(&ctx, arena, .{
+    const direct_call: ToolCall = .{
         .id = "direct",
-        .name = "run_command",
-        .arguments_json = "{\"command\":\"pwd\"}",
-    }, .auto, &.{}, &.{});
-    switch ((direct.execution_authority orelse return error.TestExpectedEqual).run_command) {
-        .direct_only => {},
-        .shell_allowed => return error.TestExpectedDirectOnly,
-    }
-    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"pwd\"}",
+    };
+    var direct_review = TestReviewTurn.init("Inspect the workspace.", direct_call);
+    const direct = try requestToolPermissionOutcomeWithRequest(
+        &ctx,
+        arena,
+        direct_call,
+        direct_review.context(),
+        .auto,
+        &.{},
+        null,
+        null,
+        &.{},
+    );
+    try std.testing.expectEqual(
+        command_admission.ShellAuthorizationSource.auto_classifier,
+        direct.execution_authority.?.run_command.shell_allowed.source,
+    );
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
 
     const accepted_call: ToolCall = .{
         .id = "accepted",
-        .name = "run_command",
-        .arguments_json = "{\"command\":\"touch accepted.txt\"}",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"touch accepted.txt\"}",
     };
     var accepted_review = TestReviewTurn.init("Create accepted.txt.", accepted_call);
     const accepted = try requestToolPermissionOutcomeWithRequest(&ctx, arena, accepted_call, accepted_review.context(), .auto, &.{}, null, null, &.{});
@@ -3941,7 +3988,7 @@ test "ACP auto mode uses automatic review allow and ask without prompting" {
             authority.source,
         ),
     }
-    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
     try std.testing.expectEqualStrings(
         "Create accepted.txt.",
         fake.root_text,
@@ -3950,15 +3997,15 @@ test "ACP auto mode uses automatic review allow and ask without prompting" {
     fake.decision = .ask;
     const blocked_call: ToolCall = .{
         .id = "check",
-        .name = "run_command",
-        .arguments_json = "{\"command\":\"touch check.txt\"}",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"touch check.txt\"}",
     };
     var blocked_review = TestReviewTurn.init("Check whether this is allowed.", blocked_call);
     const blocked = try requestToolPermissionOutcomeWithRequest(&ctx, arena, blocked_call, blocked_review.context(), .auto, &.{}, null, null, &.{});
-    try std.testing.expectEqual(ToolPermissionDecision.permission_required, blocked.decision);
-    try std.testing.expectEqual(types.ToolPermissionDenialReason.permission_required, blocked.denial_reason.?);
+    try std.testing.expectEqual(ToolPermissionDecision.deny, blocked.decision);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, blocked.denial_reason.?);
     try std.testing.expect(blocked.execution_authority == null);
-    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
     const blocked_classifier = blocked.auto_review_result orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(permission_auto_classifier.Decision.ask, blocked_classifier.decision);
     try std.testing.expectEqualStrings("test reviewer rationale", blocked_classifier.rationale);
@@ -3978,7 +4025,7 @@ test "ACP auto mode automatic review allows or asks prepared external file mutat
         ) anyerror!permission_auto_classifier.ParseOutcome {
             const self: *@This() = @ptrCast(@alignCast(raw_ctx));
             self.calls += 1;
-            self.root_text = request.review_turn.root_text_bindings[0].text;
+            self.root_text = request.review_turn.current_root_request;
             self.saw_file_mutation_context = std.meta.activeTag(request.action) == .file_mutation;
             return .{ .valid = .{
                 .risk = if (self.decision == .allow) .low else .high,
@@ -4052,8 +4099,8 @@ test "ACP auto mode automatic review allows or asks prepared external file mutat
     var blocked_review = TestReviewTurn.init("Create desktop-test.txt with hello.", blocked_call);
     const blocked = try requestToolPermissionOutcomeWithRequest(&ctx, arena, blocked_call, blocked_review.context(), .auto, &.{}, null, null, &.{});
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
-    try std.testing.expectEqual(ToolPermissionDecision.permission_required, blocked.decision);
-    try std.testing.expectEqual(types.ToolPermissionDenialReason.permission_required, blocked.denial_reason.?);
+    try std.testing.expectEqual(ToolPermissionDecision.deny, blocked.decision);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, blocked.denial_reason.?);
     try std.testing.expect(blocked.execution_authority == null);
     const blocked_classifier = blocked.auto_review_result orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(permission_auto_classifier.Decision.ask, blocked_classifier.decision);
@@ -4125,7 +4172,7 @@ test "ACP auto mode requires review when only one copy target is configured" {
         .arguments_json = args,
     }, .auto, &.{}, &.{})).decision;
 
-    try std.testing.expectEqual(ToolPermissionDecision.permission_required, decision);
+    try std.testing.expectEqual(ToolPermissionDecision.deny, decision);
 }
 
 test "ACP permission rejects semantic_search outside workspace target" {

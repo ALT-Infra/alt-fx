@@ -16,6 +16,7 @@ const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
 const hooks = @import("../hooks/hooks.zig");
 const io_mod = @import("../shared/io.zig");
 const mcp_elicitation_interaction = @import("../mcp/elicitation_interaction.zig");
+const mcp_model_catalog = @import("../mcp/model_catalog.zig");
 const permission_gate = @import("../permissions/permission_gate.zig");
 const permissions = @import("../permissions/permissions.zig");
 const prompt_policy_contract = @import("../config/prompt_policy.zig");
@@ -243,10 +244,6 @@ pub fn Runtime(comptime App: type) type {
                     &app.terminal_client
                 else
                     null,
-                .background_launch_policy = if (child_capability != null)
-                    .durable_long_lived
-                else
-                    .process_local_long_lived,
                 .session = &app.session,
                 .session_allocator = app.alloc,
                 .skills_dir = app.skills.dir,
@@ -723,6 +720,8 @@ pub fn Runtime(comptime App: type) type {
         ) !agent_runtime.ToolExecutionResult {
             var ctx = toolContext(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url);
             ctx.root_user_intent_context = request.root_user_intent_context;
+            ctx.root_user_messages = request.root_user_messages;
+            ctx.root_user_evidence_complete = request.root_user_evidence_complete;
             ctx.session_grants = request.session_grants;
             ctx.advertised_dynamic_tool_names = request.advertised_dynamic_tool_names;
             ctx.max_tool_result_bytes = request.max_tool_result_bytes;
@@ -753,6 +752,34 @@ pub fn Runtime(comptime App: type) type {
             try app.contextRegistry().appendDefaultStatic(.{
                 .project_context = modelVisibleProjectContext(app),
             }, arena, messages);
+            var snapshot = if (comptime @hasDecl(App, "snapshotMcpModelCatalog"))
+                try app.snapshotMcpModelCatalog(
+                    arena,
+                    if (comptime @hasField(App, "permission_engine")) app.permission_engine.rules else .{},
+                    false,
+                )
+            else
+                try mcp_model_catalog.Snapshot.empty(arena);
+            defer snapshot.deinit(arena);
+            const section = try mcp_model_catalog.render(arena, snapshot);
+            if (section.text.len > 0) {
+                try messages.append(arena, .{ .role = .system, .content = section.text });
+            }
+            if (section.notice) |notice| try pushMcpModelCatalogNotice(app, notice);
+        }
+
+        fn pushMcpModelCatalogNotice(app: *App, notice: []const u8) !void {
+            if (comptime @hasDecl(@TypeOf(app.session), "claimContextNotice")) {
+                if (!try app.session.claimContextNotice(std.heap.c_allocator, notice)) return;
+            }
+            const body = try types.renderContextNoticeBody(std.heap.c_allocator, notice);
+            defer std.heap.c_allocator.free(body);
+            try app_worker_runtime.Runtime(App).pushSemanticNotice(app, .{
+                .topic = "context",
+                .tone = .warning,
+                .body = body,
+                .visibility = .full_only,
+            });
         }
 
         pub fn appendTransientRuntimeContextMessage(
@@ -1078,6 +1105,22 @@ pub fn Runtime(comptime App: type) type {
                 .first_call_tool_choice = job.agent_settings.first_call_tool_choice,
                 .workspace_root = app.workspace_root,
                 .access_scope = appAccessScope(app),
+                .origin = if (app.session_persistence.writable) |writable|
+                    if (writable.external_prompt_origin == .persistent_child) .subagent else .root
+                else
+                    .root,
+                .root_user_messages = if (app.session_persistence.writable) |writable|
+                    writable.external_root_user_messages
+                else
+                    &.{},
+                .root_user_evidence_complete = if (app.session_persistence.writable) |writable|
+                    writable.external_root_user_evidence_complete
+                else
+                    false,
+                .current_prompt_is_root_authority = if (app.session_persistence.writable) |writable|
+                    writable.external_prompt_origin == .persistent_child
+                else
+                    false,
                 .session_child_capability = session_child_capability,
                 .context_limits = if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
             };
@@ -1108,9 +1151,16 @@ fn formatToolAction(
     };
     if (try tool_presentation.formatRunCommandActivity(arena, ctx.tool_registry, ctx.workspace_root, call)) |activity| {
         defer arena.free(activity.detail);
+        const label = if (activity.compatibility_tool) |compatibility_tool|
+            specLabel(compatibility_tool, state, denied_label)
+        else switch (state) {
+            .active => "Running",
+            .completed => "Ran",
+            .denied => denied_label.?,
+        };
         return formatToolActionValue(
             arena,
-            specLabel(activity.compatibility_tool orelse spec, state, denied_label),
+            label,
             activity.detail,
         );
     }
@@ -1196,7 +1246,7 @@ const test_ignored_list_entries = [_][]const u8{ ".git", "zig-out" };
 const test_gateway_chat_url = "https://gateway.test/chat";
 const test_tools = [_]tool_dispatch.Tool{
     test_builtin_tools.web_search,
-    test_builtin_tools.run_command,
+    test_builtin_tools.terminal,
     test_builtin_tools.memory,
     test_builtin_tools.semantic_search,
     test_builtin_tools.skill,
@@ -1420,6 +1470,15 @@ const FakeApp = struct {
 
     fn contextRegistry(self: *const FakeApp) context_contract.Registry {
         return self.context_registry;
+    }
+
+    fn snapshotMcpModelCatalog(
+        _: *FakeApp,
+        alloc: Allocator,
+        _: types.PermissionRuleSet,
+        _: bool,
+    ) !mcp_model_catalog.Snapshot {
+        return mcp_model_catalog.Snapshot.empty(alloc);
     }
 
     fn promptPolicy(_: *const FakeApp) prompt_policy_contract.Policy {
@@ -1759,20 +1818,14 @@ test "interactive app prepared file mutation callback applies app permission pol
     const deps = app_callbacks.Bindings(FakeApp).agentRuntimeDeps(&app);
     const callback = deps.request_prepared_file_mutation_permission orelse
         return error.TestExpectedPreparedFileMutationCallback;
-    const review_messages = [_]ChatMessage{
-        .{ .role = .user, .content = "do not bypass policy" },
-    };
     const review_calls = [_]ToolCall{call};
-    const review_bindings = [_]permission_auto_classifier.RootTextBinding{
-        .{ .message_index = 0, .text = "do not bypass policy" },
-    };
+    const review_root_messages = [_][]const u8{"do not bypass policy"};
     const review_turn: permission_auto_classifier.ReviewTurnContext = .{
         .model = "openai/gpt-5",
-        .request_messages = &review_messages,
         .pending_assistant = .{ .role = .assistant, .tool_calls = &review_calls },
         .target_call_id = call.id,
         .origin = .root,
-        .root_text_bindings = &review_bindings,
+        .current_root_request = review_root_messages[0],
     };
     const outcome = try callback(
         deps.ctx,
@@ -1918,8 +1971,8 @@ test "app agent runtime formats active completed denied and MCP tool actions" {
 
     const run_call: ToolCall = .{
         .id = "1",
-        .name = "run_command",
-        .arguments_json = "{\"command\":\"zig build\"}",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"zig build\"}",
     };
 
     const active = try app.describeToolAction(arena, run_call);
@@ -1974,7 +2027,7 @@ test "app agent runtime formats active completed denied and MCP tool actions" {
     try std.testing.expectEqual(@as(usize, 1), app.mcp_has_tool_calls);
 
     app.mcp_has_tool_calls = 0;
-    const builtin_advertised = [_][]const u8{"run_command"};
+    const builtin_advertised = [_][]const u8{"terminal"};
     _ = try Runtime(FakeApp).describeToolActionCompleted(&app, arena, run_call, null, &builtin_advertised, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
     try std.testing.expectEqual(@as(usize, 0), app.mcp_has_tool_calls);
 }
@@ -2012,10 +2065,10 @@ test "app agent runtime bounds a large multiline run command activity" {
     var app = try FakeApp.init(alloc);
     defer app.deinit();
 
-    const arguments_json = "{\"command\":\"" ++ ("x\\n" ** 20_000) ++ "\"}";
+    const arguments_json = "{\"action\":\"exec\",\"command\":\"" ++ ("x\\n" ** 20_000) ++ "\"}";
     const label = try app.describeToolAction(arena, .{
         .id = "large_command",
-        .name = "run_command",
+        .name = "terminal",
         .arguments_json = arguments_json,
     });
 
@@ -2285,10 +2338,11 @@ test "app agent runtime appends static and transient context through configured 
     try Runtime(FakeApp).appendStaticContextMessage(&app, arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
     try Runtime(FakeApp).appendTransientRuntimeContextMessage(&app, arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
 
-    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
+    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
     try std.testing.expectEqual(types.ChatRole.system, messages.items[0].role);
     try std.testing.expectEqualStrings("provider static:project context", messages.items[0].content.?);
-    try std.testing.expectEqualStrings("provider transient:/tmp/workspace:auto:macos", messages.items[1].content.?);
+    try std.testing.expect(std.mem.find(u8, messages.items[1].content.?, "<mcp_servers>") != null);
+    try std.testing.expectEqualStrings("provider transient:/tmp/workspace:auto:macos", messages.items[2].content.?);
 }
 
 test "app agent runtime prefers active queued project context snapshot" {
@@ -2308,8 +2362,9 @@ test "app agent runtime prefers active queued project context snapshot" {
 
     try Runtime(FakeApp).appendStaticContextMessage(&app, arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
 
-    try std.testing.expectEqual(@as(usize, 1), messages.items.len);
+    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
     try std.testing.expectEqualStrings("provider static:queued project context", messages.items[0].content.?);
+    try std.testing.expect(std.mem.find(u8, messages.items[1].content.?, "<mcp_servers>") != null);
     const tool_context = testToolContext(&app);
     try std.testing.expectEqualStrings("test.default_context", tool_context.context_registry.defaultProvider().id);
 }

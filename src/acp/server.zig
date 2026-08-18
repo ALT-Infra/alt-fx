@@ -410,6 +410,11 @@ fn resolveSubagentAuthority(
     else
         null;
     defer if (mcp_view) |*view| view.deinit(alloc);
+    var permission_state = active.session_rt.snapshotPermissionState(alloc) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.HostAuthorityUnavailable,
+    };
+    defer permission_state.deinit(alloc);
     return subagent_tool_host.captureHostAuthorityWithMcpView(
         alloc,
         .{
@@ -425,6 +430,7 @@ fn resolveSubagentAuthority(
         owned_integrations,
         active.permission_rules,
         active.session_grants,
+        permission_state,
         if (mcp_view) |*view| view else null,
     );
 }
@@ -452,6 +458,9 @@ fn flushActiveSessionUsage(state: *ServerState) !void {
     const history = try active.session_rt.snapshotHistory(state.alloc);
     types.freeHistoryTurnSlice(state.alloc, current.history);
     current.history = history;
+    const permission_state = try active.session_rt.snapshotPermissionState(state.alloc);
+    current.permission_state.deinit(state.alloc);
+    current.permission_state = permission_state;
     current.conversation_language = active.session_rt.languageSnapshot();
     const usage_snapshot = try active.session_rt.usage.snapshot(state.alloc);
     if (current.usage) |*old| old.deinit(state.alloc);
@@ -1120,7 +1129,7 @@ fn parseInitializeRequest(
     return request;
 }
 
-fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator, default_fast_mode: bool) !app_lifecycle.StartupState {
+fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator) !app_lifecycle.StartupState {
     if (state.cfg.home_override) |home_dir| {
         if (state.cfg.workspace_root_override) |workspace_root| {
             return app_lifecycle.loadEmbeddedStartupState(
@@ -1128,7 +1137,6 @@ fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator, defau
                 home_dir,
                 workspace_root,
                 state.cfg.default_model,
-                default_fast_mode,
                 state.cfg.default_agent_step_limit,
             );
         }
@@ -1138,7 +1146,6 @@ fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator, defau
         state.cfg.gateway_provider.oauth_transport,
         state.cfg.secret_store,
         state.cfg.default_model,
-        default_fast_mode,
         state.cfg.default_agent_step_limit,
     );
 }
@@ -1158,8 +1165,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         });
     };
 
-    const effective_default_fast_mode = state.cfg.default_fast_mode and state.cfg.model_override == null;
-    var startup = loadConfiguredStartupState(state, alloc, effective_default_fast_mode) catch |err| {
+    var startup = loadConfiguredStartupState(state, alloc) catch |err| {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.internal_error,
             .message = sandbox.configErrorMessage(err) orelse "Failed to load startup state",

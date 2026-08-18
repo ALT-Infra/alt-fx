@@ -7,7 +7,8 @@ const tool_result = @import("tool_result.zig");
 const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
-const schema_version: u64 = 6;
+const schema_version: u64 = 7;
+const root_context_schema_version: u64 = 6;
 const permission_mode_schema_version: u64 = 5;
 const manager_epoch_schema_version: u64 = 4;
 const process_epoch_schema_version: u64 = 3;
@@ -510,6 +511,14 @@ fn renderMessage(writer: *std.Io.Writer, message: domain.QueuedMessage) !void {
     try writeJsonString(writer, message.content);
     try writer.writeAll(",\"root_user_intent_context\":");
     try writeJsonString(writer, message.root_user_intent_context);
+    try writer.writeAll(",\"root_user_messages\":[");
+    for (message.root_user_messages, 0..) |root_user_message, index| {
+        if (index != 0) try writer.writeByte(',');
+        try writeJsonString(writer, root_user_message);
+    }
+    try writer.print("],\"root_user_evidence_complete\":{}", .{
+        message.root_user_evidence_complete,
+    });
     try writer.writeAll(",\"status\":");
     try writeJsonString(writer, @tagName(message.status));
     try writer.writeAll(",\"cancellation_reason\":");
@@ -622,11 +631,7 @@ fn parseRecord(alloc: Allocator, bytes: []const u8) LoadError!Record {
     const root = requireObject(parsed.value) catch return error.InvalidControlRecord;
     const version = requireU64(root, "schema_version") catch
         return error.InvalidControlRecord;
-    if (version != schema_version and version != permission_mode_schema_version and
-        version != manager_epoch_schema_version and
-        version != process_epoch_schema_version and
-        version != legacy_schema_version)
-    {
+    if (version < legacy_schema_version or version > schema_version) {
         return error.UnsupportedControlSchema;
     }
     const common_fields = [_][]const u8{
@@ -654,9 +659,7 @@ fn parseRecord(alloc: Allocator, bytes: []const u8) LoadError!Record {
     };
     const object = exactObject(
         parsed.value,
-        if (version == schema_version or version == permission_mode_schema_version or
-            version == manager_epoch_schema_version or
-            version == process_epoch_schema_version)
+        if (version >= process_epoch_schema_version)
             &current_fields
         else
             &common_fields,
@@ -742,9 +745,7 @@ fn parseRecord(alloc: Allocator, bytes: []const u8) LoadError!Record {
     {
         return error.InvalidControlRecord;
     }
-    const has_manager_epochs = version == schema_version or
-        version == permission_mode_schema_version or
-        version == manager_epoch_schema_version;
+    const has_manager_epochs = version >= manager_epoch_schema_version;
     const model_replay_floor = if (has_manager_epochs)
         stored_model_replay_floor
     else
@@ -872,6 +873,23 @@ fn validateRecordSemantics(
             ))
         {
             return error.InvalidControlRecord;
+        }
+        if (message.root_user_evidence_complete !=
+            (message.root_user_messages.len > 0))
+        {
+            return error.InvalidControlRecord;
+        }
+        var root_user_bytes: usize = 0;
+        for (message.root_user_messages) |root_user_message| {
+            if (root_user_message.len == 0) return error.InvalidControlRecord;
+            root_user_bytes = std.math.add(
+                usize,
+                root_user_bytes,
+                root_user_message.len,
+            ) catch return error.InvalidControlRecord;
+            if (root_user_bytes > domain.max_root_user_evidence_bytes) {
+                return error.InvalidControlRecord;
+            }
         }
         const requires_reason = message.status == .cancelled or
             message.status == .interrupted;
@@ -1094,7 +1112,7 @@ fn parseConfiguration(
 ) LoadError!domain.Configuration {
     const object = exactObject(
         value,
-        if (version == schema_version or version == permission_mode_schema_version)
+        if (version >= permission_mode_schema_version)
             &.{ "name", "model", "effort", "permission_mode", "notifications" }
         else
             &.{ "name", "model", "effort", "notifications" },
@@ -1116,8 +1134,7 @@ fn parseConfiguration(
         .name = name,
         .model = model,
         .effort = effort,
-        .permission_mode = if (version == schema_version or
-            version == permission_mode_schema_version)
+        .permission_mode = if (version >= permission_mode_schema_version)
             parseEnum(
                 types.PermissionMode,
                 requireString(object, "permission_mode") catch
@@ -1206,22 +1223,37 @@ fn parseQueue(
         messages.deinit(alloc);
     }
     for (value.array.items) |item| {
-        const object = exactObject(item, if (version == schema_version) &.{
-            "id",
-            "source_id",
-            "content",
-            "root_user_intent_context",
-            "status",
-            "cancellation_reason",
-            "created_at_ms",
-        } else &.{
-            "id",
-            "source_id",
-            "content",
-            "status",
-            "cancellation_reason",
-            "created_at_ms",
-        }) catch return error.InvalidControlRecord;
+        const object = exactObject(item, if (version == schema_version)
+            &.{
+                "id",
+                "source_id",
+                "content",
+                "root_user_intent_context",
+                "root_user_messages",
+                "root_user_evidence_complete",
+                "status",
+                "cancellation_reason",
+                "created_at_ms",
+            }
+        else if (version == root_context_schema_version)
+            &.{
+                "id",
+                "source_id",
+                "content",
+                "root_user_intent_context",
+                "status",
+                "cancellation_reason",
+                "created_at_ms",
+            }
+        else
+            &.{
+                "id",
+                "source_id",
+                "content",
+                "status",
+                "cancellation_reason",
+                "created_at_ms",
+            }) catch return error.InvalidControlRecord;
         const id_raw = requireString(object, "id") catch return error.InvalidControlRecord;
         domain.validateOperationId(id_raw) catch return error.InvalidControlRecord;
         const source_raw = requireString(object, "source_id") catch
@@ -1231,7 +1263,7 @@ fn parseQueue(
             return error.InvalidControlRecord;
         validateText(content_raw, domain.max_message_bytes) catch
             return error.InvalidControlRecord;
-        const root_user_intent_context_raw = if (version == schema_version)
+        const root_user_intent_context_raw = if (version >= root_context_schema_version)
             requireString(object, "root_user_intent_context") catch
                 return error.InvalidControlRecord
         else
@@ -1243,6 +1275,21 @@ fn parseQueue(
         {
             return error.InvalidControlRecord;
         }
+        const root_user_evidence_complete = if (version == schema_version)
+            requireBool(object, "root_user_evidence_complete") catch
+                return error.InvalidControlRecord
+        else
+            false;
+        const root_user_messages = if (version == schema_version)
+            try parseRootUserMessages(
+                alloc,
+                object.get("root_user_messages") orelse
+                    return error.InvalidControlRecord,
+                root_user_evidence_complete,
+            )
+        else
+            try alloc.alloc([]u8, 0);
+        errdefer freeRootUserMessages(alloc, root_user_messages);
         const reason_raw = optionalString(object, "cancellation_reason") catch
             return error.InvalidControlRecord;
         if (reason_raw) |reason| {
@@ -1269,6 +1316,8 @@ fn parseQueue(
             .source_id = source_id,
             .content = content,
             .root_user_intent_context = root_user_intent_context,
+            .root_user_messages = root_user_messages,
+            .root_user_evidence_complete = root_user_evidence_complete,
             .status = parseEnum(
                 domain.QueueStatus,
                 requireString(object, "status") catch return error.InvalidControlRecord,
@@ -1279,6 +1328,38 @@ fn parseQueue(
         });
     }
     return messages.toOwnedSlice(alloc);
+}
+
+fn parseRootUserMessages(
+    alloc: Allocator,
+    value: std.json.Value,
+    complete: bool,
+) LoadError![][]u8 {
+    if (value != .array) return error.InvalidControlRecord;
+    if (complete != (value.array.items.len > 0)) return error.InvalidControlRecord;
+    const messages = try alloc.alloc([]u8, value.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (messages[0..initialized]) |message| alloc.free(message);
+        alloc.free(messages);
+    }
+    var total_bytes: usize = 0;
+    for (value.array.items) |item| {
+        if (item != .string or item.string.len == 0) return error.InvalidControlRecord;
+        total_bytes = std.math.add(usize, total_bytes, item.string.len) catch
+            return error.InvalidControlRecord;
+        if (total_bytes > domain.max_root_user_evidence_bytes) {
+            return error.InvalidControlRecord;
+        }
+        messages[initialized] = try alloc.dupe(u8, item.string);
+        initialized += 1;
+    }
+    return messages;
+}
+
+fn freeRootUserMessages(alloc: Allocator, messages: [][]u8) void {
+    for (messages) |message| alloc.free(message);
+    alloc.free(messages);
 }
 
 fn parseEvents(alloc: Allocator, value: std.json.Value) LoadError![]domain.Event {
@@ -1480,10 +1561,7 @@ fn parseOperations(
         operations.deinit(alloc);
     }
     for (value.array.items) |item| {
-        const has_identity = version == schema_version or
-            version == permission_mode_schema_version or
-            version == manager_epoch_schema_version or
-            version == process_epoch_schema_version;
+        const has_identity = version >= process_epoch_schema_version;
         const object = exactObject(item, if (has_identity) &.{
             "id",
             "request_fingerprint",
@@ -1808,11 +1886,13 @@ test "control codec round trips an exact versioned record" {
     try std.testing.expectEqualStrings("halfway", decoded.configuration.notifications.milestones[0]);
 }
 
-test "queue codec persists canonical root user context and migrates v5 empty" {
+test "queue codec persists exact root authority and migrates legacy context incomplete" {
     const alloc = std.testing.allocator;
     const current_json =
         "[{\"id\":\"work-1\",\"source_id\":\"parent-id\",\"content\":\"inspect the requested file\"," ++
         "\"root_user_intent_context\":\"current_request: inspect the requested file\\n\"," ++
+        "\"root_user_messages\":[\"Do not modify files.\",\"Inspect the requested file.\"]," ++
+        "\"root_user_evidence_complete\":true," ++
         "\"status\":\"pending\",\"cancellation_reason\":null,\"created_at_ms\":1}]";
     var parsed_current = try std.json.parseFromSlice(std.json.Value, alloc, current_json, .{});
     defer parsed_current.deinit();
@@ -1821,6 +1901,12 @@ test "queue codec persists canonical root user context and migrates v5 empty" {
     try std.testing.expectEqualStrings(
         "current_request: inspect the requested file\n",
         current[0].root_user_intent_context,
+    );
+    try std.testing.expect(current[0].root_user_evidence_complete);
+    try std.testing.expectEqual(@as(usize, 2), current[0].root_user_messages.len);
+    try std.testing.expectEqualStrings(
+        "Do not modify files.",
+        current[0].root_user_messages[0],
     );
 
     var rendered: std.Io.Writer.Allocating = .init(alloc);
@@ -1831,19 +1917,35 @@ test "queue codec persists canonical root user context and migrates v5 empty" {
         rendered.written(),
         "\"root_user_intent_context\":\"current_request: inspect the requested file\\n\"",
     ) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        rendered.written(),
+        "\"root_user_messages\":[\"Do not modify files.\",\"Inspect the requested file.\"]",
+    ) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        rendered.written(),
+        "\"root_user_evidence_complete\":true",
+    ) != null);
 
-    const v5_json =
+    const v6_json =
         "[{\"id\":\"work-1\",\"source_id\":\"parent-id\",\"content\":\"inspect the requested file\"," ++
+        "\"root_user_intent_context\":\"current_request: inspect the requested file\\n\"," ++
         "\"status\":\"pending\",\"cancellation_reason\":null,\"created_at_ms\":1}]";
-    var parsed_v5 = try std.json.parseFromSlice(std.json.Value, alloc, v5_json, .{});
-    defer parsed_v5.deinit();
+    var parsed_v6 = try std.json.parseFromSlice(std.json.Value, alloc, v6_json, .{});
+    defer parsed_v6.deinit();
     const migrated = try parseQueue(
         alloc,
-        parsed_v5.value,
-        permission_mode_schema_version,
+        parsed_v6.value,
+        root_context_schema_version,
     );
     defer freeQueue(alloc, migrated);
-    try std.testing.expectEqual(@as(usize, 0), migrated[0].root_user_intent_context.len);
+    try std.testing.expectEqualStrings(
+        "current_request: inspect the requested file\n",
+        migrated[0].root_user_intent_context,
+    );
+    try std.testing.expect(!migrated[0].root_user_evidence_complete);
+    try std.testing.expectEqual(@as(usize, 0), migrated[0].root_user_messages.len);
 
     const forged_json =
         "[{\"id\":\"work-1\",\"source_id\":\"parent-id\",\"content\":\"inspect the requested file\"," ++
@@ -1853,7 +1955,7 @@ test "queue codec persists canonical root user context and migrates v5 empty" {
     defer parsed_forged.deinit();
     try std.testing.expectError(
         error.InvalidControlRecord,
-        parseQueue(alloc, parsed_forged.value, schema_version),
+        parseQueue(alloc, parsed_forged.value, root_context_schema_version),
     );
 }
 
@@ -1868,7 +1970,7 @@ test "control codec rejects malformed partial unknown and oversized records" {
     defer record.deinit(alloc);
     const bytes = try renderRecord(alloc, record);
     defer alloc.free(bytes);
-    const unknown = try std.mem.replaceOwned(u8, alloc, bytes, "\"schema_version\":6", "\"schema_version\":99");
+    const unknown = try std.mem.replaceOwned(u8, alloc, bytes, "\"schema_version\":7", "\"schema_version\":99");
     defer alloc.free(unknown);
     try std.testing.expectError(error.UnsupportedControlSchema, parseRecord(alloc, unknown));
     const unknown_field = try std.mem.replaceOwned(
@@ -1929,7 +2031,7 @@ test "schema v2 migration closes absent legacy replay identities" {
         u8,
         alloc,
         current,
-        "\"schema_version\":6",
+        "\"schema_version\":7",
         "\"schema_version\":2",
     );
     defer alloc.free(versioned_with_mode);
@@ -1971,7 +2073,7 @@ test "schema v3 process epochs cannot seed manager replay authority" {
         u8,
         alloc,
         current,
-        "\"schema_version\":6",
+        "\"schema_version\":7",
         "\"schema_version\":3",
     );
     defer alloc.free(legacy_with_mode);
@@ -2006,7 +2108,7 @@ test "schema v4 manager epochs retain replay authority and migrate child permiss
         u8,
         alloc,
         current,
-        "\"schema_version\":6",
+        "\"schema_version\":7",
         "\"schema_version\":4",
     );
     defer alloc.free(legacy_with_mode);
@@ -2659,6 +2761,7 @@ test "control decoder handles fuzzed bytes" {
     try std.testing.fuzz({}, fuzzControlRecord, .{ .corpus = &.{
         "",
         "{}",
+        "{\"schema_version\":7}",
         "{\"schema_version\":6}",
         "{\"schema_version\":5}",
         "{\"schema_version\":4}",

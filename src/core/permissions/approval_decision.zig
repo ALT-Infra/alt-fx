@@ -52,6 +52,7 @@ pub const InsertResult = edit_contract.InsertResult;
 
 pub const State = struct {
     choice_index: u8 = 0,
+    confirmation_only: bool = false,
     amendment: approval_amendment.State = .{},
 
     pub fn deinit(self: *State, alloc: Allocator) void {
@@ -60,17 +61,27 @@ pub const State = struct {
 
     pub fn reset(self: *State, alloc: Allocator, reason: []const u8) void {
         self.choice_index = 0;
+        self.confirmation_only = false;
         self.amendment.discard(alloc, reason);
     }
 
     pub fn resetAfterSubmission(self: *State, alloc: Allocator) void {
         const selected_choice = self.choice_index;
         self.choice_index = 0;
+        self.confirmation_only = false;
         self.amendment.discardAfterSubmission(alloc, selected_choice);
     }
 
     fn selectedDecision(self: State) ToolPermissionDecision {
+        if (self.confirmation_only) {
+            return if (self.choice_index == 0) .once else .deny;
+        }
         return permissions.permissionDecisionFromIndex(self.choice_index);
+    }
+
+    pub fn setConfirmationOnly(self: *State, enabled: bool) void {
+        self.confirmation_only = enabled;
+        if (enabled and self.choice_index >= 2) self.choice_index = 0;
     }
 
     pub fn isAmending(self: State) bool {
@@ -144,7 +155,7 @@ pub const State = struct {
                 break :blk .redraw;
             },
             .number => |choice| blk: {
-                if (choice >= option_count) break :blk .none;
+                if (choice >= self.optionCount()) break :blk .none;
                 if (self.isAmending()) {
                     break :blk try self.insertAscii(alloc, '1' + choice, max_len);
                 }
@@ -201,15 +212,20 @@ pub const State = struct {
     }
 
     fn moveChoice(self: *State, direction: Move) void {
+        const count = self.optionCount();
         const delta: i32 = switch (direction) {
             .previous => -1,
             .next => 1,
         };
         var next = @as(i32, self.choice_index) + delta;
-        if (next < 0) next = @as(i32, option_count) - 1;
-        if (next >= @as(i32, option_count)) next = 0;
+        if (next < 0) next = @as(i32, count) - 1;
+        if (next >= @as(i32, count)) next = 0;
         self.choice_index = @intCast(next);
         self.amendment.clearActive();
+    }
+
+    fn optionCount(self: State) u8 {
+        return if (self.confirmation_only) 2 else option_count;
     }
 
     fn applyDraftAction(self: *State, action: DraftAction) void {
