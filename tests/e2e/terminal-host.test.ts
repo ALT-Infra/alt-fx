@@ -81,6 +81,7 @@ const children: ChildProcessWithoutNullStreams[] = [];
 const hostPids: number[] = [];
 const fixtureArtifacts: string[] = [];
 let currentClientFixtureBinary: string | null = null;
+let currentThreadForkFixtureBinary: string | null = null;
 
 function loginShellProfile(): string | null {
   const shell = userInfo().shell;
@@ -260,6 +261,18 @@ function processExists(pid: number): boolean {
   } catch {
     return false;
   }
+}
+
+function processGroupId(pid: number): number {
+  const value = Number(
+    execFileSync("ps", ["-p", String(pid), "-o", "pgid="], {
+      encoding: "utf8",
+    }).trim(),
+  );
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`missing process group for ${pid}`);
+  }
+  return value;
 }
 
 function processFdCount(pid: number): number {
@@ -464,6 +477,95 @@ function buildCurrentClientFixture(): string {
     { cwd: repoRoot, stdio: "pipe", timeout: 120_000 },
   );
   currentClientFixtureBinary = binary;
+  return binary;
+}
+
+function buildThreadForkFixture(): string {
+  if (currentThreadForkFixtureBinary !== null) {
+    return currentThreadForkFixtureBinary;
+  }
+  const repoRoot = join(import.meta.dir, "../..");
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "fx-terminal-thread-fork-"));
+  const source = join(fixtureRoot, "thread-fork.c");
+  const binary = join(fixtureRoot, "thread-fork");
+  fixtureArtifacts.push(fixtureRoot);
+  writeFileSync(
+    source,
+    String.raw`#define _GNU_SOURCE
+#include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static const char *proof_path;
+static const char *term_path;
+
+static void on_term(int signal_number) {
+    (void)signal_number;
+    int fd = open(term_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd >= 0) {
+        (void)write(fd, "term", 4);
+        (void)close(fd);
+    }
+    _exit(0);
+}
+
+static void *fork_child(void *unused) {
+    (void)unused;
+    int ready[2];
+    if (pipe(ready) != 0) _exit(69);
+    pid_t worker_tid = (pid_t)syscall(SYS_gettid);
+    pid_t child_pid = fork();
+    if (child_pid < 0) _exit(70);
+    if (child_pid == 0) {
+        close(ready[0]);
+        if (setpgid(0, 0) != 0) _exit(71);
+        struct sigaction action = {0};
+        action.sa_handler = on_term;
+        sigemptyset(&action.sa_mask);
+        if (sigaction(SIGTERM, &action, NULL) != 0) _exit(72);
+        (void)write(ready[1], "1", 1);
+        close(ready[1]);
+        for (;;) pause();
+    }
+
+    close(ready[1]);
+    char ready_byte = 0;
+    if (read(ready[0], &ready_byte, 1) != 1) _exit(74);
+    close(ready[0]);
+
+    int fd = open(proof_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) _exit(73);
+    dprintf(fd, "%d %d %d\n", getpid(), worker_tid, child_pid);
+    close(fd);
+    (void)write(STDOUT_FILENO, "thread-fork-ready\n", 18);
+    int status = 0;
+    (void)waitpid(child_pid, &status, 0);
+    return NULL;
+}
+
+int main(int argc, char **argv) {
+    if (argc != 3) return 64;
+    proof_path = argv[1];
+    term_path = argv[2];
+    pthread_t worker;
+    if (pthread_create(&worker, NULL, fork_child, NULL) != 0) return 65;
+    if (pthread_join(worker, NULL) != 0) return 66;
+    return 0;
+}
+`,
+  );
+  execFileSync(
+    "zig",
+    ["cc", "-O2", "-pthread", source, "-o", binary],
+    { cwd: repoRoot, stdio: "pipe", timeout: 120_000 },
+  );
+  currentThreadForkFixtureBinary = binary;
   return binary;
 }
 
@@ -1348,19 +1450,16 @@ async function forceCloseTerminalFixture(
   correlation: number,
   sessionId: string,
 ): Promise<void> {
-  let frame: WireFrame | undefined;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    frame = await requestAction(
+  success(
+    await requestAction(
       client,
       revision,
-      correlation + attempt * 10_000,
+      correlation,
       "close",
       { session_id: sessionId, policy: "force" },
-    );
-    if (failureCode(frame) !== "invalid_request" || attempt === 1) break;
-    await Bun.sleep(100);
-  }
-  success(frame!, "close");
+    ),
+    "close",
+  );
 }
 
 type StartedFixtureCleanup = {
@@ -7542,6 +7641,333 @@ test("writes resize waits cancellation signals and close remain session-scoped",
   expect(existsSync(paths.socket)).toBe(false);
 }, NATIVE_STARTUP_OBSERVATION_BUDGET_MS * 8 + 60_000);
 
+test.skipIf(process.platform !== "linux")(
+  "signal reaches a child forked by a non-leader thread",
+  async () => {
+    if (!existsSync("/bin/zsh")) return;
+    const home = makeHome();
+    const paths = hostPaths(home);
+    const proofPath = join(home, "thread-fork.proof");
+    const termPath = join(home, "thread-fork.term");
+    const fixture = buildThreadForkFixture();
+    const host = startHost(home, undefined, 200);
+    await waitFor(() => existsSync(paths.socket));
+    const control = await handshake(paths.socket, { minimum: 4, current: 5 });
+    let rootPid = 0;
+    let childPid = 0;
+
+    try {
+      const started = await startNativeCommandFixture(
+        control.client,
+        control.revision!,
+        312_900,
+        {
+          cwd: home,
+          command:
+            `exec ${JSON.stringify(fixture)} ${JSON.stringify(proofPath)} ` +
+            JSON.stringify(termPath),
+          shell: { executable: { path: "/bin/zsh", clean_start: true } },
+          returnWhen: { match: "thread-fork-ready" },
+        },
+      );
+      const sessionId = (started.session as { session_id: string }).session_id;
+      await waitFor(() => existsSync(proofPath));
+      const [rootText, workerText, childText] = readFileSync(proofPath, "utf8")
+        .trim()
+        .split(/\s+/);
+      rootPid = Number(rootText);
+      const workerTid = Number(workerText);
+      childPid = Number(childText);
+      const shellPid = Number(durableTerminalRecordFor(home, sessionId).pid);
+      expect(rootPid).toBe(shellPid);
+      expect(workerTid).toBeGreaterThan(0);
+      expect(workerTid).not.toBe(rootPid);
+      expect(childPid).toBeGreaterThan(0);
+      const workerChildren = readFileSync(
+        `/proc/${rootPid}/task/${workerTid}/children`,
+        "utf8",
+      ).trim().split(/\s+/).filter(Boolean).map(Number);
+      const leaderChildren = readFileSync(
+        `/proc/${rootPid}/task/${rootPid}/children`,
+        "utf8",
+      ).trim().split(/\s+/).filter(Boolean).map(Number);
+      expect(workerChildren).toContain(childPid);
+      expect(leaderChildren).not.toContain(childPid);
+      expect(processGroupId(childPid)).not.toBe(processGroupId(rootPid));
+
+      const signaled = await requestAction(
+        control.client,
+        control.revision!,
+        312_901,
+        "signal",
+        { session_id: sessionId, signal: "terminate" },
+      );
+      expect(success(signaled, "signal").signal).toBe("terminate");
+      await waitFor(
+        () => existsSync(termPath) && readFileSync(termPath, "utf8") === "term",
+        2_000,
+      );
+      await waitFor(() => !processExists(childPid), 5_000);
+      const waited = await requestAction(
+        control.client,
+        control.revision!,
+        312_902,
+        "wait",
+        {
+          session_id: sessionId,
+          return_when: { exit: {} },
+          safety_ceiling_ms: 5_000,
+        },
+      );
+      success(waited, "wait");
+      const closed = await requestAction(
+        control.client,
+        control.revision!,
+        312_903,
+        "close",
+        { session_id: sessionId, policy: "force" },
+      );
+      expect(success(closed, "close").session).toMatchObject({
+        lifecycle: "closed",
+      });
+    } finally {
+      for (const pid of [childPid, rootPid]) {
+        if (pid <= 0 || !processExists(pid)) continue;
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {}
+      }
+      control.client.close();
+      if (host.exitCode === null) await waitForExit(host);
+    }
+  },
+  NATIVE_STARTUP_OBSERVATION_BUDGET_MS * 3 + 30_000,
+);
+
+test("force close reports incomplete refresh descendant and shell delivery", async () => {
+  if (!existsSync("/bin/zsh")) return;
+  const stages = ["refresh", "outside_group", "shell_group"] as const;
+  for (const [index, stage] of stages.entries()) {
+    const home = makeHome();
+    const paths = hostPaths(home);
+    const host = startHost(home, undefined, 200, {
+      FX_TERMINAL_TEST_FAIL_SIGNAL_STAGE: stage,
+    });
+    await waitFor(() => existsSync(paths.socket));
+    const control = await handshake(paths.socket, { minimum: 4, current: 5 });
+    let shellPid = 0;
+
+    try {
+      const started = await startNativeCommandFixture(
+        control.client,
+        control.revision!,
+        312_910 + index * 10,
+        {
+          cwd: home,
+          command:
+            `printf 'force-close-${stage}-ready\\n'; ` +
+            "while :; do sleep 0.05; done",
+          shell: { executable: { path: "/bin/zsh", clean_start: true } },
+          returnWhen: { match: `force-close-${stage}-ready` },
+        },
+      );
+      const sessionId = (started.session as { session_id: string }).session_id;
+      shellPid = Number(durableTerminalRecordFor(home, sessionId).pid);
+      const closed = await requestAction(
+        control.client,
+        control.revision!,
+        312_911 + index * 10,
+        "close",
+        { session_id: sessionId, policy: "force" },
+      );
+      expect(failure(closed)).toMatchObject({
+        action: "close",
+        code: "session_lost",
+        session_id: sessionId,
+        retryable: false,
+      });
+      expect(durableTerminalRecordFor(home, sessionId)).toMatchObject({
+        authority_revoked: true,
+        lifecycle: "closed",
+      });
+      const inspect = await requestAction(
+        control.client,
+        control.revision!,
+        312_912 + index * 10,
+        "inspect",
+        { session_id: sessionId },
+      );
+      expect(failure(inspect).code).toBe("authority_denied");
+    } finally {
+      if (shellPid > 0 && processExists(shellPid)) {
+        try {
+          process.kill(shellPid, "SIGKILL");
+        } catch {}
+      }
+      control.client.close();
+      if (host.exitCode === null) await waitForExit(host);
+    }
+  }
+}, NATIVE_STARTUP_OBSERVATION_BUDGET_MS * 8 + 60_000);
+
+test("signal reaches a background job outside the shell process group", async () => {
+  if (!existsSync("/bin/zsh")) return;
+  const home = makeHome();
+  const paths = hostPaths(home);
+  const proofPath = join(home, "background-signal.proof");
+  const termPath = join(home, "background-signal.term");
+  const stopPath = join(home, "background-signal.stop");
+  const scriptPath = join(home, "background-signal.sh");
+  writeFileSync(
+    scriptPath,
+    `#!/bin/sh
+trap 'printf term > ${JSON.stringify(termPath)}; exit 0' TERM
+printf '%s %s %s\n' "$$" "$PPID" "$(ps -o pgid= -p $$ | tr -d ' ')" > ${JSON.stringify(proofPath)}
+while [ ! -e ${JSON.stringify(stopPath)} ]; do sleep 0.05; done
+`,
+  );
+  chmodSync(scriptPath, 0o700);
+
+  const host = startHost(home, undefined, 200);
+  await waitFor(() => existsSync(paths.socket));
+  const control = await handshake(paths.socket, { minimum: 4, current: 5 });
+  let targetPid = 0;
+
+  try {
+    const started = await startNativeCommandFixture(
+      control.client,
+      control.revision!,
+      313_000,
+      {
+        cwd: home,
+        command:
+          `${JSON.stringify(scriptPath)} & child=$!; ` +
+          `while [ ! -s ${JSON.stringify(proofPath)} ]; do sleep 0.05; done; ` +
+          "printf 'background-signal-ready\\n'; wait \"$child\"",
+        shell: { executable: { path: "/bin/zsh", clean_start: true } },
+        returnWhen: { match: "background-signal-ready" },
+      },
+    );
+    const sessionId = (started.session as { session_id: string }).session_id;
+    const [pidText, parentText, pgidText] = readFileSync(proofPath, "utf8")
+      .trim()
+      .split(/\s+/);
+    targetPid = Number(pidText);
+    const targetParentPid = Number(parentText);
+    const targetPgid = Number(pgidText);
+    const shellPid = Number(durableTerminalRecordFor(home, sessionId).pid);
+    expect(targetPid).toBeGreaterThan(0);
+    expect(targetParentPid).toBe(shellPid);
+    expect(targetPgid).toBe(processGroupId(targetPid));
+    expect(targetPgid).not.toBe(processGroupId(shellPid));
+
+    const signaled = await requestAction(
+      control.client,
+      control.revision!,
+      313_010,
+      "signal",
+      { session_id: sessionId, signal: "terminate" },
+    );
+    expect(success(signaled, "signal").signal).toBe("terminate");
+    await waitFor(
+      () => existsSync(termPath) && readFileSync(termPath, "utf8") === "term",
+      2_000,
+    );
+    expect(readFileSync(termPath, "utf8")).toBe("term");
+    await waitFor(() => !processExists(targetPid), 5_000);
+  } finally {
+    writeFileSync(stopPath, "");
+    if (targetPid > 0 && processExists(targetPid)) {
+      await waitFor(() => !processExists(targetPid), 5_000).catch(() => {
+        try {
+          process.kill(targetPid, "SIGKILL");
+        } catch {}
+      });
+    }
+    control.client.close();
+    if (host.exitCode === null) await waitForExit(host);
+  }
+}, NATIVE_STARTUP_OBSERVATION_BUDGET_MS * 3 + 30_000);
+
+test("force close reaches a background job outside the shell process group", async () => {
+  if (!existsSync("/bin/zsh")) return;
+  const home = makeHome();
+  const paths = hostPaths(home);
+  const proofPath = join(home, "background-force-close.proof");
+  const stopPath = join(home, "background-force-close.stop");
+  const scriptPath = join(home, "background-force-close.sh");
+  writeFileSync(
+    scriptPath,
+    `#!/bin/sh
+printf '%s %s %s\n' "$$" "$PPID" "$(ps -o pgid= -p $$ | tr -d ' ')" > ${JSON.stringify(proofPath)}
+while [ ! -e ${JSON.stringify(stopPath)} ]; do sleep 0.05; done
+`,
+  );
+  chmodSync(scriptPath, 0o700);
+
+  const host = startHost(home, undefined, 200);
+  await waitFor(() => existsSync(paths.socket));
+  const control = await handshake(paths.socket, { minimum: 4, current: 5 });
+  let shellPid = 0;
+  let targetPid = 0;
+
+  try {
+    const started = await startNativeCommandFixture(
+      control.client,
+      control.revision!,
+      313_020,
+      {
+        cwd: home,
+        command:
+          `${JSON.stringify(scriptPath)} & child=$!; ` +
+          `while [ ! -s ${JSON.stringify(proofPath)} ]; do sleep 0.05; done; ` +
+          "printf 'background-force-close-ready\\n'; wait \"$child\"",
+        shell: { executable: { path: "/bin/zsh", clean_start: true } },
+        returnWhen: { match: "background-force-close-ready" },
+      },
+    );
+    const sessionId = (started.session as { session_id: string }).session_id;
+    const [pidText, parentText, pgidText] = readFileSync(proofPath, "utf8")
+      .trim()
+      .split(/\s+/);
+    targetPid = Number(pidText);
+    const targetParentPid = Number(parentText);
+    const targetPgid = Number(pgidText);
+    shellPid = Number(durableTerminalRecordFor(home, sessionId).pid);
+    expect(targetPid).toBeGreaterThan(0);
+    expect(targetParentPid).toBe(shellPid);
+    expect(targetPgid).toBe(processGroupId(targetPid));
+    expect(targetPgid).not.toBe(processGroupId(shellPid));
+
+    const closed = await requestAction(
+      control.client,
+      control.revision!,
+      313_030,
+      "close",
+      { session_id: sessionId, policy: "force" },
+    );
+    expect(success(closed, "close").session).toMatchObject({
+      lifecycle: "closed",
+    });
+    await waitFor(() => !processExists(shellPid), 5_000);
+    await waitFor(() => !processExists(targetPid), 5_000);
+  } finally {
+    writeFileSync(stopPath, "");
+    if (targetPid > 0 && processExists(targetPid)) {
+      try {
+        process.kill(targetPid, "SIGKILL");
+      } catch {}
+    }
+    if (shellPid > 0 && processExists(shellPid)) {
+      try {
+        process.kill(shellPid, "SIGKILL");
+      } catch {}
+    }
+    control.client.close();
+    if (host.exitCode === null) await waitForExit(host);
+  }
+}, NATIVE_STARTUP_OBSERVATION_BUDGET_MS * 3 + 30_000);
+
 test.skipIf(!tmuxAvailable())(
   "malformed close recovery cleans only its tmux owner and preserves a live sibling",
   async () => {
@@ -7712,13 +8138,14 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
-  "checked live tmux close retains cleanup intent until recovery retries",
+  "checked cleanup failure wins over incomplete delivery and retains recovery intent",
   async () => {
     if (!existsSync("/bin/zsh")) return;
     const home = makeHome();
     const paths = hostPaths(home);
     const firstHost = startHost(home, undefined, 30_000, {
       FX_TERMINAL_TEST_FAIL_TMUX_CLOSE_CLEANUP: "1",
+      FX_TERMINAL_TEST_FAIL_SIGNAL_STAGE: "outside_group",
     });
     const firstStdout = streamText(firstHost.stdout);
     const firstStderr = streamText(firstHost.stderr);

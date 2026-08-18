@@ -8,7 +8,7 @@ import {
 } from "./fx-sdk.js";
 
 export { encodeXtermKeyEvent, fxSdkApiVersion, supportsJspi, xtermAdapter };
-export const libfxApiVersion = 1;
+export const libfxApiVersion = 2;
 
 const defaultCoreWasm = new URL("./fx-core.wasm", import.meta.url).href;
 const defaultTermWasm = new URL("./fx-term.wasm", import.meta.url).href;

@@ -1,9 +1,11 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const mcp_access = @import("../mcp/access_policy.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 const elicitation = @import("../mcp/elicitation.zig");
 const mcp_health = @import("../mcp/health.zig");
+const mcp_model_catalog = @import("../mcp/model_catalog.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
 const context_limits = @import("../config/context_limits.zig");
 const tool_advertisement = @import("../tooling/tool_advertisement.zig");
@@ -39,11 +41,85 @@ pub const ReloadOutcome = union(enum) {
     }
 };
 
+pub const ReloadCompletion = union(enum) {
+    outcome: ReloadOutcome,
+    failed: anyerror,
+
+    pub fn deinit(self: *ReloadCompletion, alloc: Allocator) void {
+        switch (self.*) {
+            .outcome => |*outcome| outcome.deinit(alloc),
+            .failed => {},
+        }
+        self.* = undefined;
+    }
+};
+
+const PendingResult = union(enum) {
+    outcome: ReloadOutcome,
+    failed: anyerror,
+    cancelled,
+};
+
+const PendingReload = struct {
+    owner: *State,
+    alloc: Allocator,
+    elicitation_capabilities: elicitation.Capabilities,
+    loader: mcp_runtime.LoadRuntimeFn,
+    registry: tool_dispatch.Registry,
+    captured_at_ms: u64,
+    cancel_requested: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
+    result: ?PendingResult = null,
+
+    fn run(self: *PendingReload) void {
+        const outcome = self.owner.reloadControlled(
+            self.alloc,
+            self.elicitation_capabilities,
+            self.loader,
+            self.registry,
+            self.captured_at_ms,
+            &self.cancel_requested,
+            self,
+        ) catch |err| {
+            self.result = if (err == error.Cancelled)
+                .cancelled
+            else
+                .{ .failed = err };
+            self.done.store(true, .release);
+            return;
+        };
+        self.result = .{ .outcome = outcome };
+        self.done.store(true, .release);
+    }
+
+    fn join(self: *PendingReload) void {
+        if (comptime builtin.single_threaded) {
+            std.debug.assert(self.thread == null);
+            return;
+        }
+        if (self.thread) |thread| {
+            self.thread = null;
+            thread.join();
+        }
+    }
+
+    fn deinit(self: *PendingReload) void {
+        self.join();
+        if (self.result) |*result| switch (result.*) {
+            .outcome => |*outcome| outcome.deinit(self.alloc),
+            .failed, .cancelled => {},
+        };
+        self.alloc.destroy(self);
+    }
+};
+
 /// Owns the native profile MCP runtime. All transport work and retirement happen
 /// after releasing this state lock; the lock protects only pointer publication.
 pub const State = struct {
     lock: std.Io.RwLock = .init,
     runtime: ?*mcp_runtime.McpRuntime = null,
+    pending_reload: ?*PendingReload = null,
 
     pub fn installInitial(self: *State, runtime: ?*mcp_runtime.McpRuntime) void {
         std.debug.assert(self.runtime == null);
@@ -152,6 +228,20 @@ pub const State = struct {
         return lease.runtime.listServersAndTools(alloc);
     }
 
+    pub fn renderHealthSummary(self: *State, alloc: Allocator) ![]u8 {
+        var lease = self.acquire() orelse return mcp_health.renderSummary(
+            alloc,
+            .{ .captured_at_ms = 0, .servers = &.{} },
+        );
+        defer lease.deinit();
+        var snapshot = try lease.runtime.snapshotHealth(
+            alloc,
+            @intCast(@max(io_mod.milliTimestamp(), 0)),
+        );
+        defer snapshot.deinit(alloc);
+        return mcp_health.renderSummary(alloc, snapshot);
+    }
+
     pub fn snapshotToolNames(
         self: *State,
         alloc: Allocator,
@@ -182,6 +272,21 @@ pub const State = struct {
         return view;
     }
 
+    pub fn snapshotModelCatalog(
+        self: *State,
+        alloc: Allocator,
+        permission_rules: types.PermissionRuleSet,
+        include_ask_deferred: bool,
+    ) !mcp_model_catalog.Snapshot {
+        var lease = self.acquire() orelse return mcp_model_catalog.Snapshot.empty(alloc);
+        defer lease.deinit();
+        return lease.runtime.snapshotModelCatalog(
+            alloc,
+            permission_rules,
+            include_ask_deferred,
+        );
+    }
+
     pub fn waitForRequired(
         self: *State,
         alloc: Allocator,
@@ -202,12 +307,107 @@ pub const State = struct {
         registry: tool_dispatch.Registry,
         captured_at_ms: u64,
     ) !ReloadOutcome {
+        var cancel_requested = std.atomic.Value(bool).init(false);
+        return self.reloadControlled(
+            alloc,
+            elicitation_capabilities,
+            loader,
+            registry,
+            captured_at_ms,
+            &cancel_requested,
+            null,
+        );
+    }
+
+    pub fn beginReload(
+        self: *State,
+        alloc: Allocator,
+        elicitation_capabilities: elicitation.Capabilities,
+        loader: mcp_runtime.LoadRuntimeFn,
+        registry: tool_dispatch.Registry,
+        captured_at_ms: u64,
+    ) !void {
+        self.cancelPendingReload();
+
+        const pending = try alloc.create(PendingReload);
+        pending.* = .{
+            .owner = self,
+            .alloc = alloc,
+            .elicitation_capabilities = elicitation_capabilities,
+            .loader = loader,
+            .registry = registry,
+            .captured_at_ms = captured_at_ms,
+        };
+        self.lock.lockUncancelable(io_mod.getIo());
+        std.debug.assert(self.pending_reload == null);
+        self.pending_reload = pending;
+        self.lock.unlock(io_mod.getIo());
+
+        if (comptime builtin.single_threaded) {
+            pending.run();
+        } else {
+            pending.thread = std.Thread.spawn(.{}, PendingReload.run, .{pending}) catch |err| {
+                self.lock.lockUncancelable(io_mod.getIo());
+                if (self.pending_reload == pending) self.pending_reload = null;
+                self.lock.unlock(io_mod.getIo());
+                alloc.destroy(pending);
+                return err;
+            };
+        }
+    }
+
+    pub fn takeReloadCompletion(self: *State) ?ReloadCompletion {
+        self.lock.lockUncancelable(io_mod.getIo());
+        const pending = self.pending_reload orelse {
+            self.lock.unlock(io_mod.getIo());
+            return null;
+        };
+        if (!pending.done.load(.acquire)) {
+            self.lock.unlock(io_mod.getIo());
+            return null;
+        }
+        self.pending_reload = null;
+        self.lock.unlock(io_mod.getIo());
+
+        pending.join();
+        const result = pending.result.?;
+        pending.result = null;
+        pending.alloc.destroy(pending);
+        return switch (result) {
+            .outcome => |outcome| .{ .outcome = outcome },
+            .failed => |err| .{ .failed = err },
+            .cancelled => null,
+        };
+    }
+
+    fn cancelPendingReload(self: *State) void {
+        self.lock.lockUncancelable(io_mod.getIo());
+        const pending = self.pending_reload;
+        if (pending) |task| task.cancel_requested.store(true, .release);
+        self.pending_reload = null;
+        self.lock.unlock(io_mod.getIo());
+        if (pending) |task| task.deinit();
+    }
+
+    fn reloadControlled(
+        self: *State,
+        alloc: Allocator,
+        elicitation_capabilities: elicitation.Capabilities,
+        loader: mcp_runtime.LoadRuntimeFn,
+        registry: tool_dispatch.Registry,
+        captured_at_ms: u64,
+        cancel_requested: *std.atomic.Value(bool),
+        pending: ?*PendingReload,
+    ) !ReloadOutcome {
+        if (cancel_requested.load(.acquire)) return error.Cancelled;
         const candidate = try loader(alloc, elicitation_capabilities);
         var candidate_owned = candidate != null;
         errdefer if (candidate_owned) destroyRuntime(alloc, candidate.?);
+        if (cancel_requested.load(.acquire)) return error.Cancelled;
 
         const decision: mcp_health.StartupDecision = if (candidate) |runtime| decision: {
-            runtime.connectAll(registry);
+            runtime.connectAllCancellable(registry, cancel_requested);
+            if (cancel_requested.load(.acquire)) return error.Cancelled;
             const value = try runtime.startupDecision(alloc, captured_at_ms);
             if (!mcp_health.publishCandidateForDecision(value)) {
                 const failure = (try runtime.requiredStartupFailure(alloc, captured_at_ms)) orelse
@@ -220,6 +420,12 @@ pub const State = struct {
         } else .ready;
 
         self.lock.lockUncancelable(io_mod.getIo());
+        if (cancel_requested.load(.acquire) or
+            (pending != null and self.pending_reload != pending.?))
+        {
+            self.lock.unlock(io_mod.getIo());
+            return error.Cancelled;
+        }
         const previous = self.runtime;
         self.runtime = candidate;
         self.lock.unlock(io_mod.getIo());
@@ -233,6 +439,7 @@ pub const State = struct {
     }
 
     pub fn deinit(self: *State, alloc: Allocator) void {
+        self.cancelPendingReload();
         self.lock.lockUncancelable(io_mod.getIo());
         const previous = self.runtime;
         self.runtime = null;
@@ -270,6 +477,8 @@ const TestReloadMode = enum {
     required_disabled,
     optional_failed,
     empty,
+    delayed_empty,
+    stalled_candidate,
 };
 
 var test_reload_mode: TestReloadMode = .empty;
@@ -281,7 +490,11 @@ fn loadTestReloadRuntime(
     switch (test_reload_mode) {
         .parse_failure => return error.McpConfigInvalidJson,
         .empty => return null,
-        .required_disabled, .optional_failed => {},
+        .delayed_empty => {
+            io_mod.sleep(100 * std.time.ns_per_ms);
+            return null;
+        },
+        .required_disabled, .optional_failed, .stalled_candidate => {},
     }
     const runtime = try alloc.create(mcp_runtime.McpRuntime);
     errdefer alloc.destroy(runtime);
@@ -291,14 +504,34 @@ fn loadTestReloadRuntime(
     errdefer alloc.free(name);
     const command = try alloc.dupe(
         u8,
-        if (test_reload_mode == .optional_failed) "__fx_missing_mcp_executable__" else "disabled",
+        switch (test_reload_mode) {
+            .optional_failed => "__fx_missing_mcp_executable__",
+            .stalled_candidate => "awk",
+            else => "disabled",
+        },
     );
     errdefer alloc.free(command);
+    const args = if (test_reload_mode == .stalled_candidate) args: {
+        const values = try alloc.alloc([]const u8, 1);
+        errdefer alloc.free(values);
+        values[0] = try alloc.dupe(u8, "{}");
+        break :args values;
+    } else &.{};
+    errdefer if (args.len > 0) {
+        for (args) |arg| alloc.free(arg);
+        alloc.free(args);
+    };
     const config = mcp_contract.McpServerConfig{
         .name = name,
         .command = command,
-        .enabled = test_reload_mode == .optional_failed,
+        .args = args,
+        .enabled = test_reload_mode == .optional_failed or
+            test_reload_mode == .stalled_candidate,
         .required = test_reload_mode == .required_disabled,
+        .startup_timeout_ms = if (test_reload_mode == .stalled_candidate)
+            60_000
+        else
+            10_000,
     };
     try runtime.addServer(config);
     return runtime;
@@ -362,4 +595,78 @@ test "transactional reload retains old runtime and publishes only accepted candi
         .retained_required_failure => return error.TestUnexpectedResult,
     }
     try std.testing.expect(state.acquire() == null);
+}
+
+test "pending reload returns immediately and publishes one completion" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+    const original = try alloc.create(mcp_runtime.McpRuntime);
+    original.* = mcp_runtime.McpRuntime.init(alloc);
+    const original_generation = original.generation;
+    state.installInitial(original);
+
+    test_reload_mode = .delayed_empty;
+    const started_ms = io_mod.milliTimestamp();
+    try state.beginReload(alloc, .{}, loadTestReloadRuntime, .{}, 50);
+    try std.testing.expect(io_mod.milliTimestamp() - started_ms < 50);
+    {
+        var lease = state.acquire() orelse return error.TestUnexpectedResult;
+        defer lease.deinit();
+        try std.testing.expectEqual(original_generation, lease.runtime.generation);
+    }
+    try std.testing.expect(state.takeReloadCompletion() == null);
+
+    var completion: ?ReloadCompletion = null;
+    const deadline = io_mod.milliTimestamp() + 2_000;
+    while (completion == null and io_mod.milliTimestamp() < deadline) {
+        io_mod.sleep(std.time.ns_per_ms);
+        completion = state.takeReloadCompletion();
+    }
+    var loaded = completion orelse return error.TestUnexpectedResult;
+    defer loaded.deinit(alloc);
+    switch (loaded) {
+        .outcome => |outcome| switch (outcome) {
+            .published => |published| {
+                try std.testing.expectEqual(mcp_health.StartupDecision.ready, published.health);
+                try std.testing.expect(published.generation == null);
+            },
+            .retained_required_failure => return error.TestUnexpectedResult,
+        },
+        .failed => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(state.takeReloadCompletion() == null);
+    try std.testing.expect(state.acquire() == null);
+}
+
+test "superseding and deinitializing a stalled pending reload cancel before join" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    const original = try alloc.create(mcp_runtime.McpRuntime);
+    original.* = mcp_runtime.McpRuntime.init(alloc);
+    state.installInitial(original);
+
+    test_reload_mode = .stalled_candidate;
+    try state.beginReload(alloc, .{}, loadTestReloadRuntime, .{}, 60);
+    io_mod.sleep(25 * std.time.ns_per_ms);
+    test_reload_mode = .empty;
+    const supersede_started_ms = io_mod.milliTimestamp();
+    try state.beginReload(alloc, .{}, loadTestReloadRuntime, .{}, 70);
+    try std.testing.expect(io_mod.milliTimestamp() - supersede_started_ms < 1_000);
+
+    var completion: ?ReloadCompletion = null;
+    const completion_deadline = io_mod.milliTimestamp() + 2_000;
+    while (completion == null and io_mod.milliTimestamp() < completion_deadline) {
+        io_mod.sleep(std.time.ns_per_ms);
+        completion = state.takeReloadCompletion();
+    }
+    var loaded = completion orelse return error.TestUnexpectedResult;
+    loaded.deinit(alloc);
+
+    test_reload_mode = .stalled_candidate;
+    try state.beginReload(alloc, .{}, loadTestReloadRuntime, .{}, 80);
+    io_mod.sleep(25 * std.time.ns_per_ms);
+    const deinit_started_ms = io_mod.milliTimestamp();
+    state.deinit(alloc);
+    try std.testing.expect(io_mod.milliTimestamp() - deinit_started_ms < 1_000);
 }

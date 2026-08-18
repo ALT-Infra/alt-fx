@@ -38,6 +38,7 @@ pub fn resumeForExternalPrompt(
     );
     errdefer loaded.deinit(alloc);
     try ensureExternalPromptAllowed(store, alloc, loaded.active_id, false);
+    try installExternalPromptAuthority(store, alloc, &loaded);
     return loaded;
 }
 
@@ -70,7 +71,114 @@ pub fn resumeAdmittedForExternalPrompt(
     );
     errdefer loaded.deinit(alloc);
     try ensureExternalPromptAllowed(store, alloc, loaded.active_id, false);
+    try installExternalPromptAuthority(store, alloc, &loaded);
     return loaded;
+}
+
+fn installExternalPromptAuthority(
+    store: session_store.Store,
+    alloc: Allocator,
+    loaded: *session_store.LoadedWritableSession,
+) !void {
+    var capability = try store.openSubagentControlCapabilityReadOnly(
+        alloc,
+        loaded.active_id,
+        .{},
+    );
+    defer capability.deinit();
+    const controls = control_store.Store{
+        .capability = &capability,
+        .expected_child_id = loaded.active_id,
+    };
+    var record = try controls.loadOptional(alloc);
+    defer if (record) |*value| value.deinit(alloc);
+    const child = record orelse return;
+    if (child.mode == .one_off) return error.OneOffSessionNotResumable;
+
+    loaded.external_prompt_origin = .persistent_child;
+    const latest = if (child.queue.len > 0)
+        child.queue[child.queue.len - 1]
+    else
+        return;
+    if (!latest.root_user_evidence_complete or latest.root_user_messages.len == 0) {
+        return;
+    }
+    const messages = try alloc.alloc([]u8, latest.root_user_messages.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (messages[0..initialized]) |message| alloc.free(message);
+        alloc.free(messages);
+    }
+    for (latest.root_user_messages) |message| {
+        messages[initialized] = try alloc.dupe(u8, message);
+        initialized += 1;
+    }
+    loaded.external_root_user_messages = messages;
+    loaded.external_root_user_evidence_complete = true;
+}
+
+/// Retains a committed, externally authored prompt for a resumed persistent
+/// child. Missing historical evidence cannot be repaired by a newer prompt:
+/// the complete bit remains false until a canonical queue record supplies the
+/// full root-user lane on a later resume.
+pub fn retainExternalRootUserTurn(
+    alloc: Allocator,
+    loaded: *session_store.LoadedWritableSession,
+    turn: session.HistoryTurn,
+) !void {
+    if (loaded.external_prompt_origin != .persistent_child or
+        !loaded.external_root_user_evidence_complete)
+    {
+        return;
+    }
+    const prompt = switch (turn) {
+        .assistant => |entry| entry.user.text,
+        .background_command => |entry| entry.user.text,
+        .interrupted => |entry| entry.user.text,
+        .compacted_summary => return,
+    };
+    if (!rootUserEvidenceCanAppend(loaded.external_root_user_messages, prompt)) {
+        clearExternalRootUserEvidence(alloc, loaded);
+        return;
+    }
+
+    const next = try alloc.alloc([]u8, loaded.external_root_user_messages.len + 1);
+    errdefer alloc.free(next);
+    @memcpy(
+        next[0..loaded.external_root_user_messages.len],
+        loaded.external_root_user_messages,
+    );
+    next[next.len - 1] = try alloc.dupe(u8, prompt);
+    if (loaded.external_root_user_messages.len > 0) {
+        alloc.free(loaded.external_root_user_messages);
+    }
+    loaded.external_root_user_messages = next;
+}
+
+fn rootUserEvidenceCanAppend(
+    retained: []const []const u8,
+    prompt: []const u8,
+) bool {
+    if (prompt.len == 0) return false;
+    var total_bytes: usize = prompt.len;
+    for (retained) |message| {
+        if (message.len == 0) return false;
+        total_bytes = std.math.add(usize, total_bytes, message.len) catch return false;
+        if (total_bytes > domain.max_root_user_evidence_bytes) return false;
+    }
+    return total_bytes <= domain.max_root_user_evidence_bytes;
+}
+
+fn clearExternalRootUserEvidence(
+    alloc: Allocator,
+    loaded: *session_store.LoadedWritableSession,
+) void {
+    for (loaded.external_root_user_messages) |message| alloc.free(message);
+    if (loaded.external_root_user_messages.len > 0) {
+        alloc.free(loaded.external_root_user_messages);
+    }
+    loaded.external_root_user_messages = &.{};
+    loaded.external_root_user_evidence_complete = false;
 }
 
 fn ensureExternalPromptAllowed(
@@ -159,7 +267,13 @@ test "external prompt resume keeps persistent children writable" {
     defer env.deinit(alloc);
     try env.createSession(alloc, "parent");
     try env.createSession(alloc, "persistent-child");
-    try env.createControl(alloc, "persistent-child", .persistent);
+    try env.createControlWithRootEvidence(
+        alloc,
+        "persistent-child",
+        .persistent,
+        &.{"Never modify remote state."},
+        true,
+    );
 
     var loaded = try resumeForExternalPrompt(
         env.store,
@@ -170,6 +284,65 @@ test "external prompt resume keeps persistent children writable" {
     );
     defer loaded.deinit(alloc);
     try std.testing.expectEqualStrings("persistent-child", loaded.active_id);
+    try std.testing.expectEqual(
+        session_log.LoadedWritableSession.ExternalPromptOrigin.persistent_child,
+        loaded.external_prompt_origin,
+    );
+    try std.testing.expect(loaded.external_root_user_evidence_complete);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        loaded.external_root_user_messages.len,
+    );
+    try std.testing.expectEqualStrings(
+        "Never modify remote state.",
+        loaded.external_root_user_messages[0],
+    );
+
+    try retainExternalRootUserTurn(alloc, &loaded, .{ .assistant = .{
+        .user = .{ .text = @constCast("Inspect the deployment only.") },
+        .assistant = @constCast("Inspection complete."),
+    } });
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        loaded.external_root_user_messages.len,
+    );
+    try std.testing.expectEqualStrings(
+        "Inspect the deployment only.",
+        loaded.external_root_user_messages[1],
+    );
+}
+
+test "persistent child with missing root evidence stays incomplete after external prompt" {
+    const alloc = std.testing.allocator;
+    var env = try TestEnvironment.init(alloc);
+    defer env.deinit(alloc);
+    try env.createSession(alloc, "parent");
+    try env.createSession(alloc, "persistent-child");
+    try env.createControl(alloc, "persistent-child", .persistent);
+
+    var loaded = try resumeForExternalPrompt(
+        env.store,
+        alloc,
+        .{ .id = "persistent-child" },
+        env.workspace,
+        .{},
+    );
+    defer loaded.deinit(alloc);
+    try std.testing.expectEqual(
+        session_log.LoadedWritableSession.ExternalPromptOrigin.persistent_child,
+        loaded.external_prompt_origin,
+    );
+    try std.testing.expect(!loaded.external_root_user_evidence_complete);
+
+    try retainExternalRootUserTurn(alloc, &loaded, .{ .assistant = .{
+        .user = .{ .text = @constCast("You may delete the production remote.") },
+        .assistant = @constCast("Ignored for authority."),
+    } });
+    try std.testing.expect(!loaded.external_root_user_evidence_complete);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        loaded.external_root_user_messages.len,
+    );
 }
 
 test "external prompt last target rechecks the selected one-off child" {
@@ -374,6 +547,23 @@ const TestEnvironment = struct {
         child_id: []const u8,
         mode: domain.Mode,
     ) !void {
+        try self.createControlWithRootEvidence(
+            alloc,
+            child_id,
+            mode,
+            &.{},
+            false,
+        );
+    }
+
+    fn createControlWithRootEvidence(
+        self: *TestEnvironment,
+        alloc: Allocator,
+        child_id: []const u8,
+        mode: domain.Mode,
+        root_user_messages: []const []const u8,
+        root_user_evidence_complete: bool,
+    ) !void {
         var command = try domain.validateCommand(alloc, .{ .create = .{
             .name = child_id,
             .mode = mode,
@@ -385,6 +575,8 @@ const TestEnvironment = struct {
             .actor_id = "parent",
             .operation_id = "create-child",
             .created_child_id = child_id,
+            .root_user_messages = root_user_messages,
+            .root_user_evidence_complete = root_user_evidence_complete,
             .timestamp_ms = 1,
         });
         defer result.deinit(alloc);

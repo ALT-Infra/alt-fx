@@ -11,6 +11,7 @@ const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const tool_runtime = @import("../tooling/tool_runtime.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const mcp_access = @import("../mcp/access_policy.zig");
+const model_catalog = @import("../mcp/model_catalog.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const hooks = @import("../hooks/hooks.zig");
 const execution_memory = @import("../agent/execution_memory.zig");
@@ -59,6 +60,7 @@ const Context = struct {
         result.permission_grants = self.admission.grants;
         result.session_grants = self.admission.grants;
         result.permission_rules = self.admission.rules;
+        result.permission_state_override = &self.admission.permission_state;
         result.sandbox_backend = self.admission.sandbox_backend;
         result.advertised_dynamic_tool_names = self.admission.integration_names;
         result.mcp_access = if (self.admission.mcp_view) |*view|
@@ -186,7 +188,9 @@ pub fn run(
             .workspace_root = config.tool_context.workspace_root,
             .access_scope = config.tool_context.access_scope,
             .origin = .subagent,
-            .root_user_intent_context = message.root_user_intent_context,
+            .root_user_intent_context = prompt.root_user_intent_context,
+            .root_user_messages = message.root_user_messages,
+            .root_user_evidence_complete = message.root_user_evidence_complete,
             .session_child_capability = turn.childCapability() catch null,
             .context_limits = config.tool_context.context_limits,
         },
@@ -309,6 +313,74 @@ fn appendStaticContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayLi
     try context.config.context_registry.appendDefaultStatic(.{
         .project_context = context.config.project_context,
     }, arena, messages);
+    var snapshot = try snapshotModelCatalogForView(
+        arena,
+        if (context.admission.mcp_view) |*view| view else null,
+    );
+    defer snapshot.deinit(arena);
+    const section = try model_catalog.render(arena, snapshot);
+    if (section.text.len > 0) {
+        try messages.append(arena, .{ .role = .system, .content = section.text });
+    }
+    if (section.notice) |notice| try pushLiveNotice(raw, notice);
+}
+
+fn snapshotModelCatalogForView(
+    alloc: Allocator,
+    maybe_view: ?*const mcp_access.View,
+) !model_catalog.Snapshot {
+    const view = maybe_view orelse return model_catalog.Snapshot.empty(alloc);
+    const servers = try alloc.alloc(model_catalog.ServerSummary, view.servers.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (servers[0..initialized]) |server| alloc.free(server.name);
+        alloc.free(servers);
+    }
+    for (view.servers, 0..) |server, index| {
+        var tool_count: usize = 0;
+        for (view.tools) |tool| {
+            if (std.mem.eql(u8, tool.server_name, server.name)) tool_count += 1;
+        }
+        servers[index] = .{
+            .name = try alloc.dupe(u8, server.name),
+            .availability = .ready,
+            .tool_count = tool_count,
+        };
+        initialized += 1;
+    }
+    return .{ .servers = servers };
+}
+
+test "subagent model catalog counts only tools in the captured MCP view" {
+    const alloc = std.testing.allocator;
+    var servers = [_]mcp_access.ServerIdentity{.{
+        .name = @constCast("chrome-devtools"),
+        .source = .profile,
+        .scope = .profile,
+        .connection_generation = 1,
+        .catalog_generation = 2,
+        .auth_generation = 3,
+    }};
+    var tools = [_]mcp_access.ToolIdentity{
+        .{ .name = @constCast("mcp_chrome_one"), .server_name = @constCast("chrome-devtools") },
+        .{ .name = @constCast("mcp_chrome_two"), .server_name = @constCast("chrome-devtools") },
+    };
+    const view = mcp_access.View{
+        .runtime_generation = 1,
+        .owner_id = @constCast("child"),
+        .parent_id = @constCast("parent"),
+        .features_visible = false,
+        .servers = &servers,
+        .tools = &tools,
+    };
+
+    var snapshot = try snapshotModelCatalogForView(alloc, &view);
+    defer snapshot.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), snapshot.servers.len);
+    try std.testing.expectEqualStrings("chrome-devtools", snapshot.servers[0].name);
+    try std.testing.expectEqual(model_catalog.Availability.ready, snapshot.servers[0].availability);
+    try std.testing.expectEqual(@as(?usize, 2), snapshot.servers[0].tool_count);
 }
 
 fn validateToolCall(raw: *anyopaque, arena: Allocator, call: types.ToolCall) !agent_runtime.ToolCallValidationResult {
@@ -450,6 +522,8 @@ fn executeToolCall(raw: *anyopaque, request: agent_runtime.ToolExecutionRequest)
     const context: *Context = @ptrCast(@alignCast(raw));
     var tool_ctx = context.toolContext();
     tool_ctx.root_user_intent_context = request.root_user_intent_context;
+    tool_ctx.root_user_messages = request.root_user_messages;
+    tool_ctx.root_user_evidence_complete = request.root_user_evidence_complete;
     return tool_runtime.executeToolCallAuthorized(tool_ctx, request);
 }
 

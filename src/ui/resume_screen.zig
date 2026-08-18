@@ -130,7 +130,7 @@ test "resume screen places composer catalog and controls without transcript chro
     const session_store = @import("../core/session/session_store.zig");
     const sessions = [_]session_store.SessionSummary{.{
         .id = @constCast("one"),
-        .workspace_root = @constCast("/Users/faxes/Developer/Fx/worktrees/resume-catalog"),
+        .workspace_root = @constCast("/Users/example/Developer/Fx/worktrees/resume-catalog"),
         .title = @constCast("Redesign resume menu"),
         .created_at_ms = 1,
         .updated_at_ms = 1_000,

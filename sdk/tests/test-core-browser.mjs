@@ -121,7 +121,14 @@ async function waitFor(expression, sessionId, timeoutMs = 10000) {
     if (result.result.value) return result.result.value;
     await new Promise((resolveWait) => setTimeout(resolveWait, 25));
   }
-  throw new Error(`timed out waiting for ${expression}`);
+  let diagnostic;
+  try {
+    diagnostic = await command("Runtime.evaluate", {
+      expression: "window.__fxBrowserTerminalTest || null",
+      returnByValue: true,
+    }, sessionId);
+  } catch {}
+  throw new Error(`timed out waiting for ${expression}; last value=${JSON.stringify(diagnostic?.result?.value)}`);
 }
 async function runCase(name, query, verify) {
   const { targetId } = await command("Target.createTarget", { url: "about:blank" });
@@ -182,6 +189,8 @@ try {
     expect(result.state === "completed", result.error || `unexpected terminal state ${result.state}`);
     expect(result.code === 0, `unexpected terminal exit code ${result.code}`);
     expect(result.output.includes("Run /help for commands"), "browser terminal startup output missing");
+    expect(result.inputTaskRanDuringStream, "browser terminal input task was blocked until the buffered stream finished");
+    expect(result.draftRenderedDuringStream, "browser terminal input rendered only after the stream source closed");
     expect(result.dataListeners === 0, `browser terminal leaked ${result.dataListeners} data listener(s)`);
     expect(result.resizeListeners === 0, `browser terminal leaked ${result.resizeListeners} resize listener(s)`);
     console.log("browser terminal startup and shutdown passed");

@@ -21,7 +21,7 @@ const render_request = @import("../../ui/render_request.zig");
 
 const freeStringList = collections.freeStringList;
 const containsIgnoreCase = text_utils.containsIgnoreCase;
-const permissions_usage = "usage: /permissions [ask|auto|yolo|reset]";
+const permissions_usage = "usage: /permissions [ask|auto|yolo|reset]\n       /permissions remember <allow|deny> <tool-name> <arguments-json>\n       /permissions revoke <rule-id>";
 
 pub fn reportUserSettingsCommit(
     app: anytype,
@@ -2279,7 +2279,7 @@ test "session_commands argless permissions writes one read-only status notice wi
     try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
     const status_index = std.mem.find(u8, app.text(), "mode=auto") orelse
         return error.TestExpectedEqual;
-    const usage = "usage: /permissions [ask|auto|yolo|reset]\n";
+    const usage = permissions_usage ++ "\n";
     const usage_index = std.mem.find(u8, app.text(), usage) orelse
         return error.TestExpectedEqual;
     try std.testing.expect(status_index < usage_index);

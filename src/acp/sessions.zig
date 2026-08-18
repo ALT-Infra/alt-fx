@@ -92,6 +92,9 @@ pub fn commitWasmSessionLocked(alloc: Allocator, session: *server.ActiveSessionS
     const history = try session.session_rt.snapshotHistory(alloc);
     types.freeHistoryTurnSlice(alloc, next.history);
     next.history = history;
+    const permission_state = try session.session_rt.snapshotPermissionState(alloc);
+    next.permission_state.deinit(alloc);
+    next.permission_state = permission_state;
     next.context_history_start = session.session_rt.context_history_start;
     next.conversation_language = session.session_rt.languageSnapshot();
     next.updated_at_ms = io_mod.milliTimestamp();
@@ -304,11 +307,12 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
     var session_rt = session_runtime.SessionRuntime.init(state.cfg.max_history_turns, state.cfg.gateway_provider.generation_usage);
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
-    try session_rt.restoreWithContextHistoryStart(
+    try session_rt.restoreWithPermissionState(
         alloc,
         loaded.state.conversation_language,
         loaded.state.history,
         loaded.state.context_history_start,
+        loaded.state.permission_state,
     );
     if (loaded.state.usage) |usage| try session_rt.usage.restore(alloc, usage, loaded.state.created_at_ms);
 
@@ -544,11 +548,12 @@ fn handleRestoreSession(
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
     _ = try session_rt.initializeProfileUsage(alloc, io_mod.getenv("HOME"));
-    try session_rt.restoreWithContextHistoryStart(
+    try session_rt.restoreWithPermissionState(
         alloc,
         writable.state.conversation_language,
         writable.state.history,
         writable.state.context_history_start,
+        writable.state.permission_state,
     );
     if (writable.state.usage) |usage| {
         try session_rt.usage.restore(

@@ -136,9 +136,11 @@ Security is permission-first. All sensitive tool behavior must integrate with `s
 
 * `permission_mode` controls baseline (`ask`, `auto`, or `yolo`). Yolo bypasses Fx permission policy and uses an effective sandbox of `none` without rewriting saved sandbox configuration
 
-* Config-backed permission rules are evaluated before session grants
+* Configured denies are evaluated before saved-session rules; an exact saved-session deny can narrow a configured allow, while an exact saved-session allow can satisfy an unresolved configured ask
 
 * Session `always` approvals are non-persistent; command approvals match the exact command while other grant categories may use patterns
+
+* `/permissions remember allow|deny <tool-name> <arguments-json>` confirms and stores an exact rule only for an active saved session; list and revoke those rules by their stable IDs
 
 Do not bypass the permission system for new tools.
 

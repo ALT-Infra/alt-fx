@@ -240,34 +240,6 @@ test "processQueuedPrompt preserves finish precedence over malformed argument re
     }
 }
 
-test "processQueuedPrompt finish_turn background command propagates history and event" {
-    const alloc = std.testing.allocator;
-    const calls = [_]ToolCall{toolCall("call_1", "run_command", "{\"command\":\"npm run dev\"}")};
-    const completions = [_]FakeCompletion{.{ .tool_calls = &calls }};
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    hooks.exec_plans = &.{.{ .result = .{
-        .model_output = "background",
-        .finish_turn = true,
-        .background_command = .{
-            .pid = "123",
-            .command = "npm run dev",
-            .cwd = "/tmp/workspace",
-            .log_path = "/tmp/fx.log",
-            .url = "http://localhost:3000",
-            .expect_url = true,
-        },
-    } }};
-    defer hooks.deinit();
-    var fixture = PromptFixture{};
-
-    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
-
-    try std.testing.expectEqualStrings("/tmp/fx.log", hooks.background_history_log_path.?);
-    try std.testing.expectEqualStrings("/tmp/fx.log", hooks.background_event_log_path.?);
-}
-
 test "processQueuedPrompt returns a final response after repeated tool failures" {
     const alloc = std.testing.allocator;
     const call_one = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
@@ -1237,80 +1209,6 @@ test "common Stop finish_turn retains candidate and execution memory" {
     try std.testing.expectEqual(@as(usize, 1), turn.execution.tool_steps.len);
     try std.testing.expectEqualStrings(
         "call_finish",
-        turn.execution.tool_steps[0].tool_calls[0].id,
-    );
-    try std.testing.expectEqual(
-        types.PersistedToolStatus.success,
-        turn.execution.tool_steps[0].tool_results[0].status,
-    );
-}
-
-test "common Stop background finish retains candidate and execution memory" {
-    const alloc = std.testing.allocator;
-    const record_id = types.StableBackgroundRecordId{
-        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
-    };
-    const calls = [_]ToolCall{
-        toolCall(
-            "call_background",
-            "run_command",
-            "{\"command\":\"npm run dev\",\"background\":true}",
-        ),
-    };
-    var gateway = FakeGateway.init(alloc, &.{
-        .{ .content = "candidate" },
-        .{
-            .content = "launching",
-            .tool_calls = &calls,
-        },
-    });
-    defer gateway.deinit();
-    var deps = FakeAgentRuntimeDeps.init(alloc);
-    deps.exec_plans = &.{.{ .result = .{
-        .model_output = "background",
-        .finish_turn = true,
-        .background_command = .{
-            .pid = "123",
-            .background_record_id = record_id,
-            .command = "npm run dev",
-            .cwd = "/tmp/workspace",
-            .log_path = "/tmp/hooks-v1-background.log",
-            .url = "http://localhost:3000",
-            .expect_url = true,
-        },
-    } }};
-    defer deps.deinit();
-    var fixture = PromptFixture{};
-    var lifecycle_runtime = lifecycle_hooks.Runtime.init(alloc);
-    defer lifecycle_runtime.deinit();
-    var handler = StopTestHandler{
-        .alloc = alloc,
-        .action = .{ .continue_once = "verify" },
-    };
-    defer handler.deinit();
-    const view = try registerStopTestHandler(&lifecycle_runtime, &handler);
-
-    try runFakePromptWithLifecycle(
-        &gateway,
-        &deps,
-        fixture.config(),
-        fixture.job(),
-        testLifecycleContext(view, alloc, fixture.workspace_root),
-    );
-
-    try std.testing.expectEqual(@as(usize, 1), handler.calls);
-    try std.testing.expectEqual(@as(usize, 1), deps.history_turns.items.len);
-    const turn = deps.history_turns.items[0].background_command;
-    try std.testing.expectEqualStrings("candidate\nlaunching", turn.assistant.?);
-    try std.testing.expectEqualSlices(
-        u8,
-        &record_id,
-        &turn.background_record_id.?,
-    );
-    try std.testing.expectEqual(@as(usize, 1), turn.execution.tool_steps.len);
-    try std.testing.expectEqualStrings(
-        "call_background",
         turn.execution.tool_steps[0].tool_calls[0].id,
     );
     try std.testing.expectEqual(

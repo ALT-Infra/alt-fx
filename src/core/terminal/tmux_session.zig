@@ -28,6 +28,7 @@ const control_nonce_len: usize = 32;
 const marker_frame_len: usize = control_nonce_len + 1;
 const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
 const poll_ns: u64 = 5 * std.time.ns_per_ms;
+const cleanup_settle_deadline_ms: i64 = 500;
 const capture_accept_deadline_ms: i64 = 2_000;
 pub const marker_acknowledgement_timeout_ms: i64 = 15_000;
 const marker_acknowledgement_delivery_margin_ms: i64 = 1_000;
@@ -895,7 +896,7 @@ fn cleanupOwnedNamespaceWithEvidence(
             "-t",
             paths.session_name,
         }) catch |err| {
-            requireOwnedNamespaceAbsent(
+            waitForOwnedNamespaceAbsent(
                 alloc,
                 process_provider,
                 paths,
@@ -911,7 +912,7 @@ fn cleanupOwnedNamespaceWithEvidence(
                 },
             };
         };
-        requireOwnedNamespaceAbsent(
+        waitForOwnedNamespaceAbsent(
             alloc,
             process_provider,
             paths,
@@ -921,7 +922,7 @@ fn cleanupOwnedNamespaceWithEvidence(
             return err;
         };
     } else {
-        requireOwnedNamespaceAbsent(
+        waitForOwnedNamespaceAbsent(
             alloc,
             process_provider,
             paths,
@@ -1784,6 +1785,33 @@ fn requireOwnedNamespaceAbsent(
     try requireSavedPaneProcessAbsent(alloc, process_provider, evidence);
 }
 
+fn waitForOwnedNamespaceAbsent(
+    alloc: Allocator,
+    process_provider: background_process_provider.Provider,
+    paths: *const Paths,
+    evidence: OwnerEvidence,
+) !void {
+    const started_at = io_mod.milliTimestamp();
+    while (true) {
+        requireOwnedNamespaceAbsent(
+            alloc,
+            process_provider,
+            paths,
+            evidence,
+        ) catch |err| switch (err) {
+            error.TmuxCleanupIncomplete => {
+                if (io_mod.milliTimestamp() - started_at >= cleanup_settle_deadline_ms) {
+                    return err;
+                }
+                io_mod.sleep(poll_ns);
+                continue;
+            },
+            else => return err,
+        };
+        return;
+    }
+}
+
 fn writeLauncherConfig(
     alloc: Allocator,
     path: []const u8,
@@ -2473,6 +2501,8 @@ test "checked tmux cleanup requires saved process absence without a socket" {
     const alloc = std.testing.allocator;
     const MatchStub = struct {
         result: process_supervisor.TokenMatch,
+        matches_before_result: usize = 0,
+        match_calls: usize = 0,
 
         fn match(
             raw: ?*anyopaque,
@@ -2481,6 +2511,11 @@ test "checked tmux cleanup requires saved process absence without a socket" {
             _: process_supervisor.ProcessInstanceToken,
         ) process_supervisor.TokenMatch {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.match_calls += 1;
+            if (self.matches_before_result > 0) {
+                self.matches_before_result -= 1;
+                return .matched;
+            }
             return self.result;
         }
     };
@@ -2614,6 +2649,8 @@ test "checked tmux cleanup requires saved process absence without a socket" {
         ),
     );
     stub.result = .missing;
+    stub.matches_before_result = 2;
+    const settling_match_calls = stub.match_calls;
     try cleanupOwnedNamespaceChecked(
         alloc,
         provider,
@@ -2621,6 +2658,10 @@ test "checked tmux cleanup requires saved process absence without a socket" {
         transport_root,
         identity,
         recovered_identity,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 3),
+        stub.match_calls - settling_match_calls,
     );
 }
 

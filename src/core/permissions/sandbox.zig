@@ -2,6 +2,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const command_contract = @import("../execution/command_contract.zig");
+const command_environment = @import("../execution/command_environment.zig");
+const process_tree = @import("../execution/process_tree.zig");
 const background_process_provider = @import(
     "../execution/background_process_provider.zig",
 );
@@ -15,6 +17,7 @@ const artifact_digest = @import("../session/artifact_digest.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
+const shell_resolver = @import("../terminal/shell_resolver.zig");
 
 const Allocator = std.mem.Allocator;
 pub const CommandOutputStream = command_contract.CommandOutputStream;
@@ -176,6 +179,8 @@ const foreground_session_token = "__fx_foreground_session__";
 const foreground_session_ready_byte: u8 = 0x1e;
 const foreground_session_release_byte: u8 = 0x06;
 const foreground_session_setup_timeout_ms: i64 = 5000;
+const foreground_target_termination_grace_ms: i64 = 700;
+const foreground_target_cleanup_wait_ms: i64 = 250;
 const foreground_session_replace_failure_exit_code: u8 = 125;
 const foreground_session_failure_nonce_bytes: usize = 16;
 const foreground_session_failure_nonce_hex_bytes: usize = foreground_session_failure_nonce_bytes * 2;
@@ -183,6 +188,7 @@ const foreground_session_replace_failure_prefix = "\x00FX_FOREGROUND_EXEC_FAILED
 const foreground_session_replace_failure_marker_bytes =
     foreground_session_replace_failure_prefix.len +
     foreground_session_failure_nonce_hex_bytes + 1;
+var foreground_session_termination_requested: std.c.sig_atomic_t = 0;
 const foreground_session_replace_error_name_bytes = blk: {
     var max_len: usize = 0;
     for (std.meta.fields(std.process.ReplaceError)) |field| {
@@ -237,14 +243,219 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
         return error.InvalidForegroundSessionRelease;
     }
 
-    const replace_err = std.process.replace(zio, .{ .argv = args[2..] });
-    writeForegroundSessionReplaceFailure(args[1], replace_err);
-    std.process.exit(foreground_session_replace_failure_exit_code);
+    // The group receives TERM together. Keep the supervisor alive while the
+    // target uses the cooperative shutdown window.
+    @as(*volatile std.c.sig_atomic_t, &foreground_session_termination_requested).* = 0;
+    const supervisor_action: std.posix.Sigaction = .{
+        .handler = .{ .handler = recordForegroundSessionTermination },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.TERM, &supervisor_action, null);
+    if (comptime builtin.os.tag == .linux) {
+        _ = try std.posix.prctl(.SET_CHILD_SUBREAPER, .{@as(usize, 1)});
+    }
+    var target = std.process.spawn(zio, .{
+        .argv = args[2..],
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+        .start_suspended = builtin.os.tag == .macos,
+    }) catch |err| {
+        writeForegroundSessionReplaceFailure(args[1], err);
+        std.process.exit(foreground_session_replace_failure_exit_code);
+    };
+    const term = waitForForegroundTarget(&target) catch |err| {
+        target.kill(zio);
+        _ = target.wait(zio) catch {};
+        writeForegroundSessionReplaceFailure(args[1], err);
+        std.process.exit(foreground_session_replace_failure_exit_code);
+    };
+    exitForegroundSessionSupervisor(term);
+}
+
+fn recordForegroundSessionTermination(_: std.posix.SIG) callconv(.c) void {
+    @as(*volatile std.c.sig_atomic_t, &foreground_session_termination_requested).* = 1;
+}
+
+fn foregroundSessionTerminationRequested() bool {
+    return @as(*volatile std.c.sig_atomic_t, &foreground_session_termination_requested).* != 0;
+}
+
+fn waitForForegroundTarget(
+    target: *std.process.Child,
+) !std.process.Child.Term {
+    const target_pid = target.id orelse return error.ForegroundTargetMissing;
+    var descendants = try process_tree.Tracker.init(std.heap.page_allocator);
+    defer descendants.deinit();
+    if (comptime builtin.os.tag == .macos) {
+        try descendants.refresh(target_pid);
+        try std.posix.kill(target_pid, std.posix.SIG.CONT);
+    }
+    var termination_started_ms: ?i64 = null;
+    var forced = false;
+
+    while (true) {
+        try refreshForegroundTargetTree(&descendants, target_pid);
+        const now_ms = io_mod.milliTimestamp();
+        if (foregroundSessionTerminationRequested()) {
+            if (termination_started_ms == null) {
+                beginForegroundTargetTermination(
+                    &descendants,
+                    now_ms,
+                    &termination_started_ms,
+                );
+            } else if (!forced and
+                now_ms - termination_started_ms.? >= foreground_target_termination_grace_ms)
+            {
+                forced = true;
+                forceKillForegroundTargetDescendants(&descendants);
+            }
+        }
+
+        if (try pollProcessLeader(target)) |term| {
+            try refreshForegroundTargetTree(&descendants, target_pid);
+            if (termination_started_ms == null and
+                foregroundSessionTerminationRequested())
+            {
+                beginForegroundTargetTermination(
+                    &descendants,
+                    io_mod.milliTimestamp(),
+                    &termination_started_ms,
+                );
+            }
+            if (termination_started_ms) |started_ms| {
+                try waitForForegroundTargetDescendants(
+                    &descendants,
+                    target_pid,
+                    started_ms,
+                    &forced,
+                );
+                return term;
+            }
+            const count = try cleanupCompletedForegroundTarget(
+                &descendants,
+                target_pid,
+            );
+            if (count > 0) {
+                debug_trace.logf(
+                    "core",
+                    "captured command target completed; tracked descendants terminated count={d}",
+                    .{count},
+                );
+            }
+            return term;
+        }
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+}
+
+fn cleanupCompletedForegroundTarget(
+    descendants: *process_tree.Tracker,
+    target_pid: std.posix.pid_t,
+) !usize {
+    const started_ms = io_mod.milliTimestamp();
+    var signaled: usize = 0;
+    var empty_scans: u8 = 0;
+    while (io_mod.milliTimestamp() - started_ms <
+        foreground_target_cleanup_wait_ms)
+    {
+        try refreshForegroundTargetTree(descendants, target_pid);
+        signaled += descendants.signalAll(std.posix.SIG.KILL);
+        if (descendants.anyAlive()) {
+            empty_scans = 0;
+        } else {
+            empty_scans += 1;
+            if (empty_scans >= 2) return signaled;
+        }
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    try refreshForegroundTargetTree(descendants, target_pid);
+    signaled += descendants.signalAll(std.posix.SIG.KILL);
+    return signaled;
+}
+
+fn refreshForegroundTargetTree(
+    descendants: *process_tree.Tracker,
+    target_pid: std.posix.pid_t,
+) !void {
+    try descendants.refresh(target_pid);
+    if (comptime builtin.os.tag == .linux) {
+        try descendants.refreshAdditionalRoot(std.c.getpid());
+    }
+    if (comptime builtin.os.tag == .macos) {
+        if (foregroundSessionTerminationRequested()) {
+            try descendants.refreshLineageProcesses();
+        }
+    }
+}
+
+fn beginForegroundTargetTermination(
+    descendants: *process_tree.Tracker,
+    now_ms: i64,
+    termination_started_ms: *?i64,
+) void {
+    termination_started_ms.* = now_ms;
+    const count = descendants.signalOutsideProcessGroup(
+        std.posix.SIG.TERM,
+        std.c.getpid(),
+    );
+    debug_trace.logf(
+        "core",
+        "captured command termination reached tracked descendants count={d}",
+        .{count},
+    );
+}
+
+fn waitForForegroundTargetDescendants(
+    descendants: *process_tree.Tracker,
+    target_pid: std.posix.pid_t,
+    termination_started_ms: i64,
+    forced: *bool,
+) !void {
+    var empty_scans: u8 = 0;
+    while (true) {
+        try refreshForegroundTargetTree(descendants, target_pid);
+        const now_ms = io_mod.milliTimestamp();
+        if (!forced.* and
+            now_ms - termination_started_ms >= foreground_target_termination_grace_ms)
+        {
+            forced.* = true;
+            forceKillForegroundTargetDescendants(descendants);
+        }
+        if (forced.*) {
+            _ = descendants.signalAll(std.posix.SIG.KILL);
+        }
+        if (descendants.anyAlive()) {
+            empty_scans = 0;
+        } else {
+            empty_scans += 1;
+            if (empty_scans >= 2) return;
+        }
+        if (forced.* and
+            now_ms - termination_started_ms >=
+                foreground_target_termination_grace_ms + foreground_target_cleanup_wait_ms)
+        {
+            return;
+        }
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+}
+
+fn forceKillForegroundTargetDescendants(
+    descendants: *process_tree.Tracker,
+) void {
+    const count = descendants.signalAll(std.posix.SIG.KILL);
+    debug_trace.logf(
+        "core",
+        "captured command force-killed tracked descendants count={d}",
+        .{count},
+    );
 }
 
 fn writeForegroundSessionReplaceFailure(
     nonce: []const u8,
-    err: std.process.ReplaceError,
+    err: anyerror,
 ) void {
     var buffer: [256]u8 = undefined;
     const message = std.fmt.bufPrint(
@@ -253,6 +464,26 @@ fn writeForegroundSessionReplaceFailure(
         .{ nonce, @errorName(err) },
     ) catch foreground_session_replace_failure_prefix ++ "unknown\n";
     std.Io.File.stderr().writeStreamingAll(io_mod.getIo(), message) catch {};
+}
+
+fn exitForegroundSessionSupervisor(term: std.process.Child.Term) noreturn {
+    switch (term) {
+        .exited => |code| std.process.exit(code),
+        .signal => |signal| {
+            const default_action: std.posix.Sigaction = .{
+                .handler = .{ .handler = std.posix.SIG.DFL },
+                .mask = std.posix.sigemptyset(),
+                .flags = 0,
+            };
+            std.posix.sigaction(signal, &default_action, null);
+            var signal_mask = std.posix.sigemptyset();
+            std.posix.sigaddset(&signal_mask, signal);
+            std.posix.sigprocmask(std.posix.SIG.UNBLOCK, &signal_mask, null);
+            std.posix.raise(signal) catch {};
+            std.process.exit(128 + @as(u8, @truncate(@intFromEnum(signal))));
+        },
+        .stopped, .unknown => std.process.exit(127),
+    }
 }
 
 /// Resolves auto backend selection from host OS and locally available tools.
@@ -293,6 +524,76 @@ pub fn executeCommand(
         .vercel => executeVercel(arena, scratch, effective_cfg, command, cwd),
         .just_bash => executeJustBash(arena, scratch, effective_cfg, "just-bash", command, cwd),
         .none, .auto => executeRawBash(arena, scratch, effective_cfg, command, cwd),
+    };
+}
+
+pub fn executeCommandInEnvironment(
+    cfg: Config,
+    arena: Allocator,
+    command: []const u8,
+    cwd: []const u8,
+    environment: command_environment.Environment,
+) !command_contract.RunCommandResult {
+    switch (environment) {
+        .legacy => return executeCommand(cfg, arena, command, cwd),
+        .workspace_clean => return error.InvalidCommandEnvironment,
+        .clean, .user => {},
+    }
+
+    var scratch_state = std.heap.ArenaAllocator.init(arena);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+
+    var effective_cfg = cfg;
+    if (effective_cfg.timeout_started_ms == null) effective_cfg.timeout_started_ms = io_mod.milliTimestamp();
+    try BackendControl.init(effective_cfg).check();
+    const backend = resolveBackend(effective_cfg.backend);
+    const invocation = try shell_resolver.capturedInvocation(environment, command);
+    debug_trace.logf(
+        "core",
+        "sandbox explicit command environment={s} shell={s}",
+        .{ @tagName(std.meta.activeTag(environment)), invocation.path },
+    );
+    return switch (backend) {
+        .macos => executeMacOSInvocation(
+            arena,
+            scratch,
+            effective_cfg,
+            command,
+            cwd,
+            &invocation,
+        ),
+        .none, .auto => executeRawInvocation(
+            arena,
+            scratch,
+            effective_cfg,
+            command,
+            cwd,
+            &invocation,
+        ),
+        .vercel, .just_bash => blk: {
+            const projected = try shell_resolver.formatInvocationCommand(scratch, &invocation);
+            break :blk switch (backend) {
+                .vercel => executeVercelWithResultCommand(
+                    arena,
+                    scratch,
+                    effective_cfg,
+                    projected,
+                    command,
+                    cwd,
+                ),
+                .just_bash => executeJustBashWithResultCommand(
+                    arena,
+                    scratch,
+                    effective_cfg,
+                    "just-bash",
+                    projected,
+                    command,
+                    cwd,
+                ),
+                else => unreachable,
+            };
+        },
     };
 }
 
@@ -380,6 +681,20 @@ fn executeMacOS(
         cwd,
         command,
     );
+    return formatCollectedOutput(alloc, command, cwd, result);
+}
+
+fn executeMacOSInvocation(
+    alloc: Allocator,
+    scratch: Allocator,
+    cfg: Config,
+    command: []const u8,
+    cwd: []const u8,
+    invocation: *const shell_resolver.Invocation,
+) !command_contract.RunCommandResult {
+    if (!host.current().os_sandbox) return unsupportedOsSandboxResult(alloc, command, cwd);
+    const argv = try buildDirectMacOSArgv(scratch, cfg, invocation.argv());
+    const result = try executeProcessWithClosedInput(scratch, cfg, argv, cwd);
     return formatCollectedOutput(alloc, command, cwd, result);
 }
 
@@ -586,13 +901,38 @@ fn executeVercel(
     command: []const u8,
     cwd: []const u8,
 ) !command_contract.RunCommandResult {
+    return executeVercelWithResultCommand(
+        alloc,
+        scratch,
+        cfg,
+        command,
+        command,
+        cwd,
+    );
+}
+
+fn executeVercelWithResultCommand(
+    alloc: Allocator,
+    scratch: Allocator,
+    cfg: Config,
+    execution_command: []const u8,
+    result_command: []const u8,
+    cwd: []const u8,
+) !command_contract.RunCommandResult {
     const provider = cfg.devbox_provider orelse {
         debug_trace.logf("core", "vercel sandbox unavailable: no devbox provider, falling back to raw bash", .{});
-        return executeRawBash(alloc, scratch, cfg, command, cwd);
+        return executeRawBashWithResultCommand(
+            alloc,
+            scratch,
+            cfg,
+            execution_command,
+            result_command,
+            cwd,
+        );
     };
     return switch (try provider.execute(
         alloc,
-        command,
+        execution_command,
         cwd,
         devboxControl(cfg),
     )) {
@@ -603,7 +943,7 @@ fn executeVercel(
             try emitProviderOutput(cfg, .stderr, owned.stderr);
             break :blk try formatExitOutput(
                 alloc,
-                command,
+                result_command,
                 cwd,
                 owned.exit_code,
                 owned.stdout,
@@ -613,11 +953,25 @@ fn executeVercel(
         },
         .unavailable => blk: {
             debug_trace.logf("core", "vercel sandbox unavailable: no auth token, falling back to raw bash", .{});
-            break :blk try executeRawBash(alloc, scratch, cfg, command, cwd);
+            break :blk try executeRawBashWithResultCommand(
+                alloc,
+                scratch,
+                cfg,
+                execution_command,
+                result_command,
+                cwd,
+            );
         },
         .request_failed => blk: {
             debug_trace.logf("core", "vercel sandbox request failed, falling back to raw bash", .{});
-            break :blk try executeRawBash(alloc, scratch, cfg, command, cwd);
+            break :blk try executeRawBashWithResultCommand(
+                alloc,
+                scratch,
+                cfg,
+                execution_command,
+                result_command,
+                cwd,
+            );
         },
     };
 }
@@ -675,7 +1029,27 @@ fn executeJustBash(
     command: []const u8,
     cwd: []const u8,
 ) !command_contract.RunCommandResult {
-    const argv = [_][]const u8{ executable_path, "-c", command, "--root", cfg.workspace_root, "--cwd", cwd, "--json" };
+    return executeJustBashWithResultCommand(
+        alloc,
+        scratch,
+        cfg,
+        executable_path,
+        command,
+        command,
+        cwd,
+    );
+}
+
+fn executeJustBashWithResultCommand(
+    alloc: Allocator,
+    scratch: Allocator,
+    cfg: Config,
+    executable_path: []const u8,
+    execution_command: []const u8,
+    result_command: []const u8,
+    cwd: []const u8,
+) !command_contract.RunCommandResult {
+    const argv = [_][]const u8{ executable_path, "-c", execution_command, "--root", cfg.workspace_root, "--cwd", cwd, "--json" };
     var transport_cfg = cfg;
     if (cfg.callback_projection == .raw or cfg.on_accepted_output_chunk != null) {
         transport_cfg.output_chunk_ctx = null;
@@ -690,15 +1064,29 @@ fn executeJustBash(
         => return err,
         else => {
             debug_trace.logf("core", "just-bash execution failed err={s}, falling back to raw bash", .{@errorName(err)});
-            return executeRawBash(alloc, scratch, cfg, command, cwd);
+            return executeRawBashWithResultCommand(
+                alloc,
+                scratch,
+                cfg,
+                execution_command,
+                result_command,
+                cwd,
+            );
         },
     };
-    if (result.cancelled) return formatCollectedOutput(alloc, command, cwd, result);
+    if (result.cancelled) return formatCollectedOutput(alloc, result_command, cwd, result);
 
-    return parseJustBashJson(alloc, scratch, cfg, result.stdout, result.stderr, result.term, command, cwd, result.duration_ms) catch |err| switch (err) {
+    return parseJustBashJson(alloc, scratch, cfg, result.stdout, result.stderr, result.term, result_command, cwd, result.duration_ms) catch |err| switch (err) {
         error.JustBashParseError, error.JustBashExecutionFailed => {
             debug_trace.logf("core", "just-bash response parse failed err={s}, falling back to raw bash", .{@errorName(err)});
-            return executeRawBash(alloc, scratch, cfg, command, cwd);
+            return executeRawBashWithResultCommand(
+                alloc,
+                scratch,
+                cfg,
+                execution_command,
+                result_command,
+                cwd,
+            );
         },
         else => return err,
     };
@@ -1040,15 +1428,48 @@ fn finishCollectedProcess(
 }
 
 fn executeProcess(scratch: Allocator, cfg: Config, argv: []const []const u8, cwd: []const u8) !CollectedProcess {
+    return executeProcessWithInput(scratch, cfg, argv, cwd, false, true);
+}
+
+fn executeProcessWithClosedInput(
+    scratch: Allocator,
+    cfg: Config,
+    argv: []const []const u8,
+    cwd: []const u8,
+) !CollectedProcess {
+    if (comptime supports_foreground_session) {
+        return executeProcessWithDetachedSession(
+            scratch,
+            cfg,
+            argv,
+            cwd,
+            "",
+        );
+    }
+    return executeProcessWithInput(scratch, cfg, argv, cwd, true, true);
+}
+
+fn executeProcessWithInput(
+    scratch: Allocator,
+    cfg: Config,
+    argv: []const []const u8,
+    cwd: []const u8,
+    closed_input: bool,
+    isolate_process_group: bool,
+) !CollectedProcess {
     const started_ms = io_mod.milliTimestamp();
     var child = try std.process.spawn(io_mod.getIo(), .{
         .argv = argv,
-        .stdin = .ignore,
+        .stdin = if (closed_input) .pipe else .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
         .cwd = .{ .path = cwd },
-        .pgid = if (builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
+        .pgid = if (isolate_process_group and builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
     });
+    if (child.stdin) |input| {
+        input.close(io_mod.getIo());
+        child.stdin = null;
+    }
 
     var output = OutputCollector.init(scratch, cfg);
     defer output.deinit();
@@ -1056,8 +1477,27 @@ fn executeProcess(scratch: Allocator, cfg: Config, argv: []const []const u8, cwd
     var child_needs_cleanup = true;
     errdefer if (child_needs_cleanup) cleanupChild(&child);
 
-    const source = try collectOutputForProcess(scratch, &child, &output, cfg, null);
-    const term = try waitForCollectedProcess(&child, source);
+    const process_group_id = if (isolate_process_group and
+        builtin.os.tag != .windows and builtin.os.tag != .wasi)
+        child.id
+    else
+        null;
+    var leader_term: ?std.process.Child.Term = null;
+    const source = try collectOutputForProcess(
+        scratch,
+        &child,
+        &output,
+        cfg,
+        null,
+        process_group_id,
+        &leader_term,
+    );
+    const term = try waitForCollectedProcess(
+        &child,
+        source,
+        process_group_id,
+        leader_term,
+    );
     const duration_ms = elapsedMs(started_ms, io_mod.milliTimestamp());
     child_needs_cleanup = false;
 
@@ -1165,14 +1605,23 @@ fn executeProcessWithDetachedSession(
     script_write_open = false;
 
     var launch_failure_probe = ForegroundLaunchFailureProbe.init(&failure_marker);
+    const process_group_id = child.id;
+    var leader_term: ?std.process.Child.Term = null;
     const source = try collectOutputForProcess(
         scratch,
         &child,
         &output,
         cfg,
         &launch_failure_probe,
+        process_group_id,
+        &leader_term,
     );
-    const term = try waitForCollectedProcess(&child, source);
+    const term = try waitForCollectedProcess(
+        &child,
+        source,
+        process_group_id,
+        leader_term,
+    );
     const duration_ms = elapsedMs(started_ms, io_mod.milliTimestamp());
     child_needs_cleanup = false;
 
@@ -1307,8 +1756,23 @@ fn executeProcessWithScriptUnisolated(
     script_write.close(io_mod.getIo());
     script_write_open = false;
 
-    const source = try collectOutputForProcess(scratch, &child, &output, cfg, null);
-    const term = try waitForCollectedProcess(&child, source);
+    const process_group_id = child.id;
+    var leader_term: ?std.process.Child.Term = null;
+    const source = try collectOutputForProcess(
+        scratch,
+        &child,
+        &output,
+        cfg,
+        null,
+        process_group_id,
+        &leader_term,
+    );
+    const term = try waitForCollectedProcess(
+        &child,
+        source,
+        process_group_id,
+        leader_term,
+    );
     const duration_ms = elapsedMs(started_ms, io_mod.milliTimestamp());
     child_needs_cleanup = false;
 
@@ -1490,10 +1954,28 @@ fn executeRawBash(
     command: []const u8,
     cwd: []const u8,
 ) !command_contract.RunCommandResult {
+    return executeRawBashWithResultCommand(
+        alloc,
+        scratch,
+        cfg,
+        command,
+        command,
+        cwd,
+    );
+}
+
+fn executeRawBashWithResultCommand(
+    alloc: Allocator,
+    scratch: Allocator,
+    cfg: Config,
+    execution_command: []const u8,
+    result_command: []const u8,
+    cwd: []const u8,
+) !command_contract.RunCommandResult {
     if (builtin.os.tag == .windows) {
-        const argv = [_][]const u8{ "cmd", "/C", command };
+        const argv = [_][]const u8{ "cmd", "/C", execution_command };
         const result = try executeProcess(scratch, cfg, &argv, cwd);
-        return formatCollectedOutput(alloc, command, cwd, result);
+        return formatCollectedOutput(alloc, result_command, cwd, result);
     }
 
     const argv = [_][]const u8{
@@ -1506,9 +1988,82 @@ fn executeRawBash(
         cfg,
         &argv,
         cwd,
-        command,
+        execution_command,
+    );
+    return formatCollectedOutput(alloc, result_command, cwd, result);
+}
+
+fn executeRawInvocation(
+    alloc: Allocator,
+    scratch: Allocator,
+    cfg: Config,
+    command: []const u8,
+    cwd: []const u8,
+    invocation: *const shell_resolver.Invocation,
+) !command_contract.RunCommandResult {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.InvalidCommandEnvironment;
+    }
+    const result = try executeProcessWithScript(
+        scratch,
+        cfg,
+        invocation.argv(),
+        cwd,
+        "",
     );
     return formatCollectedOutput(alloc, command, cwd, result);
+}
+
+test "explicit captured profiles execute exact shells without synthetic stderr" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/bash", .{}) catch
+        return error.SkipZigTest;
+    const shell_path = "/bin/bash";
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cfg = Config{
+        .backend = .none,
+        .workspace_root = "/tmp",
+        .max_command_output_bytes = 16 * 1024,
+    };
+    const command = "printf 'profile-stdout'; printf 'profile-stderr' >&2";
+
+    const clean = try executeCommandInEnvironment(
+        cfg,
+        arena,
+        command,
+        "/tmp",
+        .{ .clean = shell_path },
+    );
+    try std.testing.expect(std.mem.find(u8, clean.output, "profile-stdout") != null);
+    try std.testing.expect(std.mem.find(u8, clean.output, "profile-stderr") != null);
+
+    const user = try executeCommandInEnvironment(
+        cfg,
+        arena,
+        command,
+        "/tmp",
+        .{ .user = shell_path },
+    );
+    try std.testing.expectEqualStrings(
+        "exit_code=0\n<stdout>\nprofile-stdout\n</stdout>\n<stderr>\nprofile-stderr\n</stderr>\n",
+        user.output,
+    );
+    if (std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{})) {
+        const zsh_user = try executeCommandInEnvironment(
+            cfg,
+            arena,
+            command,
+            "/tmp",
+            .{ .user = "/bin/zsh" },
+        );
+        try std.testing.expectEqualStrings(
+            "exit_code=0\n<stdout>\nprofile-stdout\n</stdout>\n<stderr>\nprofile-stderr\n</stderr>\n",
+            zsh_user.output,
+        );
+    } else |_| {}
 }
 
 fn parseJustBashJson(alloc: Allocator, scratch: Allocator, cfg: Config, stdout_raw: []const u8, stderr_raw: []const u8, term: std.process.Child.Term, command: []const u8, cwd: []const u8, duration_ms: ?u64) !command_contract.RunCommandResult {
@@ -1881,6 +2436,8 @@ fn collectOutput(
     cfg: Config,
     source: *TerminationSource,
     launch_failure_probe: ?*ForegroundLaunchFailureProbe,
+    process_group_id: ?std.posix.pid_t,
+    leader_term: *?std.process.Child.Term,
 ) !TerminationSource {
     const zio = io_mod.getIo();
     var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
@@ -1897,16 +2454,51 @@ fn collectOutput(
     const started_ms = BackendControl.init(cfg).started_ms;
     var signal_started_ms: ?i64 = null;
     var force_kill_sent = false;
+    var streams_finished = false;
 
     while (true) {
         try updateTerminationSignal(
             child,
+            process_group_id,
             cfg,
             started_ms,
             source,
             &signal_started_ms,
             &force_kill_sent,
         );
+        if (leader_term.* == null) {
+            if (try pollProcessLeader(child)) |term| {
+                leader_term.* = term;
+                if (process_group_id) |pid| {
+                    if (source.* == .natural) {
+                        terminateRemainingProcessGroup(pid);
+                        debug_trace.logf(
+                            "core",
+                            "captured command leader completed; remaining process group terminated",
+                            .{},
+                        );
+                    } else {
+                        debug_trace.logf(
+                            "core",
+                            "captured command leader completed during {s}; remaining process group retains termination grace",
+                            .{@tagName(source.*)},
+                        );
+                    }
+                }
+            }
+        }
+
+        if (streams_finished) {
+            if (source.* == .natural or
+                signal_started_ms == null or
+                force_kill_sent or
+                !remainingProcessGroupAlive(process_group_id))
+            {
+                break;
+            }
+            io_mod.sleep(10 * std.time.ns_per_ms);
+            continue;
+        }
 
         const keep_reading = if (multi_reader.fill(4096, .{ .duration = .{ .raw = .{ .nanoseconds = 100_000_000 }, .clock = .awake } }))
             true
@@ -1931,7 +2523,16 @@ fn collectOutput(
             stderr_r.tossBuffered();
         }
 
-        if (!keep_reading) break;
+        if (!keep_reading) {
+            streams_finished = true;
+            if (source.* == .natural or
+                signal_started_ms == null or
+                force_kill_sent or
+                !remainingProcessGroupAlive(process_group_id))
+            {
+                break;
+            }
+        }
     }
 
     if (launch_failure_probe) |probe| {
@@ -1947,6 +2548,8 @@ fn collectOutputForProcess(
     output: *OutputCollector,
     cfg: Config,
     launch_failure_probe: ?*ForegroundLaunchFailureProbe,
+    process_group_id: ?std.posix.pid_t,
+    leader_term: *?std.process.Child.Term,
 ) !TerminationSource {
     var source: TerminationSource = .natural;
     return collectOutput(
@@ -1956,13 +2559,59 @@ fn collectOutputForProcess(
         cfg,
         &source,
         launch_failure_probe,
+        process_group_id,
+        leader_term,
     ) catch |err|
         return mapTerminationError(source, cfg.cancel_flag, "output collection", err);
 }
 
-fn waitForCollectedProcess(child: *std.process.Child, source: TerminationSource) !std.process.Child.Term {
-    return child.wait(io_mod.getIo()) catch |err|
+fn waitForCollectedProcess(
+    child: *std.process.Child,
+    source: TerminationSource,
+    process_group_id: ?std.posix.pid_t,
+    leader_term: ?std.process.Child.Term,
+) !std.process.Child.Term {
+    if (leader_term) |term| {
+        closeChildPipes(child);
+        return term;
+    }
+    const term = child.wait(io_mod.getIo()) catch |err|
         return mapTerminationError(source, null, "process wait", err);
+    if (process_group_id) |pid| {
+        terminateRemainingProcessGroup(pid);
+    }
+    return term;
+}
+
+fn pollProcessLeader(child: *std.process.Child) !?std.process.Child.Term {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return null;
+    const pid = child.id orelse return null;
+    var status: if (builtin.link_libc) c_int else u32 = undefined;
+    while (true) {
+        const result = std.posix.system.waitpid(pid, &status, std.posix.W.NOHANG);
+        switch (std.posix.errno(result)) {
+            .SUCCESS => {
+                if (result == 0) return null;
+                if (result != pid) return error.Unexpected;
+                child.id = null;
+                return childTermFromStatus(@bitCast(status));
+            },
+            .INTR => continue,
+            .CHILD => return error.Unexpected,
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
+    }
+}
+
+fn childTermFromStatus(status: u32) std.process.Child.Term {
+    return if (std.posix.W.IFEXITED(status))
+        .{ .exited = std.posix.W.EXITSTATUS(status) }
+    else if (std.posix.W.IFSIGNALED(status))
+        .{ .signal = std.posix.W.TERMSIG(status) }
+    else if (std.posix.W.IFSTOPPED(status))
+        .{ .stopped = std.posix.W.STOPSIG(status) }
+    else
+        .{ .unknown = status };
 }
 
 fn mapTerminationError(
@@ -1990,6 +2639,7 @@ fn mapTerminationError(
 
 fn updateTerminationSignal(
     child: *std.process.Child,
+    process_group_id: ?std.posix.pid_t,
     cfg: Config,
     started_ms: i64,
     source: *TerminationSource,
@@ -2000,7 +2650,7 @@ fn updateTerminationSignal(
     if (signal_started_ms.* == null) {
         if (cancelRequested(cfg.cancel_flag)) {
             source.* = .cancelled;
-            try signalChild(child, false);
+            try signalChild(child, process_group_id, false);
             debug_trace.logf("core", "command termination requested source=cancelled", .{});
             signal_started_ms.* = now_ms;
         }
@@ -2010,7 +2660,7 @@ fn updateTerminationSignal(
                     // Timeout uses the same signal path as cancellation but
                     // records a distinct source for the post-wait mapping.
                     source.* = .timed_out;
-                    try signalChild(child, false);
+                    try signalChild(child, process_group_id, false);
                     debug_trace.logf("core", "command termination requested source=timeout", .{});
                     signal_started_ms.* = now_ms;
                 }
@@ -2020,7 +2670,7 @@ fn updateTerminationSignal(
 
     if (signal_started_ms.*) |sent_ms| {
         if (!force_kill_sent.* and now_ms - sent_ms >= 800) {
-            try signalChild(child, true);
+            try signalChild(child, process_group_id, true);
             debug_trace.logf("core", "command force-killed after termination grace expired", .{});
             force_kill_sent.* = true;
         }
@@ -2040,21 +2690,53 @@ fn emitOutputChunk(
     try callback(ctx, lifecycle_id, stream, chunk);
 }
 
-fn signalChild(child: *std.process.Child, force: bool) !void {
+fn signalChild(
+    child: *std.process.Child,
+    process_group_id: ?std.posix.pid_t,
+    force: bool,
+) !void {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
         child.kill(io_mod.getIo());
         return;
     }
 
+    if (process_group_id) |pid| return signalProcessGroup(pid, force);
     const pid = child.id orelse return;
+    return signalProcessGroup(pid, force);
+}
+
+fn signalProcessGroup(pid: std.posix.pid_t, force: bool) !void {
     std.posix.kill(-pid, if (force) std.posix.SIG.KILL else std.posix.SIG.TERM) catch |err| switch (err) {
         error.ProcessNotFound => {},
         else => return err,
     };
 }
 
+fn terminateRemainingProcessGroup(pid: std.posix.pid_t) void {
+    signalProcessGroup(pid, true) catch |err| {
+        debug_trace.logf(
+            "core",
+            "remaining captured process group cleanup failed err={s}",
+            .{@errorName(err)},
+        );
+    };
+}
+
+fn remainingProcessGroupAlive(process_group_id: ?std.posix.pid_t) bool {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return false;
+    const pid = process_group_id orelse return false;
+    std.posix.kill(-pid, @enumFromInt(0)) catch |err| return switch (err) {
+        error.ProcessNotFound => false,
+        else => true,
+    };
+    return true;
+}
+
 fn cleanupChild(child: *std.process.Child) void {
-    if (child.id == null) return;
+    if (child.id == null) {
+        closeChildPipes(child);
+        return;
+    }
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
         child.kill(io_mod.getIo());
         _ = child.wait(io_mod.getIo()) catch |err| {
@@ -2070,6 +2752,21 @@ fn cleanupChild(child: *std.process.Child) void {
     _ = child.wait(io_mod.getIo()) catch |err| {
         debug_trace.logf("core", "command cleanup wait failed err={s}", .{@errorName(err)});
     };
+}
+
+fn closeChildPipes(child: *std.process.Child) void {
+    if (child.stdin) |input| {
+        input.close(io_mod.getIo());
+        child.stdin = null;
+    }
+    if (child.stdout) |output| {
+        output.close(io_mod.getIo());
+        child.stdout = null;
+    }
+    if (child.stderr) |output| {
+        output.close(io_mod.getIo());
+        child.stderr = null;
+    }
 }
 
 fn shellQuote(arena: Allocator, input: []const u8) ![]const u8 {
@@ -2597,14 +3294,14 @@ fn expectReapedChildForTest(child: *std.process.Child, pid: std.posix.pid_t) !vo
     try std.testing.expectError(error.ProcessNotFound, std.posix.kill(pid, @enumFromInt(0)));
 }
 
-test "captured foreground command runs as a detached session leader" {
+test "captured foreground command runs beneath a detached session supervisor" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
 
     const command =
         "exec python3 -c 'import os,sys; " ++
         "pid=os.getpid(); pgid=os.getpgid(0); sid=os.getsid(0); " ++
         "print(f\"pid={pid} pgid={pgid} sid={sid}\"); " ++
-        "sys.exit(0 if pid == pgid == sid else 1)'";
+        "sys.exit(0 if pid != pgid and pgid == sid else 1)'";
     const result = try executeCommand(.{
         .backend = .none,
         .workspace_root = "/tmp",
@@ -3313,6 +4010,80 @@ test "cancellation requested by a failing output callback dominates its error" {
     try std.testing.expect(trigger.seen);
 }
 
+test "cancellation preserves the termination grace beneath the session supervisor" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var trigger = CancelAfterOutput{
+        .flag = &cancel,
+        .needle = "GRACE-READY",
+    };
+    const started_ms = io_mod.milliTimestamp();
+    const result = try executeCommand(.{
+        .backend = .none,
+        .workspace_root = "/tmp",
+        .max_command_output_bytes = 4096,
+        .cancel_flag = &cancel,
+        .output_chunk_ctx = @ptrCast(&trigger),
+        .on_output_chunk = CancelAfterOutput.onChunk,
+    }, std.testing.allocator, "trap 'sleep 3; exit 130' TERM; printf 'GRACE-READY\\n'; while :; do sleep 1; done", "/tmp");
+    defer std.testing.allocator.free(result.output);
+
+    try std.testing.expect(trigger.seen);
+    try std.testing.expect(result.cancelled);
+    try std.testing.expect(io_mod.milliTimestamp() - started_ms >= 500);
+}
+
+test "cancellation preserves the termination grace in an invoked script" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    {
+        var script = try tmp.dir.createFile(
+            io_mod.getIo(),
+            "workspace/grace-script.sh",
+            .{ .truncate = true },
+        );
+        defer script.close(io_mod.getIo());
+        try script.writeStreamingAll(
+            io_mod.getIo(),
+            "#!/bin/sh\n" ++
+                "trap 'sleep 3; exit 130' TERM\n" ++
+                "printf 'GRACE-READY\\n'\n" ++
+                "while :; do sleep 1; done\n",
+        );
+        try script.setPermissions(
+            io_mod.getIo(),
+            std.Io.File.Permissions.fromMode(0o700),
+        );
+    }
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var trigger = CancelAfterOutput{
+        .flag = &cancel,
+        .needle = "GRACE-READY",
+    };
+    const started_ms = io_mod.milliTimestamp();
+    const result = try executeCommand(.{
+        .backend = .none,
+        .workspace_root = workspace,
+        .max_command_output_bytes = 4096,
+        .cancel_flag = &cancel,
+        .output_chunk_ctx = @ptrCast(&trigger),
+        .on_output_chunk = CancelAfterOutput.onChunk,
+    }, alloc, "./grace-script.sh", workspace);
+    defer alloc.free(result.output);
+
+    try std.testing.expect(trigger.seen);
+    try std.testing.expect(result.cancelled);
+    try std.testing.expect(io_mod.milliTimestamp() - started_ms >= 500);
+}
+
 test "cap-crossing cancellation returns a synchronized bounded result" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
 
@@ -3591,7 +4362,17 @@ test "artifact write failure after cancellation remains a bare error" {
     const watcher = try std.Thread.spawn(.{}, Watcher.run, .{ ready_path, &cancel, &ready_seen });
     defer watcher.join();
 
-    try std.testing.expectError(error.Cancelled, collectOutputForProcess(alloc, &child, &output, cfg, null));
+    const process_group_id = child.id;
+    var leader_term: ?std.process.Child.Term = null;
+    try std.testing.expectError(error.Cancelled, collectOutputForProcess(
+        alloc,
+        &child,
+        &output,
+        cfg,
+        null,
+        process_group_id,
+        &leader_term,
+    ));
     try std.testing.expect(ready_seen.load(.seq_cst));
 }
 
@@ -3666,6 +4447,207 @@ test "timeout terminates foreground process group descendants" {
         }
         io_mod.sleep(10 * std.time.ns_per_ms);
     }
+}
+
+fn expectProcessGone(pid: std.posix.pid_t) !void {
+    const started_ms = io_mod.milliTimestamp();
+    while (true) {
+        std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
+            error.ProcessNotFound => return,
+            else => return err,
+        };
+        if (io_mod.milliTimestamp() - started_ms > 1000) {
+            std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+            return error.TestUnexpectedResult;
+        }
+        io_mod.sleep(10 * std.time.ns_per_ms);
+    }
+}
+
+test "natural command completion terminates background child inheriting pipes" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "inherited-child.pid" });
+    defer alloc.free(pid_path);
+    const quoted_pid_path = try shellQuote(alloc, pid_path);
+    defer alloc.free(quoted_pid_path);
+    const command = try std.fmt.allocPrint(
+        alloc,
+        "sleep 30 & child=$!; printf '%s' \"$child\" > {s}",
+        .{quoted_pid_path},
+    );
+    defer alloc.free(command);
+
+    const result = try executeCommand(.{
+        .backend = .none,
+        .workspace_root = workspace,
+        .max_command_output_bytes = 1024,
+        .timeout_ms = 2000,
+    }, alloc, command, workspace);
+    defer alloc.free(result.output);
+    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.foreground.exit_code);
+
+    const pid_text = try readAbsoluteFile(alloc, pid_path, 64);
+    defer alloc.free(pid_text);
+    const pid = try std.fmt.parseInt(
+        std.posix.pid_t,
+        std.mem.trim(u8, pid_text, " \t\r\n"),
+        10,
+    );
+    try expectProcessGone(pid);
+}
+
+test "natural command completion terminates background child with redirected streams" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "redirected-child.pid" });
+    defer alloc.free(pid_path);
+    const quoted_pid_path = try shellQuote(alloc, pid_path);
+    defer alloc.free(quoted_pid_path);
+    const command = try std.fmt.allocPrint(
+        alloc,
+        "sleep 30 >/dev/null 2>&1 & child=$!; printf '%s' \"$child\" > {s}",
+        .{quoted_pid_path},
+    );
+    defer alloc.free(command);
+
+    const result = try executeCommand(.{
+        .backend = .none,
+        .workspace_root = workspace,
+        .max_command_output_bytes = 1024,
+        .timeout_ms = 2000,
+    }, alloc, command, workspace);
+    defer alloc.free(result.output);
+    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.foreground.exit_code);
+
+    const pid_text = try readAbsoluteFile(alloc, pid_path, 64);
+    defer alloc.free(pid_text);
+    const pid = try std.fmt.parseInt(
+        std.posix.pid_t,
+        std.mem.trim(u8, pid_text, " \t\r\n"),
+        10,
+    );
+    try expectProcessGone(pid);
+}
+
+test "natural command completion terminates redirected descendant after setsid" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "escaped-child.pid" });
+    defer alloc.free(pid_path);
+    const command = try std.fmt.allocPrint(
+        alloc,
+        "python3 -c 'import os,time\n" ++
+            "pid=os.fork()\n" ++
+            "if pid == 0:\n" ++
+            " os.setsid()\n" ++
+            " null=os.open(\"/dev/null\",os.O_RDWR)\n" ++
+            " os.dup2(null,0); os.dup2(null,1); os.dup2(null,2)\n" ++
+            " open(\"{s}\",\"w\").write(str(os.getpid()))\n" ++
+            " time.sleep(30)\n" ++
+            "else:\n" ++
+            " pass'",
+        .{pid_path},
+    );
+    defer alloc.free(command);
+
+    const result = try executeCommand(.{
+        .backend = .none,
+        .workspace_root = workspace,
+        .max_command_output_bytes = 1024,
+        .timeout_ms = 2000,
+    }, alloc, command, workspace);
+    defer alloc.free(result.output);
+    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.foreground.exit_code);
+
+    const pid_text = try readAbsoluteFile(alloc, pid_path, 64);
+    defer alloc.free(pid_text);
+    const pid = try std.fmt.parseInt(
+        std.posix.pid_t,
+        std.mem.trim(u8, pid_text, " \t\r\n"),
+        10,
+    );
+    try expectProcessGone(pid);
+}
+
+test "cancellation preserves grace and removes an escaped descendant" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "escaped-cancel.pid" });
+    defer alloc.free(pid_path);
+    const term_path = try std.fs.path.join(alloc, &.{ workspace, "escaped-cancel.term" });
+    defer alloc.free(term_path);
+    const command = try std.fmt.allocPrint(
+        alloc,
+        "python3 -c 'import os,signal,time\n" ++
+            "pid=os.fork()\n" ++
+            "if pid == 0:\n" ++
+            " os.setsid()\n" ++
+            " open(\"{s}\",\"w\").write(str(os.getpid()))\n" ++
+            " def stop(signum,frame):\n" ++
+            "  open(\"{s}\",\"w\").write(\"TERM\")\n" ++
+            "  time.sleep(3)\n" ++
+            "  raise SystemExit(130)\n" ++
+            " signal.signal(signal.SIGTERM,stop)\n" ++
+            " time.sleep(0.2)\n" ++
+            " print(\"ESCAPED-GRACE-READY\",flush=True)\n" ++
+            " while True: time.sleep(1)\n" ++
+            "else:\n" ++
+            " while True: time.sleep(1)'",
+        .{ pid_path, term_path },
+    );
+    defer alloc.free(command);
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var trigger = CancelAfterOutput{
+        .flag = &cancel,
+        .needle = "ESCAPED-GRACE-READY",
+    };
+    const started_ms = io_mod.milliTimestamp();
+    const result = try executeCommand(.{
+        .backend = .none,
+        .workspace_root = workspace,
+        .max_command_output_bytes = 4096,
+        .cancel_flag = &cancel,
+        .output_chunk_ctx = @ptrCast(&trigger),
+        .on_output_chunk = CancelAfterOutput.onChunk,
+    }, alloc, command, workspace);
+    defer alloc.free(result.output);
+
+    try std.testing.expect(trigger.seen);
+    try std.testing.expect(result.cancelled);
+    try std.testing.expect(io_mod.milliTimestamp() - started_ms >= 500);
+    const term_text = try readAbsoluteFile(alloc, term_path, 64);
+    defer alloc.free(term_text);
+    try std.testing.expectEqualStrings("TERM", term_text);
+    const pid_text = try readAbsoluteFile(alloc, pid_path, 64);
+    defer alloc.free(pid_text);
+    const pid = try std.fmt.parseInt(
+        std.posix.pid_t,
+        std.mem.trim(u8, pid_text, " \t\r\n"),
+        10,
+    );
+    try expectProcessGone(pid);
 }
 
 test "backend control reuses configured timeout start time" {
@@ -4054,7 +5036,9 @@ test "just_bash raw callback emits parsed inner streams without wrapper JSON" {
     defer capture.deinit();
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
     defer scratch_state.deinit();
-    const result = try executeJustBash(
+    const submitted_command = "ignored command";
+    const projected_command = "/bin/zsh -f -c 'ignored command'";
+    const result = try executeJustBashWithResultCommand(
         alloc,
         scratch_state.allocator(),
         .{
@@ -4066,10 +5050,16 @@ test "just_bash raw callback emits parsed inner streams without wrapper JSON" {
             .callback_projection = .raw,
         },
         fake_path,
-        "ignored command",
+        projected_command,
+        submitted_command,
         workspace,
     );
     defer alloc.free(result.output);
+
+    try std.testing.expectEqualStrings(
+        submitted_command,
+        result.command_result.?.foreground.command,
+    );
 
     try std.testing.expectEqual(@as(usize, 2), capture.chunks.items.len);
     try std.testing.expectEqual(.stdout, capture.streams.items[0]);

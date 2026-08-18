@@ -1668,10 +1668,10 @@ test "auth picker renders the staged switch and disabled team screens" {
     defer search_header.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, search_header.items, "Search: play") != null);
 
-    search_view.team_query = "vercel-internal-playground";
+    search_view.team_query = "example-internal-team";
     var narrow_search_header = try composeAuthPickerRow(alloc, search_view, 0, 2, 20);
     defer narrow_search_header.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, narrow_search_header.items, "playground") != null);
+    try std.testing.expect(std.mem.find(u8, narrow_search_header.items, "nternal-team") != null);
     try std.testing.expectEqual(
         @as(u16, 20),
         authPickerQueryCursorColumn(search_view, 20).?,

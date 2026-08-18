@@ -22,11 +22,13 @@ const output_contracts = @import("../output/output_contracts.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
 const image_commands = @import("../images/image_commands.zig");
+const mcp_auth = @import("../mcp/mcp_auth.zig");
 const mcp_command_provider = @import("../mcp/command_provider.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
 const app_mcp_runtime = @import("app_mcp_runtime.zig");
 const model_cache_runtime = @import("model_cache_runtime.zig");
 const permissions = @import("../permissions/permissions.zig");
+const session_permission_state = @import("../permissions/session_permission_state.zig");
 const sandbox = @import("../permissions/sandbox.zig");
 const skill_commands = @import("../skills/skill_commands.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
@@ -314,6 +316,56 @@ pub fn Handlers(comptime App: type) type {
             };
         }
 
+        pub fn collectMcpReloadFacts(app: *App) !void {
+            if (comptime !@hasDecl(App, "takeMcpReloadCompletion")) return;
+            var completion = (try app.takeMcpReloadCompletion()) orelse return;
+            defer completion.deinit(app.alloc);
+            var warning = false;
+            const body = switch (completion) {
+                .outcome => |outcome| switch (outcome) {
+                    .published => |published| if (published.generation) |generation|
+                        try std.fmt.allocPrint(
+                            app.alloc,
+                            "MCP profile reloaded ({s}, runtime {d}).",
+                            .{ @tagName(published.health), generation },
+                        )
+                    else
+                        try std.fmt.allocPrint(
+                            app.alloc,
+                            "MCP profile reloaded ({s}; no servers configured).",
+                            .{@tagName(published.health)},
+                        ),
+                    .retained_required_failure => |failure| retained: {
+                        warning = true;
+                        break :retained try std.fmt.allocPrint(
+                            app.alloc,
+                            "MCP reload rejected; the existing runtime was retained. {s}",
+                            .{failure},
+                        );
+                    },
+                },
+                .failed => |err| failed: {
+                    warning = true;
+                    debug_trace.logf(
+                        "mcp",
+                        "profile reload retained current runtime err={s}",
+                        .{@errorName(err)},
+                    );
+                    break :failed try std.fmt.allocPrint(
+                        app.alloc,
+                        "MCP reload rejected; the existing runtime was retained. Fix the trusted profile configuration ({s}) and retry.",
+                        .{@errorName(err)},
+                    );
+                },
+            };
+            defer app.alloc.free(body);
+            try app.writeDomainNotice(.{
+                .topic = "mcp",
+                .tone = if (warning) .warning else .neutral,
+                .body = body,
+            }, true);
+        }
+
         fn handleFeedback(app: *App) !void {
             try app.flushBeforeBlockingExternalWork();
             const opened = if (comptime @hasDecl(App, "urlOpener"))
@@ -530,7 +582,238 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandHandlePermissions(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
+            if (try handlePermissionRuleManagement(app, rest)) return;
             try session_commands.Commands(App).handlePermissions(app, rest);
+            if (std.mem.trim(u8, rest, " \t").len == 0) {
+                try writeSessionPermissionRules(app);
+            }
+        }
+
+        fn writeSessionPermissionRules(app: *App) !void {
+            if (comptime !@hasField(App, "session") or
+                !@hasDecl(@TypeOf(app.session), "snapshotPermissionState"))
+            {
+                return;
+            } else {
+                var snapshot = try app.session.snapshotPermissionState(app.alloc);
+                defer snapshot.deinit(app.alloc);
+                var out: std.Io.Writer.Allocating = .init(app.alloc);
+                defer out.deinit();
+                if (snapshot.rules.items.len == 0) {
+                    try out.writer.writeAll("saved-session permission rules: none");
+                } else {
+                    try out.writer.print(
+                        "saved-session permission rules ({d}):",
+                        .{snapshot.rules.items.len},
+                    );
+                    for (snapshot.rules.items) |rule| {
+                        var identity = try text_utils.encodeTerminalSafe(
+                            app.alloc,
+                            rule.display_identity,
+                            session_permission_state.max_display_identity_bytes,
+                        );
+                        defer identity.deinit(app.alloc);
+                        try out.writer.print(
+                            "\n{d} {s} {s}",
+                            .{ rule.id.value, @tagName(rule.decision), identity.bytes },
+                        );
+                    }
+                }
+                try app.writeDomainNotice(.{
+                    .topic = "permissions",
+                    .tone = .neutral,
+                    .body = out.writer.buffered(),
+                }, true);
+            }
+        }
+
+        fn handlePermissionRuleManagement(app: *App, rest: []const u8) !bool {
+            if (comptime !@hasField(App, "approval_prompt") or
+                !@hasField(App, "session_persistence") or
+                !@hasDecl(App, "preparePermissionStateAction"))
+            {
+                return false;
+            } else {
+                const trimmed = std.mem.trim(u8, rest, " \t");
+                const action = splitPermissionWord(trimmed) orelse return false;
+                const remember = std.ascii.eqlIgnoreCase(action.word, "remember");
+                const revoke = std.ascii.eqlIgnoreCase(action.word, "revoke");
+                if (!remember and !revoke) return false;
+                debug_trace.logf("permission", "event=rule_management_begin action={s}", .{action.word});
+                if (app_session_runtime.Runtime(App).activeSessionId(app) == null) {
+                    try writePermissionManagementNotice(
+                        app,
+                        .@"error",
+                        "saved-session permission rules require an active saved session",
+                    );
+                    return true;
+                }
+                debug_trace.logf("permission", "event=rule_management_session_ready", .{});
+                if (app.approval_prompt.isActive()) {
+                    try writePermissionManagementNotice(
+                        app,
+                        .warning,
+                        "finish the active permission prompt before managing saved-session rules",
+                    );
+                    return true;
+                }
+
+                debug_trace.logf("permission", "event=rule_management_snapshot_start", .{});
+                var snapshot = try app.session.snapshotPermissionState(app.alloc);
+                defer snapshot.deinit(app.alloc);
+                debug_trace.logf("permission", "event=rule_management_snapshot_done rules={d}", .{snapshot.rules.items.len});
+                if (remember) {
+                    const decision_word = splitPermissionWord(action.rest) orelse {
+                        try writePermissionManagementUsage(app);
+                        return true;
+                    };
+                    const decision: session_permission_state.Decision =
+                        if (std.ascii.eqlIgnoreCase(decision_word.word, "allow"))
+                            .allow
+                        else if (std.ascii.eqlIgnoreCase(decision_word.word, "deny"))
+                            .deny
+                        else {
+                            try writePermissionManagementUsage(app);
+                            return true;
+                        };
+                    const tool_word = splitPermissionWord(decision_word.rest) orelse {
+                        try writePermissionManagementUsage(app);
+                        return true;
+                    };
+                    if (tool_word.rest.len == 0) {
+                        try writePermissionManagementUsage(app);
+                        return true;
+                    }
+                    var arena_state = std.heap.ArenaAllocator.init(app.alloc);
+                    defer arena_state.deinit();
+                    debug_trace.logf("permission", "event=rule_management_prepare_start tool={s}", .{tool_word.word});
+                    const prepared = app.preparePermissionStateAction(
+                        arena_state.allocator(),
+                        .{
+                            .id = "permission-rule-management",
+                            .name = tool_word.word,
+                            .arguments_json = tool_word.rest,
+                        },
+                    ) catch {
+                        try writePermissionManagementNotice(
+                            app,
+                            .@"error",
+                            "could not prepare that exact permission action without executing it",
+                        );
+                        return true;
+                    };
+                    debug_trace.logf("permission", "event=rule_management_prepare_done kind={s}", .{@tagName(prepared.key.kind)});
+                    const existing = session_permission_state.ruleForKey(
+                        snapshot,
+                        prepared.key,
+                    );
+                    try app.approval_prompt.syncRuleManagement(
+                        app.alloc,
+                        .{
+                            .id = debug_trace.nextStepId(),
+                            .label = if (decision == .allow)
+                                "Remember allow for this saved session"
+                            else
+                                "Remember deny for this saved session",
+                            .explanation = if (existing == null)
+                                "Confirm this exact saved-session permission rule. The action will not run."
+                            else
+                                "Confirm replacement of the existing exact saved-session rule. The action will not run.",
+                            .command = prepared.display_identity,
+                            .amendment_allowed = false,
+                            .confirmation_only = true,
+                        },
+                        .{ .set = .{
+                            .key = prepared.key,
+                            .display_identity = prepared.display_identity,
+                            .decision = decision,
+                            .expected_generation = if (existing) |rule|
+                                rule.generation
+                            else
+                                null,
+                        } },
+                    );
+                    debug_trace.logf("permission", "event=rule_management_prompt_published", .{});
+                    app.shell.render_requests.request(.footer);
+                    return true;
+                }
+
+                const id_word = splitPermissionWord(action.rest) orelse {
+                    try writePermissionManagementUsage(app);
+                    return true;
+                };
+                if (id_word.rest.len != 0) {
+                    try writePermissionManagementUsage(app);
+                    return true;
+                }
+                const raw_id = std.fmt.parseUnsigned(u64, id_word.word, 10) catch {
+                    try writePermissionManagementUsage(app);
+                    return true;
+                };
+                const rule = session_permission_state.ruleForId(
+                    snapshot,
+                    .{ .value = raw_id },
+                ) orelse {
+                    try writePermissionManagementNotice(
+                        app,
+                        .warning,
+                        "saved-session permission rule not found",
+                    );
+                    return true;
+                };
+                try app.approval_prompt.syncRuleManagement(
+                    app.alloc,
+                    .{
+                        .id = debug_trace.nextStepId(),
+                        .label = "Revoke saved-session permission rule",
+                        .explanation = "Confirm revocation of this stored rule. No current action will be prepared or run.",
+                        .command = rule.display_identity,
+                        .amendment_allowed = false,
+                        .confirmation_only = true,
+                    },
+                    .{ .revoke = .{
+                        .id = rule.id,
+                        .expected_generation = rule.generation,
+                    } },
+                );
+                app.shell.render_requests.request(.footer);
+                return true;
+            }
+        }
+
+        const PermissionWord = struct {
+            word: []const u8,
+            rest: []const u8,
+        };
+
+        fn splitPermissionWord(value: []const u8) ?PermissionWord {
+            const trimmed = std.mem.trim(u8, value, " \t");
+            if (trimmed.len == 0) return null;
+            const end = std.mem.findAny(u8, trimmed, " \t") orelse trimmed.len;
+            return .{
+                .word = trimmed[0..end],
+                .rest = std.mem.trim(u8, trimmed[end..], " \t"),
+            };
+        }
+
+        fn writePermissionManagementUsage(app: *App) !void {
+            try writePermissionManagementNotice(
+                app,
+                .@"error",
+                "usage: /permissions remember <allow|deny> <tool-name> <arguments-json>\n       /permissions revoke <rule-id>",
+            );
+        }
+
+        fn writePermissionManagementNotice(
+            app: *App,
+            tone: types.NoticeTone,
+            body: []const u8,
+        ) !void {
+            try app.writeDomainNotice(.{
+                .topic = "permissions",
+                .tone = tone,
+                .body = body,
+            }, true);
         }
 
         fn commandHandleAllowlist(ctx: *anyopaque, rest: []const u8) !void {
@@ -693,6 +976,7 @@ pub fn Handlers(comptime App: type) type {
             const result = try app.mcpCommandProvider().handle(app.alloc, rest, .{
                 .home = io_mod.getenv("HOME"),
                 .list_ctx = @ptrCast(app),
+                .summarize_servers = summarizeMcpServers,
                 .list_servers_and_tools = listMcpServersAndTools,
                 .auth_ctx = @ptrCast(app),
                 .validate_authentication_server = validateMcpAuthenticationServer,
@@ -716,7 +1000,7 @@ pub fn Handlers(comptime App: type) type {
             defer if (reload_notice) |notice| app.alloc.free(notice);
             var reload_warning = false;
             if (result.reload) {
-                var outcome = app.reloadMcp() catch |err| {
+                app.beginMcpReload() catch |err| {
                     reload_warning = true;
                     reload_notice = if (result.report_reload)
                         try std.fmt.allocPrint(
@@ -727,7 +1011,7 @@ pub fn Handlers(comptime App: type) type {
                     else
                         try std.fmt.allocPrint(
                             app.alloc,
-                            "{s}\nWarning: MCP runtime reload was rejected; the previous runtime remains active. Fix the trusted profile configuration ({s}) and run /mcp reload.",
+                            "{s}\nMCP reload rejected; the existing runtime was retained. Fix the trusted profile configuration ({s}) and run /mcp reload.",
                             .{ command_body, @errorName(err) },
                         );
                     debug_trace.logf("mcp", "profile reload retained current runtime err={s}", .{@errorName(err)});
@@ -735,41 +1019,15 @@ pub fn Handlers(comptime App: type) type {
                     try app.writeDomainNotice(.{ .topic = "mcp", .tone = .warning, .body = notice }, true);
                     return;
                 };
-                defer outcome.deinit(app.alloc);
-                if (result.report_reload) {
-                    reload_notice = switch (outcome) {
-                        .published => |published| if (published.generation) |generation|
-                            try std.fmt.allocPrint(
-                                app.alloc,
-                                "MCP profile reloaded ({s}, runtime {d}).",
-                                .{ @tagName(published.health), generation },
-                            )
-                        else
-                            try std.fmt.allocPrint(
-                                app.alloc,
-                                "MCP profile reloaded ({s}; no servers configured).",
-                                .{@tagName(published.health)},
-                            ),
-                        .retained_required_failure => |failure| retained: {
-                            reload_warning = true;
-                            break :retained try std.fmt.allocPrint(
-                                app.alloc,
-                                "MCP reload rejected; the existing runtime was retained. {s}",
-                                .{failure},
-                            );
-                        },
-                    };
-                } else switch (outcome) {
-                    .published => {},
-                    .retained_required_failure => |failure| {
-                        reload_warning = true;
-                        reload_notice = try std.fmt.allocPrint(
-                            app.alloc,
-                            "{s}\nWarning: MCP runtime reload was rejected; the previous runtime remains active. {s} Fix the trusted profile configuration and run /mcp reload.",
-                            .{ command_body, failure },
-                        );
-                    },
-                }
+                const started = "MCP reconnection started. The existing runtime remains active until replacement completes.";
+                reload_notice = if (result.report_reload)
+                    try app.alloc.dupe(u8, started)
+                else
+                    try std.fmt.allocPrint(
+                        app.alloc,
+                        "{s}\n{s}",
+                        .{ command_body, started },
+                    );
             }
             const body = reload_notice orelse command_body;
             try app.writeDomainNotice(.{
@@ -782,6 +1040,11 @@ pub fn Handlers(comptime App: type) type {
         fn listMcpServersAndTools(ctx: *anyopaque, alloc: std.mem.Allocator) ![]u8 {
             const app: *App = @ptrCast(@alignCast(ctx));
             return app.listMcpServersAndTools(alloc);
+        }
+
+        fn summarizeMcpServers(ctx: *anyopaque, alloc: std.mem.Allocator) ![]u8 {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            return app.summarizeMcpServers(alloc);
         }
 
         fn listMcpResources(
@@ -993,7 +1256,10 @@ pub fn Handlers(comptime App: type) type {
             return try out.toOwnedSlice();
         }
 
-        fn authenticateMcpServer(ctx: *anyopaque, name: []const u8) !void {
+        fn authenticateMcpServer(
+            ctx: *anyopaque,
+            name: []const u8,
+        ) !mcp_auth.AuthenticationResult {
             if (comptime !@hasDecl(App, "acquireMcpRuntime") or
                 !@hasDecl(App, "urlOpener"))
             {
@@ -1002,7 +1268,7 @@ pub fn Handlers(comptime App: type) type {
             const app: *App = @ptrCast(@alignCast(ctx));
             var lease = app.acquireMcpRuntime() orelse return error.McpServerNotFound;
             defer lease.deinit();
-            try lease.runtime.authenticateServer(name, app, openMcpAuthUrl);
+            return lease.runtime.authenticateServer(name, app, openMcpAuthUrl);
         }
 
         fn validateMcpAuthenticationServer(ctx: *anyopaque, name: []const u8) !void {
@@ -3306,6 +3572,7 @@ const McpCommandFakeApp = struct {
     last_topic: ?[]const u8 = null,
     last_tone: ?types.NoticeTone = null,
     reload_behavior: ReloadBehavior = .published,
+    reload_pending: bool = false,
 
     fn deinit(self: *McpCommandFakeApp) void {
         self.notice_body.deinit(self.alloc);
@@ -3344,17 +3611,28 @@ const McpCommandFakeApp = struct {
         return alloc.dupe(u8, "configured server and tool\n");
     }
 
-    fn reloadMcp(self: *McpCommandFakeApp) !app_mcp_runtime.ReloadOutcome {
+    fn summarizeMcpServers(self: *McpCommandFakeApp, alloc: std.mem.Allocator) ![]u8 {
+        return self.listMcpServersAndTools(alloc);
+    }
+
+    fn beginMcpReload(self: *McpCommandFakeApp) !void {
         self.reload_count += 1;
+        if (self.reload_behavior == .failed) return error.TestReloadFailed;
+        self.reload_pending = true;
+    }
+
+    fn takeMcpReloadCompletion(self: *McpCommandFakeApp) !?app_mcp_runtime.ReloadCompletion {
+        if (!self.reload_pending) return null;
+        self.reload_pending = false;
         return switch (self.reload_behavior) {
-            .published => .{ .published = .{ .generation = null, .health = .ready } },
-            .retained => .{
+            .published => .{ .outcome = .{ .published = .{ .generation = null, .health = .ready } } },
+            .retained => .{ .outcome = .{
                 .retained_required_failure = try self.alloc.dupe(
                     u8,
                     "Required MCP server 'fixture' failed to start.",
                 ),
-            },
-            .failed => error.TestReloadFailed,
+            } },
+            .failed => unreachable,
         };
     }
 
@@ -4035,9 +4313,16 @@ test "app_commands renders transactional status for explicit MCP reload" {
     try std.testing.expectEqualStrings("mcp", app.last_topic.?);
     try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
     try std.testing.expectEqualStrings(
-        "MCP profile reloaded (ready; no servers configured).",
+        "MCP reconnection started. The existing runtime remains active until replacement completes.",
         app.notice_body.items,
     );
+    try Handlers(McpCommandFakeApp).collectMcpReloadFacts(&app);
+    try std.testing.expectEqual(@as(usize, 2), app.notice_count);
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        app.notice_body.items,
+        "MCP profile reloaded (ready; no servers configured).",
+    ));
 }
 
 test "app_commands preserves command display after implicit MCP reload" {
@@ -4050,7 +4335,12 @@ test "app_commands preserves command display after implicit MCP reload" {
     try std.testing.expectEqual(@as(usize, 1), app.notice_count);
     try std.testing.expectEqualStrings("mcp", app.last_topic.?);
     try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
-    try std.testing.expectEqualStrings("Authenticated MCP server 'fixture'.", app.notice_body.items);
+    try std.testing.expectEqualStrings(
+        "Authenticated MCP server 'fixture'.\nMCP reconnection started. The existing runtime remains active until replacement completes.",
+        app.notice_body.items,
+    );
+    try Handlers(McpCommandFakeApp).collectMcpReloadFacts(&app);
+    try std.testing.expectEqual(@as(usize, 2), app.notice_count);
 }
 
 test "app_commands warns when implicit MCP reload retains the active runtime" {
@@ -4066,12 +4356,24 @@ test "app_commands warns when implicit MCP reload retains the active runtime" {
         try std.testing.expectEqual(@as(usize, 1), app.reload_count);
         try std.testing.expectEqual(@as(usize, 1), app.notice_count);
         try std.testing.expectEqualStrings("mcp", app.last_topic.?);
-        try std.testing.expectEqual(types.NoticeTone.warning, app.last_tone.?);
-        try std.testing.expect(std.mem.startsWith(
-            u8,
-            app.notice_body.items,
-            "Authenticated MCP server 'fixture'.\nWarning: MCP runtime reload was rejected; the previous runtime remains active.",
-        ));
+        if (behavior == .retained) {
+            try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
+            try Handlers(McpCommandFakeApp).collectMcpReloadFacts(&app);
+            try std.testing.expectEqual(@as(usize, 2), app.notice_count);
+            try std.testing.expectEqual(types.NoticeTone.warning, app.last_tone.?);
+            try std.testing.expect(std.mem.find(
+                u8,
+                app.notice_body.items,
+                "MCP reload rejected; the existing runtime was retained.",
+            ) != null);
+        } else {
+            try std.testing.expectEqual(types.NoticeTone.warning, app.last_tone.?);
+            try std.testing.expect(std.mem.find(
+                u8,
+                app.notice_body.items,
+                "MCP reload rejected; the existing runtime was retained.",
+            ) != null);
+        }
     }
 }
 

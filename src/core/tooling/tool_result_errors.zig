@@ -24,6 +24,77 @@ pub const ExecutionFailure = struct {
     suggestion: ?[]const u8 = null,
 };
 
+pub const TerminalActionFieldConflict = [2][]const u8;
+
+pub const TerminalActionFieldCorrection = struct {
+    action: []const u8,
+    invalid_fields: []const []const u8,
+    missing_fields: []const []const u8,
+    allowed_fields: []const []const u8,
+    conflicts: []const TerminalActionFieldConflict,
+};
+
+pub const TerminalActionFieldCorrectionView = struct {
+    invalid_field_count: usize,
+};
+
+const terminal_action_field_error_code = "invalid_action_fields";
+
+pub fn terminalActionFieldCorrectionJson(
+    alloc: Allocator,
+    correction: TerminalActionFieldCorrection,
+) Allocator.Error![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    std.json.Stringify.value(.{ .@"error" = .{
+        .code = terminal_action_field_error_code,
+        .action = correction.action,
+        .invalid_fields = correction.invalid_fields,
+        .missing_fields = correction.missing_fields,
+        .allowed_fields = correction.allowed_fields,
+        .conflicts = correction.conflicts,
+    } }, .{}, &out.writer) catch return error.OutOfMemory;
+    return try out.toOwnedSlice();
+}
+
+pub fn inspectTerminalActionFieldCorrection(
+    alloc: Allocator,
+    output: []const u8,
+) Allocator.Error!?TerminalActionFieldCorrectionView {
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        output,
+        .{},
+    ) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => null,
+    };
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |value| value,
+        else => return null,
+    };
+    const error_value = switch (root.get("error") orelse return null) {
+        .object => |value| value,
+        else => return null,
+    };
+    const code = switch (error_value.get("code") orelse return null) {
+        .string => |value| value,
+        else => return null,
+    };
+    if (!std.mem.eql(u8, code, terminal_action_field_error_code)) return null;
+    const action = error_value.get("action") orelse return null;
+    if (action != .string) return null;
+    const invalid_fields = switch (error_value.get("invalid_fields") orelse return null) {
+        .array => |value| value,
+        else => return null,
+    };
+    return .{
+        .invalid_field_count = invalid_fields.items.len,
+    };
+}
+
 pub const ToolOutputClassification = enum {
     structured_tool_execution_failed,
     active_legacy_tool_failure,
@@ -70,7 +141,8 @@ fn permissionDeniedMessage(tool_name: []const u8, reason: types.ToolPermissionDe
             "Network or browser access was denied by configured policy"
         else
             "Tool access was denied by configured policy",
-        .permission_required => if (std.mem.eql(u8, tool_name, "run_command"))
+        .permission_required => if (std.mem.eql(u8, tool_name, "run_command") or
+            std.mem.eql(u8, tool_name, "terminal"))
             "Shell command approval is required before this tool can run"
         else if (is_network_tool(tool_name))
             "Network or browser approval is required before this tool can run"
@@ -82,7 +154,7 @@ fn permissionDeniedMessage(tool_name: []const u8, reason: types.ToolPermissionDe
 fn permissionDeniedSuggestion(reason: types.ToolPermissionDenialReason) []const u8 {
     return switch (reason) {
         .user_denied => "The tool did not run. Do not retry unchanged; explain the denial or use a safer allowed alternative.",
-        .auto_denied => "The tool did not run. Do not retry unchanged; explain the automatic denial or ask the user for a narrower safer request.",
+        .auto_denied => "The tool did not run. Do not retry unchanged or ask the user for approval. Replan autonomously with a materially different safe action or an existing deterministic safe tool; fx will use its human approval channel after bounded recovery.",
         .policy_denied => "The tool did not run. Do not retry unchanged; explain the configured policy blocker or use an allowed alternative.",
         .permission_required => "The tool did not run. Noninteractive mode cannot show an approval prompt. Rerun interactively to approve, or configure a narrow permission rule before retrying.",
     };
@@ -94,6 +166,30 @@ fn is_network_tool(tool_name: []const u8) bool {
 
 pub fn isToolPermissionDeniedOutput(output: []const u8) bool {
     return isToolErrorOutputType(output, "tool_permission_denied");
+}
+
+pub fn toolPermissionDenialReason(output: []const u8) ?types.ToolPermissionDenialReason {
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.c_allocator, output, .{}) catch return null;
+    defer parsed.deinit();
+
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return null,
+    };
+    const error_value = switch (root.get("error") orelse return null) {
+        .object => |object| object,
+        else => return null,
+    };
+    const type_value = switch (error_value.get("type") orelse return null) {
+        .string => |value| value,
+        else => return null,
+    };
+    if (!std.mem.eql(u8, type_value, "tool_permission_denied")) return null;
+    const reason_value = switch (error_value.get("reason") orelse return null) {
+        .string => |value| value,
+        else => return null,
+    };
+    return std.meta.stringToEnum(types.ToolPermissionDenialReason, reason_value);
 }
 
 pub fn toolExecutionFailureJson(alloc: Allocator, failure: ExecutionFailure) Allocator.Error![]u8 {
@@ -316,7 +412,16 @@ test "tool permission denied JSON explains policy and headless blockers" {
     const auto_error = auto_denied.value.object.get("error").?.object;
     try std.testing.expectEqualStrings("Permission denied by auto mode classifier", auto_error.get("message").?.string);
     try std.testing.expectEqualStrings("auto_denied", auto_error.get("reason").?.string);
-    try std.testing.expect(std.mem.find(u8, auto_error.get("suggestion").?.string, "The tool did not run.") != null);
+    try std.testing.expectEqualStrings(
+        "The tool did not run. Do not retry unchanged or ask the user for approval. Replan autonomously with a materially different safe action or an existing deterministic safe tool; fx will use its human approval channel after bounded recovery.",
+        auto_error.get("suggestion").?.string,
+    );
+    try std.testing.expectEqual(
+        types.ToolPermissionDenialReason.auto_denied,
+        toolPermissionDenialReason(auto_payload).?,
+    );
+    try std.testing.expect(toolPermissionDenialReason("not json") == null);
+    try std.testing.expect(toolPermissionDenialReason("{\"error\":{\"type\":\"different\",\"reason\":\"auto_denied\"}}") == null);
 
     const policy_error = policy.value.object.get("error").?.object;
     try std.testing.expectEqualStrings("Network or browser access was denied by configured policy", policy_error.get("message").?.string);

@@ -1,12 +1,14 @@
 const std = @import("std");
+const mcp_auth = @import("mcp_auth.zig");
 
 const Allocator = std.mem.Allocator;
 
 pub const ListServersFn = *const fn (ctx: *anyopaque, alloc: Allocator) anyerror![]u8;
+pub const SummarizeServersFn = *const fn (ctx: *anyopaque, alloc: Allocator) anyerror![]u8;
 pub const AuthenticateServerFn = *const fn (
     ctx: *anyopaque,
     name: []const u8,
-) anyerror!void;
+) anyerror!mcp_auth.AuthenticationResult;
 pub const ValidateAuthenticationServerFn = *const fn (
     ctx: *anyopaque,
     name: []const u8,
@@ -66,6 +68,7 @@ pub const CompleteResourceFn = *const fn (
 pub const Request = struct {
     home: ?[]const u8,
     list_ctx: *anyopaque,
+    summarize_servers: ?SummarizeServersFn = null,
     list_servers_and_tools: ListServersFn,
     auth_ctx: ?*anyopaque = null,
     validate_authentication_server: ?ValidateAuthenticationServerFn = null,
