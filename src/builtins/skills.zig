@@ -137,7 +137,10 @@ fn installCommandResult(alloc: Allocator, skills_dir: []const u8, install: Insta
 }
 
 fn createCommandResult(alloc: Allocator, skills_dir: []const u8, name: []const u8) !CommandResult {
-    const path = try createSkillTemplate(alloc, skills_dir, name);
+    const path = createSkillTemplate(alloc, skills_dir, name) catch |err| switch (err) {
+        error.InvalidSkillName => return noticeLiteral(alloc, "Invalid skill name. Use a single directory name without '/' or '\\'.", false),
+        else => return err,
+    };
     defer alloc.free(path);
     return noticeFmt(alloc, "Created {s}", .{path}, true);
 }
@@ -2081,6 +2084,31 @@ test "built-in skills command creates and removes managed skills" {
         else => return error.TestExpectedEqual,
     }
     try expectNoAbsoluteFile(skill_file);
+}
+
+test "built-in skills command reports invalid create names without escaping the command boundary" {
+    var empty_ctx = StaticSkillCtx{ .skills = &.{} };
+    const invalid_names = [_][]const u8{ "..", "nested/name", "nested\\name", "/absolute" };
+
+    for (invalid_names) |name| {
+        var result = try executeCommand(
+            std.testing.allocator,
+            .{ .create = name },
+            staticCommandRequest("/unused", &empty_ctx),
+        );
+        defer result.deinit(std.testing.allocator);
+
+        switch (result) {
+            .notice => |notice| {
+                try std.testing.expectEqualStrings(
+                    "Invalid skill name. Use a single directory name without '/' or '\\'.",
+                    notice.text,
+                );
+                try std.testing.expect(!notice.reload);
+            },
+            else => return error.TestExpectedEqual,
+        }
+    }
 }
 
 test "built-in skills command creates a missing managed parent root" {

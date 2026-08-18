@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -45,6 +46,50 @@ async function launchAndWait(): Promise<TmuxSession> {
   await s.waitForComposer(10_000);
   return s;
 }
+
+describe.skipIf(!tmuxAvailable())("tui: skills command recovery", () => {
+  test(
+    "invalid /skills create name reports an inline error and preserves the session",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-invalid-skill-name-"));
+      const home = join(root, "home");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(home);
+
+      try {
+        session = await TmuxSession.create({
+          cwd: root,
+          stderrPath,
+          env: { HOME: home },
+          width: 100,
+          height: 28,
+        });
+        await session.waitForComposer(10_000);
+
+        await session.sendText("/skills create ../escape-attempt");
+        const rejected = await session.waitForText("Invalid skill name.", 5_000);
+        expect(rejected).toContain(
+          "Use a single directory name without '/' or '\\'.",
+        );
+        expect(session.isAlive()).toBe(true);
+        expect(hasEmptyComposer(rejected)).toBe(true);
+        expect(existsSync(join(home, ".fx", "escape-attempt"))).toBe(false);
+
+        await session.sendText("/skills path");
+        const recovered = await session.waitForText("fx managed install root:", 5_000);
+        expect(hasEmptyComposer(recovered)).toBe(true);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+});
 
 function startFakeCreditsGateway() {
   const requests: Array<{
