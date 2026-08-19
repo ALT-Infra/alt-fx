@@ -1710,7 +1710,8 @@ pub const Store = struct {
     /// Lists supported readable sessions newest-first; caller frees each item and the list.
     /// Lists all readable sessions newest-first. Caller frees each item and the list.
     pub fn list(self: Store, alloc: Allocator) anyerror!std.ArrayList(SessionSummary) {
-        return self.scanSessionSummaries(alloc, .read_only_list);
+        const scan = try self.scanSessionSummariesWithDiagnostics(alloc, .read_only_list, false);
+        return scan.summaries;
     }
 
     fn deferredCacheInvalidatesReads(self: Store) bool {
@@ -1739,12 +1740,13 @@ pub const Store = struct {
         self: Store,
         alloc: Allocator,
     ) ListSubagentControlIdsError!std.ArrayList([]u8) {
-        var summaries = self.scanSessionSummaries(alloc, .read_only_list) catch |err| {
+        const scan = self.scanSessionSummariesWithDiagnostics(alloc, .read_only_list, false) catch |err| {
             return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
                 else => error.SessionStoreUnavailable,
             };
         };
+        var summaries = scan.summaries;
         defer freeSummaries(alloc, &summaries);
         var ids: std.ArrayList([]u8) = .empty;
         errdefer {
@@ -2044,7 +2046,8 @@ pub const Store = struct {
 
     /// Lists readable sessions for this store's workspace newest-first. Caller frees each item and the list.
     pub fn listForWorkspace(self: Store, alloc: Allocator) anyerror!std.ArrayList(SessionSummary) {
-        var summaries = try self.scanSessionSummaries(alloc, .read_only_list);
+        const scan = try self.scanSessionSummariesWithDiagnostics(alloc, .read_only_list, false);
+        var summaries = scan.summaries;
         errdefer freeSummaries(alloc, &summaries);
         retainWorkspaceSummaries(alloc, &summaries, self.workspace_root);
         return summaries;
@@ -2124,7 +2127,7 @@ pub const Store = struct {
             }
         }
 
-        var scan = self.scanSessionSummariesWithDiagnostics(alloc, .read_only_list) catch |err| switch (err) {
+        var scan = self.scanSessionSummariesWithDiagnostics(alloc, .read_only_list, false) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.SessionStoreUnavailable,
         };
@@ -2569,6 +2572,7 @@ pub const Store = struct {
         var scan = try self.scanSessionSummariesWithDiagnostics(
             alloc,
             .global_read_only_last,
+            true,
         );
         defer scan.summaries.deinit(alloc);
         retainWorkspaceSummaries(alloc, &scan.summaries, workspace_root);
@@ -2586,14 +2590,20 @@ pub const Store = struct {
         alloc: Allocator,
         mode: DiscoveryMode,
     ) !std.ArrayList(SessionSummary) {
-        const scan = try self.scanSessionSummariesWithDiagnostics(alloc, mode);
+        const scan = try self.scanSessionSummariesWithDiagnostics(alloc, mode, true);
         return scan.summaries;
     }
 
+    /// Scans session directories into summaries. `probe_managed_children`
+    /// controls whether each session's subagent relationship index is opened to
+    /// resolve `has_managed_children`. Callers that persist summaries via
+    /// `writeSessionIndex` or filter with `resumable_only` must pass true;
+    /// list-only consumers that never read the field should pass false.
     fn scanSessionSummariesWithDiagnostics(
         self: Store,
         alloc: Allocator,
         mode: DiscoveryMode,
+        probe_managed_children: bool,
     ) !SessionSummaryScan {
         var scan = SessionSummaryScan{};
         errdefer scan.deinit(alloc);
@@ -2658,14 +2668,16 @@ pub const Store = struct {
                 detail.state.deinit(alloc);
                 detail = undefined;
             }
-            candidate.summary.has_managed_children =
-                self.sessionHasManagedChildren(alloc, entry.name) catch |err| switch (err) {
-                    error.OutOfMemory => {
-                        candidate.deinit(alloc);
-                        return error.OutOfMemory;
-                    },
-                    else => false,
-                };
+            if (probe_managed_children) {
+                candidate.summary.has_managed_children =
+                    self.sessionHasManagedChildren(alloc, entry.name) catch |err| switch (err) {
+                        error.OutOfMemory => {
+                            candidate.deinit(alloc);
+                            return error.OutOfMemory;
+                        },
+                        else => false,
+                    };
+            }
             logDiscovery(
                 mode,
                 entry.name,
@@ -10383,6 +10395,53 @@ test "list newest-first" {
     try std.testing.expectEqual(@as(usize, 2), listed.items.len);
     try std.testing.expectEqualStrings("newer", listed.items[0].id);
     try std.testing.expectEqualStrings("older", listed.items[1].id);
+}
+
+test "session scan probes managed children only when requested" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    var state = try testDurableState(alloc, "managed-child-probe", ctx.workspace);
+    defer state.deinit(alloc);
+    var writable = try ctx.store.startWritableSession(alloc, state);
+    {
+        const header_bytes = try relationship_index_codec.encodeHeader(alloc, .{
+            .high_watermark = 1,
+            .active_count = 1,
+        });
+        defer alloc.free(header_bytes);
+        var capability = try writable.childCapability();
+        var header_file = try capability.createExclusiveFile(
+            alloc,
+            .subagent_control,
+            session_child_store.subagent_relationship_index_file,
+        );
+        defer header_file.deinit();
+        try header_file.writeAll(header_bytes);
+        try header_file.sync();
+    }
+    writable.deinit(alloc);
+
+    var shallow = try ctx.store.scanSessionSummariesWithDiagnostics(
+        alloc,
+        .read_only_list,
+        false,
+    );
+    defer shallow.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), shallow.summaries.items.len);
+    try std.testing.expect(!shallow.summaries.items[0].has_managed_children);
+
+    var probing = try ctx.store.scanSessionSummariesWithDiagnostics(
+        alloc,
+        .read_only_list,
+        true,
+    );
+    defer probing.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), probing.summaries.items.len);
+    try std.testing.expect(probing.summaries.items[0].has_managed_children);
 }
 
 test "session discovery accepts the usage recovery name" {
