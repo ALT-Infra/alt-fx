@@ -308,23 +308,26 @@ describe("cli: help", () => {
 Run one noninteractive request
 
 Usage:
-  fx ask [--auto|--yolo] [--image PATH] [--json] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>
+  fx ask [--auto|--yolo] [--image PATH] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>
 
 Options:
-  --auto               Automatically review unresolved permission requests
-  --yolo               Disable permission checks and command sandboxing
-  --image PATH         Attach an image file; repeat for multiple images
-  --json               Emit machine-readable JSON instead of text
-  --no-save            Do not save the session; incompatible with --resume and --resume-id
-  --no-color           Render TTY output without colors or hyperlinks
-  --resume <last|id>   Continue the last session or a session by id
-  --resume-id <id>     Continue a session by exact id
-  --continue-recovery  Resume the paused model response in the selected session
-  --                   Treat every following argument as prompt text
+  --auto                Automatically review unresolved permission requests
+  --yolo                Disable permission checks and command sandboxing
+  --image PATH          Attach an image file; repeat for multiple images
+  --json                Emit machine-readable JSON instead of text
+  --quiet               Suppress assistant output
+  --prompt-permissions  Prompt for Y/N permission approval when stdin is a TTY
+  --no-save             Do not save the session; incompatible with --resume and --resume-id
+  --no-color            Render TTY output without colors or hyperlinks
+  --resume <last|id>    Continue the last session or a session by id
+  --resume-id <id>      Continue a session by exact id
+  --continue-recovery   Resume the paused model response in the selected session
+  --                    Treat every following argument as prompt text
 
 The prompt may be passed as arguments or piped on stdin when no prompt args are given.
 TTY stdout uses the Minimal transcript presentation; redirected stdout emits raw assistant Markdown.
 Operational progress and diagnostics are written to stderr. JSON output keeps raw Markdown in \`output\`.
+With --prompt-permissions, JSON and quiet requests may prompt on stderr only when stdin is a TTY.
 `;
 
       for (const alias of ["--help", "-h"]) {
@@ -4418,7 +4421,7 @@ describe("cli: error handling", () => {
             "fx ask: --no-save cannot be used with --resume or --resume-id",
           );
           expect(rejected.stderr).toContain(
-            "usage: fx ask [--auto|--yolo] [--image PATH] [--json] [--no-save]",
+            "usage: fx ask [--auto|--yolo] [--image PATH] [--json] [--quiet] [--prompt-permissions] [--no-save]",
           );
         }
         expect(gateway.requests).toHaveLength(0);
