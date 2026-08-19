@@ -695,10 +695,15 @@ pub const SessionListSnapshot = struct {
         } else {
             try out.writer.print("[sessions] {d} saved\n", .{self.sessions.len});
             for (self.sessions) |entry| {
+                try out.writer.writeAll(" - ");
+                try writeTerminalSafe(
+                    &out.writer,
+                    alloc,
+                    entry.title orelse session_display_metadata.fallback_title,
+                );
                 try out.writer.print(
-                    " - {s}\n   id={s} turns={d} language={s} updated_at_ms={d}\n",
+                    "\n   id={s} turns={d} language={s} updated_at_ms={d}\n",
                     .{
-                        entry.title orelse session_display_metadata.fallback_title,
                         entry.id,
                         entry.history_len,
                         entry.conversation_language.view(),
@@ -2071,6 +2076,27 @@ test "core session list snapshot text and json stay stable" {
     try std.testing.expectEqualStrings(
         "{\"kind\":\"sessions\",\"count\":0,\"skipped_invalid\":2,\"sessions\":[]}",
         warning_json,
+    );
+}
+
+test "core session list text visibly escapes terminal controls in titles" {
+    const sessions = [_]session_store.SessionSummary{
+        .{
+            .id = @constCast("hostile-title"),
+            .title = @constCast("\x1b[2Jbreak\nnext"),
+            .created_at_ms = 1,
+            .updated_at_ms = 2,
+            .conversation_language = types.ConversationLanguage.default(),
+            .history_len = 0,
+        },
+    };
+
+    const text = try (SessionListSnapshot{ .sessions = &sessions }).renderText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings(
+        "[sessions] 1 saved\n - \\x1b[2Jbreak\\x0anext\n" ++
+            "   id=hostile-title turns=0 language=und updated_at_ms=2\n",
+        text,
     );
 }
 
