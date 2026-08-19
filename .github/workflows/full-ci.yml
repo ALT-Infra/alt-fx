@@ -144,7 +144,7 @@ jobs:
 
       - name: Install E2E system dependencies
         shell: bash
-        timeout-minutes: 12
+        timeout-minutes: 17
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then
             missing=()
@@ -164,7 +164,9 @@ jobs:
                 done
                 return 1
               }
-              retry sudo timeout --kill-after=15s 2m apt-get \
+              # GitHub's Azure mirror can make forward progress for more than
+              # two minutes before falling back to archive.ubuntu.com.
+              retry sudo timeout --kill-after=15s 4m apt-get \
                 -o Acquire::Retries=3 \
                 -o Acquire::http::Timeout=30 \
                 -o Acquire::https::Timeout=30 \
