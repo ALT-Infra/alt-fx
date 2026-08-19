@@ -3868,7 +3868,7 @@ fn processQueuedPromptLoop(
         }
         var step_has_visible_tool_calls = false;
         for (completion.tool_calls) |call| {
-            if (runtime_tool_presentation.activityKind(deps.tool_registry, call.name) == .ask) continue;
+            if (runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, call) == .ask) continue;
             step_has_visible_tool_calls = true;
             break;
         }
@@ -4471,7 +4471,7 @@ fn processQueuedPromptLoop(
         const step_has_content = !terminal_provider_completion and completion.content != null and completion.content.?.len > 0;
         if (step_has_content) {
             const first_tool_is_ask = effective_tool_calls.len > 0 and
-                runtime_tool_presentation.activityKind(deps.tool_registry, effective_tool_calls[0].name) == .ask;
+                runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, effective_tool_calls[0]) == .ask;
             if (!first_tool_is_ask) try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
             silent_tool_steps = 0;
         } else {
@@ -6098,7 +6098,7 @@ fn processQueuedPromptLoop(
                 };
             }
             const execution_lifecycle_id = types.ToolLifecycleId{ .turn_id = turn_id, .call_id = execution_call.id };
-            const execution_is_command = runtime_tool_presentation.activityKind(deps.tool_registry, tool_call.name) == .command;
+            const execution_is_command = runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, tool_call) == .command;
             var sandbox_widening_feedback: ?[]const u8 = null;
             var sandbox_widening_required: ?runtime_tool_contracts.SandboxScopeRequired = null;
             var sandbox_widening_retry_started = false;
