@@ -1705,6 +1705,74 @@ test "built-in MCP command mutates profile config and requests reload after save
     try expectLine(missing_result, "MCP server 'fs' not found.", false);
 }
 
+test "saving MCP config refuses a symlinked target" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const external = "{\"mcp\":{\"fs\":{\"command\":\"node\"}}}";
+    try writeTempFile(&tmp, "home/external.json", external);
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    const external_path = try tmpDirPath(alloc, tmp.dir, "home/external.json");
+    defer alloc.free(external_path);
+    try tmp.dir.symLink(io_mod.getIo(), external_path, "home/.fx/mcp.json", .{ .is_directory = false });
+
+    const path = try std.fs.path.join(alloc, &.{ std.fs.path.dirname(external_path).?, ".fx", "mcp.json" });
+    defer alloc.free(path);
+
+    // The durable helper refuses a target that is not a plain private file, so
+    // a symlinked config fails the save rather than writing through the link.
+    try std.testing.expectError(error.DurablePathUnsafe, saveConfigsToPath(alloc, path, &.{}));
+
+    const untouched = try readFileForTest(alloc, external_path);
+    defer alloc.free(untouched);
+    try std.testing.expectEqualStrings(external, untouched);
+}
+
+test "built-in MCP command reports a failed save instead of a missing server" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var fixture = ListFixture{ .text = "" };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTempFile(&tmp, "home/external.json", "{\"mcp\":{\"fs\":{\"command\":\"node\"}}}");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    const external_path = try tmpDirPath(alloc, tmp.dir, "home/external.json");
+    defer alloc.free(external_path);
+    try tmp.dir.symLink(io_mod.getIo(), external_path, "home/.fx/mcp.json", .{ .is_directory = false });
+
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+
+    // The server loads through the symlink, so this is a real entry whose
+    // removal cannot be persisted. It must not be reported as missing.
+    var result = try handleCommand(alloc, "remove fs", request(home, &fixture));
+    defer result.deinit(alloc);
+    try expectLine(result, "Failed to remove MCP server 'fs': DurablePathUnsafe.", false);
+}
+
+test "adding an MCP server creates the profile directory privately" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var fixture = ListFixture{ .text = "" };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+
+    var result = try handleCommand(alloc, "add fs node server.js", request(home, &fixture));
+    defer result.deinit(alloc);
+    try expectLine(result, "Saved MCP server 'fs'.", true);
+
+    const dir_stat = try tmp.dir.statFile(io_mod.getIo(), "home/.fx", .{ .follow_symlinks = false });
+    try std.testing.expectEqual(@as(u32, 0o700), dir_stat.permissions.toMode() & 0o777);
+    const file_stat = try tmp.dir.statFile(io_mod.getIo(), "home/.fx/mcp.json", .{ .follow_symlinks = false });
+    try std.testing.expectEqual(@as(u32, 0o600), file_stat.permissions.toMode() & 0o777);
+}
+
 test "built-in MCP command preserves usage and missing-home notices" {
     const alloc = std.testing.allocator;
     var fixture = ListFixture{ .text = "" };
