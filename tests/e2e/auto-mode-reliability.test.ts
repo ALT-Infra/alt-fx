@@ -191,6 +191,82 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
+    "oversized history keeps the newest recent request in reviewer authority",
+    async () => {
+      const root = createIsolatedRoot();
+      const blockedMarker = join(root.workspace, "oversized-history-must-not-run");
+      const gateway = startGateway(
+        [
+          fakeGatewayFinalText("first turn complete"),
+          fakeGatewayFinalText("older middle turn complete"),
+          fakeGatewayFinalText("newest recent turn complete"),
+          commandCall(`touch ${JSON.stringify(blockedMarker)}`, "oversized_history_blocked"),
+          fakeGatewayFinalText("oversized history denial handled"),
+        ],
+        [fakeGatewayPermissionDecision("ask", "oversized_history_review")],
+      );
+      const env = gatewayEnv(root, gateway);
+      const firstPrompt = `first-required-marker ${"a".repeat(4096)}`;
+      const olderPrompt = `older-middle-marker ${"b".repeat(4096)}`;
+      const recentPrompt = `newest-recent-required-marker ${"c".repeat(4096)}`;
+      const currentPrompt = `current-required-marker ${"d".repeat(4096)}`;
+
+      const first = await runFx(["ask", "--quiet", "--json", firstPrompt], {
+        cwd: root.workspace,
+        env,
+        timeoutMs: TIMEOUT,
+      });
+      expect(first.code).toBe(0);
+      const sessionIds = readdirSync(join(root.home, ".fx", "sessions"), {
+        withFileTypes: true,
+      })
+        .filter((entry) =>
+          entry.isDirectory() &&
+          existsSync(join(root.home, ".fx", "sessions", entry.name, "session.json"))
+        )
+        .map((entry) => entry.name);
+      expect(sessionIds).toHaveLength(1);
+      const sessionId = sessionIds[0]!;
+
+      for (const prompt of [olderPrompt, recentPrompt]) {
+        const turn = await runFx(
+          ["ask", "--quiet", "--json", "--resume-id", sessionId, prompt],
+          { cwd: root.workspace, env, timeoutMs: TIMEOUT },
+        );
+        expect(turn.code).toBe(0);
+      }
+
+      const current = await runFx(
+        ["ask", "--quiet", "--json", "--resume-id", sessionId, currentPrompt],
+        { cwd: root.workspace, env, timeoutMs: TIMEOUT },
+      );
+
+      expect(current.code).toBe(0);
+      expect(current.stdout).toContain("oversized history denial handled");
+      expect(existsSync(blockedMarker)).toBe(false);
+      expect(gateway.classifierRequests).toHaveLength(1);
+      const reviewerPayload = JSON.parse(gateway.classifierRequests[0]!.body) as {
+        prompt: Array<{
+          role: string;
+          content: Array<{ type: string; text?: string }>;
+        }>;
+      };
+      const rootMessage = reviewerPayload.prompt[0];
+      expect(rootMessage?.role).toBe("user");
+      const rootContext = (rootMessage?.content ?? [])
+        .filter((part) => part.type === "text")
+        .map((part) => part.text ?? "")
+        .join("");
+      expect(Buffer.byteLength(rootContext)).toBeLessThanOrEqual(1024);
+      expect(rootContext).toContain("current-required-marker");
+      expect(rootContext).toContain("first-required-marker");
+      expect(rootContext).toContain("newest-recent-required-marker");
+      expect(rootContext).not.toContain("older-middle-marker");
+    },
+    TIMEOUT,
+  );
+
+  test(
     "a first automatic block returns to the agent for a safe replan",
     async () => {
       const root = createIsolatedRoot();
