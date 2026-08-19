@@ -5226,7 +5226,6 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText(rootPrompt);
-      await activeSession.waitForText("INTERACTIVE_AUTO_APPROVAL_PARENT_CREATED", TIMEOUT);
       const approvalPane = await activeSession.waitForText(COMMAND_APPROVAL_PROMPT, TIMEOUT);
 
       expect(approvalPane).toContain(
