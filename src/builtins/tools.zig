@@ -748,6 +748,7 @@ pub const memory = ToolSpec{
     .completed_action_label = "Remembered",
     .label_arg_kind = .action,
     .label_arg_default = "memory",
+    .presentation_fn = memory_impl.presentation,
     .permission_target_kind = .none,
     .decode = memory_impl.decode,
     .validate = memory_impl.validate,
@@ -2013,11 +2014,40 @@ test "built-in memory owns product metadata schema and callbacks" {
     try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.none, memory.permission_target_kind);
     try std.testing.expectEqualStrings("Remembering", memory.action_label);
     try std.testing.expectEqualStrings("Remembered", memory.completed_action_label);
+    try std.testing.expect(memory.presentation_fn.? == memory_impl.presentation);
     try std.testing.expect(memory.decode == memory_impl.decode);
     try std.testing.expect(memory.validate.? == memory_impl.validate);
     try std.testing.expect(memory.call == memory_impl.call);
     try std.testing.expect(memory.reads_only_fn == memory_impl.readsOnly);
     try std.testing.expect(memory.irreversible_fn == memory_impl.isIrreversible);
+
+    const list_call = types.ToolCall{
+        .id = "memory_list",
+        .name = "memory",
+        .arguments_json = "{\"action\":\"list\"}",
+    };
+    const save_call = types.ToolCall{
+        .id = "memory_save",
+        .name = "memory",
+        .arguments_json = "{\"action\":\"save\",\"fact\":\"test\"}",
+    };
+    const clear_call = types.ToolCall{
+        .id = "memory_clear",
+        .name = "memory",
+        .arguments_json = "{\"action\":\"clear\"}",
+    };
+    try std.testing.expectEqual(
+        types.ToolActivityKind.read,
+        tool_dispatch.toolActivityKindForCall(std.testing.allocator, registry, list_call),
+    );
+    try std.testing.expectEqual(
+        types.ToolActivityKind.write,
+        tool_dispatch.toolActivityKindForCall(std.testing.allocator, registry, save_call),
+    );
+    try std.testing.expectEqual(
+        types.ToolActivityKind.write,
+        tool_dispatch.toolActivityKindForCall(std.testing.allocator, registry, clear_call),
+    );
 }
 
 test "built-in semantic_search owns product metadata schema and callbacks" {
