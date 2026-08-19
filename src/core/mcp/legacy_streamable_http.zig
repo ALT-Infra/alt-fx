@@ -110,6 +110,7 @@ pub const Client = struct {
     lifecycle_cond: std.Io.Condition = .init,
     active_users: usize = 0,
     retiring: bool = false,
+    session_retired: std.atomic.Value(bool) = .init(false),
     auth_mutex: std.Io.Mutex = .init,
     auth_challenge: ?[]u8 = null,
 
@@ -144,12 +145,13 @@ pub const Client = struct {
         self.lifecycle_mutex.unlock(io_mod.getIo());
     }
 
+    /// Stops new work and records that the server rejected this session id.
+    /// The id stays owned by the client because requests already in flight are
+    /// still sending it as a header, so only `deinit` may free it: it drains
+    /// `active_users` and runs after the subscription listener is joined.
     pub fn retireExpiredSession(self: *Client) void {
+        self.session_retired.store(true, .release);
         self.stopping.store(true, .release);
-        if (self.session_id) |value| {
-            self.owner_allocator.free(value);
-            self.session_id = null;
-        }
     }
 
     pub fn request(self: *Client, alloc: Allocator, options: RequestOptions) ![]u8 {
@@ -248,8 +250,18 @@ pub const Client = struct {
         self.auth_challenge = replacement;
     }
 
+    /// Whether teardown should still send the session DELETE. Split out so a
+    /// test can assert both directions; `terminateSession` swallows every
+    /// transport error, so the skip is otherwise unobservable.
+    fn shouldTerminateSession(self: *const Client) bool {
+        if (self.session_id == null) return false;
+        // The server answered 404 for this session id, so a DELETE would very
+        // likely 404 as well. Skip it rather than spend a request.
+        return !self.session_retired.load(.acquire);
+    }
+
     fn terminateSession(self: *Client) void {
-        if (self.session_id == null) return;
+        if (!self.shouldTerminateSession()) return;
         const deadline = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake)
             .addDuration(.{
             .clock = .awake,
@@ -1409,4 +1421,50 @@ test "legacy Streamable HTTP rejects unsafe resumption header values" {
             .control = undefined,
         }, false),
     );
+}
+
+fn testClientWithSession(alloc: Allocator, session_id: []const u8) !*Client {
+    const client = try alloc.create(Client);
+    errdefer alloc.destroy(client);
+    client.* = .{
+        .owner_allocator = alloc,
+        .url = "http://127.0.0.1:1/mcp",
+        .static_headers = &.{},
+        .version = .v2025_03_26,
+        .session_id = try alloc.dupe(u8, session_id),
+    };
+    return client;
+}
+
+test "retiring an expired session keeps the id alive for in-flight requests" {
+    const alloc = std.testing.allocator;
+    const client = try testClientWithSession(alloc, "session-abc");
+
+    // Stand in for a request that is already past `acquireUse` and is using
+    // session_id as an outgoing header.
+    try std.testing.expect(client.acquireUse());
+    const in_flight = client.session_id.?;
+
+    client.retireExpiredSession();
+
+    try std.testing.expect(client.session_id != null);
+    try std.testing.expectEqualStrings("session-abc", in_flight);
+
+    client.releaseUse();
+    // deinit drains active_users before freeing, so it owns the free.
+    client.deinit();
+}
+
+test "a retired session refuses new leases and skips the delete on teardown" {
+    const alloc = std.testing.allocator;
+    const client = try testClientWithSession(alloc, "session-xyz");
+
+    // A live session is still deleted on teardown; only retirement skips it.
+    try std.testing.expect(client.shouldTerminateSession());
+
+    client.retireExpiredSession();
+
+    try std.testing.expect(!client.acquireUse());
+    try std.testing.expect(!client.shouldTerminateSession());
+    client.deinit();
 }
