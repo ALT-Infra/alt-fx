@@ -1708,6 +1708,30 @@ fn requiresResolvedRequestCapabilities(
         (fast_mode and !available.supports_fast_mode);
 }
 
+fn request_max_output_tokens(capabilities: model_capabilities.Capabilities) ?u32 {
+    const max_output_tokens = capabilities.max_output_tokens orelse return null;
+    const context_window = capabilities.context_window orelse return max_output_tokens;
+    if (max_output_tokens >= context_window) return null;
+    return max_output_tokens;
+}
+
+test "request output limit follows capability bounds" {
+    const cases = [_]struct {
+        capabilities: model_capabilities.Capabilities,
+        expected: ?u32,
+    }{
+        .{ .capabilities = .{}, .expected = null },
+        .{ .capabilities = .{ .max_output_tokens = 32_000 }, .expected = 32_000 },
+        .{ .capabilities = .{ .context_window = 256_000 }, .expected = null },
+        .{ .capabilities = .{ .context_window = 256_000, .max_output_tokens = 32_000 }, .expected = 32_000 },
+        .{ .capabilities = .{ .context_window = 1_048_576, .max_output_tokens = 1_048_576 }, .expected = null },
+        .{ .capabilities = .{ .context_window = 128_000, .max_output_tokens = 256_000 }, .expected = null },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, request_max_output_tokens(case.capabilities));
+    }
+}
+
 fn processQueuedPromptInner(
     deps: *const AgentRuntimeDeps,
     semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink,
@@ -2621,7 +2645,7 @@ fn processQueuedPromptLoop(
                         selected_dynamic_tool_schemas.items,
                     .vision_mode = vision_mode,
                     .provider_options = provider_opts,
-                    .max_output_tokens = request_capabilities.max_output_tokens,
+                    .max_output_tokens = request_max_output_tokens(request_capabilities),
                     .budget = .{ .cancel_flag = config.cancel_flag },
                 },
             ) catch |err| {
