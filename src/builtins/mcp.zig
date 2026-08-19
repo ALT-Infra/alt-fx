@@ -503,10 +503,13 @@ fn saveConfigsToPath(alloc: Allocator, path: []const u8, configs: []const McpSer
     const json = try renderConfigJson(alloc, configs);
     defer alloc.free(json);
 
-    if (std.fs.path.dirname(path)) |parent| ensureDir(parent);
-    var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), path, .{ .truncate = true });
-    defer file.close(io_mod.getIo());
-    try file.writeStreamingAll(io_mod.getIo(), json);
+    const parent = std.fs.path.dirname(path) orelse return error.McpConfigPathInvalid;
+    ensureDir(parent);
+    var dir = io_mod.VerifiedDir{
+        .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), parent, .{ .iterate = true }),
+    };
+    defer dir.close();
+    try io_mod.durableReplaceVerified(alloc, &dir, std.fs.path.basename(path), json);
 }
 
 fn freeConfigs(alloc: Allocator, configs: *std.ArrayList(McpServerConfig)) void {
@@ -1263,6 +1266,39 @@ fn tmpRoot(alloc: Allocator, tmp: std.testing.TmpDir) ![]u8 {
 
 fn tmpPath(alloc: Allocator, root: []const u8, name: []const u8) ![]u8 {
     return std.fs.path.join(alloc, &.{ root, name });
+}
+
+test "saving MCP config replaces the file durably" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTempFile(&tmp, "home/.fx/mcp.json", "{\"mcp\":{\"stale\":{\"command\":\"echo\"}}}");
+    const path = try tmpDirPath(alloc, tmp.dir, "home/.fx/mcp.json");
+    defer alloc.free(path);
+
+    try saveConfigsToPath(alloc, path, &.{});
+
+    const written = try readFileForTest(alloc, path);
+    defer alloc.free(written);
+    try std.testing.expect(std.mem.indexOf(u8, written, "stale") == null);
+
+    // A durable replace renames a private temp file over the target, so the
+    // result is 0600 and no temp file is left behind. A plain truncating write
+    // leaves the mode the umask picked.
+    var fx_dir = try tmp.dir.openDir(io_mod.getIo(), "home/.fx", .{ .iterate = true });
+    defer fx_dir.close(io_mod.getIo());
+    const stat = try fx_dir.statFile(io_mod.getIo(), "mcp.json", .{ .follow_symlinks = false });
+    try std.testing.expectEqual(@as(u32, 0o600), stat.permissions.toMode() & 0o777);
+
+    var it = fx_dir.iterate();
+    var entries: usize = 0;
+    while (try it.next(io_mod.getIo())) |entry| {
+        entries += 1;
+        try std.testing.expectEqualStrings("mcp.json", entry.name);
+    }
+    try std.testing.expectEqual(@as(usize, 1), entries);
 }
 
 fn tmpDirPath(alloc: Allocator, dir: std.Io.Dir, sub_path: []const u8) ![]u8 {
