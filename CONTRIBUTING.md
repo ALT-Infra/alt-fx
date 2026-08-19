@@ -247,7 +247,7 @@ Security is permission-first.
 
 * the main agent may pass that exact request ID through `ask_user_question` to open the existing permission screen; generic question text cannot authorize an action, and the resulting once or always approval is revalidated and consumed only by the exact bound action
 
-* after three consecutive all-blocked response groups, fx either makes one final tools-disabled model request when step budget remains or emits a fixed local fallback when it does not; any completed successful tool in a group resets that recovery count
+* after three consecutive all-blocked response groups, the next unresolved sensitive action skips another automatic review and uses the existing human approval path; any completed successful tool resets that recovery count, and configured and saved-session rules remain authoritative
 
 * the sandbox backend is configured independently; yolo uses an effective backend of `none` without rewriting the saved sandbox setting
 
