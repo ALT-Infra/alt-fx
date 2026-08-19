@@ -8688,7 +8688,7 @@ test "command output consolidation preserves committed prompt scrollback anchor"
     }
     // The assistant content above is complete; report producer closure so
     // the finality floor does not hold the tail.
-    runtime.setAssistantTailWritable(false);
+    runtime.transcript_release = runtime.transcript_release.with_assistant_tail_writable(false);
 
     var live_source = try runtime.prepareTranscriptSource(alloc, null);
     defer live_source.deinit(alloc);

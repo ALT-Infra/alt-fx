@@ -3353,7 +3353,7 @@ test "structured command-output rewrite materializes committed transcript scroll
     }
     // Assistant content is complete before each frame; report producer
     // closure so the finality floor does not hold the tail.
-    h.shell.setAssistantTailWritable(false);
+    h.shell.transcript_release = h.shell.transcript_release.with_assistant_tail_writable(false);
 
     try h.renderTranscriptFrame();
     try h.flush();
@@ -6315,7 +6315,7 @@ test "inline approval footer reflow preserves concurrent transcript progress" {
 
     // Closing the producer finalizes the tail; the held rows settle through
     // the catch-up replay, possibly across frames.
-    h.shell.setAssistantTailWritable(false);
+    h.shell.transcript_release = h.shell.transcript_release.with_assistant_tail_writable(false);
     var settle_frames: usize = 0;
     var settled_scroll_rows: u32 = 0;
     while (settle_frames < 8) : (settle_frames += 1) {

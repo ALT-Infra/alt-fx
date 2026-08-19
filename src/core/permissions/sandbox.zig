@@ -470,12 +470,14 @@ fn exitForegroundSessionSupervisor(term: std.process.Child.Term) noreturn {
     switch (term) {
         .exited => |code| std.process.exit(code),
         .signal => |signal| {
-            const default_action: std.posix.Sigaction = .{
-                .handler = .{ .handler = std.posix.SIG.DFL },
-                .mask = std.posix.sigemptyset(),
-                .flags = 0,
-            };
-            std.posix.sigaction(signal, &default_action, null);
+            if (signal != std.posix.SIG.KILL and signal != std.posix.SIG.STOP) {
+                const default_action: std.posix.Sigaction = .{
+                    .handler = .{ .handler = std.posix.SIG.DFL },
+                    .mask = std.posix.sigemptyset(),
+                    .flags = 0,
+                };
+                std.posix.sigaction(signal, &default_action, null);
+            }
             var signal_mask = std.posix.sigemptyset();
             std.posix.sigaddset(&signal_mask, signal);
             std.posix.sigprocmask(std.posix.SIG.UNBLOCK, &signal_mask, null);
