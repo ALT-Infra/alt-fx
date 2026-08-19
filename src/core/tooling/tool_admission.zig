@@ -6131,6 +6131,15 @@ test "human approval phase routes prepared file mutation through the prompter" {
     defer alloc.free(workspace);
     const external = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external");
     defer alloc.free(external);
+    {
+        var existing = try tmp.dir.createFile(
+            io_mod.getIo(),
+            "external/prepared.txt",
+            .{ .truncate = true },
+        );
+        defer existing.close(io_mod.getIo());
+        try existing.writeStreamingAll(io_mod.getIo(), "before\n");
+    }
 
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();

@@ -4301,6 +4301,7 @@ describe("acp: model-independent", () => {
       for (const testCase of cases) {
         const root = createIsolatedRoot(`fx-acp-auto-threshold-${testCase.suffix}-`);
         const target = join(root.external, `threshold-${testCase.suffix}.txt`);
+        writeFileSync(target, "before");
         const fourthCallId = `${testCase.suffix}_threshold_call_4`;
         const postRejectCallId = "reject_after_human_denial";
         const postDecisionResponses = testCase.executes
@@ -4348,15 +4349,16 @@ describe("acp: model-independent", () => {
           );
           expect(permissions).toHaveLength(1);
           expect(permissions[0]!.params.toolCall.toolCallId).toBe(fourthCallId);
-          expect(gateway.classifierRequests).toHaveLength(testCase.executes ? 3 : 4);
+          expect(gateway.classifierRequests).toHaveLength(testCase.executes ? 1 : 2);
           expect(gateway.requests).toHaveLength(testCase.executes ? 5 : 6);
-          expect(existsSync(target)).toBe(testCase.executes);
+          expect(existsSync(target)).toBe(true);
           if (testCase.executes) {
             expect(readFileSync(target, "utf8")).toBe("ACP_THRESHOLD_ALLOW");
             expect(acpToolResultText(gateway.requests[4]!.body, fourthCallId)).not.toContain(
               "tool_permission_denied",
             );
           } else {
+            expect(readFileSync(target, "utf8")).toBe("before");
             expect(acpToolResultText(gateway.requests[4]!.body, fourthCallId)).toContain(
               "user_denied",
             );

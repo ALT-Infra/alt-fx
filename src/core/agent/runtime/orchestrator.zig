@@ -5800,7 +5800,8 @@ fn processQueuedPromptLoop(
             const approved_revalidation = turn_permission_recovery.takeApproval(
                 execution_call,
             );
-            const preserved_automatic_denial = if (approved_revalidation == null)
+            const preserved_automatic_denial = if (approved_revalidation == null and
+                auto_permission_phase == .automatic_review)
                 try turn_permission_recovery.preservedOutcome(
                     call_allocator,
                     config.workspace_root,

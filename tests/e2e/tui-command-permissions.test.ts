@@ -5235,7 +5235,7 @@ describe("effect-aware command permissions", () => {
       expect(childId).not.toBe("");
       expect(subagentState(root, childId)).toBe("awaiting_approval");
       expect(existsSync(markerPath)).toBe(false);
-      expect(gateway.classifierRequests).toHaveLength(3);
+      expect(gateway.classifierRequests).toHaveLength(1);
       await activeSession.sendKeys("1");
       await activeSession.sendKeys("Enter");
 
@@ -5245,7 +5245,7 @@ describe("effect-aware command permissions", () => {
       }
       expect(subagentState(root, childId)).toBe("completed");
       expect(childRequestCount).toBe(5);
-      expect(gateway.classifierRequests).toHaveLength(3);
+      expect(gateway.classifierRequests).toHaveLength(1);
       expect(existsSync(markerPath)).toBe(true);
 
       await activeSession.sendText("/quit");
