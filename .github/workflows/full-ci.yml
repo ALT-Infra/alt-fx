@@ -164,8 +164,14 @@ jobs:
                 done
                 return 1
               }
-              # GitHub's Azure mirror can make forward progress for more than
-              # two minutes before falling back to archive.ubuntu.com.
+              # The Azure mirror can stall after APT has already fetched release
+              # metadata from the direct Ubuntu fallback. Prefer that fallback
+              # for the whole update when the runner's mirror list provides it.
+              if [ -f /etc/apt/apt-mirrors.txt ] &&
+                grep -Eq '^https?://(archive|ports)\.ubuntu\.com/' /etc/apt/apt-mirrors.txt
+              then
+                sudo sed -i '/:\/\/azure\..*ubuntu\.com\//d' /etc/apt/apt-mirrors.txt
+              fi
               retry sudo timeout --kill-after=15s 4m apt-get \
                 -o Acquire::Retries=3 \
                 -o Acquire::http::Timeout=30 \
