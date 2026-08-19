@@ -5268,7 +5268,7 @@ test "slash picker dismissal resolves transcript extent before layout convergenc
         .images = &.{},
     });
     _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, transcript.items);
-    h.shell.setAssistantTailWritable(false);
+    h.shell.transcript_release = h.shell.transcript_release.with_assistant_tail_writable(false);
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
     try std.testing.expectEqual(@as(u16, 70), h.shell.last_visible_transcript_last_row);
