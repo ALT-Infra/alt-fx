@@ -173,7 +173,13 @@ fn handleCommand(alloc: Allocator, rest: []const u8, command_request: CommandReq
             return lineLiteral(alloc, "Usage: /mcp remove <name>", false);
         }
 
-        const removed = removeServerFromPath(alloc, config_path, name) catch false;
+        const removed = removeServerFromPath(alloc, config_path, name) catch |err| {
+            return lineParts(
+                alloc,
+                &.{ "Failed to remove MCP server '", name, "': ", @errorName(err), "." },
+                false,
+            );
+        };
         if (!removed) {
             return lineParts(alloc, &.{ "MCP server '", name, "' not found." }, false);
         }
@@ -191,8 +197,12 @@ fn handleCommand(alloc: Allocator, rest: []const u8, command_request: CommandReq
             return lineLiteral(alloc, "Usage: /mcp add <name> <command> [args...]", false);
         }
 
-        addOrReplaceLocalServer(alloc, config_path, tokens.items[0], tokens.items[1..]) catch {
-            return lineLiteral(alloc, "Failed to save MCP server config.", false);
+        addOrReplaceLocalServer(alloc, config_path, tokens.items[0], tokens.items[1..]) catch |err| {
+            return lineParts(
+                alloc,
+                &.{ "Failed to save MCP server config: ", @errorName(err), "." },
+                false,
+            );
         };
         return lineParts(alloc, &.{ "Saved MCP server '", tokens.items[0], "'." }, true);
     }
@@ -504,10 +514,13 @@ fn saveConfigsToPath(alloc: Allocator, path: []const u8, configs: []const McpSer
     defer alloc.free(json);
 
     const parent = std.fs.path.dirname(path) orelse return error.McpConfigPathInvalid;
-    ensureDir(parent);
-    var dir = io_mod.VerifiedDir{
-        .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), parent, .{ .iterate = true }),
+    const grandparent = std.fs.path.dirname(parent) orelse return error.McpConfigPathInvalid;
+
+    var enclosing = io_mod.VerifiedDir{
+        .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), grandparent, .{ .iterate = true }),
     };
+    defer enclosing.close();
+    var dir = try io_mod.openOrCreateVerifiedPrivateDir(&enclosing, std.fs.path.basename(parent));
     defer dir.close();
     try io_mod.durableReplaceVerified(alloc, &dir, std.fs.path.basename(path), json);
 }
@@ -1160,18 +1173,6 @@ fn isValidServerName(name: []const u8) bool {
     return true;
 }
 
-fn ensureDir(path: []const u8) void {
-    std.Io.Dir.createDirAbsolute(io_mod.getIo(), path, .default_dir) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => {
-            if (std.fs.path.dirname(path)) |parent| {
-                ensureDir(parent);
-                std.Io.Dir.createDirAbsolute(io_mod.getIo(), path, .default_dir) catch {};
-            }
-        },
-    };
-}
-
 var stable_test_environ: ?*std.process.Environ.Map = null;
 
 fn stableEmptyTestEnviron() !*const std.process.Environ.Map {
@@ -1274,21 +1275,40 @@ test "saving MCP config replaces the file durably" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try writeTempFile(&tmp, "home/.fx/mcp.json", "{\"mcp\":{\"stale\":{\"command\":\"echo\"}}}");
+    const original = "{\"mcp\":{\"stale\":{\"command\":\"echo\"}}}";
+    try writeTempFile(&tmp, "home/.fx/mcp.json", original);
     const path = try tmpDirPath(alloc, tmp.dir, "home/.fx/mcp.json");
     defer alloc.free(path);
 
+    var fx_dir = try tmp.dir.openDir(io_mod.getIo(), "home/.fx", .{ .iterate = true });
+    defer fx_dir.close(io_mod.getIo());
+
+    // Seed a group-readable mode so the 0600 assertion below cannot pass just
+    // because the developer's umask already produced it.
+    {
+        var seed = try fx_dir.openFile(io_mod.getIo(), "mcp.json", .{ .mode = .read_write });
+        defer seed.close(io_mod.getIo());
+        try seed.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o644));
+    }
+
+    // Hold the pre-save file open. A rename-over leaves this descriptor on the
+    // old, unlinked inode; an in-place truncate would empty it instead, which
+    // is the failure this save must not have.
+    var held = try fx_dir.openFile(io_mod.getIo(), "mcp.json", .{});
+    defer held.close(io_mod.getIo());
+
     try saveConfigsToPath(alloc, path, &.{});
+
+    const held_stat = try held.stat(io_mod.getIo());
+    try std.testing.expectEqual(@as(u64, 0), held_stat.nlink);
+    const held_bytes = try io_mod.readFileToEnd(alloc, &held, 4096);
+    defer alloc.free(held_bytes);
+    try std.testing.expectEqualStrings(original, held_bytes);
 
     const written = try readFileForTest(alloc, path);
     defer alloc.free(written);
-    try std.testing.expect(std.mem.indexOf(u8, written, "stale") == null);
+    try std.testing.expect(std.mem.find(u8, written, "stale") == null);
 
-    // A durable replace renames a private temp file over the target, so the
-    // result is 0600 and no temp file is left behind. A plain truncating write
-    // leaves the mode the umask picked.
-    var fx_dir = try tmp.dir.openDir(io_mod.getIo(), "home/.fx", .{ .iterate = true });
-    defer fx_dir.close(io_mod.getIo());
     const stat = try fx_dir.statFile(io_mod.getIo(), "mcp.json", .{ .follow_symlinks = false });
     try std.testing.expectEqual(@as(u32, 0o600), stat.permissions.toMode() & 0o777);
 
