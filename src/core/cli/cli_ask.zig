@@ -617,7 +617,10 @@ const AskContext = struct {
             return;
         };
         debug_trace.logf("notifications", "sound play kind={s} cue={s}", .{ @tagName(kind), @tagName(cue) });
-        player.play(cue);
+        switch (kind) {
+            .attention_required => player.playAttention(cue),
+            .turn_end => player.play(cue),
+        }
     }
 
     fn deinit(self: *AskContext) void {
