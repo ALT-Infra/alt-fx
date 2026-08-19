@@ -878,11 +878,11 @@ test "buildHintLine omits the session segment when no title is cached" {
 test "buildHintLine shows the workspace and Git branch" {
     var buf: [256]u8 = undefined;
     const line = buildHintLine(false, false, true, "openai/gpt-5", .ask, 0, null, false, false, .auto, false, .{
-        .workspace_label = "/Users/mike/code/fx",
+        .workspace_label = "/workspace/code/fx",
         .git_branch = "feature/statusline",
     }, 100, &buf);
     try std.testing.expectEqualStrings(
-        "ask · gpt-5 · /Users/mike/code/fx (feature/statusline)",
+        "ask · gpt-5 · /workspace/code/fx (feature/statusline)",
         line,
     );
 }
