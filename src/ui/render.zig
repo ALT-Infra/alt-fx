@@ -2,6 +2,7 @@ const std = @import("std");
 const io_mod = @import("../core/shared/io.zig");
 const host = @import("../core/hosts/host.zig");
 const display_width = @import("../core/shared/display_width.zig");
+const text_utils = @import("../core/shared/text_utils.zig");
 const types = @import("../core/shared/types.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const assistant_presentation = @import("../core/agent/assistant_presentation.zig");
@@ -178,6 +179,8 @@ pub fn welcomeMessage(alloc: std.mem.Allocator) ![]u8 {
 }
 
 pub const StatuslineItems = struct {
+    workspace_label: []const u8 = "",
+    git_branch: ?[]const u8 = null,
     sandbox_label: ?[]const u8 = null,
     context_used: u64 = 0,
     context_total: ?u32 = null,
@@ -236,9 +239,159 @@ fn appendStatusSegment(out: []u8, end: *usize, segment: []const u8) void {
     end.* += segment.len;
 }
 
-fn leadingPermissionModeFits(limit: usize, permission_label: []const u8, model_label: []const u8) bool {
+const statusline_separator = " · ";
+const max_workspace_reserve_cells: usize = 24;
+
+fn workspaceIdentityWidth(statusline: StatuslineItems) usize {
+    if (statusline.workspace_label.len == 0) return 0;
+    var width = display_width.visibleWidth(statusline.workspace_label);
+    if (statusline.git_branch) |branch| {
+        if (branch.len > 0) {
+            width +|= display_width.visibleWidth(" (") +
+                display_width.visibleWidth(branch) +
+                display_width.visibleWidth(")");
+        }
+    }
+    return width;
+}
+
+fn requiredCoreWidth(
+    model_label: []const u8,
+    statusline: StatuslineItems,
+) usize {
+    var width = display_width.visibleWidth(model_label);
+    const workspace_width = workspaceIdentityWidth(statusline);
+    if (workspace_width > 0) {
+        width +|= display_width.visibleWidth(statusline_separator) +
+            @min(workspace_width, max_workspace_reserve_cells);
+    }
+    return width;
+}
+
+fn leadingPermissionModeFits(
+    limit: usize,
+    current: []const u8,
+    permission_label: []const u8,
+    core_width: usize,
+) bool {
     if (limit == 0) return false;
-    return display_width.visibleWidthIgnoringAnsi(permission_label) + display_width.visibleWidth(" · ") + display_width.visibleWidth(model_label) <= limit;
+    var needed = display_width.visibleWidthIgnoringAnsi(current);
+    if (current.len > 0) needed +|= display_width.visibleWidth(statusline_separator);
+    needed +|= display_width.visibleWidthIgnoringAnsi(permission_label) +
+        display_width.visibleWidth(statusline_separator) +
+        core_width;
+    return needed <= limit;
+}
+
+const ClippedSegment = struct {
+    bytes: []const u8,
+    marker_before: bool = false,
+    marker_after: bool = false,
+};
+
+fn clippedWorkspaceSuffix(encoded: []const u8, max_width: usize) ClippedSegment {
+    if (display_width.visibleWidth(encoded) <= max_width) return .{ .bytes = encoded };
+    if (max_width <= 1) return .{ .bytes = "", .marker_before = max_width == 1 };
+    return .{
+        .bytes = text_utils.suffixTerminalSafeByWidth(encoded, max_width - 1),
+        .marker_before = true,
+    };
+}
+
+fn clippedBranchPrefix(encoded: []const u8, max_width: usize) ClippedSegment {
+    if (display_width.visibleWidth(encoded) <= max_width) return .{ .bytes = encoded };
+    if (max_width <= 1) return .{ .bytes = "", .marker_after = max_width == 1 };
+    return .{
+        .bytes = text_utils.prefixTerminalSafeByWidth(encoded, max_width - 1),
+        .marker_after = true,
+    };
+}
+
+fn appendIdentityBytes(out: []u8, end: *usize, bytes: []const u8) bool {
+    if (end.* + bytes.len > out.len) return false;
+    @memcpy(out[end.* .. end.* + bytes.len], bytes);
+    end.* += bytes.len;
+    return true;
+}
+
+fn appendClippedIdentityPart(
+    out: []u8,
+    end: *usize,
+    clipped: ClippedSegment,
+) bool {
+    if (clipped.marker_before and !appendIdentityBytes(out, end, "…")) return false;
+    if (!appendIdentityBytes(out, end, clipped.bytes)) return false;
+    if (clipped.marker_after and !appendIdentityBytes(out, end, "…")) return false;
+    return true;
+}
+
+fn composeWorkspaceIdentity(
+    statusline: StatuslineItems,
+    max_width: usize,
+    out: []u8,
+) ?[]const u8 {
+    if (statusline.workspace_label.len == 0 or max_width == 0) return null;
+
+    var width_budget = @min(max_width, out.len);
+    while (width_budget > 0) : (width_budget -= 1) {
+        var end: usize = 0;
+        if (statusline.git_branch) |branch| {
+            if (branch.len > 0) {
+                // Below seven cells, showing fragments of both values is less
+                // useful than retaining the working-directory tail alone.
+                if (width_budget >= 7) {
+                    const branch_width = display_width.visibleWidth(branch);
+                    const max_branch_width = width_budget - 4;
+                    const branch_budget = @min(
+                        branch_width,
+                        @min(max_branch_width, @max(@as(usize, 4), width_budget / 2)),
+                    );
+                    const path_budget = width_budget - 3 - branch_budget;
+                    const path = clippedWorkspaceSuffix(statusline.workspace_label, path_budget);
+                    const branch_label = clippedBranchPrefix(branch, branch_budget);
+                    if (appendClippedIdentityPart(out, &end, path) and
+                        appendIdentityBytes(out, &end, " (") and
+                        appendClippedIdentityPart(out, &end, branch_label) and
+                        appendIdentityBytes(out, &end, ")"))
+                    {
+                        return out[0..end];
+                    }
+                    continue;
+                }
+            }
+        }
+
+        const path = clippedWorkspaceSuffix(statusline.workspace_label, width_budget);
+        if (appendClippedIdentityPart(out, &end, path)) return out[0..end];
+    }
+    return null;
+}
+
+fn appendWorkspaceIdentity(
+    out: []u8,
+    end: *usize,
+    status_limit: usize,
+    statusline: StatuslineItems,
+) void {
+    if (statusline.workspace_label.len == 0) return;
+    const used_width = display_width.visibleWidthIgnoringAnsi(out[0..end.*]);
+    const separator_width = if (end.* > 0)
+        display_width.visibleWidth(statusline_separator)
+    else
+        0;
+    if (used_width + separator_width >= status_limit) return;
+
+    const separator_bytes = if (end.* > 0) statusline_separator.len else 0;
+    if (end.* + separator_bytes >= out.len) return;
+    const available_width = status_limit - used_width - separator_width;
+    const available_bytes = out.len - end.* - separator_bytes;
+    var identity_buf: [512]u8 = undefined;
+    const identity = composeWorkspaceIdentity(
+        statusline,
+        available_width,
+        identity_buf[0..@min(identity_buf.len, available_bytes)],
+    ) orelse return;
+    appendStatusSegment(out, end, identity);
 }
 
 pub fn buildHintLine(
@@ -274,14 +427,18 @@ pub fn buildHintLine(
         appendStatusSegment(out, &end, std.fmt.bufPrint(&queued_buf, "queued {d}", .{queued_count}) catch "");
     }
     const status_limit = @min(@as(usize, width), out.len);
-    if (leadingPermissionModeFits(status_limit, permission_label, model_label)) {
+    const show_effort = model_supports_effort and !effort.isDefault();
+    const show_fast = model_supports_fast and fast_mode;
+    const core_width = requiredCoreWidth(model_label, statusline);
+    if (leadingPermissionModeFits(status_limit, out[0..end], permission_label, core_width)) {
         appendStatusSegment(out, &end, permission_label);
     }
     appendStatusSegment(out, &end, model_label);
-    if (model_supports_effort and !effort.isDefault()) {
+    appendWorkspaceIdentity(out, &end, status_limit, statusline);
+    if (show_effort) {
         appendStatusSegment(out, &end, effort.displayLabel());
     }
-    if (model_supports_fast and fast_mode) {
+    if (show_fast) {
         appendStatusSegment(out, &end, "⚡︎");
     }
 
@@ -716,6 +873,54 @@ test "buildHintLine omits the session segment when no title is cached" {
         .session_title = null,
     }, 80, &buf);
     try std.testing.expectEqualStrings("ask · gpt-5", line);
+}
+
+test "buildHintLine shows the workspace and Git branch" {
+    var buf: [256]u8 = undefined;
+    const line = buildHintLine(false, false, true, "openai/gpt-5", .ask, 0, null, false, false, .auto, false, .{
+        .workspace_label = "/Users/mike/code/fx",
+        .git_branch = "feature/statusline",
+    }, 100, &buf);
+    try std.testing.expectEqualStrings(
+        "ask · gpt-5 · /Users/mike/code/fx (feature/statusline)",
+        line,
+    );
+}
+
+test "buildHintLine keeps workspace and branch readable at narrow widths" {
+    var buf: [256]u8 = undefined;
+    const line = buildHintLine(false, false, true, "openai/gpt-5", .ask, 0, null, false, false, .auto, false, .{
+        .workspace_label = "/a/very/long/path/to/fx-repo",
+        .git_branch = "feature/statusline",
+    }, 32, &buf);
+    try std.testing.expectEqual(@as(usize, 32), display_width.visibleWidthIgnoringAnsi(line));
+    try std.testing.expect(std.mem.startsWith(u8, line, "gpt-5 · "));
+    try std.testing.expect(std.mem.find(u8, line, "fx-repo") != null);
+    try std.testing.expect(std.mem.find(u8, line, "feature/") != null);
+    try std.testing.expect(std.mem.endsWith(u8, line, "…)"));
+}
+
+test "buildHintLine shows a non-Git workspace without branch punctuation" {
+    var buf: [128]u8 = undefined;
+    const line = buildHintLine(false, false, true, "openai/gpt-5", .ask, 0, null, false, false, .auto, false, .{
+        .workspace_label = "/tmp/plain-workspace",
+    }, 80, &buf);
+    try std.testing.expectEqualStrings(
+        "ask · gpt-5 · /tmp/plain-workspace",
+        line,
+    );
+}
+
+test "buildHintLine labels detached HEAD" {
+    var buf: [128]u8 = undefined;
+    const line = buildHintLine(false, false, true, "openai/gpt-5", .ask, 0, null, false, false, .auto, false, .{
+        .workspace_label = "/tmp/fx",
+        .git_branch = "detached:0123456789ab",
+    }, 80, &buf);
+    try std.testing.expectEqualStrings(
+        "ask · gpt-5 · /tmp/fx (detached:0123456789ab)",
+        line,
+    );
 }
 
 test "buildHintLine keeps system labels and dot separators" {
