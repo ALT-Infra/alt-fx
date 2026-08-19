@@ -1455,6 +1455,59 @@ test "retiring an expired session keeps the id alive for in-flight requests" {
     client.deinit();
 }
 
+/// Stands in for a request that is already in flight: it holds a use lease and
+/// keeps reading `session_id` as an outgoing header would, then releases.
+const LeaseProbe = struct {
+    client: *Client,
+    entered: *std.atomic.Value(bool),
+    released: *std.atomic.Value(bool),
+    id_stayed_valid: *std.atomic.Value(bool),
+
+    fn run(self: LeaseProbe) void {
+        self.entered.store(true, .release);
+        var i: usize = 0;
+        while (i < 200_000) : (i += 1) {
+            const id = self.client.session_id orelse {
+                self.id_stayed_valid.store(false, .release);
+                break;
+            };
+            if (!std.mem.eql(u8, id, "session-drain")) {
+                self.id_stayed_valid.store(false, .release);
+                break;
+            }
+        }
+        self.released.store(true, .release);
+        self.client.releaseUse();
+    }
+};
+
+test "deinit waits for an in-flight lease before it frees the session id" {
+    const alloc = std.testing.allocator;
+    const client = try testClientWithSession(alloc, "session-drain");
+
+    var entered: std.atomic.Value(bool) = .init(false);
+    var released: std.atomic.Value(bool) = .init(false);
+    var id_stayed_valid: std.atomic.Value(bool) = .init(true);
+
+    try std.testing.expect(client.acquireUse());
+    const probe = try std.Thread.spawn(.{}, LeaseProbe.run, .{LeaseProbe{
+        .client = client,
+        .entered = &entered,
+        .released = &released,
+        .id_stayed_valid = &id_stayed_valid,
+    }});
+    while (!entered.load(.acquire)) {}
+
+    client.retireExpiredSession();
+    client.deinit();
+
+    // deinit must not have returned until the probe gave the lease back, and
+    // the id it was reading must have stayed valid for that whole window.
+    try std.testing.expect(released.load(.acquire));
+    try std.testing.expect(id_stayed_valid.load(.acquire));
+    probe.join();
+}
+
 test "a retired session refuses new leases and skips the delete on teardown" {
     const alloc = std.testing.allocator;
     const client = try testClientWithSession(alloc, "session-xyz");
