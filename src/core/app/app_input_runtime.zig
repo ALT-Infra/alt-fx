@@ -7208,6 +7208,36 @@ test "app_input_runtime decoded kitty Escape follows the raw Escape policy" {
     }
 }
 
+test "app_input_runtime Ghostty Escape press closes the usage dashboard" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try app.input_runtime.usage_menu.openError(
+        alloc,
+        .days_30,
+        "usage is unavailable",
+    );
+
+    try feedRoutingBytes(&app, "\x1b[27;1:1u");
+
+    try std.testing.expect(!app.input_runtime.usage_menu.active);
+}
+
+test "app_input_runtime Ghostty Escape release leaves the usage dashboard open" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try app.input_runtime.usage_menu.openError(
+        alloc,
+        .days_30,
+        "usage is unavailable",
+    );
+
+    try feedRoutingBytes(&app, "\x1b[27;1:3u");
+
+    try std.testing.expect(app.input_runtime.usage_menu.active);
+}
+
 test "app_input_runtime decoded kitty Backspace edits the draft without cancelling" {
     const alloc = std.testing.allocator;
     const sequences = [_][]const u8{ "\x1b[127u", "\x1b[127;1u" };
