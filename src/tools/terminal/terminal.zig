@@ -5,6 +5,7 @@ const identity = @import("../../core/terminal/identity.zig");
 const operation = @import("../../core/terminal/operation.zig");
 const store = @import("../../core/terminal/store.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
+const sort_utils = @import("../../core/shared/sort_utils.zig");
 const command_environment = @import("../../core/execution/command_environment.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const pathing = @import("../../core/workspace/pathing.zig");
@@ -296,7 +297,7 @@ fn actionFieldCorrection(
         if (isPublicField(entry.key_ptr.*)) continue;
         scratch.invalid_fields.appendAssumeCapacity(entry.key_ptr.*);
     }
-    std.mem.sort(
+    sort_utils.sort(
         []const u8,
         scratch.invalid_fields.items[unknown_start..],
         {},
