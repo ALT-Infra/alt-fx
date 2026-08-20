@@ -41,14 +41,6 @@ BENCHMARK_USE_FLAGS = (
     "-passes=default<O2>",
 )
 
-BENCHMARK_RELINK_USE_FLAGS = (
-    "--disable-vp",
-    "-pgo-kind=pgo-instr-use-pipeline",
-    "-pgo-cold-func-opt=minsize",
-    "-profile-summary-cutoff-cold=996000",
-    "-passes=default<O2>",
-)
-
 CANDIDATE_SIGNING_PAGE_SIZE = 16 * 1024
 
 PROFILE_SECTION_ALIGNMENTS = (
@@ -318,16 +310,9 @@ def profile_use_argv(
     toolchain: Toolchain,
     paths: PipelinePaths,
     profile_path: pathlib.Path | None = None,
-    *,
-    benchmark_relink: bool = False,
 ) -> tuple[str, ...]:
     profile = profile_path or paths.merged_profile
-    if benchmark_relink:
-        if paths.selector == "fx":
-            raise PgsoError("benchmark relink requires a benchmark artifact")
-        flags = BENCHMARK_RELINK_USE_FLAGS
-    else:
-        flags = USE_FLAGS if paths.selector == "fx" else BENCHMARK_USE_FLAGS
+    flags = USE_FLAGS if paths.selector == "fx" else BENCHMARK_USE_FLAGS
     return (
         str(toolchain.opt),
         *flags,
@@ -727,18 +712,12 @@ def apply_profile(
     expected_bitcode_sha256: str,
     *,
     profile_path: pathlib.Path | None = None,
-    benchmark_relink: bool = False,
 ) -> pathlib.Path:
     validate_bitcode_hash(paths.bitcode, expected_bitcode_sha256)
     profile = profile_path or paths.merged_profile
     _require_nonempty_file(profile, "merged profile")
     run_checked(
-        profile_use_argv(
-            toolchain,
-            paths,
-            profile,
-            benchmark_relink=benchmark_relink,
-        ),
+        profile_use_argv(toolchain, paths, profile),
         cwd=paths.root,
         env=os.environ.copy(),
         timeout_s=900,

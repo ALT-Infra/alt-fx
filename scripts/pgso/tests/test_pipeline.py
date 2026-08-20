@@ -8,7 +8,6 @@ import unittest
 
 from scripts.pgso.model import PgsoError, sha256_file
 from scripts.pgso.pipeline import (
-    BENCHMARK_RELINK_USE_FLAGS,
     BENCHMARK_USE_FLAGS,
     GENERATION_FLAGS,
     PROFILE_SECTION_ALIGNMENTS,
@@ -122,16 +121,6 @@ class PgsoPipelineTests(unittest.TestCase):
         )
         self.assertEqual(
             (
-                "--disable-vp",
-                "-pgo-kind=pgo-instr-use-pipeline",
-                "-pgo-cold-func-opt=minsize",
-                "-profile-summary-cutoff-cold=996000",
-                "-passes=default<O2>",
-            ),
-            BENCHMARK_RELINK_USE_FLAGS,
-        )
-        self.assertEqual(
-            (
                 str(self.toolchain.opt),
                 *GENERATION_FLAGS,
                 f"-profile-file={self.paths.raw_profile_pattern}",
@@ -167,30 +156,6 @@ class PgsoPipelineTests(unittest.TestCase):
             ),
             profile_use_argv(self.toolchain, benchmark_paths),
         )
-        self.assertEqual(
-            (
-                str(self.toolchain.opt),
-                *BENCHMARK_RELINK_USE_FLAGS,
-                f"-profile-file={benchmark_paths.merged_profile}",
-                str(benchmark_paths.bitcode),
-                "-o",
-                str(benchmark_paths.profile_use_bitcode),
-            ),
-            profile_use_argv(
-                self.toolchain,
-                benchmark_paths,
-                benchmark_relink=True,
-            ),
-        )
-        with self.assertRaisesRegex(
-            PgsoError,
-            "benchmark relink requires a benchmark artifact",
-        ):
-            profile_use_argv(
-                self.toolchain,
-                self.paths,
-                benchmark_relink=True,
-            )
         mapped_profile = self.paths.profiles / "production.profdata"
         self.assertEqual(
             f"-profile-file={mapped_profile}",

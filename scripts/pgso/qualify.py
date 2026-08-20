@@ -760,7 +760,6 @@ def relink_profile_linked_benchmarks(
             pair_paths,
             pair.bitcode_sha256,
             profile_path=mapped_profile_path,
-            benchmark_relink=True,
         )
         candidate = link_candidate(
             toolchain,
