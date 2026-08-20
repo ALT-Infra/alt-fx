@@ -7433,25 +7433,25 @@ fn processQueuedPromptLoop(
         }
     }
 
-    if (config.cancel_flag.load(.seq_cst)) {
-        runtime_telemetry.traceCancelObserved(last_step_ctx, false);
-        try runtime_interruption.persistInterruptedTurnOnce(
-            deps,
-            finalization,
-            job,
-            null,
-            null,
-            completed_tool_names.items,
-            &interrupted_persisted,
-            last_step_ctx,
-            within_turn_suffix.items,
-            stop_state.retained_candidate,
-            &stop_state.terminal_materializing,
-        );
-        finish_trace.finish("interrupted");
-        return;
-    }
     if (automatic_recovery_disposition(within_turn_suffix.items) == .finish_with_normal_blocker) {
+        if (config.cancel_flag.load(.seq_cst)) {
+            runtime_telemetry.traceCancelObserved(last_step_ctx, false);
+            try runtime_interruption.persistInterruptedTurnOnce(
+                deps,
+                finalization,
+                job,
+                null,
+                null,
+                completed_tool_names.items,
+                &interrupted_persisted,
+                last_step_ctx,
+                within_turn_suffix.items,
+                stop_state.retained_candidate,
+                &stop_state.terminal_materializing,
+            );
+            finish_trace.finish("interrupted");
+            return;
+        }
         try finish_automatic_permission_recovery(
             deps,
             finalization,
