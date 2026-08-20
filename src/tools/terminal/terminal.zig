@@ -1182,7 +1182,12 @@ fn resultFromCompletion(
         session_id,
         switch (completion.kind) {
             .cancelled => .cancelled,
-            .unavailable => .protocol_incompatible,
+            .unavailable => if (completion.is_missing_capability(
+                contracts.protocol_capability_complete_process_tree_signals,
+            ))
+                .unsupported_host
+            else
+                .protocol_incompatible,
             .disconnected => .session_lost,
             .response => .protocol_incompatible,
         },
@@ -2019,6 +2024,47 @@ test "terminal result mapper adds detail only for workspace path failures" {
             try std.testing.expectEqualStrings(expected, mapped.status_detail.?);
         } else {
             try std.testing.expect(mapped.status_detail == null);
+        }
+    }
+}
+
+test "terminal completion maps only complete signal capability misses to unsupported host" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        completion: client.Completion,
+        expected: []const u8,
+    }{
+        .{
+            .completion = .{
+                .kind = .unavailable,
+                .correlation_id = .{ .value = 1 },
+                .missing_capabilities = contracts.protocol_capability_complete_process_tree_signals,
+            },
+            .expected = "{\"failure\":{\"action\":\"start\",\"code\":\"unsupported_host\",\"session_id\":null,\"retryable\":false}}",
+        },
+        .{
+            .completion = .{
+                .kind = .unavailable,
+                .correlation_id = .{ .value = 2 },
+            },
+            .expected = "{\"failure\":{\"action\":\"start\",\"code\":\"protocol_incompatible\",\"session_id\":null,\"retryable\":false}}",
+        },
+    };
+
+    for (cases) |case| {
+        const result = try resultFromCompletion(
+            alloc,
+            .start,
+            null,
+            case.completion,
+        );
+        defer result.deinit(alloc);
+        switch (result) {
+            .failure => |body| try std.testing.expectEqualStrings(
+                case.expected,
+                body,
+            ),
+            .success => return error.TestUnexpectedResult,
         }
     }
 }
