@@ -125,7 +125,7 @@ class PgsoPipelineTests(unittest.TestCase):
                 "--disable-vp",
                 "-pgo-kind=pgo-instr-use-pipeline",
                 "-pgo-cold-func-opt=minsize",
-                "-profile-summary-cutoff-cold=995000",
+                "-profile-summary-cutoff-cold=996000",
                 "-passes=default<O2>",
             ),
             BENCHMARK_RELINK_USE_FLAGS,
