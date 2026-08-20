@@ -702,7 +702,7 @@ pub const SessionListSnapshot = struct {
                     entry.title orelse session_display_metadata.fallback_title,
                 );
                 try out.writer.writeByte('\n');
-                try writeSessionListDetails(&out.writer, entry);
+                try writeSessionListDetails(&out.writer, alloc, entry);
             }
         }
         if (self.has_more) {
@@ -753,13 +753,18 @@ pub const SessionListSnapshot = struct {
     }
 };
 
-fn writeSessionListDetails(writer: *std.Io.Writer, entry: session_store.SessionSummary) !void {
+fn writeSessionListDetails(
+    writer: *std.Io.Writer,
+    alloc: Allocator,
+    entry: session_store.SessionSummary,
+) !void {
     try writer.print(
         "   id={s} | {d} turn{s}",
         .{ entry.id, entry.history_len, if (entry.history_len == 1) "" else "s" },
     );
     if (sessionLanguageLabel(entry.conversation_language.view())) |label| {
-        try writer.print(" | {s}", .{label});
+        try writer.writeAll(" | ");
+        try writeTerminalSafe(writer, alloc, label);
     }
     try writer.writeAll(" | updated ");
     try writeUtcTimestamp(writer, entry.updated_at_ms);
@@ -2173,6 +2178,26 @@ test "core session list text visibly escapes terminal controls in titles" {
     try std.testing.expectEqualStrings(
         "[sessions] 1 saved\n - \\x1b[2Jbreak\\x0anext\n" ++
             "   id=hostile-title | 0 turns | updated 1970-01-01 00:00:00.002 UTC\n",
+        text,
+    );
+}
+
+test "core session list text visibly escapes terminal controls in unknown language tags" {
+    const sessions = [_]session_store.SessionSummary{
+        .{
+            .id = @constCast("hostile-language"),
+            .created_at_ms = 1,
+            .updated_at_ms = 2,
+            .conversation_language = try types.ConversationLanguage.fromSlice("\x1b[2J"),
+            .history_len = 0,
+        },
+    };
+
+    const text = try (SessionListSnapshot{ .sessions = &sessions }).renderText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings(
+        "[sessions] 1 saved\n - Untitled session\n" ++
+            "   id=hostile-language | 0 turns | \\x1b[2J | updated 1970-01-01 00:00:00.002 UTC\n",
         text,
     );
 }
