@@ -1324,6 +1324,7 @@ pub const Runtime = struct {
     }
 
     pub fn requestRetirementSweep(self: *Runtime, timestamp_ms: i64) void {
+        if (comptime builtin.single_threaded) return;
         self.owner.requestRetirementSweep(timestamp_ms) catch |err| {
             debug_trace.logf(
                 "subagent",
