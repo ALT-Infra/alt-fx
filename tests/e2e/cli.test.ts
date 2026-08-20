@@ -249,6 +249,7 @@ describe("cli: help", () => {
       expect(r.code).toBe(0);
       expect(r.stderr).toBe("");
       expect(r.stdout).not.toContain("\x1b[");
+      expect(r.stdout).not.toContain("\x1b]2;");
       expect(r.stdout).toStartWith(
         `𝒇x v${sourceVersion()}\nFast, native coding agent for the terminal.\n`,
       );

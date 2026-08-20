@@ -2,6 +2,7 @@ const std = @import("std");
 const io_mod = @import("../core/shared/io.zig");
 const host = @import("../core/hosts/host.zig");
 const display_width = @import("../core/shared/display_width.zig");
+const text_utils = @import("../core/shared/text_utils.zig");
 const types = @import("../core/shared/types.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const assistant_presentation = @import("../core/agent/assistant_presentation.zig");
@@ -523,21 +524,127 @@ test "render width zero emits no row bytes and first cursor column" {
     try std.testing.expectEqual(@as(u16, 1), view.cursor_col);
 }
 
-pub const terminal_title: host.TerminalTitle = .{
-    .set_model_fn = setTerminalTitleModel,
-    .clear_fn = clearTerminalTitleProvider,
-};
-
-fn setTerminalTitleModel(_: ?*anyopaque, model: []const u8) void {
-    const stdout = std.Io.File.stdout();
-    stdout.writeStreamingAll(io_mod.getIo(), "\x1b]2;fx · ") catch return;
-    stdout.writeStreamingAll(io_mod.getIo(), model) catch return;
-    stdout.writeStreamingAll(io_mod.getIo(), "\x07") catch return;
+/// Writes the title to the same file the transcript renders to, so a host
+/// that redirects its output keeps the escape sequence out of the real
+/// stdout. `out` must outlive every call.
+pub fn terminalTitleFor(out: *const std.Io.File) host.TerminalTitle {
+    return .{
+        .context = @constCast(out),
+        .set_fn = setTerminalTitleLabel,
+        .clear_fn = clearTerminalTitleProvider,
+    };
 }
 
-fn clearTerminalTitleProvider(_: ?*anyopaque) void {
-    const stdout = std.Io.File.stdout();
-    stdout.writeStreamingAll(io_mod.getIo(), "\x1b]2;\x07") catch return;
+fn titleOutput(raw: ?*anyopaque) std.Io.File {
+    const out: *const std.Io.File = @ptrCast(@alignCast(raw.?));
+    return out.*;
+}
+
+const terminal_title_osc_prefix = "\x1b]2;";
+const terminal_title_display_prefix = "fx · ";
+const terminal_title_max_content_bytes: usize = 128;
+const terminal_title_max_label_bytes = terminal_title_max_content_bytes - terminal_title_display_prefix.len;
+
+fn sanitizedTerminalTitleLabel(raw: []const u8, buffer: *[terminal_title_max_label_bytes]u8) []const u8 {
+    const marker = "...";
+    var source_index: usize = 0;
+    var written: usize = 0;
+    while (source_index < raw.len) {
+        const sequence_len: usize = std.unicode.utf8ByteSequenceLength(raw[source_index]) catch {
+            source_index += 1;
+            continue;
+        };
+        if (raw.len - source_index < sequence_len) break;
+        const sequence = raw[source_index .. source_index + sequence_len];
+        const codepoint = std.unicode.utf8Decode(sequence) catch {
+            source_index += 1;
+            continue;
+        };
+        source_index += sequence_len;
+        if (codepoint < 0x20 or (codepoint >= 0x7f and codepoint <= 0x9f)) continue;
+        if (written + sequence_len > buffer.len) {
+            written = text_utils.utf8BackwardBoundary(buffer[0..written], buffer.len - marker.len);
+            @memcpy(buffer[written .. written + marker.len], marker);
+            written += marker.len;
+            break;
+        }
+        @memcpy(buffer[written .. written + sequence_len], sequence);
+        written += sequence_len;
+    }
+    return buffer[0..written];
+}
+
+fn setTerminalTitleLabel(raw: ?*anyopaque, label: []const u8) void {
+    const out = titleOutput(raw);
+    var label_buffer: [terminal_title_max_label_bytes]u8 = undefined;
+    const sanitized = sanitizedTerminalTitleLabel(label, &label_buffer);
+    var sequence_buffer: [terminal_title_osc_prefix.len + terminal_title_max_content_bytes + 1]u8 = undefined;
+    var sequence: std.Io.Writer = .fixed(&sequence_buffer);
+    sequence.writeAll(terminal_title_osc_prefix) catch return;
+    sequence.writeAll(terminal_title_display_prefix) catch return;
+    sequence.writeAll(sanitized) catch return;
+    sequence.writeByte('\x07') catch return;
+    out.writeStreamingAll(io_mod.getIo(), sequence.buffered()) catch return;
+}
+
+fn clearTerminalTitleProvider(raw: ?*anyopaque) void {
+    const out = titleOutput(raw);
+    out.writeStreamingAll(io_mod.getIo(), "\x1b]2;\x07") catch return;
+}
+
+test "terminal title writes the label to the caller's output file" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var sink = try tmp.dir.createFile(std.testing.io, "terminal-title.log", .{});
+    defer sink.close(io_mod.getIo());
+
+    // A host that redirects its output keeps the escape sequence off the
+    // real stdout, which the Zig test runner owns as its protocol channel.
+    terminalTitleFor(&sink).set("release notes");
+
+    var written_file = try tmp.dir.openFile(io_mod.getIo(), "terminal-title.log", .{});
+    defer written_file.close(io_mod.getIo());
+    const written = try io_mod.readFileToEnd(alloc, &written_file, 128);
+    defer alloc.free(written);
+    try std.testing.expectEqualStrings("\x1b]2;fx · release notes\x07", written);
+}
+
+test "terminal title sanitizes and bounds untrusted labels" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var sink = try tmp.dir.createFile(std.testing.io, "terminal-title-hostile.log", .{});
+    defer sink.close(io_mod.getIo());
+
+    terminalTitleFor(&sink).set("safe\x07\x1b]2;owned\xc2\x9b" ++ ("é" ** 80));
+
+    var written_file = try tmp.dir.openFile(io_mod.getIo(), "terminal-title-hostile.log", .{});
+    defer written_file.close(io_mod.getIo());
+    const written = try io_mod.readFileToEnd(alloc, &written_file, 512);
+    defer alloc.free(written);
+    try std.testing.expect(written.len <= terminal_title_osc_prefix.len + terminal_title_max_content_bytes + 1);
+    try std.testing.expect(std.mem.startsWith(u8, written, "\x1b]2;fx · safe]2;owned"));
+    try std.testing.expect(std.mem.endsWith(u8, written, "...\x07"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, written, "\x07"));
+    try std.testing.expect(std.mem.find(u8, written[terminal_title_osc_prefix.len..], "\x1b") == null);
+    try std.testing.expect(std.mem.find(u8, written, "\xc2\x9b") == null);
+}
+
+test "terminal title clear restores a predictable empty state" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var sink = try tmp.dir.createFile(std.testing.io, "terminal-title-clear.log", .{});
+    defer sink.close(io_mod.getIo());
+
+    terminalTitleFor(&sink).clear();
+
+    var written_file = try tmp.dir.openFile(io_mod.getIo(), "terminal-title-clear.log", .{});
+    defer written_file.close(io_mod.getIo());
+    const written = try io_mod.readFileToEnd(alloc, &written_file, 32);
+    defer alloc.free(written);
+    try std.testing.expectEqualStrings("\x1b]2;\x07", written);
 }
 
 pub fn formatResumeHandoff(
