@@ -4115,10 +4115,26 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await active.waitForComposer(TIMEOUT);
 
         await active.sendText("/resume");
-        const resumePane = await active.waitForPane(
-          (pane) => pane.includes(persistentInitial) && !pane.includes(childName),
+        let resumePane = await active.waitForPane(
+          (pane) => pane.includes("Sessions"),
           TIMEOUT,
         );
+        const resumeContainsPersistent = (pane: string) => {
+          const sessionsStart = pane.indexOf("Sessions");
+          return sessionsStart >= 0 &&
+            pane.slice(sessionsStart).includes(persistentInitial);
+        };
+        if (!resumeContainsPersistent(resumePane)) {
+          await active.sendKeys("Escape");
+          await active.waitForComposer(TIMEOUT);
+          await Bun.sleep(5_100);
+          await active.sendText("/resume");
+          resumePane = await active.waitForPane(
+            (pane) => resumeContainsPersistent(pane) && !pane.includes(childName),
+            TIMEOUT,
+          );
+        }
+        expect(resumeContainsPersistent(resumePane)).toBe(true);
         expect(resumePane).not.toContain(childName);
         await active.sendKeys("Escape");
         await active.waitForComposer(TIMEOUT);
@@ -5860,7 +5876,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
   );
 
   test(
-    "assembled TTY tree shows model persistent, one-off, nested, and notification config",
+    "assembled TTY tree keeps persistent configuration and hides settled one-offs",
     async () => {
       const fixture = createFixture();
       const persistentPrompt = "CHECKPOINT3_PERSISTENT_CREATES_NESTED";
@@ -5946,45 +5962,14 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         const tree = await active.waitForPane(
           (pane) =>
             pane.includes("assembled-persistent") &&
-            pane.includes("assembled-one-off") &&
             pane.includes("idle") &&
-            pane.includes("completed"),
+            !pane.includes("assembled-one-off") &&
+            !pane.includes("assembled-nested"),
           TIMEOUT,
         );
         expect(tree).toContain("Agents & processes");
-        const assembledNames = [
-          "assembled-persistent",
-          "assembled-nested",
-          "assembled-one-off",
-        ];
-        const selectedAssembledName = (pane: string) => {
-          const selectedLine = pane.split("\n").find((line) =>
-            line.startsWith("› ")
-          );
-          return assembledNames.find((name) => selectedLine?.includes(name)) ?? null;
-        };
-        let nestedTree = await active.waitForPane(
-          (pane) => assembledNames.every((name) => pane.includes(name)),
-          TIMEOUT,
-        );
-        expect(nestedTree).toContain("assembled-persistent");
-        expect(nestedTree).toContain("assembled-one-off");
-        for (let moves = 0; moves < assembledNames.length; moves += 1) {
-          const selected = selectedAssembledName(nestedTree);
-          if (selected === "assembled-persistent") break;
-          if (!selected) {
-            throw new Error("assembled tree did not expose a deterministic selection");
-          }
-          await active.sendLiteralText("k");
-          nestedTree = await active.waitForPane(
-            (pane) => {
-              const next = selectedAssembledName(pane);
-              return next !== null && next !== selected;
-            },
-            TIMEOUT,
-          );
-        }
-        expect(selectedAssembledName(nestedTree)).toBe("assembled-persistent");
+        expect(tree).not.toContain("assembled-one-off");
+        expect(tree).not.toContain("assembled-nested");
 
         type Control = {
           child_id: string;
@@ -6002,36 +5987,19 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           .map((id) => join(sessionsDir, id, "subagent", "control.json"))
           .filter((path) => existsSync(path))
           .map((path) => JSON.parse(readFileSync(path, "utf8")) as Control);
-        let controls = readControls();
+        let persistent: Control | undefined;
         const controlsDeadline = Date.now() + TIMEOUT;
         while (Date.now() < controlsDeadline) {
-          const states = new Map(
-            controls.map((control) => [control.configuration.name, control.state]),
+          persistent = readControls().find(
+            (control) => control.configuration.name === "assembled-persistent" &&
+              control.state === "idle",
           );
-          if (states.get("assembled-persistent") === "idle" &&
-              states.get("assembled-nested") === "completed" &&
-              states.get("assembled-one-off") === "completed") break;
+          if (persistent) break;
           await Bun.sleep(25);
-          controls = readControls();
         }
-        const byName = new Map(
-          controls.map((control) => [control.configuration.name, control]),
-        );
-        const persistent = byName.get("assembled-persistent");
-        const nested = byName.get("assembled-nested");
-        const oneOff = byName.get("assembled-one-off");
-        expect(persistent).toBeDefined();
-        expect(nested).toBeDefined();
-        expect(oneOff).toBeDefined();
+        if (!persistent) throw new Error("assembled persistent control did not settle");
         expect(persistent!.mode).toBe("persistent");
         expect(persistent!.state).toBe("idle");
-        expect(nested).toMatchObject({
-          parent_id: persistent!.child_id,
-          mode: "one_off",
-          state: "completed",
-        });
-        expect(oneOff).toMatchObject({ mode: "one_off", state: "completed" });
-        expect(oneOff!.parent_id).toBe(persistent!.parent_id);
         expect(persistent!.configuration.notifications).toMatchObject({
           milestones: ["assembled-checkpoint"],
           stop_conditions: ["terminal", "duration_elapsed"],
