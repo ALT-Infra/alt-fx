@@ -244,7 +244,7 @@ fn resolveCommandCwdFromArgs(
     workspace_root: []const u8,
     args: std.json.ObjectMap,
 ) ![]const u8 {
-    const cwd_input = tool_args.optionalStringArg(args, "cwd") orelse ".";
+    const cwd_input = tool_args.nullablePlaceholderStringArg(args, "cwd") orelse ".";
     if (std.mem.eql(u8, cwd_input, ".")) return arena.dupe(u8, workspace_root);
     return pathing.resolveWorkspaceOrExternalPath(arena, workspace_root, cwd_input);
 }
@@ -254,7 +254,7 @@ fn resolveCommandCwdFromArgsInScope(
     scope: workspace_access.AccessScope,
     args: std.json.ObjectMap,
 ) ![]const u8 {
-    const cwd_input = tool_args.optionalStringArg(args, "cwd") orelse ".";
+    const cwd_input = tool_args.nullablePlaceholderStringArg(args, "cwd") orelse ".";
     if (std.mem.eql(u8, cwd_input, ".")) return arena.dupe(u8, scope.primary_directory);
     return pathing.resolveWorkspaceOrExternalPath(arena, scope.primary_directory, cwd_input);
 }
@@ -2516,6 +2516,20 @@ test "rulesDenyAllTargetsForPermission honors last matching overrides" {
         .{ .permission = @constCast("edit"), .pattern = @constCast("src/*"), .action = .deny },
     };
     try std.testing.expect(!rulesDenyAllTargetsForPermission(.{ .rules = &target_deny_rules }, "edit"));
+}
+
+test "command permission target treats a textual null cwd as absent" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const target = try permissionTargetForCall(arena, "/tmp/workspace", .{
+        .id = "terminal",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"ls\",\"cwd\":\" NULL \"}",
+    }, .command_cwd);
+
+    try std.testing.expectEqualStrings("/tmp/workspace::ls", target);
 }
 
 test "web_fetch permission target is canonical domain rather than full url" {
