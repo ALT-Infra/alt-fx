@@ -168,7 +168,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
 
         await session.resizeWindow(50, 30);
         const narrow = await session.waitForPane(
-          (pane) => pane.includes("tus-root") && pane.includes("detached:"),
+          (pane) => pane.includes("s-root") && pane.includes("detached:"),
           5_000,
         );
         expect(narrow).not.toContain("initial-branch");

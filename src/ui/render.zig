@@ -240,47 +240,16 @@ fn appendStatusSegment(out: []u8, end: *usize, segment: []const u8) void {
 }
 
 const statusline_separator = " · ";
-const max_workspace_reserve_cells: usize = 24;
-
-fn workspaceIdentityWidth(statusline: StatuslineItems) usize {
-    if (statusline.workspace_label.len == 0) return 0;
-    var width = display_width.visibleWidth(statusline.workspace_label);
-    if (statusline.git_branch) |branch| {
-        if (branch.len > 0) {
-            width +|= display_width.visibleWidth(" (") +
-                display_width.visibleWidth(branch) +
-                display_width.visibleWidth(")");
-        }
-    }
-    return width;
-}
-
-fn requiredCoreWidth(
-    model_label: []const u8,
-    statusline: StatuslineItems,
-) usize {
-    var width = display_width.visibleWidth(model_label);
-    const workspace_width = workspaceIdentityWidth(statusline);
-    if (workspace_width > 0) {
-        width +|= display_width.visibleWidth(statusline_separator) +
-            @min(workspace_width, max_workspace_reserve_cells);
-    }
-    return width;
-}
 
 fn leadingPermissionModeFits(
     limit: usize,
-    current: []const u8,
     permission_label: []const u8,
-    core_width: usize,
+    model_label: []const u8,
 ) bool {
     if (limit == 0) return false;
-    var needed = display_width.visibleWidthIgnoringAnsi(current);
-    if (current.len > 0) needed +|= display_width.visibleWidth(statusline_separator);
-    needed +|= display_width.visibleWidthIgnoringAnsi(permission_label) +
+    return display_width.visibleWidthIgnoringAnsi(permission_label) +
         display_width.visibleWidth(statusline_separator) +
-        core_width;
-    return needed <= limit;
+        display_width.visibleWidth(model_label) <= limit;
 }
 
 const ClippedSegment = struct {
@@ -429,12 +398,10 @@ pub fn buildHintLine(
     const status_limit = @min(@as(usize, width), out.len);
     const show_effort = model_supports_effort and !effort.isDefault();
     const show_fast = model_supports_fast and fast_mode;
-    const core_width = requiredCoreWidth(model_label, statusline);
-    if (leadingPermissionModeFits(status_limit, out[0..end], permission_label, core_width)) {
+    if (leadingPermissionModeFits(status_limit, permission_label, model_label)) {
         appendStatusSegment(out, &end, permission_label);
     }
     appendStatusSegment(out, &end, model_label);
-    appendWorkspaceIdentity(out, &end, status_limit, statusline);
     if (show_effort) {
         appendStatusSegment(out, &end, effort.displayLabel());
     }
@@ -464,6 +431,7 @@ pub fn buildHintLine(
             appendStatusSegment(out, &end, std.fmt.bufPrint(&ctx_buf, "Context: {d}k", .{used_k}) catch "");
         }
     }
+    appendWorkspaceIdentity(out, &end, status_limit, statusline);
 
     const width_usize: usize = width;
     if (width_usize == 0) return "";
@@ -892,12 +860,25 @@ test "buildHintLine keeps workspace and branch readable at narrow widths" {
     const line = buildHintLine(false, false, true, "openai/gpt-5", .ask, 0, null, false, false, .auto, false, .{
         .workspace_label = "/a/very/long/path/to/fx-repo",
         .git_branch = "feature/statusline",
-    }, 32, &buf);
-    try std.testing.expectEqual(@as(usize, 32), display_width.visibleWidthIgnoringAnsi(line));
-    try std.testing.expect(std.mem.startsWith(u8, line, "gpt-5 · "));
+    }, 36, &buf);
+    try std.testing.expectEqual(@as(usize, 36), display_width.visibleWidthIgnoringAnsi(line));
+    try std.testing.expect(std.mem.startsWith(u8, line, "ask · gpt-5 · "));
     try std.testing.expect(std.mem.find(u8, line, "fx-repo") != null);
     try std.testing.expect(std.mem.find(u8, line, "feature/") != null);
     try std.testing.expect(std.mem.endsWith(u8, line, "…)"));
+}
+
+test "buildHintLine workspace identity does not displace existing status segments" {
+    var buf: [256]u8 = undefined;
+    const line = buildHintLine(false, false, true, "anthropic/claude-opus-4.8", .auto, 0, null, true, true, types.ReasoningEffort.literal("xhigh"), true, .{
+        .workspace_label = "/a/very/long/path/to/the/active/workspace",
+        .git_branch = "feature/statusline",
+        .context_used = 1_000,
+        .context_total = 100_000,
+    }, 60, &buf);
+    try std.testing.expect(std.mem.find(u8, line, "xhigh") != null);
+    try std.testing.expect(std.mem.find(u8, line, "⚡︎") != null);
+    try std.testing.expect(std.mem.find(u8, line, "Context: 1k/100k 1%") != null);
 }
 
 test "buildHintLine shows a non-Git workspace without branch punctuation" {
