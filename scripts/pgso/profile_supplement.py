@@ -15,7 +15,7 @@ from scripts.pgso.toolchain import Toolchain
 
 
 PROFILE_SUMMARY_CUTOFF_COLD = 990_000
-SUPPLEMENT_COLD_THRESHOLD_MULTIPLIER = 9
+SUPPLEMENT_COLD_THRESHOLD_MULTIPLIER = 8
 
 
 @dataclasses.dataclass(frozen=True)

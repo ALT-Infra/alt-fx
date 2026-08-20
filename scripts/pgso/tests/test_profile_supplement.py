@@ -119,7 +119,7 @@ attributes #4 = { cold minsize nounwind }
             ("fx;core.workspace.file_index.scoreAsciiRange",),
             supplement.function_names,
         )
-        self.assertEqual(11, supplement.total_counter_value)
+        self.assertEqual(10, supplement.total_counter_value)
         self.assertIn(
             "fx;core.workspace.file_index.scoreAsciiRange",
             supplement.text,
@@ -179,8 +179,8 @@ attributes #4 = { cold minsize nounwind }
             speed_functions=("core.output.diff.compute",),
         )
 
-        self.assertIn("\n225\n112\n0\n56\n", supplement.text)
-        self.assertEqual(393, supplement.total_counter_value)
+        self.assertIn("\n200\n100\n0\n50\n", supplement.text)
+        self.assertEqual(350, supplement.total_counter_value)
 
     def test_raises_a_low_workload_count_above_the_production_cold_cutoff(self) -> None:
         production = profile_text(
@@ -199,8 +199,8 @@ attributes #4 = { cold minsize nounwind }
             speed_functions=("core.output.diff.compute",),
         )
 
-        self.assertIn("\n225\n112\n0\n22\n", supplement.text)
-        self.assertEqual(359, supplement.total_counter_value)
+        self.assertIn("\n200\n100\n0\n20\n", supplement.text)
+        self.assertEqual(320, supplement.total_counter_value)
 
     def test_rejects_malformed_counter_count(self) -> None:
         production = profile_text(("fx;core.output.diff.compute", 7, (1,)))
