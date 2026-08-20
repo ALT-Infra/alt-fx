@@ -793,6 +793,7 @@ pub fn isManagedInstallSkill(skill: Skill) bool {
 pub fn skillGroupLabel(source: SkillSource) []const u8 {
     return switch (source) {
         .global_fx => "Managed installs",
+        .workspace_fx => "Workspace skills",
         .workspace_shared => "Workspace skills",
         .workspace_opencode,
         .workspace_codex,
@@ -811,6 +812,7 @@ pub fn skillGroupLabel(source: SkillSource) []const u8 {
 pub fn skillGroupRank(source: SkillSource) usize {
     return switch (source) {
         .global_fx => 0,
+        .workspace_fx => 1,
         .workspace_shared => 1,
         .workspace_opencode,
         .workspace_codex,
@@ -830,6 +832,7 @@ const skill_group_count: usize = 3;
 
 pub fn skillSourceLabel(source: SkillSource) []const u8 {
     return switch (source) {
+        .workspace_fx => "workspace .fx/skills",
         .workspace_shared => "workspace skills/",
         .workspace_opencode => "workspace .opencode/skills",
         .workspace_codex => "workspace .codex/skills",
@@ -847,6 +850,7 @@ pub fn skillSourceLabel(source: SkillSource) []const u8 {
 
 pub fn skillSourceShortLabel(source: SkillSource) []const u8 {
     return switch (source) {
+        .workspace_fx => "workspace .fx",
         .workspace_shared => "workspace skills/",
         .workspace_opencode => "workspace .opencode",
         .workspace_codex => "workspace .codex",
@@ -878,6 +882,7 @@ pub fn skillMenuFilterLabel(filter: SkillMenuSourceFilter) []const u8 {
 pub fn skillMenuFilterForSource(source: SkillSource) SkillMenuSourceFilter {
     return switch (source) {
         .global_fx => .fx,
+        .workspace_fx => .fx,
         .workspace_shared => .workspace,
         .workspace_opencode, .global_opencode => .opencode,
         .workspace_codex, .global_codex => .codex,
