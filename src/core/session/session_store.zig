@@ -325,6 +325,94 @@ const SessionSummaryScan = struct {
     }
 };
 
+const DeferredReplayScope = union(enum) {
+    tokens: std.ArrayList(summary_codec.DeferredCacheToken),
+    all,
+
+    fn deinit(self: *DeferredReplayScope, alloc: Allocator) void {
+        switch (self.*) {
+            .tokens => |*tokens| summary_codec.freeDeferredCacheTokens(alloc, tokens),
+            .all => {},
+        }
+        self.* = undefined;
+    }
+};
+
+fn tokenScopeRequiresCanonicalReplay(
+    scope: DeferredReplayScope,
+    session_id: []const u8,
+) bool {
+    return switch (scope) {
+        .all => true,
+        .tokens => |tokens| for (tokens.items) |token| {
+            if (std.mem.eql(u8, token.session_id, session_id)) break true;
+        } else false,
+    };
+}
+
+fn readOnlyScopeRequiresCanonicalReplay(
+    scope: DeferredReplayScope,
+    session_id: []const u8,
+    projection_state: ProjectionState,
+) bool {
+    return switch (scope) {
+        .all => true,
+        .tokens => |tokens| tokens.items.len > 0 and
+            (projection_state == .stale or
+                tokenScopeRequiresCanonicalReplay(scope, session_id)),
+    };
+}
+
+test "deferred replay scope preserves token identity and stale projection safety" {
+    var token_values = [_]summary_codec.DeferredCacheToken{
+        testDeferredCacheToken("dirty-session"),
+        testDeferredCacheToken("second-dirty-session"),
+    };
+    const empty = DeferredReplayScope{ .tokens = .empty };
+    const populated = DeferredReplayScope{ .tokens = .{
+        .items = token_values[0..],
+        .capacity = token_values.len,
+    } };
+    const untrusted = DeferredReplayScope.all;
+    const cases = [_]struct {
+        scope: DeferredReplayScope,
+        session_id: []const u8,
+        projection_state: ProjectionState,
+        expected: bool,
+    }{
+        .{ .scope = empty, .session_id = "clean-session", .projection_state = .current, .expected = false },
+        .{ .scope = empty, .session_id = "clean-session", .projection_state = .stale, .expected = false },
+        .{ .scope = populated, .session_id = "dirty-session", .projection_state = .current, .expected = true },
+        .{ .scope = populated, .session_id = "second-dirty-session", .projection_state = .current, .expected = true },
+        .{ .scope = populated, .session_id = "clean-session", .projection_state = .current, .expected = false },
+        .{ .scope = populated, .session_id = "clean-session", .projection_state = .stale, .expected = true },
+        .{ .scope = untrusted, .session_id = "clean-session", .projection_state = .current, .expected = true },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(
+            case.expected,
+            readOnlyScopeRequiresCanonicalReplay(
+                case.scope,
+                case.session_id,
+                case.projection_state,
+            ),
+        );
+    }
+}
+
+fn testDeferredCacheToken(session_id: []const u8) summary_codec.DeferredCacheToken {
+    return .{
+        .session_id = @constCast(session_id),
+        .workspace_root = @constCast("/tmp/workspace"),
+        .position = .{
+            .log_generation = [_]u8{0x11} ** 16,
+            .through_seq = 2,
+            .through_event_id = [_]u8{0x22} ** 16,
+            .through_event_log_bytes = 100,
+        },
+    };
+}
+
 test {
     _ = session_child_store;
     _ = session_layout;
@@ -1719,6 +1807,15 @@ pub const Store = struct {
         return summary_codec.deferredCachePresent(sessions) catch true;
     }
 
+    fn loadDeferredReplayScope(self: Store, alloc: Allocator) DeferredReplayScope {
+        const sessions = &(self.canonical_root.sessions orelse return .{ .tokens = .empty });
+        const tokens = summary_codec.readDeferredCacheTokens(
+            alloc,
+            sessions,
+        ) catch return .all;
+        return .{ .tokens = tokens };
+    }
+
     /// Invalidates the derived resume catalog after managed child ownership
     /// changes. The relationship index remains the canonical authority.
     pub fn invalidateResumableIndex(self: Store, alloc: Allocator) !void {
@@ -2607,7 +2704,8 @@ pub const Store = struct {
     ) !SessionSummaryScan {
         var scan = SessionSummaryScan{};
         errdefer scan.deinit(alloc);
-        const replay_schema_v3 = self.deferredCacheInvalidatesReads();
+        var replay_scope = self.loadDeferredReplayScope(alloc);
+        defer replay_scope.deinit(alloc);
         var metadata: std.ArrayList(DiscoveryCandidateMetadata) = .empty;
         defer metadata.deinit(alloc);
         if (self.canonical_root.sessions == null) return scan;
@@ -2642,7 +2740,13 @@ pub const Store = struct {
                 },
             };
             session_dir.close();
-            if (replay_schema_v3 and candidate.storage == .schema_v3) {
+            if (candidate.storage == .schema_v3 and
+                readOnlyScopeRequiresCanonicalReplay(
+                    replay_scope,
+                    entry.name,
+                    candidate.projection_state,
+                ))
+            {
                 var detail = self.loadReadOnlyDetail(
                     alloc,
                     entry.name,
@@ -3101,7 +3205,8 @@ pub const Store = struct {
     ) !?[]u8 {
         try validateWorkspaceRoot(workspace_root);
         if (self.canonical_root.sessions == null) return null;
-        const replay_schema_v3 = self.deferredCacheInvalidatesReads();
+        var replay_scope = self.loadDeferredReplayScope(alloc);
+        defer replay_scope.deinit(alloc);
 
         var selected: ?WritableCandidate = null;
         defer if (selected) |*candidate| candidate.deinit(alloc);
@@ -3133,7 +3238,10 @@ pub const Store = struct {
                     return err;
                 },
             };
-            if (replay_schema_v3 and candidate.storage == .schema_v3) {
+            if (candidate.storage == .schema_v3 and
+                candidate.projection_state == .current and
+                tokenScopeRequiresCanonicalReplay(replay_scope, entry.name))
+            {
                 var root = self.canonical_root;
                 var state = root.loadReadOnly(
                     alloc,
@@ -5046,13 +5154,33 @@ fn writeWritableHistoryFixture(
     updated_at_ms: i64,
     prompt: []const u8,
 ) !void {
+    return writeWritableHistoryResponseFixture(
+        alloc,
+        store,
+        id,
+        workspace_root,
+        updated_at_ms,
+        prompt,
+        "saved response",
+    );
+}
+
+fn writeWritableHistoryResponseFixture(
+    alloc: Allocator,
+    store: Store,
+    id: []const u8,
+    workspace_root: []const u8,
+    updated_at_ms: i64,
+    prompt: []const u8,
+    response: []const u8,
+) !void {
     var state = try testDurableState(alloc, id, workspace_root);
     defer state.deinit(alloc);
     var writable = try store.startWritableSession(alloc, state);
     errdefer writable.deinit(alloc);
 
     var history = try alloc.alloc(session.HistoryTurn, 1);
-    history[0] = try session.makeAssistantTurn(alloc, prompt, "saved response");
+    history[0] = try session.makeAssistantTurn(alloc, prompt, response);
     defer session.freeHistoryTurnSlice(alloc, history);
     const desired = session_codec.DurableSessionState{
         .id = writable.state.id,
@@ -5074,6 +5202,105 @@ fn writeWritableHistoryFixture(
         .{},
     );
     writable.deinit(alloc);
+}
+
+fn writeLargeWritableHistoryFixture(
+    alloc: Allocator,
+    store: Store,
+    id: []const u8,
+    workspace_root: []const u8,
+    updated_at_ms: i64,
+    response_bytes: usize,
+) !void {
+    const response = try alloc.alloc(u8, response_bytes);
+    defer alloc.free(response);
+    @memset(response, 'x');
+    return writeWritableHistoryResponseFixture(
+        alloc,
+        store,
+        id,
+        workspace_root,
+        updated_at_ms,
+        "unrelated prompt",
+        response,
+    );
+}
+
+fn writeStaleWritableHistoryFixture(
+    alloc: Allocator,
+    store: Store,
+    id: []const u8,
+    workspace_root: []const u8,
+    updated_at_ms: i64,
+) !void {
+    var state = try testDurableState(alloc, id, workspace_root);
+    defer state.deinit(alloc);
+    var writable = try store.startWritableSession(alloc, state);
+    defer writable.deinit(alloc);
+    var session_dir = try store.openSessionDir(id);
+    defer session_dir.close();
+    var manifest_file = try session_dir.dir.openFile(io_mod.getIo(), "session.json", .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+        .resolve_beneath = true,
+    });
+    const stale_manifest = try io_mod.readFileToEnd(
+        alloc,
+        &manifest_file,
+        session_projection.manifest_max_bytes + 1,
+    );
+    manifest_file.close(io_mod.getIo());
+    defer alloc.free(stale_manifest);
+    const turn = try session.makeAssistantTurn(
+        alloc,
+        "new canonical prompt",
+        "new canonical response",
+    );
+    defer session.freeHistoryTurn(alloc, turn);
+    _ = try writable.appendEvent(
+        alloc,
+        .{ .history_turn_committed = .{
+            .conversation_language = session.ConversationLanguage.literal("en"),
+            .total_input_tokens = 3,
+            .total_output_tokens = 4,
+            .turn = turn,
+        } },
+        updated_at_ms,
+        .retry_expected_tail,
+        .{},
+    );
+    try io_mod.durableReplaceVerified(
+        alloc,
+        &session_dir,
+        "session.json",
+        stale_manifest,
+    );
+}
+
+fn writeDeferredTokenForTest(
+    alloc: Allocator,
+    store: Store,
+    session_id: []const u8,
+    workspace_root: []const u8,
+) !void {
+    var target = try store.resumeTargetForWrite(
+        alloc,
+        .{ .id = session_id },
+        workspace_root,
+        .{},
+    );
+    const position = target.position;
+    target.deinit(alloc);
+    var sessions = store.canonical_root.sessions orelse return error.TestExpectedEqual;
+    const cache = try LatestCache.init(alloc, &sessions, .{}, .maintain);
+    defer cache.deinit(alloc);
+    try cache.writeDeferredToken(
+        alloc,
+        session_id,
+        workspace_root,
+        position,
+    );
 }
 
 fn writeWritableIncompleteAuthorityFixture(
@@ -7564,6 +7791,176 @@ test "read-only session page replays canonical state for a deferred token" {
     defer page.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), page.summaries.items.len);
     try std.testing.expectEqual(@as(i64, 30), page.summaries.items[0].updated_at_ms);
+}
+
+test "dirty readers do not replay an unrelated current long session" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    try writeWritableHistoryFixture(
+        alloc,
+        ctx.store,
+        "dirty-bounded-target",
+        ctx.workspace,
+        30,
+        "target prompt",
+    );
+
+    try writeLargeWritableHistoryFixture(
+        alloc,
+        ctx.store,
+        "unrelated-current-long",
+        ctx.workspace,
+        20,
+        512 * 1024,
+    );
+
+    try writeDeferredTokenForTest(
+        alloc,
+        ctx.store,
+        "dirty-bounded-target",
+        ctx.workspace,
+    );
+
+    var scratch: [256 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&scratch);
+    var page = try ctx.store.listSessionPage(
+        fixed.allocator(),
+        .all_workspaces,
+        null,
+        10,
+    );
+    try std.testing.expectEqual(@as(usize, 2), page.summaries.items.len);
+    try std.testing.expectEqualStrings(
+        "dirty-bounded-target",
+        page.summaries.items[0].id,
+    );
+    try std.testing.expectEqualStrings(
+        "unrelated-current-long",
+        page.summaries.items[1].id,
+    );
+    page.deinit(fixed.allocator());
+
+    var sessions = ctx.store.canonical_root.sessions orelse return error.TestExpectedEqual;
+    var latest_lock = try io_mod.acquireTimedAdvisoryLock(
+        &sessions,
+        latest_sessions_lock_file,
+        2000,
+    );
+    defer latest_lock.release();
+    var resume_scratch: [256 * 1024]u8 = undefined;
+    var resume_fixed = std.heap.FixedBufferAllocator.init(&resume_scratch);
+    var resumed = try ctx.store.resumeTargetForWrite(
+        resume_fixed.allocator(),
+        .last,
+        ctx.workspace,
+        .{ .log = .{ .commit_lock_deadline_ms = 0 } },
+    );
+    defer resumed.deinit(resume_fixed.allocator());
+    try std.testing.expectEqualStrings(
+        "dirty-bounded-target",
+        resumed.active_id,
+    );
+    try std.testing.expectEqual(@as(i64, 30), resumed.state.updated_at_ms);
+    try std.testing.expectEqual(@as(usize, 1), resumed.state.history.len);
+}
+
+test "dirty list still replays an unrelated stale session" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    try writeWritableHistoryFixture(
+        alloc,
+        ctx.store,
+        "dirty-stale-target",
+        ctx.workspace,
+        30,
+        "target prompt",
+    );
+
+    try writeStaleWritableHistoryFixture(
+        alloc,
+        ctx.store,
+        "unrelated-stale",
+        ctx.workspace,
+        40,
+    );
+
+    try writeDeferredTokenForTest(
+        alloc,
+        ctx.store,
+        "dirty-stale-target",
+        ctx.workspace,
+    );
+
+    var page = try ctx.store.listSessionPage(
+        alloc,
+        .all_workspaces,
+        null,
+        10,
+    );
+    defer page.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), page.summaries.items.len);
+    try std.testing.expectEqualStrings(
+        "unrelated-stale",
+        page.summaries.items[0].id,
+    );
+    try std.testing.expectEqual(@as(i64, 40), page.summaries.items[0].updated_at_ms);
+    try std.testing.expectEqual(@as(usize, 1), page.summaries.items[0].history_len);
+}
+
+test "malformed deferred token scope replays all stale sessions" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    try writeStaleWritableHistoryFixture(
+        alloc,
+        ctx.store,
+        "malformed-token-stale",
+        ctx.workspace,
+        40,
+    );
+    var sessions = ctx.store.canonical_root.sessions orelse return error.TestExpectedEqual;
+    var latest = try io_mod.openOrCreateVerifiedPrivateDir(
+        &sessions,
+        latest_sessions_dir,
+    );
+    defer latest.close();
+    var deferred = try io_mod.openOrCreateVerifiedPrivateDir(
+        &latest,
+        summary_codec.deferred_cache_dir,
+    );
+    defer deferred.close();
+    try io_mod.durableReplaceVerified(
+        alloc,
+        &deferred,
+        "malformed-token",
+        "{}",
+    );
+
+    var page = try ctx.store.listSessionPage(
+        alloc,
+        .all_workspaces,
+        null,
+        10,
+    );
+    defer page.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), page.summaries.items.len);
+    try std.testing.expectEqualStrings(
+        "malformed-token-stale",
+        page.summaries.items[0].id,
+    );
+    try std.testing.expectEqual(@as(i64, 40), page.summaries.items[0].updated_at_ms);
+    try std.testing.expectEqual(@as(usize, 1), page.summaries.items[0].history_len);
 }
 
 test "writable picker returns canonical results while deferred repair is busy" {
