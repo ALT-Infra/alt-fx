@@ -3845,6 +3845,9 @@ test {
     _ = @import("core/terminal/host.zig");
     _ = @import("core/terminal/tmux_session.zig");
     _ = @import("core/terminal/client.zig");
+    _ = @import("core/terminal/direct_runtime.zig");
+    _ = @import("core/app/app_terminal_runtime.zig");
+    _ = @import("tools/terminal/terminal.zig");
     _ = @import("core/app/input_approval_runtime.zig");
     _ = @import("acp/sessions.zig");
     _ = @import("core/tasks/task_helpers.zig");
