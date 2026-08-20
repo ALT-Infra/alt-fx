@@ -2267,7 +2267,7 @@ pub fn runCommandContext(
     const cwd = switch (tool.captured_command_host) {
         .workspace_clean => try arena.dupe(u8, input.workspace_root),
         .native => blk: {
-            const cwd_arg = tool_args.optionalStringArg(args, "cwd") orelse ".";
+            const cwd_arg = tool_args.nullablePlaceholderStringArg(args, "cwd") orelse ".";
             break :blk if (std.mem.eql(u8, cwd_arg, "."))
                 try arena.dupe(u8, input.workspace_root)
             else
@@ -2277,7 +2277,7 @@ pub fn runCommandContext(
     const environment_value: command_environment.Environment = switch (tool.captured_command_host) {
         .workspace_clean => .workspace_clean,
         .native => blk: {
-            const profile_raw = tool_args.optionalStringArg(args, "profile");
+            const profile_raw = tool_args.nullablePlaceholderStringArg(args, "profile");
             const profile: ?command_environment.Profile = if (profile_raw) |raw|
                 std.meta.stringToEnum(command_environment.Profile, raw) orelse
                     return error.InvalidCommandProfile
