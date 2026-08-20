@@ -2608,7 +2608,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         await active.sendText("/statusline");
         await active.waitForText("Status line", TIMEOUT);
         await active.sendKeys("Right");
-        await active.waitForText("sandbox:none", TIMEOUT);
+        await active.waitForText("sandbox:os", TIMEOUT);
         await active.sendKeys("Down");
         await active.sendKeys("Right");
       },
