@@ -48,6 +48,16 @@ fx
 
 The current directory becomes the primary workspace. Enter a prompt, or run `/help` to browse interactive commands.
 
+The status line hides the workspace path and Git branch by default. Enable the `Status line workspace` option in `/settings`, run `/statusline workspace`, or set it in `~/.fx/settings.json`:
+
+```json
+{
+  "statusLine": {
+    "workspace": true
+  }
+}
+```
+
 List saved sessions with `fx sessions`. Resume the latest session for the current workspace, or select an exact session ID, through the same command group:
 
 ```bash
