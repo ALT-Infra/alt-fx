@@ -466,6 +466,11 @@ function startFakeGrokOAuth(options: {
     body: string | null;
     conversationId: string | null;
     tokenAuth: string | null;
+    authenticateResponse: string | null;
+    clientIdentifier: string | null;
+    clientVersion: string | null;
+    modelOverride: string | null;
+    grokUserId: string | null;
     userId: string | null;
     query: string;
   }> = [];
@@ -489,6 +494,11 @@ function startFakeGrokOAuth(options: {
         body,
         conversationId: request.headers.get("x-grok-conv-id"),
         tokenAuth: request.headers.get("x-xai-token-auth"),
+        authenticateResponse: request.headers.get("x-authenticateresponse"),
+        clientIdentifier: request.headers.get("x-grok-client-identifier"),
+        clientVersion: request.headers.get("x-grok-client-version"),
+        modelOverride: request.headers.get("x-grok-model-override"),
+        grokUserId: request.headers.get("x-grok-user-id"),
         userId: request.headers.get("x-userid"),
         query: url.search,
       });
@@ -835,6 +845,14 @@ function startFakeCodexAutoReview() {
 
 function startFakeGrokAutoReview() {
   const bodies: string[] = [];
+  const headers: Array<{
+    tokenAuth: string | null;
+    authenticateResponse: string | null;
+    clientIdentifier: string | null;
+    clientVersion: string | null;
+    modelOverride: string | null;
+    grokUserId: string | null;
+  }> = [];
   const accessToken = "grok-auto-review-token";
   let mainRequests = 0;
   const server = Bun.serve({
@@ -848,6 +866,14 @@ function startFakeGrokAutoReview() {
       if (path === "/modalities") {
         return Response.json({ models: [grokModalityModel("grok-4.20", false)] });
       }
+      headers.push({
+        tokenAuth: request.headers.get("x-xai-token-auth"),
+        authenticateResponse: request.headers.get("x-authenticateresponse"),
+        clientIdentifier: request.headers.get("x-grok-client-identifier"),
+        clientVersion: request.headers.get("x-grok-client-version"),
+        modelOverride: request.headers.get("x-grok-model-override"),
+        grokUserId: request.headers.get("x-grok-user-id"),
+      });
       const body = await request.text();
       bodies.push(body);
       if (body.includes('"name":"permission_decision"')) {
@@ -877,6 +903,7 @@ function startFakeGrokAutoReview() {
   return {
     accessToken,
     bodies,
+    headers,
     responsesUrl: `http://127.0.0.1:${server.port}/responses`,
     modelsUrl: `http://127.0.0.1:${server.port}/models`,
     modalitiesUrl: `http://127.0.0.1:${server.port}/modalities`,
@@ -2099,6 +2126,15 @@ test(
       expect(responses[0]!.conversationId).toBe(responses[1]!.conversationId);
       expect(responses[0]!.authorization).toBe(`Bearer ${grok.initialAccessToken}`);
       expect(responses[1]!.authorization).toBe(`Bearer ${grok.refreshedAccessToken}`);
+      for (const request of responses) {
+        expect(request.tokenAuth).toBe("xai-grok-cli");
+        expect(request.authenticateResponse).toBe("authenticate-response");
+        expect(request.clientIdentifier).toBe("fx");
+        expect(request.clientVersion).toBe("1.0.6");
+        expect(request.modelOverride).toBe("grok-4.20");
+        expect(request.grokUserId).toBe("acct_grok_e2e");
+        expect(request.userId).toBeNull();
+      }
       expect(grok.tokenCalls()).toBe(2);
       const userinfo = grok.requests.filter((request) => request.path === "/oauth2/userinfo");
       expect(userinfo).toHaveLength(2);
@@ -2739,6 +2775,15 @@ test(
       expect(grok.bodies.map((body) => (JSON.parse(body) as { model: string }).model))
         .toEqual(["grok-4.20", "grok-4.20", "grok-4.20"]);
       expect(grok.bodies[1]).toContain('"name":"permission_decision"');
+      expect(grok.headers).toHaveLength(3);
+      for (const headers of grok.headers) {
+        expect(headers.tokenAuth).toBe("xai-grok-cli");
+        expect(headers.authenticateResponse).toBe("authenticate-response");
+        expect(headers.clientIdentifier).toBe("fx");
+        expect(headers.clientVersion).toBe("1.0.6");
+        expect(headers.modelOverride).toBe("grok-4.20");
+        expect(headers.grokUserId).toBe("acct_auto_review");
+      }
       for (const request of gateway.requests) {
         expect(request.body).not.toContain("permission_decision");
       }

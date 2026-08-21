@@ -108,6 +108,8 @@ pub const BuildRequest = struct {
 pub const Request = struct {
     api_key: []const u8,
     credential_source: ?types.CredentialSource = null,
+    /// Borrowed provider account identity captured with the admitted credential.
+    account_id: ?[]const u8 = null,
     team: ?[]const u8,
     /// Borrowed for the duration of `Provider.stream`.
     session_id: ?[]const u8 = null,

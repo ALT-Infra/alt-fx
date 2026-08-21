@@ -276,6 +276,7 @@ pub const Context = struct {
             return permission_auto_classifier.Classifier.disabled();
         return permission_auto_classifier.Classifier.withProvider(provider, .{
             .credential = self.api_key,
+            .account_id = self.account_id,
             .tenant = self.gateway_team,
             .endpoint = self.gateway_chat_url,
             .cancel_flag = self.cancel_flag,

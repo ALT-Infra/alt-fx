@@ -14,6 +14,7 @@ pub const provider = permission_auto_classifier.Provider{
 
 const ReviewConfig = struct {
     credential: []const u8,
+    account_id: []const u8,
     cancel_flag: ?*std.atomic.Value(bool),
     usage: ?*session_usage.Usage,
     usage_allocator: Allocator,
@@ -26,8 +27,10 @@ fn reviewGrok(
     request: permission_auto_classifier.ReviewRequest,
 ) anyerror!permission_auto_classifier.ParseOutcome {
     if (input.credential.len == 0) return .invalid;
+    const account_id = input.account_id orelse return .invalid;
     var config = ReviewConfig{
         .credential = input.credential,
+        .account_id = account_id,
         .cancel_flag = input.cancel_flag,
         .usage = input.usage,
         .usage_allocator = input.usage_allocator,
@@ -107,6 +110,7 @@ fn sendReview(
     var result = xai_grok.agent_stream_provider.stream(alloc, .{
         .api_key = config.credential,
         .credential_source = .grok_subscription,
+        .account_id = config.account_id,
         .team = null,
         .model = model,
         .retry_count = 1,

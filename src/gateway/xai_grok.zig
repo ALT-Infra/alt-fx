@@ -1,5 +1,6 @@
 const std = @import("std");
 const image_attachments = @import("../core/images/image_attachments.zig");
+const grok_session = @import("../core/auth/grok_session.zig");
 const secret = @import("../core/auth/secret.zig");
 const stream_provider = @import("../core/agent/stream_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
@@ -7,8 +8,10 @@ const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
 
 const Allocator = std.mem.Allocator;
-const endpoint = "https://api.x.ai/v1/responses";
-const generation_origin = "https://api.x.ai/v1";
+const endpoint = "https://cli-chat-proxy.grok.com/v1/responses";
+const generation_origin = "https://cli-chat-proxy.grok.com/v1";
+// The proxy gates this as Grok wire compatibility; fx identifies itself separately below.
+const proxy_compatibility_version = "1.0.6";
 const e2e_endpoint_env = "FX_E2E_XAI_GROK_RESPONSES_URL";
 const max_error_body_bytes: usize = 256 * 1024;
 const max_sse_line_bytes: usize = 1024 * 1024;
@@ -310,6 +313,8 @@ fn streamCompletionCore(alloc: Allocator, request: stream_provider.Request) !str
     if (request.credential_source != .grok_subscription) {
         return error.GrokSubscriptionCredentialRequired;
     }
+    const account_id = request.account_id orelse return error.GrokSubscriptionAccountRequired;
+    if (!grok_session.validAccountId(account_id)) return error.InvalidGrokSubscriptionAccount;
     try validateModel(request.model);
     const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.api_key});
     defer secret.zeroAndFree(alloc, auth_header);
@@ -319,9 +324,21 @@ fn streamCompletionCore(alloc: Allocator, request: stream_provider.Request) !str
     } else endpoint;
     const uri = try std.Uri.parse(request_endpoint);
 
-    var extra_headers_buf: [2]std.http.Header = undefined;
+    var extra_headers_buf: [8]std.http.Header = undefined;
     var extra_count: usize = 0;
     extra_headers_buf[extra_count] = .{ .name = "accept", .value = "text/event-stream" };
+    extra_count += 1;
+    extra_headers_buf[extra_count] = .{ .name = "X-XAI-Token-Auth", .value = "xai-grok-cli" };
+    extra_count += 1;
+    extra_headers_buf[extra_count] = .{ .name = "x-authenticateresponse", .value = "authenticate-response" };
+    extra_count += 1;
+    extra_headers_buf[extra_count] = .{ .name = "x-grok-client-version", .value = proxy_compatibility_version };
+    extra_count += 1;
+    extra_headers_buf[extra_count] = .{ .name = "x-grok-client-identifier", .value = "fx" };
+    extra_count += 1;
+    extra_headers_buf[extra_count] = .{ .name = "x-grok-model-override", .value = request.model };
+    extra_count += 1;
+    extra_headers_buf[extra_count] = .{ .name = "x-grok-user-id", .value = account_id };
     extra_count += 1;
     if (request.session_id) |session_id| if (session_id.len > 0) {
         extra_headers_buf[extra_count] = .{ .name = "x-grok-conv-id", .value = session_id };
@@ -864,7 +881,7 @@ test "xAI Grok serializes each verified image directly once" {
     try std.testing.expect(std.mem.find(u8, body, "data:image/png;base64,AQIDBA==") != null);
 }
 
-test "xAI Grok rejects a wrong-origin credential before network I/O" {
+test "xAI Grok rejects wrong-origin and invalid-account credentials before network I/O" {
     var cancelled = std.atomic.Value(bool).init(false);
     var delivery = stream_provider.DeliveryCertainty.init();
     var evidence: stream_provider.AttemptEvidence = .{};
@@ -874,6 +891,54 @@ test "xAI Grok rejects a wrong-origin credential before network I/O" {
         agent_stream_provider.stream(std.testing.allocator, .{
             .api_key = "gateway-key",
             .credential_source = .ai_gateway_api_key,
+            .team = null,
+            .model = "grok-4.20",
+            .retry_count = 1,
+            .chat_url = "",
+            .payload = "{}",
+            .trace_ctx = .{},
+            .content_capture_limit = null,
+            .delivery = &delivery,
+            .attempt_evidence = &evidence,
+            .callback_ctx = @ptrCast(&callback_context),
+            .on_content_chunk = struct {
+                fn ignore(_: *anyopaque, _: []const u8) void {}
+            }.ignore,
+            .on_tool_start = null,
+            .on_reasoning_chunk = null,
+            .cancel_flag = &cancelled,
+        }),
+    );
+    try std.testing.expectEqual(stream_provider.DeliveryCertainty.State.definitely_unsent, delivery.load());
+    try std.testing.expectError(
+        error.GrokSubscriptionAccountRequired,
+        agent_stream_provider.stream(std.testing.allocator, .{
+            .api_key = "grok-token",
+            .credential_source = .grok_subscription,
+            .team = null,
+            .model = "grok-4.20",
+            .retry_count = 1,
+            .chat_url = "",
+            .payload = "{}",
+            .trace_ctx = .{},
+            .content_capture_limit = null,
+            .delivery = &delivery,
+            .attempt_evidence = &evidence,
+            .callback_ctx = @ptrCast(&callback_context),
+            .on_content_chunk = struct {
+                fn ignore(_: *anyopaque, _: []const u8) void {}
+            }.ignore,
+            .on_tool_start = null,
+            .on_reasoning_chunk = null,
+            .cancel_flag = &cancelled,
+        }),
+    );
+    try std.testing.expectError(
+        error.InvalidGrokSubscriptionAccount,
+        agent_stream_provider.stream(std.testing.allocator, .{
+            .api_key = "grok-token",
+            .credential_source = .grok_subscription,
+            .account_id = "acct\r\ninjected",
             .team = null,
             .model = "grok-4.20",
             .retry_count = 1,
@@ -1140,6 +1205,7 @@ fn runXaiTestStream(deadline: ?std.Io.Clock.Timestamp) !stream_provider.Result {
     return agent_stream_provider.stream(std.testing.allocator, .{
         .api_key = "grok-test-token",
         .credential_source = .grok_subscription,
+        .account_id = "acct_grok_test",
         .team = null,
         .model = "grok-4.20",
         .retry_count = 1,
