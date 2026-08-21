@@ -2277,6 +2277,40 @@ test "processQueuedPrompt keeps native image parts for vision route model" {
     try std.testing.expectEqualStrings("Native image answer", hooks.finish_assistant_text.?);
 }
 
+test "processQueuedPrompt never uses the vision fallback for Codex" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const image_path = try writeTestImagePath(alloc, &tmp);
+    defer alloc.free(image_path);
+    const image = try testCapturedImage(alloc, &tmp, image_path, 1);
+    defer types.freeImageAttachment(alloc, image);
+    var images = [_]types.ImageAttachment{image};
+    const capability_overrides = [_]ModelCapabilityOverride{.{
+        .model = "gpt-5.6-sol",
+        .capabilities = .{},
+    }};
+    var gateway = FakeGateway.init(alloc, &.{});
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.capability_overrides = &capability_overrides;
+    hooks.tool_registry = .{ .tools = test_support.vision_agent_test_tools[0..] };
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.provider = .codex;
+    job.model = @constCast("gpt-5.6-sol");
+    job.prompt = @constCast("Describe the attached image.");
+    job.images = &images;
+    job.authorized_image_catalog = &images;
+
+    try std.testing.expectError(
+        error.CodexNativeImageUnavailable,
+        runFakePrompt(&gateway, &hooks, fixture.config(), job),
+    );
+    try std.testing.expectEqual(@as(usize, 0), gateway.request_bodies.items.len);
+}
+
 test "processQueuedPrompt routes images natively only when vision and file input are both supported" {
     const alloc = std.testing.allocator;
     const cases = [_]struct {

@@ -10,10 +10,9 @@ const runtime_gateway_step = @import("gateway_step.zig");
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
 
-pub const default_model = "google/gemini-2.5-flash";
+const model = "google/gemini-2.5-flash";
 
 pub const Request = struct {
-    model: []const u8 = default_model,
     stream_provider: agent_stream_provider.Provider,
     api_key: []const u8,
     credential_source: ?types.CredentialSource = null,
@@ -51,11 +50,11 @@ pub fn inspect(
         .{ .role = .system, .content = system_prompt },
         .{ .role = .user, .content = user_prompt },
     };
-    const provider_opts = model_capabilities.resolveProviderOptions(request.model, .auto, false);
+    const provider_opts = model_capabilities.resolveProviderOptions(model, .auto, false);
     const payload = try request.stream_provider.build(
         alloc,
         .{
-            .model = request.model,
+            .model = model,
             .serialized_tools = "[]",
             .messages = &messages,
             .tool_choice = .none,
@@ -81,7 +80,7 @@ pub fn inspect(
         request.credential_source,
         request.gateway_team,
         request.session_id,
-        request.model,
+        model,
         request.retry_count,
         request.chat_url,
         payload,

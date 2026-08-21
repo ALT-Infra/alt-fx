@@ -15,7 +15,6 @@ const image_attachments = @import("../images/image_attachments.zig");
 const io_mod = @import("../shared/io.zig");
 const tool_contracts = @import("../agent/runtime/tool_contracts.zig");
 const vision_executor = @import("../agent/runtime/vision_executor.zig");
-const image_provider = @import("../agent/runtime/image_provider.zig");
 const background_runtime = @import("../background/background_runtime.zig");
 const background_launch_identity = @import("../background/background_launch_identity.zig");
 const process_supervisor = @import("../background/process_supervisor.zig");
@@ -304,7 +303,15 @@ fn registeredToolSpec(ctx: Context, name: []const u8) ?*const tool_specs.ToolSpe
     return ctx.tool_registry.lookup(name);
 }
 
+fn providerDisablesTool(provider: model_provider.ProviderId, name: []const u8) bool {
+    return std.mem.eql(u8, name, "vision") and
+        !model_provider.usesGatewayAuxiliaries(provider);
+}
+
 pub fn validateToolCall(ctx: Context, arena: Allocator, call: ToolCall) !tool_contracts.ToolCallValidationResult {
+    if (providerDisablesTool(ctx.provider, call.name)) {
+        return .{ .failure = try arena.dupe(u8, "Unsupported tool: vision") };
+    }
     const spec = registeredToolSpec(ctx, call.name) orelse {
         return switch (try tool_mcp_runtime.validateAdvertisedDynamicTool(.{
             .is_registered_tool = false,
@@ -334,6 +341,9 @@ pub fn validateToolCall(ctx: Context, arena: Allocator, call: ToolCall) !tool_co
 }
 
 pub fn checkToolAvailability(ctx: Context, arena: Allocator, call: ToolCall) !?[]const u8 {
+    if (providerDisablesTool(ctx.provider, call.name)) {
+        return try arena.dupe(u8, "Unsupported tool: vision");
+    }
     return tool_dispatch.localToolAvailabilityFailureForCall(
         typedDispatchContext(ctx, arena),
         ctx.tool_registry,
@@ -999,7 +1009,6 @@ fn executeVisionRequest(
     authority: command_admission.ToolExecutionAuthority,
 ) !ToolExecutionResult {
     const config: vision_executor.Config = .{
-        .model = imageAdapterModel(state.runtime.provider, state.runtime.model),
         .stream_provider = state.runtime.agent_stream_provider,
         .api_key = state.runtime.api_key,
         .credential_source = state.runtime.credential_source,
@@ -1030,24 +1039,6 @@ fn executeVisionRequest(
     const raw_paths = request.paths() orelse return error.InvalidVisionExecutionAuthority;
     if (raw_paths.len != approved_targets.len) return error.InvalidVisionExecutionAuthority;
     return executeVisionPathRequest(state, alloc, request, approved_targets, config);
-}
-
-fn imageAdapterModel(provider: model_provider.ProviderId, active_model: []const u8) []const u8 {
-    return switch (provider) {
-        .gateway => image_provider.default_model,
-        .codex => active_model,
-    };
-}
-
-test "Codex vision fallback stays on the admitted Codex model" {
-    try std.testing.expectEqualStrings(
-        "gpt-5.4-mini",
-        imageAdapterModel(.codex, "gpt-5.4-mini"),
-    );
-    try std.testing.expectEqualStrings(
-        image_provider.default_model,
-        imageAdapterModel(.gateway, "zai/glm-5.2"),
-    );
 }
 
 fn executeVisionPathRequest(
@@ -2145,6 +2136,7 @@ const TestRuntime = struct {
     max_command_output_bytes: usize = 64 * 1024,
     max_tool_result_bytes: usize = 64 * 1024,
     api_key: []const u8 = "",
+    provider: model_provider.ProviderId = .gateway,
     gateway_team: ?[]const u8 = null,
     gateway_retry_count: usize = 0,
     gateway_chat_url: []const u8 = "",
@@ -2194,6 +2186,7 @@ const TestRuntime = struct {
             .api_key = self.api_key,
             .agent_stream_provider = self.agent_stream_provider,
             .gateway_team = self.gateway_team,
+            .provider = self.provider,
             .model = self.model,
             .gateway_retry_count = self.gateway_retry_count,
             .gateway_chat_url = self.gateway_chat_url,
@@ -8548,6 +8541,35 @@ fn executeVisionPathTargetsForTest(
         .advertised_dynamic_tool_names = &.{},
         .max_tool_result_bytes = rt.max_tool_result_bytes,
     });
+}
+
+test "Codex vision calls fail before provider access" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const catalog = try makeVisionCatalog(alloc, tmp.dir, 1);
+    defer types.freeImageAttachmentSlice(alloc, catalog);
+    const provider_json = try visionProviderSuccess(alloc, &.{1});
+    defer alloc.free(provider_json);
+    const responses = [_]VisionGatewayResponse{.{ .content = provider_json }};
+    var fixture = VisionGatewayFixture{ .alloc = alloc, .responses = &responses };
+    defer fixture.deinit();
+    var rt = TestRuntime{
+        .provider = .codex,
+        .agent_stream_provider = fixture.provider(),
+        .tool_registry = .{ .tools = vision_test_registry_tools[0..] },
+        .session_allocator = alloc,
+    };
+    defer rt.deinit(alloc);
+    const args = try visionArgs(alloc, &.{1}, "Read the image");
+    defer alloc.free(args);
+
+    const result = try executeVisionForTest(&rt, alloc, args, catalog);
+    defer alloc.free(@constCast(result.model_output));
+
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
+    try std.testing.expectEqualStrings("Unsupported tool: vision", result.model_output);
+    try std.testing.expectEqual(@as(usize, 0), fixture.call_count);
 }
 
 fn visionRequestAllocationCount(args_json: []const u8) !usize {

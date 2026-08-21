@@ -2517,6 +2517,31 @@ fn executeActionBoundPermissionRequest(
     };
 }
 
+fn visionFallbackMode(
+    provider: model_provider.ProviderId,
+    tool_registered: bool,
+) runtime_gateway_step.VisionToolMode {
+    if (!model_provider.usesGatewayAuxiliaries(provider) or !tool_registered) {
+        return .unavailable;
+    }
+    return .optional;
+}
+
+test "vision fallback is available only through Gateway" {
+    try std.testing.expectEqual(
+        runtime_gateway_step.VisionToolMode.optional,
+        visionFallbackMode(.gateway, true),
+    );
+    try std.testing.expectEqual(
+        runtime_gateway_step.VisionToolMode.unavailable,
+        visionFallbackMode(.gateway, false),
+    );
+    try std.testing.expectEqual(
+        runtime_gateway_step.VisionToolMode.unavailable,
+        visionFallbackMode(.codex, true),
+    );
+}
+
 fn processQueuedPromptLoop(
     deps: *const AgentRuntimeDeps,
     semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink,
@@ -2859,10 +2884,10 @@ fn processQueuedPromptLoop(
             );
             debug_trace.eventf("gateway", "before_payload_build", step_ctx, "model={s} gateway_messages={d}", .{ gateway_model, gateway_messages.items.len });
             var vision_route: runtime_vision_contracts.VisionRoute = .native_images;
-            var vision_mode: runtime_gateway_step.VisionToolMode = if (deps.tool_registry.lookup("vision") != null)
-                .optional
-            else
-                .unavailable;
+            var vision_mode = visionFallbackMode(
+                job.provider,
+                deps.tool_registry.lookup("vision") != null,
+            );
             const recovery_source_messages = try appendReadFailureRecoveryContext(
                 overlay_arena,
                 gateway_messages.items,
@@ -2883,6 +2908,9 @@ fn processQueuedPromptLoop(
                         recovery_source_messages,
                         current_user_message_index,
                     );
+                }
+                if (!model_provider.usesGatewayAuxiliaries(job.provider)) {
+                    return error.CodexNativeImageUnavailable;
                 }
                 if (job.authorized_image_catalog.len == 0) {
                     return error.MissingAuthorizedImageCatalog;
