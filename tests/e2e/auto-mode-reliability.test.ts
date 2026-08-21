@@ -294,6 +294,8 @@ describe("lean auto mode reliability", () => {
         ["shred", "shred disposable.txt"],
         ["git_clean", "git clean -fd"],
         ["git_rm", "git rm tracked.txt"],
+        ["git_rm_separator", "git rm -- -n"],
+        ["git_clean_separator", "git clean -f -- -n"],
         ["git_reset", "git reset --hard HEAD~1"],
         ["compound_rm", "pwd && rm compound.txt"],
       ] as const) {

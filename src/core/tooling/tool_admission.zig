@@ -5151,6 +5151,10 @@ test "delegated command effects remain reviewer owned" {
         "git switch feature/repro",
         "git pull --ff-only",
         "rtk rm -rf generated",
+        "printf ok # harmless; rm victim",
+        "cat <<EOF\nrm victim\nEOF",
+        "rm --help",
+        "rm",
     }) |command| {
         const arguments_json = try std.fmt.allocPrint(
             arena_state.allocator(),
@@ -5171,7 +5175,7 @@ test "delegated command effects remain reviewer owned" {
         try std.testing.expectEqual(ToolPermissionDecision.deny, outcome.decision);
         try std.testing.expect(outcome.auto_review_result != null);
     }
-    try std.testing.expectEqual(@as(usize, 4), fake.calls);
+    try std.testing.expectEqual(@as(usize, 8), fake.calls);
 }
 
 test "automatic delete replans before reviewer" {
