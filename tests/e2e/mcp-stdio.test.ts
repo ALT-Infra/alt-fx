@@ -270,6 +270,20 @@ function readStartedDispatcherPids(path: string): number[] {
   )].map((match) => Number(match[1]));
 }
 
+function readStartupLaunchEvidence(root: FixtureRoot): {
+  startedPids: number[];
+  childRecordedPids: number[];
+  allPids: number[];
+} {
+  const startedPids = readStartedDispatcherPids(root.traceLogPath);
+  const childRecordedPids = readAttemptedPids(root.launchLogPath);
+  return {
+    startedPids,
+    childRecordedPids,
+    allPids: [...new Set([...startedPids, ...childRecordedPids])],
+  };
+}
+
 function preserveStdioFailure(
   label: string,
   root: FixtureRoot,
@@ -3398,16 +3412,16 @@ describe("modern MCP stdio compatibility", () => {
     expect(result.code).toBe(0);
     expect(JSON.parse(result.stdout).output).toContain("Startup timeout bounded.");
     expect(activeGateway.requests).toHaveLength(2);
-    const startedPids = readStartedDispatcherPids(root.traceLogPath);
-    expect(startedPids.length).toBeGreaterThanOrEqual(2);
-    expect(startedPids.length).toBeLessThanOrEqual(4);
-    const childRecordedPids = readAttemptedPids(root.launchLogPath);
-    expect(childRecordedPids.length).toBeGreaterThanOrEqual(2);
-    expect(childRecordedPids.length).toBeLessThanOrEqual(4);
-    expect(childRecordedPids.every((pid) => startedPids.includes(pid))).toBe(true);
-    await expectProcessesExited([
-      ...new Set([...startedPids, ...childRecordedPids]),
-    ]);
+    const launch = readStartupLaunchEvidence(root);
+    expect(launch.startedPids.length).toBeGreaterThanOrEqual(2);
+    expect(launch.startedPids.length).toBeLessThanOrEqual(4);
+    expect(launch.childRecordedPids.length).toBeLessThanOrEqual(
+      launch.startedPids.length,
+    );
+    expect(
+      launch.childRecordedPids.every((pid) => launch.startedPids.includes(pid)),
+    ).toBe(true);
+    await expectProcessesExited(launch.allPids);
   }, 15_000);
 
   test.skipIf(!tmuxAvailable())(
@@ -3445,12 +3459,15 @@ describe("modern MCP stdio compatibility", () => {
 
       await tui.kill();
       tui = null;
-      const attemptedPids = readAttemptedPids(root.launchLogPath);
-      expect(attemptedPids.length).toBeGreaterThan(0);
+      const launch = readStartupLaunchEvidence(root);
+      expect(launch.startedPids.length).toBeGreaterThan(0);
       expect(
-        attemptedPids.every((pid) => Number.isSafeInteger(pid) && pid > 0),
+        launch.startedPids.every((pid) => Number.isSafeInteger(pid) && pid > 0),
       ).toBe(true);
-      await expectProcessesExited(attemptedPids);
+      expect(
+        launch.childRecordedPids.every((pid) => launch.startedPids.includes(pid)),
+      ).toBe(true);
+      await expectProcessesExited(launch.allPids);
     },
     25_000,
   );
@@ -3486,12 +3503,15 @@ describe("modern MCP stdio compatibility", () => {
     });
     expect(result.stderr).toContain("Required MCP server 'fixture'");
     expect(activeGateway.requests).toHaveLength(0);
-    const attemptedPids = readAttemptedPids(root.launchLogPath);
-    expect(attemptedPids.length).toBeGreaterThan(0);
+    const launch = readStartupLaunchEvidence(root);
+    expect(launch.startedPids.length).toBeGreaterThan(0);
     expect(
-      attemptedPids.every((pid) => Number.isSafeInteger(pid) && pid > 0),
+      launch.startedPids.every((pid) => Number.isSafeInteger(pid) && pid > 0),
     ).toBe(true);
-    await expectProcessesExited(attemptedPids);
+    expect(
+      launch.childRecordedPids.every((pid) => launch.startedPids.includes(pid)),
+    ).toBe(true);
+    await expectProcessesExited(launch.allPids);
   }, 15_000);
 
   test.skipIf(!tmuxAvailable())(
@@ -3522,12 +3542,15 @@ describe("modern MCP stdio compatibility", () => {
       expect(activeGateway.requests).toHaveLength(0);
       await tui.kill();
       tui = null;
-      const attemptedPids = readAttemptedPids(root.launchLogPath);
-      expect(attemptedPids.length).toBeGreaterThan(0);
+      const launch = readStartupLaunchEvidence(root);
+      expect(launch.startedPids.length).toBeGreaterThan(0);
       expect(
-        attemptedPids.every((pid) => Number.isSafeInteger(pid) && pid > 0),
+        launch.startedPids.every((pid) => Number.isSafeInteger(pid) && pid > 0),
       ).toBe(true);
-      await expectProcessesExited(attemptedPids);
+      expect(
+        launch.childRecordedPids.every((pid) => launch.startedPids.includes(pid)),
+      ).toBe(true);
+      await expectProcessesExited(launch.allPids);
     },
     15_000,
   );
