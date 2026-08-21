@@ -331,6 +331,70 @@ async function expectProcessesExited(pids: Iterable<number>, timeoutMs = 5_000) 
 }
 
 describe("modern MCP stdio compatibility", () => {
+  test.skipIf(!tmuxAvailable())(
+    "the TUI shows exact dynamic MCP arguments before human approval",
+    async () => {
+      const root = createRoot("tui-human-approval-arguments", MODERN_FIXTURE);
+      const stderrPath = join(root.root, "stderr.log");
+      const expectedArguments = '{"text":"mcp-live-human-active"}';
+      const activeGateway = startFakeGateway([
+        fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
+        fakeGatewayToolCall("call_mcp", TOOL_NAME, {
+          text: "mcp-live-human-active",
+        }),
+        fakeGatewayFinalText("MCP approval denied without transport."),
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      gateway = activeGateway;
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 140,
+        height: 40,
+        stderrPath,
+        env: {
+          ...fixtureEnv(root, activeGateway),
+          FX_PERMISSION_MODE: "ask",
+        },
+      });
+
+      await tui.waitForComposer(15_000);
+      await tui.sendText(
+        "Call the MCP fixture only after I approve its exact arguments.",
+      );
+      const approval = await tui.waitForText(
+        `Arguments for this request: ${expectedArguments}`,
+        20_000,
+      );
+      expect(approval).toContain("Allow this MCP tool call?");
+      expect(approval).toContain(TOOL_NAME);
+      expect(approval).toContain(
+        "This MCP tool needs approval before fx can send the request.",
+      );
+      expect(approval).toContain("3. Deny");
+      expect(
+        readWire(root.wireLogPath).some(
+          (entry) => entry.message.method === "tools/call",
+        ),
+      ).toBe(false);
+
+      await tui.sendKeys("3");
+      await tui.waitForText("MCP approval denied without transport.", 10_000);
+      expect(
+        readWire(root.wireLogPath).some(
+          (entry) => entry.message.method === "tools/call",
+        ),
+      ).toBe(false);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await tui.kill();
+      tui = null;
+      await expectFixtureProcessesExited(readWire(root.wireLogPath));
+    },
+    40_000,
+  );
+
   test("repository-local MCP configuration never launches a process or network request", async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-mcp-project-trust-")));
     cleanupRoot = root;
