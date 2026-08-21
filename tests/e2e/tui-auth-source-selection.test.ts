@@ -1560,6 +1560,33 @@ test(
       expect(request.headers.get("authorization")).not.toBe(`Bearer ${chatgptOauth.accessToken}`);
     }
 
+    const gatewayRequestsBeforeImage = gateway.requests.length;
+    const gatewayModelRequestsBeforeImage = gateway.modelRequests.length;
+    const imageAsk = await runFx([
+      "ask",
+      "--json",
+      "--auto",
+      "--no-save",
+      "--image",
+      join(REPO_ROOT, "tests/e2e/fixtures/favicon.png"),
+      "Read the attached image directly.",
+    ], {
+      env,
+      timeoutMs: TIMEOUT,
+    });
+    expect(imageAsk.code, `stdout: ${imageAsk.stdout}\nstderr: ${imageAsk.stderr}`).toBe(0);
+    expect(imageAsk.stdout).toContain("CHATGPT_DIRECT_RESPONSE");
+    const imageResponses = chatgptOauth.requests.filter(
+      (request) => request.path === "/chatgpt/responses",
+    );
+    expect(imageResponses).toHaveLength(3);
+    const imageBody = imageResponses[2]!.body ?? "";
+    expect(imageBody.match(/"type":"input_image"/g)).toHaveLength(1);
+    expect(imageBody).toContain("data:image/png;base64,");
+    expect(imageBody).not.toContain('"name":"vision"');
+    expect(gateway.requests).toHaveLength(gatewayRequestsBeforeImage);
+    expect(gateway.modelRequests).toHaveLength(gatewayModelRequestsBeforeImage);
+
     const tokenRequestsBeforeRoundTrip = chatgptOauth.requests.filter(
       (request) => request.path === "/chatgpt/token",
     ).length;
