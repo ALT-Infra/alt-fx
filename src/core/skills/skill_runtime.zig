@@ -793,7 +793,11 @@ pub fn openValidatedSkillCandidate(alloc: Allocator, skill: Skill) error{OutOfMe
             return if (err == error.FileNotFound) .missing else .{ .skipped = .unreadable };
         };
     };
-    var file = switch (try openPrimarySkillFile(alloc, &candidate_dir, skill.read_authority)) {
+    const primary_file = openPrimarySkillFile(alloc, &candidate_dir, skill.read_authority) catch |err| {
+        candidate_dir.close(io_mod.getIo());
+        return err;
+    };
+    var file = switch (primary_file) {
         .opened => |opened| opened,
         .missing => {
             candidate_dir.close(io_mod.getIo());
@@ -2105,6 +2109,20 @@ fn createTempFifoOrSkip(alloc: Allocator, tmp: *std.testing.TmpDir, sub_path: []
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path_z = try std.fmt.bufPrintZ(&path_buf, "{s}", .{path});
     if (mkfifo(path_z, 0o600) != 0) return error.SkipZigTest;
+}
+
+fn openFileDescriptorCount() !usize {
+    const path = switch (@import("builtin").os.tag) {
+        .linux => "/proc/self/fd",
+        .macos => "/dev/fd",
+        else => return error.SkipZigTest,
+    };
+    var dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), path, .{ .iterate = true });
+    defer dir.close(io_mod.getIo());
+    var count: usize = 0;
+    var it = dir.iterate();
+    while (try it.next(io_mod.getIo())) |_| count += 1;
+    return count;
 }
 
 fn readAbsoluteFile(alloc: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
@@ -3592,11 +3610,13 @@ test "linked metadata cleans every partial allocation failure" {
     const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
     defer alloc.free(managed_root);
 
+    const descriptor_count_before = try openFileDescriptorCount();
     try std.testing.checkAllAllocationFailures(
         alloc,
         checkLinkedMetadataAllocationFailures,
         .{ workspace_root, home_root, managed_root },
     );
+    try std.testing.expectEqual(descriptor_count_before, try openFileDescriptorCount());
 }
 
 test "freeSkills accepts static empty slice" {
