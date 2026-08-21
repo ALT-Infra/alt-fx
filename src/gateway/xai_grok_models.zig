@@ -555,6 +555,7 @@ const CatalogBodyFixture = struct {
     body: []const u8,
     thread: ?std.Thread = null,
     server_open: bool = true,
+    stopping: std.atomic.Value(bool) = .init(false),
     failure: ?anyerror = null,
 
     fn init(body: []const u8) !@This() {
@@ -574,7 +575,11 @@ const CatalogBodyFixture = struct {
     fn deinit(self: *@This()) void {
         if (!self.server_open) return;
         const zio = self.io();
+        self.stopping.store(true, .seq_cst);
         if (self.thread) |thread| {
+            const listener = std.Io.net.Stream{ .socket = self.server.socket };
+            listener.shutdown(zio, .both) catch {};
+            self.wakeAccept();
             thread.join();
             self.thread = null;
         }
@@ -590,8 +595,17 @@ const CatalogBodyFixture = struct {
         return self.server.socket.address.getPort();
     }
 
+    fn wakeAccept(self: *@This()) void {
+        var wake_io_backend: std.Io.Threaded = .init_single_threaded;
+        const zio = wake_io_backend.io();
+        const address = std.Io.net.IpAddress{ .ip4 = .loopback(self.port()) };
+        var stream = address.connect(zio, .{ .mode = .stream }) catch return;
+        stream.close(zio);
+    }
+
     fn run(self: *@This()) void {
         self.runFallible() catch |err| {
+            if (self.stopping.load(.seq_cst) and err == error.SocketNotListening) return;
             self.failure = err;
         };
     }
@@ -600,6 +614,7 @@ const CatalogBodyFixture = struct {
         const zio = self.io();
         var stream = try self.server.accept(zio);
         defer stream.close(zio);
+        if (self.stopping.load(.seq_cst)) return;
         var socket_buffer: [4096]u8 = undefined;
         var reader = stream.reader(zio, &socket_buffer);
         var request: [16 * 1024]u8 = undefined;
@@ -620,6 +635,15 @@ const CatalogBodyFixture = struct {
         try writer.interface.flush();
     }
 };
+
+test "Grok catalog fixture cleanup joins without a client" {
+    var fixture = try CatalogBodyFixture.init("{}");
+    defer fixture.deinit();
+    try fixture.start();
+    fixture.deinit();
+    try std.testing.expect(fixture.thread == null);
+    try std.testing.expect(fixture.failure == null);
+}
 
 var stable_catalog_test_environ: ?*std.process.Environ.Map = null;
 
