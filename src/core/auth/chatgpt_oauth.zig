@@ -862,10 +862,7 @@ fn percentEncode(writer: *std.Io.Writer, value: []const u8) !void {
 }
 
 fn writeStdout(text: []const u8) !void {
-    var buffer: [1024]u8 = undefined;
-    var writer = std.Io.File.stdout().writer(io_mod.getIo(), &buffer);
-    try writer.interface.writeAll(text);
-    try writer.interface.flush();
+    try std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text);
 }
 
 test "ChatGPT E2E OAuth endpoint overrides accept only loopback HTTP" {

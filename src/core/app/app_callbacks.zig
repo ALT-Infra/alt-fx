@@ -7,6 +7,7 @@ const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
+const provider_runtime = @import("provider_runtime.zig");
 const core_input_runtime = @import("../input/runtime.zig");
 const app_worker_runtime = @import("app_worker_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
@@ -1074,7 +1075,7 @@ pub fn Bindings(comptime App: type) type {
         fn workerBridgeOpenModelPicker(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime @hasField(App, "input_runtime") and
-                @hasField(App, "selected_model") and
+                provider_runtime.supported(App) and
                 @hasDecl(App, "modelCompletions"))
             {
                 try input_completion_runtime.CompletionRuntime(App).openCurrentModelPicker(app);

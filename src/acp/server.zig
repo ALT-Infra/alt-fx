@@ -1524,29 +1524,28 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 .message = "Invalid session model",
             });
         if (comptime !host_target.is_wasm) {
-            var model_available = false;
-            if (state.capability_resolver.catalogEntries()) |entries| {
-                for (entries) |entry| {
-                    if (std.mem.eql(u8, entry.id, value)) {
-                        model_available = true;
-                        break;
+            if (session.provider == .codex) {
+                var model_available = false;
+                if (state.capability_resolver.catalogEntries()) |entries| {
+                    for (entries) |entry| {
+                        if (std.mem.eql(u8, entry.id, value)) {
+                            model_available = true;
+                            break;
+                        }
                     }
                 }
-            }
-            if (!model_available) {
-                return state.writer.writeError(alloc, msg.id, .{
-                    .code = ErrorCode.invalid_params,
-                    .message = "Model is not available for the active provider",
-                });
-            }
-            if (!try selectCredentialForProvider(state, session.provider)) {
-                return state.writer.writeError(alloc, msg.id, .{
-                    .code = ErrorCode.invalid_request,
-                    .message = if (session.provider == .codex)
-                        credentials.missing_chatgpt_credential_message
-                    else
-                        credentials.missing_credential_message,
-                });
+                if (!model_available) {
+                    return state.writer.writeError(alloc, msg.id, .{
+                        .code = ErrorCode.invalid_params,
+                        .message = "Model is not available for the active provider",
+                    });
+                }
+                if (!try selectCredentialForProvider(state, .codex)) {
+                    return state.writer.writeError(alloc, msg.id, .{
+                        .code = ErrorCode.invalid_request,
+                        .message = credentials.missing_chatgpt_credential_message,
+                    });
+                }
             }
         }
         if (host_target.is_wasm and session.writable == null) {
