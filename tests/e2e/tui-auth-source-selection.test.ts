@@ -481,6 +481,11 @@ function startFakeGrokOAuth(options: {
     { id: "grok-4.6", object: "model", input_modalities: ["text", "image"], output_modalities: ["text"] },
     { id: "grok-image-only", object: "model", input_modalities: ["text"], output_modalities: ["image"] },
   ];
+  const allSubscriptionModels = [
+    grokSubscriptionModel("grok-4.20", 1_000_000),
+    grokSubscriptionModel("grok-4.6", 500_000, ["xhigh", "high", "medium", "low"]),
+  ];
+  let subscriptionModels = allSubscriptionModels;
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
@@ -547,10 +552,7 @@ function startFakeGrokOAuth(options: {
         return Response.json({ models });
       }
       if (url.pathname === "/v1/models") {
-        return Response.json({ data: [
-          grokSubscriptionModel("grok-4.20", 1_000_000),
-          grokSubscriptionModel("grok-4.6", 500_000, ["xhigh", "high", "medium", "low"]),
-        ] });
+        return Response.json({ data: subscriptionModels });
       }
       if (url.pathname === "/v1/responses") {
         responseCalls += 1;
@@ -584,6 +586,8 @@ function startFakeGrokOAuth(options: {
     },
     setModels(next: typeof models) {
       models = next;
+      const visibleIds = new Set(next.map((model) => model.id));
+      subscriptionModels = allSubscriptionModels.filter((model) => visibleIds.has(model.id));
     },
     stop() { server.stop(true); },
   };
