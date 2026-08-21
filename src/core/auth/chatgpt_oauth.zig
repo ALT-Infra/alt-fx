@@ -397,7 +397,6 @@ pub fn runLogin(
             .succeeded => |completion| {
                 var owned = completion;
                 defer owned.deinit(alloc);
-                try writeStdout("Signed in with Codex.\n");
                 return;
             },
             .failed => |err| return err,

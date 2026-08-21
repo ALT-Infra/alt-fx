@@ -27,15 +27,46 @@ const ProviderSwitchDecision = enum {
     prepare,
 };
 
-fn decideProviderSwitch(
+const ProviderSwitchIntent = enum {
+    manual,
+    post_oauth,
+};
+
+const ProviderSwitchFacts = struct {
     current: model_provider.ProviderId,
     target: model_provider.ProviderId,
+    target_credential_ready: bool,
+    intent: ProviderSwitchIntent,
     stream_active: bool,
     queued_prompts: usize,
-) ProviderSwitchDecision {
-    if (current == target) return .no_change;
-    if (stream_active or queued_prompts > 0) return .busy;
+};
+
+fn decideProviderSwitch(facts: ProviderSwitchFacts) ProviderSwitchDecision {
+    if (facts.intent == .manual and facts.current == facts.target and facts.target_credential_ready) return .no_change;
+    if (facts.stream_active or facts.queued_prompts > 0) return .busy;
     return .prepare;
+}
+
+fn providerFailureMessage(
+    intent: ProviderSwitchIntent,
+    ordinary: []const u8,
+    after_oauth: []const u8,
+) []const u8 {
+    return if (intent == .post_oauth) after_oauth else ordinary;
+}
+
+fn selectCatalogModel(
+    entries: []const model_catalog.ModelCatalogEntry,
+    primary: ?[]const u8,
+    secondary: ?[]const u8,
+) ?[]const u8 {
+    for ([_]?[]const u8{ primary, secondary }) |maybe_candidate| {
+        const candidate = maybe_candidate orelse continue;
+        for (entries) |entry| {
+            if (std.mem.eql(u8, candidate, entry.id)) return entry.id;
+        }
+    }
+    return if (entries.len > 0) entries[0].id else null;
 }
 
 pub fn Runtime(comptime App: type) type {
@@ -104,32 +135,6 @@ pub fn Runtime(comptime App: type) type {
             try app.auth.refreshSourceInventory(app.alloc);
             app.auth.openPicker(app.alloc);
             app.shell.render_requests.request(.footer);
-        }
-
-        pub fn runProviderCommand(app: *App, raw_target: []const u8) !void {
-            const target = std.mem.trim(u8, raw_target, " \t\r\n");
-            if (target.len == 0) {
-                if (comptime !provider_runtime.supported(App)) {
-                    try app.writeDomainNotice(.{
-                        .topic = "provider",
-                        .tone = .warning,
-                        .body = "Provider switching is unavailable in this host.",
-                    }, true);
-                    return;
-                }
-                app.auth.openProviderPicker(app.alloc, provider_runtime.provider(app));
-                app.shell.render_requests.request(.footer);
-                return;
-            }
-            const provider = model_provider.parse(target) orelse {
-                try app.writeDomainNotice(.{
-                    .topic = "provider",
-                    .tone = .warning,
-                    .body = "Usage: /provider [gateway|codex|grok]",
-                }, true);
-                return;
-            };
-            try switchProvider(app, provider, true);
         }
 
         pub fn runLogoutCommand(app: *App, target: []const u8) !void {
@@ -304,7 +309,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
             switch (choice) {
-                .provider => |provider| try switchProvider(app, provider, true),
+                .provider => |provider| try switchProvider(app, provider, true, .manual),
                 .source => |source| try applySourceChoice(app, source),
                 .action => |action| switch (action) {
                     .login => try beginSignIn(app, true),
@@ -324,6 +329,7 @@ pub fn Runtime(comptime App: type) type {
                     },
                     .change_team => try beginTeamPicker(app),
                     .switch_credential => app.auth.openSwitchCredentialPicker(app.alloc),
+                    .switch_provider => app.auth.openProviderPicker(app.alloc, provider_runtime.provider(app)),
                     .automatic => try applyAutomaticCredential(app),
                 },
                 .team => |index| try applyTeamChoice(app, index),
@@ -375,11 +381,6 @@ pub fn Runtime(comptime App: type) type {
                 app.auth.pickerView().sign_in_source
             else
                 .fx_login;
-            const completes_provider_switch = if (comptime @hasDecl(@TypeOf(app.auth), "signInReturnsToRoot"))
-                (sign_in_source == .chatgpt_subscription or sign_in_source == .grok_subscription) and
-                    !app.auth.signInReturnsToRoot()
-            else
-                false;
             app.auth.pulseSignIn(app.alloc);
             switch (app.auth.pollSignInTransition(app.alloc)) {
                 .none => {},
@@ -418,18 +419,12 @@ pub fn Runtime(comptime App: type) type {
                         },
                         .chatgpt => {
                             try app.auth.refreshSourceInventory(app.alloc);
-                            if (completes_provider_switch and comptime provider_runtime.supported(App)) {
+                            if (comptime provider_runtime.supported(App)) {
                                 app.auth.closePicker(app.alloc);
-                                try switchProvider(app, .codex, false);
+                                try switchProvider(app, .codex, false, .post_oauth);
                                 return;
                             }
-                            const selected_model_uses_chatgpt = if (comptime provider_runtime.supported(App))
-                                provider_runtime.provider(app) == .codex
-                            else
-                                false;
-                            if (selected_model_uses_chatgpt and
-                                !try selectCredentialSource(app, .chatgpt_subscription))
-                            {
+                            if (!try selectCredentialSource(app, .chatgpt_subscription)) {
                                 _ = app.auth.popPickerStage(app.alloc);
                                 try writeAuthNotice(app, .{
                                     .topic = "auth",
@@ -437,10 +432,6 @@ pub fn Runtime(comptime App: type) type {
                                     .body = "Signed in, but the Codex subscription credential could not be loaded.",
                                 });
                                 return;
-                            }
-                            if (!selected_model_uses_chatgpt) {
-                                app.model_cache.reset();
-                                if (comptime @hasDecl(App, "startModelCacheWarmup")) app.startModelCacheWarmup();
                             }
                             app.auth.closePicker(app.alloc);
                             try writeAuthNotice(app, .{
@@ -451,9 +442,9 @@ pub fn Runtime(comptime App: type) type {
                         },
                         .grok => {
                             try app.auth.refreshSourceInventory(app.alloc);
-                            if (completes_provider_switch and comptime provider_runtime.supported(App)) {
+                            if (comptime provider_runtime.supported(App)) {
                                 app.auth.closePicker(app.alloc);
-                                try switchProvider(app, .grok, false);
+                                try switchProvider(app, .grok, false, .post_oauth);
                                 return;
                             }
                             const selected_model_uses_grok = if (comptime provider_runtime.supported(App))
@@ -652,6 +643,24 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn beginChatGptSignIn(app: *App) !void {
+            if (comptime provider_runtime.supported(App)) {
+                const decision = decideProviderSwitch(.{
+                    .current = provider_runtime.provider(app),
+                    .target = .codex,
+                    .target_credential_ready = false,
+                    .intent = .post_oauth,
+                    .stream_active = app.stream.active,
+                    .queued_prompts = app.worker.queuedPromptCount(),
+                });
+                if (decision == .busy) {
+                    try app.writeDomainNotice(.{
+                        .topic = "auth",
+                        .tone = .warning,
+                        .body = "Codex sign-in is unavailable until active and queued work finishes.",
+                    }, true);
+                    return;
+                }
+            }
             try app.flushBeforeBlockingExternalWork();
             const started = app.auth.openChatGptSignInPickerFromRoot(app.alloc);
             if (started catch |err| {
@@ -665,6 +674,24 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn beginGrokSignIn(app: *App) !void {
+            if (comptime provider_runtime.supported(App)) {
+                const decision = decideProviderSwitch(.{
+                    .current = provider_runtime.provider(app),
+                    .target = .grok,
+                    .target_credential_ready = false,
+                    .intent = .post_oauth,
+                    .stream_active = app.stream.active,
+                    .queued_prompts = app.worker.queuedPromptCount(),
+                });
+                if (decision == .busy) {
+                    try app.writeDomainNotice(.{
+                        .topic = "auth",
+                        .tone = .warning,
+                        .body = "Grok sign-in is unavailable until active and queued work finishes.",
+                    }, true);
+                    return;
+                }
+            }
             try app.flushBeforeBlockingExternalWork();
             const started = app.auth.openGrokSignInPickerFromRoot(app.alloc);
             if (started catch |err| {
@@ -707,6 +734,7 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             target: model_provider.ProviderId,
             allow_login: bool,
+            intent: ProviderSwitchIntent,
         ) !void {
             if (comptime !provider_runtime.supported(App) or
                 !@hasDecl(App, "fetchProviderCatalog") or
@@ -729,12 +757,19 @@ pub fn Runtime(comptime App: type) type {
             }
 
             const current = provider_runtime.provider(app);
-            switch (decideProviderSwitch(
-                current,
-                target,
-                app.stream.active,
-                app.worker.queuedPromptCount(),
-            )) {
+            const active_source = app.auth.credentialSource();
+            const target_credential_ready = if (active_source) |source|
+                model_provider.authorizesCredential(target, source)
+            else
+                false;
+            switch (decideProviderSwitch(.{
+                .current = current,
+                .target = target,
+                .target_credential_ready = target_credential_ready,
+                .intent = intent,
+                .stream_active = app.stream.active,
+                .queued_prompts = app.worker.queuedPromptCount(),
+            })) {
                 .prepare => {},
                 .no_change => {
                     const body = try std.fmt.allocPrint(
@@ -750,7 +785,11 @@ pub fn Runtime(comptime App: type) type {
                     try app.writeDomainNotice(.{
                         .topic = "provider",
                         .tone = .warning,
-                        .body = "Provider switching is unavailable until active and queued work finishes.",
+                        .body = providerFailureMessage(
+                            intent,
+                            "Provider switching is unavailable until active and queued work finishes.",
+                            "Subscription sign-in completed, but provider activation is unavailable until active and queued work finishes. The current provider is unchanged.",
+                        ),
                     }, true);
                     return;
                 },
@@ -769,7 +808,11 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "provider",
                     .tone = .@"error",
-                    .body = "Could not prepare the target provider credential. The current provider is unchanged.",
+                    .body = providerFailureMessage(
+                        intent,
+                        "Could not prepare the target provider credential. The current provider is unchanged.",
+                        "Subscription sign-in completed, but its credential could not be prepared. The current provider is unchanged.",
+                    ),
                 }, true);
                 return;
             };
@@ -785,7 +828,9 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "provider",
                     .tone = .warning,
-                    .body = if (target == .codex)
+                    .body = if (intent == .post_oauth)
+                        "Subscription sign-in completed, but its saved credential is unavailable. The current provider is unchanged."
+                    else if (target == .codex)
                         "Run fx login codex, then try switching again."
                     else if (target == .grok)
                         "Run fx login grok, then try switching again."
@@ -799,7 +844,11 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "provider",
                     .tone = .@"error",
-                    .body = "The target credential cannot authorize that provider. The current provider is unchanged.",
+                    .body = providerFailureMessage(
+                        intent,
+                        "The target credential cannot authorize that provider. The current provider is unchanged.",
+                        "Subscription sign-in completed, but its credential cannot authorize the provider. The current provider is unchanged.",
+                    ),
                 }, true);
                 return;
             }
@@ -814,7 +863,11 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "provider",
                     .tone = .@"error",
-                    .body = "Could not load the target provider catalog. The current provider is unchanged.",
+                    .body = providerFailureMessage(
+                        intent,
+                        "Could not load the target provider catalog. The current provider is unchanged.",
+                        "Subscription sign-in completed, but its model catalog could not be loaded. The current provider is unchanged.",
+                    ),
                 }, true);
                 return;
             };
@@ -825,7 +878,11 @@ pub fn Runtime(comptime App: type) type {
                     try app.writeDomainNotice(.{
                         .topic = "provider",
                         .tone = .@"error",
-                        .body = "The target provider catalog could not be validated. The current provider is unchanged.",
+                        .body = providerFailureMessage(
+                            intent,
+                            "The target provider catalog could not be validated. The current provider is unchanged.",
+                            "Subscription sign-in completed, but its model catalog could not be validated. The current provider is unchanged.",
+                        ),
                     }, true);
                     return;
                 },
@@ -835,7 +892,11 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "provider",
                     .tone = .@"error",
-                    .body = "The target provider returned no supported models. The current provider is unchanged.",
+                    .body = providerFailureMessage(
+                        intent,
+                        "The target provider returned no supported models. The current provider is unchanged.",
+                        "Subscription sign-in completed, but its model catalog returned no supported models. The current provider is unchanged.",
+                    ),
                 }, true);
                 return;
             }
@@ -845,7 +906,11 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "provider",
                     .tone = .@"error",
-                    .body = "Could not load the saved provider model. The current provider is unchanged.",
+                    .body = providerFailureMessage(
+                        intent,
+                        "Could not load the saved provider model. The current provider is unchanged.",
+                        "Subscription sign-in completed, but its saved provider model could not be loaded. The current provider is unchanged.",
+                    ),
                 }, true);
                 return;
             };
@@ -855,19 +920,30 @@ pub fn Runtime(comptime App: type) type {
                 .codex => settings.codex_model,
                 .grok => settings.grok_model,
             };
-            const requested_model = io_mod.getenv("FX_MODEL") orelse saved_model;
-            var selected: ?[]const u8 = null;
-            if (requested_model) |candidate| {
-                for (catalog.items) |entry| {
-                    if (std.mem.eql(u8, candidate, entry.id)) {
-                        selected = entry.id;
-                        break;
-                    }
-                }
-            }
-            if (selected == null) selected = catalog.items[0].id;
-            var owned_model = try app.alloc.dupe(u8, selected.?);
+            const current_model = if (intent == .post_oauth and current == target)
+                provider_runtime.model(app)
+            else
+                null;
+            const preferred_model = if (intent == .post_oauth)
+                saved_model
+            else
+                io_mod.getenv("FX_MODEL") orelse saved_model;
+            const selected_model = selectCatalogModel(catalog.items, current_model, preferred_model) orelse unreachable;
+            var owned_model = try app.alloc.dupe(u8, selected_model);
             errdefer app.alloc.free(owned_model);
+
+            if (app.stream.active or app.worker.queuedPromptCount() > 0) {
+                try app.writeDomainNotice(.{
+                    .topic = "provider",
+                    .tone = .warning,
+                    .body = providerFailureMessage(
+                        intent,
+                        "Provider switching is unavailable until active and queued work finishes.",
+                        "Subscription sign-in completed, but provider activation is unavailable until active and queued work finishes. The current provider is unchanged.",
+                    ),
+                }, true);
+                return;
+            }
 
             app.model_cache.adoptOwnedCatalog(access, &catalog);
             app.provider_selection.adoptOwned(target, &owned_model);
@@ -1163,20 +1239,94 @@ pub fn Runtime(comptime App: type) type {
 test "provider switch state machine no-ops rejects busy work and prepares only idle changes" {
     try std.testing.expectEqual(
         ProviderSwitchDecision.no_change,
-        decideProviderSwitch(.gateway, .gateway, true, 2),
-    );
-    try std.testing.expectEqual(
-        ProviderSwitchDecision.busy,
-        decideProviderSwitch(.gateway, .codex, true, 0),
-    );
-    try std.testing.expectEqual(
-        ProviderSwitchDecision.busy,
-        decideProviderSwitch(.gateway, .codex, false, 1),
+        decideProviderSwitch(.{
+            .current = .gateway,
+            .target = .gateway,
+            .target_credential_ready = true,
+            .intent = .manual,
+            .stream_active = true,
+            .queued_prompts = 2,
+        }),
     );
     try std.testing.expectEqual(
         ProviderSwitchDecision.prepare,
-        decideProviderSwitch(.gateway, .codex, false, 0),
+        decideProviderSwitch(.{
+            .current = .codex,
+            .target = .codex,
+            .target_credential_ready = false,
+            .intent = .manual,
+            .stream_active = false,
+            .queued_prompts = 0,
+        }),
     );
+    try std.testing.expectEqual(
+        ProviderSwitchDecision.busy,
+        decideProviderSwitch(.{
+            .current = .codex,
+            .target = .codex,
+            .target_credential_ready = false,
+            .intent = .manual,
+            .stream_active = true,
+            .queued_prompts = 0,
+        }),
+    );
+    try std.testing.expectEqual(
+        ProviderSwitchDecision.busy,
+        decideProviderSwitch(.{
+            .current = .gateway,
+            .target = .codex,
+            .target_credential_ready = false,
+            .intent = .manual,
+            .stream_active = false,
+            .queued_prompts = 1,
+        }),
+    );
+    try std.testing.expectEqual(
+        ProviderSwitchDecision.prepare,
+        decideProviderSwitch(.{
+            .current = .codex,
+            .target = .codex,
+            .target_credential_ready = true,
+            .intent = .post_oauth,
+            .stream_active = false,
+            .queued_prompts = 0,
+        }),
+    );
+    try std.testing.expectEqual(
+        ProviderSwitchDecision.busy,
+        decideProviderSwitch(.{
+            .current = .codex,
+            .target = .codex,
+            .target_credential_ready = true,
+            .intent = .post_oauth,
+            .stream_active = false,
+            .queued_prompts = 1,
+        }),
+    );
+    try std.testing.expectEqual(
+        ProviderSwitchDecision.prepare,
+        decideProviderSwitch(.{
+            .current = .gateway,
+            .target = .codex,
+            .target_credential_ready = false,
+            .intent = .manual,
+            .stream_active = false,
+            .queued_prompts = 0,
+        }),
+    );
+}
+
+test "post OAuth catalog selection keeps valid current then saved then first" {
+    const entries = [_]model_catalog.ModelCatalogEntry{
+        .{ .id = @constCast("first"), .model_type = @constCast("language") },
+        .{ .id = @constCast("current"), .model_type = @constCast("language") },
+        .{ .id = @constCast("saved"), .model_type = @constCast("language") },
+    };
+
+    try std.testing.expectEqualStrings("current", selectCatalogModel(&entries, "current", "saved").?);
+    try std.testing.expectEqualStrings("saved", selectCatalogModel(&entries, "missing", "saved").?);
+    try std.testing.expectEqualStrings("first", selectCatalogModel(&entries, "missing", "also-missing").?);
+    try std.testing.expect(selectCatalogModel(&.{}, "current", "saved") == null);
 }
 
 const TestModelCache = struct {
@@ -1186,6 +1336,89 @@ const TestModelCache = struct {
         self.reset_count += 1;
     }
 };
+
+const BusySignInAuth = struct {
+    start_count: usize = 0,
+
+    fn openChatGptSignInPickerFromRoot(self: *BusySignInAuth, _: std.mem.Allocator) !bool {
+        self.start_count += 1;
+        return true;
+    }
+
+    fn openGrokSignInPickerFromRoot(self: *BusySignInAuth, _: std.mem.Allocator) !bool {
+        self.start_count += 1;
+        return true;
+    }
+
+    fn signInBrowserUrlAlloc(_: *BusySignInAuth, _: std.mem.Allocator) !?[]u8 {
+        return null;
+    }
+};
+
+const BusySignInApp = struct {
+    pub const host_profile = runtime_profile.native;
+
+    alloc: std.mem.Allocator = std.testing.allocator,
+    selected_provider: model_provider.ProviderId = .gateway,
+    selected_model: std.ArrayList(u8) = .empty,
+    auth: BusySignInAuth = .{},
+    stream: struct { active: bool = false } = .{},
+    worker: struct {
+        queued_prompts: usize = 0,
+
+        fn queuedPromptCount(self: @This()) usize {
+            return self.queued_prompts;
+        }
+    } = .{},
+    shell: struct { render_requests: TestRenderRequests = .{} } = .{},
+    notice_count: usize = 0,
+    flush_count: usize = 0,
+
+    fn deinit(self: *BusySignInApp) void {
+        self.selected_model.deinit(self.alloc);
+    }
+
+    fn writeDomainNotice(self: *BusySignInApp, _: types.SemanticNotice, _: bool) !void {
+        self.notice_count += 1;
+    }
+
+    fn flushBeforeBlockingExternalWork(self: *BusySignInApp) !void {
+        self.flush_count += 1;
+    }
+
+    fn urlOpener(_: *BusySignInApp) host.UrlOpener {
+        return host.unavailable_url_opener;
+    }
+};
+
+test "interactive subscription sign-in rejects active and queued work before OAuth" {
+    const cases = [_]struct {
+        stream_active: bool,
+        queued_prompts: usize,
+    }{
+        .{ .stream_active = true, .queued_prompts = 0 },
+        .{ .stream_active = false, .queued_prompts = 1 },
+    };
+
+    for (cases) |case| {
+        inline for ([_]model_provider.ProviderId{ .codex, .grok }) |provider| {
+            var app: BusySignInApp = .{};
+            defer app.deinit();
+            app.stream.active = case.stream_active;
+            app.worker.queued_prompts = case.queued_prompts;
+
+            switch (provider) {
+                .codex => try Runtime(BusySignInApp).beginChatGptSignIn(&app),
+                .grok => try Runtime(BusySignInApp).beginGrokSignIn(&app),
+                .gateway => unreachable,
+            }
+
+            try std.testing.expectEqual(@as(usize, 0), app.auth.start_count);
+            try std.testing.expectEqual(@as(usize, 0), app.flush_count);
+            try std.testing.expectEqual(@as(usize, 1), app.notice_count);
+        }
+    }
+}
 
 const TestTeam = struct {
     name: []const u8,

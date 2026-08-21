@@ -154,6 +154,7 @@ pub const AcquisitionAction = enum {
     setup,
     change_team,
     switch_credential,
+    switch_provider,
     /// Clears a remembered choice so resolution returns to plain precedence.
     /// Without it the only way back would be editing settings.json by hand.
     automatic,
@@ -390,7 +391,7 @@ pub const PickerView = struct {
             else if (comptime host_target.is_wasm)
                 4
             else
-                6,
+                7,
             .provider => if (comptime host_target.is_wasm) 2 else 3,
             .sign_in, .api_key => 0,
             .change_team => blk: {
@@ -433,8 +434,9 @@ pub const PickerView = struct {
                 1 => .{ .action = .chatgpt_login },
                 2 => .{ .action = .grok_login },
                 3 => .{ .action = .setup },
-                4 => .{ .action = .change_team },
-                5 => .{ .action = .switch_credential },
+                4 => .{ .action = .switch_provider },
+                5 => .{ .action = .change_team },
+                6 => .{ .action = .switch_credential },
                 else => null,
             },
             .provider => switch (index) {
@@ -487,6 +489,7 @@ pub const PickerView = struct {
                 .setup => if (self.include_skip) "Add an API key" else "API key",
                 .change_team => "Change team",
                 .switch_credential => "Switch credential",
+                .switch_provider => "Switch provider",
                 .automatic => "Automatic",
             },
             .team => |index| if (index < self.teams.len) self.teams[index].name else "",
@@ -501,7 +504,7 @@ pub const PickerView = struct {
                 .login => if (self.fx_login_session_available) "connected" else "",
                 .chatgpt_login => if (self.available_sources.contains(.chatgpt_subscription)) "connected" else "",
                 .grok_login => if (self.available_sources.contains(.grok_subscription)) "connected" else "",
-                .setup, .switch_credential => "",
+                .setup, .switch_credential, .switch_provider => "",
                 .automatic => "use normal precedence",
                 .change_team => if (self.fx_login_session_available) "choose a team" else "sign in first",
             },
@@ -1228,7 +1231,8 @@ pub const Runtime = struct {
             return true;
         }
         if (stage == .provider) {
-            self.closePicker(alloc);
+            self.picker_stage = .root;
+            self.picker_selection = .{ .action = .switch_provider };
             return true;
         }
 
@@ -1299,6 +1303,7 @@ pub const Runtime = struct {
                 .source => self.closePicker(alloc),
                 .action => |action| switch (action) {
                     .change_team => {},
+                    .switch_provider => {},
                     .switch_credential => {
                         self.openSwitchCredentialPicker(alloc);
                         return null;
@@ -2289,8 +2294,9 @@ test "auth picker root starts on sign in and keeps sources in the switch stage" 
     const picker = runtime.pickerView();
     try std.testing.expect(picker.active);
     try std.testing.expect((Choice{ .action = .login }).eql(picker.selected_choice.?));
-    try std.testing.expectEqual(@as(usize, 6), picker.choiceCount());
-    try std.testing.expect(picker.choiceAt(6) == null);
+    try std.testing.expectEqual(@as(usize, 7), picker.choiceCount());
+    try std.testing.expectEqualStrings("Switch provider", picker.choiceLabel(picker.choiceAt(4).?));
+    try std.testing.expect(picker.choiceAt(7) == null);
 }
 
 test "credential switcher excludes provider-routed subscription sessions" {
@@ -2307,7 +2313,7 @@ test "credential switcher excludes provider-routed subscription sessions" {
     try std.testing.expect((Choice{ .action = .automatic }).eql(picker.choiceAt(1).?));
 }
 
-test "auth picker navigation wraps across the six hub actions" {
+test "auth picker navigation wraps across the seven hub actions" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     runtime.source_inventory = SourceSet.initMany(&.{ .ai_gateway_api_key, .fx_login });
@@ -2319,6 +2325,8 @@ test "auth picker navigation wraps across the six hub actions" {
     try std.testing.expect((Choice{ .action = .grok_login }).eql(runtime.pickerView().selected_choice.?));
     try std.testing.expect(runtime.movePicker(1));
     try std.testing.expect((Choice{ .action = .setup }).eql(runtime.pickerView().selected_choice.?));
+    try std.testing.expect(runtime.movePicker(1));
+    try std.testing.expectEqualStrings("Switch provider", runtime.pickerView().choiceLabel(runtime.pickerView().selected_choice.?));
     try std.testing.expect(runtime.movePicker(1));
     try std.testing.expect((Choice{ .action = .change_team }).eql(runtime.pickerView().selected_choice.?));
     try std.testing.expect(runtime.movePicker(1));
@@ -2350,7 +2358,7 @@ test "auth picker without credentials exposes acquisition actions" {
     try std.testing.expect(picker.active_source == null);
     try std.testing.expect((Choice{ .action = .login }).eql(picker.selected_choice.?));
     try std.testing.expectEqual(@as(usize, 0), picker.available_sources.count());
-    try std.testing.expectEqual(@as(usize, 6), picker.choiceCount());
+    try std.testing.expectEqual(@as(usize, 7), picker.choiceCount());
     try std.testing.expect(!picker.choiceEnabled(.{ .action = .change_team }));
     try std.testing.expectEqualStrings("missing", picker.activeSourceLabel());
 }
@@ -2423,6 +2431,20 @@ test "switch credential stage includes the active source and pops to its root ac
     try std.testing.expect(root_view.active);
     try std.testing.expectEqual(PickerStage.root, root_view.stage);
     try std.testing.expect((Choice{ .action = .switch_credential }).eql(root_view.selected_choice.?));
+}
+
+test "provider stage pops to its setup root action" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    runtime.openPicker(alloc);
+    runtime.openProviderPicker(alloc, .codex);
+
+    try std.testing.expect(runtime.popPickerStage(alloc));
+    const root_view = runtime.pickerView();
+    try std.testing.expect(root_view.active);
+    try std.testing.expectEqual(PickerStage.root, root_view.stage);
+    try std.testing.expectEqualStrings("Switch provider", root_view.choiceLabel(root_view.selected_choice.?));
 }
 
 test "change team stage owns fetched rows and releases them when popped" {

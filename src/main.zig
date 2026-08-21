@@ -931,10 +931,6 @@ const App = struct {
         try AuthAppRuntime.runLoginCommand(self);
     }
 
-    pub fn runProviderCommand(self: *App, target: []const u8) !void {
-        try AuthAppRuntime.runProviderCommand(self, target);
-    }
-
     pub fn runLogoutCommand(self: *App, target: []const u8) !void {
         try AuthAppRuntime.runLogoutCommand(self, target);
     }

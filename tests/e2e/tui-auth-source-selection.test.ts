@@ -351,6 +351,10 @@ function startFakeChatGptOAuth(
 ) {
   const accessToken = chatgptAccessToken();
   let responseCount = 0;
+  let models = [
+    { slug: "gpt-5.6-sol", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "max" }, { effort: "high" }], additional_speed_tiers: ["fast"], input_modalities: ["text", "image"], context_window: 272000 },
+    { slug: "gpt-5.4-mini", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "low" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 128000 },
+  ];
   const requests: Array<{
     method: string;
     path: string;
@@ -389,10 +393,7 @@ function startFakeChatGptOAuth(
         });
       }
       if (url.pathname === "/chatgpt/models") {
-        return Response.json({ models: [
-          { slug: "gpt-5.6-sol", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "max" }, { effort: "high" }], additional_speed_tiers: ["fast"], input_modalities: ["text", "image"], context_window: 272000 },
-          { slug: "gpt-5.4-mini", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "low" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 128000 },
-        ] });
+        return Response.json({ models });
       }
       if (url.pathname === "/chatgpt/responses") {
         responseCount += 1;
@@ -423,6 +424,9 @@ function startFakeChatGptOAuth(
       FX_E2E_OPENAI_CODEX_RESPONSES_URL: `${baseUrl}/chatgpt/responses`,
     },
     baseUrl,
+    setModels(next: typeof models) {
+      models = next;
+    },
     stop() {
       server.stop(true);
     },
@@ -446,6 +450,11 @@ function startFakeGrokOAuth(options: {
   }> = [];
   let tokenCalls = 0;
   let responseCalls = 0;
+  let models = [
+    { id: "grok-4.20", object: "model", input_modalities: ["text", "image"], output_modalities: ["text"] },
+    { id: "grok-4.6", object: "model", input_modalities: ["text", "image"], output_modalities: ["text"] },
+    { id: "grok-image-only", object: "model", input_modalities: ["text"], output_modalities: ["image"] },
+  ];
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
@@ -502,11 +511,7 @@ function startFakeGrokOAuth(options: {
         });
       }
       if (url.pathname === "/v1/language-models") {
-        return Response.json({ models: [
-          { id: "grok-4.20", object: "model", input_modalities: ["text", "image"], output_modalities: ["text"] },
-          { id: "grok-4.6", object: "model", input_modalities: ["text", "image"], output_modalities: ["text"] },
-          { id: "grok-image-only", object: "model", input_modalities: ["text"], output_modalities: ["image"] },
-        ] });
+        return Response.json({ models });
       }
       if (url.pathname === "/v1/responses") {
         responseCalls += 1;
@@ -536,6 +541,9 @@ function startFakeGrokOAuth(options: {
       FX_E2E_GROK_REVOKE_URL: `${baseUrl}/oauth2/revoke`,
       FX_E2E_XAI_GROK_MODELS_URL: `${baseUrl}/v1/language-models`,
       FX_E2E_XAI_GROK_RESPONSES_URL: `${baseUrl}/v1/responses`,
+    },
+    setModels(next: typeof models) {
+      models = next;
     },
     stop() { server.stop(true); },
   };
@@ -598,18 +606,17 @@ async function completeDisplayedCodexLogin(
   activeSession: TmuxSession,
   fixture: ReturnType<typeof startFakeChatGptOAuth>,
 ) {
-  await activeSession.resizeWindow(500, 20);
-  const pane = await activeSession.waitForPane(
-    (value) => value.includes(`${fixture.baseUrl}/oauth/authorize?`),
-    TIMEOUT,
-  );
-  const authorizationUrl = pane
-    .split(/\s+/)
-    .find((value) => value.startsWith(`${fixture.baseUrl}/oauth/authorize?`));
-  if (!authorizationUrl) throw new Error("Codex authorization URL was not rendered");
+  await activeSession.waitForText("Authorize with Codex", TIMEOUT);
+  const escapes = await activeSession.capturePaneEscapes();
+  const urlStart = escapes.indexOf(`${fixture.baseUrl}/oauth/authorize?`);
+  const linkStart = escapes.lastIndexOf("\x1b]8;", urlStart);
+  const urlEnd = escapes.indexOf("\x1b\\", urlStart);
+  if (urlStart < 0 || linkStart < 0 || urlEnd < 0) {
+    throw new Error("Codex authorization hyperlink was not rendered");
+  }
+  const authorizationUrl = escapes.slice(urlStart, urlEnd);
   const response = await fetch(authorizationUrl, { redirect: "follow" });
   expect(response.status).toBe(200);
-  await activeSession.resizeWindow(100, 30);
 }
 
 async function runCodexLoginWithBrowser(
@@ -905,12 +912,16 @@ tmuxTest(
     const signInScreen = await session.waitForPane(
       (pane) =>
         pane.includes("Sign in with Codex") &&
-        pane.includes(`${chatgptOauth!.baseUrl}/oauth/authorize?`) &&
+        pane.includes("Authorize with Codex") &&
         pane.includes("Waiting for authorization") &&
         pane.includes("Enter reopens browser · Esc cancels"),
       TIMEOUT,
     );
     expect(signInScreen).not.toContain("Code   ");
+    expect(signInScreen).not.toContain(`${chatgptOauth.baseUrl}/oauth/authorize?`);
+    const signInEscapes = await session.capturePaneEscapes();
+    expect(signInEscapes).toContain(`\x1b]8;;${chatgptOauth.baseUrl}/oauth/authorize?`);
+    expect(signInEscapes).toContain("\x1b]8;;\x1b\\");
     await session.sendKeys("C-c");
     await session.waitForComposer(TIMEOUT);
 
@@ -923,7 +934,7 @@ tmuxTest(
 );
 
 tmuxTest(
-  "provider switch completes Codex browser OAuth and round-trips without reauthentication",
+  "setup provider switch reauthenticates current Codex and replaces an unavailable model",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-chatgpt-success-"));
     stderrPath = join(home, "stderr.log");
@@ -949,8 +960,7 @@ tmuxTest(
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/model openai/gpt-5.6-sol");
     await session.waitForText("Switched to openai/gpt-5.6-sol", TIMEOUT);
-    await session.sendText("/provider");
-    await session.waitForText("Switch provider", TIMEOUT);
+    await openProviderPicker(session);
     await session.sendKeys("Down");
     await session.sendKeys("Enter");
     await session.waitForText("Sign in with Codex", TIMEOUT);
@@ -973,7 +983,8 @@ tmuxTest(
         pane.includes("gpt-5.4-mini"),
       TIMEOUT,
     );
-    expect(picker).not.toContain("openai/gpt-5.6-sol");
+    const pickerRows = picker.split("\n").filter((line) => /^\s+gpt-/.test(line));
+    expect(pickerRows.join("\n")).not.toContain("openai/gpt-5.6-sol");
     await session.sendKeys("Escape");
     await session.sendKeys("C-c");
     await session.waitForComposer(TIMEOUT);
@@ -1027,12 +1038,9 @@ tmuxTest(
     const settingsPath = join(home, ".fx", "settings.json");
     const gatewayModelBefore = JSON.parse(readFileSync(settingsPath, "utf8")).model;
     expect(typeof gatewayModelBefore).toBe("string");
-    await session.sendLiteralText("/model gpt-5.4-mini low");
-    await session.sendKeys("Enter");
-    await session.waitForText("Switched to gpt-5.4-mini", TIMEOUT);
     const savedCodex = JSON.parse(readFileSync(settingsPath, "utf8"));
     expect(savedCodex.model).toBe(gatewayModelBefore);
-    expect(savedCodex.codex_model).toBe("gpt-5.4-mini");
+    expect(savedCodex.codex_model).toBe("gpt-5.6-sol");
     await session.sendText("/quit");
     await session.waitForSessionEnd(TIMEOUT);
     session = null;
@@ -1050,19 +1058,23 @@ tmuxTest(
     );
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/status");
-    await session.waitForText("model=gpt-5.4-mini", TIMEOUT);
-    await session.sendText("/provider gateway");
+    await session.waitForText("model=gpt-5.6-sol", TIMEOUT);
+    await openProviderPicker(session);
+    await session.sendKeys("Up");
+    await session.sendKeys("Enter");
     await session.waitForText("Switched to Vercel AI Gateway", TIMEOUT);
     const savedGateway = JSON.parse(readFileSync(settingsPath, "utf8"));
     expect(savedGateway.provider).toBe("gateway");
     expect(savedGateway.model).toBe(gatewayModelBefore);
-    expect(savedGateway.codex_model).toBe("gpt-5.4-mini");
-    await session.sendText("/provider codex");
+    expect(savedGateway.codex_model).toBe("gpt-5.6-sol");
+    await openProviderPicker(session);
+    await session.sendKeys("Down");
+    await session.sendKeys("Enter");
     await session.waitForText("Switched to Codex subscription", TIMEOUT);
     const restoredCodex = JSON.parse(readFileSync(settingsPath, "utf8"));
     expect(restoredCodex.provider).toBe("codex");
     expect(restoredCodex.model).toBe(gatewayModelBefore);
-    expect(restoredCodex.codex_model).toBe("gpt-5.4-mini");
+    expect(restoredCodex.codex_model).toBe("gpt-5.6-sol");
     expect(chatgptOauth.requests.filter((request) => request.path === "/oauth/authorize"))
       .toHaveLength(authorizeRequestsBeforeRoundTrip);
     await session.sendText("/logout codex");
@@ -1070,9 +1082,57 @@ tmuxTest(
     expect(existsSync(authPath)).toBe(false);
     await session.sendText("/status");
     await session.waitForText("model_source=Codex subscription", TIMEOUT);
+    chatgptOauth.setModels([
+      { slug: "gpt-5.4-mini", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "low" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 128000 },
+    ]);
+    await openProviderPicker(session);
+    await session.sendKeys("Enter");
+    await session.waitForText("Sign in with Codex", TIMEOUT);
+    await completeDisplayedCodexLogin(session, chatgptOauth);
+    await session.waitForText("Switched to Codex subscription with gpt-5.4-mini.", TIMEOUT);
+    const reauthenticated = JSON.parse(readFileSync(settingsPath, "utf8"));
+    expect(reauthenticated.provider).toBe("codex");
+    expect(reauthenticated.codex_model).toBe("gpt-5.4-mini");
+    expect(chatgptOauth.requests.filter((request) => request.path === "/oauth/authorize"))
+      .toHaveLength(authorizeRequestsBeforeRoundTrip + 1);
     await session.sendKeys("C-c");
 
     expect(session.isAlive()).toBe(true);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "interactive Codex login activates a Codex catalog model",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-chatgpt-login-activation-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    chatgptOauth = startFakeChatGptOAuth();
+
+    session = await startFx(
+      home,
+      stderrPath,
+      gateway,
+      undefined,
+      undefined,
+      { ...chatgptOauth.env, FX_MODEL: undefined },
+    );
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/login");
+    await session.waitForText("Sign in with Codex", TIMEOUT);
+    await session.sendKeys("Down");
+    await session.sendKeys("Enter");
+    await completeDisplayedCodexLogin(session, chatgptOauth);
+    await session.waitForText("Switched to Codex subscription with gpt-5.6-sol.", TIMEOUT);
+
+    const selected = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
+    expect(selected.provider).toBe("codex");
+    expect(selected.codex_model).toBe("gpt-5.6-sol");
+    await session.sendText("/status");
+    await session.waitForText("model_source=Codex subscription", TIMEOUT);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,
@@ -1141,7 +1201,7 @@ tmuxTest(
         pane.includes("Sign in with Codex") &&
         pane.includes("Sign in with Grok") &&
         pane.includes("API key") &&
-        pane.includes("Change team"),
+        pane.includes("Switch provider"),
       TIMEOUT,
     );
     expect(root).not.toContain("AI_GATEWAY_API_KEY");
@@ -1150,7 +1210,7 @@ tmuxTest(
     await session.sendKeys("Enter");
     await session.waitForText("Enter reopens browser · Esc cancels", TIMEOUT);
     await session.sendKeys("Escape");
-    await session.waitForText("Sign in with Grok", TIMEOUT);
+    await session.waitForText("Setup", TIMEOUT);
 
     await session.sendKeys("Down");
     await session.sendKeys("Down");
@@ -1159,7 +1219,13 @@ tmuxTest(
     const apiKey = await session.waitForText("Paste your AI Gateway API key", TIMEOUT);
     expect(apiKey).toContain("Saves to");
     await session.sendKeys("Escape");
-    await session.waitForText("Switch credential", TIMEOUT);
+    await session.waitForText("Setup", TIMEOUT);
+
+    await session.sendKeys("Down");
+    await session.sendKeys("Enter");
+    await session.waitForText("Switch provider", TIMEOUT);
+    await session.sendKeys("Escape");
+    await session.waitForText("Setup", TIMEOUT);
 
     await session.sendKeys("Down");
     await session.sendKeys("Enter");
@@ -1235,16 +1301,26 @@ async function waitForTrace(tracePath: string, needle: string): Promise<void> {
 }
 
 async function enterSwitchCredential(pickerSession: TmuxSession): Promise<void> {
-  for (let index = 0; index < 5; index += 1) {
+  for (let index = 0; index < 6; index += 1) {
     await pickerSession.sendKeys("Down");
   }
   await pickerSession.sendKeys("Enter");
   await pickerSession.waitForText("Use this credential", TIMEOUT);
 }
 
+async function openProviderPicker(pickerSession: TmuxSession): Promise<void> {
+  await pickerSession.sendText("/setup");
+  await pickerSession.waitForText("Setup", TIMEOUT);
+  for (let index = 0; index < 4; index += 1) {
+    await pickerSession.sendKeys("Down");
+  }
+  await pickerSession.sendKeys("Enter");
+  await pickerSession.waitForText("Switch provider", TIMEOUT);
+}
+
 async function openSwitchCredential(pickerSession: TmuxSession): Promise<void> {
   await pickerSession.sendText("/setup");
-  await pickerSession.waitForText("Sign in with Grok", TIMEOUT);
+  await pickerSession.waitForText("Setup", TIMEOUT);
   await enterSwitchCredential(pickerSession);
 }
 
@@ -1394,7 +1470,8 @@ tmuxTest(
     await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
 
     await session.sendText("/setup");
-    await session.waitForText("Change team", TIMEOUT);
+    await session.waitForText("Setup", TIMEOUT);
+    await session.sendKeys("Down");
     await session.sendKeys("Down");
     await session.sendKeys("Down");
     await session.sendKeys("Down");
@@ -1813,10 +1890,10 @@ test(
     const authPath = join(home, ".fx", "chatgpt-auth.json");
     expect(existsSync(authPath)).toBe(true);
     expect(statSync(authPath).mode & 0o077).toBe(0);
-
-    const selected = await runFx(["provider", "codex"], { env, timeoutMs: TIMEOUT });
-    expect(selected.code, `stdout: ${selected.stdout}\nstderr: ${selected.stderr}`).toBe(0);
-    expect(selected.stdout).toContain("Provider set to Codex.");
+    const settingsPath = join(home, ".fx", "settings.json");
+    const selected = JSON.parse(readFileSync(settingsPath, "utf8"));
+    expect(selected.provider).toBe("codex");
+    expect(selected.codex_model).toBe("gpt-5.6-sol");
 
     const models = await runFx(["models", "--json"], { env, timeoutMs: TIMEOUT });
     const modelIds = (JSON.parse(models.stdout) as { models: Array<{ id: string }> }).models
@@ -1910,10 +1987,9 @@ test(
       const authPath = join(home, ".fx", "grok-auth.json");
       expect(existsSync(authPath)).toBe(true);
       expect(statSync(authPath).mode & 0o077).toBe(0);
-
-      const selected = await runFx(["provider", "grok"], { env, timeoutMs: TIMEOUT });
-      expect(selected.code, `stdout: ${selected.stdout}\nstderr: ${selected.stderr}`).toBe(0);
-      expect(selected.stdout).toContain("Provider set to Grok.");
+      const settings = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
+      expect(settings.provider).toBe("grok");
+      expect(settings.grok_model).toBe("grok-4.20");
 
       const models = await runFx(["models", "--json"], { env, timeoutMs: TIMEOUT });
       const modelIds = (JSON.parse(models.stdout) as { models: Array<{ id: string }> }).models
@@ -2080,7 +2156,7 @@ test("Grok CLI sends verified images directly without advertising the vision fal
 });
 
 tmuxTest(
-  "interactive provider switch completes Grok OAuth and round-trips without reauthentication",
+  "interactive Grok login activates Grok and setup round-trips without reauthentication",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-grok-tui-switch-"));
     stderrPath = join(home, "stderr.log");
@@ -2093,16 +2169,26 @@ tmuxTest(
       });
       await session.waitForText("auto ·", TIMEOUT);
 
-      await session.sendText("/provider grok");
+      await session.sendText("/login");
+      await session.waitForText("Sign in with Grok", TIMEOUT);
+      await session.sendKeys("Down");
+      await session.sendKeys("Down");
+      await session.sendKeys("Enter");
       await completeDisplayedGrokLogin(session, grok);
       await session.waitForText("Switched to Grok subscription with grok-4.20.", TIMEOUT);
       await session.sendText("Answer from Grok.");
       await session.waitForText("GROK_DIRECT_RESPONSE", TIMEOUT);
 
       const tokenCallsAfterLogin = grok.tokenCalls();
-      await session.sendText("/provider gateway");
+      await openProviderPicker(session);
+      await session.sendKeys("Up");
+      await session.sendKeys("Up");
+      await session.sendKeys("Enter");
       await session.waitForText("Switched to Vercel AI Gateway", TIMEOUT);
-      await session.sendText("/provider grok");
+      await openProviderPicker(session);
+      await session.sendKeys("Down");
+      await session.sendKeys("Down");
+      await session.sendKeys("Enter");
       await session.waitForText("Switched to Grok subscription with grok-4.20.", TIMEOUT);
       expect(grok.tokenCalls()).toBe(tokenCallsAfterLogin);
 
@@ -2252,6 +2338,71 @@ test(
       for (const request of [...gateway.requests, ...gateway.modelRequests]) {
         expect(request.headers.get("authorization")).not.toContain("grok-tool-loop-token");
       }
+    } finally {
+      grok.stop();
+    }
+  },
+  60_000,
+);
+
+test(
+  "Codex CLI login preserves durable auth but does not claim success when activation fails",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-cli-activation-failure-"));
+    gateway = startFakeGateway([]);
+    chatgptOauth = startFakeChatGptOAuth();
+    chatgptOauth.setModels([]);
+    const env = {
+      HOME: home,
+      AI_GATEWAY_API_KEY: ENV_TOKEN,
+      VERCEL_OIDC_TOKEN: undefined,
+      FX_DISABLE_KEYCHAIN: "1",
+      FX_SKIP_ONBOARDING: "1",
+      FX_AUTO_UPGRADE: "0",
+      FX_NO_OPEN_BROWSER: "1",
+      FX_GATEWAY_BASE_URL: gateway.baseUrl,
+      FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+      ...chatgptOauth.env,
+    };
+
+    const login = await runCodexLoginWithBrowser(env);
+    expect(login.code).toBe(1);
+    expect(login.stdout).not.toContain("Signed in with Codex.");
+    expect(login.stderr).toContain("fx login: could not load the target model catalog (malformed_response)");
+    expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(true);
+    const settingsPath = join(home, ".fx", "settings.json");
+    expect(existsSync(settingsPath)).toBe(false);
+  },
+  60_000,
+);
+
+test(
+  "Grok CLI login preserves durable auth but does not claim success when activation fails",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-grok-cli-activation-failure-"));
+    gateway = startFakeGateway([]);
+    const grok = startFakeGrokOAuth();
+    grok.setModels([]);
+    try {
+      const env = {
+        HOME: home,
+        AI_GATEWAY_API_KEY: ENV_TOKEN,
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_SKIP_ONBOARDING: "1",
+        FX_AUTO_UPGRADE: "0",
+        FX_NO_OPEN_BROWSER: "1",
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        ...grok.env,
+      };
+
+      const login = await runGrokLoginWithBrowser(env);
+      expect(login.code).toBe(1);
+      expect(login.stdout).not.toContain("Signed in with Grok.");
+      expect(login.stderr).toContain("fx login: target model catalog is empty");
+      expect(existsSync(join(home, ".fx", "grok-auth.json"))).toBe(true);
+      expect(existsSync(join(home, ".fx", "settings.json"))).toBe(false);
     } finally {
       grok.stop();
     }
@@ -2805,7 +2956,8 @@ tmuxTest(
         pane.includes("Setup") &&
         pane.includes("Sign in with Vercel") &&
         pane.includes("Sign in with Grok") &&
-        pane.includes("API key"),
+        pane.includes("API key") &&
+        pane.includes("Switch provider"),
       TIMEOUT,
     );
     expect(inventory).not.toMatch(/^\s+fx login\s+/m);
@@ -2903,7 +3055,7 @@ tmuxTest(
         pane.includes("fx login credential refresh failed.") &&
         pane.includes("Choose another source below") &&
         pane.includes("Setup") &&
-        pane.includes("Sign in with Grok"),
+        pane.includes("Switch provider"),
       TIMEOUT,
     );
     expect(failed).toContain(`${promptHead}${promptTail}`);
@@ -3137,7 +3289,7 @@ tmuxTest(
       (pane) =>
         pane.includes(blockedPrompt) &&
         pane.includes("fx login credential refresh failed.") &&
-        pane.includes("Sign in with Grok"),
+        pane.includes("Switch provider"),
       TIMEOUT,
     );
     expect(gateway.requests).toHaveLength(0);
@@ -3209,7 +3361,7 @@ tmuxTest(
       (pane) =>
         pane.includes(firstPrompt) &&
         pane.includes("fx login credential refresh failed.") &&
-        pane.includes("Sign in with Grok"),
+        pane.includes("Switch provider"),
       TIMEOUT,
     );
     expect(firstFailure).toContain("Choose another source below.");
@@ -3244,7 +3396,7 @@ tmuxTest(
       (pane) =>
         pane.includes(secondPrompt) &&
         pane.includes("fx login credential refresh failed.") &&
-        pane.includes("Sign in with Grok"),
+        pane.includes("Switch provider"),
       TIMEOUT,
     );
     expect(gateway.requests).toHaveLength(0);

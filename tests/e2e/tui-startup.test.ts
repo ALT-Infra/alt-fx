@@ -40,7 +40,7 @@ describe.skipIf(SKIP)("tui: startup and exit", () => {
       session = await TmuxSession.create();
       await session.waitForComposer(10_000);
       await session.sendText("/help");
-      const pane = await session.waitForText("Commands 39", 5_000);
+      const pane = await session.waitForText("Commands 38", 5_000);
       expect(pane).toContain("General");
       expect(pane).toContain("Enter Open");
       expect(pane).not.toContain("Run /help for commands");
@@ -367,7 +367,7 @@ describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {
 
 describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
   test(
-    "/setup opens the provider-aware setup hub without source rows",
+    "/setup opens account and provider actions without source rows",
     async () => {
       const home = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-direct-setup-")));
       session = await TmuxSession.create({
@@ -390,7 +390,7 @@ describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
           pane.includes("Sign in with Codex") &&
           pane.includes("Sign in with Grok") &&
           pane.includes("API key") &&
-          pane.includes("Change team"),
+          pane.includes("Switch provider"),
         TIMEOUT,
       );
       expect(setup).not.toContain("AI_GATEWAY_API_KEY");
