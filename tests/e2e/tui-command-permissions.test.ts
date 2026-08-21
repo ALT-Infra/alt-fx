@@ -1356,7 +1356,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "TUI yolo user-profile command keeps its provisional row before following transcript text",
+    "TUI yolo user-profile command waits for authoritative arguments after streamed text",
     async () => {
       const root = createIsolatedRoot();
       const streamText = "DIRECT_NO_NOTICE_STREAM_TEXT";
@@ -1402,7 +1402,9 @@ describe("effect-aware command permissions", () => {
       const completedIndex = scrollback.indexOf("● Ran");
       const streamTextIndex = scrollback.indexOf(streamText);
       expect(completedIndex).toBeGreaterThanOrEqual(0);
-      expect(streamTextIndex).toBeGreaterThan(completedIndex);
+      expect(streamTextIndex).toBeGreaterThanOrEqual(0);
+      expect(completedIndex).toBeGreaterThan(streamTextIndex);
+      expect(scrollback).not.toContain("Preparing command");
       expect(scrollback).not.toContain("Auto agent approved this request");
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.classifierRequests).toHaveLength(0);
