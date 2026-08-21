@@ -1,22 +1,28 @@
 const std = @import("std");
 const command_classification = @import("../shell_command/command_classification.zig");
 
-const RiskKind = enum {
+pub const DestructiveEffect = enum {
     discard_version_control_state,
-    forceful_file_removal,
+    remove_files,
 };
+
+/// Returns a destructive effect only when it appears at an executed command
+/// position. Unknown wrappers and quoted or argument text remain unresolved.
+pub fn destructive_effect_for(command: []const u8) ?DestructiveEffect {
+    const analysis = command_classification.analysis_command_tail(command);
+    return destructive_effect_in_analysis(analysis);
+}
 
 /// Returns a short policy note for command text with a high-risk shape.
 pub fn command_risk_note_for(command: []const u8) ?[]const u8 {
-    const analysis = command_classification.analysis_command_tail(command);
-    const risk = risk_kind_in_analysis(analysis) orelse return null;
+    const risk = destructive_effect_for(command) orelse return null;
     return risk_note_for(risk);
 }
 
 /// Returns a narrow alternative when the command text has an unambiguous safer path.
 pub fn command_safer_alternative_for(command: []const u8) ?[]const u8 {
     const analysis = command_classification.analysis_command_tail(command);
-    if (risk_kind_in_analysis(analysis)) |risk| {
+    if (destructive_effect_in_analysis(analysis)) |risk| {
         return safer_alternative_for_risk(risk);
     }
 
@@ -37,17 +43,17 @@ pub fn command_safer_alternative_for(command: []const u8) ?[]const u8 {
     return null;
 }
 
-fn risk_note_for(risk: RiskKind) []const u8 {
+fn risk_note_for(risk: DestructiveEffect) []const u8 {
     return switch (risk) {
         .discard_version_control_state => "note: command may discard version-control state",
-        .forceful_file_removal => "note: command may remove files forcefully",
+        .remove_files => "note: command may remove files forcefully",
     };
 }
 
-fn safer_alternative_for_risk(risk: RiskKind) []const u8 {
+fn safer_alternative_for_risk(risk: DestructiveEffect) []const u8 {
     return switch (risk) {
         .discard_version_control_state => "safer: inspect git status first and revert only the intended files",
-        .forceful_file_removal => "safer: inspect targets first or use delete_file for explicit files",
+        .remove_files => "safer: inspect targets first or use delete_file for explicit files",
     };
 }
 
@@ -75,7 +81,7 @@ pub fn semantic_exit_annotation(command_text: []const u8, exit_code: i64, stderr
     return null;
 }
 
-fn risk_kind_in_analysis(command: []const u8) ?RiskKind {
+fn destructive_effect_in_analysis(command: []const u8) ?DestructiveEffect {
     if (warning_at_command_position(command)) |risk| return risk;
 
     var in_single = false;
@@ -124,7 +130,7 @@ fn risk_kind_in_analysis(command: []const u8) ?RiskKind {
     return null;
 }
 
-fn warning_at_command_position(command: []const u8) ?RiskKind {
+fn warning_at_command_position(command: []const u8) ?DestructiveEffect {
     var cursor = command_classification.skip_whitespace(command, 0);
     while (command_classification.next_token(command, cursor)) |token| {
         if (!command_classification.is_env_assignment(token.text)) break;
@@ -137,8 +143,8 @@ fn warning_at_command_position(command: []const u8) ?RiskKind {
     }
 
     const rest = command[first.end..];
-    if (git_hard_reset(first.text, rest)) |risk| return risk;
-    if (forceful_file_removal(first.text, rest)) |risk| return risk;
+    if (git_destructive_effect(first.text, rest)) |risk| return risk;
+    if (file_removal_effect(first.text)) |risk| return risk;
     return null;
 }
 
@@ -233,37 +239,108 @@ fn parse_su_command_argument(command: []const u8, start: usize) ?[]const u8 {
     return token.text;
 }
 
-fn git_hard_reset(command_name: []const u8, rest: []const u8) ?RiskKind {
-    if (!std.mem.eql(u8, command_name, "git")) return null;
+fn git_destructive_effect(command_name: []const u8, rest: []const u8) ?DestructiveEffect {
+    if (!std.mem.eql(u8, std.fs.path.basename(command_name), "git")) return null;
 
-    const sub = command_classification.next_token(rest, 0) orelse return null;
+    const sub = git_subcommand(rest) orelse return null;
     const args = rest[sub.end..];
 
     if (std.mem.eql(u8, sub.text, "reset") and has_token(args, "--hard")) {
         return .discard_version_control_state;
     }
+    if ((std.mem.eql(u8, sub.text, "clean") or
+        std.mem.eql(u8, sub.text, "rm")) and
+        !has_dry_run_flag(args))
+    {
+        return .remove_files;
+    }
     return null;
 }
 
-fn forceful_file_removal(command_name: []const u8, rest: []const u8) ?RiskKind {
-    if (!std.mem.eql(u8, command_name, "rm")) return null;
+fn git_subcommand(rest: []const u8) ?command_classification.Token {
+    var offset: usize = 0;
+    while (command_classification.next_token(rest, offset)) |token| {
+        if (std.mem.eql(u8, token.text, "--")) {
+            return command_classification.next_token(rest, token.end);
+        }
+        if (!std.mem.startsWith(u8, token.text, "-")) return token;
+        if (git_global_option_takes_value(token.text)) {
+            const value = command_classification.next_token(rest, token.end) orelse return null;
+            offset = value.end;
+            continue;
+        }
+        if (git_global_option_has_inline_value(token.text) or
+            git_global_flag(token.text))
+        {
+            offset = token.end;
+            continue;
+        }
+        return null;
+    }
+    return null;
+}
 
-    var has_recursive = false;
-    var has_force = false;
+fn git_global_option_takes_value(option: []const u8) bool {
+    return std.mem.eql(u8, option, "-C") or
+        std.mem.eql(u8, option, "-c") or
+        std.mem.eql(u8, option, "--git-dir") or
+        std.mem.eql(u8, option, "--work-tree") or
+        std.mem.eql(u8, option, "--namespace") or
+        std.mem.eql(u8, option, "--config-env");
+}
+
+fn git_global_option_has_inline_value(option: []const u8) bool {
+    if (std.mem.startsWith(u8, option, "-C") and option.len > 2) return true;
+    if (std.mem.startsWith(u8, option, "-c") and option.len > 2) return true;
+    for ([_][]const u8{
+        "--git-dir=",
+        "--work-tree=",
+        "--namespace=",
+        "--config-env=",
+    }) |prefix| {
+        if (std.mem.startsWith(u8, option, prefix) and option.len > prefix.len) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn git_global_flag(option: []const u8) bool {
+    return std.mem.eql(u8, option, "--bare") or
+        std.mem.eql(u8, option, "--no-replace-objects") or
+        std.mem.eql(u8, option, "--literal-pathspecs") or
+        std.mem.eql(u8, option, "--glob-pathspecs") or
+        std.mem.eql(u8, option, "--noglob-pathspecs") or
+        std.mem.eql(u8, option, "--icase-pathspecs") or
+        std.mem.eql(u8, option, "--no-optional-locks") or
+        std.mem.eql(u8, option, "--no-pager") or
+        std.mem.eql(u8, option, "--paginate") or
+        std.mem.eql(u8, option, "-p") or
+        std.mem.eql(u8, option, "-P");
+}
+
+fn file_removal_effect(command_name: []const u8) ?DestructiveEffect {
+    const executable = std.fs.path.basename(command_name);
+    return if (std.mem.eql(u8, executable, "rm") or
+        std.mem.eql(u8, executable, "rmdir") or
+        std.mem.eql(u8, executable, "unlink") or
+        std.mem.eql(u8, executable, "shred"))
+        .remove_files
+    else
+        null;
+}
+
+fn has_dry_run_flag(rest: []const u8) bool {
     var cursor: usize = 0;
     while (command_classification.next_token(rest, cursor)) |token| {
         cursor = token.end;
-        if (!std.mem.startsWith(u8, token.text, "-")) continue;
-        if (std.mem.eql(u8, token.text, "--recursive") or std.mem.eql(u8, token.text, "-r") or std.mem.eql(u8, token.text, "-R")) has_recursive = true;
-        if (std.mem.eql(u8, token.text, "--force") or std.mem.eql(u8, token.text, "-f")) has_force = true;
-        if (token.text.len > 1 and token.text[1] != '-') {
-            for (token.text[1..]) |ch| {
-                if (ch == 'r' or ch == 'R') has_recursive = true;
-                if (ch == 'f') has_force = true;
-            }
+        if (std.mem.eql(u8, token.text, "--dry-run") or
+            std.mem.eql(u8, token.text, "-n")) return true;
+        if (token.text.len > 2 and token.text[0] == '-' and token.text[1] != '-') {
+            if (std.mem.findScalar(u8, token.text[1..], 'n') != null) return true;
         }
     }
-    return if (has_recursive or has_force) .forceful_file_removal else null;
+    return false;
 }
 
 fn is_pattern_matcher(command: []const u8) bool {
@@ -346,6 +423,42 @@ test "command risk note stays narrow for ordinary git operations" {
 
 test "command risk note detects forceful removal" {
     try std.testing.expectEqualStrings("note: command may remove files forcefully", command_risk_note_for("rm -rf /tmp/x").?);
+}
+
+test "command risk note detects direct destructive effects only" {
+    for ([_][]const u8{
+        "rm scratch.txt",
+        "rmdir generated",
+        "unlink stale-link",
+        "shred secret.txt",
+        "git clean -fd",
+        "git rm tracked.txt",
+        "/bin/rm scratch.txt",
+        "/usr/bin/git clean -fd",
+        "git -C nested clean -fd",
+        "git --git-dir=.git rm tracked.txt",
+    }) |command| {
+        try std.testing.expectEqual(
+            DestructiveEffect.remove_files,
+            destructive_effect_for(command).?,
+        );
+        try std.testing.expectEqualStrings(
+            "note: command may remove files forcefully",
+            command_risk_note_for(command).?,
+        );
+    }
+
+    try std.testing.expect(command_risk_note_for("git clean --dry-run") == null);
+    try std.testing.expect(command_risk_note_for("git clean -nd") == null);
+    try std.testing.expect(command_risk_note_for("git -C nested clean --dry-run") == null);
+    try std.testing.expect(command_risk_note_for("git rm --dry-run tracked.txt") == null);
+    try std.testing.expect(command_risk_note_for("git -C clean status") == null);
+    try std.testing.expect(command_risk_note_for("git --unknown clean -fd") == null);
+    try std.testing.expect(command_risk_note_for("rtk rm -rf generated") == null);
+    try std.testing.expectEqual(
+        DestructiveEffect.discard_version_control_state,
+        destructive_effect_for("git reset --hard HEAD~1").?,
+    );
 }
 
 test "command risk note detects privilege-wrapped removal" {
