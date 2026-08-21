@@ -3179,6 +3179,7 @@ pub fn Runtime(comptime App: type) type {
             var result = host.executeHumanCommand(app.alloc, &mutation.command, .{
                 .invocation_id = mutation.invocation_id,
                 .defaults = .{
+                    .provider = provider_runtime.provider(app),
                     .model = provider_runtime.model(app),
                     .effort = app.effort,
                     .fast_mode = if (comptime @hasField(App, "fast_mode")) app.fast_mode else false,

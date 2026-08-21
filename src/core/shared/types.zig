@@ -1552,6 +1552,7 @@ pub const BackendKind = enum {
 pub const ToolChoice = enum {
     auto,
     none,
+    required,
 
     pub fn label(self: ToolChoice) []const u8 {
         return @tagName(self);

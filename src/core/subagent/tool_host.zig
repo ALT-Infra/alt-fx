@@ -21,6 +21,7 @@ const session_codec = @import("../session/session_codec.zig");
 const session_store = @import("../session/session_store.zig");
 const mcp_access = @import("../mcp/access_policy.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
+const model_provider = @import("../config/model_provider.zig");
 const permissions = @import("../permissions/permissions.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
@@ -103,6 +104,7 @@ fn recoveryStateAfterFinish(outcome: RecoveryFinishOutcome) RecoveryState {
 pub const BackgroundRecoveryError = error{ThreadSpawnFailed};
 
 pub const Defaults = struct {
+    provider: model_provider.ProviderId,
     model: []const u8,
     effort: types.ReasoningEffort,
     fast_mode: bool = false,
@@ -2175,6 +2177,7 @@ fn freshChildState(
         .updated_at_ms = now,
         .conversation_language = defaults.conversation_language,
         .preferences = .{
+            .provider = defaults.provider,
             .model = model,
             .effort = create.configuration.effort orelse defaults.effort,
             .fast_mode = defaults.fast_mode,
@@ -2183,6 +2186,31 @@ fn freshChildState(
         .total_input_tokens = 0,
         .total_output_tokens = 0,
     };
+}
+
+test "fresh child state persists its provider with the model" {
+    const alloc = std.testing.allocator;
+    var command = try domain.validateCommand(alloc, .{ .create = .{
+        .name = "codex-child",
+        .mode = .persistent,
+    } });
+    defer command.deinit(alloc);
+    var state = try freshChildState(
+        alloc,
+        "01J00000000000000000000000",
+        "/tmp/workspace",
+        command.create,
+        .{
+            .provider = .codex,
+            .model = "gpt-5.6-sol",
+            .effort = types.ReasoningEffort.literal("high"),
+            .conversation_language = session.ConversationLanguage.literal("en"),
+        },
+    );
+    defer state.deinit(alloc);
+
+    try std.testing.expectEqual(model_provider.ProviderId.codex, state.preferences.provider);
+    try std.testing.expectEqualStrings("gpt-5.6-sol", state.preferences.model);
 }
 
 fn reservationWasCommitted(
@@ -2915,6 +2943,7 @@ fn testOptions(caller_id: []const u8, invocation_id: []const u8) ExecuteOptions 
         .caller_id = caller_id,
         .invocation_id = invocation_id,
         .defaults = .{
+            .provider = .gateway,
             .model = "test/model",
             .effort = types.ReasoningEffort.literal("high"),
             .conversation_language = session.ConversationLanguage.literal("en"),
@@ -2928,6 +2957,7 @@ fn testHumanOptions(invocation_id: []const u8) HumanCommandOptions {
     return .{
         .invocation_id = invocation_id,
         .defaults = .{
+            .provider = .gateway,
             .model = "test/model",
             .effort = types.ReasoningEffort.literal("high"),
             .conversation_language = session.ConversationLanguage.literal("en"),

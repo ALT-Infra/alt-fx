@@ -469,9 +469,16 @@ async function runCodexLoginWithBrowser(
   return { code, stdout, stderr };
 }
 
-function startFakeCodexToolLoop() {
+function startFakeCodexToolLoop(options: {
+  toolName?: string;
+  toolArguments?: object;
+  finalText?: string;
+} = {}) {
   const bodies: string[] = [];
   const accessToken = chatgptAccessToken("acct_tool_loop");
+  const toolName = options.toolName ?? "read_file";
+  const toolArguments = options.toolArguments ?? { path: "README.md" };
+  const finalText = options.finalText ?? "CODEX_TOOL_LOOP_OK";
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
@@ -487,14 +494,14 @@ function startFakeCodexToolLoop() {
         return new Response(
           'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning"}}\n\n' +
             'data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_tool","type":"reasoning","summary":[],"encrypted_content":"opaque-tool-loop"}}\n\n' +
-            'data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_read","name":"read_file"}}\n\n' +
-            'data: {"type":"response.function_call_arguments.done","output_index":1,"arguments":"{\\"path\\":\\"README.md\\"}"}\n\n' +
+            `data: ${JSON.stringify({ type: "response.output_item.added", output_index: 1, item: { type: "function_call", call_id: "call_tool", name: toolName } })}\n\n` +
+            `data: ${JSON.stringify({ type: "response.function_call_arguments.done", output_index: 1, arguments: JSON.stringify(toolArguments) })}\n\n` +
             'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":5,"output_tokens":2}}}\n\n',
           { headers: { "content-type": "text/event-stream" } },
         );
       }
       return new Response(
-        'data: {"type":"response.output_text.delta","delta":"CODEX_TOOL_LOOP_OK"}\n\n' +
+        `data: ${JSON.stringify({ type: "response.output_text.delta", delta: finalText })}\n\n` +
           'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":7,"output_tokens":3}}}\n\n',
         { headers: { "content-type": "text/event-stream" } },
       );
@@ -665,6 +672,8 @@ tmuxTest(
       },
     );
     await session.waitForComposer(TIMEOUT);
+    await session.sendText("/model openai/gpt-5.6-sol");
+    await session.waitForText("Switched to openai/gpt-5.6-sol", TIMEOUT);
     await session.sendText("/provider");
     await session.waitForText("Switch provider", TIMEOUT);
     await session.sendKeys("Down");
@@ -740,10 +749,45 @@ tmuxTest(
     const authorizeRequestsBeforeRoundTrip = chatgptOauth.requests.filter(
       (request) => request.path === "/oauth/authorize",
     ).length;
+    const settingsPath = join(home, ".fx", "settings.json");
+    const gatewayModelBefore = JSON.parse(readFileSync(settingsPath, "utf8")).model;
+    expect(typeof gatewayModelBefore).toBe("string");
+    await session.sendLiteralText("/model gpt-5.4-mini low");
+    await session.sendKeys("Enter");
+    await session.waitForText("Switched to gpt-5.4-mini", TIMEOUT);
+    const savedCodex = JSON.parse(readFileSync(settingsPath, "utf8"));
+    expect(savedCodex.model).toBe(gatewayModelBefore);
+    expect(savedCodex.codex_model).toBe("gpt-5.4-mini");
+    await session.sendText("/quit");
+    await session.waitForSessionEnd(TIMEOUT);
+    session = null;
+
+    session = await startFx(
+      home,
+      stderrPath,
+      gateway,
+      undefined,
+      undefined,
+      {
+        ...chatgptOauth.env,
+        FX_MODEL: undefined,
+      },
+    );
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/status");
+    await session.waitForText("model=gpt-5.4-mini", TIMEOUT);
     await session.sendText("/provider gateway");
     await session.waitForText("Switched to Vercel AI Gateway", TIMEOUT);
+    const savedGateway = JSON.parse(readFileSync(settingsPath, "utf8"));
+    expect(savedGateway.provider).toBe("gateway");
+    expect(savedGateway.model).toBe(gatewayModelBefore);
+    expect(savedGateway.codex_model).toBe("gpt-5.4-mini");
     await session.sendText("/provider codex");
     await session.waitForText("Switched to Codex subscription", TIMEOUT);
+    const restoredCodex = JSON.parse(readFileSync(settingsPath, "utf8"));
+    expect(restoredCodex.provider).toBe("codex");
+    expect(restoredCodex.model).toBe(gatewayModelBefore);
+    expect(restoredCodex.codex_model).toBe("gpt-5.4-mini");
     expect(chatgptOauth.requests.filter((request) => request.path === "/oauth/authorize"))
       .toHaveLength(authorizeRequestsBeforeRoundTrip);
     await session.sendText("/logout codex");
@@ -1567,6 +1611,62 @@ test(
       expect(codex.bodies).toHaveLength(2);
       expect(codex.bodies[1]).toContain('"encrypted_content":"opaque-tool-loop"');
       expect(codex.bodies[1]).toContain('"type":"function_call_output"');
+      for (const request of [...gateway.requests, ...gateway.modelRequests]) {
+        expect(request.headers.get("authorization")).not.toBe(`Bearer ${codex.accessToken}`);
+      }
+    } finally {
+      codex.stop();
+    }
+  },
+  60_000,
+);
+
+test(
+  "Codex rejects the vision fallback without another provider request",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-vision-disabled-"));
+    gateway = startFakeGateway([]);
+    const codex = startFakeCodexToolLoop({
+      toolName: "vision",
+      toolArguments: { image_ids: [1], focus: "Inspect the image." },
+      finalText: "CODEX_VISION_DISABLED_OK",
+    });
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol" }) + "\n",
+        { mode: 0o600 },
+      );
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Answer without using a vision fallback."],
+        {
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: "gateway-vision-sentinel",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_AUTO_UPGRADE: "0",
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+            FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(result.stdout).toContain("CODEX_VISION_DISABLED_OK");
+      expect(codex.bodies).toHaveLength(2);
+      expect(codex.bodies[0]).not.toContain('"name":"vision"');
+      const continuation = JSON.parse(codex.bodies[1]) as {
+        input: Array<{ type?: string; output?: string }>;
+      };
+      const toolResult = continuation.input.find(
+        (item) => item.type === "function_call_output",
+      );
+      expect(toolResult?.output).toContain("Vision is unavailable for this request.");
+      expect(toolResult?.output).toContain("native image input");
       for (const request of [...gateway.requests, ...gateway.modelRequests]) {
         expect(request.headers.get("authorization")).not.toBe(`Bearer ${codex.accessToken}`);
       }

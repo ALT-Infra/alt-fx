@@ -270,6 +270,16 @@ fn runAskChild(
     return subagent_agent_adapter.run(.{
         .host = ctx.subagent_host orelse return error.ProviderFailed,
         .tool_context = ctx.toolContext(),
+        .provider_routes = .{
+            .gateway = .{
+                .agent_stream_provider = ctx.cfg.gateway_provider.agent_stream,
+                .permission_reviewer_provider = ctx.cfg.permission_reviewer_provider,
+            },
+            .codex = .{
+                .agent_stream_provider = ctx.cfg.codex_agent_stream orelse agent_stream_provider.unavailable_provider,
+                .permission_reviewer_provider = ctx.cfg.codex_permission_reviewer_provider,
+            },
+        },
         .system_prompt = ctx.cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = ctx.cfg.prompt_policy.modelPromptOverlay(admission.model),
         .skills_prompt_section = ctx.subagent_skills_prompt,

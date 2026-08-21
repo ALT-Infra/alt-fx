@@ -8,6 +8,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
+const model_provider = @import("../config/model_provider.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const permissions = @import("../permissions/permissions.zig");
 const sandbox = @import("../permissions/sandbox.zig");
@@ -765,7 +766,10 @@ pub fn Commands(comptime App: type) type {
 
         pub fn selectModelFromPicker(app: *App, model: []const u8, effort: types.ReasoningEffort, fast_mode: bool) !void {
             try setResolvedModelRuntime(app, model, true);
-            var patch = app_session_runtime.SessionPreferencePatch{ .model = model };
+            var patch = app_session_runtime.SessionPreferencePatch{
+                .provider = provider_runtime.provider(app),
+                .model = model,
+            };
             const capabilities = model_capabilities.resolveForApp(App, app, model);
             if (capabilities.reasoning_efforts.len == 0) {
                 if (capabilities.supports_fast_mode) {
@@ -1038,7 +1042,10 @@ pub fn Commands(comptime App: type) type {
             try setResolvedModelRuntime(app, resolved, announce);
             try persistPreferenceTargets(
                 app,
-                .{ .model = resolved },
+                .{
+                    .provider = provider_runtime.provider(app),
+                    .model = resolved,
+                },
                 "model",
                 !announce,
             );
@@ -1057,11 +1064,7 @@ pub fn Commands(comptime App: type) type {
                 var committed = app_session_runtime.PreferenceCommitResult{};
                 const attempt = config_runtime.attemptUserPreferences(
                     app.alloc,
-                    .{
-                        .model = patch.model,
-                        .effort = patch.effort,
-                        .fast_mode = patch.fast_mode,
-                    },
+                    patch.userSettingsPatch(),
                 );
                 switch (attempt) {
                     .outcome => |outcome| committed.settings_outcome = outcome,
@@ -1091,11 +1094,7 @@ pub fn Commands(comptime App: type) type {
                 _ = try reportUserSettingsCommit(
                     app,
                     label,
-                    .{
-                        .model = patch.model,
-                        .effort = patch.effort,
-                        .fast_mode = patch.fast_mode,
-                    },
+                    patch.userSettingsPatch(),
                     outcome,
                     result.session_error,
                     announce_commit,
@@ -1657,6 +1656,7 @@ const FakeApp = struct {
     workspace_root: []u8,
     tool_registry: tool_dispatch.Registry = .{},
     selected_model: std.ArrayList(u8) = .empty,
+    selected_provider: model_provider.ProviderId = .gateway,
     auth: auth_runtime.Runtime = .{},
     permission_engine: permissions.PermissionEngine = .{},
     permission_state: app_permission_runtime.State = .{},
@@ -1677,6 +1677,7 @@ const FakeApp = struct {
     last_tone: ?types.NoticeTone = null,
     preference_commit_count: usize = 0,
     last_preference_model: std.ArrayList(u8) = .empty,
+    last_preference_provider: ?model_provider.ProviderId = null,
     last_preference_effort: ?types.ReasoningEffort = null,
     last_preference_fast_mode: ?bool = null,
     preference_settings_error: ?anyerror = null,
@@ -1824,6 +1825,7 @@ const FakeApp = struct {
         patch: app_session_runtime.SessionPreferencePatch,
     ) app_session_runtime.PreferenceCommitResult {
         self.preference_commit_count += 1;
+        self.last_preference_provider = patch.provider;
         self.last_preference_model.clearRetainingCapacity();
         if (patch.model) |model| {
             self.last_preference_model.appendSlice(self.alloc, model) catch
@@ -1834,11 +1836,7 @@ const FakeApp = struct {
         if (self.preference_settings_error == null) {
             const attempt = config_runtime.attemptUserPreferences(
                 self.alloc,
-                .{
-                    .model = patch.model,
-                    .effort = patch.effort,
-                    .fast_mode = patch.fast_mode,
-                },
+                patch.userSettingsPatch(),
             );
             return switch (attempt) {
                 .outcome => |outcome| .{
@@ -2208,11 +2206,13 @@ test "session_commands handleModel resolves fuzzy cached model and syncs queued 
     var app = try FakeApp.init(alloc, "/tmp/workspace", "openai/gpt-4o");
     defer app.deinit();
     app.cached_ids = &ids;
+    app.selected_provider = .codex;
 
     try Commands(FakeApp).handleModel(&app, "claude sonnet");
 
     try std.testing.expectEqualStrings("anthropic/claude-sonnet-4-20250514", app.selected_model.items);
     try std.testing.expectEqualStrings("anthropic/claude-sonnet-4-20250514", app.worker.synced_model.?);
+    try std.testing.expectEqual(model_provider.ProviderId.codex, app.last_preference_provider.?);
     try std.testing.expectEqualStrings(
         "workspace · anthropic/claude-sonnet-4-20250514",
         app.terminalTitleLabelText(),
@@ -2844,6 +2844,7 @@ test "session_commands model picker emits one combined preference transaction" {
         "anthropic/claude-opus-4.7",
     );
     defer app.deinit();
+    app.selected_provider = .codex;
     const efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("high")};
     app.setGatewayControls("anthropic/claude-opus-4.7", &efforts, true);
 
@@ -2855,6 +2856,7 @@ test "session_commands model picker emits one combined preference transaction" {
     );
 
     try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
+    try std.testing.expectEqual(model_provider.ProviderId.codex, app.last_preference_provider.?);
     try std.testing.expectEqualStrings(
         "anthropic/claude-opus-4.7",
         app.last_preference_model.items,

@@ -14,6 +14,7 @@ const session_runtime = @import("../core/session/session.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const host = @import("../core/hosts/host.zig");
+const host_target = @import("../core/hosts/target.zig");
 const credentials = @import("../core/auth/credentials.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const mode_registry = @import("../core/modes/mode_registry.zig");
@@ -252,8 +253,10 @@ fn writeNewSessionResponse(
     try out.writer.writeAll("{\"sessionId\":");
     try writeJsonStr(session_id, &out.writer);
     try out.writer.writeAll(",\"configOptions\":[");
-    try writeProviderConfigOption(&out.writer, state.active_session.?.provider);
-    try out.writer.writeAll(",");
+    if (comptime !host_target.is_wasm) {
+        try writeProviderConfigOption(&out.writer, state.active_session.?.provider);
+        try out.writer.writeAll(",");
+    }
     try writeModelConfigOption(
         &out.writer,
         state.active_session.?.model,
@@ -692,8 +695,10 @@ fn writeLoadSessionResponse(
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll("{\"configOptions\":[");
-    try writeProviderConfigOption(&out.writer, state.active_session.?.provider);
-    try out.writer.writeAll(",");
+    if (comptime !host_target.is_wasm) {
+        try writeProviderConfigOption(&out.writer, state.active_session.?.provider);
+        try out.writer.writeAll(",");
+    }
     try writeModelConfigOption(
         &out.writer,
         model,

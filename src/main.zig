@@ -83,6 +83,7 @@ const hooks = @import("core/hooks/hooks.zig");
 const github_publish = @import("core/github/github_publish.zig");
 const subagent_domain = @import("core/subagent/domain.zig");
 const subagent_execution = @import("core/subagent/execution.zig");
+const subagent_agent_adapter = @import("core/subagent/agent_adapter.zig");
 const types = @import("core/shared/types.zig");
 const image_attachments = @import("core/images/image_attachments.zig");
 const permissions = @import("core/permissions/permissions.zig");
@@ -435,10 +436,9 @@ const App = struct {
     }
 
     pub fn agentStreamProvider(self: *const Self) agent_stream_provider.Provider {
-        return if (comptime host_target.is_wasm)
-            js_host_stream_provider.provider()
-        else
-            builtin_providers.agentStream(self.provider_selection.selection().provider);
+        return self.subagentProviderRoutes()
+            .select(self.provider_selection.selection().provider)
+            .agent_stream_provider;
     }
 
     pub fn fetchProviderCatalog(
@@ -1583,10 +1583,33 @@ const App = struct {
     }
 
     pub fn permissionReviewerProvider(self: *const App) ?permission_auto_classifier.Provider {
-        if (comptime !host_profile.tools) return null;
-        return switch (self.provider_selection.selection().provider) {
-            .gateway => builtin_gateway.permission_reviewer.provider,
-            .codex => openai_codex_permission_reviewer.provider,
+        return self.subagentProviderRoutes()
+            .select(self.provider_selection.selection().provider)
+            .permission_reviewer_provider;
+    }
+
+    pub fn subagentProviderRoutes(_: *const App) subagent_agent_adapter.ProviderRoutes {
+        return .{
+            .gateway = .{
+                .agent_stream_provider = if (comptime host_target.is_wasm)
+                    js_host_stream_provider.provider()
+                else
+                    builtin_providers.agentStream(.gateway),
+                .permission_reviewer_provider = if (comptime host_profile.tools)
+                    builtin_gateway.permission_reviewer.provider
+                else
+                    null,
+            },
+            .codex = .{
+                .agent_stream_provider = if (comptime host_target.is_wasm)
+                    agent_stream_provider.unavailable_provider
+                else
+                    builtin_providers.agentStream(.codex),
+                .permission_reviewer_provider = if (comptime host_profile.tools and !host_target.is_wasm)
+                    openai_codex_permission_reviewer.provider
+                else
+                    null,
+            },
         };
     }
 
