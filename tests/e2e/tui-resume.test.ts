@@ -4131,8 +4131,9 @@ test.skipIf(!tmuxAvailable())(
     let active: TmuxSession | null = null;
 
     function expectDeferredPresentation(scrollback: string): void {
-      expect(scrollback).toContain(`↻ Context updated ${command}`);
-      expect(countOccurrences(scrollback, "Context updated")).toBe(1);
+      expect(scrollback).toContain("1 failed");
+      expect(scrollback).toContain("1 deferred");
+      expect(scrollback).not.toContain("Context updated");
       expect(scrollback).not.toContain("Not executed");
       expect(scrollback).not.toContain("● Failed nested/input.txt");
       expect(scrollback).not.toContain(`● Failed ${command}`);
@@ -4759,7 +4760,7 @@ test.skipIf(!tmuxAvailable())(
       await active.sendText("Run pwd once for resume.");
       const liveToolScrollback = await waitForScrollback(active, toolReply);
       expect(liveToolScrollback).toContain("Ran pwd");
-      expect(liveToolScrollback).toContain(toolWorkspaceMarker);
+      expect(liveToolScrollback).not.toContain(toolWorkspaceMarker);
       expectNoRawToolReplay(liveToolScrollback);
       await active.sendText("/quit");
       expect(await active.waitForSessionEnd()).toBe(true);
@@ -4789,7 +4790,7 @@ test.skipIf(!tmuxAvailable())(
         await active.waitForComposer(TIMEOUT);
         const resumedToolScrollback = await waitForScrollback(active, toolReply);
         expect(resumedToolScrollback).toContain("Ran pwd");
-        expect(resumedToolScrollback).toContain(toolWorkspaceMarker);
+        expect(resumedToolScrollback).not.toContain(toolWorkspaceMarker);
         expect(resumedToolScrollback).toContain(toolReply);
         expectNoRawToolReplay(resumedToolScrollback);
         if (index === 0) {
@@ -5212,8 +5213,8 @@ test.skipIf(!tmuxAvailable())(
       await active.sendKeys("1");
       await active.sendKeys("Enter");
       const firstLive = await waitForScrollback(active, firstCompletion);
-      expect(firstLive).toContain("Wrote first-large.md");
-      expect(firstLive).toContain("⋯ +");
+      expect(firstLive).toContain("Wrote first-large.md +120");
+      expect(firstLive).not.toContain("RESUMED_FIRST_FILE_LINE_001");
       expect(readFileSync(join(workspace, "first-large.md"), "utf8")).toBe(
         `${firstLines.join("\n")}\n`,
       );
@@ -5223,9 +5224,9 @@ test.skipIf(!tmuxAvailable())(
       await active.sendKeys("1");
       await active.sendKeys("Enter");
       const live = await waitForScrollback(active, secondCompletion);
-      expect(live).toContain("Wrote first-large.md");
-      expect(live).toContain("Wrote second-large.md");
-      expect(live).toContain("⋯ +");
+      expect(live).toContain("Wrote first-large.md +120");
+      expect(live).toContain("Wrote second-large.md +60");
+      expect(live).not.toContain("RESUMED_SECOND_FILE_LINE_001");
       expect(readFileSync(join(workspace, "second-large.md"), "utf8")).toBe(
         `${secondLines.join("\n")}\n`,
       );
@@ -5254,9 +5255,9 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       const resumed = await waitForScrollback(active, secondCompletion);
-      expect(resumed).toContain("Wrote first-large.md");
-      expect(resumed).toContain("Wrote second-large.md");
-      expect(resumed).toContain("⋯ +");
+      expect(resumed).toContain("Wrote first-large.md +120");
+      expect(resumed).toContain("Wrote second-large.md +60");
+      expect(resumed).not.toContain("RESUMED_SECOND_FILE_LINE_001");
 
       await active.sendKeys("C-o");
       await active.waitForText("┃ Review · ←/→ switch · ctrl o close", TIMEOUT);
@@ -5287,7 +5288,7 @@ test.skipIf(!tmuxAvailable())(
       expect(firstFull).not.toContain('"content":"RESUMED_FIRST_FILE_LINE');
 
       await active.sendKeys("C-o");
-      await active.waitForText("⋯ +", TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
 
       await active.sendText("/undo");
       await active.waitForText("Nothing to undo.", TIMEOUT);
@@ -6194,7 +6195,7 @@ while :; do sleep 1; done
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Run the prepared interrupt command.");
-      await waitForScrollback(active, outputMarker, timeout);
+      await waitForScrollback(active, "Running ./resume-cancel.sh", timeout);
       await waitForCondition(
         () => existsSync(readyPath),
         "the interrupt command readiness file",
@@ -6209,7 +6210,7 @@ while :; do sleep 1; done
         timeout,
       );
       const liveCancelled = stripAnsi(await active.captureFullScrollback());
-      expect(liveCancelled).toContain(outputMarker);
+      expect(liveCancelled).not.toContain(outputMarker);
       expect(liveCancelled).not.toContain(bufferedTailMarker);
       expect(liveCancelled).not.toContain(artifactTailMarker);
 
@@ -6264,13 +6265,9 @@ while :; do sleep 1; done
       const resumed = stripAnsi(await waitForScrollback(active, followUpMarker, timeout));
       const assistantIndex = resumed.indexOf(assistantMarker);
       const cancelledIndex = resumed.indexOf("Cancelled");
-      const outputIndex = resumed.indexOf(outputMarker);
-      const cancellationNoticeIndex = resumed.indexOf("● System: cancelled");
       expect(assistantIndex).toBeGreaterThanOrEqual(0);
       expect(cancelledIndex).toBeGreaterThan(assistantIndex);
-      expect(outputIndex).toBeGreaterThan(cancelledIndex);
-      expect(cancellationNoticeIndex).toBeGreaterThan(outputIndex);
-      expect(countOccurrences(resumed, "● System: cancelled")).toBe(1);
+      expect(resumed).not.toContain(outputMarker);
       expect(resumed).not.toContain("Interrupted by user after completing");
       expect(resumed).not.toContain("<turn_aborted>");
       expect(resumed).not.toContain(bufferedTailMarker);

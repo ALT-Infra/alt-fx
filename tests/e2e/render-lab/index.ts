@@ -20,6 +20,7 @@ import {
   commandMoreCount,
   findFooters,
   readQuiescence,
+  TERMINAL_TOOL_MARKER,
   traceCountersFromTrace,
 } from "./analyzer";
 import type {
@@ -471,22 +472,16 @@ async function runActiveToolPlacement(
     );
     await capture(context, session, "active-tool-visible");
 
-    await session.waitForPane(
-      (pane) => commandMoreCount(pane) === 27,
-      ACTIVE_TOOL_RESIZE_CAPTURE_TIMEOUT_MS,
-    );
     await session.resize(80, 18);
     await session.waitForPane(
-      (pane) =>
-        commandMoreCount(pane) === 27 &&
-        pane.includes(ACTIVE_TOOL_MARKER),
+      (pane) => pane.includes(ACTIVE_TOOL_MARKER),
       ACTIVE_TOOL_RESIZE_CAPTURE_TIMEOUT_MS,
     );
     await capture(context, session, "active-tool-clipped");
 
     writeFileSync(activeToolReleasePath, "");
     await session.waitForPane(
-      (pane) => pane.includes("● Ran sleep 1; i=1"),
+      (pane) => pane.includes(TERMINAL_TOOL_MARKER),
       ACTIVE_TOOL_RESIZE_CAPTURE_TIMEOUT_MS,
     );
     await session.resize(80, 5);
@@ -502,18 +497,12 @@ async function runActiveToolPlacement(
 
     await session.resize(100, 52);
     await session.waitForPane(
-      (pane) =>
-        commandMoreCount(pane) === 27 &&
-        pane.includes("● Ran sleep 1; i=1"),
+      (pane) => pane.includes(TERMINAL_TOOL_MARKER),
       ACTIVE_TOOL_RESIZE_CAPTURE_TIMEOUT_MS,
     );
     const resized = await capture(context, session, "active-tool-resized-visible");
     manifest.finalFrameIndex = resized.index;
 
-    await session.waitForPane(
-      (pane) => commandMoreCount(pane) === 27,
-      30_000,
-    );
     await waitForLocalGatewayRequestCount(
       gateway.requests,
       `POST ${LOCAL_GATEWAY_CHAT_PATH}`,
@@ -577,7 +566,10 @@ async function runActiveToolPlacement(
       context,
       session,
       "active-tool-command-output-collapsed-again",
-      (pane) => commandMoreCount(pane) === 27 && !pane.includes("ACTIVE_TOOL_LINE_32"),
+      (pane) =>
+        pane.includes(TERMINAL_TOOL_MARKER) &&
+        commandMoreCount(pane) === null &&
+        !pane.includes("ACTIVE_TOOL_LINE_32"),
       10_000,
     );
 

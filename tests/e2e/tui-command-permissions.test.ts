@@ -1182,11 +1182,11 @@ describe("effect-aware command permissions", () => {
 
       const scrollback = await activeSession.captureFullScrollback();
       expect(scrollback.indexOf("first command completed")).toBeGreaterThanOrEqual(0);
-      expect(scrollback.indexOf(feedback)).toBeGreaterThan(
+      expect(scrollback.indexOf("second command completed")).toBeGreaterThan(
         scrollback.indexOf("first command completed"),
       );
-      expect(scrollback.indexOf("second command completed")).toBeGreaterThan(
-        scrollback.indexOf(feedback),
+      expect(scrollback.indexOf(feedback)).toBeGreaterThan(
+        scrollback.indexOf("second command completed"),
       );
       const rawAnsiScrollback = await activeSession.captureFullScrollbackEscapes();
       expect(rawAnsiScrollback).toContain(feedback);
@@ -1399,7 +1399,7 @@ describe("effect-aware command permissions", () => {
       await activeSession.waitForText("direct auto complete", TIMEOUT);
 
       const scrollback = await activeSession.captureFullScrollback();
-      const completedIndex = scrollback.indexOf("● Ran");
+      const completedIndex = scrollback.indexOf("└ Ran pwd");
       const streamTextIndex = scrollback.indexOf(streamText);
       expect(completedIndex).toBeGreaterThanOrEqual(0);
       expect(streamTextIndex).toBeGreaterThanOrEqual(0);
@@ -1418,11 +1418,11 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "TUI Minimal keeps command output exclusive to Ctrl-O through resize and resume",
+    "TUI keeps command output exclusive to Ctrl-O through resize and resume",
     async () => {
       const root = createIsolatedRoot();
-      const stderrPath = join(root.root, "minimal-command-output-stderr.log");
-      const resumedStderrPath = join(root.root, "minimal-command-output-resumed-stderr.log");
+      const stderrPath = join(root.root, "current-command-output-stderr.log");
+      const resumedStderrPath = join(root.root, "current-command-output-resumed-stderr.log");
       writeFileSync(
         join(root.home, ".fx", "settings.json"),
         JSON.stringify({
@@ -1575,7 +1575,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "TUI user-profile printf keeps compact output bounded and Ctrl-O complete",
+    "TUI user-profile printf keeps compact output hidden and Ctrl-O complete",
     async () => {
       const root = createIsolatedRoot();
       const tracePath = join(root.root, "direct-printf-trace.log");
@@ -1614,12 +1614,6 @@ describe("effect-aware command permissions", () => {
       writeFileSync(resumedStderrPath, "");
       const commandOutputText = (text: string): string =>
         text.split("\n").filter((line) => line.trimStart().startsWith("│ ")).join("\n");
-      const expectCommandHeaderImmediatelyBefore = (text: string, output: string): void => {
-        const lines = text.split("\n");
-        const outputIndex = lines.findIndex((line) => line.includes(output));
-        expect(outputIndex).toBeGreaterThan(0);
-        expect(lines[outputIndex - 1]).toContain("● Ran");
-      };
       const toolResultValue = (body: string, toolCallId: string): string => {
         const request = JSON.parse(body) as {
           prompt?: Array<{ content?: Array<Record<string, any>> }>;
@@ -1655,13 +1649,9 @@ describe("effect-aware command permissions", () => {
 
       const losslessCompact = await activeSession.captureFullScrollback();
       const losslessCompactOutput = commandOutputText(losslessCompact);
-      for (const row of losslessRows.slice(0, 5)) {
-        expect(losslessCompactOutput).toContain(`│ ${row}`);
-      }
-      expect(losslessCompactOutput).not.toContain(losslessRows[5]!);
-      expect(losslessCompactOutput).not.toContain(losslessRows[6]!);
-      expect(losslessCompactOutput).toContain("│ … 2 lines more (ctrl o to view)");
-      expectCommandHeaderImmediatelyBefore(losslessCompact, `│ ${losslessRows[0]}`);
+      expect(losslessCompactOutput).toBe("");
+      expect(losslessCompact).toContain("Ran printf");
+      for (const row of losslessRows) expect(losslessCompact).not.toContain(`│ ${row}`);
       expect(commandReplayFiles(root)).toEqual([]);
       const losslessGrid = await activeSession.capturePaneGrid();
 
@@ -1689,14 +1679,9 @@ describe("effect-aware command permissions", () => {
       );
       const lossyCompact = await activeSession.captureFullScrollback();
       const lossyCompactOutput = commandOutputText(lossyCompact);
-      expect(lossyCompactOutput).toContain("│   DIRECT_PADDED");
-      expect(lossyCompactOutput).toContain(`│ ${lossyRows[1]}`);
-      expect(lossyCompactOutput).toContain(`│ ${lossyRows[2]}`);
-      expect(lossyCompactOutput).toContain(`│ ${lossyRows[3]}`);
-      expect(lossyCompactOutput).not.toContain(lossyRows[4]!);
-      expect(lossyCompactOutput).not.toContain(lossyRows[7]!);
-      expect(lossyCompactOutput).toContain("│ … 4 lines more (ctrl o to view)");
-      expectCommandHeaderImmediatelyBefore(lossyCompact, "│   DIRECT_PADDED");
+      expect(lossyCompactOutput).toBe("");
+      expect(lossyCompact).toContain("Ran printf");
+      for (const row of lossyRows) expect(lossyCompact).not.toContain(`│ ${row}`);
       expect(commandReplayFiles(root)).toHaveLength(1);
       const lossyGrid = await activeSession.capturePaneGrid();
 
@@ -1764,12 +1749,12 @@ describe("effect-aware command permissions", () => {
         width: 72,
         height: 30,
       });
-      await activeSession.waitForText("│ … 4 lines more (ctrl o to view)", TIMEOUT);
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.waitForText("Ran printf", TIMEOUT);
       const resumedCompact = await activeSession.capturePane();
       const resumedCompactOutput = commandOutputText(resumedCompact);
-      expect(resumedCompactOutput).toContain(lossyRows[1]!);
-      expect(resumedCompactOutput).not.toContain(lossyRows[7]!);
-      expectCommandHeaderImmediatelyBefore(resumedCompact, "│   DIRECT_PADDED");
+      expect(resumedCompactOutput).toBe("");
+      for (const row of lossyRows) expect(resumedCompact).not.toContain(`│ ${row}`);
       await activeSession.sendKeys("C-o");
       await activeSession.waitForText("Review · ←/→ switch · ctrl o close", TIMEOUT);
       await activeSession.sendKeys("Right");
@@ -1835,10 +1820,8 @@ describe("effect-aware command permissions", () => {
       expect(promptText(gateway.requests[0]!.body)).toContain("/output quiet");
       expect(gateway.requests).toHaveLength(2);
       const compact = await activeSession.captureFullScrollback();
-      for (const row of commandRows.slice(0, 5)) expect(compact).toContain(`│ ${row}`);
-      expect(compact).not.toContain(commandRows[5]!);
-      expect(compact).not.toContain(commandRows[6]!);
-      expect(compact).toContain("│ … 2 lines more (ctrl o to view)");
+      expect(compact).toContain("Ran printf");
+      for (const row of commandRows) expect(compact).not.toContain(`│ ${row}`);
 
       await activeSession.sendKeys("C-o");
       await activeSession.waitForText("Review · ←/→ switch · ctrl o close", TIMEOUT);
@@ -1870,7 +1853,10 @@ describe("effect-aware command permissions", () => {
       expect(afterSlashCommands.indexOf("● Sound: on")).toBeGreaterThan(
         afterSlashCommands.indexOf(responseRows.at(-1)!),
       );
-      expect(afterSlashCommands).toContain(`│ ${commandRows[0]}`);
+      expect(afterSlashCommands).toContain("Ran printf");
+      for (const row of commandRows) {
+        expect(afterSlashCommands).not.toContain(`│ ${row}`);
+      }
       expect(JSON.parse(readFileSync(settingsPath, "utf8")).output_level).toEqual({
         legacy: true,
       });
@@ -2147,7 +2133,7 @@ describe("effect-aware command permissions", () => {
       expect(compactScrollback).not.toContain(
         "Auto agent approved this request: Running command.",
       );
-      expect(compactScrollback).toContain("● Ran");
+      expect(compactScrollback).toContain("└ Ran");
       const compactGrid = await activeSession.capturePaneGrid();
 
       await activeSession.sendKeys("C-o");
@@ -2393,7 +2379,7 @@ describe("effect-aware command permissions", () => {
           foregroundFxRow(ttyPath, binary);
           process.kill(fixture.pid, 0);
 
-          await activeSession.waitForText("TTY_SESSION_STDOUT_BEGIN", TIMEOUT);
+          await activeSession.waitForText("Running exec python3", TIMEOUT);
           await activeSession.sendLiteralText("q");
           await activeSession.waitForPane((pane) => pane.includes("┃ q"), TIMEOUT);
           foregroundFxRow(ttyPath, binary);
@@ -2439,20 +2425,29 @@ describe("effect-aware command permissions", () => {
         expect(pwdResult).toContain(`\n${root.workspace}\n`);
 
         const scrollback = await activeSession.captureFullScrollback();
-        const completedIndex = scrollback.indexOf("● Ran");
-        const stdoutBeginIndex = scrollback.indexOf("TTY_SESSION_STDOUT_BEGIN");
-        const stdoutEndIndex = scrollback.indexOf("TTY_SESSION_STDOUT_END");
+        const completedIndex = scrollback.indexOf("Ran exec python3");
         const finalIndex = scrollback.indexOf(`TTY_SESSION_FINAL_${sandbox}`);
         const followupIndex = scrollback.indexOf("Run pwd through the user profile.");
         const pwdFinalIndex = scrollback.indexOf(`TTY_SESSION_PWD_FINAL_${sandbox}`);
         expect(completedIndex).toBeGreaterThanOrEqual(0);
-        expect(stdoutBeginIndex).toBeGreaterThan(completedIndex);
-        expect(stdoutEndIndex).toBeGreaterThan(stdoutBeginIndex);
-        expect(finalIndex).toBeGreaterThan(stdoutEndIndex);
+        expect(scrollback).not.toContain("TTY_SESSION_STDOUT_BEGIN");
+        expect(scrollback).not.toContain("TTY_SESSION_STDOUT_END");
+        expect(finalIndex).toBeGreaterThan(completedIndex);
         expect(followupIndex).toBeGreaterThan(finalIndex);
         expect(pwdFinalIndex).toBeGreaterThan(followupIndex);
         expect(scrollback).not.toContain("suspended (tty input)");
         expect(scrollback).not.toContain("FX_FOREGROUND_EXEC_FAILED");
+
+        await activeSession.sendKeys("C-o");
+        await activeSession.waitForText("Review · ←/→ switch · ctrl o close", TIMEOUT);
+        await activeSession.sendKeys("Right");
+        await activeSession.waitForText("TTY_SESSION_STDERR", TIMEOUT);
+        const full = await activeSession.capturePane();
+        expect(full).toContain("TTY_SESSION_STDOUT_BEGIN");
+        expect(full).toContain("TTY_SESSION_STDOUT_END");
+        expect(full).toContain("TTY_SESSION_STDERR");
+        await activeSession.sendKeys("C-o");
+        await activeSession.waitForComposer(TIMEOUT);
 
         const trace = readFileSync(tracePath, "utf8");
         expect(trace).toContain(
@@ -4757,6 +4752,10 @@ describe("effect-aware command permissions", () => {
         TIMEOUT,
       );
       expect(approvalPane).toContain("touch");
+      const approvalDeadline = Date.now() + TIMEOUT;
+      while (approval === null && Date.now() < approvalDeadline) {
+        await Bun.sleep(20);
+      }
       expect(approval).not.toBeNull();
       expect(subagentState(root, childId)).toBe("awaiting_approval");
       expect(gateway.classifierRequests).toHaveLength(0);

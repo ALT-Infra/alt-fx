@@ -1177,7 +1177,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       let grid = await waitForSettingsMenu(session);
       expect(grid.join("\n")).toContain("Slash menu categories");
 
-      for (let index = 0; index < 5; index += 1) {
+      for (let index = 0; index < 3; index += 1) {
         await session.sendKeys("Down");
       }
       await session.sendKeys("Left");
