@@ -296,8 +296,12 @@ describe("lean auto mode reliability", () => {
         ["git_rm", "git rm tracked.txt"],
         ["git_rm_separator", "git rm -- -n"],
         ["git_clean_separator", "git clean -f -- -n"],
+        ["git_clean_exclude_short", "git clean -f -e --dry-run"],
+        ["git_clean_exclude_long", "git clean -f --exclude --dry-run"],
         ["git_reset", "git reset --hard HEAD~1"],
+        ["git_reset_boundary", "git reset --hard; printf ok"],
         ["compound_rm", "pwd && rm compound.txt"],
+        ["rm_boundary", "rm victim; printf ok"],
       ] as const) {
         const root = createIsolatedRoot();
         const marker = join(root.root, `${name}-must-not-run`);

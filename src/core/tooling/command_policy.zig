@@ -82,21 +82,19 @@ pub fn semantic_exit_annotation(command_text: []const u8, exit_code: i64, stderr
 }
 
 fn destructive_effect_in_analysis(command: []const u8) ?DestructiveEffect {
-    var effect = warning_at_command_position(command);
-
+    var effect: ?DestructiveEffect = null;
     var in_single = false;
     var in_double = false;
     var escaped = false;
     var in_comment = false;
+    var segment_start: usize = 0;
     var i: usize = 0;
     while (i < command.len) : (i += 1) {
         const ch = command[i];
         if (in_comment) {
             if (ch != '\n') continue;
             in_comment = false;
-            if (effect == null) {
-                effect = warning_at_command_position(command[i + 1 ..]);
-            }
+            segment_start = i + 1;
             continue;
         }
         if (escaped) {
@@ -115,15 +113,19 @@ fn destructive_effect_in_analysis(command: []const u8) ?DestructiveEffect {
             in_double = !in_double;
             continue;
         }
+        if (!in_single and (ch == '$' or ch == '`')) return null;
         if (in_single or in_double) continue;
         if (ch == '#' and starts_shell_comment(command, i)) {
+            if (effect == null) {
+                effect = warning_at_command_position(command[segment_start..i]);
+            }
             in_comment = true;
             continue;
         }
-        if (ch == '<' and i + 1 < command.len and command[i + 1] == '<') {
-            return null;
-        }
+        if (ch == '<' or ch == '>' or ch == '(' or ch == ')' or
+            ch == '{' or ch == '}') return null;
 
+        const boundary_start = i;
         const boundary_end = switch (ch) {
             ';', '\n', '&' => blk: {
                 if (ch == '&' and i + 1 < command.len and command[i + 1] == '&') {
@@ -142,10 +144,14 @@ fn destructive_effect_in_analysis(command: []const u8) ?DestructiveEffect {
             else => continue,
         };
         if (effect == null) {
-            effect = warning_at_command_position(command[boundary_end..]);
+            effect = warning_at_command_position(command[segment_start..boundary_start]);
         }
+        segment_start = boundary_end;
     }
     if (in_single or in_double or escaped) return null;
+    if (!in_comment and effect == null) {
+        effect = warning_at_command_position(command[segment_start..]);
+    }
     return effect;
 }
 
@@ -270,9 +276,9 @@ fn git_destructive_effect(command_name: []const u8, rest: []const u8) ?Destructi
     if (!std.mem.eql(u8, std.fs.path.basename(command_name), "git")) return null;
 
     const sub = git_subcommand(rest) orelse return null;
-    const args = git_effect_args(rest[sub.end..]);
+    const args = git_effect_args(sub.text, rest[sub.end..]);
 
-    if (args.help_or_version) return null;
+    if (!args.supported or args.help_or_version) return null;
     if (std.mem.eql(u8, sub.text, "reset") and args.hard_reset) {
         return .discard_version_control_state;
     }
@@ -289,13 +295,14 @@ fn git_destructive_effect(command_name: []const u8, rest: []const u8) ?Destructi
 }
 
 const GitEffectArgs = struct {
+    supported: bool = true,
     dry_run: bool = false,
     help_or_version: bool = false,
     hard_reset: bool = false,
     has_operand: bool = false,
 };
 
-fn git_effect_args(rest: []const u8) GitEffectArgs {
+fn git_effect_args(subcommand: []const u8, rest: []const u8) GitEffectArgs {
     var args: GitEffectArgs = .{};
     var options = true;
     var offset: usize = 0;
@@ -310,20 +317,59 @@ fn git_effect_args(rest: []const u8) GitEffectArgs {
             args.has_operand = true;
             continue;
         }
+        if (std.mem.eql(u8, subcommand, "clean")) {
+            if (clean_exclude_short_index(token.text)) |exclude_index| {
+                if (std.mem.findScalar(u8, token.text[1..exclude_index], 'n') != null) {
+                    args.dry_run = true;
+                }
+                if (exclude_index + 1 == token.text.len) {
+                    const pattern = command_classification.next_token(rest, offset) orelse {
+                        args.supported = false;
+                        break;
+                    };
+                    if (token_starts_shell_comment(pattern.text)) {
+                        args.supported = false;
+                        break;
+                    }
+                    offset = pattern.end;
+                }
+                continue;
+            }
+            if (std.mem.eql(u8, token.text, "--exclude")) {
+                const pattern = command_classification.next_token(rest, offset) orelse {
+                    args.supported = false;
+                    break;
+                };
+                if (token_starts_shell_comment(pattern.text)) {
+                    args.supported = false;
+                    break;
+                }
+                offset = pattern.end;
+                continue;
+            }
+            if (std.mem.startsWith(u8, token.text, "--exclude=")) {
+                if (token.text.len == "--exclude=".len) args.supported = false;
+                continue;
+            }
+        }
         if (std.mem.eql(u8, token.text, "--help") or
-            std.mem.eql(u8, token.text, "--version")) args.help_or_version = true;
+            std.mem.eql(u8, token.text, "--version") or
+            std.mem.eql(u8, token.text, "-h")) args.help_or_version = true;
         if (std.mem.eql(u8, token.text, "--hard")) args.hard_reset = true;
         if (std.mem.eql(u8, token.text, "--dry-run") or
             std.mem.eql(u8, token.text, "-n") or
             short_option_contains(token.text, 'n')) args.dry_run = true;
-        if (std.mem.eql(u8, token.text, "--pathspec-from-file")) {
+        if (std.mem.eql(u8, token.text, "--pathspec-from-file") and
+            !std.mem.eql(u8, subcommand, "clean"))
+        {
             const path = command_classification.next_token(rest, offset) orelse break;
             if (token_starts_shell_comment(path.text)) break;
             args.has_operand = true;
             offset = path.end;
             continue;
         }
-        if (std.mem.startsWith(u8, token.text, "--pathspec-from-file=") and
+        if (!std.mem.eql(u8, subcommand, "clean") and
+            std.mem.startsWith(u8, token.text, "--pathspec-from-file=") and
             token.text.len > "--pathspec-from-file=".len)
         {
             args.has_operand = true;
@@ -332,6 +378,12 @@ fn git_effect_args(rest: []const u8) GitEffectArgs {
         if (!std.mem.startsWith(u8, token.text, "-")) args.has_operand = true;
     }
     return args;
+}
+
+fn clean_exclude_short_index(option: []const u8) ?usize {
+    if (option.len < 2 or option[0] != '-' or option[1] == '-') return null;
+    const relative = std.mem.findScalar(u8, option[1..], 'e') orelse return null;
+    return relative + 1;
 }
 
 fn short_option_contains(option: []const u8, needle: u8) bool {
@@ -550,11 +602,15 @@ test "command risk note detects direct destructive effects only" {
 
     try std.testing.expect(command_risk_note_for("git clean --dry-run") == null);
     try std.testing.expect(command_risk_note_for("git clean -nd") == null);
+    try std.testing.expect(command_risk_note_for("git clean -nfeignored") == null);
     try std.testing.expect(command_risk_note_for("git -C nested clean --dry-run") == null);
     try std.testing.expect(command_risk_note_for("git rm --dry-run tracked.txt") == null);
     try std.testing.expect(command_risk_note_for("git rm -n -- tracked.txt") == null);
     try std.testing.expect(command_risk_note_for("git rm --help") == null);
     try std.testing.expect(command_risk_note_for("git clean --help") == null);
+    try std.testing.expect(command_risk_note_for("git clean -h") == null);
+    try std.testing.expect(command_risk_note_for("git rm -h tracked.txt") == null);
+    try std.testing.expect(command_risk_note_for("git reset -h --hard") == null);
     try std.testing.expect(command_risk_note_for("git -C clean status") == null);
     try std.testing.expect(command_risk_note_for("git --unknown clean -fd") == null);
     try std.testing.expect(command_risk_note_for("rtk rm -rf generated") == null);
@@ -566,6 +622,18 @@ test "command risk note detects direct destructive effects only" {
         DestructiveEffect.remove_files,
         destructive_effect_for("git clean -f -- -n").?,
     );
+    for ([_][]const u8{
+        "git clean -f -e --dry-run",
+        "git clean -f --exclude --dry-run",
+        "git clean -f -e-n",
+        "git clean -fe-n",
+        "git clean -f --exclude=--dry-run",
+    }) |command| {
+        try std.testing.expectEqual(
+            DestructiveEffect.remove_files,
+            destructive_effect_for(command).?,
+        );
+    }
     try std.testing.expectEqual(
         DestructiveEffect.discard_version_control_state,
         destructive_effect_for("git reset --hard HEAD~1").?,
@@ -586,6 +654,10 @@ test "command destructive effect leaves unsupported and targetless removal unres
         "git rm # no target",
         "git rm -- # no target",
         "git reset # --hard",
+        "rm -f; printf ok",
+        "git rm --dry-run; printf ok",
+        "rm -f < input.txt",
+        "rm victim > output.txt",
         "printf ok # harmless; rm victim",
         "cat <<EOF\nrm victim\nEOF",
     }) |command| {
@@ -603,6 +675,14 @@ test "command destructive effect leaves unsupported and targetless removal unres
     try std.testing.expectEqual(
         DestructiveEffect.remove_files,
         destructive_effect_for("printf ok # ignored; rm first\nrm second").?,
+    );
+    try std.testing.expectEqual(
+        DestructiveEffect.discard_version_control_state,
+        destructive_effect_for("git reset --hard; printf ok").?,
+    );
+    try std.testing.expectEqual(
+        DestructiveEffect.remove_files,
+        destructive_effect_for("rm victim; printf ok").?,
     );
 }
 
