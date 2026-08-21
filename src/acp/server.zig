@@ -326,7 +326,7 @@ fn adoptServerCredential(state: *ServerState, credential: *credentials.Credentia
         active.credential_source = state.credential_source;
         active.account_id = state.account_id;
         if (comptime !host_target.is_wasm) {
-            if (state.credential_source == .chatgpt_subscription) {
+            if (state.credential_source == .chatgpt_subscription or state.credential_source == .grok_subscription) {
                 active.session_rt.usage.clearReconciliationCredential();
             }
         }
@@ -373,6 +373,8 @@ pub fn streamProviderFor(
         .gateway => state.cfg.gateway_provider.agent_stream,
         .codex => state.cfg.codex_agent_stream orelse
             @import("../core/agent/stream_provider.zig").unavailable_provider,
+        .grok => state.cfg.grok_agent_stream orelse
+            @import("../core/agent/stream_provider.zig").unavailable_provider,
     };
 }
 
@@ -383,6 +385,7 @@ pub fn catalogProviderFor(
     return switch (provider) {
         .gateway => state.cfg.gateway_provider.model_catalog,
         .codex => state.cfg.codex_model_catalog,
+        .grok => state.cfg.grok_model_catalog,
     };
 }
 
@@ -402,15 +405,16 @@ pub fn refreshModelCredential(
         expected_account_id,
     ) orelse return null;
     errdefer secret.zeroAndFree(alloc, refreshed);
-    if (source == .chatgpt_subscription) {
-        try publishRefreshedChatGptToken(state, refreshed, expected_account_id);
+    if (source == .chatgpt_subscription or source == .grok_subscription) {
+        try publishRefreshedSubscriptionToken(state, refreshed, source, expected_account_id);
     }
     return refreshed;
 }
 
-fn publishRefreshedChatGptToken(
+fn publishRefreshedSubscriptionToken(
     state: *ServerState,
     refreshed: []const u8,
+    source: types.CredentialSource,
     expected_account_id: ?[]const u8,
 ) !void {
     const expected = expected_account_id orelse return error.ChatGptAccountChanged;
@@ -425,10 +429,10 @@ fn publishRefreshedChatGptToken(
     if (state.active_session) |*active| active.api_key = &.{};
     if (state.api_key.len > 0) secret.zeroAndFree(state.alloc, state.api_key);
     state.api_key = owned;
-    state.credential_source = .chatgpt_subscription;
+    state.credential_source = source;
     if (state.active_session) |*active| {
         active.api_key = state.api_key;
-        active.credential_source = .chatgpt_subscription;
+        active.credential_source = source;
     }
 }
 
@@ -440,7 +444,7 @@ pub fn releaseActiveSession(state: *ServerState) !void {
         active.session_rt.usage.cancelReconciliation();
         active.session_rt.usage.finishProfilePublicationsBeforeShutdown();
         flushActiveSessionUsage(state) catch |err| {
-            if (state.credential_source == .chatgpt_subscription) {
+            if (state.credential_source == .chatgpt_subscription or state.credential_source == .grok_subscription) {
                 active.session_rt.usage.clearReconciliationCredential();
             } else {
                 active.session_rt.usage.startReconciliation(
@@ -1388,6 +1392,8 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
                 .code = ErrorCode.invalid_request,
                 .message = if (state.provider == .codex)
                     credentials.missing_chatgpt_credential_message
+                else if (state.provider == .grok)
+                    credentials.missing_grok_credential_message
                 else
                     credentials.missing_credential_message,
             });
@@ -1399,6 +1405,8 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
             .code = ErrorCode.invalid_request,
             .message = if (state.provider == .codex)
                 credentials.missing_chatgpt_credential_message
+            else if (state.provider == .grok)
+                credentials.missing_grok_credential_message
             else
                 credentials.missing_credential_message,
         });
@@ -1553,7 +1561,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 .message = "Invalid session model",
             });
         if (comptime !host_target.is_wasm) {
-            if (session.provider == .codex) {
+            if (session.provider != .gateway) {
                 var model_available = false;
                 if (state.capability_resolver.catalogEntries()) |entries| {
                     for (entries) |entry| {
@@ -1569,10 +1577,13 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                         .message = "Model is not available for the active provider",
                     });
                 }
-                if (!try selectCredentialForProvider(state, .codex)) {
+                if (!try selectCredentialForProvider(state, session.provider)) {
                     return state.writer.writeError(alloc, msg.id, .{
                         .code = ErrorCode.invalid_request,
-                        .message = credentials.missing_chatgpt_credential_message,
+                        .message = if (session.provider == .codex)
+                            credentials.missing_chatgpt_credential_message
+                        else
+                            credentials.missing_grok_credential_message,
                     });
                 }
             }
@@ -1633,7 +1644,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             if (host_target.is_wasm) {
                 return state.writer.writeError(alloc, msg.id, .{
                     .code = ErrorCode.invalid_request,
-                    .message = "Codex provider switching is unavailable in this WASM runtime",
+                    .message = "Subscription provider switching is unavailable in this WASM runtime",
                 });
             }
             var staged_credential = if (target == .gateway and state.cfg.credential_override != null)
@@ -1655,6 +1666,8 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                         .code = ErrorCode.invalid_request,
                         .message = if (target == .codex)
                             credentials.missing_chatgpt_credential_message
+                        else if (target == .grok)
+                            credentials.missing_grok_credential_message
                         else
                             credentials.missing_credential_message,
                     });
@@ -1704,6 +1717,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             const saved_model = switch (target) {
                 .gateway => settings.model,
                 .codex => settings.codex_model,
+                .grok => settings.grok_model,
             };
             var selected_model = catalog.items[0].id;
             if (saved_model) |saved| {
@@ -2492,7 +2506,7 @@ test "ACP publishes an account-bound refreshed Codex token for later prompts" {
         alloc.free(state.account_id.?);
     }
 
-    try publishRefreshedChatGptToken(&state, "fresh-token", "acct-1");
+    try publishRefreshedSubscriptionToken(&state, "fresh-token", .chatgpt_subscription, "acct-1");
 
     try std.testing.expectEqualStrings("fresh-token", state.api_key);
     try std.testing.expectEqualStrings("fresh-token", state.active_session.?.api_key);
@@ -2515,7 +2529,7 @@ test "ACP rejects refreshed Codex tokens for another account" {
 
     try std.testing.expectError(
         error.ChatGptAccountChanged,
-        publishRefreshedChatGptToken(&state, "wrong-token", "acct-2"),
+        publishRefreshedSubscriptionToken(&state, "wrong-token", .chatgpt_subscription, "acct-2"),
     );
     try std.testing.expectEqualStrings("stale-token", state.api_key);
 }

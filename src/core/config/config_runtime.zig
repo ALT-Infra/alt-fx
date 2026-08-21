@@ -40,6 +40,7 @@ pub const Settings = struct {
     model: ?[]u8 = null,
     provider: ?model_provider.ProviderId = null,
     codex_model: ?[]u8 = null,
+    grok_model: ?[]u8 = null,
     permission_mode: ?types.PermissionMode = null,
     credential_source: ?types.CredentialSource = null,
     yolo_acknowledged: ?bool = null,
@@ -71,6 +72,7 @@ pub const Settings = struct {
     pub fn deinit(self: *Settings, alloc: Allocator) void {
         if (self.model) |value| alloc.free(value);
         if (self.codex_model) |value| alloc.free(value);
+        if (self.grok_model) |value| alloc.free(value);
         if (self.input_appearance) |value| alloc.free(value);
         if (self.maxxing_mode) |value| alloc.free(value);
         if (self.sandbox) |value| alloc.free(value);
@@ -111,6 +113,7 @@ pub const ConfigSources = struct {
     model: ConfigSource = .compiled_default,
     provider: ConfigSource = .compiled_default,
     codex_model: ConfigSource = .compiled_default,
+    grok_model: ConfigSource = .compiled_default,
     permission_mode: ConfigSource = .compiled_default,
     effort: ConfigSource = .compiled_default,
     fast_mode: ConfigSource = .compiled_default,
@@ -550,6 +553,7 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "model",
         "provider",
         "codex_model",
+        "grok_model",
         "effort",
         "fast_mode",
         "input_appearance",
@@ -596,6 +600,7 @@ fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: Conf
     if (settings.model != null) sources.model = source;
     if (settings.provider != null) sources.provider = source;
     if (settings.codex_model != null) sources.codex_model = source;
+    if (settings.grok_model != null) sources.grok_model = source;
     if (settings.permission_mode != null) sources.permission_mode = source;
     if (settings.effort != null) sources.effort = source;
     if (settings.fast_mode != null) sources.fast_mode = source;
@@ -1349,6 +1354,12 @@ fn parseProfileOnlyFields(
         settings.codex_model = try alloc.dupe(u8, model_value.string);
     }
 
+    if (root.object.get("grok_model")) |model_value| {
+        if (model_value != .string) return error.InvalidGrokModelType;
+        settings_store.validateModel(model_value.string) catch return error.InvalidGrokModelValue;
+        settings.grok_model = try alloc.dupe(u8, model_value.string);
+    }
+
     if (root.object.get("permission_mode")) |permission_mode_value| {
         const value = permission_mode_value;
         if (value != .string) return error.InvalidPermissionModeType;
@@ -1540,6 +1551,11 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) void 
         if (target.codex_model) |current| alloc.free(current);
         target.codex_model = value;
         incoming.codex_model = null;
+    }
+    if (incoming.grok_model) |value| {
+        if (target.grok_model) |current| alloc.free(current);
+        target.grok_model = value;
+        incoming.grok_model = null;
     }
     if (incoming.permission_mode) |value| target.permission_mode = value;
     if (incoming.credential_source) |value| target.credential_source = value;
@@ -2083,15 +2099,16 @@ test "max_agent_steps absence and explicit values resolve distinctly" {
     try std.testing.expectEqual(@as(usize, 50), agent_steps.resolveMaxAgentSteps(positive.max_agent_steps, 25));
 }
 
-test "provider settings keep independent Gateway and Codex models" {
+test "provider settings keep independent provider models" {
     var settings = try parseSettingsJson(
         std.testing.allocator,
-        "{\"provider\":\"codex\",\"model\":\"gateway/model\",\"codex_model\":\"gpt-5.4-mini\"}",
+        "{\"provider\":\"grok\",\"model\":\"gateway/model\",\"codex_model\":\"gpt-5.4-mini\",\"grok_model\":\"grok-4.20-0309-non-reasoning\"}",
     );
     defer settings.deinit(std.testing.allocator);
-    try std.testing.expectEqual(model_provider.ProviderId.codex, settings.provider.?);
+    try std.testing.expectEqual(model_provider.ProviderId.grok, settings.provider.?);
     try std.testing.expectEqualStrings("gateway/model", settings.model.?);
     try std.testing.expectEqualStrings("gpt-5.4-mini", settings.codex_model.?);
+    try std.testing.expectEqualStrings("grok-4.20-0309-non-reasoning", settings.grok_model.?);
 }
 
 test "max_agent_steps explicit zero survives serialization round trip" {

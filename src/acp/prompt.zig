@@ -250,6 +250,7 @@ const AcpContext = struct {
             .permission_reviewer_provider = switch (session.provider) {
                 .gateway => self.state.cfg.permission_reviewer_provider,
                 .codex => self.state.cfg.codex_permission_reviewer_provider,
+                .grok => self.state.cfg.grok_permission_reviewer_provider,
             },
             .auto_classifier = self.auto_classifier,
             .subagent_host = self.state.subagent_host,
@@ -450,6 +451,8 @@ pub fn handlePrompt(
             .code = ErrorCode.invalid_request,
             .message = if (session.provider == .codex)
                 credentials.missing_chatgpt_credential_message
+            else if (session.provider == .grok)
+                credentials.missing_grok_credential_message
             else
                 credentials.missing_credential_message,
         } };
@@ -707,6 +710,10 @@ pub fn runSubagentChild(
             .codex = .{
                 .agent_stream_provider = server.streamProviderFor(state, .codex),
                 .permission_reviewer_provider = state.cfg.codex_permission_reviewer_provider,
+            },
+            .grok = .{
+                .agent_stream_provider = server.streamProviderFor(state, .grok),
+                .permission_reviewer_provider = state.cfg.grok_permission_reviewer_provider,
             },
         },
         .system_prompt = state.cfg.prompt_policy.system_prompt,

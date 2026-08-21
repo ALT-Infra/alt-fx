@@ -92,6 +92,7 @@ pub const UserSettingsPatch = struct {
     model: ?[]const u8 = null,
     provider: ?model_provider.ProviderId = null,
     codex_model: ?[]const u8 = null,
+    grok_model: ?[]const u8 = null,
     permission_mode: ?types.PermissionMode = null,
     credential_source: ?types.CredentialSource = null,
     /// Removes the key entirely so resolution returns to plain precedence.
@@ -115,6 +116,7 @@ pub const UserSettingsPatch = struct {
         return self.model == null and
             self.provider == null and
             self.codex_model == null and
+            self.grok_model == null and
             self.permission_mode == null and
             self.credential_source == null and
             !self.clear_credential_source and
@@ -942,7 +944,7 @@ test "clearing the credential choice removes the key rather than blanking it" {
     try std.testing.expect(!application.changed);
 }
 
-test "provider patch keeps independent Gateway and Codex models" {
+test "provider patch keeps independent provider models" {
     const alloc = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -956,11 +958,13 @@ test "provider patch keeps independent Gateway and Codex models" {
     const application = try applyUserPatchToRoot(arena.allocator(), &root, .{
         .provider = .codex,
         .codex_model = "gpt-5.4-mini",
+        .grok_model = "grok-4.20-0309-non-reasoning",
     });
     try std.testing.expect(application.changed);
     try std.testing.expectEqualStrings("gateway/model", root.object.get("model").?.string);
     try std.testing.expectEqualStrings("codex", root.object.get("provider").?.string);
     try std.testing.expectEqualStrings("gpt-5.4-mini", root.object.get("codex_model").?.string);
+    try std.testing.expectEqualStrings("grok-4.20-0309-non-reasoning", root.object.get("grok_model").?.string);
     try std.testing.expectEqual(model_provider.ProviderId.codex, model_provider.parse(root.object.get("provider").?.string).?);
 }
 
@@ -1007,6 +1011,7 @@ fn applyUserPatchToRoot(
     if (patch.model) |value| application.changed = try putString(arena, &root.object, "model", value) or application.changed;
     if (patch.provider) |value| application.changed = try putString(arena, &root.object, "provider", @tagName(value)) or application.changed;
     if (patch.codex_model) |value| application.changed = try putString(arena, &root.object, "codex_model", value) or application.changed;
+    if (patch.grok_model) |value| application.changed = try putString(arena, &root.object, "grok_model", value) or application.changed;
     if (patch.permission_mode) |value| application.changed = try putString(arena, &root.object, "permission_mode", @tagName(value)) or application.changed;
     if (patch.credential_source) |value| application.changed = try putString(arena, &root.object, "credential_source", @tagName(value)) or application.changed;
     if (patch.clear_credential_source and root.object.contains("credential_source")) {
@@ -1695,6 +1700,10 @@ fn validateKnownSettingsObject(
         }
     }
     if (object.get("codex_model")) |value| {
+        if (value != .string) return error.InvalidSettingsFormat;
+        try validateModel(value.string);
+    }
+    if (object.get("grok_model")) |value| {
         if (value != .string) return error.InvalidSettingsFormat;
         try validateModel(value.string);
     }

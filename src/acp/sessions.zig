@@ -312,10 +312,10 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
     const sid_copy = try alloc.dupe(u8, loaded.state.id);
     var sid_owned = true;
     defer if (sid_owned) alloc.free(sid_copy);
-    if (loaded.state.preferences.provider == .codex) {
+    if (loaded.state.preferences.provider != .gateway) {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
-            .message = "Codex subscription models are unavailable in this WASM runtime",
+            .message = "Subscription models are unavailable in this WASM runtime",
         });
     }
     const model_copy = try alloc.dupe(u8, loaded.state.preferences.model);
@@ -566,6 +566,8 @@ fn handleRestoreSession(
             .code = ErrorCode.invalid_request,
             .message = if (effective_provider == .codex)
                 credentials.missing_chatgpt_credential_message
+            else if (effective_provider == .grok)
+                credentials.missing_grok_credential_message
             else
                 credentials.missing_credential_message,
         });
@@ -796,7 +798,7 @@ fn activateSession(
     };
     server.enableSubagentHost(state);
     state.active_session.?.session_rt.attachProfileUsagePublisher(state.alloc);
-    if (state.credential_source == .chatgpt_subscription) {
+    if (state.credential_source == .chatgpt_subscription or state.credential_source == .grok_subscription) {
         state.active_session.?.session_rt.usage.clearReconciliationCredential();
     } else {
         state.active_session.?.session_rt.usage.startReconciliation(
@@ -1111,7 +1113,11 @@ pub fn writeProviderConfigOption(
 ) !void {
     try w.writeAll("{\"id\":\"provider\",\"name\":\"Provider\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":");
     try writeJsonStr(@tagName(current), w);
-    try w.writeAll(",\"options\":[{\"value\":\"gateway\",\"name\":\"Vercel AI Gateway\"},{\"value\":\"codex\",\"name\":\"Codex subscription\"}]}");
+    try w.writeAll(",\"options\":[{\"value\":\"gateway\",\"name\":\"Vercel AI Gateway\"},{\"value\":\"codex\",\"name\":\"Codex subscription\"}");
+    if (comptime !host_target.is_wasm) {
+        try w.writeAll(",{\"value\":\"grok\",\"name\":\"Grok subscription\"}");
+    }
+    try w.writeAll("]}");
 }
 
 pub fn writeModeConfigOption(

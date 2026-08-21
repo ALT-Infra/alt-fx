@@ -24,6 +24,8 @@ pub const Config = struct {
     gateway_provider: gateway_provider.Provider,
     codex_agent_stream: ?agent_stream_provider.Provider = null,
     codex_model_catalog: ?model_catalog.Provider = null,
+    grok_agent_stream: ?agent_stream_provider.Provider = null,
+    grok_model_catalog: ?model_catalog.Provider = null,
     background_process_provider: background_process_provider.Provider =
         background_process_provider.unavailable_provider,
     secret_store: host.SecretStore,
@@ -41,6 +43,7 @@ pub const Config = struct {
     devbox_provider: ?devbox_executor.Provider = null,
     permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
     codex_permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
+    grok_permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
     model_override: ?[]const u8 = null,
     credential_override: ?[]const u8 = null,
     home_override: ?[]const u8 = null,
