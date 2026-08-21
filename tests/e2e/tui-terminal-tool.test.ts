@@ -426,6 +426,7 @@ async function launch(
   size = { width: 120, height: 30 },
 ) {
   const session = await TmuxSession.create({
+    isolated: true,
     cmd,
     cwd: fixture.workspace,
     env: {
