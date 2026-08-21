@@ -1324,6 +1324,50 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "read_file rejects a FIFO without waiting for a writer",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-read-file-fifo-");
+      const fifoPath = join(root.workspace, "search-pipe");
+      const fifo = Bun.spawnSync(["mkfifo", fifoPath]);
+      expect(fifo.exitCode).toBe(0);
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("fifo_read_1", "read_file", {
+          path: "search-pipe",
+        }),
+        finalText("FIFO rejection handled."),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await startCodeSession(client);
+
+        const result = await runPrompt(
+          client,
+          "Try to read the FIFO fixture.",
+          3_000,
+        );
+
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(2);
+        const toolResult = acpToolResultText(
+          gateway.requests[1]!.body,
+          "fifo_read_1",
+        );
+        expect(toolResult).toContain("NotRegularFile");
+        expect(toolResult).toContain("regular file");
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "ACP reload replays pending execution once and clears recovery after completion",
     async () => {
       const root = createIsolatedRoot("fx-acp-reload-model-recovery-");
