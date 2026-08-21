@@ -1,4 +1,6 @@
 const std = @import("std");
+const credentials = @import("../core/auth/credentials.zig");
+const grok_session = @import("../core/auth/grok_session.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
@@ -63,6 +65,9 @@ fn fetchCatalogForProvider(
         return .{ .failure = .{ .category = .authentication, .http_status = .unauthorized } };
     const account_id = input.access.accountId() orelse
         return .{ .failure = .{ .category = .authentication, .http_status = .unauthorized } };
+    if (!grok_session.validAccountId(account_id)) {
+        return .{ .failure = .{ .category = .authentication, .http_status = .unauthorized } };
+    }
     const request_url = modelsUrl(alloc) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = .{ .category = .runtime } };
@@ -89,10 +94,7 @@ fn fetchCatalogForProvider(
         deadline,
     ) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        return .{ .failure = .{
-            .category = if (err == error.Cancelled) .cancellation else .transport,
-            .retryable = err != error.Cancelled,
-        } };
+        return .{ .failure = catalogFetchFailure(err) };
     };
     defer response.deinit(alloc);
     if (response.status != .ok) {
@@ -107,10 +109,7 @@ fn fetchCatalogForProvider(
         deadline,
     ) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        return .{ .failure = .{
-            .category = if (err == error.Cancelled) .cancellation else .transport,
-            .retryable = err != error.Cancelled,
-        } };
+        return .{ .failure = catalogFetchFailure(err) };
     };
     defer modalities_response.deinit(alloc);
     if (modalities_response.status != .ok) {
@@ -121,6 +120,12 @@ fn fetchCatalogForProvider(
         return .{ .failure = .{ .category = .malformed_response, .http_status = .ok } };
     };
     return .{ .catalog = catalog };
+}
+
+fn catalogFetchFailure(err: anyerror) model_catalog.Failure {
+    if (err == error.Cancelled) return .{ .category = .cancellation };
+    if (err == error.GrokModelCatalogTooLarge) return .{ .category = .malformed_response };
+    return .{ .category = .transport, .retryable = true };
 }
 
 const FetchResponse = struct {
@@ -378,8 +383,8 @@ test "Grok catalog parser joins provider-owned subscription capabilities and mod
     const alloc = std.testing.allocator;
     const subscription_json =
         \\{"data":[
-        \\  {"id":"current-a","model":"current-a","api_backend":"responses","context_window":500123,"supports_reasoning_effort":true,"reasoning_efforts":[{"value":"xhigh"},{"value":"medium"}]},
-        \\  {"id":"current-b","model":"current-b","api_backend":"responses","context_window":480321,"supports_reasoning_effort":true,"reasoning_efforts":[{"value":"high"},{"value":"low"}]},
+        \\  {"id":"current-a","model":"current-a","api_backend":"responses","context_window":500123,"max_completion_tokens":32768,"supports_reasoning_effort":true,"reasoning_efforts":[{"value":"xhigh"},{"value":"medium"}]},
+        \\  {"id":"current-b","model":"current-b","api_backend":"responses","context_window":480321,"supports_reasoning_effort":true,"reasoning_efforts":[{"value":"provider-next"},{"value":"low"}]},
         \\  {"id":"chat-only","model":"chat-only","api_backend":"chat_completions","context_window":200000,"supports_reasoning_effort":false,"reasoning_efforts":[]}
         \\]}
     ;
@@ -397,6 +402,7 @@ test "Grok catalog parser joins provider-owned subscription capabilities and mod
     const first = catalog.items[0];
     try std.testing.expectEqualStrings("current-a", first.id);
     try std.testing.expectEqual(@as(u32, 500_123), first.context_window);
+    try std.testing.expectEqual(@as(u32, 32_768), first.max_tokens);
     try std.testing.expectEqual(@as(usize, 2), first.reasoning_efforts.items.len);
     try std.testing.expectEqualStrings("xhigh", first.reasoning_efforts.items[0].label());
     try std.testing.expectEqualStrings("medium", first.reasoning_efforts.items[1].label());
@@ -406,8 +412,9 @@ test "Grok catalog parser joins provider-owned subscription capabilities and mod
     const second = catalog.items[1];
     try std.testing.expectEqualStrings("current-b", second.id);
     try std.testing.expectEqual(@as(u32, 480_321), second.context_window);
+    try std.testing.expectEqual(@as(u32, 0), second.max_tokens);
     try std.testing.expectEqual(@as(usize, 2), second.reasoning_efforts.items.len);
-    try std.testing.expectEqualStrings("high", second.reasoning_efforts.items[0].label());
+    try std.testing.expectEqualStrings("provider-next", second.reasoning_efforts.items[0].label());
     try std.testing.expectEqualStrings("low", second.reasoning_efforts.items[1].label());
     try std.testing.expect(!second.has_vision);
 }
@@ -463,6 +470,24 @@ test "Grok subscription catalog requires account identity before network I/O" {
             return error.TestExpectedAuthenticationFailure;
         },
     }
+    try expectCatalogProviderFailure(
+        try model_catalog_provider.fetch(std.testing.allocator, .{
+            .access = .{ .authenticated = .{
+                .source = .grok_subscription,
+                .credential = "grok-token",
+                .team_context = null,
+                .account_id = "acct\r\ninjected",
+            } },
+            .endpoint = "",
+        }),
+        .authentication,
+    );
+}
+
+test "Grok oversized catalog responses are terminal malformed data" {
+    const failure = catalogFetchFailure(error.GrokModelCatalogTooLarge);
+    try std.testing.expectEqual(model_catalog.FailureCategory.malformed_response, failure.category);
+    try std.testing.expect(!failure.retryable);
 }
 
 test "Grok model ids enforce the exact provider-local bound" {
@@ -596,6 +621,69 @@ const CatalogBodyFixture = struct {
     }
 };
 
+var stable_catalog_test_environ: ?*std.process.Environ.Map = null;
+
+fn stableCatalogTestEnviron() !*const std.process.Environ.Map {
+    if (stable_catalog_test_environ) |map| return map;
+    const alloc = std.heap.page_allocator;
+    const map = try alloc.create(std.process.Environ.Map);
+    map.* = std.process.Environ.Map.init(alloc);
+    stable_catalog_test_environ = map;
+    return map;
+}
+
+const CatalogEndpointEnvironment = struct {
+    alloc: std.mem.Allocator,
+    map: std.process.Environ.Map,
+
+    fn install(
+        alloc: std.mem.Allocator,
+        models_url: []const u8,
+        modalities_url: []const u8,
+    ) !*@This() {
+        _ = try stableCatalogTestEnviron();
+        const self = try alloc.create(@This());
+        errdefer alloc.destroy(self);
+        self.* = .{
+            .alloc = alloc,
+            .map = std.process.Environ.Map.init(alloc),
+        };
+        errdefer self.map.deinit();
+        try self.map.put(e2e_models_endpoint_env, models_url);
+        try self.map.put(e2e_modalities_endpoint_env, modalities_url);
+        io_mod.setEnvironMap(&self.map);
+        return self;
+    }
+
+    fn deinit(self: *@This()) void {
+        if (stable_catalog_test_environ) |map| io_mod.setEnvironMap(map);
+        self.map.deinit();
+        const alloc = self.alloc;
+        alloc.destroy(self);
+    }
+};
+
+fn catalogFixtureUrl(alloc: std.mem.Allocator, fixture: *CatalogBodyFixture, path: []const u8) ![]u8 {
+    return std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/{s}", .{ fixture.port(), path });
+}
+
+fn expectCatalogProviderFailure(
+    result: model_catalog.ProviderResult,
+    expected: model_catalog.FailureCategory,
+) !void {
+    switch (result) {
+        .failure => |failure| {
+            try std.testing.expectEqual(expected, failure.category);
+            try std.testing.expect(!failure.retryable);
+        },
+        .catalog => |catalog| {
+            var unexpected = catalog;
+            model_catalog.freeModelCatalog(std.testing.allocator, &unexpected);
+            return error.TestExpectedCatalogFailure;
+        },
+    }
+}
+
 fn fetchCatalogFixture(body: []const u8) !FetchResponse {
     var fixture = try CatalogBodyFixture.init(body);
     defer fixture.deinit();
@@ -652,4 +740,61 @@ test "Grok catalog fetch and parser enforce body and model-count bounds" {
     const excess_count = try buildCatalogJson(std.testing.allocator, max_catalog_models + 1, 8, 0);
     defer std.testing.allocator.free(excess_count);
     try expectCatalogParseError(error.InvalidGrokModelCatalog, excess_count, modalities);
+}
+
+test "Grok catalog adapter classifies oversized bodies at both provider origins" {
+    const alloc = std.testing.allocator;
+    const oversized_subscription = try buildCatalogJson(alloc, 1, 8, max_catalog_bytes + 1);
+    defer alloc.free(oversized_subscription);
+    var subscription_fixture = try CatalogBodyFixture.init(oversized_subscription);
+    defer subscription_fixture.deinit();
+    try subscription_fixture.start();
+    const subscription_url = try catalogFixtureUrl(alloc, &subscription_fixture, "models");
+    defer alloc.free(subscription_url);
+    const access: credentials.CatalogAccess = .{ .authenticated = .{
+        .source = .grok_subscription,
+        .credential = "grok-token",
+        .team_context = null,
+        .account_id = "acct_grok",
+    } };
+    {
+        const environment = try CatalogEndpointEnvironment.install(
+            alloc,
+            subscription_url,
+            "http://127.0.0.1:1/modalities",
+        );
+        defer environment.deinit();
+        try expectCatalogProviderFailure(
+            try model_catalog_provider.fetch(alloc, .{ .access = access, .endpoint = "" }),
+            .malformed_response,
+        );
+    }
+    subscription_fixture.deinit();
+    if (subscription_fixture.failure) |err| return err;
+
+    const valid_subscription = try buildCatalogJson(alloc, 1, 8, 0);
+    defer alloc.free(valid_subscription);
+    const oversized_modalities = try alloc.alloc(u8, max_catalog_bytes + 1);
+    defer alloc.free(oversized_modalities);
+    @memset(oversized_modalities, 'x');
+    var valid_fixture = try CatalogBodyFixture.init(valid_subscription);
+    defer valid_fixture.deinit();
+    var modalities_fixture = try CatalogBodyFixture.init(oversized_modalities);
+    defer modalities_fixture.deinit();
+    try valid_fixture.start();
+    try modalities_fixture.start();
+    const valid_url = try catalogFixtureUrl(alloc, &valid_fixture, "models");
+    defer alloc.free(valid_url);
+    const modalities_url = try catalogFixtureUrl(alloc, &modalities_fixture, "modalities");
+    defer alloc.free(modalities_url);
+    const modalities_environment = try CatalogEndpointEnvironment.install(alloc, valid_url, modalities_url);
+    defer modalities_environment.deinit();
+    try expectCatalogProviderFailure(
+        try model_catalog_provider.fetch(alloc, .{ .access = access, .endpoint = "" }),
+        .malformed_response,
+    );
+    valid_fixture.deinit();
+    modalities_fixture.deinit();
+    if (valid_fixture.failure) |err| return err;
+    if (modalities_fixture.failure) |err| return err;
 }

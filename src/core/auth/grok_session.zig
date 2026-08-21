@@ -11,11 +11,20 @@ const max_auth_file_bytes: usize = 64 * 1024;
 const expiry_skew_ms: i64 = 60 * 1000;
 const mutation_lock_file_name = "grok-auth.lock";
 const mutation_lock_deadline_ms: u64 = 2000;
+const max_account_id_bytes: usize = 1024;
 
 const auth_file_name = profile_paths.grok_auth_file_name;
 
 pub fn refreshDeadlineMs(expires_at_ms: i64) i64 {
     return @max(expires_at_ms - expiry_skew_ms, 0);
+}
+
+pub fn validAccountId(account_id: []const u8) bool {
+    if (account_id.len == 0 or account_id.len > max_account_id_bytes) return false;
+    for (account_id) |byte| {
+        if (byte < 0x21 or byte > 0x7e) return false;
+    }
+    return true;
 }
 
 pub const Session = struct {
@@ -207,6 +216,7 @@ pub fn parse(alloc: Allocator, bytes: []const u8) !Session {
     errdefer secret.zeroAndFree(alloc, refresh_token);
     const account_id = try dupeRequiredString(alloc, object, "account_id");
     errdefer alloc.free(account_id);
+    if (!validAccountId(account_id)) return error.InvalidGrokAuthSession;
     const expires_at_ms = try requiredInteger(object, "expires_at_ms");
     return .{
         .access_token = access_token,
@@ -217,6 +227,7 @@ pub fn parse(alloc: Allocator, bytes: []const u8) !Session {
 }
 
 pub fn stringify(alloc: Allocator, session: Session) ![]u8 {
+    if (!validAccountId(session.account_id)) return error.InvalidGrokAuthSession;
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     try out.writer.writeAll("{\"version\":1,\"access_token\":");
@@ -260,6 +271,18 @@ test "Grok auth session round trips without exposing token fields to structure" 
     try std.testing.expectEqualStrings(session.refresh_token, decoded.refresh_token);
     try std.testing.expectEqualStrings(session.account_id, decoded.account_id);
     try std.testing.expectEqual(session.expires_at_ms, decoded.expires_at_ms);
+}
+
+test "Grok account identity is bounded and safe for HTTP headers" {
+    try std.testing.expect(validAccountId("acct_123"));
+    try std.testing.expect(!validAccountId(""));
+    try std.testing.expect(!validAccountId("acct\r\ninjected"));
+    try std.testing.expect(!validAccountId("a" ** (max_account_id_bytes + 1)));
+
+    const invalid =
+        \\{"version":1,"access_token":"access","refresh_token":"refresh","expires_at_ms":1234,"account_id":"acct\ninjected"}
+    ;
+    try std.testing.expectError(error.InvalidGrokAuthSession, parse(std.testing.allocator, invalid));
 }
 
 test "Grok session refresh deadline keeps a one minute safety margin" {
