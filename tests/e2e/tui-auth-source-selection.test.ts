@@ -2280,14 +2280,21 @@ tmuxTest(
       await session.sendKeys("Down");
       await session.sendKeys("Enter");
       await session.waitForText("Switched to Grok subscription with grok-4.20.", TIMEOUT);
+      const settingsPath = join(home, ".fx", "settings.json");
+      const persistenceDeadline = Date.now() + TIMEOUT;
+      let saved: { provider: string; grok_model: string } | undefined;
+      while (Date.now() < persistenceDeadline) {
+        saved = JSON.parse(readFileSync(settingsPath, "utf8")) as {
+          provider: string;
+          grok_model: string;
+        };
+        if (saved.provider === "grok") break;
+        await Bun.sleep(25);
+      }
+      expect(saved).toBeDefined();
       expect(grok.tokenCalls()).toBe(tokenCallsAfterLogin);
-
-      const saved = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8")) as {
-        provider: string;
-        grok_model: string;
-      };
-      expect(saved.provider).toBe("grok");
-      expect(saved.grok_model).toBe("grok-4.20");
+      expect(saved!.provider).toBe("grok");
+      expect(saved!.grok_model).toBe("grok-4.20");
       const responses = grok.requests.filter((request) => request.path === "/v1/responses");
       expect(responses).toHaveLength(1);
       expect(responses[0]!.conversationId).toBeTruthy();
