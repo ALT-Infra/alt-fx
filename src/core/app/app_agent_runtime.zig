@@ -469,11 +469,34 @@ pub fn Runtime(comptime App: type) type {
             return lease.runtime.callFeatureForModel(arena, request, options);
         }
 
+        pub fn resolveToolActionDisplayTarget(
+            app: *App,
+            arena: Allocator,
+            call: ToolCall,
+            ignored_list_entries: []const []const u8,
+            max_list_entries: usize,
+            max_read_file_bytes: usize,
+            max_read_file_lines: usize,
+            max_read_file_line_len: usize,
+            max_command_output_bytes: usize,
+            gateway_retry_count: usize,
+            gateway_chat_url: []const u8,
+        ) !?[]const u8 {
+            const ctx = toolContext(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url);
+            return tool_presentation.resolveTerminalDisplayTarget(
+                arena,
+                ctx.tool_registry,
+                ctx.workspace_root,
+                ctx.terminal_client,
+                call,
+            );
+        }
+
         pub fn describeToolAction(
             app: *App,
             arena: Allocator,
             call: ToolCall,
-            file_display_path: ?[]const u8,
+            display_target: ?[]const u8,
             advertised_dynamic_tool_names: []const []const u8,
             ignored_list_entries: []const []const u8,
             max_list_entries: usize,
@@ -485,14 +508,14 @@ pub fn Runtime(comptime App: type) type {
             gateway_chat_url: []const u8,
         ) ![]const u8 {
             const ctx = tool_runtime.withAdvertisedDynamicToolNames(toolContext(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), advertised_dynamic_tool_names);
-            return formatToolAction(ctx, arena, call, file_display_path, .active, null);
+            return formatToolAction(ctx, arena, call, display_target, .active, null);
         }
 
         pub fn describeToolActionCompleted(
             app: *App,
             arena: Allocator,
             call: ToolCall,
-            file_display_path: ?[]const u8,
+            display_target: ?[]const u8,
             advertised_dynamic_tool_names: []const []const u8,
             ignored_list_entries: []const []const u8,
             max_list_entries: usize,
@@ -504,14 +527,14 @@ pub fn Runtime(comptime App: type) type {
             gateway_chat_url: []const u8,
         ) ![]const u8 {
             const ctx = tool_runtime.withAdvertisedDynamicToolNames(toolContext(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), advertised_dynamic_tool_names);
-            return formatToolAction(ctx, arena, call, file_display_path, .completed, null);
+            return formatToolAction(ctx, arena, call, display_target, .completed, null);
         }
 
         pub fn describeToolActionDenied(
             app: *App,
             arena: Allocator,
             call: ToolCall,
-            file_display_path: ?[]const u8,
+            display_target: ?[]const u8,
             label: []const u8,
             advertised_dynamic_tool_names: []const []const u8,
             ignored_list_entries: []const []const u8,
@@ -524,7 +547,7 @@ pub fn Runtime(comptime App: type) type {
             gateway_chat_url: []const u8,
         ) ![]const u8 {
             const ctx = tool_runtime.withAdvertisedDynamicToolNames(toolContext(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), advertised_dynamic_tool_names);
-            return formatToolAction(ctx, arena, call, file_display_path, .denied, label);
+            return formatToolAction(ctx, arena, call, display_target, .denied, label);
         }
 
         pub fn requestToolPermissionSync(
@@ -1160,7 +1183,7 @@ fn formatToolAction(
     ctx: tool_runtime.Context,
     arena: Allocator,
     call: ToolCall,
-    file_display_path: ?[]const u8,
+    display_target: ?[]const u8,
     state: ToolActionState,
     denied_label: ?[]const u8,
 ) ![]const u8 {
@@ -1196,7 +1219,7 @@ fn formatToolAction(
         return formatToolActionValue(
             arena,
             specLabel(spec, state, denied_label),
-            file_display_path orelse spec.label_arg_default,
+            display_target orelse spec.label_arg_default,
         );
     }
     const args = tool_args.parseToolArgsObject(arena, call.arguments_json) catch {
@@ -1204,7 +1227,9 @@ fn formatToolAction(
     };
 
     const presentation = tool_dispatch.presentationForArgs(spec.*, args);
-    const value = tool_dispatch.presentationLabelValue(presentation, args) orelse presentation.label_arg_default;
+    const value = display_target orelse
+        tool_dispatch.presentationLabelValue(presentation, args) orelse
+        presentation.label_arg_default;
     return formatToolActionValue(arena, presentationLabel(presentation, state, denied_label), value);
 }
 
@@ -1640,24 +1665,24 @@ const FakeApp = struct {
         return Runtime(FakeApp).describeToolAction(self, arena, call, null, &.{}, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
     }
 
-    pub fn describeToolActionWithAdvertised(self: *FakeApp, arena: Allocator, call: ToolCall, file_display_path: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
-        return Runtime(FakeApp).describeToolAction(self, arena, call, file_display_path, advertised_dynamic_tool_names, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    pub fn describeToolActionWithAdvertised(self: *FakeApp, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
+        return Runtime(FakeApp).describeToolAction(self, arena, call, display_target, advertised_dynamic_tool_names, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
     }
 
     pub fn describeToolActionCompleted(self: *FakeApp, arena: Allocator, call: ToolCall) ![]const u8 {
         return Runtime(FakeApp).describeToolActionCompleted(self, arena, call, null, &.{}, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
     }
 
-    pub fn describeToolActionCompletedWithAdvertised(self: *FakeApp, arena: Allocator, call: ToolCall, file_display_path: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
-        return Runtime(FakeApp).describeToolActionCompleted(self, arena, call, file_display_path, advertised_dynamic_tool_names, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    pub fn describeToolActionCompletedWithAdvertised(self: *FakeApp, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
+        return Runtime(FakeApp).describeToolActionCompleted(self, arena, call, display_target, advertised_dynamic_tool_names, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
     }
 
     pub fn describeToolActionDenied(self: *FakeApp, arena: Allocator, call: ToolCall, label: []const u8) ![]const u8 {
         return Runtime(FakeApp).describeToolActionDenied(self, arena, call, null, label, &.{}, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
     }
 
-    pub fn describeToolActionDeniedWithAdvertised(self: *FakeApp, arena: Allocator, call: ToolCall, file_display_path: ?[]const u8, label: []const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
-        return Runtime(FakeApp).describeToolActionDenied(self, arena, call, file_display_path, label, advertised_dynamic_tool_names, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    pub fn describeToolActionDeniedWithAdvertised(self: *FakeApp, arena: Allocator, call: ToolCall, display_target: ?[]const u8, label: []const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
+        return Runtime(FakeApp).describeToolActionDenied(self, arena, call, display_target, label, advertised_dynamic_tool_names, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
     }
 
     pub fn permissionTargetForCall(self: *FakeApp, arena: Allocator, call: ToolCall) ![]const u8 {

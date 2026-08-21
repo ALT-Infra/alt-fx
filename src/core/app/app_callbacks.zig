@@ -287,6 +287,10 @@ pub fn Bindings(comptime App: type) type {
                 .check_tool_availability = agentCheckToolAvailability,
                 .request_tool_permission = agentRequestToolPermission,
                 .request_prepared_file_mutation_permission = agentRequestPreparedFileMutationPermission,
+                .resolve_tool_action_display_target = if (comptime @hasDecl(App, "resolveToolActionDisplayTarget"))
+                    agentResolveToolActionDisplayTarget
+                else
+                    null,
                 .describe_tool_action = agentDescribeToolAction,
                 .describe_tool_action_completed = agentDescribeToolActionCompleted,
                 .describe_tool_action_denied = agentDescribeToolActionDenied,
@@ -658,19 +662,24 @@ pub fn Bindings(comptime App: type) type {
             return app.checkToolAvailability(arena, call);
         }
 
-        fn agentDescribeToolAction(ctx: *anyopaque, arena: Allocator, call: ToolCall, file_display_path: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
+        fn agentResolveToolActionDisplayTarget(ctx: *anyopaque, arena: Allocator, call: ToolCall) !?[]const u8 {
             const app: *App = @ptrCast(@alignCast(ctx));
-            return app.describeToolActionWithAdvertised(arena, call, file_display_path, advertised_dynamic_tool_names);
+            return app.resolveToolActionDisplayTarget(arena, call);
         }
 
-        fn agentDescribeToolActionCompleted(ctx: *anyopaque, arena: Allocator, call: ToolCall, file_display_path: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
+        fn agentDescribeToolAction(ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
             const app: *App = @ptrCast(@alignCast(ctx));
-            return app.describeToolActionCompletedWithAdvertised(arena, call, file_display_path, advertised_dynamic_tool_names);
+            return app.describeToolActionWithAdvertised(arena, call, display_target, advertised_dynamic_tool_names);
         }
 
-        fn agentDescribeToolActionDenied(ctx: *anyopaque, arena: Allocator, call: ToolCall, file_display_path: ?[]const u8, label: []const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
+        fn agentDescribeToolActionCompleted(ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
             const app: *App = @ptrCast(@alignCast(ctx));
-            return app.describeToolActionDeniedWithAdvertised(arena, call, file_display_path, label, advertised_dynamic_tool_names);
+            return app.describeToolActionCompletedWithAdvertised(arena, call, display_target, advertised_dynamic_tool_names);
+        }
+
+        fn agentDescribeToolActionDenied(ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, label: []const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            return app.describeToolActionDeniedWithAdvertised(arena, call, display_target, label, advertised_dynamic_tool_names);
         }
 
         fn agentPermissionTargetForCall(ctx: *anyopaque, arena: Allocator, call: ToolCall, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {

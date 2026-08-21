@@ -1464,9 +1464,13 @@ test.skipIf(!tmuxAvailable())(
     });
 
     const scrollback = await active.captureFullScrollback();
-    expect(scrollback).toContain("Failed start · 17 invalid fields");
-    expect(countOccurrences(scrollback, "Used terminal start")).toBe(1);
-    expect(scrollback).toContain("Used terminal close");
+    expect(scrollback).toContain("Failed printf SHOULD_NOT_RUN");
+    expect(scrollback).toContain("17 inv");
+    expect(countOccurrences(scrollback, "Started printf ACTION_SCHEMA_OK")).toBe(1);
+    expect(scrollback).toContain("Killed printf ACTION_SCHEMA_OK");
+    expect(scrollback).not.toContain("Using terminal");
+    expect(scrollback).not.toContain("Used terminal");
+    expect(scrollback).not.toContain("Preparing command");
     await active.sendKeys("C-o");
     await active.sendKeys("PPage");
     const expanded = await active.waitForText("missing_fields", TIMEOUT);
@@ -1616,7 +1620,7 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
-  "TUI starts an interactive terminal when the command is exact empty",
+  "TUI starts and gracefully closes an interactive terminal when the command is exact empty",
   async () => {
     const fixture = createFixture("fx-tui-terminal-empty-command-");
     let terminalSessionId = "";
@@ -1636,7 +1640,7 @@ test.skipIf(!tmuxAvailable())(
         return fakeGatewayToolCall("tui_terminal_empty_close", "terminal", {
           action: "close",
           session_id: terminalSessionId,
-          close_policy: "force",
+          close_policy: "graceful",
         });
       },
       (body) => {
@@ -1654,8 +1658,8 @@ test.skipIf(!tmuxAvailable())(
       "Interactive terminal started and closed",
       TIMEOUT,
     );
-    expect(pane).toContain("Used terminal start");
-    expect(pane).toContain("Used terminal close");
+    expect(pane).toContain("Started interactive shell");
+    expect(pane).toContain("Closed interactive shell");
     expect(pane).not.toContain("InvalidCommand");
     expect(pane).not.toContain("Failed start");
     expect(gateway.requests).toHaveLength(3);
@@ -1788,10 +1792,10 @@ test.skipIf(!tmuxAvailable())(
       "Terminal monitor path scope verified",
       TIMEOUT,
     );
-    expect(pane).toContain("Failed start: path is outside the workspace");
-    expect(pane).toContain("Used terminal start");
-    expect(pane).toContain("Used terminal inspect");
-    expect(pane).toContain("Used terminal close");
+    expect(pane).toContain("Failed printf SHOULD_NOT_RUN");
+    expect(pane).toContain("Started while [ ! -e");
+    expect(pane).toContain("Inspected while [ ! -e");
+    expect(pane).toContain("Killed while [ ! -e");
     expect(gateway.requests).toHaveLength(5);
     expect(gateway.requests[1]!.body).toContain("path_outside_workspace");
     expect(existsSync(rejectedMarker)).toBe(false);
@@ -1854,15 +1858,15 @@ test.skipIf(!tmuxAvailable())(
 
     await active.sendText("Run and list the native terminal fixture.");
     const pane = await active.waitForText("TUI public terminal complete", TIMEOUT);
-    if (pane.includes("Failed start") || pane.includes("Failed list")) {
+    if (pane.includes("Failed printf TUI_PUBLIC_TERMINAL_NATIVE") || pane.includes("Failed terminal sessions")) {
       throw new Error(
         `start=${toolResultText(gateway.requests[1]!.body, "tui_terminal_start")}\n` +
           `list=${toolResultText(gateway.requests[2]!.body, "tui_terminal_list")}\n` +
           `TRACE\n${readFileSync(fixture.tracePath, "utf8")}`,
       );
     }
-    expect(pane).toContain("Used terminal start");
-    expect(pane).toContain("Used terminal list");
+    expect(pane).toContain("Started printf TUI_PUBLIC_TERMINAL_NATIVE");
+    expect(pane).toContain("Listed terminal sessions");
     expect(gateway.requests).toHaveLength(3);
     expect(gateway.requests[1]!.body).toContain("tui_terminal_start");
     expect(gateway.requests[1]!.body).toContain('\\"backend\\":\\"native\\"');
@@ -2014,8 +2018,11 @@ test.skipIf(!tmuxAvailable())(
       "TUI terminal lease payload complete",
       TIMEOUT,
     );
-    expect(pane).toContain("Failed write");
-    expect(pane).toContain("Used terminal write");
+    expect(pane).toContain("Failed printf 'TUI_PUBLIC_LEASE_PAYLOAD_READY");
+    expect(pane).toContain("Acquired control of");
+    expect(pane).toContain("Sent input to");
+    expect(pane).toContain("Finished waiting for");
+    expect(pane).toContain("Killed printf 'TUI_PUBLIC_LEASE_PAYLOAD_READY");
     expect(gateway.requests).toHaveLength(9);
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
@@ -2116,8 +2123,10 @@ test.skipIf(!tmuxAvailable())(
       "TUI public terminal controls complete",
       TIMEOUT,
     );
-    expect(pane).toContain("Failed write");
-    expect(pane).toContain("Used terminal write");
+    expect(pane).toContain("Failed printf 'TUI_PUBLIC_CONTROLS_READY");
+    expect(pane).toContain("Acquired control of");
+    expect(pane).toContain("Sent input to");
+    expect(pane).toContain("Killed printf 'TUI_PUBLIC_CONTROLS_READY");
     expect(gateway.requests).toHaveLength(6);
     expect(readFileSync(bytePath, "utf8").trim()).toBe("12");
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
@@ -2209,8 +2218,9 @@ ${holdUntilCleanup(fixture.root)}
       "TUI public terminal signal complete",
       TIMEOUT,
     );
-    expect(pane).toContain("Used terminal start");
-    expect(pane).toContain("Used terminal signal");
+    expect(pane).toContain("Started");
+    expect(pane).toContain("foreground-signal.sh");
+    expect(pane).toContain("Sent terminate to");
     expect(gateway.requests).toHaveLength(3);
     await waitForSignalMarker(termPath);
     await waitForOwnedProcessExit([targetPid]);
@@ -2512,15 +2522,16 @@ test.skipIf(!tmuxAvailable())(
       "TUI public terminal monitor complete",
       TIMEOUT,
     );
-    for (const action of [
-      "start",
-      "monitor",
-      "write",
-      "wait",
-      "inspect",
-      "close",
+    for (const label of [
+      "Started",
+      "Added monitor to",
+      "Acquired control of",
+      "Sent input to",
+      "Finished waiting for",
+      "Inspected",
+      "Killed",
     ]) {
-      expect(pane).toContain(`Used terminal ${action}`);
+      expect(pane).toContain(label);
     }
     expect(gateway.requests).toHaveLength(9);
     expect(gateway.requests[2]!.body).toContain(
@@ -2605,8 +2616,8 @@ test.skipIf(!tmuxAvailable())(
       "LONG HOME public terminal complete",
       TIMEOUT,
     );
-    for (const action of ["start", "inspect", "read", "close"]) {
-      expect(pane).toContain(`Used terminal ${action}`);
+    for (const label of ["Started", "Inspected", "Read output from", "Killed"]) {
+      expect(pane).toContain(label);
     }
     expect(gateway.requests).toHaveLength(5);
     const inspectResult = toolResultText(

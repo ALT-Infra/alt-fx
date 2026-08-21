@@ -5505,6 +5505,10 @@ fn processQueuedPromptLoop(
                 continue;
             }
 
+            var tool_display_target = if (deps.resolve_tool_action_display_target) |resolve|
+                try resolve(deps.ctx, arena, tool_call)
+            else
+                null;
             last_tool_call_name = tool_call.name;
             last_tool_call_id = tool_call.id;
             debug_trace.eventf("tool", "tool_call", step_ctx, "call_id={s} name={s}", .{ tool_call.id, tool_call.name });
@@ -5570,7 +5574,7 @@ fn processQueuedPromptLoop(
                             turn_id,
                             tool_call,
                             false,
-                            null,
+                            tool_display_target,
                             execution,
                             prepared.model_output,
                             prepared.memory,
@@ -5696,7 +5700,7 @@ fn processQueuedPromptLoop(
                                     turn_id,
                                     tool_call,
                                     false,
-                                    null,
+                                    tool_display_target,
                                     execution,
                                     safe_output,
                                     prepared_terminal.memory,
@@ -5737,7 +5741,7 @@ fn processQueuedPromptLoop(
                                     turn_id,
                                     tool_call,
                                     false,
-                                    null,
+                                    tool_display_target,
                                     execution,
                                     safe_output,
                                     prepared_terminal.memory,
@@ -5780,7 +5784,7 @@ fn processQueuedPromptLoop(
                                         turn_id,
                                         stream_ctx.provisional_statuses.presentation_group_id,
                                         tool_call,
-                                        null,
+                                        tool_display_target,
                                         advertised_dynamic_tool_names,
                                     );
                                 _ = try stream_ctx.provisional_statuses.finishDeniedCall(
@@ -5790,7 +5794,7 @@ fn processQueuedPromptLoop(
                                     turn_id,
                                     tool_call,
                                     status_started,
-                                    null,
+                                    tool_display_target,
                                     "Blocked",
                                     advertised_dynamic_tool_names,
                                 );
@@ -5812,7 +5816,7 @@ fn processQueuedPromptLoop(
                                     turn_id,
                                     stream_ctx.provisional_statuses.presentation_group_id,
                                     tool_call,
-                                    null,
+                                    tool_display_target,
                                     advertised_dynamic_tool_names,
                                 );
                                 const execution: ToolExecutionResult = .{
@@ -5827,7 +5831,7 @@ fn processQueuedPromptLoop(
                                     turn_id,
                                     tool_call,
                                     status_started,
-                                    null,
+                                    tool_display_target,
                                     execution,
                                     safe_output,
                                     prepared_terminal.memory,
@@ -5864,7 +5868,7 @@ fn processQueuedPromptLoop(
                                     turn_id,
                                     tool_call,
                                     false,
-                                    null,
+                                    tool_display_target,
                                     execution,
                                     safe_output,
                                     prepared_terminal.memory,
@@ -5921,7 +5925,7 @@ fn processQueuedPromptLoop(
                     turn_id,
                     tool_call,
                     false,
-                    null,
+                    tool_display_target,
                     execution,
                     safe_tool_output,
                     prepared.memory,
@@ -5977,7 +5981,7 @@ fn processQueuedPromptLoop(
                         turn_id,
                         tool_call,
                         false,
-                        null,
+                        tool_display_target,
                         execution,
                         safe_tool_output,
                         prepared.memory,
@@ -6014,7 +6018,7 @@ fn processQueuedPromptLoop(
                         turn_id,
                         tool_call,
                         false,
-                        null,
+                        tool_display_target,
                         execution,
                         safe_tool_output,
                         prepared.memory,
@@ -6198,7 +6202,7 @@ fn processQueuedPromptLoop(
             if (!runtime_tool_admission.deferVisibleLifecycleUntilAfterPermission(tool_call.name) and
                 !defer_auto_command_lifecycle)
             {
-                status_started = try runtime_tool_presentation.startToolVisibleLifecycle(deps, arena, turn_id, stream_ctx.provisional_statuses.presentation_group_id, tool_call, null, advertised_dynamic_tool_names);
+                status_started = try runtime_tool_presentation.startToolVisibleLifecycle(deps, arena, turn_id, stream_ctx.provisional_statuses.presentation_group_id, tool_call, tool_display_target, advertised_dynamic_tool_names);
             }
 
             if (try runtime_stop_policy.blockedNonLiveBackgroundRestart(
@@ -6214,7 +6218,7 @@ fn processQueuedPromptLoop(
                     turn_id,
                     tool_call,
                     status_started,
-                    null,
+                    tool_display_target,
                     "Blocked",
                     advertised_dynamic_tool_names,
                 );
@@ -6354,7 +6358,7 @@ fn processQueuedPromptLoop(
                         turn_id,
                         stream_ctx.provisional_statuses.presentation_group_id,
                         execution_call,
-                        null,
+                        tool_display_target,
                         advertised_dynamic_tool_names,
                     );
                 }
@@ -6365,7 +6369,7 @@ fn processQueuedPromptLoop(
                     turn_id,
                     execution_call,
                     status_started,
-                    null,
+                    tool_display_target,
                     "Cancelled",
                     advertised_dynamic_tool_names,
                 );
@@ -6445,7 +6449,7 @@ fn processQueuedPromptLoop(
                             turn_id,
                             null,
                             execution_call,
-                            null,
+                            tool_display_target,
                             advertised_dynamic_tool_names,
                         );
                     }
@@ -6455,7 +6459,7 @@ fn processQueuedPromptLoop(
                         turn_id,
                         execution_call,
                         status_started,
-                        null,
+                        tool_display_target,
                         "Cancelled",
                         advertised_dynamic_tool_names,
                     );
@@ -6484,7 +6488,7 @@ fn processQueuedPromptLoop(
                         turn_id,
                         stream_ctx.provisional_statuses.presentation_group_id,
                         execution_call,
-                        null,
+                        tool_display_target,
                         advertised_dynamic_tool_names,
                     );
                 }
@@ -6506,7 +6510,7 @@ fn processQueuedPromptLoop(
                     turn_id,
                     execution_call,
                     status_started,
-                    null,
+                    tool_display_target,
                     failure,
                     prepared_failure.model_output,
                     prepared_failure.memory,
@@ -6578,7 +6582,7 @@ fn processQueuedPromptLoop(
                         turn_id,
                         stream_ctx.provisional_statuses.presentation_group_id,
                         execution_call,
-                        null,
+                        tool_display_target,
                         advertised_dynamic_tool_names,
                     );
                 }
@@ -6589,7 +6593,7 @@ fn processQueuedPromptLoop(
                     turn_id,
                     execution_call,
                     status_started,
-                    null,
+                    tool_display_target,
                     runtime_tool_admission.permissionDeniedStatusLabel(reason),
                     advertised_dynamic_tool_names,
                 );
@@ -6670,6 +6674,9 @@ fn processQueuedPromptLoop(
                 call_allocator,
                 execution_authority,
             );
+            if (file_display_path) |display_path| {
+                tool_display_target = display_path;
+            }
 
             if (!status_started) {
                 status_started = try runtime_tool_presentation.startToolVisibleLifecycle(
@@ -6678,7 +6685,7 @@ fn processQueuedPromptLoop(
                     turn_id,
                     stream_ctx.provisional_statuses.presentation_group_id,
                     execution_call,
-                    file_display_path,
+                    tool_display_target,
                     advertised_dynamic_tool_names,
                 );
             }
@@ -6742,7 +6749,7 @@ fn processQueuedPromptLoop(
                     turn_id,
                     execution_call,
                     status_started,
-                    file_display_path,
+                    tool_display_target,
                     "Cancelled",
                     advertised_dynamic_tool_names,
                 );
@@ -6866,7 +6873,7 @@ fn processQueuedPromptLoop(
                             turn_id,
                             execution_call,
                             status_started,
-                            file_display_path,
+                            tool_display_target,
                             "Cancelled",
                             advertised_dynamic_tool_names,
                         );
@@ -6977,7 +6984,7 @@ fn processQueuedPromptLoop(
                             turn_id,
                             execution_call,
                             status_started,
-                            file_display_path,
+                            tool_display_target,
                             failure,
                             prepared_failure.model_output,
                             prepared_failure.memory,
@@ -7127,7 +7134,7 @@ fn processQueuedPromptLoop(
                                 turn_id,
                                 execution_call,
                                 status_started,
-                                file_display_path,
+                                tool_display_target,
                                 runtime_tool_admission.permissionDeniedStatusLabel(reason),
                                 advertised_dynamic_tool_names,
                                 denied_execution,
@@ -7141,7 +7148,7 @@ fn processQueuedPromptLoop(
                                 turn_id,
                                 execution_call,
                                 status_started,
-                                file_display_path,
+                                tool_display_target,
                                 runtime_tool_admission.permissionDeniedStatusLabel(reason),
                                 advertised_dynamic_tool_names,
                             );
@@ -7313,7 +7320,7 @@ fn processQueuedPromptLoop(
                             turn_id,
                             execution_call,
                             status_started,
-                            file_display_path,
+                            tool_display_target,
                             retained,
                             advertised_dynamic_tool_names,
                         );
@@ -7384,7 +7391,7 @@ fn processQueuedPromptLoop(
                     turn_id,
                     execution_call,
                     status_started,
-                    file_display_path,
+                    tool_display_target,
                     execution,
                     advertised_dynamic_tool_names,
                 );
@@ -7501,7 +7508,7 @@ fn processQueuedPromptLoop(
                 turn_id,
                 execution_call,
                 status_started,
-                file_display_path,
+                tool_display_target,
                 execution,
                 safe_tool_output,
                 prepared.memory,

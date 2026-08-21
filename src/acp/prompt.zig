@@ -988,6 +988,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .request_tool_permission = requestToolPermissionOutcomeWithRequest,
         .request_prepared_file_mutation_permission = requestPreparedFileMutationPermissionOutcomeForRuntime,
         .request_sandbox_widening = requestSandboxWideningForRuntime,
+        .resolve_tool_action_display_target = resolveToolActionDisplayTarget,
         .describe_tool_action = describeToolAction,
         .describe_tool_action_completed = describeToolActionCompleted,
         .describe_tool_action_denied = describeToolActionDenied,
@@ -1401,32 +1402,43 @@ fn writePermissionOption(
     try writer.writeByte('}');
 }
 
-fn describeToolAction(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, file_display_path: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
+fn describeToolAction(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     return tool_presentation.formatPlainAction(arena, .{
         .tool_registry = ctx.toolRegistry(),
         .call = call,
-        .file_display_path = file_display_path,
+        .display_target = display_target,
         .is_available_dynamic_mcp_tool = lifecycleDynamicMcpToolAvailable(ctx, call.name, advertised_dynamic_tool_names),
     });
 }
 
-fn describeToolActionCompleted(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, file_display_path: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
+fn resolveToolActionDisplayTarget(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !?[]const u8 {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    return tool_presentation.resolveTerminalDisplayTarget(
+        arena,
+        ctx.toolRegistry(),
+        ctx.state.workspace_root,
+        &ctx.state.terminal_client,
+        call,
+    );
+}
+
+fn describeToolActionCompleted(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     return tool_presentation.formatPlainAction(arena, .{
         .tool_registry = ctx.toolRegistry(),
         .call = call,
-        .file_display_path = file_display_path,
+        .display_target = display_target,
         .is_available_dynamic_mcp_tool = lifecycleDynamicMcpToolAvailable(ctx, call.name, advertised_dynamic_tool_names),
     });
 }
 
-fn describeToolActionDenied(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, file_display_path: ?[]const u8, label: []const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
+fn describeToolActionDenied(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, label: []const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const action = try tool_presentation.formatPlainAction(arena, .{
         .tool_registry = ctx.toolRegistry(),
         .call = call,
-        .file_display_path = file_display_path,
+        .display_target = display_target,
         .is_available_dynamic_mcp_tool = lifecycleDynamicMcpToolAvailable(ctx, call.name, advertised_dynamic_tool_names),
     });
     return std.fmt.allocPrint(arena, "{s}: {s}", .{ label, action });
@@ -2473,10 +2485,21 @@ pub fn mapToolKind(tool_name: []const u8) acp_types.ToolCallKind {
 }
 
 fn describeToolTitle(registry: tool_dispatch.Registry, arena: Allocator, call: ToolCall) ![]const u8 {
-    if (registry.lookup(call.name)) |tool| {
-        return std.fmt.allocPrint(arena, "{s}", .{tool.action_label});
+    if (tool_dispatch.toolCallPresentation(arena, registry, call)) |presentation| {
+        return std.fmt.allocPrint(arena, "{s}", .{presentation.action_label});
     }
     return std.fmt.allocPrint(arena, "{s}", .{call.name});
+}
+
+test "ACP terminal title uses the call-aware action label" {
+    const alloc = std.testing.allocator;
+    const title = try describeToolTitle(builtin_tools.registry, alloc, .{
+        .id = "close",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"close\",\"session_id\":\"terminal-a\",\"close_policy\":\"graceful\"}",
+    });
+    defer alloc.free(title);
+    try std.testing.expectEqualStrings("Closing", title);
 }
 
 test "ACP lifecycle action preserves dynamic MCP availability boundaries" {
