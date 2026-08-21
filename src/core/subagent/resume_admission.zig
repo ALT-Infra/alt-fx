@@ -169,6 +169,7 @@ fn summaryIsActionable(
         .{},
     ) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
+        error.SessionNotFound => true,
         else => false,
     };
     defer capability.deinit();
