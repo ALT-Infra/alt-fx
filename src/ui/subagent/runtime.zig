@@ -744,6 +744,16 @@ pub const ChildRouteState = struct {
     presentation_diffs: std.ArrayList(diff_mod.DiffEntry) = .empty,
     presented_through_sequence: u64 = 0,
 
+    noinline fn init() ChildRouteState {
+        var result: ChildRouteState = .{
+            .editor = undefined,
+            .presentation = undefined,
+        };
+        result.editor = .{};
+        result.presentation = null;
+        return result;
+    }
+
     fn deinit(self: *ChildRouteState, alloc: Allocator) void {
         self.clear(alloc);
         self.pages.deinit(alloc);
@@ -883,7 +893,11 @@ pub const Runtime = struct {
     count_projection: usize = 0,
 
     pub noinline fn init() Runtime {
-        var result: Runtime = .{ .form = undefined };
+        var result: Runtime = .{
+            .child = undefined,
+            .form = undefined,
+        };
+        result.child = ChildRouteState.init();
         result.form = FormState.init();
         return result;
     }
@@ -3905,6 +3919,36 @@ test "repeated editor defaults are initialized through one runtime path" {
     for (runtime.form.editors) |editor| {
         try std.testing.expect(editor.slash_menu_categories);
     }
+}
+
+test "child route initializer preserves every runtime default" {
+    var child = ChildRouteState.init();
+    defer child.deinit(std.testing.allocator);
+
+    try std.testing.expect(child.chat == null);
+    try std.testing.expect(child.unavailable == null);
+    try std.testing.expectEqual(@as(usize, 0), child.pages.pages.items.len);
+    try std.testing.expect(child.editor.slash_menu_categories);
+    try std.testing.expectEqual(@as(usize, 0), child.scroll_from_bottom);
+    try std.testing.expectEqual(@as(usize, 0), child.max_scroll);
+    try std.testing.expect(child.invocation_id == null);
+    try std.testing.expectEqual(@as(u64, 0), child.identity_epoch);
+    try std.testing.expect(child.submission_failure == null);
+    try std.testing.expect(child.input_failure == null);
+    try std.testing.expect(child.paste_rejection == null);
+    try std.testing.expectEqual(@as(u64, 0), child.operation_counter);
+    try std.testing.expect(child.rendered_chat_rows == null);
+    try std.testing.expectEqual(ViewportMutation.none, child.viewport_mutation);
+    try std.testing.expect(child.presentation == null);
+    try std.testing.expectEqual(
+        transcript_presentation.Depth.inline_mode,
+        child.presentation_transcript_depth,
+    );
+    try std.testing.expect(child.presentation_live_work_id == null);
+    try std.testing.expectEqual(@as(usize, 0), child.presentation_live_event_count);
+    try std.testing.expectEqual(@as(u32, 1), child.presentation_next_diff_id);
+    try std.testing.expectEqual(@as(usize, 0), child.presentation_diffs.items.len);
+    try std.testing.expectEqual(@as(u64, 0), child.presented_through_sequence);
 }
 
 pub fn paint(
