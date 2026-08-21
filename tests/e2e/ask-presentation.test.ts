@@ -380,7 +380,9 @@ describe("fx ask presentation", () => {
 
       expect(result.code).toBe(0);
       expect(result.stdout).toBe("Ask public terminal complete.\n");
-      expect(result.stderr).toContain("Using terminal start");
+      expect(result.stderr).toContain("Starting printf ASK_PUBLIC_TERMINAL_TMUX");
+      expect(result.stderr).not.toContain("Using terminal");
+      expect(result.stderr).not.toContain("Preparing command");
       expect(result.stderr).not.toContain("failed");
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.requests[1]!.body).toContain(toolCallId);

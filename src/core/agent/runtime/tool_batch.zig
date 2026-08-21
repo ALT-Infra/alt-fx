@@ -281,7 +281,7 @@ pub fn processCommittedFileResult(
     execution: ToolExecutionResult,
     committed_file_tool_name: []u8,
     status_started: bool,
-    file_display_path: ?[]const u8,
+    display_target: ?[]const u8,
     is_file_mutation: bool,
     turn_id: u64,
     advertised_dynamic_tool_names: []const []const u8,
@@ -395,7 +395,7 @@ pub fn processCommittedFileResult(
         turn_id,
         execution_call,
         status_started,
-        file_display_path,
+        display_target,
         handoff.preview,
         advertised_dynamic_tool_names,
     ) catch |err| {

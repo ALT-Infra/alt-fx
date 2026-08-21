@@ -6518,7 +6518,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "argless streamed terminal start never renders bare Running while held open",
+    "argless streamed terminal start stays in composing activity while held open",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-run-command-provisional-")));
       const home = join(root, "home");
@@ -6573,9 +6573,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const scrollback = await waitForScrollback(
         session,
         (candidate) =>
-          candidate.includes("● Preparing command") &&
+          candidate.includes("Thinking") &&
+          !candidate.includes("● Preparing command") &&
+          !candidate.includes("Using terminal") &&
           !hasBareRunningRow(candidate),
-        "argless terminal provisional row",
+        "terminal composing activity",
       );
 
       expect(stream.cancelled).toBe(false);
@@ -6583,7 +6585,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(session.isPaneAlive()).toBe(true);
       expect(streamingGateway.requests).toHaveLength(1);
       expect(hasBareRunningRow(scrollback)).toBe(false);
-      expect(scrollback).toContain("● Preparing command");
+      expect(scrollback).not.toContain("● Preparing command");
+      expect(scrollback).not.toContain("Using terminal");
+      expect(scrollback).not.toContain("Used terminal");
       expect(scrollback).toContain("Thinking");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(existsSync(tapePath)).toBe(true);

@@ -1015,10 +1015,11 @@ pub const terminal = ToolSpec{
     .executor_kind = .terminal,
     .activity_kind = .command,
     .requires_approval = true,
-    .action_label = "Using terminal",
-    .completed_action_label = "Used terminal",
+    .action_label = "Checking",
+    .completed_action_label = "Checked",
     .label_arg_kind = .action,
-    .label_arg_default = "session",
+    .label_arg_default = "terminal request",
+    .presentation_fn = terminal_impl.presentation,
     .permission_target_kind = .none,
     .decode = terminal_impl.decode,
     .validate = terminal_impl.validate,
@@ -1428,6 +1429,10 @@ test "terminal tool schema derives one closed branch per terminal action" {
     try std.testing.expectEqual(tool_dispatch.ExecutorKind.terminal, terminal.executor_kind);
     try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.none, terminal.permission_target_kind);
     try std.testing.expect(terminal.authorized_result_mapper != null);
+    try std.testing.expect(terminal.presentation_fn == terminal_impl.presentation);
+    try std.testing.expectEqualStrings("Checking", terminal.action_label);
+    try std.testing.expectEqualStrings("Checked", terminal.completed_action_label);
+    try std.testing.expectEqualStrings("terminal request", terminal.label_arg_default);
 
     const input_schema = terminal.gateway_schema.input_schema;
     try std.testing.expectEqual(@as(usize, 1), input_schema.properties.len);

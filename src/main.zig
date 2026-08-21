@@ -1613,28 +1613,32 @@ const App = struct {
         };
     }
 
-    pub fn describeToolAction(self: *App, arena: Allocator, call: ToolCall, file_display_path: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
-        return AgentAppRuntime.describeToolAction(self, arena, call, file_display_path, advertised_dynamic_tool_names, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+    pub fn describeToolAction(self: *App, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
+        return AgentAppRuntime.describeToolAction(self, arena, call, display_target, advertised_dynamic_tool_names, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     }
 
-    pub fn describeToolActionWithAdvertised(self: *App, arena: Allocator, call: ToolCall, file_display_path: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
-        return self.describeToolAction(arena, call, file_display_path, advertised_dynamic_tool_names);
+    pub fn resolveToolActionDisplayTarget(self: *App, arena: Allocator, call: ToolCall) !?[]const u8 {
+        return AgentAppRuntime.resolveToolActionDisplayTarget(self, arena, call, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     }
 
-    pub fn describeToolActionCompleted(self: *App, arena: Allocator, call: ToolCall, file_display_path: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
-        return AgentAppRuntime.describeToolActionCompleted(self, arena, call, file_display_path, advertised_dynamic_tool_names, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+    pub fn describeToolActionWithAdvertised(self: *App, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
+        return self.describeToolAction(arena, call, display_target, advertised_dynamic_tool_names);
     }
 
-    pub fn describeToolActionCompletedWithAdvertised(self: *App, arena: Allocator, call: ToolCall, file_display_path: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
-        return self.describeToolActionCompleted(arena, call, file_display_path, advertised_dynamic_tool_names);
+    pub fn describeToolActionCompleted(self: *App, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
+        return AgentAppRuntime.describeToolActionCompleted(self, arena, call, display_target, advertised_dynamic_tool_names, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     }
 
-    pub fn describeToolActionDenied(self: *App, arena: Allocator, call: ToolCall, file_display_path: ?[]const u8, label: []const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
-        return AgentAppRuntime.describeToolActionDenied(self, arena, call, file_display_path, label, advertised_dynamic_tool_names, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+    pub fn describeToolActionCompletedWithAdvertised(self: *App, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
+        return self.describeToolActionCompleted(arena, call, display_target, advertised_dynamic_tool_names);
     }
 
-    pub fn describeToolActionDeniedWithAdvertised(self: *App, arena: Allocator, call: ToolCall, file_display_path: ?[]const u8, label: []const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
-        return self.describeToolActionDenied(arena, call, file_display_path, label, advertised_dynamic_tool_names);
+    pub fn describeToolActionDenied(self: *App, arena: Allocator, call: ToolCall, display_target: ?[]const u8, label: []const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
+        return AgentAppRuntime.describeToolActionDenied(self, arena, call, display_target, label, advertised_dynamic_tool_names, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+    }
+
+    pub fn describeToolActionDeniedWithAdvertised(self: *App, arena: Allocator, call: ToolCall, display_target: ?[]const u8, label: []const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
+        return self.describeToolActionDenied(arena, call, display_target, label, advertised_dynamic_tool_names);
     }
 
     pub fn requestToolPermissionSync(self: *App, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, revalidation: ?agent_runtime.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {
