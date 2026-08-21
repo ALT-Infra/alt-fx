@@ -457,11 +457,14 @@ pub fn Runtime(comptime App: type) type {
 
             const visible_model = pending_model orelse provider_runtime.model(app);
             const visible_capabilities = model_capabilities.resolveForApp(App, app, visible_model);
-            const model_supports_fast = visible_capabilities.supports_fast_mode;
-            const model_supports_effort = visible_capabilities.reasoning_efforts.len > 0;
+            const active_capabilities_pending = pending_model == null and app.isModelCacheLoading();
+            const model_supports_fast = visible_capabilities.supports_fast_mode or
+                (active_capabilities_pending and app.fast_mode);
+            const model_supports_effort = visible_capabilities.reasoning_efforts.len > 0 or
+                (active_capabilities_pending and !app.effort.isDefault());
             const visible_effort = if (pending_model != null and model_supports_effort)
                 pendingPickerEffort(app, visible_model, model_query, app.input_runtime.picker.model_picker_effort_index)
-            else if (model_capabilities.reasoningEffortSupported(visible_capabilities, app.effort))
+            else if (active_capabilities_pending or model_capabilities.reasoningEffortSupported(visible_capabilities, app.effort))
                 app.effort
             else
                 .auto;
@@ -4538,6 +4541,7 @@ const CoordinatorTestApp = struct {
     pending_images: std.ArrayList(types.ImageAttachment) = .empty,
     skills: skill_runtime.Runtime = .{},
     model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.testing.allocator, "/v1/models"),
+    model_cache_loading: bool = false,
     stream: types.StreamState = .{},
     fast_mode: bool = false,
     effort: types.ReasoningEffort = .auto,
@@ -4581,8 +4585,8 @@ const CoordinatorTestApp = struct {
         return 0;
     }
 
-    fn isModelCacheLoading(_: *CoordinatorTestApp) bool {
-        return false;
+    fn isModelCacheLoading(self: *CoordinatorTestApp) bool {
+        return self.model_cache_loading;
     }
 
     fn isModelCacheFailed(_: *CoordinatorTestApp) bool {
@@ -4677,6 +4681,50 @@ test "core.app_render_runtime keeps final token progress during paced response t
         ),
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
+}
+
+test "core.app_render_runtime keeps configured controls visible while model capabilities load" {
+    const alloc = std.testing.allocator;
+    var app = CoordinatorTestApp{
+        .alloc = alloc,
+        .shell = .{},
+        .model_cache_loading = true,
+        .fast_mode = true,
+        .effort = types.ReasoningEffort.literal("xhigh"),
+    };
+    defer app.deinit();
+    try app.selected_model.appendSlice(alloc, "anthropic/claude-opus-4.8");
+
+    var upgrade_status_buf: [64]u8 = undefined;
+    const queued_cards: QueuedCardProjection = .{};
+    const ctx = Runtime(CoordinatorTestApp).footerContext(
+        &app,
+        &upgrade_status_buf,
+        0,
+        &queued_cards,
+    );
+
+    var hint_buf: [128]u8 = undefined;
+    const line = ui_render.buildHintLine(
+        ctx.stream.active,
+        false,
+        ctx.has_api_key,
+        ctx.model,
+        ctx.permission_mode,
+        ctx.queued_count,
+        null,
+        ctx.fast_mode,
+        ctx.model_supports_fast,
+        ctx.effort,
+        ctx.model_supports_effort,
+        ctx.statusline,
+        80,
+        &hint_buf,
+    );
+    try std.testing.expectEqualStrings(
+        "run /login · ask · opus 4.8 · xhigh · ⚡︎",
+        line,
+    );
 }
 
 test "core.app_render_runtime projects only the visible inline completion suffix" {
