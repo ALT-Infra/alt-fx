@@ -78,7 +78,6 @@ function createIsolatedRoot(): IsolatedRoot {
       sandbox: "none",
       permission_mode: "ask",
       permission: {},
-      maxxing_mode: "legacy",
     }),
   );
   roots.push(root);
@@ -379,6 +378,8 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       });
       expect(approval).toContain(marker);
       expect(approval).not.toContain(plainMarker);
+      expect(approval).toContain("┃ Create the combining fixture");
+      expect(approval).not.toContain("❯ Create the combining fixture");
       expect(gateway.requests[0]!.body).toContain(marker);
       expect(gateway.requests[0]!.body).not.toContain(plainMarker);
 
@@ -388,6 +389,8 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       });
       expect(approval).toContain(marker);
       expect(approval).not.toContain(plainMarker);
+      expect(approval).toContain("┃ Create the combining fixture");
+      expect(approval).not.toContain("❯ Create the combining fixture");
       expect(session.paneStatus()).toEqual({ dead: false, status: null });
 
       await decide(session, 1);

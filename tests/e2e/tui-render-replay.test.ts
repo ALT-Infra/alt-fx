@@ -54,7 +54,7 @@ async function launch(options: {
   mkdirSync(join(workDir, ".fx"), { recursive: true });
   writeFileSync(
     join(workDir, ".fx", "settings.json"),
-    JSON.stringify({ maxxing_mode: "legacy" }),
+    JSON.stringify({}),
   );
 
   const s = await TmuxSession.create({
@@ -97,7 +97,7 @@ async function launchAutomaticRecording(): Promise<{
   mkdirSync(join(home, ".fx"), { recursive: true });
   writeFileSync(
     join(home, ".fx", "settings.json"),
-    JSON.stringify({ maxxing_mode: "legacy" }),
+    JSON.stringify({}),
   );
 
   const goldenPath = join(workDir, "grid.txt");
@@ -555,7 +555,7 @@ function assertNoFooterlessCapturedRepaintSplit(path: string, failures: string[]
     if (
       clear.includes("\x1b[2J\x1b[3J") &&
       syncEnd === "\x1b[?2026l" &&
-      /❯|\[\d+\/\d+\]\s❯/.test(footer)
+      /┃|\[\d+\/\d+\]\s┃/.test(footer)
     ) {
       failures.push(`captured repaint exposed footerless sync split at stdout frames ${frames[i]!.index}-${frames[i + 2]!.index}`);
     }

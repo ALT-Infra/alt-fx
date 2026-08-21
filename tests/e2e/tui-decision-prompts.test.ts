@@ -403,7 +403,7 @@ function createIsolatedRoot(
   mkdirSync(workspace, { recursive: true });
   writeFileSync(
     join(home, ".fx", "settings.json"),
-    JSON.stringify({ permission_mode: permissionMode, permission, maxxing_mode: "legacy" }),
+    JSON.stringify({ permission_mode: permissionMode, permission }),
   );
   roots.push(root);
   return { root, home, workspace: realpathSync(workspace) };

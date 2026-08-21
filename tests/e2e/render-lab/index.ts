@@ -1094,7 +1094,7 @@ async function runStartupScrollbackOverflow(
   mkdirSync(join(fixture.home, ".fx"), { recursive: true });
   writeFileSync(
     join(fixture.home, ".fx", "settings.json"),
-    `${JSON.stringify({ startup_scrollback: startupScrollback, maxxing_mode: "legacy" })}\n`,
+    `${JSON.stringify({ startup_scrollback: startupScrollback })}\n`,
   );
   const gateway = startLocalGatewayFixture(promptTail);
   let session: RenderLabTmux | null = null;
@@ -1155,7 +1155,7 @@ async function runStartupScrollbackOverflow(
     await session.waitForPane(
       (pane) =>
         pane.includes(promptTail) &&
-        pane.split("\n").some((row) => /^❯\s*$/.test(row)),
+        pane.split("\n").some((row) => /^┃\s*$/.test(row)),
       10_000,
     );
     const submittedFrame = await capture(context, session, "overflow-submitted-prompt-tail-visible");
@@ -2338,7 +2338,7 @@ function createFixture(runId: string): Fixture {
   mkdirSync(fixture.work, { recursive: true });
   writeFileSync(
     join(fixture.home, ".fx", "settings.json"),
-    `${JSON.stringify({ maxxing_mode: "legacy" })}\n`,
+    `${JSON.stringify({})}\n`,
   );
   writeFileSync(join(fixture.work, "run-id.txt"), `${runId}\n`);
   writeFileSync(

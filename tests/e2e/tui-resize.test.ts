@@ -68,7 +68,6 @@ async function createResizeSession(
   const settings = existsSync(settingsPath)
     ? JSON.parse(readFileSync(settingsPath, "utf8")) as Record<string, unknown>
     : {};
-  settings.maxxing_mode = "legacy";
   writeFileSync(settingsPath, JSON.stringify(settings));
 
   return TmuxSession.create({ ...opts, env });
@@ -1031,11 +1030,11 @@ async function recoverActiveInput(
 }
 
 /**
- * Match fx's input row. tmux trims trailing spaces, so the `❯ ` prefix
- * becomes `❯`. The multi-line prefix `[n/m] ❯ ` is also recognized.
+ * Match fx's input row. tmux trims trailing spaces, so the `┃ ` prefix
+ * becomes `┃`. The multi-line prefix `[n/m] ┃ ` is also recognized.
  */
 function isInputRow(line: string): boolean {
-  return /^❯(\s|$)/.test(line) || /^\[\d+\/\d+\]\s❯(\s|$)/.test(line);
+  return /^┃(\s|$)/.test(line) || /^\[\d+\/\d+\]\s┃(\s|$)/.test(line);
 }
 
 /** A line that is mostly box-drawing characters — a footer divider. */
@@ -1067,12 +1066,28 @@ function findFooter(grid: string[]): { topDivider: number; input: number; bottom
     while (bottomDivider < grid.length && !isDividerRow(grid[bottomDivider]!)) {
       bottomDivider++;
     }
-    if (bottomDivider >= grid.length || bottomDivider + 1 >= grid.length) continue;
-    if (!isDividerRow(grid[bottomDivider]!)) continue;
-    if (!isFooterHintRow(grid[bottomDivider + 1]!)) continue;
-    if (!grid.slice(input + 1, bottomDivider).every(isInputContinuationRow)) continue;
-    const hasTopDivider = topDivider >= 0 && isDividerRow(grid[topDivider]!);
-    return { topDivider: hasTopDivider ? topDivider : input, input, bottomDivider, hint: bottomDivider + 1, hasTopDivider };
+    if (bottomDivider < grid.length && bottomDivider + 1 < grid.length) {
+      if (isDividerRow(grid[bottomDivider]!) &&
+        isFooterHintRow(grid[bottomDivider + 1]!) &&
+        grid.slice(input + 1, bottomDivider).every(isInputContinuationRow)) {
+        const hasTopDivider = topDivider >= 0 && isDividerRow(grid[topDivider]!);
+        return { topDivider: hasTopDivider ? topDivider : input, input, bottomDivider, hint: bottomDivider + 1, hasTopDivider };
+      }
+    }
+
+    let lastInput = input;
+    while (lastInput + 1 < grid.length && isInputRow(grid[lastInput + 1]!)) lastInput++;
+    let hint = lastInput + 1;
+    while (hint < grid.length && grid[hint]!.trim().length === 0) hint++;
+    if (hint < grid.length && isFooterHintRow(grid[hint]!)) {
+      return {
+        topDivider: input,
+        input,
+        bottomDivider: Math.max(lastInput, hint - 1),
+        hint,
+        hasTopDivider: false,
+      };
+    }
   }
   return null;
 }
@@ -2094,7 +2109,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         expect(Array.from(rule).filter((glyph) => glyph === "─")).toHaveLength(
           cols - gutter,
         );
-        expect(grid[footer!.input]).toBe("❯");
+        expect(grid[footer!.input]).toBe("┃");
       };
 
       await expectRule(120);
@@ -2180,7 +2195,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         expect(terminalRows.join("\n")).not.toContain("> >");
         const footer = findFooter(grid);
         expect(footer).not.toBeNull();
-        expect(grid[footer!.input]).toBe("❯");
+        expect(grid[footer!.input]).toBe("┃");
       };
 
       await expectNestedQuote(120, 1);
@@ -2338,7 +2353,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       writeFileSync(join(root, "pane-final.txt"), `${await session.capturePane()}\n`);
 
       const finalGrid = await session.capturePaneGrid();
-      expect(finalGrid.filter((line) => line.trim() === "❯")).toHaveLength(1);
+      expect(finalGrid.filter((line) => line.trim() === "┃")).toHaveLength(1);
       expect(findFooter(finalGrid)).not.toBeNull();
       expect(session.paneStatus()).toEqual({ dead: false, status: null });
       expect(session.isPaneAlive()).toBe(true);
@@ -2449,7 +2464,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       await session.waitForText("/help", 10_000);
       await waitForSelectedSlashLabel(session, "/help");
       const shrinkStage = await session.captureFullScrollback();
-      expect(shrinkStage).toContain("Commands 38 · Type to filter");
+      expect(shrinkStage).toContain("Commands 37 · Type to filter");
       expect(shrinkStage).toContain("1–4");
       writeFileSync(join(root, "scrollback-after-shrink.txt"), shrinkStage);
 
@@ -2488,7 +2503,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       writeFileSync(join(root, "pane-final.txt"), `${await session.capturePane()}\n`);
 
       const finalGrid = await session.capturePaneGrid();
-      expect(finalGrid.filter((line) => line.trim() === "❯")).toHaveLength(1);
+      expect(finalGrid.filter((line) => line.trim() === "┃")).toHaveLength(1);
       expect(findFooter(finalGrid)).not.toBeNull();
       expect(session.paneStatus()).toEqual({ dead: false, status: null });
       expect(session.isPaneAlive()).toBe(true);
@@ -2611,20 +2626,6 @@ describe.skipIf(SKIP)("tui: resize", () => {
         await active.waitForText("off  on", TIMEOUT);
         await active.sendKeys("Down");
         await active.sendKeys("Right");
-      },
-    },
-    {
-      issue: "FXC-119",
-      label: "appearance",
-      width: 72,
-      height: 16,
-      surfaceMarker: "Appearance",
-      editedInput: "x",
-      async openSurface(active) {
-        await active.sendText("/appearance");
-        await active.waitForText("Input appearance", TIMEOUT);
-        await active.sendKeys("Right");
-        await active.waitForText("lines  tint", TIMEOUT);
       },
     },
     {
@@ -2914,9 +2915,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       expect(grid.length).toBeGreaterThan(0);
       const footer = findFooter(grid);
       expect(footer).not.toBeNull();
-      const dividerRow = footerDividerRow(footer!);
-      expect(grid[dividerRow]!.length).toBeGreaterThanOrEqual(40);
-      expect(grid[dividerRow]!.length).toBeLessThanOrEqual(60);
+      expect(isInputRow(grid[footer!.input]!)).toBe(true);
     },
     TIMEOUT,
   );
@@ -3456,11 +3455,11 @@ describe.skipIf(SKIP)("tui: resize", () => {
     async () => {
       session = await launchAt(120, 40);
       await session.sendText("/help");
-      await session.waitForText("Commands 38", 5_000);
+      await session.waitForText("Commands 37", 5_000);
       await session.resizeWindow(76, 24, 400);
 
       const grid = await session.capturePaneGrid();
-      expect(grid.join("\n")).toContain("Commands 38");
+      expect(grid.join("\n")).toContain("Commands 37");
       expect(findHelpScreen(grid)).not.toBeNull();
 
       await session.sendKeys("Escape");
@@ -3478,7 +3477,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
     async () => {
       session = await launchAt(120, 40);
       await session.sendText("/help");
-      await session.waitForText("Commands 38", 5_000);
+      await session.waitForText("Commands 37", 5_000);
 
       const captureScrollback = () =>
         execSync(`tmux capture-pane -t ${session!.name} -p -S -`, {
@@ -3486,7 +3485,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
           stdio: "pipe",
         });
       const expectHelpCatalog = (grid: string[]) => {
-        expect(grid.join("\n")).toContain("Commands 38");
+        expect(grid.join("\n")).toContain("Commands 37");
         expect(grid.join("\n")).not.toContain("Run /help for commands");
         expect(findHelpScreen(grid)).not.toBeNull();
       };
@@ -3502,7 +3501,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const restored = captureScrollback();
       expect(restored.match(/𝒇x v\d+\.\d+\.\d+\b/g)).toHaveLength(1);
       expect(restored.match(/Run \/help for commands/g)).toHaveLength(1);
-      expect(restored).not.toContain("Commands 38");
+      expect(restored).not.toContain("Commands 37");
       expect(findFooter(await session.capturePaneGrid())).not.toBeNull();
     },
     TIMEOUT,
@@ -3607,7 +3606,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const finalGrid = await session.capturePaneGrid();
       const finalFooter = findFooter(finalGrid);
       expect(finalFooter).not.toBeNull();
-      expect(finalGrid[finalFooter!.input]).toContain("❯ x");
+      expect(finalGrid[finalFooter!.input]).toContain("┃ x");
 
       const resizeLines = readTraceLines(tracePath);
       const signalIndex = resizeLines.findIndex(
@@ -3664,7 +3663,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       }));
       const firstInputFrame = replayFrames.find(
         (frame) =>
-          frame.grid.includes("❯ x") && frame.metadata.cursor.visible,
+          frame.grid.includes("┃ x") && frame.metadata.cursor.visible,
       );
       const finalFooterFrame = replayFrames.findLast(
         (frame) => frame.metadata.cursor.visible,
@@ -3679,7 +3678,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const visibleViewport = finalGrid.join("\n");
       expect(countOccurrences(visibleViewport, firstMarker)).toBe(1);
       expect(countOccurrences(visibleViewport, secondMarker)).toBe(1);
-      expect(countOccurrences(visibleViewport, "❯ x")).toBe(1);
+      expect(countOccurrences(visibleViewport, "┃ x")).toBe(1);
       expect(visibleViewport).not.toContain(preFxMarker);
       expect(session.paneStatus()).toEqual({ dead: false, status: null });
       expect(session.isPaneAlive()).toBe(true);
@@ -4016,7 +4015,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         expect(await session.captureFullScrollback()).toContain(marker);
 
         await session.sendText("/help");
-        await session.waitForText("Commands 38", 5_000);
+        await session.waitForText("Commands 37", 5_000);
         await session.resizeWindow(84, 28, 500);
 
         const catalog = await session.capturePaneGrid();
@@ -4031,7 +4030,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         expect(scrollback.match(/𝒇x v\d+\.\d+\.\d+\b/g)).toHaveLength(1);
         expect(scrollback.match(/Run \/help for commands/g)).toHaveLength(1);
         expect(scrollback.split("\n")[0]).toMatch(/𝒇x v\d+\.\d+\.\d+\b/);
-        expect(scrollback).not.toContain("Commands 38");
+        expect(scrollback).not.toContain("Commands 37");
         const finalGrid = await session.capturePaneGrid();
         expect(findFooter(finalGrid), finalGrid.join("\n")).not.toBeNull();
 
@@ -4091,7 +4090,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       await session.waitForComposer(TIMEOUT);
       await new Promise((resolve) => setTimeout(resolve, 200));
       const initialInputRows = (await session.capturePaneGrid()).filter(isInputRow);
-      expect(initialInputRows).toEqual(["❯"]);
+      expect(initialInputRows).toEqual(["┃"]);
       await session.sendText("Record a theme reset transcript marker.");
       await session.waitForText("THEME_RESET_FIRST_RESPONSE", TIMEOUT);
 

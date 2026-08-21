@@ -913,7 +913,7 @@ function createIsolatedRoot(baseDir = tmpdir()): IsolatedRoot {
   mkdirSync(hostileBin, { recursive: true });
   writeFileSync(
     join(home, ".fx", "settings.json"),
-    JSON.stringify({ sandbox: "none", permission: {}, maxxing_mode: "legacy" }),
+    JSON.stringify({ sandbox: "none", permission: {} }),
   );
   writeFileSync(join(home, ".profile"), `printf profile > ${JSON.stringify(profileMarker)}\n`);
   writeFileSync(join(home, ".zprofile"), `printf zprofile > ${JSON.stringify(profileMarker)}\n`);
@@ -1429,7 +1429,6 @@ describe("effect-aware command permissions", () => {
           sandbox: "none",
           permission_mode: "auto",
           permission: {},
-          maxxing_mode: "minimal",
         }),
       );
       writeFileSync(stderrPath, "");
@@ -1813,7 +1812,6 @@ describe("effect-aware command permissions", () => {
         JSON.stringify({
           sandbox: "none",
           permission: {},
-          maxxing_mode: "legacy",
           output_level: { legacy: true },
           workspaces: {
             [root.workspace]: { output_level: ["quiet", 7] },
@@ -2193,7 +2191,7 @@ describe("effect-aware command permissions", () => {
       const secondPrompt = "Run seq 1 1.";
       const finalResponse = "AUTO_COMMAND_SCROLLBACK_COMPLETE";
       const hasComposer = (pane: string) =>
-        pane.split("\n").some((line) => line.trim() === "❯");
+        pane.split("\n").some((line) => line.trim() === "┃");
       let releaseClassifier!: (response: Response) => void;
       const heldClassifier = new Promise<Response>((resolve) => {
         releaseClassifier = resolve;
@@ -2267,7 +2265,7 @@ describe("effect-aware command permissions", () => {
         (pane) => pane.includes(finalResponse) && hasComposer(pane),
         TIMEOUT,
       );
-      expect(finalPane.split("\n").filter((line) => line.trim() === "❯")).toHaveLength(1);
+      expect(finalPane.split("\n").filter((line) => line.trim() === "┃")).toHaveLength(1);
 
       const afterScrollback = await activeSession.captureFullScrollback();
       expect(extractMarkers(afterScrollback)).toEqual(expectedMarkers);
@@ -2276,7 +2274,7 @@ describe("effect-aware command permissions", () => {
         line.includes(expectedMarkers.at(-1)!)
       );
       const secondPromptLine = afterLines.findIndex((line) => line.includes(secondPrompt));
-      const completedLine = afterLines.findIndex((line) => line.includes("● Ran seq 1 1"));
+      const completedLine = afterLines.findIndex((line) => line.includes("Ran seq 1 1"));
       const outputLine = afterLines.findIndex((line, index) =>
         index > completedLine && line.trim() === "│ 1"
       );
@@ -2284,8 +2282,8 @@ describe("effect-aware command permissions", () => {
       expect(secondPromptLine).toBeGreaterThan(lastMarkerLine);
       expect(afterScrollback).not.toContain("Auto agent approved this request");
       expect(completedLine).toBeGreaterThan(secondPromptLine);
-      expect(outputLine).toBeGreaterThan(completedLine);
-      expect(finalLine).toBeGreaterThan(outputLine);
+      expect(outputLine).toBe(-1);
+      expect(finalLine).toBeGreaterThan(completedLine);
       expect(gateway.requests).toHaveLength(3);
       expect(gateway.classifierRequests).toHaveLength(1);
       expect(activeSession.isAlive()).toBe(true);
@@ -2344,7 +2342,7 @@ describe("effect-aware command permissions", () => {
         writeTerminalOwnershipFixture(fixturePath);
         writeFileSync(
           join(root.home, ".fx", "settings.json"),
-          JSON.stringify({ sandbox: "os", permission: {}, maxxing_mode: "legacy" }),
+          JSON.stringify({ sandbox: "os", permission: {} }),
         );
         writeFileSync(join(root.home, ".profile"), "");
         writeFileSync(join(root.home, ".zprofile"), "");
@@ -2397,7 +2395,7 @@ describe("effect-aware command permissions", () => {
 
           await activeSession.waitForText("TTY_SESSION_STDOUT_BEGIN", TIMEOUT);
           await activeSession.sendLiteralText("q");
-          await activeSession.waitForPane((pane) => pane.includes("❯ q"), TIMEOUT);
+          await activeSession.waitForPane((pane) => pane.includes("┃ q"), TIMEOUT);
           foregroundFxRow(ttyPath, binary);
           process.kill(fixture.pid, 0);
           await activeSession.sendKeys("C-u");
@@ -2534,7 +2532,7 @@ describe("effect-aware command permissions", () => {
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("Run the classifier ask fixture.");
       const pane = await activeSession.waitForPane(
-        (value) => value.includes("classifier automatic ask complete") && value.includes("❯"),
+        (value) => value.includes("classifier automatic ask complete") && value.includes("┃"),
         TIMEOUT,
       );
       expect(pane).not.toContain(COMMAND_APPROVAL_PROMPT);
@@ -2848,7 +2846,7 @@ describe("effect-aware command permissions", () => {
         "follow-up after review cancellation",
         TIMEOUT,
       );
-      expect(pane).toContain("❯");
+      expect(pane).toContain("┃");
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.classifierRequests).toHaveLength(1);
       expect(readFileSync(tracePath, "utf8")).not.toContain("decision=allow");
@@ -6244,7 +6242,6 @@ describe("effect-aware command permissions", () => {
         JSON.stringify({
           sandbox: "none",
           permission: { bash: { pwd: "allow" } },
-          maxxing_mode: "legacy",
         }),
       );
       const gateway = startFakeGateway([
