@@ -129,8 +129,12 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
     };
 
     const zio = io_mod.getIo();
-    var file = io_mod.openExistingReadOnlyRegularFile(std.Io.Dir.cwd(), target) catch |err| {
-        return readFileFailure(ctx.allocator, err, target);
+    var file = io_mod.openExistingReadOnlyRegularFile(std.Io.Dir.cwd(), target, .no_follow) catch |err| {
+        return readFileFailure(
+            ctx.allocator,
+            if (err == error.DurablePathUnsafe) error.NotRegularFile else err,
+            target,
+        );
     };
     defer file.close(zio);
 
