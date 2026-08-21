@@ -806,6 +806,55 @@ describe("gateway stream lifecycle", () => {
     }
   }, 30_000);
 
+  test("memory save rejects a corrupt store without replacing it", async () => {
+    const root = createFixtureRoot("memory-corrupt-save");
+    const tracePath = join(root.root, "trace.log");
+    const memoriesPath = join(root.home, ".fx", "memories.json");
+    const corruptStore = '["recoverable prior memory",\n';
+    writeFileSync(memoriesPath, corruptStore);
+
+    const callId = "memory_corrupt_save_1";
+    const responses = [
+      fakeGatewayToolCall(callId, "memory", {
+        action: "save",
+        fact: "replacement memory",
+      }),
+      fakeGatewayFinalText("Corrupt memory store handled."),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+
+    try {
+      const result = await runFx(
+        ["ask", "--auto", "--json", "--no-save", "Save a memory."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+
+      expect(result.code).toBe(0);
+      expect(json.exit_code).toBe(0);
+      expect(json.error).toBeUndefined();
+      expect(json.output).toContain("Corrupt memory store handled.");
+      expect(json.tool_calls).toContainEqual({
+        name: "memory",
+        status: "error",
+      });
+      expect(gateway.requestCount()).toBe(2);
+      expect(toolResultOutput(gateway.requests[1]!.body, callId)).toContain(
+        "memory store is malformed; ~/.fx/memories.json was not modified",
+      );
+      expect(readFileSync(memoriesPath, "utf8")).toBe(corruptStore);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("ask keeps the GLM default model identity without enabling fast mode", async () => {
     const root = createFixtureRoot("default-model");
     const tracePath = join(root.root, "trace.log");
