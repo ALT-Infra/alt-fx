@@ -1086,14 +1086,58 @@ fn visionPathFailure(alloc: Allocator, err: anyerror) Allocator.Error!ToolExecut
     };
 }
 
+fn visionPathImagePreparationFailure(alloc: Allocator) Allocator.Error!ToolExecutionResult {
+    const details = [_]tool_result_errors.Detail{
+        .{ .name = "error", .value = .{ .string = "ImagePreparationFailed" } },
+    };
+    return .{
+        .status = .failure,
+        .status_detail = "ImagePreparationFailed",
+        .model_output = try tool_result_errors.toolExecutionFailureJson(alloc, .{
+            .tool_name = "vision",
+            .message = "Vision could not prepare an approved image path.",
+            .details = &details,
+            .suggestion = image_attachments.image_preparation_failed_notice,
+        }),
+    };
+}
+
 fn visionPathPreparationFailure(
     alloc: Allocator,
     err: anyerror,
 ) !ToolExecutionResult {
     return switch (err) {
-        error.OutOfMemory, error.Cancelled => err,
+        error.OutOfMemory, error.Cancelled, error.TimedOut => err,
+        error.ImagePreparationFailed => visionPathImagePreparationFailure(alloc),
         else => visionPathFailure(alloc, err),
     };
+}
+
+test "Vision path preparation reports semantic failure and preserves operational errors" {
+    const alloc = std.testing.allocator;
+    const failed = try visionPathPreparationFailure(alloc, error.ImagePreparationFailed);
+    defer alloc.free(@constCast(failed.model_output));
+    try std.testing.expectEqualStrings("ImagePreparationFailed", failed.status_detail.?);
+    try expectContains(failed.model_output, "Vision could not prepare an approved image path.");
+    try expectContains(failed.model_output, image_attachments.image_preparation_failed_notice);
+
+    const too_large = try visionPathPreparationFailure(alloc, error.ImageTooLarge);
+    defer alloc.free(@constCast(too_large.model_output));
+    try std.testing.expectEqualStrings("ImageTooLarge", too_large.status_detail.?);
+    try expectContains(too_large.model_output, "under 20 MiB");
+
+    try std.testing.expectError(
+        error.Cancelled,
+        visionPathPreparationFailure(alloc, error.Cancelled),
+    );
+    try std.testing.expectError(
+        error.TimedOut,
+        visionPathPreparationFailure(alloc, error.TimedOut),
+    );
+    try std.testing.expectError(
+        error.OutOfMemory,
+        visionPathPreparationFailure(alloc, error.OutOfMemory),
+    );
 }
 
 fn semanticFailure(output: []const u8) ToolExecutionResult {

@@ -1175,6 +1175,13 @@ fn writeAskUsage(deps: RunDeps, usage: []const u8) !void {
     try deps.write_stderr(deps.stderr_ctx, "\n");
 }
 
+fn askErrorNotice(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.ImagePreparationFailed => image_attachments.image_preparation_failed_notice,
+        else => null,
+    };
+}
+
 fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: RunDeps) !u8 {
     var interrupt_scope = try headless_interrupt.Scope.install(
         deps.install_headless_interrupt,
@@ -1287,7 +1294,13 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
             );
             return 1;
         }
-        if (!options.json_output) return err;
+        if (!options.json_output) {
+            const notice = askErrorNotice(err) orelse return err;
+            try deps.write_stderr(deps.stderr_ctx, "fx ask: ");
+            try deps.write_stderr(deps.stderr_ctx, notice);
+            try deps.write_stderr(deps.stderr_ctx, "\n");
+            return 1;
+        }
         const json = try renderErrorJsonResult(alloc, @errorName(err));
         defer alloc.free(json);
         try deps.write_stdout(deps.stdout_ctx, json);
@@ -5207,6 +5220,23 @@ test "stdin prompt errors keep exact structured names" {
     try std.testing.expectEqualStrings(
         "{\"output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"PromptInputReadFailed\"}\n",
         read_failure,
+    );
+}
+
+test "image preparation failure has stable text and JSON contracts" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectEqualStrings(
+        image_attachments.image_preparation_failed_notice,
+        askErrorNotice(error.ImagePreparationFailed).?,
+    );
+    try std.testing.expect(askErrorNotice(error.Cancelled) == null);
+    try std.testing.expect(askErrorNotice(error.TimedOut) == null);
+
+    const json = try renderErrorJsonResult(alloc, @errorName(error.ImagePreparationFailed));
+    defer alloc.free(json);
+    try std.testing.expectEqualStrings(
+        "{\"output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"ImagePreparationFailed\"}\n",
+        json,
     );
 }
 
