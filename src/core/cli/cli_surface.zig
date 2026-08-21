@@ -2857,6 +2857,7 @@ fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
         .gateway_models_path = cfg.models_path,
         .gateway_provider = cfg.gateway_provider,
         .codex_agent_stream = cfg.codex_agent_stream,
+        .codex_model_catalog = cfg.codex_model_catalog,
         .background_process_provider = cfg.background_process_provider,
         .secret_store = cfg.secret_store,
         .prompt_policy = cfg.prompt_policy,

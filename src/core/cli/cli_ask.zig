@@ -15,6 +15,7 @@ const process_supervisor = @import("../background/process_supervisor.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const devbox_executor = @import("../execution/devbox_executor.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
+const model_catalog = @import("../gateway/model_catalog.zig");
 const background_process_provider = @import(
     "../execution/background_process_provider.zig",
 );
@@ -224,6 +225,7 @@ pub const Config = struct {
     gateway_models_path: []const u8,
     gateway_provider: gateway_provider.Provider,
     codex_agent_stream: ?agent_stream_provider.Provider = null,
+    codex_model_catalog: ?model_catalog.Provider = null,
     background_process_provider: background_process_provider.Provider =
         background_process_provider.unavailable_provider,
     secret_store: host.SecretStore,
@@ -1980,9 +1982,14 @@ fn reportUsage(raw_ctx: *anyopaque, usage: types.Usage) void {
 
 fn resolveModelCapabilities(raw_ctx: *anyopaque, _: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    const catalog = selectModelCatalog(
+        ctx.provider,
+        ctx.cfg.gateway_provider.model_catalog,
+        ctx.cfg.codex_model_catalog,
+    ) orelse return model_capabilities.capabilitiesForModel(model);
     return ctx.capability_resolver.resolve(
         ctx.alloc,
-        ctx.cfg.gateway_provider.model_catalog,
+        catalog,
         .{
             .access = ctx.model_catalog_access,
             .endpoint = ctx.cfg.gateway_models_path,
@@ -1992,9 +1999,48 @@ fn resolveModelCapabilities(raw_ctx: *anyopaque, _: Allocator, model: []const u8
     );
 }
 
+fn selectModelCatalog(
+    provider: model_provider.ProviderId,
+    gateway: model_catalog.Provider,
+    codex: ?model_catalog.Provider,
+) ?model_catalog.Provider {
+    return switch (provider) {
+        .gateway => gateway,
+        .codex => codex,
+    };
+}
+
 fn availableModelCapabilities(raw_ctx: *anyopaque, model: []const u8) model_capabilities.Capabilities {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     return ctx.capability_resolver.available(model);
+}
+
+test "provider catalog selection never falls back across origins" {
+    var gateway_tag: u8 = 0;
+    var codex_tag: u8 = 0;
+    var gateway = test_builtin_gateway.model_catalog_provider;
+    gateway.context = &gateway_tag;
+    var codex = test_builtin_gateway.model_catalog_provider;
+    codex.context = &codex_tag;
+    const cases = [_]struct {
+        provider: model_provider.ProviderId,
+        codex: ?model_catalog.Provider,
+        expected_context: ?*anyopaque,
+    }{
+        .{ .provider = .gateway, .codex = codex, .expected_context = &gateway_tag },
+        .{ .provider = .codex, .codex = codex, .expected_context = &codex_tag },
+        .{ .provider = .codex, .codex = null, .expected_context = null },
+    };
+
+    for (cases) |case| {
+        const selected = selectModelCatalog(case.provider, gateway, case.codex);
+        if (case.expected_context) |expected| {
+            try std.testing.expect(selected != null);
+            try std.testing.expect(selected.?.context.? == expected);
+        } else {
+            try std.testing.expect(selected == null);
+        }
+    }
 }
 
 fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentationOutcome, disposition: ?types.ProviderCompletionDisposition) !void {
