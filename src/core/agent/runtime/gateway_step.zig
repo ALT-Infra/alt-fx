@@ -105,7 +105,7 @@ pub fn streamGatewayCompletion(
     if (comptime @import("builtin").os.tag != .wasi) {
         if (result.reconcile_generation_usage) {
             if (usage) |ledger| {
-                if (credential_source == .chatgpt_subscription) {
+                if (credential_source == .chatgpt_subscription or credential_source == .grok_subscription) {
                     ledger.clearReconciliationCredential();
                 } else {
                     ledger.startReconciliation(usage_allocator, api_key);

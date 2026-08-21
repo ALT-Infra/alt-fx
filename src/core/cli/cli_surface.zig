@@ -5,6 +5,7 @@ const app_lifecycle = @import("../app/app_lifecycle.zig");
 const background_record_liveness = @import("../background/background_record_liveness.zig");
 const background_store = @import("../background/background_store.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
+const grok_oauth = @import("../auth/grok_oauth.zig");
 const acp_runner = @import("acp_runner.zig");
 const cli_ask = @import("cli_ask.zig");
 const cli_replay = @import("cli_replay.zig");
@@ -181,6 +182,9 @@ pub const Config = struct {
     codex_agent_stream: ?agent_stream_provider.Provider = null,
     codex_cli_model_catalog: ?gateway_provider.CliModelCatalogProvider = null,
     codex_model_catalog: ?model_catalog.Provider = null,
+    grok_agent_stream: ?agent_stream_provider.Provider = null,
+    grok_cli_model_catalog: ?gateway_provider.CliModelCatalogProvider = null,
+    grok_model_catalog: ?model_catalog.Provider = null,
     background_process_provider: background_process_provider.Provider =
         background_process_provider.unavailable_provider,
     url_opener: host.UrlOpener,
@@ -204,6 +208,7 @@ pub const Config = struct {
     devbox_provider: ?devbox_executor.Provider = null,
     permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
     codex_permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
+    grok_permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
 };
 
 const LocalSurfaceOptions = struct {
@@ -729,6 +734,8 @@ fn runNonInteractiveWithDeps(
                 .gateway_provider = cfg.gateway_provider,
                 .codex_agent_stream = cfg.codex_agent_stream,
                 .codex_model_catalog = cfg.codex_model_catalog,
+                .grok_agent_stream = cfg.grok_agent_stream,
+                .grok_model_catalog = cfg.grok_model_catalog,
                 .background_process_provider = cfg.background_process_provider,
                 .secret_store = cfg.secret_store,
                 .prompt_policy = cfg.prompt_policy,
@@ -745,6 +752,7 @@ fn runNonInteractiveWithDeps(
                 .devbox_provider = cfg.devbox_provider,
                 .permission_reviewer_provider = cfg.permission_reviewer_provider,
                 .codex_permission_reviewer_provider = cfg.codex_permission_reviewer_provider,
+                .grok_permission_reviewer_provider = cfg.grok_permission_reviewer_provider,
                 .context_limit_overrides = global_args.modifiers.context_limit_overrides,
                 .additional_directories = global_args.modifiers.additional_directories,
                 .saved_directories_suppressed = global_args.modifiers.saved_directories_suppressed,
@@ -757,7 +765,7 @@ fn runNonInteractiveWithDeps(
         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
         .login => |rest| {
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx login [vercel|codex]\n");
+                try writeStderr(deps, "usage: fx login [vercel|codex|grok]\n");
                 return .handled_failure;
             };
             // Preserve the original `fx login` behavior for scripts and users.
@@ -790,12 +798,21 @@ fn runNonInteractiveWithDeps(
                     try writeStderr(deps, message);
                     return .handled_failure;
                 },
+                .grok => grok_oauth.runLogin(
+                    alloc,
+                    cfg.gateway_provider.oauth_transport,
+                    cfg.url_opener,
+                ) catch |err| {
+                    debug_trace.logf("auth", "Grok login failed err={s}", .{@errorName(err)});
+                    try writeStderr(deps, "fx login: failed to sign in with Grok\n");
+                    return .handled_failure;
+                },
             }
             return .handled_success;
         },
         .logout => |rest| {
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx logout [vercel|codex]\n");
+                try writeStderr(deps, "usage: fx logout [vercel|codex|grok]\n");
                 return .handled_failure;
             };
             // Preserve the original `fx logout` behavior for scripts and users.
@@ -816,6 +833,29 @@ fn runNonInteractiveWithDeps(
                     },
                     .deleted_not_durable => result: {
                         try writeStderr(deps, "fx logout: failed to durably remove saved Codex login\n");
+                        break :result .handled_failure;
+                    },
+                };
+            }
+            if (login_provider == .grok) {
+                const outcome = grok_oauth.logout(alloc, cfg.gateway_provider.oauth_transport) catch {
+                    try writeStderr(deps, "fx logout: failed to durably remove saved Grok login\n");
+                    return .handled_failure;
+                };
+                if (outcome.revocation_failed) {
+                    try writeStderr(deps, "fx logout: local Grok session removed, but remote revocation could not be confirmed\n");
+                }
+                return switch (outcome.deletion) {
+                    .deleted => result: {
+                        try writeStdout(deps, "Signed out of Grok.\n");
+                        break :result .handled_success;
+                    },
+                    .missing => result: {
+                        try writeStdout(deps, "No Grok login session found.\n");
+                        break :result .handled_success;
+                    },
+                    .deleted_not_durable => result: {
+                        try writeStderr(deps, "fx logout: failed to durably remove saved Grok login\n");
                         break :result .handled_failure;
                     },
                 };
@@ -861,11 +901,11 @@ fn runNonInteractiveWithDeps(
         },
         .provider => |rest| {
             if (rest.len != 1) {
-                try writeStderr(deps, "usage: fx provider <gateway|codex>\n");
+                try writeStderr(deps, "usage: fx provider <gateway|codex|grok>\n");
                 return .handled_failure;
             }
             const target = model_provider.parse(rest[0]) orelse {
-                try writeStderr(deps, "fx provider: expected gateway or codex\n");
+                try writeStderr(deps, "fx provider: expected gateway, codex, or grok\n");
                 return .handled_failure;
             };
             const workspace_root = try io_mod.realpathAlloc(alloc, ".");
@@ -877,7 +917,12 @@ fn runNonInteractiveWithDeps(
             };
             defer settings.deinit(alloc);
             if ((settings.provider orelse .gateway) == target) {
-                try writeStdout(deps, if (target == .codex) "Codex is already selected.\n" else "Gateway is already selected.\n");
+                const message = switch (target) {
+                    .gateway => "Gateway is already selected.\n",
+                    .codex => "Codex is already selected.\n",
+                    .grok => "Grok is already selected.\n",
+                };
+                try writeStdout(deps, message);
                 return .handled_success;
             }
 
@@ -905,20 +950,41 @@ fn runNonInteractiveWithDeps(
                     settings.credential_source,
                 );
             }
+            if (resolution.credential == null and target == .grok) {
+                grok_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener) catch |err| {
+                    debug_trace.logf("auth", "provider selection Grok login failed err={s}", .{@errorName(err)});
+                    try writeStderr(deps, "fx provider: Grok login failed\n");
+                    return .handled_failure;
+                };
+                resolution = try credentials.resolveForProvider(
+                    alloc,
+                    cfg.gateway_provider.oauth_transport,
+                    cfg.secret_store,
+                    .refresh_if_needed,
+                    target,
+                    settings.credential_source,
+                );
+            }
             const credential = if (resolution.credential) |*value| value else {
                 try writeStderr(deps, if (target == .codex)
                     "fx provider: run fx login codex first\n"
+                else if (target == .grok)
+                    "fx provider: run fx login grok first\n"
                 else
                     "fx provider: configure a Gateway credential first\n");
                 return .handled_failure;
             };
-            const catalog_provider = if (target == .codex)
-                cfg.codex_model_catalog orelse {
+            const catalog_provider = switch (target) {
+                .codex => cfg.codex_model_catalog orelse {
                     try writeStderr(deps, "fx provider: Codex model catalog is unavailable\n");
                     return .handled_failure;
-                }
-            else
-                cfg.gateway_provider.model_catalog;
+                },
+                .grok => cfg.grok_model_catalog orelse {
+                    try writeStderr(deps, "fx provider: Grok model catalog is unavailable\n");
+                    return .handled_failure;
+                },
+                .gateway => cfg.gateway_provider.model_catalog,
+            };
             const fetch_result = model_catalog.fetchWithPublicFallback(catalog_provider, alloc, .{
                 .access = credentials.catalogAccessAt(credential.*, io_mod.milliTimestamp()),
                 .endpoint = cfg.models_path,
@@ -939,15 +1005,20 @@ fn runNonInteractiveWithDeps(
                 },
             };
             defer model_catalog.freeModelCatalog(alloc, &loaded.catalog);
-            const saved_model = if (target == .codex) settings.codex_model else settings.model;
+            const saved_model = switch (target) {
+                .gateway => settings.model,
+                .codex => settings.codex_model,
+                .grok => settings.grok_model,
+            };
             const selected_model = selectCatalogModel(loaded.catalog.items, saved_model) orelse {
                 try writeStderr(deps, "fx provider: target model catalog is empty\n");
                 return .handled_failure;
             };
-            var attempt = config_runtime.attemptUserPreferences(alloc, if (target == .codex)
-                .{ .provider = target, .codex_model = selected_model }
-            else
-                .{ .provider = target, .model = selected_model });
+            var attempt = config_runtime.attemptUserPreferences(alloc, switch (target) {
+                .gateway => .{ .provider = target, .model = selected_model },
+                .codex => .{ .provider = target, .codex_model = selected_model },
+                .grok => .{ .provider = target, .grok_model = selected_model },
+            });
             defer attempt.deinit(alloc);
             switch (attempt) {
                 .failure => |failure| {
@@ -957,7 +1028,11 @@ fn runNonInteractiveWithDeps(
                 },
                 .outcome => {},
             }
-            try writeStdout(deps, if (target == .codex) "Provider set to Codex.\n" else "Provider set to Gateway.\n");
+            try writeStdout(deps, switch (target) {
+                .gateway => "Provider set to Gateway.\n",
+                .codex => "Provider set to Codex.\n",
+                .grok => "Provider set to Grok.\n",
+            });
             return .handled_success;
         },
         .setup => |rest| {
@@ -1035,13 +1110,17 @@ fn runNonInteractiveWithDeps(
             try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
 
             const catalog_access = startup.modelCatalogAccess();
-            const catalog_provider = if (startup.provider == .codex)
-                cfg.codex_cli_model_catalog orelse {
+            const catalog_provider = switch (startup.provider) {
+                .codex => cfg.codex_cli_model_catalog orelse {
                     try writeStderr(deps, "fx models: Codex model catalog is unavailable\n");
                     return .handled_failure;
-                }
-            else
-                cfg.gateway_provider.cli_model_catalog;
+                },
+                .grok => cfg.grok_cli_model_catalog orelse {
+                    try writeStderr(deps, "fx models: Grok model catalog is unavailable\n");
+                    return .handled_failure;
+                },
+                .gateway => cfg.gateway_provider.cli_model_catalog,
+            };
             const loaded = switch (catalog_provider.fetch(alloc, .{
                 .access = catalog_access,
                 .endpoint = cfg.models_path,
@@ -2858,6 +2937,8 @@ fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
         .gateway_provider = cfg.gateway_provider,
         .codex_agent_stream = cfg.codex_agent_stream,
         .codex_model_catalog = cfg.codex_model_catalog,
+        .grok_agent_stream = cfg.grok_agent_stream,
+        .grok_model_catalog = cfg.grok_model_catalog,
         .background_process_provider = cfg.background_process_provider,
         .secret_store = cfg.secret_store,
         .prompt_policy = cfg.prompt_policy,
@@ -2875,6 +2956,7 @@ fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
         .devbox_provider = cfg.devbox_provider,
         .permission_reviewer_provider = cfg.permission_reviewer_provider,
         .codex_permission_reviewer_provider = cfg.codex_permission_reviewer_provider,
+        .grok_permission_reviewer_provider = cfg.grok_permission_reviewer_provider,
     };
 }
 

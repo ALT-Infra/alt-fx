@@ -352,6 +352,7 @@ pub const SessionPreferencePatch = struct {
             switch (provider) {
                 .gateway => patch.model = self.model,
                 .codex => patch.codex_model = self.model,
+                .grok => patch.grok_model = self.model,
             }
         } else {
             patch.model = self.model;
@@ -1827,7 +1828,7 @@ pub fn Runtime(comptime App: type) type {
         pub fn startResumedSessionReconciliation(app: *App) void {
             if (comptime @hasField(App, "auth")) {
                 if (comptime @hasDecl(@TypeOf(app.auth), "credentialSource")) {
-                    if (app.auth.credentialSource() == .chatgpt_subscription) {
+                    if (app.auth.credentialSource() == .chatgpt_subscription or app.auth.credentialSource() == .grok_subscription) {
                         app.session.usage.clearReconciliationCredential();
                         return;
                     }

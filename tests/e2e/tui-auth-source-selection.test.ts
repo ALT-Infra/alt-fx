@@ -83,6 +83,21 @@ function writeSeededChatGptLogin(testHome: string, accessToken = chatgptAccessTo
   chmodSync(authPath, 0o600);
 }
 
+function writeSeededGrokLogin(testHome: string, accessToken: string, accountId = "acct_grok_e2e"): void {
+  const fxDir = join(testHome, ".fx");
+  mkdirSync(fxDir, { recursive: true, mode: 0o700 });
+  chmodSync(fxDir, 0o700);
+  const authPath = join(fxDir, "grok-auth.json");
+  writeFileSync(authPath, JSON.stringify({
+    version: 1,
+    access_token: accessToken,
+    refresh_token: "grok-refresh",
+    expires_at_ms: Date.now() + 60 * 60 * 1000,
+    account_id: accountId,
+  }) + "\n", { mode: 0o600 });
+  chmodSync(authPath, 0o600);
+}
+
 function writeSeededFxLogin(
   testHome: string,
   expiresAtMs = Date.now() + 60 * 60 * 1000,
@@ -414,6 +429,171 @@ function startFakeChatGptOAuth(
   };
 }
 
+function startFakeGrokOAuth(options: {
+  unauthorizedResponses?: number;
+  revokeStatus?: number;
+  userinfoSub?: string;
+} = {}) {
+  const initialAccessToken = "grok-initial-access-token";
+  const refreshedAccessToken = "grok-refreshed-access-token";
+  const requests: Array<{
+    method: string;
+    path: string;
+    authorization: string | null;
+    body: string | null;
+    conversationId: string | null;
+    query: string;
+  }> = [];
+  let tokenCalls = 0;
+  let responseCalls = 0;
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      const url = new URL(request.url);
+      const body = request.method === "POST" ? await request.text() : null;
+      requests.push({
+        method: request.method,
+        path: url.pathname,
+        authorization: request.headers.get("authorization"),
+        body,
+        conversationId: request.headers.get("x-grok-conv-id"),
+        query: url.search,
+      });
+      if (url.pathname === "/oauth2/authorize") {
+        const redirectUri = url.searchParams.get("redirect_uri");
+        const state = url.searchParams.get("state");
+        if (!redirectUri || !state || url.searchParams.get("nonce")) {
+          return new Response("invalid authorize request", { status: 400 });
+        }
+        if (url.searchParams.get("referrer") !== "fx") {
+          return new Response("missing fx referrer", { status: 400 });
+        }
+        const callback = new URL(redirectUri);
+        callback.searchParams.set("code", "grok-code");
+        callback.searchParams.set("state", state);
+        return Response.redirect(callback.toString(), 302);
+      }
+      if (url.pathname === "/oauth2/token") {
+        tokenCalls += 1;
+        const form = new URLSearchParams(body ?? "");
+        const refresh = form.get("grant_type") === "refresh_token";
+        return Response.json({
+          access_token: refresh ? refreshedAccessToken : initialAccessToken,
+          refresh_token: refresh ? "grok-refresh-next" : "grok-refresh",
+          expires_in: 3600,
+        });
+      }
+      if (url.pathname === "/oauth2/userinfo") {
+        if (!request.headers.get("authorization")?.startsWith("Bearer grok-")) {
+          return Response.json({ error: "unauthorized" }, { status: 401 });
+        }
+        return Response.json({ sub: options.userinfoSub ?? "acct_grok_e2e" });
+      }
+      if (url.pathname === "/oauth2/revoke") {
+        const form = new URLSearchParams(body ?? "");
+        const valid = form.get("client_id") === "b1a00492-073a-47ea-816f-4c329264a828" &&
+          (form.get("token") === "grok-refresh-next" || form.get("token") === "grok-refresh");
+        if (valid && options.revokeStatus && options.revokeStatus !== 200) {
+          return Response.json({ error: "revocation unavailable" }, { status: options.revokeStatus });
+        }
+        return Response.json(valid ? { revoked: true } : { error: "invalid" }, {
+          status: valid ? 200 : 400,
+        });
+      }
+      if (url.pathname === "/v1/language-models") {
+        return Response.json({ models: [
+          { id: "grok-4.20", object: "model", input_modalities: ["text", "image"], output_modalities: ["text"] },
+          { id: "grok-4.6", object: "model", input_modalities: ["text", "image"], output_modalities: ["text"] },
+          { id: "grok-image-only", object: "model", input_modalities: ["text"], output_modalities: ["image"] },
+        ] });
+      }
+      if (url.pathname === "/v1/responses") {
+        responseCalls += 1;
+        if (responseCalls <= (options.unauthorizedResponses ?? 0)) {
+          return Response.json({ error: { message: "expired" } }, { status: 401 });
+        }
+        return new Response(
+          'data: {"type":"response.output_text.delta","delta":"GROK_DIRECT_RESPONSE"}\n\n' +
+            'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":4,"output_tokens":2}}}\n\n',
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      }
+      return new Response("not found", { status: 404 });
+    },
+  });
+  const baseUrl = `http://127.0.0.1:${server.port}`;
+  return {
+    initialAccessToken,
+    refreshedAccessToken,
+    requests,
+    tokenCalls: () => tokenCalls,
+    baseUrl,
+    env: {
+      FX_E2E_GROK_ISSUER_URL: baseUrl,
+      FX_E2E_GROK_TOKEN_URL: `${baseUrl}/oauth2/token`,
+      FX_E2E_GROK_USERINFO_URL: `${baseUrl}/oauth2/userinfo`,
+      FX_E2E_GROK_REVOKE_URL: `${baseUrl}/oauth2/revoke`,
+      FX_E2E_XAI_GROK_MODELS_URL: `${baseUrl}/v1/language-models`,
+      FX_E2E_XAI_GROK_RESPONSES_URL: `${baseUrl}/v1/responses`,
+    },
+    stop() { server.stop(true); },
+  };
+}
+
+async function runGrokLoginWithBrowser(env: Record<string, string | undefined>) {
+  const childEnv: NodeJS.ProcessEnv = { ...process.env };
+  for (const [key, value] of Object.entries(env)) {
+    if (value === undefined) delete childEnv[key];
+    else childEnv[key] = value;
+  }
+  const proc = nodeSpawn(FX_BIN, ["login", "grok"], {
+    cwd: REPO_ROOT,
+    env: childEnv,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  proc.stdout!.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+  proc.stderr!.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+  const deadline = Date.now() + TIMEOUT;
+  let authorizationUrl: string | undefined;
+  while (Date.now() < deadline) {
+    authorizationUrl = stdout.match(/http:\/\/127\.0\.0\.1:\d+\/oauth2\/authorize\?\S+/)?.[0];
+    if (authorizationUrl) break;
+    await Bun.sleep(20);
+  }
+  if (!authorizationUrl) {
+    proc.kill("SIGTERM");
+    throw new Error(`Grok login did not print an authorization URL: ${stdout}\n${stderr}`);
+  }
+  const response = await fetch(authorizationUrl, { redirect: "follow" });
+  expect(response.status).toBe(200);
+  const code = await new Promise<number>((resolve, reject) => {
+    proc.once("error", reject);
+    proc.once("close", (value) => resolve(value ?? 1));
+  });
+  return { code, stdout, stderr };
+}
+
+async function completeDisplayedGrokLogin(
+  activeSession: TmuxSession,
+  fixture: ReturnType<typeof startFakeGrokOAuth>,
+) {
+  await activeSession.resizeWindow(500, 20);
+  const pane = await activeSession.waitForPane(
+    (value) => value.includes(`${fixture.baseUrl}/oauth2/authorize?`),
+    TIMEOUT,
+  );
+  const authorizationUrl = pane
+    .split(/\s+/)
+    .find((value) => value.startsWith(`${fixture.baseUrl}/oauth2/authorize?`));
+  if (!authorizationUrl) throw new Error("Grok authorization URL was not rendered");
+  const response = await fetch(authorizationUrl, { redirect: "follow" });
+  expect(response.status).toBe(200);
+  await activeSession.resizeWindow(100, 30);
+}
+
 async function completeDisplayedCodexLogin(
   activeSession: TmuxSession,
   fixture: ReturnType<typeof startFakeChatGptOAuth>,
@@ -516,6 +696,52 @@ function startFakeCodexToolLoop(options: {
   };
 }
 
+function startFakeGrokToolLoop(options: {
+  toolName?: string;
+  toolArguments?: object;
+  finalText?: string;
+} = {}) {
+  const bodies: string[] = [];
+  const accessToken = "grok-tool-loop-token";
+  const toolName = options.toolName ?? "read_file";
+  const toolArguments = options.toolArguments ?? { path: "README.md" };
+  const finalText = options.finalText ?? "GROK_TOOL_LOOP_OK";
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      if (new URL(request.url).pathname === "/models") {
+        return Response.json({ models: [
+          { id: "grok-4.20", object: "model", input_modalities: ["text", "image"], output_modalities: ["text"] },
+        ] });
+      }
+      bodies.push(await request.text());
+      if (bodies.length === 1) {
+        return new Response(
+          'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning"}}\n\n' +
+            'data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_tool","type":"reasoning","summary":[],"encrypted_content":"opaque-grok-tool-loop"}}\n\n' +
+            `data: ${JSON.stringify({ type: "response.output_item.added", output_index: 1, item: { type: "function_call", call_id: "call_tool", name: toolName } })}\n\n` +
+            `data: ${JSON.stringify({ type: "response.function_call_arguments.done", output_index: 1, arguments: JSON.stringify(toolArguments) })}\n\n` +
+            'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":5,"output_tokens":2}}}\n\n',
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      }
+      return new Response(
+        `data: ${JSON.stringify({ type: "response.output_text.delta", delta: finalText })}\n\n` +
+          'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":7,"output_tokens":3}}}\n\n',
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    },
+  });
+  return {
+    accessToken,
+    bodies,
+    responsesUrl: `http://127.0.0.1:${server.port}/responses`,
+    modelsUrl: `http://127.0.0.1:${server.port}/models`,
+    stop() { server.stop(true); },
+  };
+}
+
 function startFakeCodexAutoReview() {
   const bodies: string[] = [];
   const accessToken = chatgptAccessToken("acct_auto_review");
@@ -553,6 +779,55 @@ function startFakeCodexAutoReview() {
       }
       return new Response(
         'data: {"type":"response.output_text.delta","delta":"CODEX_AUTO_REVIEW_OK"}\n\n' +
+          'data: {"type":"response.completed","response":{"id":"gen_main_2","status":"completed","usage":{"input_tokens":7,"output_tokens":3}}}\n\n',
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    },
+  });
+  return {
+    accessToken,
+    bodies,
+    responsesUrl: `http://127.0.0.1:${server.port}/responses`,
+    modelsUrl: `http://127.0.0.1:${server.port}/models`,
+    stop() { server.stop(true); },
+  };
+}
+
+function startFakeGrokAutoReview() {
+  const bodies: string[] = [];
+  const accessToken = "grok-auto-review-token";
+  let mainRequests = 0;
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      const path = new URL(request.url).pathname;
+      if (path === "/models") {
+        return Response.json({ models: [
+          { id: "grok-4.20", object: "model", input_modalities: ["text"], output_modalities: ["text"] },
+        ] });
+      }
+      const body = await request.text();
+      bodies.push(body);
+      if (body.includes('"name":"permission_decision"')) {
+        return new Response(
+          'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_permission","name":"permission_decision"}}\n\n' +
+            'data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\\"risk\\":\\"low\\",\\"authorization\\":\\"high\\",\\"decision\\":\\"allow\\",\\"rationale\\":\\"The user requested this harmless command.\\"}"}\n\n' +
+            'data: {"type":"response.completed","response":{"id":"gen_review","status":"completed","usage":{"input_tokens":8,"output_tokens":3}}}\n\n',
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      }
+      mainRequests += 1;
+      if (mainRequests === 1) {
+        return new Response(
+          'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_terminal","name":"terminal"}}\n\n' +
+            'data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\\"action\\":\\"exec\\",\\"command\\":\\"pwd\\"}"}\n\n' +
+            'data: {"type":"response.completed","response":{"id":"gen_main_1","status":"completed","usage":{"input_tokens":5,"output_tokens":2}}}\n\n',
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      }
+      return new Response(
+        'data: {"type":"response.output_text.delta","delta":"GROK_AUTO_REVIEW_OK"}\n\n' +
           'data: {"type":"response.completed","response":{"id":"gen_main_2","status":"completed","usage":{"input_tokens":7,"output_tokens":3}}}\n\n',
         { headers: { "content-type": "text/event-stream" } },
       );
@@ -857,15 +1132,16 @@ tmuxTest(
 
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
     await session.waitForComposer(TIMEOUT);
+    await session.resizeWindow(100, 36);
     await session.sendText("/setup");
     const root = await session.waitForPane(
       (pane) =>
         pane.includes("Setup") &&
         pane.includes("Sign in with Vercel") &&
         pane.includes("Sign in with Codex") &&
+        pane.includes("Sign in with Grok") &&
         pane.includes("API key") &&
-        pane.includes("Change team") &&
-        pane.includes("Switch credential"),
+        pane.includes("Change team"),
       TIMEOUT,
     );
     expect(root).not.toContain("AI_GATEWAY_API_KEY");
@@ -874,8 +1150,9 @@ tmuxTest(
     await session.sendKeys("Enter");
     await session.waitForText("Enter reopens browser · Esc cancels", TIMEOUT);
     await session.sendKeys("Escape");
-    await session.waitForText("Switch credential", TIMEOUT);
+    await session.waitForText("Sign in with Grok", TIMEOUT);
 
+    await session.sendKeys("Down");
     await session.sendKeys("Down");
     await session.sendKeys("Down");
     await session.sendKeys("Enter");
@@ -958,7 +1235,7 @@ async function waitForTrace(tracePath: string, needle: string): Promise<void> {
 }
 
 async function enterSwitchCredential(pickerSession: TmuxSession): Promise<void> {
-  for (let index = 0; index < 4; index += 1) {
+  for (let index = 0; index < 5; index += 1) {
     await pickerSession.sendKeys("Down");
   }
   await pickerSession.sendKeys("Enter");
@@ -967,7 +1244,7 @@ async function enterSwitchCredential(pickerSession: TmuxSession): Promise<void> 
 
 async function openSwitchCredential(pickerSession: TmuxSession): Promise<void> {
   await pickerSession.sendText("/setup");
-  await pickerSession.waitForText("Switch credential", TIMEOUT);
+  await pickerSession.waitForText("Sign in with Grok", TIMEOUT);
   await enterSwitchCredential(pickerSession);
 }
 
@@ -995,6 +1272,7 @@ profileStoredKeyTmuxTest(
 
     await session.sendText("/setup");
     await session.waitForText("API key", TIMEOUT);
+    await session.sendKeys("Down");
     await session.sendKeys("Down");
     await session.sendKeys("Down");
     await session.sendKeys("Enter");
@@ -1117,6 +1395,7 @@ tmuxTest(
 
     await session.sendText("/setup");
     await session.waitForText("Change team", TIMEOUT);
+    await session.sendKeys("Down");
     await session.sendKeys("Down");
     await session.sendKeys("Down");
     await session.sendKeys("Down");
@@ -1604,6 +1883,293 @@ test(
 );
 
 test(
+  "Grok CLI browser login fetches subscription models and replays one account-stable 401",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-grok-cli-login-"));
+    gateway = startFakeGateway([]);
+    const grok = startFakeGrokOAuth({ unauthorizedResponses: 1 });
+    try {
+      const env = {
+        HOME: home,
+        AI_GATEWAY_API_KEY: ENV_TOKEN,
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_SKIP_ONBOARDING: "1",
+        FX_AUTO_UPGRADE: "0",
+        FX_NO_OPEN_BROWSER: "1",
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        ...grok.env,
+      };
+
+      const login = await runGrokLoginWithBrowser(env);
+      expect(login.code, `stdout: ${login.stdout}\nstderr: ${login.stderr}`).toBe(0);
+      expect(login.stdout).toContain("Signed in with Grok.");
+      expect(login.stderr).toBe("");
+
+      const authPath = join(home, ".fx", "grok-auth.json");
+      expect(existsSync(authPath)).toBe(true);
+      expect(statSync(authPath).mode & 0o077).toBe(0);
+
+      const selected = await runFx(["provider", "grok"], { env, timeoutMs: TIMEOUT });
+      expect(selected.code, `stdout: ${selected.stdout}\nstderr: ${selected.stderr}`).toBe(0);
+      expect(selected.stdout).toContain("Provider set to Grok.");
+
+      const models = await runFx(["models", "--json"], { env, timeoutMs: TIMEOUT });
+      const modelIds = (JSON.parse(models.stdout) as { models: Array<{ id: string }> }).models
+        .map((model) => model.id);
+      expect(modelIds).toEqual(["grok-4.20", "grok-4.6"]);
+
+      const ask = await runFx(["ask", "--json", "--auto", "Answer directly."], {
+        env,
+        timeoutMs: TIMEOUT,
+      });
+      expect(ask.code, `stdout: ${ask.stdout}\nstderr: ${ask.stderr}`).toBe(0);
+      expect(ask.stdout).toContain("GROK_DIRECT_RESPONSE");
+      const responses = grok.requests.filter((request) => request.path === "/v1/responses");
+      expect(responses).toHaveLength(2);
+      expect(responses[0]!.body).toBe(responses[1]!.body);
+      expect(responses[0]!.conversationId).toBeTruthy();
+      expect(responses[0]!.conversationId).toBe(responses[1]!.conversationId);
+      expect(responses[0]!.authorization).toBe(`Bearer ${grok.initialAccessToken}`);
+      expect(responses[1]!.authorization).toBe(`Bearer ${grok.refreshedAccessToken}`);
+      expect(grok.tokenCalls()).toBe(2);
+      const userinfo = grok.requests.filter((request) => request.path === "/oauth2/userinfo");
+      expect(userinfo).toHaveLength(2);
+      for (const request of [...gateway.requests, ...gateway.modelRequests]) {
+        expect(request.headers.get("authorization")).not.toContain("grok-");
+      }
+
+      expect((await runFx(["provider", "gateway"], { env, timeoutMs: TIMEOUT })).code).toBe(0);
+      expect((await runFx(["provider", "grok"], { env, timeoutMs: TIMEOUT })).code).toBe(0);
+      expect(grok.tokenCalls()).toBe(2);
+
+      const logout = await runFx(["logout", "grok"], { env, timeoutMs: TIMEOUT });
+      expect(logout.code, `stdout: ${logout.stdout}\nstderr: ${logout.stderr}`).toBe(0);
+      expect(logout.stdout).toContain("Signed out of Grok.");
+      expect(grok.requests.some((request) => request.path === "/oauth2/revoke")).toBe(true);
+      expect(existsSync(authPath)).toBe(false);
+    } finally {
+      grok.stop();
+    }
+  },
+  60_000,
+);
+
+test("Grok logout removes local credentials when remote revocation fails", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-grok-logout-revoke-failure-"));
+  const grok = startFakeGrokOAuth({ revokeStatus: 503 });
+  try {
+    writeSeededGrokLogin(home, grok.initialAccessToken);
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({ provider: "grok", grok_model: "grok-4.20" }) + "\n",
+      { mode: 0o600 },
+    );
+    const authPath = join(home, ".fx", "grok-auth.json");
+    const result = await runFx(["logout", "grok"], {
+      env: {
+        HOME: home,
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_AUTO_UPGRADE: "0",
+        FX_E2E_GROK_REVOKE_URL: grok.env.FX_E2E_GROK_REVOKE_URL,
+      },
+      timeoutMs: TIMEOUT,
+    });
+    expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+    expect(result.stdout).toContain("Signed out of Grok.");
+    expect(result.stderr).toContain("remote revocation could not be confirmed");
+    expect(existsSync(authPath)).toBe(false);
+    expect(JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8")).provider)
+      .toBe("grok");
+    const ask = await runFx(["ask", "--json", "--no-save", "Still Grok?"], {
+      env: { HOME: home, FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0" },
+      timeoutMs: TIMEOUT,
+    });
+    expect(ask.code).toBe(1);
+    expect(ask.stderr).toContain("fx login grok");
+  } finally {
+    grok.stop();
+  }
+});
+
+test("Grok 401 replay refuses a different account before the second provider send", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-grok-account-mismatch-"));
+  gateway = startFakeGateway([]);
+  const grok = startFakeGrokOAuth({ unauthorizedResponses: 1, userinfoSub: "acct_other" });
+  try {
+    writeSeededGrokLogin(home, grok.initialAccessToken);
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({ provider: "grok", grok_model: "grok-4.20" }) + "\n",
+      { mode: 0o600 },
+    );
+    const env = {
+      HOME: home,
+      AI_GATEWAY_API_KEY: ENV_TOKEN,
+      VERCEL_OIDC_TOKEN: undefined,
+      FX_DISABLE_KEYCHAIN: "1",
+      FX_AUTO_UPGRADE: "0",
+      FX_GATEWAY_BASE_URL: gateway.baseUrl,
+      FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+      ...grok.env,
+    };
+    const ask = await runFx(["ask", "--json", "--auto", "--no-save", "Answer."], {
+      env,
+      timeoutMs: TIMEOUT,
+    });
+    expect(ask.code).toBe(1);
+    expect(grok.requests.filter((request) => request.path === "/v1/responses")).toHaveLength(1);
+    const saved = JSON.parse(readFileSync(join(home, ".fx", "grok-auth.json"), "utf8")) as {
+      access_token: string;
+      account_id: string;
+    };
+    expect(saved.access_token).toBe(grok.initialAccessToken);
+    expect(saved.account_id).toBe("acct_grok_e2e");
+    for (const request of [...gateway.requests, ...gateway.modelRequests]) {
+      expect(request.headers.get("authorization")).not.toContain("grok-");
+    }
+  } finally {
+    grok.stop();
+  }
+});
+
+test("Grok CLI sends verified images directly without advertising the vision fallback", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-grok-native-image-"));
+  gateway = startFakeGateway([]);
+  const grok = startFakeGrokOAuth();
+  try {
+    writeSeededGrokLogin(home, grok.initialAccessToken);
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({ provider: "grok", grok_model: "grok-4.20" }) + "\n",
+      { mode: 0o600 },
+    );
+    const imagePath = join(home, "attachment.png");
+    writeFileSync(imagePath, Buffer.from("89504e470d0a1a0a72657374", "hex"));
+    const ask = await runFx([
+      "ask",
+      "--json",
+      "--auto",
+      "--no-save",
+      "--image",
+      imagePath,
+      "Describe the image.",
+    ], {
+      env: {
+        HOME: home,
+        AI_GATEWAY_API_KEY: ENV_TOKEN,
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_AUTO_UPGRADE: "0",
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        ...grok.env,
+      },
+      timeoutMs: TIMEOUT,
+    });
+    expect(ask.code, `stdout: ${ask.stdout}\nstderr: ${ask.stderr}`).toBe(0);
+    const responses = grok.requests.filter((request) => request.path === "/v1/responses");
+    expect(responses).toHaveLength(1);
+    expect(responses[0]!.body).toContain('"type":"input_image"');
+    expect(responses[0]!.body).not.toContain('"name":"vision"');
+    expect(gateway.requests).toHaveLength(0);
+  } finally {
+    grok.stop();
+  }
+});
+
+tmuxTest(
+  "interactive provider switch completes Grok OAuth and round-trips without reauthentication",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-grok-tui-switch-"));
+    stderrPath = join(home, "stderr.log");
+    gateway = startFakeGateway([fakeGatewayFinalText("GATEWAY_AFTER_GROK")]);
+    const grok = startFakeGrokOAuth();
+    try {
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        FX_MODEL: undefined,
+        ...grok.env,
+      });
+      await session.waitForText("auto ·", TIMEOUT);
+
+      await session.sendText("/provider grok");
+      await completeDisplayedGrokLogin(session, grok);
+      await session.waitForText("Switched to Grok subscription with grok-4.20.", TIMEOUT);
+      await session.sendText("Answer from Grok.");
+      await session.waitForText("GROK_DIRECT_RESPONSE", TIMEOUT);
+
+      const tokenCallsAfterLogin = grok.tokenCalls();
+      await session.sendText("/provider gateway");
+      await session.waitForText("Switched to Vercel AI Gateway", TIMEOUT);
+      await session.sendText("/provider grok");
+      await session.waitForText("Switched to Grok subscription with grok-4.20.", TIMEOUT);
+      expect(grok.tokenCalls()).toBe(tokenCallsAfterLogin);
+
+      const saved = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8")) as {
+        provider: string;
+        grok_model: string;
+      };
+      expect(saved.provider).toBe("grok");
+      expect(saved.grok_model).toBe("grok-4.20");
+      const responses = grok.requests.filter((request) => request.path === "/v1/responses");
+      expect(responses).toHaveLength(1);
+      expect(responses[0]!.conversationId).toBeTruthy();
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      grok.stop();
+    }
+  },
+  60_000,
+);
+
+tmuxTest(
+  "Grok model selection accepts proven effort levels and sends the selected effort",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-grok-effort-selection-"));
+    stderrPath = join(home, "stderr.log");
+    gateway = startFakeGateway([]);
+    const grok = startFakeGrokOAuth();
+    try {
+      writeSeededGrokLogin(home, grok.initialAccessToken);
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ provider: "grok", grok_model: "grok-4.20" }) + "\n",
+        { mode: 0o600 },
+      );
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        FX_MODEL: undefined,
+        ...grok.env,
+      });
+      await session.waitForComposer(TIMEOUT);
+      const catalogDeadline = Date.now() + TIMEOUT;
+      while (!grok.requests.some((request) => request.path === "/v1/language-models")) {
+        if (Date.now() >= catalogDeadline) throw new Error("Grok catalog did not load");
+        await Bun.sleep(25);
+      }
+      await session.sendText("/model grok-4.6 xhigh");
+      await session.waitForText("Switched to grok-4.6", TIMEOUT);
+      await session.sendText("Use the selected effort.");
+      await session.waitForText("GROK_DIRECT_RESPONSE", TIMEOUT);
+
+      const response = grok.requests.find((request) => request.path === "/v1/responses");
+      expect(response).toBeDefined();
+      const body = JSON.parse(response!.body ?? "{}") as {
+        model?: string;
+        reasoning?: { effort?: string };
+      };
+      expect(body.model).toBe("grok-4.6");
+      expect(body.reasoning?.effort).toBe("xhigh");
+      expect(readFileSync(join(home, ".fx", "settings.json"), "utf8")).toContain('"effort":"xhigh"');
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      grok.stop();
+    }
+  },
+  60_000,
+);
+
+test(
   "ChatGPT tool loops round-trip encrypted reasoning without Gateway leakage",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-chatgpt-tool-loop-"));
@@ -1643,6 +2209,51 @@ test(
       }
     } finally {
       codex.stop();
+    }
+  },
+  60_000,
+);
+
+test(
+  "Grok tool loops round-trip encrypted reasoning without Gateway leakage",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-grok-tool-loop-"));
+    gateway = startFakeGateway([]);
+    const grok = startFakeGrokToolLoop();
+    try {
+      writeSeededGrokLogin(home, grok.accessToken, "acct_tool_loop");
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ provider: "grok", grok_model: "grok-4.20" }) + "\n",
+        { mode: 0o600 },
+      );
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Read the README, then finish."],
+        {
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: "gateway-grok-tool-loop-sentinel",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_AUTO_UPGRADE: "0",
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_E2E_XAI_GROK_RESPONSES_URL: grok.responsesUrl,
+            FX_E2E_XAI_GROK_MODELS_URL: grok.modelsUrl,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(result.stdout).toContain("GROK_TOOL_LOOP_OK");
+      expect(grok.bodies).toHaveLength(2);
+      expect(grok.bodies[1]).toContain('"encrypted_content":"opaque-grok-tool-loop"');
+      expect(grok.bodies[1]).toContain('"type":"function_call_output"');
+      for (const request of [...gateway.requests, ...gateway.modelRequests]) {
+        expect(request.headers.get("authorization")).not.toContain("grok-tool-loop-token");
+      }
+    } finally {
+      grok.stop();
     }
   },
   60_000,
@@ -1705,6 +2316,57 @@ test(
 );
 
 test(
+  "Grok rejects the vision fallback because native image input owns OCR",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-grok-vision-disabled-"));
+    gateway = startFakeGateway([]);
+    const grok = startFakeGrokToolLoop({
+      toolName: "vision",
+      toolArguments: { image_ids: [1], focus: "Inspect the image." },
+      finalText: "GROK_VISION_DISABLED_OK",
+    });
+    try {
+      writeSeededGrokLogin(home, grok.accessToken, "acct_vision");
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ provider: "grok", grok_model: "grok-4.20" }) + "\n",
+        { mode: 0o600 },
+      );
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Answer without a vision fallback."],
+        {
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: "gateway-grok-vision-sentinel",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_AUTO_UPGRADE: "0",
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_E2E_XAI_GROK_RESPONSES_URL: grok.responsesUrl,
+            FX_E2E_XAI_GROK_MODELS_URL: grok.modelsUrl,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(result.stdout).toContain("GROK_VISION_DISABLED_OK");
+      expect(grok.bodies).toHaveLength(2);
+      expect(grok.bodies[0]).not.toContain('"name":"vision"');
+      const continuation = JSON.parse(grok.bodies[1]) as {
+        input: Array<{ type?: string; output?: string }>;
+      };
+      const toolResult = continuation.input.find((item) => item.type === "function_call_output");
+      expect(toolResult?.output).toContain("Vision is unavailable for this request.");
+      expect(gateway.requests).toHaveLength(0);
+    } finally {
+      grok.stop();
+    }
+  },
+  60_000,
+);
+
+test(
   "Codex automatic review uses gpt-5.4-mini while Gateway review stays untouched",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-codex-auto-review-"));
@@ -1744,6 +2406,51 @@ test(
       }
     } finally {
       codex.stop();
+    }
+  },
+  60_000,
+);
+
+test(
+  "Grok automatic review reuses the admitted Grok model and never reaches Gateway",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-grok-auto-review-"));
+    gateway = startFakeGateway([]);
+    const grok = startFakeGrokAutoReview();
+    try {
+      writeSeededGrokLogin(home, grok.accessToken, "acct_auto_review");
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ provider: "grok", grok_model: "grok-4.20" }) + "\n",
+        { mode: 0o600 },
+      );
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Run pwd, then finish."],
+        {
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: "gateway-grok-auto-review-sentinel",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_AUTO_UPGRADE: "0",
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_E2E_XAI_GROK_RESPONSES_URL: grok.responsesUrl,
+            FX_E2E_XAI_GROK_MODELS_URL: grok.modelsUrl,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(result.stdout).toContain("GROK_AUTO_REVIEW_OK");
+      expect(grok.bodies.map((body) => (JSON.parse(body) as { model: string }).model))
+        .toEqual(["grok-4.20", "grok-4.20", "grok-4.20"]);
+      expect(grok.bodies[1]).toContain('"name":"permission_decision"');
+      for (const request of gateway.requests) {
+        expect(request.body).not.toContain("permission_decision");
+      }
+    } finally {
+      grok.stop();
     }
   },
   60_000,
@@ -2097,14 +2804,14 @@ tmuxTest(
       (pane) =>
         pane.includes("Setup") &&
         pane.includes("Sign in with Vercel") &&
-        pane.includes("API key") &&
-        pane.includes("Switch credential"),
+        pane.includes("Sign in with Grok") &&
+        pane.includes("API key"),
       TIMEOUT,
     );
     expect(inventory).not.toMatch(/^\s+fx login\s+/m);
     await session.sendKeys("Escape");
     await session.waitForPane(
-      (pane) => !pane.includes("Switch credential"),
+      (pane) => !pane.includes("   Setup"),
       TIMEOUT,
     );
 
@@ -2196,7 +2903,7 @@ tmuxTest(
         pane.includes("fx login credential refresh failed.") &&
         pane.includes("Choose another source below") &&
         pane.includes("Setup") &&
-        pane.includes("Switch credential"),
+        pane.includes("Sign in with Grok"),
       TIMEOUT,
     );
     expect(failed).toContain(`${promptHead}${promptTail}`);
@@ -2430,14 +3137,14 @@ tmuxTest(
       (pane) =>
         pane.includes(blockedPrompt) &&
         pane.includes("fx login credential refresh failed.") &&
-        pane.includes("Switch credential"),
+        pane.includes("Sign in with Grok"),
       TIMEOUT,
     );
     expect(gateway.requests).toHaveLength(0);
 
     await session.sendKeys("Escape");
     await session.waitForPane(
-      (pane) => pane.includes(blockedPrompt) && !pane.includes("Switch credential"),
+      (pane) => pane.includes(blockedPrompt) && !pane.includes("   Setup"),
       TIMEOUT,
     );
     await session.sendKeys("C-u");
@@ -2502,7 +3209,7 @@ tmuxTest(
       (pane) =>
         pane.includes(firstPrompt) &&
         pane.includes("fx login credential refresh failed.") &&
-        pane.includes("Switch credential"),
+        pane.includes("Sign in with Grok"),
       TIMEOUT,
     );
     expect(firstFailure).toContain("Choose another source below.");
@@ -2515,7 +3222,7 @@ tmuxTest(
 
     await session.sendKeys("Escape");
     await session.waitForPane(
-      (pane) => pane.includes(firstPrompt) && !pane.includes("Switch credential"),
+      (pane) => pane.includes(firstPrompt) && !pane.includes("   Setup"),
       TIMEOUT,
     );
     await session.sendKeys("C-u");
@@ -2537,7 +3244,7 @@ tmuxTest(
       (pane) =>
         pane.includes(secondPrompt) &&
         pane.includes("fx login credential refresh failed.") &&
-        pane.includes("Switch credential"),
+        pane.includes("Sign in with Grok"),
       TIMEOUT,
     );
     expect(gateway.requests).toHaveLength(0);

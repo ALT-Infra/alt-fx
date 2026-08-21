@@ -1688,7 +1688,7 @@ fn refreshGatewayCredentialForJob(
     const previous_api_key = active_api_key.*;
     if (comptime !host_target.is_wasm) {
         if (deps.usage) |usage| {
-            if (source == .chatgpt_subscription) {
+            if (source == .chatgpt_subscription or source == .grok_subscription) {
                 usage.clearReconciliationCredential();
             } else {
                 usage.refreshReconciliationCredential(
@@ -3164,7 +3164,7 @@ fn processQueuedPromptLoop(
                     );
                 }
                 if (!model_provider.usesGatewayAuxiliaries(job.provider)) {
-                    return error.CodexNativeImageUnavailable;
+                    return error.SubscriptionNativeImageUnavailable;
                 }
                 if (job.authorized_image_catalog.len == 0) {
                     return error.MissingAuthorizedImageCatalog;
@@ -3189,7 +3189,7 @@ fn processQueuedPromptLoop(
             else
                 .auto;
             var verified_images: std.ArrayList(image_attachments.VerifiedSnapshot) = .empty;
-            if (job.provider == .codex and job.images.len > 0 and
+            if (job.provider != .gateway and job.images.len > 0 and
                 request_capabilities.supports_vision and request_capabilities.supports_file_input)
             {
                 try verified_images.ensureTotalCapacity(overlay_arena, job.images.len);
@@ -3253,7 +3253,7 @@ fn processQueuedPromptLoop(
                 request_messages.len,
                 config.gateway_tools_json,
             );
-            if (job.provider != .codex) {
+            if (job.provider == .gateway) {
                 try persistRecoveryCheckpoint(
                     deps,
                     arena,
@@ -3629,7 +3629,7 @@ fn processQueuedPromptLoop(
                 gateway_delivery.load(),
             );
             stream_result_set = true;
-            if (job.provider == .codex and
+            if (job.provider != .gateway and
                 stream_result.status == .unauthorized and
                 !auth_retry_used and
                 stream_ctx.raw_text.items.len == 0 and
@@ -3684,7 +3684,7 @@ fn processQueuedPromptLoop(
                     );
                     debug_trace.eventf(
                         "auth",
-                        "codex_request_replayed",
+                        "subscription_request_replayed",
                         step_ctx,
                         "payload_bytes={d} semantic_attempt={d}",
                         .{ request_payload.len, semantic_attempt + 1 },
@@ -3768,7 +3768,7 @@ fn processQueuedPromptLoop(
                 );
             }
             const settled_attempts = semantic_attempt + 1;
-            if (job.provider != .codex or stream_result.status != .unauthorized) {
+            if (job.provider == .gateway or stream_result.status != .unauthorized) {
                 try persistRecoveryCheckpoint(
                     deps,
                     arena,
@@ -3799,7 +3799,7 @@ fn processQueuedPromptLoop(
                 debug_trace.logf("agent", "token progress publication failed source=gateway_usage err={s}", .{@errorName(progress_err)});
             };
             if (stream_result.status == .unauthorized and
-                job.provider != .codex and
+                job.provider == .gateway and
                 !auth_retry_used and
                 semantic_attempt + 1 < semantic_limit)
             {

@@ -363,11 +363,15 @@ fn writeTerminalSafe(writer: *std.Io.Writer, alloc: Allocator, raw: []const u8) 
 
 fn gatewayProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
     const source = auth.active_source orelse return auth.gateway_connected;
-    return auth.gateway_connected or source != .chatgpt_subscription;
+    return auth.gateway_connected or (source != .chatgpt_subscription and source != .grok_subscription);
 }
 
 fn chatGptProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
     return auth.chatgpt_connected or auth.active_source == .chatgpt_subscription;
+}
+
+fn grokProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
+    return auth.grok_connected or auth.active_source == .grok_subscription;
 }
 
 fn writeConnectedProvidersText(writer: *std.Io.Writer, auth: auth_runtime.StatusSnapshot) !void {
@@ -379,6 +383,11 @@ fn writeConnectedProvidersText(writer: *std.Io.Writer, auth: auth_runtime.Status
     if (chatGptProviderConnected(auth)) {
         if (wrote_provider) try writer.writeAll(", Codex");
         if (!wrote_provider) try writer.writeAll("Codex");
+        wrote_provider = true;
+    }
+    if (grokProviderConnected(auth)) {
+        if (wrote_provider) try writer.writeAll(", Grok");
+        if (!wrote_provider) try writer.writeAll("Grok");
         wrote_provider = true;
     }
     if (!wrote_provider) try writer.writeAll("none");
@@ -412,7 +421,7 @@ pub const StatusSnapshot = struct {
         defer out.deinit();
 
         try out.writer.print("[status] model={s}\n", .{self.model});
-        if (self.provider == .codex) {
+        if (self.provider != .gateway) {
             try out.writer.print("[status] model_source={s}\n", .{model_provider.label(self.provider)});
         }
         try out.writer.print("[status] update_channel={s}\n", .{self.update_channel});
@@ -424,7 +433,7 @@ pub const StatusSnapshot = struct {
             try out.writer.print("[status] mcp_config_error={s}\n", .{error_name});
         }
         try out.writer.print("[status] auth={s}\n", .{self.auth.activeSourceLabel()});
-        if (self.provider == .codex) {
+        if (self.provider != .gateway) {
             try out.writer.writeAll("[status] connected_providers=");
             try writeConnectedProvidersText(&out.writer, self.auth);
             try out.writer.writeByte('\n');
@@ -451,7 +460,7 @@ pub const StatusSnapshot = struct {
         defer out.deinit();
 
         try out.writer.print("model={s}\n", .{self.model});
-        if (self.provider == .codex) {
+        if (self.provider != .gateway) {
             try out.writer.print("model_source={s}\n", .{model_provider.label(self.provider)});
         }
         try out.writer.print("update_channel={s}\n", .{self.update_channel});
@@ -460,7 +469,7 @@ pub const StatusSnapshot = struct {
             try out.writer.print("build_revision={s}\n", .{self.build_revision});
         }
         try out.writer.print("auth={s}\n", .{self.auth.activeSourceLabel()});
-        if (self.provider == .codex) {
+        if (self.provider != .gateway) {
             try out.writer.writeAll("connected_providers=");
             try writeConnectedProvidersText(&out.writer, self.auth);
             try out.writer.writeByte('\n');
@@ -489,7 +498,7 @@ pub const StatusSnapshot = struct {
     pub fn writeJson(self: StatusSnapshot, writer: *std.Io.Writer) !void {
         try writer.writeAll("{\"kind\":\"status\",\"model\":");
         try std.json.Stringify.value(self.model, .{}, writer);
-        if (self.provider == .codex) {
+        if (self.provider != .gateway) {
             try writer.writeAll(",\"model_source\":");
             try std.json.Stringify.value(model_provider.label(self.provider), .{}, writer);
         }
@@ -505,7 +514,7 @@ pub const StatusSnapshot = struct {
         }
         try writer.writeAll(",\"auth\":");
         try std.json.Stringify.value(self.auth.activeSourceLabel(), .{}, writer);
-        if (self.provider == .codex) {
+        if (self.provider != .gateway) {
             try writer.writeAll(",\"connected_providers\":[");
             var wrote_provider = false;
             if (gatewayProviderConnected(self.auth)) {
@@ -515,6 +524,11 @@ pub const StatusSnapshot = struct {
             if (chatGptProviderConnected(self.auth)) {
                 if (wrote_provider) try writer.writeByte(',');
                 try std.json.Stringify.value("codex", .{}, writer);
+                wrote_provider = true;
+            }
+            if (grokProviderConnected(self.auth)) {
+                if (wrote_provider) try writer.writeByte(',');
+                try std.json.Stringify.value("grok", .{}, writer);
             }
             try writer.writeByte(']');
         }
@@ -666,7 +680,7 @@ pub const ModelListSnapshot = struct {
 
         const shown = self.shownCount();
         for (self.ids[0..shown]) |id| {
-            if (self.provider == .codex) {
+            if (self.provider != .gateway) {
                 try out.writer.print(" - {s} · {s}\n", .{ id, model_provider.label(self.provider) });
             } else {
                 try out.writer.print(" - {s}\n", .{id});
@@ -694,7 +708,7 @@ pub const ModelListSnapshot = struct {
         try out.writer.print("{d} available", .{self.ids.len});
         const shown = self.shownCount();
         for (self.ids[0..shown]) |id| {
-            if (self.provider == .codex) {
+            if (self.provider != .gateway) {
                 try out.writer.print("\n - {s} · {s}", .{ id, model_provider.label(self.provider) });
             } else {
                 try out.writer.print("\n - {s}", .{id});
@@ -718,7 +732,7 @@ pub const ModelListSnapshot = struct {
             if (i > 0) try out.writer.writeByte(',');
             try std.json.Stringify.value(id, .{}, &out.writer);
         }
-        if (self.provider == .codex) {
+        if (self.provider != .gateway) {
             try out.writer.writeAll("],\"models\":[");
             for (self.ids[0..shown], 0..) |id, i| {
                 if (i > 0) try out.writer.writeByte(',');
@@ -741,6 +755,7 @@ pub const ModelListSnapshot = struct {
         return switch (self.provider) {
             .gateway => "gateway",
             .codex => model_provider.label(.codex),
+            .grok => model_provider.label(.grok),
         };
     }
 
@@ -754,6 +769,7 @@ pub const ModelListSnapshot = struct {
             .credential_refresh_failed => "Vercel sign-in refresh failed; using the public model catalog.",
             .authenticated_credential_rejected => "Your Gateway credential was rejected; using the public model catalog.",
             .chatgpt_subscription => "Codex models require an authenticated Codex catalog.",
+            .grok_subscription => "Grok models require an authenticated Grok catalog.",
         };
     }
 };
@@ -1217,7 +1233,7 @@ pub const DoctorSnapshot = struct {
         );
         try out.writer.print("[doctor] workspace={s}\n", .{self.workspace_root});
         try out.writer.print("[doctor] model={s}\n", .{self.model});
-        if (self.provider == .codex) {
+        if (self.provider != .gateway) {
             try out.writer.print("[doctor] model_source={s}\n", .{model_provider.label(self.provider)});
         }
         try out.writer.print("[doctor] auth={s}\n", .{self.auth.activeSourceLabel()});
@@ -1254,7 +1270,7 @@ pub const DoctorSnapshot = struct {
         try std.json.Stringify.value(self.workspace_root, .{}, writer);
         try writer.writeAll(",\"model\":");
         try std.json.Stringify.value(self.model, .{}, writer);
-        if (self.provider == .codex) {
+        if (self.provider != .gateway) {
             try writer.writeAll(",\"model_source\":");
             try std.json.Stringify.value(model_provider.label(self.provider), .{}, writer);
         }

@@ -1122,6 +1122,7 @@ fn configuredProviderSelection(
     const model = switch (provider) {
         .gateway => settings.model orelse default_model,
         .codex => settings.codex_model orelse return error.CodexModelNotSelected,
+        .grok => settings.grok_model orelse return error.GrokModelNotSelected,
     };
     return .{ .provider = provider, .model = model };
 }
@@ -1156,6 +1157,14 @@ test "startup provider chooses only its provider-scoped model" {
         error.CodexModelNotSelected,
         configuredProviderSelection("default/model", &missing_codex),
     );
+
+    const grok_settings = config_runtime.Settings{
+        .provider = .grok,
+        .grok_model = @constCast("grok-model"),
+    };
+    const grok = try configuredProviderSelection("default/model", &grok_settings);
+    try std.testing.expectEqual(model_provider.ProviderId.grok, grok.provider);
+    try std.testing.expectEqualStrings("grok-model", grok.model);
 }
 
 fn loadInitialModel(alloc: Allocator, default_model: []const u8, configured: ?[]const u8) ![]u8 {
