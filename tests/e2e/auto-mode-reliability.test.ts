@@ -93,6 +93,20 @@ function cleanCommandCall(command: string, id: string) {
   });
 }
 
+function toolResultText(body: string, toolCallId: string): string {
+  const request = JSON.parse(body) as {
+    prompt?: Array<{ content?: Array<Record<string, unknown>> }>;
+  };
+  const result = (request.prompt ?? [])
+    .flatMap((message) => message.content ?? [])
+    .find((part) => part.type === "tool-result" && part.toolCallId === toolCallId);
+  expect(result).toBeDefined();
+  const output = result!.output as Record<string, unknown>;
+  expect(output.type).toBe("text");
+  expect(typeof output.value).toBe("string");
+  return output.value as string;
+}
+
 function installRecorder(root: IsolatedRoot, name: string, marker: string) {
   const bin = join(root.root, "bin");
   mkdirSync(bin, { recursive: true });
@@ -325,7 +339,12 @@ describe("lean auto mode reliability", () => {
               finishReason: { unified: "tool-calls", raw: "tool-calls" },
             },
           ]),
-          fakeGatewayFinalText("Clean command group complete."),
+          (body) => {
+            expect(toolResultText(body, "clean_direct_pwd")).toContain("exit_code=0");
+            expect(toolResultText(body, "clean_direct_git_status")).toContain("exit_code=0");
+            expect(toolResultText(body, "clean_blocked_reset")).toContain("auto_denied");
+            return fakeGatewayFinalText("Clean command group complete.");
+          },
         ],
         [fakeGatewayPermissionDecision("ask", "must_not_review_clean_reads")],
       );
