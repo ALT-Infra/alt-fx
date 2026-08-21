@@ -541,6 +541,23 @@ function toolResultText(body: string, callId: string): string {
   return result ? contentText(result.output) : `<missing ${callId}>`;
 }
 
+function toolCallInput(body: string, callId: string): Record<string, unknown> {
+  const request = JSON.parse(body) as {
+    prompt: Array<{ content: unknown }>;
+  };
+  const parts = request.prompt.flatMap((message) =>
+    Array.isArray(message.content) ? message.content : []
+  ) as Array<Record<string, unknown>>;
+  const call = parts.find((part) =>
+    part.type === "tool-call" && part.toolCallId === callId
+  );
+  const input = call?.input;
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw new Error(`missing tool call input for ${callId}`);
+  }
+  return input as Record<string, unknown>;
+}
+
 function fakeTerminalToolBatch(
   calls: Array<{ id: string; input: Record<string, unknown> }>,
 ) {
@@ -1230,29 +1247,31 @@ test.skipIf(!tmuxAvailable())(
     let terminalSessionId = "";
     const gateway = startFakeGateway([
       fakeGatewayToolCall("terminal_mixed_start", "terminal", {
-        action: "start",
-        cwd: fixture.workspace,
-        command: `printf SHOULD_NOT_RUN > ${JSON.stringify(mixedMarker)}`,
-        backend: "native",
-        session_id: "terminal-foreign",
-        cursor_segment: 1,
-        cursor_offset: 0,
-        after_event_id: 0,
-        acknowledge_event_id: 1,
-        max_events: 1,
-        write: { kind: "text", text: "wrong action" },
-        lease: "use",
-        monitor: { kind: "remove", monitor_id: "monitor-foreign" },
-        task_id: "task-foreign",
-        workspace_root: fixture.workspace,
-        rows: 24,
-        columns: 80,
-        signal: "terminate",
-        close_policy: "force",
-        profile: "user",
-        shell: { kind: "user_login" },
-        sections: null,
-        unknown_zeta: true,
+        request: {
+          action: "start",
+          cwd: fixture.workspace,
+          command: `printf SHOULD_NOT_RUN > ${JSON.stringify(mixedMarker)}`,
+          backend: "native",
+          session_id: "terminal-foreign",
+          cursor_segment: 1,
+          cursor_offset: 0,
+          after_event_id: 0,
+          acknowledge_event_id: 1,
+          max_events: 1,
+          write: { kind: "text", text: "wrong action" },
+          lease: "use",
+          monitor: { kind: "remove", monitor_id: "monitor-foreign" },
+          task_id: "task-foreign",
+          workspace_root: fixture.workspace,
+          rows: 24,
+          columns: 80,
+          signal: "terminate",
+          close_policy: "force",
+          profile: "user",
+          shell: { kind: "user_login" },
+          sections: null,
+          unknown_zeta: true,
+        },
       }),
       (body) => {
         const correction = JSON.parse(
@@ -1308,35 +1327,22 @@ test.skipIf(!tmuxAvailable())(
         expect(terminalRecords(fixture.home)).toEqual([]);
         expect(existsSync(mixedMarker)).toBe(false);
         return fakeGatewayToolCall("terminal_valid_start", "terminal", {
-          action: "start",
-          session_id: null,
-          cwd: fixture.workspace,
-          command: "printf ACTION_SCHEMA_OK",
-          profile: null,
-          shell: {
-            kind: "executable",
-            path: TERMINAL_FIXTURE_SHELL,
-            clean_start: true,
+          request: {
+            action: "start",
+            cwd: fixture.workspace,
+            command: "printf ACTION_SCHEMA_OK",
+            profile: null,
+            shell: {
+              kind: "executable",
+              path: TERMINAL_FIXTURE_SHELL,
+              clean_start: true,
+            },
+            backend: "native",
+            return_when: { kind: "exit" },
+            wait_ceiling_ms: 20_000,
+            dimensions: null,
+            initial_monitors: null,
           },
-          backend: "native",
-          return_when: { kind: "exit" },
-          wait_ceiling_ms: 20_000,
-          dimensions: null,
-          initial_monitors: null,
-          cursor_segment: null,
-          cursor_offset: null,
-          after_event_id: null,
-          acknowledge_event_id: null,
-          max_events: null,
-          write: null,
-          lease: null,
-          monitor: null,
-          task_id: null,
-          workspace_root: null,
-          rows: null,
-          columns: null,
-          signal: null,
-          close_policy: null,
         });
       },
       (body) => {
@@ -1347,9 +1353,11 @@ test.skipIf(!tmuxAvailable())(
         terminalSessionId = result.success.start.session.session_id;
         expect(terminalSessionId.length).toBeGreaterThan(0);
         return fakeGatewayToolCall("terminal_valid_close", "terminal", {
-          action: "close",
-          session_id: terminalSessionId,
-          close_policy: "force",
+          request: {
+            action: "close",
+            session_id: terminalSessionId,
+            close_policy: "force",
+          },
         });
       },
       (body) => {
@@ -1366,21 +1374,20 @@ test.skipIf(!tmuxAvailable())(
     await active.waitForText("Terminal action schema verified", TIMEOUT);
     expect(gateway.requests).toHaveLength(4);
 
+    type JsonSchema = {
+      type?: string;
+      properties?: Record<string, JsonSchema>;
+      enum?: string[];
+      anyOf?: JsonSchema[];
+      oneOf?: JsonSchema[];
+      required?: string[];
+      additionalProperties?: boolean;
+      description?: string;
+    };
     const firstRequest = JSON.parse(gateway.requests[0]!.body) as {
       tools: Array<{
         name?: string;
-        inputSchema?: {
-          type?: string;
-          properties?: Record<string, {
-            type?: string;
-            enum?: string[];
-            anyOf?: Array<{ type?: string }>;
-            description?: string;
-          }>;
-          required?: string[];
-          additionalProperties?: boolean;
-          oneOf?: unknown[];
-        };
+        inputSchema?: JsonSchema;
       }>;
     };
     const terminalSchema = firstRequest.tools.find(
@@ -1391,63 +1398,69 @@ test.skipIf(!tmuxAvailable())(
     expect(terminalSchema!.oneOf).toBeUndefined();
     expect(terminalSchema!.additionalProperties).toBe(false);
     const properties = terminalSchema!.properties ?? {};
-    const propertyNames = [
-      "action",
-      "session_id",
-      "cwd",
-      "command",
-      "profile",
-      "shell",
-      "backend",
-      "return_when",
-      "wait_ceiling_ms",
-      "dimensions",
-      "initial_monitors",
-      "cursor_segment",
-      "cursor_offset",
-      "after_event_id",
-      "acknowledge_event_id",
-      "max_events",
-      "write",
-      "lease",
-      "monitor",
-      "task_id",
-      "workspace_root",
-      "rows",
-      "columns",
-      "signal",
-      "close_policy",
-    ];
-    expect(Object.keys(properties)).toEqual(propertyNames);
-    expect(terminalSchema!.required).toEqual(propertyNames);
-    expect(properties.action!.enum).toEqual([
+    expect(Object.keys(properties)).toEqual(["request"]);
+    expect(terminalSchema!.required).toEqual(["request"]);
+    const branches = properties.request!.oneOf ?? [];
+    expect(branches).toHaveLength(12);
+    const branchByAction = new Map(branches.map((branch) => [
+      branch.properties?.action?.enum?.[0],
+      branch,
+    ]));
+    expect([...branchByAction.keys()]).toEqual([
       "exec", "start", "read", "screen", "write", "wait",
       "monitor", "inspect", "list", "resize", "signal", "close",
     ]);
-    expect(properties.action!.type).toBe("string");
-    for (const name of propertyNames.slice(1)) {
-      expect(properties[name]!.anyOf).toHaveLength(2);
-      expect(properties[name]!.anyOf![1]!.type).toBe("null");
-      expect(properties[name]!.description).toContain(
-        "Set null when the selected action does not use this field.",
-      );
+    for (const branch of branches) {
+      expect(branch.type).toBe("object");
+      expect(branch.additionalProperties).toBe(false);
     }
-    expect(properties.wait_ceiling_ms!.anyOf![0]!.type).toBe("integer");
-    expect(properties.shell!.anyOf![0]!.type).toBe("object");
-    expect(properties.initial_monitors!.anyOf![0]!.type).toBe("array");
-    expect(properties.return_when!.description).toContain(
+    const startProperties = branchByAction.get("start")!.properties!;
+    expect(startProperties.wait_ceiling_ms!.anyOf![0]!.type).toBe("integer");
+    expect(startProperties.shell!.anyOf![0]!.type).toBe("object");
+    expect(startProperties.initial_monitors!.anyOf![0]!.type).toBe("array");
+    expect(startProperties.return_when!.description).toContain(
       "required for every wait",
     );
-    expect(properties.return_when!.description).toContain(
+    expect(startProperties.return_when!.description).toContain(
       "output_contains is monitor-only",
     );
-    expect(properties.cursor_segment!.description).toContain(
+    const readProperties = branchByAction.get("read")!.properties!;
+    expect(Object.keys(readProperties)).toEqual([
+      "action", "session_id", "cursor_segment", "cursor_offset",
+    ]);
+    expect(readProperties.cwd).toBeUndefined();
+    expect(readProperties.cursor_segment!.description).toContain(
       "required for every read",
     );
-    expect(properties.cursor_segment!.description).toContain(
+    expect(readProperties.cursor_segment!.description).toContain(
       "raw_gap.available_from",
     );
-    expect(properties.close_policy!.description).toContain("Close is final");
+    const closeProperties = branchByAction.get("close")!.properties!;
+    expect(closeProperties.close_policy!.type).toBe("string");
+    expect(closeProperties.close_policy!.description).toContain("Close is final");
+
+    const mixedInput = toolCallInput(
+      gateway.requests[1]!.body,
+      "terminal_mixed_start",
+    );
+    expect(mixedInput.request).toBeUndefined();
+    expect(mixedInput.action).toBe("start");
+    expect(mixedInput.session_id).toBe("terminal-foreign");
+    const validStartInput = toolCallInput(
+      gateway.requests[2]!.body,
+      "terminal_valid_start",
+    );
+    expect(validStartInput.request).toBeUndefined();
+    expect(validStartInput.action).toBe("start");
+    const validCloseInput = toolCallInput(
+      gateway.requests[3]!.body,
+      "terminal_valid_close",
+    );
+    expect(validCloseInput).toEqual({
+      action: "close",
+      session_id: terminalSessionId,
+      close_policy: "force",
+    });
 
     const scrollback = await active.captureFullScrollback();
     expect(scrollback).toContain("Failed start · 17 invalid fields");

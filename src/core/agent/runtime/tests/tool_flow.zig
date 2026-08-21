@@ -65,6 +65,8 @@ const VisionAgentToolRuntime = test_support.VisionAgentToolRuntime;
 
 const fixture_tools_json =
     "[{\"type\":\"function\",\"name\":\"read_file\",\"description\":\"Read a file\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]";
+const terminal_nested_tools_json =
+    "[{\"type\":\"function\",\"name\":\"terminal\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"request\":{\"oneOf\":[{\"type\":\"object\"}]}},\"required\":[\"request\"],\"additionalProperties\":false}}]";
 
 fn makeOwnedVisionCatalog(
     alloc: std.mem.Allocator,
@@ -1016,6 +1018,44 @@ test "accepted automatic review remains internal before ordinary tool execution"
     );
     try std.testing.expect(
         !hooks.lifecycle_events.items[0].authoritative_started.place_after_current_transcript,
+    );
+}
+
+test "borrowed nested terminal completion is flat before authority execution and memory" {
+    const alloc = std.testing.allocator;
+    const flat_arguments = "{\"action\":\"exec\",\"command\":\"printf done\"}";
+    const calls = [_]ToolCall{toolCall(
+        "call_nested_terminal",
+        "terminal",
+        "{\"request\":{\"action\":\"exec\",\"command\":\"printf done\"}}",
+    )};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.permission_decisions = &.{.once};
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.gateway_tools_json = terminal_nested_tools_json;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try std.testing.expectEqualStrings("terminal", hooks.executed_names.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), hooks.execute_authority_scopes.items.len);
+    try std.testing.expectEqualStrings(flat_arguments, hooks.last_validated_arguments.?);
+    try std.testing.expectEqualStrings(flat_arguments, hooks.last_permission_arguments.?);
+    try std.testing.expectEqualStrings(flat_arguments, hooks.last_executed_arguments.?);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    const execution = hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
+    try std.testing.expectEqualStrings(
+        flat_arguments,
+        execution.tool_steps[0].tool_calls[0].arguments_json,
     );
 }
 
