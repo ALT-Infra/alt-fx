@@ -984,7 +984,12 @@ fn resolveOrdinaryPermissionOutcome(
 ) !command_admission.PermissionOutcome {
     const command_call = try isRunCommandCall(input, arena, call);
     if (command_call) {
-        const default_outcome = defaultRunCommandPermissionOutcome(input, arena, call);
+        const default_outcome = defaultRunCommandPermissionOutcome(
+            input,
+            arena,
+            call,
+            permission_mode,
+        );
         if (default_outcome.execution_authority != null) return default_outcome;
     }
     if (toolApprovalPolicy(input, call.name) == .ask_only) {
@@ -2283,11 +2288,16 @@ fn defaultRunCommandPermissionOutcome(
     input: Input,
     arena: Allocator,
     call: ToolCall,
+    permission_mode: PermissionMode,
 ) command_admission.PermissionOutcome {
     const command_ctx = runCommandContext(input, arena, call) catch {
         return .{ .decision = .permission_required };
     };
-    return switch (command_admission.defaultForRunCommand(arena, command_ctx)) {
+    return switch (command_admission.defaultForRunCommand(
+        arena,
+        command_ctx,
+        permission_mode,
+    )) {
         .direct_only => |fingerprint| .{
             .decision = .once,
             .execution_authority = .{ .run_command = .{ .direct_only = fingerprint } },
@@ -5538,6 +5548,50 @@ test "configured command authority skips automatic review" {
     );
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expectEqual(@as(usize, 1), recording.calls);
+}
+
+test "automatic clean direct command bypasses the reviewer" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var background: BackgroundRuntime = .{};
+    defer background.deinit(std.testing.allocator);
+    var fake = FakeAutoClassifier{ .decision = .ask };
+    const input = testInputWithClassifier(
+        &worker,
+        &background,
+        permission_auto_classifier.Classifier.withOverride(
+            @ptrCast(&fake),
+            FakeAutoClassifier.classify,
+        ),
+    );
+
+    const outcome = requestPermissionOutcome(
+        input,
+        arena_state.allocator(),
+        .{
+            .id = "clean-direct",
+            .name = "terminal",
+            .arguments_json = "{\"action\":\"exec\",\"command\":\"pwd\",\"profile\":\"clean\"}",
+        },
+        .auto,
+        &.{},
+    ) catch |err| switch (err) {
+        error.MissingLoginShell, error.UnsupportedShell => return error.SkipZigTest,
+        else => return err,
+    };
+
+    try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    const authority = outcome.execution_authority orelse return error.TestExpectedEqual;
+    switch (authority.run_command) {
+        .direct_only => |fingerprint| try std.testing.expectEqual(
+            std.meta.Tag(command_environment.Environment).clean,
+            std.meta.activeTag(fingerprint.environment),
+        ),
+        .shell_allowed => return error.TestExpectedDirectOnly,
+    }
 }
 
 test "known reversible auto commands bypass the reviewer" {

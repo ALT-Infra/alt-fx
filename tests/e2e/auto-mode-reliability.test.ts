@@ -285,6 +285,86 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
+    "clean direct reads bypass review and PATH while destructive commands stay blocked",
+    async () => {
+      const root = createIsolatedRoot();
+      runGit(root.workspace, ["init", "--quiet"]);
+      const shadowMarker = join(root.root, "shadow-git-must-not-run");
+      const shadowBin = installRecorder(root, "git", shadowMarker);
+      const gateway = startGateway(
+        [
+          fakeGatewaySse([
+            {
+              type: "tool-call",
+              toolCallId: "clean_direct_pwd",
+              toolName: "terminal",
+              input: { action: "exec", command: "pwd", profile: "clean" },
+            },
+            {
+              type: "tool-call",
+              toolCallId: "clean_direct_git_status",
+              toolName: "terminal",
+              input: {
+                action: "exec",
+                command: "git status --short",
+                profile: "clean",
+              },
+            },
+            {
+              type: "tool-call",
+              toolCallId: "clean_blocked_reset",
+              toolName: "terminal",
+              input: {
+                action: "exec",
+                command: "git reset --hard",
+                profile: "clean",
+              },
+            },
+            {
+              type: "finish",
+              finishReason: { unified: "tool-calls", raw: "tool-calls" },
+            },
+          ]),
+          fakeGatewayFinalText("Clean command group complete."),
+        ],
+        [fakeGatewayPermissionDecision("ask", "must_not_review_clean_reads")],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Run the mixed clean command group."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...gatewayEnv(root, gateway),
+            PATH: `${shadowBin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(
+        result.code,
+        `stdout: ${result.stdout}\nstderr: ${result.stderr}`,
+      ).toBe(0);
+      expect(result.stderr).not.toContain("panic");
+      expect(result.stderr).not.toContain("error:");
+      expect(gateway.requests).toHaveLength(2);
+      expect(gateway.classifierRequests).toHaveLength(0);
+      expect(existsSync(shadowMarker)).toBe(false);
+      const json = JSON.parse(result.stdout.trim()) as {
+        tool_calls: Array<{ name: string; status: string }>;
+      };
+      const terminalStatuses = json.tool_calls
+        .filter(({ name }) => name === "terminal")
+        .map(({ status }) => status);
+      expect(terminalStatuses.filter((status) => status === "success")).toHaveLength(2);
+      expect(terminalStatuses.filter((status) => status === "error")).toHaveLength(1);
+      expect(result.stdout).toContain("Clean command group complete.");
+    },
+    TIMEOUT,
+  );
+
+  test(
     "direct destructive commands replan before reviewer allow",
     async () => {
       for (const [name, command] of [
