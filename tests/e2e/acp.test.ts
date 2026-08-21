@@ -645,6 +645,25 @@ function writeSeededAcpGrokLogin(home: string, accessToken: string): void {
   chmodSync(authPath, 0o600);
 }
 
+function acpGrokSubscriptionModel(id: string, contextWindow: number) {
+  return {
+    id,
+    model: id,
+    api_backend: "responses",
+    context_window: contextWindow,
+    supports_reasoning_effort: false,
+    reasoning_efforts: [],
+  };
+}
+
+function acpGrokModalityModel(id: string) {
+  return {
+    id,
+    input_modalities: ["text", "image"],
+    output_modalities: ["text"],
+  };
+}
+
 function startAcpFakeGrok(options: {
   unauthorizedResponses?: number;
   route?: (body: string) => string | Promise<string>;
@@ -664,9 +683,11 @@ function startAcpFakeGrok(options: {
       const authorization = request.headers.get("authorization");
       if (path === "/models") {
         modelRequests.push({ path, authorization });
-        return Response.json({ models: [
-          { id: "grok-4.20", object: "model", input_modalities: ["text", "image"], output_modalities: ["text"] },
-        ] });
+        return Response.json({ data: [acpGrokSubscriptionModel("grok-4.20", 1_000_000)] });
+      }
+      if (path === "/modalities") {
+        modelRequests.push({ path, authorization });
+        return Response.json({ models: [acpGrokModalityModel("grok-4.20")] });
       }
       if (path === "/token") {
         const body = await request.text();
@@ -707,6 +728,7 @@ function startAcpFakeGrok(options: {
     userinfoRequests,
     responsesUrl: `${base}/responses`,
     modelsUrl: `${base}/models`,
+    modalitiesUrl: `${base}/modalities`,
     tokenUrl: `${base}/token`,
     userinfoUrl: `${base}/userinfo`,
     stop() { server.stop(true); },
@@ -7203,6 +7225,7 @@ describe("acp: model-independent", () => {
             ...fakeGatewayEnv(root, gateway),
             FX_E2E_XAI_GROK_RESPONSES_URL: grok.responsesUrl,
             FX_E2E_XAI_GROK_MODELS_URL: grok.modelsUrl,
+            FX_E2E_XAI_GROK_MODALITIES_URL: grok.modalitiesUrl,
           },
         });
         await client.request("initialize", { protocolVersion: 1 }, 1);
@@ -7685,6 +7708,7 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
             ...fakeGatewayEnv(root, gateway),
             FX_E2E_XAI_GROK_RESPONSES_URL: grok.responsesUrl,
             FX_E2E_XAI_GROK_MODELS_URL: grok.modelsUrl,
+            FX_E2E_XAI_GROK_MODALITIES_URL: grok.modalitiesUrl,
             FX_E2E_GROK_TOKEN_URL: grok.tokenUrl,
             FX_E2E_GROK_USERINFO_URL: grok.userinfoUrl,
           },
@@ -7712,7 +7736,7 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
         expect(grok.requests[0]!.body).toBe(grok.requests[1]!.body);
         expect(grok.requests[0]!.conversationId).toBeTruthy();
         expect(grok.requests[0]!.conversationId).toBe(grok.requests[1]!.conversationId);
-        expect(grok.modelRequests).toHaveLength(1);
+        expect(grok.modelRequests.map((request) => request.path)).toEqual(["/models", "/modalities"]);
         expect(grok.requests[0]!.authorization).toBe(`Bearer ${grok.accessToken}`);
         expect(grok.requests[1]!.authorization).toBe(`Bearer ${grok.refreshedAccessToken}`);
         expect(grok.requests[2]!.authorization).toBe(`Bearer ${grok.refreshedAccessToken}`);

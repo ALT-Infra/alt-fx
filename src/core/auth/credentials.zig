@@ -66,6 +66,7 @@ pub const CatalogAccess = union(enum) {
         source: CatalogAuthenticatedSource,
         credential: []const u8,
         team_context: ?[]const u8,
+        account_id: ?[]const u8 = null,
     },
 
     pub fn credentialSource(self: CatalogAccess) ?Source {
@@ -115,6 +116,14 @@ pub const CatalogAccess = union(enum) {
         };
         return if (team.len > 0) team else null;
     }
+
+    pub fn accountId(self: CatalogAccess) ?[]const u8 {
+        const account_id = switch (self) {
+            .public_only => return null,
+            .authenticated => |access| access.account_id orelse return null,
+        };
+        return if (account_id.len > 0) account_id else null;
+    }
 };
 
 pub fn catalogAccessAt(credential: ?Credential, now_ms: i64) CatalogAccess {
@@ -122,10 +131,11 @@ pub fn catalogAccessAt(credential: ?Credential, now_ms: i64) CatalogAccess {
     if (selected.source == .fx_login and selected.needsRefreshAt(now_ms)) {
         return .{ .public_only = .fx_login_refresh_required };
     }
-    return catalogAccessForCredential(
+    return catalogAccessForCredentialAndAccount(
         selected.source,
         selected.token,
         selected.gatewayTeam(),
+        selected.accountId(),
     );
 }
 
@@ -141,6 +151,15 @@ pub fn catalogAccessForCredential(
     source: ?Source,
     credential: []const u8,
     team_context: ?[]const u8,
+) CatalogAccess {
+    return catalogAccessForCredentialAndAccount(source, credential, team_context, null);
+}
+
+pub fn catalogAccessForCredentialAndAccount(
+    source: ?Source,
+    credential: []const u8,
+    team_context: ?[]const u8,
+    account_id: ?[]const u8,
 ) CatalogAccess {
     const selected_source = source orelse return .{ .public_only = .no_credential };
     const authenticated_source: CatalogAuthenticatedSource = switch (selected_source) {
@@ -162,6 +181,7 @@ pub fn catalogAccessForCredential(
             .source = authenticated_source,
             .credential = credential,
             .team_context = if (authenticated_source == .chatgpt_subscription or authenticated_source == .grok_subscription) null else team_context,
+            .account_id = if (authenticated_source == .grok_subscription) account_id else null,
         },
     };
 }
@@ -699,6 +719,16 @@ test "catalog access isolates public and authenticated provider credentials" {
     try std.testing.expectEqualStrings("chatgpt-secret", chatgpt.authorizationCredential().?);
     try std.testing.expect(chatgpt.teamContext() == null);
     try std.testing.expect(chatgpt.publicFallbackAfterRejection() == null);
+
+    var grok_credential = Credential{
+        .token = try std.testing.allocator.dupe(u8, "grok-secret"),
+        .source = .grok_subscription,
+        .account_id = try std.testing.allocator.dupe(u8, "acct_grok"),
+    };
+    defer grok_credential.deinit(std.testing.allocator);
+    const grok = catalogAccessAt(grok_credential, 0);
+    try std.testing.expectEqualStrings("acct_grok", grok.accountId().?);
+    try std.testing.expect(grok.teamContext() == null);
 
     const rejected: CatalogAccess = .{ .public_only = .{ .authenticated_credential_rejected = .stored_key } };
     try std.testing.expectEqual(CatalogPublicOnlyReason.authenticated_credential_rejected, rejected.publicOnlyReason().?);

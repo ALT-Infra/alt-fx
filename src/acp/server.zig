@@ -1430,7 +1430,12 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         state.alloc,
         startup_catalog,
         .{
-            .access = credentials.catalogAccessForCredential(state.credential_source, state.api_key, state.gateway_team),
+            .access = credentials.catalogAccessForCredentialAndAccount(
+                state.credential_source,
+                state.api_key,
+                state.gateway_team,
+                state.account_id,
+            ),
             .endpoint = state.cfg.gateway_models_path,
             .cancel_flag = &catalog_cancel_flag,
         },
@@ -1673,10 +1678,11 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     .code = ErrorCode.invalid_request,
                     .message = "Selected provider is unavailable in this host",
                 });
-            const access = credentials.catalogAccessForCredential(
+            const access = credentials.catalogAccessForCredentialAndAccount(
                 staged_credential.source,
                 staged_credential.token,
                 staged_credential.gatewayTeam(),
+                staged_credential.accountId(),
             );
             const fetched = try catalog_provider.fetch(alloc, .{
                 .access = access,

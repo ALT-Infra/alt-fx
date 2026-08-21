@@ -853,10 +853,11 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
 
-            const access = credentials.catalogAccessForCredential(
+            const access = credentials.catalogAccessForCredentialAndAccount(
                 credential.source,
                 credential.token,
                 credential.gatewayTeam(),
+                credential.accountId(),
             );
             const fetched = app.fetchProviderCatalog(target, access) catch |err| {
                 debug_trace.logf("provider", "catalog preparation failed provider={t} err={s}", .{ target, @errorName(err) });
