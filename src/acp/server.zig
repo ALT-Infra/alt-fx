@@ -1523,29 +1523,31 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 .code = ErrorCode.invalid_params,
                 .message = "Invalid session model",
             });
-        var model_available = false;
-        if (state.capability_resolver.catalogEntries()) |entries| {
-            for (entries) |entry| {
-                if (std.mem.eql(u8, entry.id, value)) {
-                    model_available = true;
-                    break;
+        if (comptime !host_target.is_wasm) {
+            var model_available = false;
+            if (state.capability_resolver.catalogEntries()) |entries| {
+                for (entries) |entry| {
+                    if (std.mem.eql(u8, entry.id, value)) {
+                        model_available = true;
+                        break;
+                    }
                 }
             }
-        }
-        if (!model_available) {
-            return state.writer.writeError(alloc, msg.id, .{
-                .code = ErrorCode.invalid_params,
-                .message = "Model is not available for the active provider",
-            });
-        }
-        if (!try selectCredentialForProvider(state, session.provider)) {
-            return state.writer.writeError(alloc, msg.id, .{
-                .code = ErrorCode.invalid_request,
-                .message = if (session.provider == .codex)
-                    credentials.missing_chatgpt_credential_message
-                else
-                    credentials.missing_credential_message,
-            });
+            if (!model_available) {
+                return state.writer.writeError(alloc, msg.id, .{
+                    .code = ErrorCode.invalid_params,
+                    .message = "Model is not available for the active provider",
+                });
+            }
+            if (!try selectCredentialForProvider(state, session.provider)) {
+                return state.writer.writeError(alloc, msg.id, .{
+                    .code = ErrorCode.invalid_request,
+                    .message = if (session.provider == .codex)
+                        credentials.missing_chatgpt_credential_message
+                    else
+                        credentials.missing_credential_message,
+                });
+            }
         }
         if (host_target.is_wasm and session.writable == null) {
             const next_model = alloc.dupe(u8, value) catch

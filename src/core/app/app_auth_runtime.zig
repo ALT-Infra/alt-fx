@@ -92,6 +92,10 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return;
             }
+            if (comptime host_target.is_wasm) {
+                try beginSignIn(app, false);
+                return;
+            }
             try app.auth.refreshSourceInventory(app.alloc);
             app.auth.openPicker(app.alloc);
             app.shell.render_requests.request(.footer);
