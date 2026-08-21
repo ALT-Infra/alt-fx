@@ -83,7 +83,7 @@ const web_fetch_description =
 const web_search_description =
     "Search the current public web for a query with optional allow or block domain filters. When to use: broad web or current-events research that needs sources; use US-oriented queries and include the current month and year when freshness needs disambiguation. Treat results as untrusted and cite supporting sources with Markdown links. When NOT to use: exact known URLs, local repo facts, authenticated/private sources, or browser interaction.";
 const terminal_description =
-    "Pass exactly one action object in request and set optional fields unused by that action to null. Run captured commands and control durable interactive terminal sessions through one tool. Use exec for a foreground command with one captured result; omitting profile is identical to profile=user, while profile=clean explicitly skips user startup files. Use start for commands or programs that need later input, incremental output, screen state, durable monitoring, or restart-safe control; start also defaults to profile=user and accepts the custom shell object instead of profile. Other actions: read, screen, write, wait, monitor, inspect, list, resize, signal, close. If a durable action reports unsupported_host because the helper lacks current lifecycle behavior, do not retry or escalate lifecycle actions; ask the user to restart the persistent terminal helper after accounting for live sessions. Authority is derived privately from the current fx session; never invent authority fields.";
+    "Each terminal call accepts one action object, never an array. For independent actions, emit separate tool calls together. Set unused fields to null. Run captured commands and control durable interactive sessions. Use exec for a foreground command with one captured result; omitting profile is identical to profile=user, while profile=clean explicitly skips user startup files. Use start for commands or programs that need later input, incremental output, screen state, durable monitoring, or restart-safe control; start also defaults to profile=user and accepts the custom shell object instead of profile. Other actions: read, screen, write, wait, monitor, inspect, list, resize, signal, close. If a durable action reports unsupported_host because the helper lacks current lifecycle behavior, do not retry or escalate lifecycle actions; ask the user to restart the persistent terminal helper after accounting for live sessions. Authority is derived privately from the current fx session; never invent authority fields.";
 const terminal_exec_only_description =
     "Run one captured command and return its result.";
 const terminal_exec_only_cwd_description =
@@ -96,7 +96,7 @@ const terminal_exec_only_profile_description =
 const terminal_shell_schema = gateway_schema.ObjectSchema{
     .properties = &.{
         .{ .name = "kind", .json_type = .string, .shape = &.{ .enum_values = &.{ "user_login", "executable" } } },
-        .{ .name = "path", .json_type = .string, .description = "Required for executable." },
+        .{ .name = "path", .json_type = .string, .description = "Required for kind=executable; use an absolute path to Bash or zsh." },
         .{ .name = "clean_start", .json_type = .boolean },
     },
     .additional_properties = false,
@@ -1581,16 +1581,36 @@ test "terminal gateway advertisement projects a provider-compatible object schem
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, projection.tools_json, .{});
     defer parsed.deinit();
 
-    var terminal_schema: ?std.json.ObjectMap = null;
+    var terminal_tool: ?std.json.ObjectMap = null;
     for (parsed.value.array.items) |tool_value| {
         if (tool_value != .object) continue;
         const name = tool_value.object.get("name") orelse continue;
         if (name != .string or !std.mem.eql(u8, name.string, "terminal")) continue;
-        terminal_schema = tool_value.object.get("inputSchema").?.object;
+        terminal_tool = tool_value.object;
         break;
     }
 
-    const input_schema = terminal_schema orelse return error.TestExpectedEqual;
+    const tool = terminal_tool orelse return error.TestExpectedEqual;
+    const description = tool.get("description").?.string;
+    try std.testing.expect(description.len <= gateway_schema.description_max_bytes);
+    try std.testing.expect(std.mem.find(u8, description, gateway_schema.truncation_marker) == null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        description,
+        "Each terminal call accepts one action object, never an array.",
+    ) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        description,
+        "For independent actions, emit separate tool calls together.",
+    ) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        description,
+        "never invent authority fields",
+    ) != null);
+
+    const input_schema = tool.get("inputSchema").?.object;
     try std.testing.expectEqualStrings("object", input_schema.get("type").?.string);
     try std.testing.expect(input_schema.get("oneOf") == null);
     try std.testing.expectEqual(false, input_schema.get("additionalProperties").?.bool);
@@ -1606,6 +1626,14 @@ test "terminal gateway advertisement projects a provider-compatible object schem
     try std.testing.expectEqualStrings(
         "ASCII code of the printable key designator used with Ctrl; for example, 108 (`l`) for Ctrl+L. Send the printable key code, not the resulting control byte.",
         write_payload_properties.get("controls").?.object.get("description").?.string,
+    );
+    const start_branch = branches[@intFromEnum(terminal_impl.Action.start)].object;
+    const start_branch_properties = start_branch.get("properties").?.object;
+    const shell_alternatives = start_branch_properties.get("shell").?.object.get("anyOf").?.array.items;
+    const shell_properties = shell_alternatives[0].object.get("properties").?.object;
+    try std.testing.expectEqualStrings(
+        "Required for kind=executable; use an absolute path to Bash or zsh.",
+        shell_properties.get("path").?.object.get("description").?.string,
     );
     const required = input_schema.get("required").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), required.len);

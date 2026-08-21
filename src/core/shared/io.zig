@@ -251,57 +251,6 @@ fn openExistingRegularFileWithPolicy(
     return file;
 }
 
-/// Opens an existing read-only regular file without following the final
-/// symlink or blocking if a special file races the metadata check. Hard-linked
-/// regular files remain valid. The caller owns the returned file.
-pub fn openExistingReadOnlyRegularFile(
-    dir: std.Io.Dir,
-    sub_path: []const u8,
-) !std.Io.File {
-    const initial = try dir.statFile(getIo(), sub_path, .{
-        .follow_symlinks = false,
-    });
-    if (initial.kind != .file) return error.NotRegularFile;
-
-    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
-        var file = dir.openFile(getIo(), sub_path, .{
-            .mode = .read_only,
-            .allow_directory = false,
-            .follow_symlinks = false,
-        }) catch |err| switch (err) {
-            error.IsDir, error.SymLinkLoop, error.NotDir => return error.NotRegularFile,
-            else => return err,
-        };
-        errdefer file.close(getIo());
-        const stat = try file.stat(getIo());
-        if (stat.kind != .file) return error.NotRegularFile;
-        return file;
-    }
-
-    var flags: std.posix.O = .{
-        .ACCMODE = .RDONLY,
-        .NOFOLLOW = true,
-        .NONBLOCK = true,
-    };
-    if (@hasField(std.posix.O, "CLOEXEC")) flags.CLOEXEC = true;
-    if (@hasField(std.posix.O, "LARGEFILE")) flags.LARGEFILE = true;
-    if (@hasField(std.posix.O, "NOCTTY")) flags.NOCTTY = true;
-
-    const fd = std.posix.openat(dir.handle, sub_path, flags, 0) catch |err| switch (err) {
-        error.NoDevice, error.SymLinkLoop, error.NotDir => return error.NotRegularFile,
-        else => return err,
-    };
-    var file = std.Io.File{
-        .handle = fd,
-        .flags = .{ .nonblocking = true },
-    };
-    errdefer file.close(getIo());
-    const stat = try file.stat(getIo());
-    if (stat.kind != .file) return error.NotRegularFile;
-    try makeFileBlocking(&file);
-    return file;
-}
-
 pub fn verifyOpenedRegularFile(
     stat: std.Io.File.Stat,
     mode: std.Io.Dir.OpenFileOptions.Mode,
