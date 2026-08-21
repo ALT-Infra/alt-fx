@@ -1065,6 +1065,7 @@ const AskContext = struct {
             return permission_auto_classifier.Classifier.disabled();
         return permission_auto_classifier.Classifier.withProvider(provider, .{
             .credential = self.api_key,
+            .account_id = self.account_id,
             .tenant = self.gateway_team,
             .endpoint = self.cfg.gateway_chat_url,
             .cancel_flag = self.cancelFlag(),
@@ -1565,7 +1566,12 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.gateway_team = credential.gatewayTeam();
     ctx.credential_source = credential.source;
     ctx.account_id = credential.accountId();
-    ctx.model_catalog_access = credentials.catalogAccessForCredential(credential.source, api_key, credential.gatewayTeam());
+    ctx.model_catalog_access = credentials.catalogAccessForCredentialAndAccount(
+        credential.source,
+        api_key,
+        credential.gatewayTeam(),
+        credential.accountId(),
+    );
 
     const restored_image_catalog = try ctx.session.snapshotImageCatalog(alloc, &.{});
     defer types.freeImageAttachmentSlice(alloc, restored_image_catalog);

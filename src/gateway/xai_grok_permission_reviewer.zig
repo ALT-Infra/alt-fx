@@ -14,6 +14,7 @@ pub const provider = permission_auto_classifier.Provider{
 
 const ReviewConfig = struct {
     credential: []const u8,
+    account_id: []const u8,
     cancel_flag: ?*std.atomic.Value(bool),
     usage: ?*session_usage.Usage,
     usage_allocator: Allocator,
@@ -26,8 +27,10 @@ fn reviewGrok(
     request: permission_auto_classifier.ReviewRequest,
 ) anyerror!permission_auto_classifier.ParseOutcome {
     if (input.credential.len == 0) return .invalid;
+    const account_id = input.account_id orelse return .invalid;
     var config = ReviewConfig{
         .credential = input.credential,
+        .account_id = account_id,
         .cancel_flag = input.cancel_flag,
         .usage = input.usage,
         .usage_allocator = input.usage_allocator,
@@ -107,6 +110,7 @@ fn sendReview(
     var result = xai_grok.agent_stream_provider.stream(alloc, .{
         .api_key = config.credential,
         .credential_source = .grok_subscription,
+        .account_id = config.account_id,
         .team = null,
         .model = model,
         .retry_count = 1,
@@ -114,6 +118,7 @@ fn sendReview(
         .payload = payload,
         .trace_ctx = .{},
         .content_capture_limit = 16 * 1024,
+        .deadline = deadline,
         .delivery = &delivery,
         .attempt_evidence = &evidence,
         .callback_ctx = @ptrCast(&callback_context),
@@ -127,9 +132,7 @@ fn sendReview(
             .ambiguous_delivery
         else
             .unbilled) catch return .permanent_failure;
-        if (err == error.OutOfMemory) return error.OutOfMemory;
-        if (err == error.Cancelled or cancel_flag.load(.seq_cst)) return .cancelled;
-        return .transient_failure;
+        return mapStreamError(err, cancel_flag);
     };
     var result_owned = true;
     defer if (result_owned) result.deinit(alloc);
@@ -161,6 +164,16 @@ fn sendReview(
         .context = @ptrCast(owned),
         .deinit_fn = deinitOwnedResult,
     } };
+}
+
+fn mapStreamError(
+    err: anyerror,
+    cancel_flag: *std.atomic.Value(bool),
+) error{OutOfMemory}!permission_auto_classifier.TransportOutcome {
+    if (err == error.OutOfMemory) return error.OutOfMemory;
+    if (err == error.Cancelled or cancel_flag.load(.seq_cst)) return .cancelled;
+    if (err == error.Timeout) return .timed_out;
+    return .transient_failure;
 }
 
 test "Grok reviewer builds a direct Responses request with the admitted model" {
@@ -197,4 +210,12 @@ test "Grok reviewer builds a direct Responses request with the admitted model" {
     try std.testing.expect(std.mem.find(u8, body, "\"tool_choice\":\"required\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"type\":\"function_call_output\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "ai-gateway") == null);
+}
+
+test "Grok reviewer maps an enforced stream deadline to fail-closed timeout" {
+    var cancelled = std.atomic.Value(bool).init(false);
+    try std.testing.expectEqual(
+        permission_auto_classifier.TransportOutcome.timed_out,
+        try mapStreamError(error.Timeout, &cancelled),
+    );
 }

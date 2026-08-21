@@ -191,6 +191,7 @@ pub const OverrideFn = *const fn (
 /// returns.
 pub const ProviderInput = struct {
     credential: []const u8 = "",
+    account_id: ?[]const u8 = null,
     tenant: ?[]const u8 = null,
     endpoint: []const u8 = "",
     cancel_flag: ?*std.atomic.Value(bool) = null,

@@ -669,8 +669,11 @@ fn fetchAccountId(
         return error.InvalidGrokUserInfoResponse;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidGrokUserInfoResponse;
-    return dupeRequiredString(alloc, parsed.value.object, "sub") catch
+    const account_id = dupeRequiredString(alloc, parsed.value.object, "sub") catch
         return error.InvalidGrokUserInfoResponse;
+    errdefer alloc.free(account_id);
+    if (!grok_session.validAccountId(account_id)) return error.InvalidGrokUserInfoResponse;
+    return account_id;
 }
 
 fn revokeToken(
@@ -865,6 +868,22 @@ test "Grok account identity comes from authenticated userinfo" {
     defer std.testing.allocator.free(account_id);
     try std.testing.expect(state.authorization_seen);
     try std.testing.expectEqualStrings("acct_test", account_id);
+}
+
+test "Grok account identity rejects unsafe userinfo bytes" {
+    const State = struct {
+        fn execute(_: ?*anyopaque, alloc: Allocator, _: oauth_transport.Request) !oauth_transport.Response {
+            return .{ .disposition = .accepted, .body = try alloc.dupe(u8, "{\"sub\":\"acct\\ninjected\"}") };
+        }
+    };
+    try std.testing.expectError(
+        error.InvalidGrokUserInfoResponse,
+        fetchAccountId(
+            std.testing.allocator,
+            .{ .execute_fn = State.execute },
+            "access-token",
+        ),
+    );
 }
 
 test "Grok refresh uses form encoding and accepts omitted token rotation" {

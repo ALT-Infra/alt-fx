@@ -41,6 +41,25 @@ const LOGOUT_FALLBACK_RESPONSE = "LOGOUT_FALLBACK_RESPONSE";
 const REFRESH_RECOVERY_RESPONSE = "REFRESH_RECOVERY_RESPONSE";
 const ACQUIRED_LOGIN_TOKEN = "acquired-login-token";
 
+function grokSubscriptionModel(id: string, contextWindow: number, efforts: string[] = []) {
+  return {
+    id,
+    model: id,
+    api_backend: "responses",
+    context_window: contextWindow,
+    supports_reasoning_effort: efforts.length > 0,
+    reasoning_efforts: efforts.map((value) => ({ value })),
+  };
+}
+
+function grokModalityModel(id: string, vision: boolean) {
+  return {
+    id,
+    input_modalities: vision ? ["text", "image"] : ["text"],
+    output_modalities: ["text"],
+  };
+}
+
 let session: TmuxSession | null = null;
 let home: string | null = null;
 let stderrPath: string | null = null;
@@ -446,6 +465,13 @@ function startFakeGrokOAuth(options: {
     authorization: string | null;
     body: string | null;
     conversationId: string | null;
+    tokenAuth: string | null;
+    authenticateResponse: string | null;
+    clientIdentifier: string | null;
+    clientVersion: string | null;
+    modelOverride: string | null;
+    grokUserId: string | null;
+    userId: string | null;
     query: string;
   }> = [];
   let tokenCalls = 0;
@@ -455,6 +481,11 @@ function startFakeGrokOAuth(options: {
     { id: "grok-4.6", object: "model", input_modalities: ["text", "image"], output_modalities: ["text"] },
     { id: "grok-image-only", object: "model", input_modalities: ["text"], output_modalities: ["image"] },
   ];
+  const allSubscriptionModels = [
+    grokSubscriptionModel("grok-4.20", 1_000_000),
+    grokSubscriptionModel("grok-4.6", 500_000, ["xhigh", "high", "medium", "low"]),
+  ];
+  let subscriptionModels = allSubscriptionModels;
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
@@ -467,6 +498,13 @@ function startFakeGrokOAuth(options: {
         authorization: request.headers.get("authorization"),
         body,
         conversationId: request.headers.get("x-grok-conv-id"),
+        tokenAuth: request.headers.get("x-xai-token-auth"),
+        authenticateResponse: request.headers.get("x-authenticateresponse"),
+        clientIdentifier: request.headers.get("x-grok-client-identifier"),
+        clientVersion: request.headers.get("x-grok-client-version"),
+        modelOverride: request.headers.get("x-grok-model-override"),
+        grokUserId: request.headers.get("x-grok-user-id"),
+        userId: request.headers.get("x-userid"),
         query: url.search,
       });
       if (url.pathname === "/oauth2/authorize") {
@@ -513,6 +551,9 @@ function startFakeGrokOAuth(options: {
       if (url.pathname === "/v1/language-models") {
         return Response.json({ models });
       }
+      if (url.pathname === "/v1/models") {
+        return Response.json({ data: subscriptionModels });
+      }
       if (url.pathname === "/v1/responses") {
         responseCalls += 1;
         if (responseCalls <= (options.unauthorizedResponses ?? 0)) {
@@ -539,11 +580,14 @@ function startFakeGrokOAuth(options: {
       FX_E2E_GROK_TOKEN_URL: `${baseUrl}/oauth2/token`,
       FX_E2E_GROK_USERINFO_URL: `${baseUrl}/oauth2/userinfo`,
       FX_E2E_GROK_REVOKE_URL: `${baseUrl}/oauth2/revoke`,
-      FX_E2E_XAI_GROK_MODELS_URL: `${baseUrl}/v1/language-models`,
+      FX_E2E_XAI_GROK_MODELS_URL: `${baseUrl}/v1/models`,
+      FX_E2E_XAI_GROK_MODALITIES_URL: `${baseUrl}/v1/language-models`,
       FX_E2E_XAI_GROK_RESPONSES_URL: `${baseUrl}/v1/responses`,
     },
     setModels(next: typeof models) {
       models = next;
+      const visibleIds = new Set(next.map((model) => model.id));
+      subscriptionModels = allSubscriptionModels.filter((model) => visibleIds.has(model.id));
     },
     stop() { server.stop(true); },
   };
@@ -717,10 +761,12 @@ function startFakeGrokToolLoop(options: {
     hostname: "127.0.0.1",
     port: 0,
     async fetch(request) {
-      if (new URL(request.url).pathname === "/models") {
-        return Response.json({ models: [
-          { id: "grok-4.20", object: "model", input_modalities: ["text", "image"], output_modalities: ["text"] },
-        ] });
+      const path = new URL(request.url).pathname;
+      if (path === "/models") {
+        return Response.json({ data: [grokSubscriptionModel("grok-4.20", 1_000_000)] });
+      }
+      if (path === "/modalities") {
+        return Response.json({ models: [grokModalityModel("grok-4.20", true)] });
       }
       bodies.push(await request.text());
       if (bodies.length === 1) {
@@ -745,6 +791,7 @@ function startFakeGrokToolLoop(options: {
     bodies,
     responsesUrl: `http://127.0.0.1:${server.port}/responses`,
     modelsUrl: `http://127.0.0.1:${server.port}/models`,
+    modalitiesUrl: `http://127.0.0.1:${server.port}/modalities`,
     stop() { server.stop(true); },
   };
 }
@@ -802,6 +849,14 @@ function startFakeCodexAutoReview() {
 
 function startFakeGrokAutoReview() {
   const bodies: string[] = [];
+  const headers: Array<{
+    tokenAuth: string | null;
+    authenticateResponse: string | null;
+    clientIdentifier: string | null;
+    clientVersion: string | null;
+    modelOverride: string | null;
+    grokUserId: string | null;
+  }> = [];
   const accessToken = "grok-auto-review-token";
   let mainRequests = 0;
   const server = Bun.serve({
@@ -810,10 +865,19 @@ function startFakeGrokAutoReview() {
     async fetch(request) {
       const path = new URL(request.url).pathname;
       if (path === "/models") {
-        return Response.json({ models: [
-          { id: "grok-4.20", object: "model", input_modalities: ["text"], output_modalities: ["text"] },
-        ] });
+        return Response.json({ data: [grokSubscriptionModel("grok-4.20", 500_000)] });
       }
+      if (path === "/modalities") {
+        return Response.json({ models: [grokModalityModel("grok-4.20", false)] });
+      }
+      headers.push({
+        tokenAuth: request.headers.get("x-xai-token-auth"),
+        authenticateResponse: request.headers.get("x-authenticateresponse"),
+        clientIdentifier: request.headers.get("x-grok-client-identifier"),
+        clientVersion: request.headers.get("x-grok-client-version"),
+        modelOverride: request.headers.get("x-grok-model-override"),
+        grokUserId: request.headers.get("x-grok-user-id"),
+      });
       const body = await request.text();
       bodies.push(body);
       if (body.includes('"name":"permission_decision"')) {
@@ -843,8 +907,53 @@ function startFakeGrokAutoReview() {
   return {
     accessToken,
     bodies,
+    headers,
     responsesUrl: `http://127.0.0.1:${server.port}/responses`,
     modelsUrl: `http://127.0.0.1:${server.port}/models`,
+    modalitiesUrl: `http://127.0.0.1:${server.port}/modalities`,
+    stop() { server.stop(true); },
+  };
+}
+
+function startFakeGrokResourceRecovery() {
+  const accessToken = "grok-resource-limit-token";
+  const bodies: string[] = [];
+  let responseCalls = 0;
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      const path = new URL(request.url).pathname;
+      if (path === "/models") {
+        return Response.json({ data: [grokSubscriptionModel("grok-4.20", 500_000)] });
+      }
+      if (path === "/modalities") {
+        return Response.json({ models: [grokModalityModel("grok-4.20", false)] });
+      }
+      bodies.push(await request.text());
+      responseCalls += 1;
+      if (responseCalls === 1) {
+        return new Response(
+          'data: {"type":"response.output_text.delta","delta":"' +
+            "x".repeat(1024 * 1024) +
+            '"}\n\n',
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      }
+      const text = responseCalls === 2 ? "GROK_LIMIT_RECOVERED" : "GROK_AFTER_LIMIT_OK";
+      return new Response(
+        `data: ${JSON.stringify({ type: "response.output_text.delta", delta: text })}\n\n` +
+          'data: {"type":"response.completed","response":{"status":"completed"}}\n\n',
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    },
+  });
+  return {
+    accessToken,
+    bodies,
+    responsesUrl: `http://127.0.0.1:${server.port}/responses`,
+    modelsUrl: `http://127.0.0.1:${server.port}/models`,
+    modalitiesUrl: `http://127.0.0.1:${server.port}/modalities`,
     stop() { server.stop(true); },
   };
 }
@@ -1995,6 +2104,18 @@ test(
       const modelIds = (JSON.parse(models.stdout) as { models: Array<{ id: string }> }).models
         .map((model) => model.id);
       expect(modelIds).toEqual(["grok-4.20", "grok-4.6"]);
+      const subscriptionCatalogRequests = grok.requests.filter((request) => request.path === "/v1/models");
+      expect(subscriptionCatalogRequests.length).toBeGreaterThan(0);
+      for (const request of subscriptionCatalogRequests) {
+        expect(request.tokenAuth).toBe("xai-grok-cli");
+        expect(request.userId).toBe("acct_grok_e2e");
+      }
+      const modalityRequests = grok.requests.filter((request) => request.path === "/v1/language-models");
+      expect(modalityRequests.length).toBeGreaterThan(0);
+      for (const request of modalityRequests) {
+        expect(request.tokenAuth).toBeNull();
+        expect(request.userId).toBeNull();
+      }
 
       const ask = await runFx(["ask", "--json", "--auto", "Answer directly."], {
         env,
@@ -2009,6 +2130,15 @@ test(
       expect(responses[0]!.conversationId).toBe(responses[1]!.conversationId);
       expect(responses[0]!.authorization).toBe(`Bearer ${grok.initialAccessToken}`);
       expect(responses[1]!.authorization).toBe(`Bearer ${grok.refreshedAccessToken}`);
+      for (const request of responses) {
+        expect(request.tokenAuth).toBe("xai-grok-cli");
+        expect(request.authenticateResponse).toBe("authenticate-response");
+        expect(request.clientIdentifier).toBe("fx");
+        expect(request.clientVersion).toBe("1.0.6");
+        expect(request.modelOverride).toBe("grok-4.20");
+        expect(request.grokUserId).toBe("acct_grok_e2e");
+        expect(request.userId).toBeNull();
+      }
       expect(grok.tokenCalls()).toBe(2);
       const userinfo = grok.requests.filter((request) => request.path === "/oauth2/userinfo");
       expect(userinfo).toHaveLength(2);
@@ -2190,14 +2320,21 @@ tmuxTest(
       await session.sendKeys("Down");
       await session.sendKeys("Enter");
       await session.waitForText("Switched to Grok subscription with grok-4.20.", TIMEOUT);
+      const settingsPath = join(home, ".fx", "settings.json");
+      const persistenceDeadline = Date.now() + TIMEOUT;
+      let saved: { provider: string; grok_model: string } | undefined;
+      while (Date.now() < persistenceDeadline) {
+        saved = JSON.parse(readFileSync(settingsPath, "utf8")) as {
+          provider: string;
+          grok_model: string;
+        };
+        if (saved.provider === "grok") break;
+        await Bun.sleep(25);
+      }
+      expect(saved).toBeDefined();
       expect(grok.tokenCalls()).toBe(tokenCallsAfterLogin);
-
-      const saved = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8")) as {
-        provider: string;
-        grok_model: string;
-      };
-      expect(saved.provider).toBe("grok");
-      expect(saved.grok_model).toBe("grok-4.20");
+      expect(saved!.provider).toBe("grok");
+      expect(saved!.grok_model).toBe("grok-4.20");
       const responses = grok.requests.filter((request) => request.path === "/v1/responses");
       expect(responses).toHaveLength(1);
       expect(responses[0]!.conversationId).toBeTruthy();
@@ -2210,7 +2347,7 @@ tmuxTest(
 );
 
 tmuxTest(
-  "Grok model selection accepts proven effort levels and sends the selected effort",
+  "Grok model selection uses provider-advertised context and effort metadata",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-grok-effort-selection-"));
     stderrPath = join(home, "stderr.log");
@@ -2220,7 +2357,7 @@ tmuxTest(
       writeSeededGrokLogin(home, grok.initialAccessToken);
       writeFileSync(
         join(home, ".fx", "settings.json"),
-        JSON.stringify({ provider: "grok", grok_model: "grok-4.20" }) + "\n",
+        JSON.stringify({ provider: "grok", grok_model: "grok-4.20", statusLine: { context: true } }) + "\n",
         { mode: 0o600 },
       );
       session = await startFx(home, stderrPath, gateway, undefined, undefined, {
@@ -2246,7 +2383,49 @@ tmuxTest(
       };
       expect(body.model).toBe("grok-4.6");
       expect(body.reasoning?.effort).toBe("xhigh");
+      expect(await session.capturePane()).toContain("/500k");
       expect(readFileSync(join(home, ".fx", "settings.json"), "utf8")).toContain('"effort":"xhigh"');
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      grok.stop();
+    }
+  },
+  60_000,
+);
+
+tmuxTest(
+  "Grok resource exhaustion stays on-provider and leaves later input usable",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-grok-resource-recovery-"));
+    stderrPath = join(home, "stderr.log");
+    gateway = startFakeGateway([]);
+    const grok = startFakeGrokResourceRecovery();
+    try {
+      writeSeededGrokLogin(home, grok.accessToken, "acct_resource_limit");
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ provider: "grok", grok_model: "grok-4.20" }) + "\n",
+        { mode: 0o600 },
+      );
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        FX_MODEL: undefined,
+        FX_E2E_XAI_GROK_RESPONSES_URL: grok.responsesUrl,
+        FX_E2E_XAI_GROK_MODELS_URL: grok.modelsUrl,
+        FX_E2E_XAI_GROK_MODALITIES_URL: grok.modalitiesUrl,
+      });
+      await session.waitForComposer(TIMEOUT);
+      const failureVisible = session.waitForText("request failed: XaiGrokSseEventTooLarge", TIMEOUT);
+      await session.sendText("Recover from a bounded Grok response.");
+      await failureVisible;
+      await session.sendText("Accept another prompt after recovery.");
+      await session.waitForText("GROK_LIMIT_RECOVERED", TIMEOUT);
+      await session.sendText("Accept one more prompt after recovery.");
+      await session.waitForText("GROK_AFTER_LIMIT_OK", TIMEOUT);
+
+      const scrollback = await session.captureFullScrollback();
+      expect(scrollback).toContain("XaiGrokSseEventTooLarge");
+      expect(grok.bodies).toHaveLength(3);
+      expect(gateway.requests).toHaveLength(0);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     } finally {
       grok.stop();
@@ -2326,6 +2505,7 @@ test(
             FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
             FX_E2E_XAI_GROK_RESPONSES_URL: grok.responsesUrl,
             FX_E2E_XAI_GROK_MODELS_URL: grok.modelsUrl,
+            FX_E2E_XAI_GROK_MODALITIES_URL: grok.modalitiesUrl,
           },
           timeoutMs: TIMEOUT,
         },
@@ -2496,6 +2676,7 @@ test(
             FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
             FX_E2E_XAI_GROK_RESPONSES_URL: grok.responsesUrl,
             FX_E2E_XAI_GROK_MODELS_URL: grok.modelsUrl,
+            FX_E2E_XAI_GROK_MODALITIES_URL: grok.modalitiesUrl,
           },
           timeoutMs: TIMEOUT,
         },
@@ -2588,6 +2769,7 @@ test(
             FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
             FX_E2E_XAI_GROK_RESPONSES_URL: grok.responsesUrl,
             FX_E2E_XAI_GROK_MODELS_URL: grok.modelsUrl,
+            FX_E2E_XAI_GROK_MODALITIES_URL: grok.modalitiesUrl,
           },
           timeoutMs: TIMEOUT,
         },
@@ -2597,6 +2779,15 @@ test(
       expect(grok.bodies.map((body) => (JSON.parse(body) as { model: string }).model))
         .toEqual(["grok-4.20", "grok-4.20", "grok-4.20"]);
       expect(grok.bodies[1]).toContain('"name":"permission_decision"');
+      expect(grok.headers).toHaveLength(3);
+      for (const headers of grok.headers) {
+        expect(headers.tokenAuth).toBe("xai-grok-cli");
+        expect(headers.authenticateResponse).toBe("authenticate-response");
+        expect(headers.clientIdentifier).toBe("fx");
+        expect(headers.clientVersion).toBe("1.0.6");
+        expect(headers.modelOverride).toBe("grok-4.20");
+        expect(headers.grokUserId).toBe("acct_auto_review");
+      }
       for (const request of gateway.requests) {
         expect(request.body).not.toContain("permission_decision");
       }

@@ -645,13 +645,43 @@ function writeSeededAcpGrokLogin(home: string, accessToken: string): void {
   chmodSync(authPath, 0o600);
 }
 
+function acpGrokSubscriptionModel(id: string, contextWindow: number) {
+  return {
+    id,
+    model: id,
+    api_backend: "responses",
+    context_window: contextWindow,
+    supports_reasoning_effort: false,
+    reasoning_efforts: [],
+  };
+}
+
+function acpGrokModalityModel(id: string) {
+  return {
+    id,
+    input_modalities: ["text", "image"],
+    output_modalities: ["text"],
+  };
+}
+
 function startAcpFakeGrok(options: {
   unauthorizedResponses?: number;
   route?: (body: string) => string | Promise<string>;
 } = {}) {
   const accessToken = "grok-acp-stale";
   const refreshedAccessToken = "grok-acp-fresh";
-  const requests: Array<{ path: string; authorization: string | null; body: string; conversationId: string | null }> = [];
+  const requests: Array<{
+    path: string;
+    authorization: string | null;
+    body: string;
+    conversationId: string | null;
+    tokenAuth: string | null;
+    authenticateResponse: string | null;
+    clientIdentifier: string | null;
+    clientVersion: string | null;
+    modelOverride: string | null;
+    grokUserId: string | null;
+  }> = [];
   const modelRequests: Array<{ path: string; authorization: string | null }> = [];
   const tokenRequests: Array<{ path: string; authorization: string | null; body: string }> = [];
   const userinfoRequests: Array<{ path: string; authorization: string | null }> = [];
@@ -664,9 +694,11 @@ function startAcpFakeGrok(options: {
       const authorization = request.headers.get("authorization");
       if (path === "/models") {
         modelRequests.push({ path, authorization });
-        return Response.json({ models: [
-          { id: "grok-4.20", object: "model", input_modalities: ["text", "image"], output_modalities: ["text"] },
-        ] });
+        return Response.json({ data: [acpGrokSubscriptionModel("grok-4.20", 1_000_000)] });
+      }
+      if (path === "/modalities") {
+        modelRequests.push({ path, authorization });
+        return Response.json({ models: [acpGrokModalityModel("grok-4.20")] });
       }
       if (path === "/token") {
         const body = await request.text();
@@ -687,6 +719,12 @@ function startAcpFakeGrok(options: {
         authorization,
         body,
         conversationId: request.headers.get("x-grok-conv-id"),
+        tokenAuth: request.headers.get("x-xai-token-auth"),
+        authenticateResponse: request.headers.get("x-authenticateresponse"),
+        clientIdentifier: request.headers.get("x-grok-client-identifier"),
+        clientVersion: request.headers.get("x-grok-client-version"),
+        modelOverride: request.headers.get("x-grok-model-override"),
+        grokUserId: request.headers.get("x-grok-user-id"),
       });
       if (unauthorizedResponses > 0) {
         unauthorizedResponses -= 1;
@@ -707,6 +745,7 @@ function startAcpFakeGrok(options: {
     userinfoRequests,
     responsesUrl: `${base}/responses`,
     modelsUrl: `${base}/models`,
+    modalitiesUrl: `${base}/modalities`,
     tokenUrl: `${base}/token`,
     userinfoUrl: `${base}/userinfo`,
     stop() { server.stop(true); },
@@ -7203,6 +7242,7 @@ describe("acp: model-independent", () => {
             ...fakeGatewayEnv(root, gateway),
             FX_E2E_XAI_GROK_RESPONSES_URL: grok.responsesUrl,
             FX_E2E_XAI_GROK_MODELS_URL: grok.modelsUrl,
+            FX_E2E_XAI_GROK_MODALITIES_URL: grok.modalitiesUrl,
           },
         });
         await client.request("initialize", { protocolVersion: 1 }, 1);
@@ -7242,6 +7282,12 @@ describe("acp: model-independent", () => {
         for (const request of grok.requests) {
           expect(request.authorization).toBe(`Bearer ${grok.accessToken}`);
           expect(JSON.parse(request.body).model).toBe("grok-4.20");
+          expect(request.tokenAuth).toBe("xai-grok-cli");
+          expect(request.authenticateResponse).toBe("authenticate-response");
+          expect(request.clientIdentifier).toBe("fx");
+          expect(request.clientVersion).toBe("1.0.6");
+          expect(request.modelOverride).toBe("grok-4.20");
+          expect(request.grokUserId).toBe("acct_grok_acp");
         }
         for (const request of [...gateway.requests, ...gateway.modelRequests]) {
           expect(request.headers.get("authorization")).not.toContain("grok-acp-");
@@ -7685,6 +7731,7 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
             ...fakeGatewayEnv(root, gateway),
             FX_E2E_XAI_GROK_RESPONSES_URL: grok.responsesUrl,
             FX_E2E_XAI_GROK_MODELS_URL: grok.modelsUrl,
+            FX_E2E_XAI_GROK_MODALITIES_URL: grok.modalitiesUrl,
             FX_E2E_GROK_TOKEN_URL: grok.tokenUrl,
             FX_E2E_GROK_USERINFO_URL: grok.userinfoUrl,
           },
@@ -7712,10 +7759,18 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
         expect(grok.requests[0]!.body).toBe(grok.requests[1]!.body);
         expect(grok.requests[0]!.conversationId).toBeTruthy();
         expect(grok.requests[0]!.conversationId).toBe(grok.requests[1]!.conversationId);
-        expect(grok.modelRequests).toHaveLength(1);
+        expect(grok.modelRequests.map((request) => request.path)).toEqual(["/models", "/modalities"]);
         expect(grok.requests[0]!.authorization).toBe(`Bearer ${grok.accessToken}`);
         expect(grok.requests[1]!.authorization).toBe(`Bearer ${grok.refreshedAccessToken}`);
         expect(grok.requests[2]!.authorization).toBe(`Bearer ${grok.refreshedAccessToken}`);
+        for (const request of grok.requests) {
+          expect(request.tokenAuth).toBe("xai-grok-cli");
+          expect(request.authenticateResponse).toBe("authenticate-response");
+          expect(request.clientIdentifier).toBe("fx");
+          expect(request.clientVersion).toBe("1.0.6");
+          expect(request.modelOverride).toBe("grok-4.20");
+          expect(request.grokUserId).toBe("acct_grok_acp");
+        }
         expect(grok.tokenRequests).toHaveLength(1);
         expect(grok.tokenRequests[0]!.body).toContain("grant_type=refresh_token");
         expect(grok.userinfoRequests).toHaveLength(1);

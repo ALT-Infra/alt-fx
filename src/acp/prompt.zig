@@ -1102,7 +1102,12 @@ fn resolveModelCapabilities(
         ctx.state.alloc,
         ctx.state.cfg.gateway_provider.model_catalog,
         .{
-            .access = credentials.catalogAccessForCredential(session.credential_source, session.api_key, ctx.state.gateway_team),
+            .access = credentials.catalogAccessForCredentialAndAccount(
+                session.credential_source,
+                session.api_key,
+                ctx.state.gateway_team,
+                session.account_id,
+            ),
             .endpoint = ctx.state.cfg.gateway_models_path,
             .cancel_flag = &session.cancel_flag,
         },
