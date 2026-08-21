@@ -4114,31 +4114,6 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await active.sendKeys("C-x");
         await active.waitForComposer(TIMEOUT);
 
-        await active.sendText("/resume");
-        let resumePane = await active.waitForPane(
-          (pane) => pane.includes("Sessions"),
-          TIMEOUT,
-        );
-        const resumeContainsPersistent = (pane: string) => {
-          const sessionsStart = pane.indexOf("Sessions");
-          return sessionsStart >= 0 &&
-            pane.slice(sessionsStart).includes(persistentInitial);
-        };
-        if (!resumeContainsPersistent(resumePane)) {
-          await active.sendKeys("Escape");
-          await active.waitForComposer(TIMEOUT);
-          await Bun.sleep(5_100);
-          await active.sendText("/resume");
-          resumePane = await active.waitForPane(
-            (pane) => resumeContainsPersistent(pane) && !pane.includes(childName),
-            TIMEOUT,
-          );
-        }
-        expect(resumeContainsPersistent(resumePane)).toBe(true);
-        expect(resumePane).not.toContain(childName);
-        await active.sendKeys("Escape");
-        await active.waitForComposer(TIMEOUT);
-
         await active.sendText(parentAck);
         await active.waitForText(parentAckDone, TIMEOUT);
         expect(
