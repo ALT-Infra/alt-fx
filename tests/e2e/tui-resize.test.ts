@@ -3556,7 +3556,6 @@ describe.skipIf(SKIP)("tui: resize", () => {
           FX_TRACE_SCOPES:
             "frame_schedule,frame_plan,frame_diff,frame_commit,scroll,resize,input,worker",
           NO_COLOR: "1",
-          TMUX: undefined,
         },
       });
       await session.waitForComposer(10_000);
@@ -3573,35 +3572,37 @@ describe.skipIf(SKIP)("tui: resize", () => {
 
       const beforeResizeLine = readTraceLines(tracePath).length - 1;
       const beforeResizeFrame = readTapeFrames(tapePath).length;
+      const paneTty = execFileSync(
+        "tmux",
+        ["display-message", "-p", "-t", session.name, "#{pane_tty}"],
+        { encoding: "utf8", stdio: "pipe" },
+      ).trim();
+      // Drift the terminal position without updating fx's shadow grid. Tmux
+      // can then answer the resize probe while reconciliation is still blocked.
+      writeFileSync(paneTty, "\x1b[3A");
       await session.resizeWindow(120, 40, 0);
       execFileSync("tmux", ["send-keys", "-t", session.name, "-l", "x"], {
         stdio: "pipe",
       });
 
-      const requestedTrace = await waitForTraceText(
+      const resizeCycle = await waitForResizeCycle(
         tracePath,
-        "cursor_measure_requested protocol=private",
-        30_000,
-        5,
-      );
-      const requestLine = requestedTrace
-        .split("\n")
-        .findLast((line) => line.includes("cursor_measure_requested protocol=private"));
-      expect(requestLine).toBeDefined();
-      const expectedRow = signedTraceField(requestLine!, "expected_reflow_row");
-      expect(expectedRow).toBeGreaterThan(3);
-      const actualRow = expectedRow - 3;
-      sendRawTmuxBytes(
-        session,
-        "prepaint-cursor-reply",
-        Buffer.from(`\x1b[?${actualRow};1R\x1b[?${actualRow};2R`),
-      );
-
-      await waitForTraceText(
-        tracePath,
-        "history_row_delta=3 valid=true",
+        beforeResizeLine,
+        (cycle) =>
+          cycle.newSize.cols === 120 &&
+          cycle.newSize.rows === 40 &&
+          cycle.historyRowDelta !== 0,
         60_000,
       );
+      expect(resizeCycle.historyRowDelta).not.toBe(0);
+      const requestLine = readTraceLines(tracePath).find(
+        (line, index) =>
+          index > beforeResizeLine &&
+          line.includes("cursor_measure_requested protocol=ansi_tagged"),
+      );
+      expect(requestLine).toBeDefined();
+      expect(signedTraceField(requestLine!, "expected_reflow_row"))
+        .toBeGreaterThan(3);
       await waitForTraceText(tracePath, "settled_reset_committed");
       const finalGrid = await session.capturePaneGrid();
       const finalFooter = findFooter(finalGrid);
