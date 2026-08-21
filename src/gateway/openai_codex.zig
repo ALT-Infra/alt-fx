@@ -61,7 +61,7 @@ pub fn buildRequest(
     try writeInput(writer, alloc, request.messages, request.verified_images);
     try writer.writeByte(']');
 
-    const tool_count = try writeTools(writer, alloc, request.serialized_tools, request.selected_dynamic_tool_schemas);
+    _ = try writeTools(writer, alloc, request.serialized_tools, request.selected_dynamic_tool_schemas);
     try writer.writeAll(",\"tool_choice\":");
     try std.json.Stringify.value(request.tool_choice.label(), .{}, writer);
     try writer.writeAll(",\"parallel_tool_calls\":true,\"include\":[\"reasoning.encrypted_content\"]");
@@ -92,10 +92,6 @@ pub fn buildRequest(
     }
     // The ChatGPT Codex endpoint chooses the model's output limit and rejects
     // the public Responses API max_output_tokens parameter.
-    if (tool_count == 0 and request.tool_choice == .none) {
-        // Explicitly keeping the empty tool set out of the request avoids a
-        // backend validation difference between no tools and `tools: []`.
-    }
     try writer.writeByte('}');
     return out.toOwnedSlice();
 }

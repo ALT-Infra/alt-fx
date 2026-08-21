@@ -665,6 +665,8 @@ tmuxTest(
       },
     );
     await session.waitForComposer(TIMEOUT);
+    await session.sendText("/model openai/gpt-5.6-sol");
+    await session.waitForText("Switched to openai/gpt-5.6-sol", TIMEOUT);
     await session.sendText("/provider");
     await session.waitForText("Switch provider", TIMEOUT);
     await session.sendKeys("Down");
@@ -740,10 +742,45 @@ tmuxTest(
     const authorizeRequestsBeforeRoundTrip = chatgptOauth.requests.filter(
       (request) => request.path === "/oauth/authorize",
     ).length;
+    const settingsPath = join(home, ".fx", "settings.json");
+    const gatewayModelBefore = JSON.parse(readFileSync(settingsPath, "utf8")).model;
+    expect(typeof gatewayModelBefore).toBe("string");
+    await session.sendLiteralText("/model gpt-5.4-mini low");
+    await session.sendKeys("Enter");
+    await session.waitForText("Switched to gpt-5.4-mini", TIMEOUT);
+    const savedCodex = JSON.parse(readFileSync(settingsPath, "utf8"));
+    expect(savedCodex.model).toBe(gatewayModelBefore);
+    expect(savedCodex.codex_model).toBe("gpt-5.4-mini");
+    await session.sendText("/quit");
+    await session.waitForSessionEnd(TIMEOUT);
+    session = null;
+
+    session = await startFx(
+      home,
+      stderrPath,
+      gateway,
+      undefined,
+      undefined,
+      {
+        ...chatgptOauth.env,
+        FX_MODEL: undefined,
+      },
+    );
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/status");
+    await session.waitForText("model=gpt-5.4-mini", TIMEOUT);
     await session.sendText("/provider gateway");
     await session.waitForText("Switched to Vercel AI Gateway", TIMEOUT);
+    const savedGateway = JSON.parse(readFileSync(settingsPath, "utf8"));
+    expect(savedGateway.provider).toBe("gateway");
+    expect(savedGateway.model).toBe(gatewayModelBefore);
+    expect(savedGateway.codex_model).toBe("gpt-5.4-mini");
     await session.sendText("/provider codex");
     await session.waitForText("Switched to Codex subscription", TIMEOUT);
+    const restoredCodex = JSON.parse(readFileSync(settingsPath, "utf8"));
+    expect(restoredCodex.provider).toBe("codex");
+    expect(restoredCodex.model).toBe(gatewayModelBefore);
+    expect(restoredCodex.codex_model).toBe("gpt-5.4-mini");
     expect(chatgptOauth.requests.filter((request) => request.path === "/oauth/authorize"))
       .toHaveLength(authorizeRequestsBeforeRoundTrip);
     await session.sendText("/logout codex");

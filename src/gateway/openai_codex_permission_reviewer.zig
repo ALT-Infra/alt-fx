@@ -67,7 +67,7 @@ fn buildReviewPayload(
         .model = model,
         .serialized_tools = tools_json,
         .messages = expanded,
-        .tool_choice = .auto,
+        .tool_choice = .required,
         .provider_options = .{},
         .max_output_tokens = 2048,
         .budget = .{ .deadline = deadline, .cancel_flag = cancel_flag },
@@ -199,6 +199,7 @@ test "Codex reviewer builds a direct Responses request with gpt-5.4-mini" {
     defer std.testing.allocator.free(body);
 
     try std.testing.expect(std.mem.find(u8, body, "\"model\":\"gpt-5.4-mini\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"tool_choice\":\"required\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"type\":\"function_call_output\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "ai-gateway") == null);
 }

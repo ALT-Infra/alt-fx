@@ -394,13 +394,42 @@ pub fn refreshModelCredential(
     expected_account_id: ?[]const u8,
 ) !?[]u8 {
     const state: *ServerState = @ptrCast(@alignCast(raw));
-    return auth_runtime.refreshCredentialTokenForAccount(
+    const refreshed = try auth_runtime.refreshCredentialTokenForAccount(
         state.cfg.gateway_provider.oauth_transport,
         alloc,
         source,
         mode,
         expected_account_id,
-    );
+    ) orelse return null;
+    errdefer secret.zeroAndFree(alloc, refreshed);
+    if (source == .chatgpt_subscription) {
+        try publishRefreshedChatGptToken(state, refreshed, expected_account_id);
+    }
+    return refreshed;
+}
+
+fn publishRefreshedChatGptToken(
+    state: *ServerState,
+    refreshed: []const u8,
+    expected_account_id: ?[]const u8,
+) !void {
+    const expected = expected_account_id orelse return error.ChatGptAccountChanged;
+    const state_account = state.account_id orelse return error.ChatGptAccountChanged;
+    if (!std.mem.eql(u8, expected, state_account)) return error.ChatGptAccountChanged;
+    if (state.active_session) |active| {
+        const active_account = active.account_id orelse return error.ChatGptAccountChanged;
+        if (!std.mem.eql(u8, expected, active_account)) return error.ChatGptAccountChanged;
+    }
+
+    const owned = try state.alloc.dupe(u8, refreshed);
+    if (state.active_session) |*active| active.api_key = &.{};
+    if (state.api_key.len > 0) secret.zeroAndFree(state.alloc, state.api_key);
+    state.api_key = owned;
+    state.credential_source = .chatgpt_subscription;
+    if (state.active_session) |*active| {
+        active.api_key = state.api_key;
+        active.credential_source = .chatgpt_subscription;
+    }
 }
 
 pub fn releaseActiveSession(state: *ServerState) !void {
@@ -1717,11 +1746,13 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll("{\"configOptions\":[");
-    try sessions.writeProviderConfigOption(
-        &out.writer,
-        if (state.active_session) |session| session.provider else state.provider,
-    );
-    try out.writer.writeAll(",");
+    if (comptime !host_target.is_wasm) {
+        try sessions.writeProviderConfigOption(
+            &out.writer,
+            if (state.active_session) |session| session.provider else state.provider,
+        );
+        try out.writer.writeAll(",");
+    }
     try sessions.writeModelConfigOption(
         &out.writer,
         current_model,
@@ -2442,6 +2473,51 @@ test "ACP model commits honor the active session write boundary" {
         error.SessionPersistenceUnavailable,
         worker.failure.?,
     );
+}
+
+test "ACP publishes an account-bound refreshed Codex token for later prompts" {
+    const alloc = std.testing.allocator;
+    var state: ServerState = undefined;
+    state.alloc = alloc;
+    state.api_key = try alloc.dupe(u8, "stale-token");
+    state.account_id = try alloc.dupe(u8, "acct-1");
+    state.credential_source = .chatgpt_subscription;
+    var active: ActiveSessionState = undefined;
+    active.api_key = state.api_key;
+    active.account_id = state.account_id;
+    active.credential_source = .chatgpt_subscription;
+    state.active_session = active;
+    defer {
+        secret.zeroAndFree(alloc, state.api_key);
+        alloc.free(state.account_id.?);
+    }
+
+    try publishRefreshedChatGptToken(&state, "fresh-token", "acct-1");
+
+    try std.testing.expectEqualStrings("fresh-token", state.api_key);
+    try std.testing.expectEqualStrings("fresh-token", state.active_session.?.api_key);
+    try std.testing.expectEqualStrings("acct-1", state.account_id.?);
+    try std.testing.expectEqualStrings("acct-1", state.active_session.?.account_id.?);
+}
+
+test "ACP rejects refreshed Codex tokens for another account" {
+    const alloc = std.testing.allocator;
+    var state: ServerState = undefined;
+    state.alloc = alloc;
+    state.api_key = try alloc.dupe(u8, "stale-token");
+    state.account_id = try alloc.dupe(u8, "acct-1");
+    state.credential_source = .chatgpt_subscription;
+    state.active_session = null;
+    defer {
+        secret.zeroAndFree(alloc, state.api_key);
+        alloc.free(state.account_id.?);
+    }
+
+    try std.testing.expectError(
+        error.ChatGptAccountChanged,
+        publishRefreshedChatGptToken(&state, "wrong-token", "acct-2"),
+    );
+    try std.testing.expectEqualStrings("stale-token", state.api_key);
 }
 
 test "ACP usage flush preserves snapshot ownership on allocation failure" {

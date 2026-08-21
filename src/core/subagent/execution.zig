@@ -67,6 +67,26 @@ pub fn resolveTurnPreferences(
     };
 }
 
+test "turn preference overrides preserve the persisted provider" {
+    var command = try domain.validateCommand(std.testing.allocator, .{ .create = .{
+        .name = "child",
+        .mode = .persistent,
+        .model = "gpt-5.4-mini",
+    } });
+    defer command.deinit(std.testing.allocator);
+    const preferences = resolveTurnPreferences(
+        command.create.configuration,
+        .{
+            .provider = .codex,
+            .model = @constCast("gpt-5.6-sol"),
+            .effort = types.ReasoningEffort.literal("high"),
+            .fast_mode = false,
+        },
+    );
+    try std.testing.expectEqual(model_provider.ProviderId.codex, preferences.provider);
+    try std.testing.expectEqualStrings("gpt-5.4-mini", preferences.model);
+}
+
 pub const WorkOutcome = enum {
     completed,
     failed,
@@ -2781,7 +2801,8 @@ fn runOne(slot: *Slot) OneResult {
         return .admission_failed;
     };
     defer admission.deinit(owner.alloc);
-    if (admission.permission_mode != record.configuration.permission_mode or
+    if (admission.provider != preferences.provider or
+        admission.permission_mode != record.configuration.permission_mode or
         !std.mem.eql(u8, admission.parent_id, parent_id) or
         !std.mem.eql(u8, admission.source_id, record.queue[index].source_id) or
         !std.mem.eql(u8, admission.model, preferences.model) or

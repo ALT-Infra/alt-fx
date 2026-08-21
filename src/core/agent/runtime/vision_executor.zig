@@ -26,6 +26,7 @@ const system_prompt =
     "Extract exactly one record for every requested image ID, in requested order.";
 
 pub const Config = struct {
+    model: []const u8 = image_provider.default_model,
     stream_provider: agent_stream_provider.Provider,
     api_key: []const u8,
     credential_source: ?types.CredentialSource = null,
@@ -279,6 +280,7 @@ fn runBatchAttempt(
         user_prompt,
         verified_images,
         .{
+            .model = config.model,
             .stream_provider = config.stream_provider,
             .api_key = config.api_key,
             .credential_source = config.credential_source,

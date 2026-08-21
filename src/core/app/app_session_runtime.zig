@@ -342,7 +342,7 @@ pub const SessionPreferencePatch = struct {
     effort: ?types.ReasoningEffort = null,
     fast_mode: ?bool = null,
 
-    fn userSettingsPatch(self: SessionPreferencePatch) config_runtime.UserSettingsPatch {
+    pub fn userSettingsPatch(self: SessionPreferencePatch) config_runtime.UserSettingsPatch {
         var patch = config_runtime.UserSettingsPatch{
             .provider = self.provider,
             .effort = self.effort,

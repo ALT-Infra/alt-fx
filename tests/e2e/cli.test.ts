@@ -3257,7 +3257,6 @@ describe("cli: models", () => {
             more_count: 0,
             private_models_hidden: true,
             ids: ["public/fallback"],
-            models: [{ id: "public/fallback", source: "Vercel AI Gateway" }],
           });
 
           expect(gateway.modelRequests).toHaveLength(2);

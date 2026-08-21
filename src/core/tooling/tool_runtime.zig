@@ -15,6 +15,7 @@ const image_attachments = @import("../images/image_attachments.zig");
 const io_mod = @import("../shared/io.zig");
 const tool_contracts = @import("../agent/runtime/tool_contracts.zig");
 const vision_executor = @import("../agent/runtime/vision_executor.zig");
+const image_provider = @import("../agent/runtime/image_provider.zig");
 const background_runtime = @import("../background/background_runtime.zig");
 const background_launch_identity = @import("../background/background_launch_identity.zig");
 const process_supervisor = @import("../background/process_supervisor.zig");
@@ -998,6 +999,7 @@ fn executeVisionRequest(
     authority: command_admission.ToolExecutionAuthority,
 ) !ToolExecutionResult {
     const config: vision_executor.Config = .{
+        .model = imageAdapterModel(state.runtime.provider, state.runtime.model),
         .stream_provider = state.runtime.agent_stream_provider,
         .api_key = state.runtime.api_key,
         .credential_source = state.runtime.credential_source,
@@ -1028,6 +1030,24 @@ fn executeVisionRequest(
     const raw_paths = request.paths() orelse return error.InvalidVisionExecutionAuthority;
     if (raw_paths.len != approved_targets.len) return error.InvalidVisionExecutionAuthority;
     return executeVisionPathRequest(state, alloc, request, approved_targets, config);
+}
+
+fn imageAdapterModel(provider: model_provider.ProviderId, active_model: []const u8) []const u8 {
+    return switch (provider) {
+        .gateway => image_provider.default_model,
+        .codex => active_model,
+    };
+}
+
+test "Codex vision fallback stays on the admitted Codex model" {
+    try std.testing.expectEqualStrings(
+        "gpt-5.4-mini",
+        imageAdapterModel(.codex, "gpt-5.4-mini"),
+    );
+    try std.testing.expectEqualStrings(
+        image_provider.default_model,
+        imageAdapterModel(.gateway, "zai/glm-5.2"),
+    );
 }
 
 fn executeVisionPathRequest(
@@ -1739,6 +1759,7 @@ fn executeSubagentProvider(
         .root_user_messages = ctx.root_user_messages,
         .root_user_evidence_complete = ctx.root_user_evidence_complete,
         .defaults = .{
+            .provider = ctx.provider,
             .model = ctx.model,
             .effort = ctx.effort,
             .fast_mode = ctx.fast_mode,

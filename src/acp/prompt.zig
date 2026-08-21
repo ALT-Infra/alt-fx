@@ -699,6 +699,16 @@ pub fn runSubagentChild(
     return subagent_agent_adapter.run(.{
         .host = subagent_host,
         .tool_context = ctx.toolContext(),
+        .provider_routes = .{
+            .gateway = .{
+                .agent_stream_provider = server.streamProviderFor(state, .gateway),
+                .permission_reviewer_provider = state.cfg.permission_reviewer_provider,
+            },
+            .codex = .{
+                .agent_stream_provider = server.streamProviderFor(state, .codex),
+                .permission_reviewer_provider = state.cfg.codex_permission_reviewer_provider,
+            },
+        },
         .system_prompt = state.cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = state.cfg.prompt_policy.modelPromptOverlay(admission.model),
         .skills_prompt_section = bounded_skills.text,

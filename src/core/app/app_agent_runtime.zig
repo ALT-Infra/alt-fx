@@ -1052,10 +1052,25 @@ pub fn Runtime(comptime App: type) type {
             ) catch return error.OutOfMemory;
             defer explicit_skills.deinit(alloc);
             const prompt_policy = app.promptPolicy();
+            const tool_context = childToolContext(app.subagentToolContextForAdmission(admission));
+            const provider_routes = if (comptime @hasDecl(App, "subagentProviderRoutes"))
+                app.subagentProviderRoutes()
+            else
+                subagent_agent_adapter.ProviderRoutes{
+                    .gateway = .{
+                        .agent_stream_provider = tool_context.agent_stream_provider,
+                        .permission_reviewer_provider = tool_context.permission_reviewer_provider,
+                    },
+                    .codex = .{
+                        .agent_stream_provider = tool_context.agent_stream_provider,
+                        .permission_reviewer_provider = tool_context.permission_reviewer_provider,
+                    },
+                };
             return subagent_agent_adapter.run(.{
                 .host = app_session_runtime.Runtime(App).subagentHost(app) orelse
                     return error.ProviderFailed,
-                .tool_context = childToolContext(app.subagentToolContextForAdmission(admission)),
+                .tool_context = tool_context,
+                .provider_routes = provider_routes,
                 .system_prompt = prompt_policy.system_prompt,
                 .model_prompt_overlay = prompt_policy.modelPromptOverlay(admission.model),
                 .skills_prompt_section = bounded_skills.text,

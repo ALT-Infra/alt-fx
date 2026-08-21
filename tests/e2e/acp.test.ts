@@ -519,11 +519,14 @@ function writeSeededFxAuth(home: string, teamId?: string): void {
   chmodSync(authPath, 0o600);
 }
 
-function acpChatGptAccessToken(accountId = "acct_acp_e2e"): string {
+function acpChatGptAccessToken(
+  accountId = "acct_acp_e2e",
+  signature = "signature",
+): string {
   const payload = Buffer.from(JSON.stringify({
     "https://api.openai.com/auth": { chatgpt_account_id: accountId },
   })).toString("base64url");
-  return `header.${payload}.signature`;
+  return `header.${payload}.${signature}`;
 }
 
 function writeSeededAcpChatGptLogin(home: string, accessToken: string): void {
@@ -541,14 +544,50 @@ function writeSeededAcpChatGptLogin(home: string, accessToken: string): void {
   chmodSync(authPath, 0o600);
 }
 
-function startAcpFakeCodex() {
-  const accessToken = acpChatGptAccessToken();
-  const requests: Array<{ path: string; authorization: string | null }> = [];
+function codexFinalText(text: string): string {
+  return `data: ${JSON.stringify({ type: "response.output_text.delta", delta: text })}\n\n` +
+    'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":4,"output_tokens":2}}}\n\n';
+}
+
+function codexToolCall(callId: string, name: string, args: object): string {
+  return `data: ${JSON.stringify({
+    type: "response.output_item.added",
+    output_index: 0,
+    item: { type: "function_call", call_id: callId, name },
+  })}\n\n` +
+    `data: ${JSON.stringify({
+      type: "response.function_call_arguments.done",
+      output_index: 0,
+      arguments: JSON.stringify(args),
+    })}\n\n` +
+    'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":4,"output_tokens":2}}}\n\n';
+}
+
+function codexLatestToolResult(body: string): { callId: string; output: string } | null {
+  const request = JSON.parse(body) as {
+    input?: Array<{ type?: string; call_id?: string; output?: string }>;
+  };
+  const result = request.input?.at(-1);
+  if (result?.type !== "function_call_output" || !result.call_id || !result.output) {
+    return null;
+  }
+  return { callId: result.call_id, output: result.output };
+}
+
+function startAcpFakeCodex(options: {
+  unauthorizedResponses?: number;
+  route?: (body: string) => string | Promise<string>;
+} = {}) {
+  const accessToken = acpChatGptAccessToken("acct_acp_e2e", "stale");
+  const refreshedAccessToken = acpChatGptAccessToken("acct_acp_e2e", "fresh");
+  const requests: Array<{ path: string; authorization: string | null; body: string }> = [];
   const modelRequests: Array<{ path: string; authorization: string | null }> = [];
+  const tokenRequests: Array<{ path: string; authorization: string | null }> = [];
+  let unauthorizedResponses = options.unauthorizedResponses ?? 0;
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
-    fetch(request) {
+    async fetch(request) {
       const path = new URL(request.url).pathname;
       const recorded = { path, authorization: request.headers.get("authorization") };
       if (path === "/models") {
@@ -558,20 +597,35 @@ function startAcpFakeCodex() {
           { slug: "gpt-5.4-mini", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "low" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 128000 },
         ] });
       }
-      requests.push(recorded);
+      if (path === "/token") {
+        tokenRequests.push(recorded);
+        return Response.json({
+          access_token: refreshedAccessToken,
+          refresh_token: "chatgpt-refresh-next",
+          expires_in: 3600,
+        });
+      }
+      const body = await request.text();
+      requests.push({ ...recorded, body });
+      if (unauthorizedResponses > 0) {
+        unauthorizedResponses -= 1;
+        return Response.json({ error: { message: "expired" } }, { status: 401 });
+      }
       return new Response(
-        'data: {"type":"response.output_text.delta","delta":"ACP_CHATGPT_RESPONSE"}\n\n' +
-          'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":4,"output_tokens":2}}}\n\n',
+        options.route ? await options.route(body) : codexFinalText("ACP_CHATGPT_RESPONSE"),
         { headers: { "content-type": "text/event-stream" } },
       );
     },
   });
   return {
     accessToken,
+    refreshedAccessToken,
     requests,
     modelRequests,
+    tokenRequests,
     responsesUrl: `http://127.0.0.1:${server.port}/responses`,
     modelsUrl: `http://127.0.0.1:${server.port}/models`,
+    tokenUrl: `http://127.0.0.1:${server.port}/token`,
     stop() { server.stop(true); },
   };
 }
@@ -6790,6 +6844,140 @@ describe("acp: model-independent", () => {
 
 
   test(
+    "ACP persistent Codex children retain their provider across messages",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-codex-subagent-");
+      const gateway = startFakeGateway([]);
+      const childFirstPrompt = "CODEX_CHILD_FIRST_TURN";
+      const childSecondPrompt = "CODEX_CHILD_SECOND_TURN";
+      let childId = "";
+      const codex = startAcpFakeCodex({
+        route(body) {
+          const toolResult = codexLatestToolResult(body);
+          if (toolResult?.callId === "codex_child_resume") {
+            return codexFinalText("CODEX_PARENT_RESUMED_CHILD");
+          }
+          if (toolResult?.callId === "codex_child_message") {
+            if (!childId) throw new Error("Codex child id was not captured");
+            return codexToolCall("codex_child_resume", "subagent", {
+              command: {
+                lifecycle: { id: childId, action: "resume" },
+              },
+            });
+          }
+          if (toolResult?.callId === "codex_child_create") {
+            const created = JSON.parse(toolResult.output) as {
+              child_id: string;
+              status: string;
+            };
+            expect(created.status).toBe("created");
+            childId = created.child_id;
+            return codexFinalText("CODEX_PARENT_CREATED_CHILD");
+          }
+          if (body.includes("Send the persistent Codex child another message.")) {
+            if (!childId) throw new Error("Codex child id was not captured");
+            return codexToolCall("codex_child_message", "subagent", {
+              command: {
+                message: {
+                  send: { id: childId, content: childSecondPrompt },
+                },
+              },
+            });
+          }
+          if (body.includes(childSecondPrompt)) {
+            return codexFinalText("CODEX_CHILD_SECOND_DONE");
+          }
+          if (body.includes(childFirstPrompt)) {
+            return codexFinalText("CODEX_CHILD_FIRST_DONE");
+          }
+          return codexToolCall("codex_child_create", "subagent", {
+            command: { create: {
+              name: "codex-persistent-child",
+              mode: "persistent",
+              prompt: childFirstPrompt,
+            } },
+          });
+        },
+      });
+      writeSeededAcpChatGptLogin(root.home, codex.accessToken);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+            FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+          },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { mcpServers: [] }, 2);
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "code" }, 3);
+        const changed = await client.request("session/set_config_option", {
+          configId: "provider",
+          value: "codex",
+        }, 4) as any;
+        expect(changed.result.configOptions.find((option: any) => option.id === "provider").currentValue)
+          .toBe("codex");
+
+        const first = await runPrompt(client, "Create a persistent Codex child.", TIMEOUT);
+        expect(first.promptResult.result.stopReason).toBe("end_turn");
+        await waitForCondition(
+          "first Codex child turn",
+          () => childId.length > 0 &&
+            codex.requests.some((request) => request.body.includes(childFirstPrompt)),
+          TIMEOUT,
+        );
+        await waitForCondition(
+          "first Codex child idle state",
+          () => acpSubagentState(root, childId) === "idle",
+          TIMEOUT,
+        );
+        const childState = JSON.parse(
+          readFileSync(
+            join(root.home, ".fx", "sessions", childId, "session.json"),
+            "utf8",
+          ),
+        ) as { preferences: { provider: string; model: string } };
+        expect(childState.preferences.provider).toBe("codex");
+        expect(childState.preferences.model).toBe("gpt-5.6-sol");
+
+        const second = await runPrompt(
+          client,
+          "Send the persistent Codex child another message.",
+          TIMEOUT,
+        );
+        expect(second.promptResult.result.stopReason).toBe("end_turn");
+        await waitForCondition(
+          "second Codex child turn",
+          () => codex.requests.some((request) => request.body.includes(childSecondPrompt)),
+          TIMEOUT,
+        );
+        await waitForCondition(
+          "second Codex child idle state",
+          () => acpSubagentState(root, childId) === "idle",
+          TIMEOUT,
+        );
+        expect(codex.requests.length).toBeGreaterThanOrEqual(7);
+        for (const request of codex.requests) {
+          expect(request.authorization).toBe(`Bearer ${codex.accessToken}`);
+          expect(JSON.parse(request.body).model).toBe("gpt-5.6-sol");
+        }
+        for (const request of [...gateway.requests, ...gateway.modelRequests]) {
+          expect(request.headers.get("authorization")).not.toBe(`Bearer ${codex.accessToken}`);
+        }
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        codex.stop();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "stdin shutdown cancels a pending permission request",
     async () => {
       const root = createIsolatedRoot("fx-acp-permission-shutdown-");
@@ -7154,7 +7342,7 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
     async () => {
       const root = createIsolatedRoot("fx-acp-chatgpt-route-");
       const gateway = startFakeGateway([]);
-      const codex = startAcpFakeCodex();
+      const codex = startAcpFakeCodex({ unauthorizedResponses: 1 });
       writeSeededAcpChatGptLogin(root.home, codex.accessToken);
       try {
         client = await AcpClient.create({
@@ -7163,6 +7351,7 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
             ...fakeGatewayEnv(root, gateway),
             FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
             FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+            FX_E2E_CHATGPT_TOKEN_URL: codex.tokenUrl,
           },
         });
         await client.request("initialize", { protocolVersion: 1 }, 1);
@@ -7181,9 +7370,14 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
         const prompt = await runPrompt(client, "Answer directly.", TIMEOUT);
         expect(prompt.promptResult.result.stopReason).toBe("end_turn");
         expect(JSON.stringify(prompt.messages)).toContain("ACP_CHATGPT_RESPONSE");
-        expect(codex.requests).toHaveLength(1);
+        const secondPrompt = await runPrompt(client, "Answer again.", TIMEOUT);
+        expect(secondPrompt.promptResult.result.stopReason).toBe("end_turn");
+        expect(codex.requests).toHaveLength(3);
         expect(codex.modelRequests).toHaveLength(1);
         expect(codex.requests[0]!.authorization).toBe(`Bearer ${codex.accessToken}`);
+        expect(codex.requests[1]!.authorization).toBe(`Bearer ${codex.refreshedAccessToken}`);
+        expect(codex.requests[2]!.authorization).toBe(`Bearer ${codex.refreshedAccessToken}`);
+        expect(codex.tokenRequests).toHaveLength(1);
         for (const request of [...gateway.requests, ...gateway.modelRequests]) {
           expect(request.headers.get("authorization")).not.toBe(`Bearer ${codex.accessToken}`);
         }

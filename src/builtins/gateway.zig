@@ -2043,10 +2043,8 @@ fn fetchCatalogForProvider(
     };
     const json_text = switch (response) {
         .success => |body| body,
-        .http_status => |status| {
-            const failure = model_catalog.failureForHttpStatus(status);
-            if (failure.allowsPublicFallback()) return .{ .failure = failure };
-            return .{ .failure = failure };
+        .http_status => |status| return .{
+            .failure = model_catalog.failureForHttpStatus(status),
         },
     };
     defer alloc.free(json_text);
@@ -2085,10 +2083,7 @@ fn fetchModelCatalogForView(
     };
     defer alloc.free(json_text);
 
-    var catalog = try parseModelCatalogForView(alloc, json_text, view);
-    errdefer freeModelCatalog(alloc, &catalog);
-
-    return catalog;
+    return parseModelCatalogForView(alloc, json_text, view);
 }
 
 fn fetchModelCatalogResponse(

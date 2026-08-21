@@ -1,5 +1,6 @@
 const std = @import("std");
 const agent_runtime = @import("../agent/agent_runtime.zig");
+const stream_provider = @import("../agent/stream_provider.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
@@ -30,9 +31,57 @@ const tool_host = @import("tool_host.zig");
 
 const Allocator = std.mem.Allocator;
 
+pub const ProviderRoute = struct {
+    agent_stream_provider: stream_provider.Provider,
+    permission_reviewer_provider: ?auto_classifier.Provider,
+};
+
+pub const ProviderRoutes = struct {
+    gateway: ProviderRoute,
+    codex: ProviderRoute,
+
+    pub fn select(self: ProviderRoutes, provider: model_provider.ProviderId) ProviderRoute {
+        return switch (provider) {
+            .gateway => self.gateway,
+            .codex => self.codex,
+        };
+    }
+};
+
+test "provider routes select independent streams and reviewers" {
+    var gateway_tag: u8 = 0;
+    var codex_tag: u8 = 0;
+    var gateway_stream = stream_provider.unavailable_provider;
+    gateway_stream.context = &gateway_tag;
+    var codex_stream = stream_provider.unavailable_provider;
+    codex_stream.context = &codex_tag;
+    const Reviewer = struct {
+        fn review(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: auto_classifier.ProviderInput,
+            _: auto_classifier.ReviewRequest,
+        ) anyerror!auto_classifier.ParseOutcome {
+            return .invalid;
+        }
+    };
+    const gateway_reviewer = auto_classifier.Provider{ .context = &gateway_tag, .review_fn = Reviewer.review };
+    const codex_reviewer = auto_classifier.Provider{ .context = &codex_tag, .review_fn = Reviewer.review };
+    const routes = ProviderRoutes{
+        .gateway = .{ .agent_stream_provider = gateway_stream, .permission_reviewer_provider = gateway_reviewer },
+        .codex = .{ .agent_stream_provider = codex_stream, .permission_reviewer_provider = codex_reviewer },
+    };
+
+    try std.testing.expect(routes.select(.gateway).agent_stream_provider.context.? == @as(*anyopaque, @ptrCast(&gateway_tag)));
+    try std.testing.expect(routes.select(.gateway).permission_reviewer_provider.?.context.? == @as(*anyopaque, @ptrCast(&gateway_tag)));
+    try std.testing.expect(routes.select(.codex).agent_stream_provider.context.? == @as(*anyopaque, @ptrCast(&codex_tag)));
+    try std.testing.expect(routes.select(.codex).permission_reviewer_provider.?.context.? == @as(*anyopaque, @ptrCast(&codex_tag)));
+}
+
 pub const Config = struct {
     host: *tool_host.Runtime,
     tool_context: tool_runtime.Context,
+    provider_routes: ProviderRoutes,
     system_prompt: []const u8,
     model_prompt_overlay: ?[]const u8 = null,
     skills_prompt_section: []const u8 = "",
@@ -126,6 +175,10 @@ pub fn run(
     var routed_credential: ?credentials.Credential = null;
     defer if (routed_credential) |*credential| credential.deinit(turn.alloc);
     var routed_config = config;
+    const route = config.provider_routes.select(admission.provider);
+    routed_config.tool_context.agent_stream_provider = route.agent_stream_provider;
+    routed_config.tool_context.permission_reviewer_provider = route.permission_reviewer_provider;
+    routed_config.tool_context.auto_classifier = auto_classifier.Classifier.disabled();
     if (!model_provider.authorizesCredential(
         admission.provider,
         config.tool_context.credential_source,
@@ -157,8 +210,6 @@ pub fn run(
     routed_config.tool_context.model = admission.model;
     routed_config.tool_context.provider = admission.provider;
     if (!model_provider.usesGatewayAuxiliaries(admission.provider)) {
-        routed_config.tool_context.permission_reviewer_provider = null;
-        routed_config.tool_context.auto_classifier = auto_classifier.Classifier.disabled();
         routed_config.tool_context.web_search_backend = null;
         routed_config.tool_context.web_search_runtime_ready = false;
     }
