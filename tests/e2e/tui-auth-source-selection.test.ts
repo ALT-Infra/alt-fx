@@ -849,6 +849,47 @@ function startFakeGrokAutoReview() {
   };
 }
 
+function startFakeGrokResourceRecovery() {
+  const accessToken = "grok-resource-limit-token";
+  const bodies: string[] = [];
+  let responseCalls = 0;
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      const path = new URL(request.url).pathname;
+      if (path === "/models") {
+        return Response.json({ models: [
+          { id: "grok-4.20", object: "model", input_modalities: ["text"], output_modalities: ["text"] },
+        ] });
+      }
+      bodies.push(await request.text());
+      responseCalls += 1;
+      if (responseCalls === 1) {
+        return new Response(
+          'data: {"type":"response.output_text.delta","delta":"' +
+            "x".repeat(1024 * 1024) +
+            '"}\n\n',
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      }
+      const text = responseCalls === 2 ? "GROK_LIMIT_RECOVERED" : "GROK_AFTER_LIMIT_OK";
+      return new Response(
+        `data: ${JSON.stringify({ type: "response.output_text.delta", delta: text })}\n\n` +
+          'data: {"type":"response.completed","response":{"status":"completed"}}\n\n',
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    },
+  });
+  return {
+    accessToken,
+    bodies,
+    responsesUrl: `http://127.0.0.1:${server.port}/responses`,
+    modelsUrl: `http://127.0.0.1:${server.port}/models`,
+    stop() { server.stop(true); },
+  };
+}
+
 tmuxTest(
   "inline sign-in renders the device flow and Ctrl+C cancels without a session",
   async () => {
@@ -2247,6 +2288,46 @@ tmuxTest(
       expect(body.model).toBe("grok-4.6");
       expect(body.reasoning?.effort).toBe("xhigh");
       expect(readFileSync(join(home, ".fx", "settings.json"), "utf8")).toContain('"effort":"xhigh"');
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      grok.stop();
+    }
+  },
+  60_000,
+);
+
+tmuxTest(
+  "Grok resource exhaustion stays on-provider and leaves later input usable",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-grok-resource-recovery-"));
+    stderrPath = join(home, "stderr.log");
+    gateway = startFakeGateway([]);
+    const grok = startFakeGrokResourceRecovery();
+    try {
+      writeSeededGrokLogin(home, grok.accessToken, "acct_resource_limit");
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ provider: "grok", grok_model: "grok-4.20" }) + "\n",
+        { mode: 0o600 },
+      );
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        FX_MODEL: undefined,
+        FX_E2E_XAI_GROK_RESPONSES_URL: grok.responsesUrl,
+        FX_E2E_XAI_GROK_MODELS_URL: grok.modelsUrl,
+      });
+      await session.waitForComposer(TIMEOUT);
+      const failureVisible = session.waitForText("request failed: XaiGrokSseEventTooLarge", TIMEOUT);
+      await session.sendText("Recover from a bounded Grok response.");
+      await failureVisible;
+      await session.sendText("Accept another prompt after recovery.");
+      await session.waitForText("GROK_LIMIT_RECOVERED", TIMEOUT);
+      await session.sendText("Accept one more prompt after recovery.");
+      await session.waitForText("GROK_AFTER_LIMIT_OK", TIMEOUT);
+
+      const scrollback = await session.captureFullScrollback();
+      expect(scrollback).toContain("XaiGrokSseEventTooLarge");
+      expect(grok.bodies).toHaveLength(3);
+      expect(gateway.requests).toHaveLength(0);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     } finally {
       grok.stop();

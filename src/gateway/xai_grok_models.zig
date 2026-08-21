@@ -303,21 +303,172 @@ test "Grok catalog URL is the live-validated direct endpoint" {
 }
 
 test "Grok model ids enforce the exact provider-local bound" {
-    var accepted: [max_model_id_bytes]u8 = @splat('a');
-    try validateModelId(&accepted);
-    var rejected: [max_model_id_bytes + 1]u8 = @splat('a');
-    try std.testing.expectError(error.InvalidGrokModelCatalog, validateModelId(&rejected));
+    const exact_json = try buildCatalogJson(std.testing.allocator, 1, max_model_id_bytes, 0);
+    defer std.testing.allocator.free(exact_json);
+    var exact = try parseCatalog(std.testing.allocator, exact_json);
+    defer model_catalog.freeModelCatalog(std.testing.allocator, &exact);
+    try std.testing.expectEqual(@as(usize, 1), exact.items.len);
+    try std.testing.expectEqual(max_model_id_bytes, exact.items[0].id.len);
+
+    const excess_json = try buildCatalogJson(std.testing.allocator, 1, max_model_id_bytes + 1, 0);
+    defer std.testing.allocator.free(excess_json);
+    try expectCatalogParseError(error.InvalidGrokModelCatalog, excess_json);
 }
 
-test "Grok catalog resource limits accept exact values and reject one beyond" {
-    try validateCatalogBodySize(max_catalog_bytes);
-    try std.testing.expectError(
-        error.GrokModelCatalogTooLarge,
-        validateCatalogBodySize(max_catalog_bytes + 1),
+fn buildCatalogJson(alloc: std.mem.Allocator, model_count: usize, id_bytes: usize, total_bytes: usize) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try out.writer.writeAll("{\"models\":[");
+    for (0..model_count) |index| {
+        if (index > 0) try out.writer.writeByte(',');
+        try out.writer.writeAll("{\"id\":\"");
+        try out.writer.splatByteAll('g', id_bytes);
+        try out.writer.writeAll("\",\"input_modalities\":[\"text\"],\"output_modalities\":[\"text\"]}");
+    }
+    if (total_bytes > 0) {
+        try out.writer.writeAll("],\"padding\":\"");
+        const suffix = "\"}";
+        if (out.written().len + suffix.len > total_bytes) return error.TestCatalogTargetTooSmall;
+        try out.writer.splatByteAll('p', total_bytes - out.written().len - suffix.len);
+        try out.writer.writeAll(suffix);
+    } else {
+        try out.writer.writeAll("]}");
+    }
+    return out.toOwnedSlice();
+}
+
+fn expectCatalogParseError(expected: anyerror, bytes: []const u8) !void {
+    var catalog = parseCatalog(std.testing.allocator, bytes) catch |err| {
+        try std.testing.expectEqual(expected, err);
+        return;
+    };
+    defer model_catalog.freeModelCatalog(std.testing.allocator, &catalog);
+    return error.TestExpectedCatalogFailure;
+}
+
+const CatalogBodyFixture = struct {
+    io_backend: std.Io.Threaded = .init_single_threaded,
+    server: std.Io.net.Server,
+    body: []const u8,
+    thread: ?std.Thread = null,
+    server_open: bool = true,
+    failure: ?anyerror = null,
+
+    fn init(body: []const u8) !@This() {
+        var fixture: @This() = .{
+            .server = undefined,
+            .body = body,
+        };
+        var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        fixture.server = try address.listen(fixture.io(), .{ .reuse_address = true });
+        return fixture;
+    }
+
+    fn start(self: *@This()) !void {
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    fn deinit(self: *@This()) void {
+        if (!self.server_open) return;
+        const zio = self.io();
+        if (self.thread) |thread| {
+            thread.join();
+            self.thread = null;
+        }
+        self.server.deinit(zio);
+        self.server_open = false;
+    }
+
+    fn io(self: *@This()) std.Io {
+        return self.io_backend.io();
+    }
+
+    fn port(self: *@This()) u16 {
+        return self.server.socket.address.getPort();
+    }
+
+    fn run(self: *@This()) void {
+        self.runFallible() catch |err| {
+            self.failure = err;
+        };
+    }
+
+    fn runFallible(self: *@This()) !void {
+        const zio = self.io();
+        var stream = try self.server.accept(zio);
+        defer stream.close(zio);
+        var socket_buffer: [4096]u8 = undefined;
+        var reader = stream.reader(zio, &socket_buffer);
+        var request: [16 * 1024]u8 = undefined;
+        var request_len: usize = 0;
+        while (request_len < request.len) {
+            request[request_len] = try reader.interface.takeByte();
+            request_len += 1;
+            if (std.mem.endsWith(u8, request[0..request_len], "\r\n\r\n")) break;
+        } else return error.TestRequestTooLarge;
+
+        var writer_buffer: [16 * 1024]u8 = undefined;
+        var writer = stream.writer(zio, &writer_buffer);
+        try writer.interface.print(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+            .{self.body.len},
+        );
+        try writer.interface.writeAll(self.body);
+        try writer.interface.flush();
+    }
+};
+
+fn fetchCatalogFixture(body: []const u8) !FetchResponse {
+    var fixture = try CatalogBodyFixture.init(body);
+    defer fixture.deinit();
+    try fixture.start();
+    const url = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "http://127.0.0.1:{d}/models",
+        .{fixture.port()},
     );
-    try validateCatalogModelCount(max_catalog_models);
-    try std.testing.expectError(
-        error.InvalidGrokModelCatalog,
-        validateCatalogModelCount(max_catalog_models + 1),
-    );
+    defer std.testing.allocator.free(url);
+    var operation = FetchOperation{
+        .alloc = std.testing.allocator,
+        .url = url,
+        .credential = "grok-test-token",
+    };
+    const result = operation.run();
+    fixture.deinit();
+    if (fixture.failure) |err| return err;
+    return result;
+}
+
+fn expectCatalogFetchError(expected: anyerror, body: []const u8) !void {
+    var response = fetchCatalogFixture(body) catch |err| {
+        try std.testing.expectEqual(expected, err);
+        return;
+    };
+    defer response.deinit(std.testing.allocator);
+    return error.TestExpectedCatalogFailure;
+}
+
+test "Grok catalog fetch and parser enforce body and model-count bounds" {
+    const exact_body = try buildCatalogJson(std.testing.allocator, 1, 8, max_catalog_bytes);
+    defer std.testing.allocator.free(exact_body);
+    var exact_response = try fetchCatalogFixture(exact_body);
+    defer exact_response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(max_catalog_bytes, exact_response.body.len);
+    var exact_catalog = try parseCatalog(std.testing.allocator, exact_response.body);
+    defer model_catalog.freeModelCatalog(std.testing.allocator, &exact_catalog);
+    try std.testing.expectEqual(@as(usize, 1), exact_catalog.items.len);
+
+    const excess_body = try buildCatalogJson(std.testing.allocator, 1, 8, max_catalog_bytes + 1);
+    defer std.testing.allocator.free(excess_body);
+    try expectCatalogFetchError(error.GrokModelCatalogTooLarge, excess_body);
+
+    const exact_count = try buildCatalogJson(std.testing.allocator, max_catalog_models, 8, 0);
+    defer std.testing.allocator.free(exact_count);
+    var count_catalog = try parseCatalog(std.testing.allocator, exact_count);
+    defer model_catalog.freeModelCatalog(std.testing.allocator, &count_catalog);
+    try std.testing.expectEqual(max_catalog_models, count_catalog.items.len);
+
+    const excess_count = try buildCatalogJson(std.testing.allocator, max_catalog_models + 1, 8, 0);
+    defer std.testing.allocator.free(excess_count);
+    try expectCatalogParseError(error.InvalidGrokModelCatalog, excess_count);
 }

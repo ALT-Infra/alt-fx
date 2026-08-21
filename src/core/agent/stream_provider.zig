@@ -117,6 +117,9 @@ pub const Request = struct {
     payload: []const u8,
     trace_ctx: debug_trace.TraceContext,
     content_capture_limit: ?usize,
+    /// Optional absolute provider deadline. Transports that support bounded
+    /// execution must stop in-flight I/O before returning `error.Timeout`.
+    deadline: ?std.Io.Clock.Timestamp = null,
     cooperative_pulse: ?CooperativePulse = null,
     delivery: *DeliveryCertainty,
     attempt_evidence: *AttemptEvidence,
