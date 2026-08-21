@@ -459,6 +459,12 @@ const ToolAccumulator = struct {
 
 const SseReader = struct {
     pending_line: std.ArrayList(u8) = .empty,
+    aggregate_bytes: usize = 0,
+
+    const Line = struct {
+        bytes: []const u8,
+        wire_bytes: usize,
+    };
 
     fn deinit(self: *SseReader, alloc: Allocator) void {
         self.pending_line.deinit(alloc);
@@ -471,7 +477,12 @@ const SseReader = struct {
     fn next(self: *SseReader, alloc: Allocator, reader: anytype) !?[]const u8 {
         while (true) {
             const line = try self.readLine(alloc, reader) orelse return null;
-            const trimmed = std.mem.trim(u8, line, " \t\r");
+            self.aggregate_bytes = try checkedAccumulatedSize(
+                self.aggregate_bytes,
+                line.wire_bytes,
+                max_sse_aggregate_bytes,
+            );
+            const trimmed = std.mem.trim(u8, line.bytes, " \t\r");
             if (trimmed.len == 0 or trimmed[0] == ':') {
                 self.release();
                 continue;
@@ -486,7 +497,7 @@ const SseReader = struct {
         }
     }
 
-    fn readLine(self: *SseReader, alloc: Allocator, reader: anytype) !?[]const u8 {
+    fn readLine(self: *SseReader, alloc: Allocator, reader: anytype) !?Line {
         while (true) {
             const fragment = reader.takeDelimiter('\n') catch |err| switch (err) {
                 error.StreamTooLong => {
@@ -501,15 +512,28 @@ const SseReader = struct {
                 },
                 error.ReadFailed => return error.ReadFailed,
             } orelse {
-                if (self.pending_line.items.len > 0) return self.pending_line.items;
+                if (self.pending_line.items.len > 0) {
+                    return .{
+                        .bytes = self.pending_line.items,
+                        .wire_bytes = self.pending_line.items.len,
+                    };
+                }
                 return null;
             };
             if (fragment.len > max_sse_line_bytes - self.pending_line.items.len) {
                 return error.XaiGrokSseEventTooLarge;
             }
-            if (self.pending_line.items.len == 0) return fragment;
+            if (self.pending_line.items.len == 0) {
+                return .{
+                    .bytes = fragment,
+                    .wire_bytes = fragment.len + 1,
+                };
+            }
             try self.pending_line.appendSlice(alloc, fragment);
-            return self.pending_line.items;
+            return .{
+                .bytes = self.pending_line.items,
+                .wire_bytes = self.pending_line.items.len + 1,
+            };
         }
     }
 };
@@ -544,13 +568,11 @@ fn consumeSse(
     var terminal_seen = false;
     var saw_content_delta = false;
     var event_count: usize = 0;
-    var aggregate_bytes: usize = 0;
 
     while (try sse.next(alloc, reader)) |json_text| {
         defer sse.release();
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
         event_count = try checkedAccumulatedSize(event_count, 1, max_sse_events);
-        aggregate_bytes = try checkedAccumulatedSize(aggregate_bytes, json_text.len, max_sse_aggregate_bytes);
         var parsed = std.json.parseFromSlice(std.json.Value, alloc, json_text, .{}) catch
             return error.InvalidXaiGrokSseEvent;
         defer parsed.deinit();
@@ -1332,30 +1354,24 @@ fn buildEventCountSse(alloc: Allocator, event_count: usize) ![]u8 {
     return out.toOwnedSlice();
 }
 
-fn buildAggregateSse(alloc: Allocator, aggregate_bytes: usize) ![]u8 {
-    const event_count: usize = 128;
-    const json_prefix = "{\"pad\":\"";
-    const json_suffix = "\"}";
-    const terminal_json = "{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}";
-    const framing_bytes = event_count * (json_prefix.len + json_suffix.len) + terminal_json.len;
-    const content_bytes = aggregate_bytes - framing_bytes;
-    const content_per_event = content_bytes / event_count;
-    var remainder = content_bytes % event_count;
-
+fn buildIgnoredAggregateSse(alloc: Allocator, wire_bytes: usize) ![]u8 {
+    const mixed_ignored_and_data = ": keepalive\n\nretry: 1000\ndata: {}\n\n";
+    const terminal = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n";
+    if (wire_bytes < mixed_ignored_and_data.len + terminal.len) return error.NoSpaceLeft;
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
-    for (0..event_count) |_| {
-        const extra: usize = if (remainder > 0) 1 else 0;
-        remainder -|= extra;
-        try out.writer.writeAll("data: ");
-        try out.writer.writeAll(json_prefix);
-        try out.writer.splatByteAll('a', content_per_event + extra);
-        try out.writer.writeAll(json_suffix);
-        try out.writer.writeAll("\n\n");
+    try out.writer.writeAll(mixed_ignored_and_data);
+    var remaining = wire_bytes - mixed_ignored_and_data.len - terminal.len;
+    while (remaining > 0) {
+        const line_wire_bytes = @min(remaining, max_sse_line_bytes + 1);
+        if (line_wire_bytes > 1) {
+            try out.writer.writeByte(':');
+            try out.writer.splatByteAll('a', line_wire_bytes - 2);
+        }
+        try out.writer.writeByte('\n');
+        remaining -= line_wire_bytes;
     }
-    try out.writer.writeAll("data: ");
-    try out.writer.writeAll(terminal_json);
-    try out.writer.writeAll("\n\n");
+    try out.writer.writeAll(terminal);
     return out.toOwnedSlice();
 }
 
@@ -1432,7 +1448,7 @@ test "xAI Grok SSE reader accepts the exact line bound and rejects one beyond" {
     }
 }
 
-test "xAI Grok SSE reducer enforces event and aggregate bounds" {
+test "xAI Grok SSE reducer enforces event and ignored-wire aggregate bounds" {
     const exact_events = try buildEventCountSse(std.testing.allocator, max_sse_events);
     defer std.testing.allocator.free(exact_events);
     var exact_event_completion = try consumeTestSse(exact_events);
@@ -1442,13 +1458,15 @@ test "xAI Grok SSE reducer enforces event and aggregate bounds" {
     defer std.testing.allocator.free(excess_events);
     try expectTestSseError(error.XaiGrokResourceLimitExceeded, excess_events);
 
-    const exact_aggregate = try buildAggregateSse(std.testing.allocator, max_sse_aggregate_bytes);
+    const exact_aggregate = try buildIgnoredAggregateSse(std.testing.allocator, max_sse_aggregate_bytes);
     defer std.testing.allocator.free(exact_aggregate);
+    try std.testing.expectEqual(max_sse_aggregate_bytes, exact_aggregate.len);
     var exact_aggregate_completion = try consumeTestSse(exact_aggregate);
     deinitTestCompletion(&exact_aggregate_completion);
 
-    const excess_aggregate = try buildAggregateSse(std.testing.allocator, max_sse_aggregate_bytes + 1);
+    const excess_aggregate = try buildIgnoredAggregateSse(std.testing.allocator, max_sse_aggregate_bytes + 1);
     defer std.testing.allocator.free(excess_aggregate);
+    try std.testing.expectEqual(max_sse_aggregate_bytes + 1, excess_aggregate.len);
     try expectTestSseError(error.XaiGrokResourceLimitExceeded, excess_aggregate);
 }
 
