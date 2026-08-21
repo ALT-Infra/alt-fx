@@ -65,6 +65,8 @@ const assistant_prefill_recovery_prompt =
     "Continue from the preceding tool result.";
 const repeated_terminal_validation_notice =
     "Repeated terminal validation failures stopped the tool loop. The invalid terminal calls were not executed and produced no terminal effect.";
+const repeated_malformed_arguments_notice =
+    "Repeated malformed tool arguments stopped the agent loop. The invalid calls were not executed. Continue with a follow-up prompt if needed.";
 const Config = runtime_config.Config;
 const LifecycleContext = runtime_lifecycle.LifecycleContext;
 const PreparedToolCall = runtime_lifecycle.PreparedToolCall;
@@ -2828,6 +2830,7 @@ fn processQueuedPromptLoop(
     defer turn_permission_recovery.deinit(arena);
     var terminal_validation_retry: runtime_tool_admission.TerminalValidationRetryState = .{};
     defer terminal_validation_retry.deinit(arena);
+    var malformed_arguments_retry: runtime_tool_admission.MalformedArgumentsRetryState = .{};
     var completed_tool_names = completed_tool_names_ptr.*;
     defer completed_tool_names_ptr.* = completed_tool_names;
     var context_delivery_state: context_contract.DeliveryState = if (deps.context_enabled)
@@ -5113,6 +5116,10 @@ fn processQueuedPromptLoop(
 
         var step_batch = runtime_tool_batch.StepBatchState{};
         terminal_validation_retry.beginBatch();
+        malformed_arguments_retry.beginBatch();
+        for (effective_tool_calls) |tool_call| {
+            malformed_arguments_retry.observe(tool_call);
+        }
         var settled_vision_ids: std.ArrayList(usize) = .empty;
         defer mem_utils.deinitList(arena, &settled_vision_ids);
         var parallel_skip_until: usize = 0;
@@ -7679,6 +7686,28 @@ fn processQueuedPromptLoop(
             &within_turn_suffix,
             &step_batch,
         );
+        if (malformed_arguments_retry.finishBatch()) {
+            debug_trace.eventf(
+                "agent",
+                "repeated_malformed_tool_arguments",
+                step_ctx,
+                "tool_call_count={d}",
+                .{effective_tool_calls.len},
+            );
+            try finishFailedTurnWithNotice(
+                deps,
+                finalization,
+                arena,
+                job,
+                within_turn_suffix.items,
+                &summary_accumulator,
+                stop_state,
+                &finish_trace,
+                repeated_malformed_arguments_notice,
+                "repeated_malformed_tool_arguments",
+            );
+            return;
+        }
         if (terminal_validation_retry.finishBatch()) {
             try deps.push_system_notice(
                 deps.ctx,

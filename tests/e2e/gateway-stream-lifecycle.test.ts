@@ -2048,6 +2048,80 @@ describe("gateway stream lifecycle", () => {
     }
   });
 
+  test("default ask stops a consecutive malformed argument loop", async () => {
+    const root = createFixtureRoot("repeated-malformed-arguments");
+    const tracePath = join(root.root, "trace.log");
+    const alternateMalformedArguments = '{"path":"README.md",}';
+    const responses = [
+      fakeGatewaySerializedToolCall(
+        "malformed_repeat_1",
+        MALFORMED_TOOL_NAME,
+        MALFORMED_ARGUMENTS,
+      ),
+      fakeGatewaySerializedToolCall(
+        "malformed_repeat_2",
+        MALFORMED_TOOL_NAME,
+        MALFORMED_ARGUMENTS,
+      ),
+      fakeGatewaySerializedToolCall(
+        "malformed_repeat_3",
+        "read_file",
+        alternateMalformedArguments,
+      ),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+    try {
+      const result = await runFx(
+        [
+          "ask",
+          "--json",
+          "--auto",
+          "--no-save",
+          "Run the repeated malformed argument fixture.",
+        ],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_MAX_AGENT_STEPS: undefined,
+          },
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+      const trace = readFileSync(tracePath, "utf8");
+      const notice =
+        "Repeated malformed tool arguments stopped the agent loop. The invalid calls were not executed. Continue with a follow-up prompt if needed.";
+
+      expect(result.code).toBe(1);
+      expect(json.exit_code).toBe(1);
+      expect(json.error).toBeUndefined();
+      expect(result.stderr).toContain(notice);
+      expect(gateway.requestCount()).toBe(3);
+      expect(
+        json.tool_calls.filter(
+          (call) => call.name === MALFORMED_TOOL_NAME && call.status === "error",
+        ),
+      ).toHaveLength(2);
+      expect(json.tool_calls).toContainEqual({
+        name: "read_file",
+        status: "error",
+      });
+      expect(result.stdout).not.toContain(MALFORMED_ARGUMENTS);
+      expect(result.stderr).not.toContain(MALFORMED_ARGUMENTS);
+      expect(trace).toContain("event=repeated_malformed_tool_arguments");
+      expect(trace).not.toContain(MALFORMED_ARGUMENTS);
+      expect(result.stdout).not.toContain(alternateMalformedArguments);
+      expect(result.stderr).not.toContain(alternateMalformedArguments);
+      expect(trace).not.toContain(alternateMalformedArguments);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
   test("text and JSON ask defer a newly scoped build target until rules are visible", async () => {
     const variants = [
       { name: "text", json: false },
