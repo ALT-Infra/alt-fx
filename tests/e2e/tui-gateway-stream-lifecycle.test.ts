@@ -31,6 +31,7 @@ import {
   classifierEvidenceFromRequest,
   composerContains,
   fakeGatewayFinalText,
+  fakeGatewayPermissionDecision,
   fakeGatewaySerializedToolCall,
   fakeGatewaySse,
   fakeGatewayToolCall,
@@ -6513,6 +6514,98 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(pane).toContain("● 1 tool call · 1 read · 1 failed");
       expect(pane).toContain("└ Connection interrupted before read_file ran");
       expect(pane).not.toContain("● Reading");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "automatic command review keeps elapsed activity after assistant prose",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-auto-review-activity-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const tapePath = join(root, "session.fxtape");
+      const finalText = "AUTO_REVIEW_ACTIVITY_DONE";
+      let releaseClassifier!: (response: Response) => void;
+      const heldClassifier = new Promise<Response>((resolve) => {
+        releaseClassifier = resolve;
+      });
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+
+      const commandGateway = startFakeGateway([
+        fakeGatewaySse([
+          {
+            type: "text-delta",
+            id: "before_command",
+            delta: "I will inspect the process list.",
+          },
+          {
+            type: "tool-input-start",
+            id: "command_1",
+            toolName: "terminal",
+          },
+          {
+            type: "tool-call",
+            toolCallId: "command_1",
+            toolName: "terminal",
+            input: { action: "exec", command: "seq 1 1" },
+          },
+          {
+            type: "finish",
+            finishReason: { unified: "tool-calls", raw: "tool-calls" },
+          },
+        ]),
+        fakeGatewayFinalText(finalText),
+      ], { classifierResponses: [() => heldClassifier] });
+      gateway = commandGateway;
+
+      session = await TmuxSession.create({
+        cwd: realpathSync(workspace),
+        stderrPath,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-auto-review-activity-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_PERMISSION_MODE: "auto",
+          FX_GATEWAY_BASE_URL: commandGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: commandGateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: commandGateway.chatUrl,
+          FX_MODEL: MODEL,
+          FX_RECORD: tapePath,
+          FX_RECORD_INPUT: "1",
+        },
+      });
+
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Inspect the process list.");
+      await waitForCondition(
+        () => commandGateway.classifierRequests.length === 1,
+        "held automatic command review",
+      );
+      await Bun.sleep(1_200);
+
+      const reviewing = await session.capturePane();
+      expect(reviewing).toContain("I will inspect the process list.");
+      expect(reviewing).toMatch(/Thinking \(\d+s\)/);
+      expect(reviewing).not.toContain(finalText);
+
+      releaseClassifier(fakeGatewayPermissionDecision("allow"));
+      await session.waitForPane(
+        (pane) => pane.includes(finalText) && !pane.includes("Thinking"),
+        TIMEOUT,
+      );
+      expect(commandGateway.requests).toHaveLength(2);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(existsSync(tapePath)).toBe(true);
+      expect(
+        execFileSync(FX_BIN, ["replay", tapePath, "--frames"], {
+          encoding: "utf8",
+        }),
+      ).toMatch(/Thinking \(\d+s\)/);
     },
     TIMEOUT,
   );
