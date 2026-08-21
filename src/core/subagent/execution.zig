@@ -9371,29 +9371,31 @@ test "completed one off reconciles one stable final result message" {
     var canonical = try manager.snapshot(alloc, .{ .root_id = "parent" });
     defer canonical.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), canonical.snapshot.nodes.len);
-    var communication_capability = try env.store.openSubagentControlCapabilityReadOnly(
-        alloc,
-        "one-off-child",
-        .{},
-    );
-    defer communication_capability.deinit();
-    const communication_state = communication_store.Store{
-        .capability = &communication_capability,
-        .expected_session_id = "one-off-child",
-    };
-    var acknowledged = try communication_state.load(alloc);
-    defer acknowledged.deinit(alloc);
-    const result_id = communication.stableDeliveryId(
-        "one-off-child",
-        "one-off-work",
-        "final-result",
-    );
-    try std.testing.expect(communication.parentTurnDeliveryFullyAcknowledged(
-        acknowledged,
-        "parent-model",
-        "parent",
-        &result_id,
-    ));
+    {
+        var communication_capability = try env.store.openSubagentControlCapabilityReadOnly(
+            alloc,
+            "one-off-child",
+            .{},
+        );
+        defer communication_capability.deinit();
+        const communication_state = communication_store.Store{
+            .capability = &communication_capability,
+            .expected_session_id = "one-off-child",
+        };
+        var acknowledged = try communication_state.load(alloc);
+        defer acknowledged.deinit(alloc);
+        const result_id = communication.stableDeliveryId(
+            "one-off-child",
+            "one-off-work",
+            "final-result",
+        );
+        try std.testing.expect(communication.parentTurnDeliveryFullyAcknowledged(
+            acknowledged,
+            "parent-model",
+            "parent",
+            &result_id,
+        ));
+    }
     try std.testing.expectEqual(
         @as(?u64, 0),
         try relationship_index.activeCountIfMigrationComplete(
@@ -9403,41 +9405,18 @@ test "completed one off reconciles one stable final result message" {
             .{},
         ),
     );
-    try owner.requestRetirementSweep(21);
-    const deadline = io_mod.milliTimestamp() + 30_000;
-    while (true) {
-        var retained = env.store.loadReadOnly(alloc, "one-off-child") catch |err| switch (err) {
-            error.SessionNotFound => break,
-            error.FileNotFound => {
-                if (io_mod.milliTimestamp() >= deadline) return error.TestUnexpectedResult;
-                std.Thread.yield() catch std.atomic.spinLoopHint();
-                continue;
-            },
-            else => return err,
-        };
-        retained.deinit(alloc);
-        if (io_mod.milliTimestamp() >= deadline) return error.TestUnexpectedResult;
-        std.Thread.yield() catch std.atomic.spinLoopHint();
-    }
-    while (true) {
-        const lookup = relationship_index.lookupSlot(
-            alloc,
-            &env.store,
-            "parent",
-            "one-off-child",
-            .{},
-        ) catch |err| switch (err) {
-            error.CommitIndeterminate, error.RecoveryRequired => {
-                if (io_mod.milliTimestamp() >= deadline) return error.TestUnexpectedResult;
-                std.Thread.yield() catch std.atomic.spinLoopHint();
-                continue;
-            },
-            else => return err,
-        };
-        if (lookup == null) break;
-        if (io_mod.milliTimestamp() >= deadline) return error.TestUnexpectedResult;
-        std.Thread.yield() catch std.atomic.spinLoopHint();
-    }
+    try std.testing.expect(!owner.tryRetireOneOff("one-off-child"));
+    try std.testing.expectError(
+        error.SessionNotFound,
+        env.store.loadReadOnly(alloc, "one-off-child"),
+    );
+    try std.testing.expect((try relationship_index.lookupSlot(
+        alloc,
+        &env.store,
+        "parent",
+        "one-off-child",
+        .{},
+    )) == null);
 }
 
 fn checkAdmissionAllocationFailures(alloc: Allocator) !void {
