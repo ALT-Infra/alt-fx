@@ -213,9 +213,20 @@ pub const StoredKeyReadStatus = enum {
     unavailable,
 };
 
+/// Why the fx login produced no credential. Only meaningful once resolution has
+/// reached the fx-login step and it stayed silent. `unavailable` means the
+/// session could not be loaded or its refresh failed, which is different from
+/// having no session at all: the login exists and may still be repairable.
+pub const FxLoginReadStatus = enum {
+    not_attempted,
+    absent,
+    unavailable,
+};
+
 pub const Resolution = struct {
     credential: ?Credential = null,
     stored_key_status: StoredKeyReadStatus = .not_attempted,
+    fx_login_status: FxLoginReadStatus = .not_attempted,
 };
 
 /// The single credential resolution method. Walks source precedence, then falls back to
@@ -279,13 +290,20 @@ pub fn resolvePreferring(
     if (try loadSource(alloc, transport, secret_store, .vercel_oidc_token)) |credential| return .{ .credential = credential };
     if (try loadSource(alloc, transport, secret_store, .ai_gateway_api_key)) |credential| return .{ .credential = credential };
 
-    const fx_login = switch (mode) {
-        .stored => try loadStoredFxLoginCredential(alloc),
-        .refresh_if_needed => try loadFxLoginCredential(alloc, transport),
+    // A login that cannot be loaded or refreshed is one silent source, not a
+    // reason to abandon resolution: the sources on either side of it already
+    // fall through on failure, and a rejected refresh token must not hide a
+    // stored key that works. OutOfMemory stays fatal, as it does for them.
+    var fx_login_status: FxLoginReadStatus = .absent;
+    const fx_login = loadFxLoginForPrecedence(alloc, transport, mode) catch |err| blk: {
+        if (err == error.OutOfMemory) return err;
+        fx_login_status = .unavailable;
+        debug_trace.logf("auth", "fx login load failed mode={t} err={s}; using precedence", .{ mode, @errorName(err) });
+        break :blk null;
     };
     if (fx_login) |credential| return .{ .credential = credential };
 
-    if (secret_store.isDisabled()) return .{};
+    if (secret_store.isDisabled()) return .{ .fx_login_status = fx_login_status };
 
     var status: StoredKeyReadStatus = .not_found;
     const stored = loadSource(alloc, transport, secret_store, .stored_key) catch |err| blk: {
@@ -294,8 +312,19 @@ pub fn resolvePreferring(
         debug_trace.logf("auth", "stored key load failed err={s} status={t}", .{ @errorName(err), status });
         break :blk null;
     };
-    if (stored) |credential| return .{ .credential = credential };
-    return .{ .stored_key_status = status };
+    if (stored) |credential| return .{ .credential = credential, .fx_login_status = fx_login_status };
+    return .{ .stored_key_status = status, .fx_login_status = fx_login_status };
+}
+
+fn loadFxLoginForPrecedence(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    mode: LoadMode,
+) !?Credential {
+    return switch (mode) {
+        .stored => loadStoredFxLoginCredential(alloc),
+        .refresh_if_needed => loadFxLoginCredential(alloc, transport),
+    };
 }
 
 /// `loadSource` always refreshes an expired fx login, which `.stored` mode
@@ -921,4 +950,110 @@ test "credential resolution preserves unreadable store classification" {
     try std.testing.expectEqual(@as(usize, 1), store_fixture.load_calls);
     try std.testing.expect(resolution.credential == null);
     try std.testing.expectEqual(StoredKeyReadStatus.unavailable, resolution.stored_key_status);
+}
+
+test "a failed fx-login refresh falls through to the stored key" {
+    const alloc = std.testing.allocator;
+    var fixture = try ExpiredFxLoginFixture.install(alloc);
+    defer fixture.deinit();
+    var store_fixture = SecretStoreFixture{ .value = "stored-key-that-works" };
+
+    // The refresh cannot succeed, but a working stored key is right behind it.
+    var resolution = try resolve(
+        alloc,
+        oauth_transport.unavailable_provider,
+        store_fixture.provider(),
+        .refresh_if_needed,
+    );
+    defer if (resolution.credential) |*credential| credential.deinit(alloc);
+
+    const credential = resolution.credential orelse return error.TestExpectedCredential;
+    try std.testing.expectEqual(Source.stored_key, credential.source);
+    try std.testing.expectEqualStrings("stored-key-that-works", credential.token);
+    try std.testing.expectEqual(FxLoginReadStatus.unavailable, resolution.fx_login_status);
+    try std.testing.expectEqual(@as(usize, 1), store_fixture.load_calls);
+}
+
+test "a failed fx-login refresh is still reported when nothing else resolves" {
+    const alloc = std.testing.allocator;
+    var fixture = try ExpiredFxLoginFixture.install(alloc);
+    defer fixture.deinit();
+    var store_fixture = SecretStoreFixture{};
+
+    // Falling through must not erase why the login was silent: an unrepairable
+    // session is a different problem from never having logged in.
+    var resolution = try resolve(
+        alloc,
+        oauth_transport.unavailable_provider,
+        store_fixture.provider(),
+        .refresh_if_needed,
+    );
+    defer if (resolution.credential) |*credential| credential.deinit(alloc);
+
+    try std.testing.expect(resolution.credential == null);
+    try std.testing.expectEqual(FxLoginReadStatus.unavailable, resolution.fx_login_status);
+    try std.testing.expectEqual(StoredKeyReadStatus.not_found, resolution.stored_key_status);
+}
+
+/// A HOME holding an fx login whose session is expired and whose refresh token
+/// the issuer rejects, which is what an expired or revoked login looks like on
+/// disk. Paired with `oauth_transport.unavailable_provider`, the refresh fails.
+const ExpiredFxLoginFixture = struct {
+    alloc: std.mem.Allocator,
+    tmp: std.testing.TmpDir,
+    env: *CredentialTestEnv,
+    home: []u8,
+
+    fn install(alloc: std.mem.Allocator) !ExpiredFxLoginFixture {
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "");
+        errdefer alloc.free(home);
+
+        try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
+        const auth_path = try std.fs.path.join(alloc, &.{ home, ".fx", "auth.json" });
+        defer alloc.free(auth_path);
+        var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), auth_path, .{
+            .truncate = true,
+            .permissions = std.Io.File.Permissions.fromMode(0o600),
+        });
+        defer file.close(io_mod.getIo());
+        try file.writeStreamingAll(
+            io_mod.getIo(),
+            "{\"version\":1,\"issuer\":\"https://vercel.com\",\"client_id\":\"client\"," ++
+                "\"access_token\":\"access\",\"refresh_token\":\"rejected-refresh\"," ++
+                "\"expires_at_ms\":1,\"scope\":\"openid offline_access\"," ++
+                "\"token_type\":\"Bearer\",\"team_slug\":\"team-slug\",\"team_id\":\"team-id\"}",
+        );
+
+        const env = try CredentialTestEnv.install(alloc, &.{.{ "HOME", home }});
+        return .{ .alloc = alloc, .tmp = tmp, .env = env, .home = home };
+    }
+
+    fn deinit(self: *ExpiredFxLoginFixture) void {
+        self.env.deinit();
+        self.alloc.free(self.home);
+        self.tmp.cleanup();
+    }
+};
+
+test "a disabled store still reports why the fx login was silent" {
+    const alloc = std.testing.allocator;
+    var fixture = try ExpiredFxLoginFixture.install(alloc);
+    defer fixture.deinit();
+    var store_fixture = SecretStoreFixture{ .disabled = true };
+
+    // The store is switched off, so resolution ends at the login. Its failure is
+    // still the useful diagnostic and must survive the early return.
+    var resolution = try resolve(
+        alloc,
+        oauth_transport.unavailable_provider,
+        store_fixture.provider(),
+        .refresh_if_needed,
+    );
+    defer if (resolution.credential) |*credential| credential.deinit(alloc);
+
+    try std.testing.expect(resolution.credential == null);
+    try std.testing.expectEqual(FxLoginReadStatus.unavailable, resolution.fx_login_status);
+    try std.testing.expectEqual(StoredKeyReadStatus.not_attempted, resolution.stored_key_status);
 }
