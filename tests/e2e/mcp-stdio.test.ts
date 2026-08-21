@@ -3556,7 +3556,7 @@ describe("modern MCP stdio compatibility", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "the TUI cancels a stalled stdio request with its original id",
+    "the TUI cancels a stalled stdio request and accepts a follow-up prompt",
     async () => {
       const root = createRoot("tui-cancel", MODERN_FIXTURE, {
         mode: "stall_operation",
@@ -3565,11 +3565,14 @@ describe("modern MCP stdio compatibility", () => {
       });
       const activeGateway = startToolGateway("Cancelled MCP TUI complete.");
       gateway = activeGateway;
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
       tui = await TmuxSession.create({
         isolated: true,
         cwd: root.workspace,
         width: 100,
         height: 30,
+        stderrPath,
         env: fixtureEnv(root, activeGateway),
       });
 
@@ -3594,6 +3597,7 @@ describe("modern MCP stdio compatibility", () => {
 
       await tui.sendKeys("Escape");
       await tui.waitForText("Cancelled mcp_fixture_echo", 10_000);
+      await tui.waitForText("■ Cancelled", 5_000);
       const cancel_deadline = Date.now() + 5_000;
       while (Date.now() < cancel_deadline) {
         if (
@@ -3610,6 +3614,13 @@ describe("modern MCP stdio compatibility", () => {
         (entry) => entry.message.method === "notifications/cancelled",
       );
       expect(cancelled?.message.params?.requestId).toBe(2);
+
+      await tui.waitForStableComposer(5_000);
+      await tui.sendText("Confirm the next prompt works.");
+      await tui.waitForText("Cancelled MCP TUI complete.", 10_000);
+      expect(activeGateway.requests).toHaveLength(3);
+      expect(activeGateway.requests[2]?.body).toContain("Confirm the next prompt works.");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       await tui.kill();
       tui = null;
