@@ -1196,7 +1196,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       let grid = await waitForSettingsMenu(session);
       expect(grid.join("\n")).toContain("Slash menu categories");
 
-      for (let index = 0; index < 6; index += 1) {
+      for (let index = 0; index < 5; index += 1) {
         await session.sendKeys("Down");
       }
       await session.sendKeys("Left");
@@ -1455,7 +1455,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
 
       await session.sendText("/help");
-      let grid = await waitForHelpMenu(session, 40);
+      let grid = await waitForHelpMenu(session, 39);
       let pane = grid.join("\n");
       expect(pane).not.toContain("𝒇x");
       expect(pane).not.toContain("Run /help for commands");
@@ -1475,7 +1475,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).not.toContain("/clear");
 
       await session.sendKeys("C-u");
-      await waitForHelpMenu(session, 40);
+      await waitForHelpMenu(session, 39);
       await session.sendKeys("Down");
       await session.sendKeys("Enter");
       pane = await session.waitForPane(
@@ -1488,7 +1488,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("C-u");
       await session.sendText("/help");
-      await waitForHelpMenu(session, 40);
+      await waitForHelpMenu(session, 39);
       await session.sendLiteralText("additional directories");
       await waitForHelpMenu(session, 1);
       await session.sendKeys("Enter");
@@ -1505,7 +1505,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("C-u");
       await session.sendText("/help");
-      await waitForHelpMenu(session, 40);
+      await waitForHelpMenu(session, 39);
       await session.sendLiteralText("no command can match this query");
       await session.waitForText("No commands found.", 5_000);
       await session.sendKeys("Escape");
@@ -1577,7 +1577,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("Left");
       await waitForSettingValue(settingsPath, "maxxing_mode", "legacy");
 
-      for (let index = 0; index < 4; index += 1) await session.sendKeys("Down");
+      for (let index = 0; index < 3; index += 1) await session.sendKeys("Down");
       await session.waitForText(/Status line workspace\s+off/, 5_000);
       await session.sendKeys("Right");
       await waitForStatuslineValue(settingsPath, "workspace", true);
