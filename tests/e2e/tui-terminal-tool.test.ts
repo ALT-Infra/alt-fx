@@ -2305,16 +2305,18 @@ test.skipIf(!tmuxAvailable())(
     await active.sendText("Exercise the public terminal wait contract.");
     await active.waitForText("TUI public terminal wait complete", TIMEOUT);
     expect(gateway.requests).toHaveLength(6);
+    type WaitSchema = {
+      type?: string;
+      properties?: Record<string, WaitSchema>;
+      enum?: string[];
+      oneOf?: WaitSchema[];
+      required?: string[];
+      additionalProperties?: boolean;
+    };
     const request = JSON.parse(gateway.requests[0]!.body) as {
       tools: Array<{
         name?: string;
-        inputSchema?: {
-          type?: string;
-          properties?: Record<string, { enum?: string[] }>;
-          required?: string[];
-          additionalProperties?: boolean;
-          oneOf?: unknown[];
-        };
+        inputSchema?: WaitSchema;
       }>;
     };
     const terminalSchema = request.tools.find(
@@ -2324,16 +2326,20 @@ test.skipIf(!tmuxAvailable())(
     expect(terminalSchema!.type).toBe("object");
     expect(terminalSchema!.oneOf).toBeUndefined();
     expect(terminalSchema!.additionalProperties).toBe(false);
-    expect(terminalSchema!.properties?.action?.enum).toContain("wait");
-    const terminalProperties = Object.keys(terminalSchema!.properties ?? {});
-    expect(terminalProperties).toHaveLength(25);
-    expect(terminalSchema!.required).toEqual(terminalProperties);
-    expect(
-      terminalProperties.filter((name) => name === "wait_ceiling_ms"),
-    ).toHaveLength(1);
-    expect(terminalProperties).not.toContain("safety_ceiling_ms");
-    expect(terminalProperties).not.toContain("authority");
-    expect(terminalProperties).not.toContain("proof");
+    expect(terminalSchema!.required).toEqual(["request"]);
+    const branches = terminalSchema!.properties?.request?.oneOf ?? [];
+    const waitBranch = branches.find((branch) =>
+      branch.properties?.action?.enum?.[0] === "wait"
+    );
+    expect(waitBranch).toBeDefined();
+    const waitProperties = Object.keys(waitBranch!.properties ?? {});
+    expect(waitProperties).toEqual([
+      "action", "session_id", "return_when", "wait_ceiling_ms",
+    ]);
+    expect(waitBranch!.required).toEqual(waitProperties);
+    expect(waitProperties).not.toContain("safety_ceiling_ms");
+    expect(waitProperties).not.toContain("authority");
+    expect(waitProperties).not.toContain("proof");
     expect(gateway.requests[4]!.body).toContain('"wait_ceiling_ms":20000');
     expect(gateway.requests[4]!.body).not.toContain("safety_ceiling_ms");
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
