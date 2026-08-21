@@ -59,11 +59,6 @@ pub const ParseOutcome = union(enum) {
     }
 };
 
-pub const SandboxScope = enum {
-    restricted,
-    broader,
-};
-
 pub const ReviewPhase = enum {
     initial,
     preflight,
@@ -74,9 +69,7 @@ pub const CommandAction = struct {
     command: []const u8,
     resolved_cwd: []const u8,
     background: bool,
-    backend: types.BackendKind,
     target_os: std.Target.Os.Tag,
-    scope: SandboxScope = .restricted,
 };
 
 pub const FileMutationAction = struct {
@@ -95,24 +88,10 @@ pub const ToolAction = struct {
     schema_required: bool = false,
 };
 
-pub const SandboxWideningAction = struct {
-    command: []const u8,
-    resolved_cwd: []const u8,
-    background: bool,
-    backend: types.BackendKind,
-    target_os: std.Target.Os.Tag,
-    prior_scope: SandboxScope,
-    requested_scope: SandboxScope,
-    reason: []const u8,
-    restricted_result: ?[]const u8 = null,
-    restricted_command_result: ?[]const u8 = null,
-};
-
 pub const Action = union(enum) {
     command: CommandAction,
     file_mutation: FileMutationAction,
     tool: ToolAction,
-    sandbox_widening: SandboxWideningAction,
 };
 
 pub const ReviewOrigin = enum {
@@ -520,8 +499,8 @@ fn serializeEvidence(
             try writeBoundedField(&out.writer, alloc, "command", command.command, max_action_field_bytes, &action_complete);
             try writeBoundedField(&out.writer, alloc, "cwd", command.resolved_cwd, max_action_field_bytes, &action_complete);
             try out.writer.print(
-                "background: {}\nbackend: {s}\ntarget_os: {s}\nsandbox_scope: {s}\n",
-                .{ command.background, @tagName(command.backend), @tagName(command.target_os), @tagName(command.scope) },
+                "background: {}\ntarget_os: {s}\n",
+                .{ command.background, @tagName(command.target_os) },
             );
         },
         .file_mutation => |file| {
@@ -571,34 +550,6 @@ fn serializeEvidence(
             } else if (tool.schema_required) {
                 action_complete = false;
                 try out.writer.writeAll("schema_json: [evidence unavailable]\n");
-            }
-        },
-        .sandbox_widening => |widening| {
-            try out.writer.writeAll("action: sandbox_widening\n");
-            try writeBoundedField(&out.writer, alloc, "command", widening.command, max_action_field_bytes, &action_complete);
-            try writeBoundedField(&out.writer, alloc, "cwd", widening.resolved_cwd, max_action_field_bytes, &action_complete);
-            try out.writer.print(
-                "background: {}\nbackend: {s}\ntarget_os: {s}\nprior_scope: {s}\nrequested_scope: {s}\n",
-                .{
-                    widening.background,
-                    @tagName(widening.backend),
-                    @tagName(widening.target_os),
-                    @tagName(widening.prior_scope),
-                    @tagName(widening.requested_scope),
-                },
-            );
-            try writeBoundedField(&out.writer, alloc, "reason", widening.reason, max_action_field_bytes, &action_complete);
-            if (widening.restricted_result) |result| {
-                try writeBoundedField(&out.writer, alloc, "restricted_result", result, max_action_field_bytes, &action_complete);
-            } else if (request.phase == .reactive) {
-                action_complete = false;
-                try out.writer.writeAll("restricted_result: [evidence unavailable]\n");
-            }
-            if (widening.restricted_command_result) |result| {
-                try writeBoundedField(&out.writer, alloc, "restricted_command_result", result, max_action_field_bytes, &action_complete);
-            } else if (request.phase == .reactive) {
-                action_complete = false;
-                try out.writer.writeAll("restricted_command_result: [evidence unavailable]\n");
             }
         },
     }
@@ -1180,7 +1131,6 @@ test "automatic review does not send redacted action evidence" {
             .command = "printf API_KEY=super-secret",
             .resolved_cwd = "/tmp/workspace",
             .background = false,
-            .backend = .none,
             .target_os = .linux,
         } },
         .escalation_reason = "command_requires_approval",
@@ -1375,7 +1325,6 @@ test "automatic review serializes the pending call structurally" {
             .command = "pnpm install",
             .resolved_cwd = "/tmp/workspace",
             .background = false,
-            .backend = .none,
             .target_os = .linux,
         } },
         .escalation_reason = "command_requires_approval",
@@ -1451,7 +1400,6 @@ test "subagent automatic review sends only the current root request" {
             .command = "rm README.md",
             .resolved_cwd = "/tmp/workspace",
             .background = false,
-            .backend = .none,
             .target_os = .linux,
         } },
         .escalation_reason = "command_requires_approval",
@@ -1505,7 +1453,6 @@ test "automatic review rejects an oversized complete packet without sending" {
             .command = "touch file",
             .resolved_cwd = "/tmp/workspace",
             .background = false,
-            .backend = .none,
             .target_os = .linux,
         } },
         .escalation_reason = "command_requires_approval",
@@ -1642,7 +1589,6 @@ test "automatic review excludes assistant preamble and images" {
             .command = "printf safe",
             .resolved_cwd = "/tmp/workspace",
             .background = false,
-            .backend = .none,
             .target_os = .linux,
         } },
         .escalation_reason = "command_requires_approval",
@@ -1697,7 +1643,6 @@ test "automatic review ignores legacy authority completeness" {
             .command = "touch file",
             .resolved_cwd = "/tmp/workspace",
             .background = false,
-            .backend = .none,
             .target_os = .linux,
         } },
         .escalation_reason = "command_requires_approval",
@@ -1723,7 +1668,6 @@ test "automatic review ignores legacy authority completeness" {
             .command = "touch file",
             .resolved_cwd = "/tmp/workspace",
             .background = false,
-            .backend = .none,
             .target_os = .linux,
         } },
         .escalation_reason = "command_requires_approval",
@@ -1838,7 +1782,6 @@ test "expired review budget fails closed before transport" {
             .command = "true",
             .resolved_cwd = "/tmp/workspace",
             .background = false,
-            .backend = .none,
             .target_os = .linux,
         } },
         .escalation_reason = "command_requires_approval",

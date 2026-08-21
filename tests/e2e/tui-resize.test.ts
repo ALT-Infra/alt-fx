@@ -2608,10 +2608,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         await active.sendText("/statusline");
         await active.waitForText("Status line", TIMEOUT);
         await active.sendKeys("Right");
-        await active.waitForText(
-          process.platform === "darwin" ? "sandbox:os" : "sandbox:none",
-          TIMEOUT,
-        );
+        await active.waitForText("off  on", TIMEOUT);
         await active.sendKeys("Down");
         await active.sendKeys("Right");
       },
@@ -2641,19 +2638,6 @@ describe.skipIf(SKIP)("tui: resize", () => {
         await active.resizeWindow(60, 12, 500);
         await active.sendText("/help");
         await active.waitForText("Commands ", TIMEOUT);
-      },
-    },
-    {
-      issue: "FXC-123",
-      label: "sandbox",
-      width: 120,
-      height: 36,
-      surfaceMarker: "Command sandbox",
-      editedInput: "x",
-      async openSurface(active) {
-        await active.sendText("/sandbox");
-        await active.waitForText("Command sandbox", TIMEOUT);
-        await active.resizeWindow(60, 12, 500);
       },
     },
     {

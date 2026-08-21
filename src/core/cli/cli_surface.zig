@@ -13,7 +13,6 @@ const collections = @import("../shared/collections.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const model_provider = @import("../config/model_provider.zig");
-const devbox_executor = @import("../execution/devbox_executor.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const doctor_runtime = @import("doctor_runtime.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
@@ -32,7 +31,6 @@ const secret = @import("../auth/secret.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
-const sandbox = @import("../permissions/sandbox.zig");
 const session_store = @import("../session/session_store.zig");
 const usage_report = @import("../session/usage_report.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
@@ -201,7 +199,6 @@ pub const Config = struct {
     inspect_mcp_profile_config: mcp_contract.InspectProfileConfigFn,
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
     acp_runner: acp_runner.Runner,
-    devbox_provider: ?devbox_executor.Provider = null,
     permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
     codex_permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
 };
@@ -742,7 +739,6 @@ fn runNonInteractiveWithDeps(
                 .max_history_turns = cfg.max_history_turns,
                 .context_registry = cfg.context_registry,
                 .mode_registry = cfg.mode_registry,
-                .devbox_provider = cfg.devbox_provider,
                 .permission_reviewer_provider = cfg.permission_reviewer_provider,
                 .codex_permission_reviewer_provider = cfg.codex_permission_reviewer_provider,
                 .context_limit_overrides = global_args.modifiers.context_limit_overrides,
@@ -1890,10 +1886,6 @@ fn statusSnapshotFromStartupWithBuild(
         .auth = startup.auth,
         .auth_help = startup.auth.missingHelp(.cli),
         .permission_mode = permissionModeForSnapshot(startup.permission_mode),
-        .sandbox_backend = sandbox.effectiveBackend(
-            startup.permission_mode,
-            startup.sandbox_backend,
-        ),
         .workspace_root = startup.workspace_root,
         .history_turns = 0,
         .session_permission_grants = 0,
@@ -2872,7 +2864,6 @@ fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
         .max_history_turns = cfg.max_history_turns,
         .mode_registry = cfg.mode_registry,
         .load_mcp_runtime = cfg.load_mcp_runtime,
-        .devbox_provider = cfg.devbox_provider,
         .permission_reviewer_provider = cfg.permission_reviewer_provider,
         .codex_permission_reviewer_provider = cfg.codex_permission_reviewer_provider,
     };
@@ -3580,7 +3571,6 @@ test "ACP command routes parsed options and launch config through the injected r
                     expected.context_registry.defaultProvider().id,
                 ) and
                 std.mem.eql(u8, cfg.mode_registry.default_mode_id, expected.mode_registry.default_mode_id) and
-                cfg.devbox_provider.?.execute_fn == expected.devbox_provider.?.execute_fn and
                 cfg.permission_reviewer_provider.?.review_fn == expected.permission_reviewer_provider.?.review_fn;
 
             const limit_matches = cfg.context_limit_overrides.len == 1 and
@@ -4453,7 +4443,6 @@ test "workflow config does not carry placeholder gateway tools" {
     try std.testing.expectEqualStrings("surface", cfg.mode_registry.default_mode_id);
     try std.testing.expectEqualStrings("skills", cfg.skill_root_policy.workspace_roots[0].path);
     try std.testing.expect(cfg.load_mcp_runtime == noMcpRuntimeForTest);
-    try std.testing.expect(cfg.devbox_provider.?.execute_fn == unavailableDevboxForTest);
 }
 test "runIfRequested invalid local flags write usage" {
     var capture = CaptureOutput.init(std.testing.allocator);
@@ -4827,7 +4816,7 @@ test "runIfRequested local json success appends exactly one newline" {
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("status"), @constCast("--json") }, testConfig(), deps);
     try std.testing.expectEqual(RunResult.handled_success, result);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"auto\",\"sandbox\":\"none\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
+        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"auto\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
         capture.stdout.written(),
     );
     try std.testing.expect(!std.mem.endsWith(u8, capture.stdout.written(), "\n\n"));
@@ -4920,24 +4909,9 @@ test "writeRenderedJsonLine falls back to heap and appends exactly one newline" 
     );
 
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"sandbox\":\"none\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
+        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
         capture.stdout.written(),
     );
-}
-
-test "status snapshot reports yolo effective sandbox without mutating startup" {
-    const startup = app_lifecycle.StartupStatus{
-        .workspace_root = @constCast("/tmp/fx"),
-        .selected_model = "test-model",
-        .permission_mode = .yolo,
-        .sandbox_backend = .macos,
-        .agent_step_limit = 42,
-    };
-
-    const snapshot = statusSnapshotFromStartup(startup);
-    try std.testing.expectEqual(types.PermissionMode.yolo, snapshot.permission_mode);
-    try std.testing.expectEqual(sandbox.BackendKind.none, snapshot.sandbox_backend);
-    try std.testing.expectEqual(sandbox.BackendKind.macos, startup.sandbox_backend);
 }
 
 test "writeRenderedJsonLine renders doctor json through output contract" {
@@ -5088,16 +5062,6 @@ const test_surface_context_registry = context_contract.Registry{ .default_provid
     .append_transient_fn = appendNoopTransientContextForTest,
 } };
 
-fn unavailableDevboxForTest(
-    _: ?*anyopaque,
-    _: Allocator,
-    _: []const u8,
-    _: []const u8,
-    _: devbox_executor.Control,
-) devbox_executor.ProviderError!devbox_executor.VercelOutcome {
-    return .unavailable;
-}
-
 fn noMcpRuntimeForTest(_: Allocator, _: @import("../mcp/elicitation.zig").Capabilities) !?*mcp_runtime.McpRuntime {
     return null;
 }
@@ -5169,7 +5133,6 @@ fn testConfig() Config {
         .inspect_mcp_profile_config = clearMcpConfigInspectionForTest,
         .load_mcp_runtime = noMcpRuntimeForTest,
         .acp_runner = .{ .run_fn = unexpectedAcpRunForTest },
-        .devbox_provider = .{ .execute_fn = unavailableDevboxForTest },
         .tool_set = .{
             .registry = .{ .tools = &.{} },
             .order = &.{},

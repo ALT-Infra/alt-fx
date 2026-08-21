@@ -1,6 +1,5 @@
 const std = @import("std");
 const config_runtime = @import("../config/config_runtime.zig");
-const devbox_executor = @import("../execution/devbox_executor.zig");
 const background_process_provider = @import(
     "../execution/background_process_provider.zig",
 );
@@ -38,7 +37,6 @@ pub const Config = struct {
     max_history_turns: usize,
     context_registry: context_contract.Registry,
     mode_registry: mode_registry.Registry,
-    devbox_provider: ?devbox_executor.Provider = null,
     permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
     codex_permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
     model_override: ?[]const u8 = null,
