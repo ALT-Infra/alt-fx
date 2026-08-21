@@ -87,6 +87,7 @@ fn destructive_effect_in_analysis(command: []const u8) ?DestructiveEffect {
     var in_double = false;
     var escaped = false;
     var in_comment = false;
+    var word_active = false;
     var segment_start: usize = 0;
     var i: usize = 0;
     while (i < command.len) : (i += 1) {
@@ -94,11 +95,13 @@ fn destructive_effect_in_analysis(command: []const u8) ?DestructiveEffect {
         if (in_comment) {
             if (ch != '\n') continue;
             in_comment = false;
+            word_active = false;
             segment_start = i + 1;
             continue;
         }
         if (escaped) {
             escaped = false;
+            if (ch != '\n') word_active = true;
             continue;
         }
         if (ch == '\\' and !in_single) {
@@ -107,19 +110,25 @@ fn destructive_effect_in_analysis(command: []const u8) ?DestructiveEffect {
         }
         if (ch == '\'' and !in_double) {
             in_single = !in_single;
+            word_active = true;
             continue;
         }
         if (ch == '"' and !in_single) {
             in_double = !in_double;
+            word_active = true;
             continue;
         }
         if (!in_single and (ch == '$' or ch == '`')) return null;
         if (in_single or in_double) continue;
-        if (ch == '#' and starts_shell_comment(command, i)) {
+        if (ch == '#' and !word_active) {
             if (effect == null) {
                 effect = warning_at_command_position(command[segment_start..i]);
             }
             in_comment = true;
+            continue;
+        }
+        if (ch == ' ' or ch == '\t' or ch == '\r') {
+            word_active = false;
             continue;
         }
         if (ch == '<' or ch == '>' or ch == '(' or ch == ')' or
@@ -141,11 +150,15 @@ fn destructive_effect_in_analysis(command: []const u8) ?DestructiveEffect {
                 }
                 break :blk i + 1;
             },
-            else => continue,
+            else => {
+                word_active = true;
+                continue;
+            },
         };
         if (effect == null) {
             effect = warning_at_command_position(command[segment_start..boundary_start]);
         }
+        word_active = false;
         segment_start = boundary_end;
     }
     if (in_single or in_double or escaped) return null;
@@ -153,14 +166,6 @@ fn destructive_effect_in_analysis(command: []const u8) ?DestructiveEffect {
         effect = warning_at_command_position(command[segment_start..]);
     }
     return effect;
-}
-
-fn starts_shell_comment(command: []const u8, index: usize) bool {
-    if (index == 0) return true;
-    return switch (command[index - 1]) {
-        ' ', '\t', '\r', '\n', ';', '|', '&', '(', ')' => true,
-        else => false,
-    };
 }
 
 fn warning_at_command_position(command: []const u8) ?DestructiveEffect {
@@ -322,6 +327,9 @@ fn git_effect_args(subcommand: []const u8, rest: []const u8) GitEffectArgs {
                 if (std.mem.findScalar(u8, token.text[1..exclude_index], 'n') != null) {
                     args.dry_run = true;
                 }
+                if (std.mem.findScalar(u8, token.text[1..exclude_index], 'h') != null) {
+                    args.help_or_version = true;
+                }
                 if (exclude_index + 1 == token.text.len) {
                     const pattern = command_classification.next_token(rest, offset) orelse {
                         args.supported = false;
@@ -354,7 +362,8 @@ fn git_effect_args(subcommand: []const u8, rest: []const u8) GitEffectArgs {
         }
         if (std.mem.eql(u8, token.text, "--help") or
             std.mem.eql(u8, token.text, "--version") or
-            std.mem.eql(u8, token.text, "-h")) args.help_or_version = true;
+            std.mem.eql(u8, token.text, "-h") or
+            short_option_contains(token.text, 'h')) args.help_or_version = true;
         if (std.mem.eql(u8, token.text, "--hard")) args.hard_reset = true;
         if (std.mem.eql(u8, token.text, "--dry-run") or
             std.mem.eql(u8, token.text, "-n") or
@@ -609,8 +618,12 @@ test "command risk note detects direct destructive effects only" {
     try std.testing.expect(command_risk_note_for("git rm --help") == null);
     try std.testing.expect(command_risk_note_for("git clean --help") == null);
     try std.testing.expect(command_risk_note_for("git clean -h") == null);
+    try std.testing.expect(command_risk_note_for("git clean -hf") == null);
+    try std.testing.expect(command_risk_note_for("git clean -fh") == null);
     try std.testing.expect(command_risk_note_for("git rm -h tracked.txt") == null);
+    try std.testing.expect(command_risk_note_for("git rm -hf tracked.txt") == null);
     try std.testing.expect(command_risk_note_for("git reset -h --hard") == null);
+    try std.testing.expect(command_risk_note_for("git reset -hq --hard") == null);
     try std.testing.expect(command_risk_note_for("git -C clean status") == null);
     try std.testing.expect(command_risk_note_for("git --unknown clean -fd") == null);
     try std.testing.expect(command_risk_note_for("rtk rm -rf generated") == null);
@@ -628,6 +641,8 @@ test "command risk note detects direct destructive effects only" {
         "git clean -f -e-n",
         "git clean -fe-n",
         "git clean -f --exclude=--dry-run",
+        "git clean -f -ehelp",
+        "git clean -f -fehelp",
     }) |command| {
         try std.testing.expectEqual(
             DestructiveEffect.remove_files,
@@ -675,6 +690,21 @@ test "command destructive effect leaves unsupported and targetless removal unres
     try std.testing.expectEqual(
         DestructiveEffect.remove_files,
         destructive_effect_for("printf ok # ignored; rm first\nrm second").?,
+    );
+    try std.testing.expectEqual(
+        DestructiveEffect.remove_files,
+        destructive_effect_for("printf foo\\ #bar; rm victim").?,
+    );
+    try std.testing.expectEqual(
+        DestructiveEffect.remove_files,
+        destructive_effect_for("printf foo\\;#bar; rm victim").?,
+    );
+    try std.testing.expectEqual(
+        DestructiveEffect.remove_files,
+        destructive_effect_for("printf foo\\" ++ "\n#bar; rm victim").?,
+    );
+    try std.testing.expect(
+        destructive_effect_for("printf \\" ++ "\n# comment; rm ignored") == null,
     );
     try std.testing.expectEqual(
         DestructiveEffect.discard_version_control_state,

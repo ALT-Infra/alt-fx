@@ -302,6 +302,7 @@ describe("lean auto mode reliability", () => {
         ["git_reset_boundary", "git reset --hard; printf ok"],
         ["compound_rm", "pwd && rm compound.txt"],
         ["rm_boundary", "rm victim; printf ok"],
+        ["escaped_space_rm", "printf foo\\ #bar; rm victim"],
       ] as const) {
         const root = createIsolatedRoot();
         const marker = join(root.root, `${name}-must-not-run`);
