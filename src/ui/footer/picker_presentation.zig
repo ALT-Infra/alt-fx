@@ -247,6 +247,21 @@ fn composeSignInPickerRow(
         else
             ui_render.dim_style,
     );
+    if (row_index == 2 and source == .chatgpt_subscription) {
+        const prefix = "   Open   ";
+        try row_text.appendClipped(alloc, &row, prefix, width);
+        const used: u16 = @intCast(@min(display_width.visibleWidth(prefix), width));
+        const remaining = width -| used;
+        if (remaining > 0) {
+            try row.appendSlice(alloc, "\x1b]8;id=fx-codex-auth;");
+            try row.appendSlice(alloc, snapshot.verification_uri);
+            try row.appendSlice(alloc, "\x1b\\\x1b[4m");
+            try row_text.appendClipped(alloc, &row, "Authorize with Codex", remaining);
+            try row.appendSlice(alloc, "\x1b[24m\x1b]8;;\x1b\\");
+        }
+        try row.appendSlice(alloc, ui_render.reset_style);
+        return row;
+    }
     var label_buf: [512]u8 = undefined;
     const label = switch (row_index) {
         0 => if (source == .chatgpt_subscription)
@@ -1637,7 +1652,7 @@ test "auth picker composes only detected credential sources" {
         .include_skip = false,
     };
     const row_count = authPickerRowCount(view);
-    try std.testing.expectEqual(@as(u16, 7), row_count);
+    try std.testing.expectEqual(@as(u16, 8), row_count);
 
     var header = try composeAuthPickerRow(alloc, view, 0, row_count, 80);
     defer header.deinit(alloc);
@@ -1659,12 +1674,16 @@ test "auth picker composes only detected credential sources" {
     defer setup.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, setup.items, "API key") != null);
 
-    var change_team = try composeAuthPickerRow(alloc, view, 5, row_count, 80);
+    var switch_provider = try composeAuthPickerRow(alloc, view, 5, row_count, 80);
+    defer switch_provider.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, switch_provider.items, "Switch provider") != null);
+
+    var change_team = try composeAuthPickerRow(alloc, view, 6, row_count, 80);
     defer change_team.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, change_team.items, "Change team") != null);
     try std.testing.expect(std.mem.find(u8, change_team.items, "sign in first") != null);
 
-    var switch_credential = try composeAuthPickerRow(alloc, view, 6, row_count, 80);
+    var switch_credential = try composeAuthPickerRow(alloc, view, 7, row_count, 80);
     defer switch_credential.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, switch_credential.items, "Switch credential") != null);
 }
@@ -1830,6 +1849,33 @@ test "sign-in stage renders the complete device authorization screen" {
     }) |expected| {
         try std.testing.expect(std.mem.find(u8, screen.items, expected) != null);
     }
+}
+
+test "Codex sign-in stage renders a bounded clickable authorization action" {
+    const alloc = std.testing.allocator;
+    const url = "https://auth.openai.test/oauth/authorize?response_type=code&client_id=test&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&state=full-state";
+    const view = auth_runtime.PickerView{
+        .active = true,
+        .available_sources = .empty,
+        .selected_choice = null,
+        .active_source = null,
+        .include_skip = false,
+        .stage = .sign_in,
+        .sign_in_source = .chatgpt_subscription,
+        .sign_in = .{
+            .state = .polling,
+            .verification_uri = url,
+        },
+    };
+
+    var row = try composeAuthPickerRow(alloc, view, 2, authPickerRowCount(view), 40);
+    defer row.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, row.items, "   Open   ") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "Authorize with Codex") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "\x1b]8;") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, url) != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "\x1b]8;;\x1b\\") != null);
+    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 40);
 }
 
 test "partially visible auth picker shows a source window without duplicates" {

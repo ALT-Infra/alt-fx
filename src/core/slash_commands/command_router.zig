@@ -25,7 +25,6 @@ pub const ParsedCommand = union(enum) {
     images: []const u8,
     model: []const u8,
     models,
-    provider: []const u8,
     permissions: []const u8,
     allowlist: []const u8,
     stats,
@@ -71,7 +70,6 @@ pub const CommandHandlers = struct {
     manage_images: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_model: *const fn (ctx: *anyopaque, query: []const u8) anyerror!void,
     show_models: *const fn (ctx: *anyopaque) anyerror!void,
-    handle_provider: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_permissions: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_allowlist: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     show_stats: *const fn (ctx: *anyopaque) anyerror!void,
@@ -123,7 +121,6 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .image => .{ .image = payload },
         .model => .{ .model = payload },
         .models => .models,
-        .provider => .{ .provider = payload },
         .permissions => .{ .permissions = payload },
         .allowlist => .{ .allowlist = payload },
         .stats => .stats,
@@ -183,7 +180,6 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .images => |rest| try handlers.manage_images(handlers.ctx, rest),
         .model => |query| try handlers.handle_model(handlers.ctx, query),
         .models => try handlers.show_models(handlers.ctx),
-        .provider => |rest| try handlers.handle_provider(handlers.ctx, rest),
         .permissions => |rest| try handlers.handle_permissions(handlers.ctx, rest),
         .allowlist => |rest| try handlers.handle_allowlist(handlers.ctx, rest),
         .stats => try handlers.show_stats(handlers.ctx),
@@ -236,11 +232,8 @@ test "parse recognizes models" {
     }
 }
 
-test "parse extracts provider selection" {
-    switch (parse(testSlashRegistry(), "/provider codex")) {
-        .provider => |provider| try std.testing.expectEqualStrings("codex", provider),
-        else => return error.TestExpectedEqual,
-    }
+test "parse leaves provider selection to setup" {
+    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/provider codex"));
 }
 
 test "parse extracts allowlist command payload" {
@@ -564,7 +557,6 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .manage_images = unexpectedPayload,
         .handle_model = unexpectedPayload,
         .show_models = unexpectedNoPayload,
-        .handle_provider = unexpectedPayload,
         .handle_permissions = unexpectedPayload,
         .handle_allowlist = unexpectedPayload,
         .show_stats = unexpectedNoPayload,

@@ -642,6 +642,178 @@ fn runNoConfigIfRequestedWithDeps(
     return true;
 }
 
+const ProviderActivationCaller = enum {
+    provider_command,
+    provider_login,
+};
+
+fn writeProviderActivationError(
+    alloc: Allocator,
+    deps: RunDeps,
+    caller: ProviderActivationCaller,
+    detail: []const u8,
+) !void {
+    const message = try std.fmt.allocPrint(
+        alloc,
+        "{s}: {s}\n",
+        .{ if (caller == .provider_login) "fx login" else "fx provider", detail },
+    );
+    defer alloc.free(message);
+    try writeStderr(deps, message);
+}
+
+fn activateProviderSelection(
+    alloc: Allocator,
+    cfg: Config,
+    deps: RunDeps,
+    target: model_provider.ProviderId,
+    caller: ProviderActivationCaller,
+) !bool {
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    defer alloc.free(workspace_root);
+    var settings = config_runtime.loadMergedSettings(alloc, workspace_root) catch |err| {
+        try writeProviderActivationError(alloc, deps, caller, "could not load settings");
+        debug_trace.logf("config", "provider selection settings load failed err={s}", .{@errorName(err)});
+        return false;
+    };
+    defer settings.deinit(alloc);
+
+    var resolution = try credentials.resolveForProvider(
+        alloc,
+        cfg.gateway_provider.oauth_transport,
+        cfg.secret_store,
+        .refresh_if_needed,
+        target,
+        settings.credential_source,
+    );
+    defer if (resolution.credential) |*credential| credential.deinit(alloc);
+
+    const already_selected = (settings.provider orelse .gateway) == target;
+    if (caller == .provider_command and already_selected and resolution.credential != null) {
+        try writeStdout(deps, switch (target) {
+            .gateway => "Gateway is already selected.\n",
+            .codex => "Codex is already selected.\n",
+            .grok => "Grok is already selected.\n",
+        });
+        return true;
+    }
+
+    var performed_login: ?model_provider.ProviderId = null;
+    if (resolution.credential == null and target == .codex and caller == .provider_command) {
+        chatgpt_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener) catch |err| {
+            debug_trace.logf("auth", "provider selection Codex login failed err={s}", .{@errorName(err)});
+            try writeProviderActivationError(alloc, deps, caller, "Codex login failed");
+            return false;
+        };
+        performed_login = .codex;
+        resolution = try credentials.resolveForProvider(
+            alloc,
+            cfg.gateway_provider.oauth_transport,
+            cfg.secret_store,
+            .refresh_if_needed,
+            target,
+            settings.credential_source,
+        );
+    }
+    if (resolution.credential == null and target == .grok and caller == .provider_command) {
+        grok_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener) catch |err| {
+            debug_trace.logf("auth", "provider selection Grok login failed err={s}", .{@errorName(err)});
+            try writeProviderActivationError(alloc, deps, caller, "Grok login failed");
+            return false;
+        };
+        performed_login = .grok;
+        resolution = try credentials.resolveForProvider(
+            alloc,
+            cfg.gateway_provider.oauth_transport,
+            cfg.secret_store,
+            .refresh_if_needed,
+            target,
+            settings.credential_source,
+        );
+    }
+
+    const credential = if (resolution.credential) |*value| value else {
+        try writeProviderActivationError(
+            alloc,
+            deps,
+            caller,
+            switch (target) {
+                .codex => "Codex credential is unavailable",
+                .grok => "Grok credential is unavailable",
+                .gateway => "configure a Gateway credential first",
+            },
+        );
+        return false;
+    };
+    const catalog_provider = switch (target) {
+        .codex => cfg.codex_model_catalog orelse {
+            try writeProviderActivationError(alloc, deps, caller, "Codex model catalog is unavailable");
+            return false;
+        },
+        .grok => cfg.grok_model_catalog orelse {
+            try writeProviderActivationError(alloc, deps, caller, "Grok model catalog is unavailable");
+            return false;
+        },
+        .gateway => cfg.gateway_provider.model_catalog,
+    };
+    const fetch_result = model_catalog.fetchWithPublicFallback(catalog_provider, alloc, .{
+        .access = credentials.catalogAccessAt(credential.*, io_mod.milliTimestamp()),
+        .endpoint = cfg.models_path,
+        .view = .picker,
+    });
+    var loaded = switch (fetch_result) {
+        .loaded => |loaded| loaded,
+        .failed => |failure| {
+            debug_trace.logf("catalog", "provider selection catalog failed provider={s} category={s}", .{ @tagName(target), @tagName(failure.failure.category) });
+            const detail = try std.fmt.allocPrint(
+                alloc,
+                "could not load the target model catalog ({s})",
+                .{@tagName(failure.failure.category)},
+            );
+            defer alloc.free(detail);
+            try writeProviderActivationError(alloc, deps, caller, detail);
+            return false;
+        },
+    };
+    defer model_catalog.freeModelCatalog(alloc, &loaded.catalog);
+    const saved_model = switch (target) {
+        .gateway => settings.model,
+        .codex => settings.codex_model,
+        .grok => settings.grok_model,
+    };
+    const selected_model = selectCatalogModel(loaded.catalog.items, saved_model) orelse {
+        try writeProviderActivationError(alloc, deps, caller, "target model catalog is empty");
+        return false;
+    };
+    var attempt = config_runtime.attemptUserPreferences(alloc, switch (target) {
+        .gateway => .{ .provider = target, .model = selected_model },
+        .codex => .{ .provider = target, .codex_model = selected_model },
+        .grok => .{ .provider = target, .grok_model = selected_model },
+    });
+    defer attempt.deinit(alloc);
+    switch (attempt) {
+        .failure => |failure| {
+            debug_trace.logf("config", "provider selection persistence failed err={s}", .{@errorName(failure.err)});
+            try writeProviderActivationError(alloc, deps, caller, "failed to save provider selection");
+            return false;
+        },
+        .outcome => {},
+    }
+    if (performed_login) |provider| switch (provider) {
+        .codex => try writeStdout(deps, "Signed in with Codex.\n"),
+        .grok => try writeStdout(deps, "Signed in with Grok.\n"),
+        .gateway => unreachable,
+    };
+    if (caller == .provider_command) {
+        try writeStdout(deps, switch (target) {
+            .gateway => "Provider set to Gateway.\n",
+            .codex => "Provider set to Codex.\n",
+            .grok => "Provider set to Grok.\n",
+        });
+    }
+    return true;
+}
+
 fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: RunDeps) !RunResult {
     const parsed_launch = parseInteractiveLaunch(alloc, args, cfg.command_catalog) catch |err| {
         if (err == error.RecordModifierRequiresInteractive) {
@@ -781,27 +953,39 @@ fn runNonInteractiveWithDeps(
                     try writeStderr(deps, message);
                     return .handled_failure;
                 },
-                .codex => chatgpt_oauth.runLogin(
-                    alloc,
-                    cfg.gateway_provider.oauth_transport,
-                    cfg.url_opener,
-                ) catch |err| {
-                    const message = switch (err) {
-                        error.ChatGptLoginTimedOut => "fx login: Codex authorization expired; run fx login codex again\n",
-                        error.ChatGptAuthorizationFailed => "fx login: Codex authorization denied\n",
-                        else => "fx login: failed to sign in with Codex\n",
+                .codex => {
+                    chatgpt_oauth.runLogin(
+                        alloc,
+                        cfg.gateway_provider.oauth_transport,
+                        cfg.url_opener,
+                    ) catch |err| {
+                        const message = switch (err) {
+                            error.ChatGptLoginTimedOut => "fx login: Codex authorization expired; run fx login codex again\n",
+                            error.ChatGptAuthorizationFailed => "fx login: Codex authorization denied\n",
+                            else => "fx login: failed to sign in with Codex\n",
+                        };
+                        try writeStderr(deps, message);
+                        return .handled_failure;
                     };
-                    try writeStderr(deps, message);
-                    return .handled_failure;
+                    if (!try activateProviderSelection(alloc, cfg, deps, .codex, .provider_login)) {
+                        return .handled_failure;
+                    }
+                    try writeStdout(deps, "Signed in with Codex.\n");
                 },
-                .grok => grok_oauth.runLogin(
-                    alloc,
-                    cfg.gateway_provider.oauth_transport,
-                    cfg.url_opener,
-                ) catch |err| {
-                    debug_trace.logf("auth", "Grok login failed err={s}", .{@errorName(err)});
-                    try writeStderr(deps, "fx login: failed to sign in with Grok\n");
-                    return .handled_failure;
+                .grok => {
+                    grok_oauth.runLogin(
+                        alloc,
+                        cfg.gateway_provider.oauth_transport,
+                        cfg.url_opener,
+                    ) catch |err| {
+                        debug_trace.logf("auth", "Grok login failed err={s}", .{@errorName(err)});
+                        try writeStderr(deps, "fx login: failed to sign in with Grok\n");
+                        return .handled_failure;
+                    };
+                    if (!try activateProviderSelection(alloc, cfg, deps, .grok, .provider_login)) {
+                        return .handled_failure;
+                    }
+                    try writeStdout(deps, "Signed in with Grok.\n");
                 },
             }
             return .handled_success;
@@ -904,132 +1088,10 @@ fn runNonInteractiveWithDeps(
                 try writeStderr(deps, "fx provider: expected gateway, codex, or grok\n");
                 return .handled_failure;
             };
-            const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-            defer alloc.free(workspace_root);
-            var settings = config_runtime.loadMergedSettings(alloc, workspace_root) catch |err| {
-                try writeStderr(deps, "fx provider: could not load settings\n");
-                debug_trace.logf("config", "provider selection settings load failed err={s}", .{@errorName(err)});
-                return .handled_failure;
-            };
-            defer settings.deinit(alloc);
-            if ((settings.provider orelse .gateway) == target) {
-                const message = switch (target) {
-                    .gateway => "Gateway is already selected.\n",
-                    .codex => "Codex is already selected.\n",
-                    .grok => "Grok is already selected.\n",
-                };
-                try writeStdout(deps, message);
-                return .handled_success;
-            }
-
-            var resolution = try credentials.resolveForProvider(
-                alloc,
-                cfg.gateway_provider.oauth_transport,
-                cfg.secret_store,
-                .refresh_if_needed,
-                target,
-                settings.credential_source,
-            );
-            defer if (resolution.credential) |*credential| credential.deinit(alloc);
-            if (resolution.credential == null and target == .codex) {
-                chatgpt_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener) catch |err| {
-                    debug_trace.logf("auth", "provider selection Codex login failed err={s}", .{@errorName(err)});
-                    try writeStderr(deps, "fx provider: Codex login failed\n");
-                    return .handled_failure;
-                };
-                resolution = try credentials.resolveForProvider(
-                    alloc,
-                    cfg.gateway_provider.oauth_transport,
-                    cfg.secret_store,
-                    .refresh_if_needed,
-                    target,
-                    settings.credential_source,
-                );
-            }
-            if (resolution.credential == null and target == .grok) {
-                grok_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener) catch |err| {
-                    debug_trace.logf("auth", "provider selection Grok login failed err={s}", .{@errorName(err)});
-                    try writeStderr(deps, "fx provider: Grok login failed\n");
-                    return .handled_failure;
-                };
-                resolution = try credentials.resolveForProvider(
-                    alloc,
-                    cfg.gateway_provider.oauth_transport,
-                    cfg.secret_store,
-                    .refresh_if_needed,
-                    target,
-                    settings.credential_source,
-                );
-            }
-            const credential = if (resolution.credential) |*value| value else {
-                try writeStderr(deps, if (target == .codex)
-                    "fx provider: run fx login codex first\n"
-                else if (target == .grok)
-                    "fx provider: run fx login grok first\n"
-                else
-                    "fx provider: configure a Gateway credential first\n");
-                return .handled_failure;
-            };
-            const catalog_provider = switch (target) {
-                .codex => cfg.codex_model_catalog orelse {
-                    try writeStderr(deps, "fx provider: Codex model catalog is unavailable\n");
-                    return .handled_failure;
-                },
-                .grok => cfg.grok_model_catalog orelse {
-                    try writeStderr(deps, "fx provider: Grok model catalog is unavailable\n");
-                    return .handled_failure;
-                },
-                .gateway => cfg.gateway_provider.model_catalog,
-            };
-            const fetch_result = model_catalog.fetchWithPublicFallback(catalog_provider, alloc, .{
-                .access = credentials.catalogAccessAt(credential.*, io_mod.milliTimestamp()),
-                .endpoint = cfg.models_path,
-                .view = .picker,
-            });
-            var loaded = switch (fetch_result) {
-                .loaded => |loaded| loaded,
-                .failed => |failure| {
-                    debug_trace.logf("catalog", "provider selection catalog failed provider={s} category={s}", .{ @tagName(target), @tagName(failure.failure.category) });
-                    const message = try std.fmt.allocPrint(
-                        alloc,
-                        "fx provider: could not load the target model catalog ({s})\n",
-                        .{@tagName(failure.failure.category)},
-                    );
-                    defer alloc.free(message);
-                    try writeStderr(deps, message);
-                    return .handled_failure;
-                },
-            };
-            defer model_catalog.freeModelCatalog(alloc, &loaded.catalog);
-            const saved_model = switch (target) {
-                .gateway => settings.model,
-                .codex => settings.codex_model,
-                .grok => settings.grok_model,
-            };
-            const selected_model = selectCatalogModel(loaded.catalog.items, saved_model) orelse {
-                try writeStderr(deps, "fx provider: target model catalog is empty\n");
-                return .handled_failure;
-            };
-            var attempt = config_runtime.attemptUserPreferences(alloc, switch (target) {
-                .gateway => .{ .provider = target, .model = selected_model },
-                .codex => .{ .provider = target, .codex_model = selected_model },
-                .grok => .{ .provider = target, .grok_model = selected_model },
-            });
-            defer attempt.deinit(alloc);
-            switch (attempt) {
-                .failure => |failure| {
-                    debug_trace.logf("config", "provider selection persistence failed err={s}", .{@errorName(failure.err)});
-                    try writeStderr(deps, "fx provider: failed to save provider selection\n");
-                    return .handled_failure;
-                },
-                .outcome => {},
-            }
-            try writeStdout(deps, switch (target) {
-                .gateway => "Provider set to Gateway.\n",
-                .codex => "Provider set to Codex.\n",
-                .grok => "Provider set to Grok.\n",
-            });
-            return .handled_success;
+            return if (try activateProviderSelection(alloc, cfg, deps, target, .provider_command))
+                .handled_success
+            else
+                .handled_failure;
         },
         .setup => |rest| {
             if (rest.len != 0) {

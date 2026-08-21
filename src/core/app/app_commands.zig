@@ -332,7 +332,6 @@ pub fn Handlers(comptime App: type) type {
                 .manage_images = commandManageImages,
                 .handle_model = commandHandleModel,
                 .show_models = commandShowModels,
-                .handle_provider = commandHandleProvider,
                 .handle_permissions = commandHandlePermissions,
                 .handle_allowlist = commandHandleAllowlist,
                 .show_stats = commandShowStats,
@@ -575,19 +574,6 @@ pub fn Handlers(comptime App: type) type {
                     .topic = "auth",
                     .tone = .@"error",
                     .body = "logout is not available in this runtime",
-                }, true);
-            }
-        }
-
-        fn commandHandleProvider(ctx: *anyopaque, rest: []const u8) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            if (comptime @hasDecl(App, "runProviderCommand")) {
-                try app.runProviderCommand(rest);
-            } else {
-                try app.writeDomainNotice(.{
-                    .topic = "provider",
-                    .tone = .@"error",
-                    .body = "provider switching is not available in this runtime",
                 }, true);
             }
         }
