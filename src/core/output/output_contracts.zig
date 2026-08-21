@@ -640,10 +640,11 @@ pub const ModelListSnapshot = struct {
 
     pub fn renderText(self: ModelListSnapshot, alloc: Allocator) ![]u8 {
         if (self.ids.len == 0) {
+            const provider_name = self.emptyCatalogProviderName();
             if (self.catalogExplanation()) |explanation| {
-                return std.fmt.allocPrint(alloc, "[models] no models returned by {s}\n[models] {s}\n", .{ model_provider.label(self.provider), explanation });
+                return std.fmt.allocPrint(alloc, "[models] no models returned by {s}\n[models] {s}\n", .{ provider_name, explanation });
             }
-            return std.fmt.allocPrint(alloc, "[models] no models returned by {s}\n", .{model_provider.label(self.provider)});
+            return std.fmt.allocPrint(alloc, "[models] no models returned by {s}\n", .{provider_name});
         }
 
         var out: std.Io.Writer.Allocating = .init(alloc);
@@ -665,10 +666,11 @@ pub const ModelListSnapshot = struct {
 
     pub fn renderInteractiveBody(self: ModelListSnapshot, alloc: Allocator) ![]u8 {
         if (self.ids.len == 0) {
+            const provider_name = self.emptyCatalogProviderName();
             if (self.catalogExplanation()) |explanation| {
-                return std.fmt.allocPrint(alloc, "no models returned by {s}\n{s}", .{ model_provider.label(self.provider), explanation });
+                return std.fmt.allocPrint(alloc, "no models returned by {s}\n{s}", .{ provider_name, explanation });
             }
-            return std.fmt.allocPrint(alloc, "no models returned by {s}", .{model_provider.label(self.provider)});
+            return std.fmt.allocPrint(alloc, "no models returned by {s}", .{provider_name});
         }
 
         var out: std.Io.Writer.Allocating = .init(alloc);
@@ -709,6 +711,13 @@ pub const ModelListSnapshot = struct {
 
     fn shownCount(self: ModelListSnapshot) usize {
         return if (self.limit) |value| @min(self.ids.len, value) else self.ids.len;
+    }
+
+    fn emptyCatalogProviderName(self: ModelListSnapshot) []const u8 {
+        return switch (self.provider) {
+            .gateway => "gateway",
+            .codex => model_provider.label(.codex),
+        };
     }
 
     fn catalogExplanation(self: ModelListSnapshot) ?[]const u8 {
@@ -2071,13 +2080,18 @@ test "model list explains public-only and rejected-credential catalogs" {
         },
         .{
             .snapshot = .{ .ids = &.{}, .private_models_hidden = true, .public_only_reason = .no_credential },
-            .text = "[models] no models returned by Vercel AI Gateway\n[models] Using the public model catalog; sign in with Vercel or use an AI Gateway API key for team-private models.\n",
-            .body = "no models returned by Vercel AI Gateway\nUsing the public model catalog; sign in with Vercel or use an AI Gateway API key for team-private models.",
+            .text = "[models] no models returned by gateway\n[models] Using the public model catalog; sign in with Vercel or use an AI Gateway API key for team-private models.\n",
+            .body = "no models returned by gateway\nUsing the public model catalog; sign in with Vercel or use an AI Gateway API key for team-private models.",
         },
         .{
             .snapshot = .{ .ids = &.{}, .private_models_hidden = true, .public_only_reason = .authenticated_credential_rejected },
-            .text = "[models] no models returned by Vercel AI Gateway\n[models] Your Gateway credential was rejected; using the public model catalog.\n",
-            .body = "no models returned by Vercel AI Gateway\nYour Gateway credential was rejected; using the public model catalog.",
+            .text = "[models] no models returned by gateway\n[models] Your Gateway credential was rejected; using the public model catalog.\n",
+            .body = "no models returned by gateway\nYour Gateway credential was rejected; using the public model catalog.",
+        },
+        .{
+            .snapshot = .{ .ids = &.{}, .provider = .codex },
+            .text = "[models] no models returned by Codex subscription\n",
+            .body = "no models returned by Codex subscription",
         },
     };
 
@@ -2133,7 +2147,7 @@ test "core model list snapshot handles limits and empty lists" {
 
     const empty_text = try (ModelListSnapshot{ .ids = &.{} }).renderText(std.testing.allocator);
     defer std.testing.allocator.free(empty_text);
-    try std.testing.expectEqualStrings("[models] no models returned by Vercel AI Gateway\n", empty_text);
+    try std.testing.expectEqualStrings("[models] no models returned by gateway\n", empty_text);
 
     const empty_json = try (ModelListSnapshot{ .ids = &.{} }).renderJson(std.testing.allocator);
     defer std.testing.allocator.free(empty_json);

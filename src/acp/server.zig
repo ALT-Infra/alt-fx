@@ -325,8 +325,10 @@ fn adoptServerCredential(state: *ServerState, credential: *credentials.Credentia
         active.api_key = state.api_key;
         active.credential_source = state.credential_source;
         active.account_id = state.account_id;
-        if (state.credential_source == .chatgpt_subscription) {
-            active.session_rt.usage.clearReconciliationCredential();
+        if (comptime !host_target.is_wasm) {
+            if (state.credential_source == .chatgpt_subscription) {
+                active.session_rt.usage.clearReconciliationCredential();
+            }
         }
     }
 }

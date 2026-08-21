@@ -2964,7 +2964,7 @@ pub fn Runtime(comptime App: type) type {
         /// workspace basename. The active model remains visible as secondary
         /// context, including after a model switch.
         pub fn syncTerminalTitle(app: *App) void {
-            if (comptime !@hasField(App, "selected_model")) return;
+            if (comptime !provider_runtime.supported(App)) return;
             syncTerminalTitleWith(app, terminalTitle(app));
         }
 
@@ -2972,7 +2972,7 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             provider: host_capability.TerminalTitle,
         ) void {
-            if (comptime !@hasField(App, "selected_model")) return;
+            if (comptime !provider_runtime.supported(App)) return;
             var label_buffer: [terminal_title_label_max_bytes]u8 = undefined;
             var writer: std.Io.Writer = .fixed(&label_buffer);
             const primary = cachedSessionTitle(app) orelse workspaceTerminalTitle(app);
@@ -2981,11 +2981,12 @@ pub fn Runtime(comptime App: type) type {
                 primary,
                 terminal_title_primary_max_bytes,
             ) catch return;
-            if (app.selected_model.items.len > 0) {
+            const selected_model = provider_runtime.model(app);
+            if (selected_model.len > 0) {
                 writer.writeAll(terminal_title_separator) catch return;
                 writeBoundedTerminalTitleComponent(
                     &writer,
-                    app.selected_model.items,
+                    selected_model,
                     terminal_title_model_max_bytes,
                 ) catch return;
             }
