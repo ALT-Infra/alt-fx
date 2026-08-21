@@ -122,7 +122,6 @@ const Context = struct {
         result.session_grants = self.admission.grants;
         result.permission_rules = self.admission.rules;
         result.permission_state_override = &self.admission.permission_state;
-        result.sandbox_backend = self.admission.sandbox_backend;
         result.advertised_dynamic_tool_names = self.admission.integration_names;
         result.mcp_access = if (self.admission.mcp_view) |*view|
             .{ .scoped = .{
@@ -248,7 +247,6 @@ pub fn run(
         else
             null,
         .permission_mode = admission.permission_mode,
-        .sandbox_backend = admission.sandbox_backend,
         .history = history,
         .root_user_intent_context = if (message.root_user_intent_context.len > 0)
             arena.dupe(u8, message.root_user_intent_context) catch return error.OutOfMemory
@@ -335,7 +333,6 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .check_tool_availability = checkToolAvailability,
         .request_tool_permission = requestToolPermission,
         .request_prepared_file_mutation_permission = requestPreparedFileMutationPermission,
-        .request_sandbox_widening = requestSandboxWidening,
         .resolve_tool_action_display_target = resolveToolActionDisplayTarget,
         .describe_tool_action = describeToolAction,
         .describe_tool_action_completed = describeToolAction,
@@ -431,7 +428,6 @@ fn appendRuntimeContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayL
         .access_scope = tool_ctx.access_scope,
         .interactive = false,
         .permission_mode = context.admission.permission_mode,
-        .sandbox_backend = context.admission.sandbox_backend,
         .tracker = null,
         .background = tool_ctx.background,
         .session = context.turn.sessionRuntime(),
@@ -557,16 +553,6 @@ fn requestToolPermission(
             action.authority,
             action.human_approval,
         ),
-        .sandbox_widening => |widening| tool_admission.revalidateLiveSandboxWideningOutcome(
-            tool_ctx.admissionInputWithLiveAuthority(live),
-            arena,
-            call,
-            mode,
-            grants,
-            widening.authority,
-            widening.required.wideningInput(),
-            widening.human_approval,
-        ),
     };
     return tool_admission.requestPermissionOutcome(
         tool_ctx.admissionInputWithLiveAuthority(live),
@@ -597,29 +583,6 @@ fn requestPreparedFileMutationPermission(
         prepared,
         mode,
         grants,
-    );
-}
-
-fn requestSandboxWidening(
-    raw: *anyopaque,
-    arena: Allocator,
-    call: types.ToolCall,
-    review: auto_classifier.ReviewTurnContext,
-    mode: types.PermissionMode,
-    grants: []const types.PermissionGrant,
-    live: ?agent_runtime.LiveToolAuthority,
-    dynamic_names: []const []const u8,
-    required: agent_runtime.SandboxScopeRequired,
-) !command_admission.PermissionOutcome {
-    const context: *Context = @ptrCast(@alignCast(raw));
-    const tool_ctx = admissionContext(context, dynamic_names, review);
-    return tool_admission.requestSandboxWideningOutcome(
-        tool_ctx.admissionInputWithLiveAuthority(live),
-        arena,
-        call,
-        mode,
-        grants,
-        required.wideningInput(),
     );
 }
 

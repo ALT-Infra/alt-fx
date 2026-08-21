@@ -43,7 +43,6 @@ pub const ParsedCommand = union(enum) {
     paste,
     fast,
     appearance: []const u8,
-    sandbox: []const u8,
     statusline: []const u8,
     notifications: []const u8,
     workspace: []const u8,
@@ -90,7 +89,6 @@ pub const CommandHandlers = struct {
     paste_clipboard: *const fn (ctx: *anyopaque) anyerror!void,
     toggle_fast: *const fn (ctx: *anyopaque) anyerror!void,
     handle_appearance: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
-    handle_sandbox: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_statusline: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     rename_session: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_notifications: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
@@ -143,7 +141,6 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .paste => .paste,
         .fast => .fast,
         .appearance => .{ .appearance = payload },
-        .sandbox => .{ .sandbox = payload },
         .statusline => .{ .statusline = payload },
         .notifications => .{ .notifications = payload },
         .workspace => .{ .workspace = payload },
@@ -204,7 +201,6 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .paste => try handlers.paste_clipboard(handlers.ctx),
         .fast => try handlers.toggle_fast(handlers.ctx),
         .appearance => |rest| try handlers.handle_appearance(handlers.ctx, rest),
-        .sandbox => |rest| try handlers.handle_sandbox(handlers.ctx, rest),
         .statusline => |rest| try handlers.handle_statusline(handlers.ctx, rest),
         .notifications => |rest| try handlers.handle_notifications(handlers.ctx, rest),
         .workspace => |rest| try handlers.handle_workspace(handlers.ctx, rest),
@@ -369,17 +365,6 @@ test "parse extracts alias payload" {
     }
 }
 
-test "parse extracts sandbox command payload" {
-    switch (parse(testSlashRegistry(), "/sandbox vercel")) {
-        .sandbox => |rest| try std.testing.expectEqualStrings("vercel", rest),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(testSlashRegistry(), "/sandbox")) {
-        .sandbox => |rest| try std.testing.expectEqualStrings("", rest),
-        else => return error.TestExpectedEqual,
-    }
-}
-
 test "parse extracts appearance and compatibility alias payloads" {
     switch (parse(testSlashRegistry(), "/appearance input tint")) {
         .appearance => |rest| try std.testing.expectEqualStrings("input tint", rest),
@@ -431,10 +416,6 @@ test "parse returns empty payload for bare prefix commands" {
     }
     switch (parse(testSlashRegistry(), "/skills")) {
         .skills => |rest| try std.testing.expectEqualStrings("", rest),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(testSlashRegistry(), "/sandbox")) {
-        .sandbox => |rest| try std.testing.expectEqualStrings("", rest),
         else => return error.TestExpectedEqual,
     }
     switch (parse(testSlashRegistry(), "/appearance")) {
@@ -601,7 +582,6 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .paste_clipboard = unexpectedNoPayload,
         .toggle_fast = unexpectedNoPayload,
         .handle_appearance = unexpectedPayload,
-        .handle_sandbox = unexpectedPayload,
         .handle_statusline = unexpectedPayload,
         .rename_session = unexpectedPayload,
         .handle_notifications = unexpectedPayload,

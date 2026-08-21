@@ -23,7 +23,6 @@ const model_catalog = @import("../core/gateway/model_catalog.zig");
 const hooks = @import("../core/hooks/hooks.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
 const mode_registry = @import("../core/modes/mode_registry.zig");
-const sandbox = @import("../core/permissions/sandbox.zig");
 const skill_runtime = @import("../core/skills/skill_runtime.zig");
 const session_codec = @import("../core/session/session_codec.zig");
 const session_log = @import("../core/session/session_log.zig");
@@ -163,7 +162,6 @@ pub const ActiveSessionState = struct {
     effort: types.ReasoningEffort,
     first_call_tool_choice: types.ToolChoice,
     permission_mode: types.PermissionMode,
-    sandbox_backend: sandbox.BackendKind,
     permission_rules: types.PermissionRuleSet,
     /// Runtime-only "allow for this session" grants. Never persisted to
     /// profile or project configuration.
@@ -202,7 +200,6 @@ const ActivePrompt = struct {
     /// Mid-turn mode changes apply to the next prompt, never the running one.
     mode: []const u8,
     permission_mode: types.PermissionMode,
-    sandbox_backend: sandbox.BackendKind,
     thread: if (host_target.is_wasm) void else std.Thread = if (host_target.is_wasm) {} else undefined,
     reapable: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
@@ -235,7 +232,6 @@ pub const ServerState = struct {
     effort: types.ReasoningEffort = .auto,
     first_call_tool_choice: types.ToolChoice = .auto,
     context_enabled: bool = true,
-    sandbox_backend: sandbox.BackendKind = .none,
     active_session: ?ActiveSessionState = null,
     active_prompt: ?*ActivePrompt = null,
     subagent_authority_mutex: std.Io.Mutex = .init,
@@ -580,7 +576,6 @@ fn resolveSubagentAuthority(
                 },
             },
         },
-        active.sandbox_backend,
         owned_integrations,
         active.permission_rules,
         active.session_grants,
@@ -1160,10 +1155,6 @@ fn startPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Messag
         .msg = try cloneMessage(alloc, msg),
         .mode = session.mode,
         .permission_mode = session.permission_mode,
-        .sandbox_backend = sandbox.effectiveBackend(
-            session.permission_mode,
-            session.sandbox_backend,
-        ),
     };
     errdefer jsonrpc.freeMessage(alloc, &active.msg);
 
@@ -1185,7 +1176,6 @@ fn promptWorkerMain(active: *ActivePrompt) void {
         &active.msg,
         active.mode,
         active.permission_mode,
-        active.sandbox_backend,
     ) catch |err| .{
         .rpc_error = .{
             .code = ErrorCode.internal_error,
@@ -1319,10 +1309,10 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         });
     };
 
-    var startup = loadConfiguredStartupState(state, alloc) catch |err| {
+    var startup = loadConfiguredStartupState(state, alloc) catch {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.internal_error,
-            .message = sandbox.configErrorMessage(err) orelse "Failed to load startup state",
+            .message = "Failed to load startup state",
         });
     };
     defer startup.deinit(alloc);
@@ -1423,7 +1413,6 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.effort = startup.effort;
     state.first_call_tool_choice = startup.first_call_tool_choice;
     state.context_enabled = startup.context_enabled;
-    state.sandbox_backend = startup.sandbox_backend;
 
     if (comptime !host_target.is_wasm) {
         const loaded_skills = try app_runtime_setup.loadSkills(alloc, state.workspace_root, builtin_skills.root_policy);
@@ -1906,7 +1895,6 @@ test "applySessionMode uses registered mode policy and ignores unknown modes" {
         .effort = .auto,
         .first_call_tool_choice = .auto,
         .permission_mode = .ask,
-        .sandbox_backend = .none,
         .permission_rules = .{},
         .session_rt = .{ .max_history_turns = 0 },
         .cancel_flag = std.atomic.Value(bool).init(false),
@@ -1916,7 +1904,6 @@ test "applySessionMode uses registered mode policy and ignores unknown modes" {
     applySessionMode(registry, &session, "apply");
     try std.testing.expectEqualStrings("apply", session.mode);
     try std.testing.expectEqual(types.PermissionMode.auto, session.permission_mode);
-    try std.testing.expectEqual(sandbox.BackendKind.none, session.sandbox_backend);
 
     applySessionMode(registry, &session, "inspect");
     try std.testing.expectEqualStrings("inspect", session.mode);
@@ -1926,13 +1913,10 @@ test "applySessionMode uses registered mode policy and ignores unknown modes" {
     try std.testing.expectEqualStrings("inspect", session.mode);
     try std.testing.expectEqual(types.PermissionMode.ask, session.permission_mode);
 
-    session.sandbox_backend = .macos;
     applySessionMode(registry, &session, "apply");
     try std.testing.expectEqual(types.PermissionMode.auto, session.permission_mode);
-    try std.testing.expectEqual(sandbox.BackendKind.macos, session.sandbox_backend);
     applySessionMode(registry, &session, "inspect");
     try std.testing.expectEqual(types.PermissionMode.ask, session.permission_mode);
-    try std.testing.expectEqual(sandbox.BackendKind.macos, session.sandbox_backend);
 }
 
 test "ACP notifications with absent id are not response targets" {
