@@ -6,6 +6,7 @@ const background_record_liveness = @import("../background/background_record_live
 const background_store = @import("../background/background_store.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
 const grok_oauth = @import("../auth/grok_oauth.zig");
+const opencode_session = @import("../auth/opencode_session.zig");
 const acp_runner = @import("acp_runner.zig");
 const cli_ask = @import("cli_ask.zig");
 const cli_replay = @import("cli_replay.zig");
@@ -703,6 +704,7 @@ fn activateProviderSelection(
             .gateway => "Gateway is already selected.\n",
             .codex => "Codex is already selected.\n",
             .grok => "Grok is already selected.\n",
+            .opencode => "OpenCode is already selected.\n",
         });
         return true;
     }
@@ -749,6 +751,7 @@ fn activateProviderSelection(
             switch (target) {
                 .codex => "Codex credential is unavailable",
                 .grok => "Grok credential is unavailable",
+                .opencode => "OpenCode credential is unavailable",
                 .gateway => "configure a Gateway credential first",
             },
         );
@@ -758,6 +761,7 @@ fn activateProviderSelection(
         try writeProviderActivationError(alloc, deps, caller, switch (target) {
             .codex => "Codex model catalog is unavailable",
             .grok => "Grok model catalog is unavailable",
+            .opencode => "OpenCode model catalog is unavailable",
             .gateway => "Gateway model catalog is unavailable",
         });
         return false;
@@ -803,6 +807,7 @@ fn activateProviderSelection(
     if (performed_login) |provider| switch (provider) {
         .codex => try writeStdout(deps, "Signed in with Codex.\n"),
         .grok => try writeStdout(deps, "Signed in with Grok.\n"),
+        .opencode => try writeStdout(deps, "Signed in with OpenCode.\n"),
         .gateway => unreachable,
     };
     if (caller == .provider_command) {
@@ -810,6 +815,7 @@ fn activateProviderSelection(
             .gateway => "Provider set to Gateway.\n",
             .codex => "Provider set to Codex.\n",
             .grok => "Provider set to Grok.\n",
+            .opencode => "Provider set to OpenCode.\n",
         });
     }
     return true;
@@ -932,7 +938,7 @@ fn runNonInteractiveWithDeps(
         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
         .login => |rest| {
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx login [vercel|codex|grok]\n");
+                try writeStderr(deps, "usage: fx login [vercel|codex|grok|opencode]\n");
                 return .handled_failure;
             };
             // Preserve the original `fx login` behavior for scripts and users.
@@ -986,12 +992,29 @@ fn runNonInteractiveWithDeps(
                     }
                     try writeStdout(deps, "Signed in with Grok.\n");
                 },
+                .opencode => {
+                    const key = io_mod.getenv("OPENCODE_API_KEY") orelse {
+                        try writeStderr(deps, "fx login: set OPENCODE_API_KEY to your opencode.ai key first\n");
+                        return .handled_failure;
+                    };
+                    var session = opencode_session.Session{ .api_key = try alloc.dupe(u8, key) };
+                    defer session.deinit(alloc);
+                    opencode_session.saveNewSession(alloc, session) catch |err| {
+                        debug_trace.logf("auth", "OpenCode login failed err={s}", .{@errorName(err)});
+                        try writeStderr(deps, "fx login: failed to store the OpenCode API key\n");
+                        return .handled_failure;
+                    };
+                    if (!try activateProviderSelection(alloc, cfg, deps, .opencode, .provider_login)) {
+                        return .handled_failure;
+                    }
+                    try writeStdout(deps, "Signed in with OpenCode.\n");
+                },
             }
             return .handled_success;
         },
         .logout => |rest| {
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx logout [vercel|codex|grok]\n");
+                try writeStderr(deps, "usage: fx logout [vercel|codex|grok|opencode]\n");
                 return .handled_failure;
             };
             // Preserve the original `fx logout` behavior for scripts and users.
@@ -1039,6 +1062,26 @@ fn runNonInteractiveWithDeps(
                     },
                 };
             }
+            if (login_provider == .opencode) {
+                const outcome = opencode_session.logout() catch {
+                    try writeStderr(deps, "fx logout: failed to durably remove saved OpenCode login\n");
+                    return .handled_failure;
+                };
+                return switch (outcome) {
+                    .deleted => result: {
+                        try writeStdout(deps, "Signed out of OpenCode.\n");
+                        break :result .handled_success;
+                    },
+                    .missing => result: {
+                        try writeStdout(deps, "No OpenCode login session found.\n");
+                        break :result .handled_success;
+                    },
+                    .deleted_not_durable => result: {
+                        try writeStderr(deps, "fx logout: failed to durably remove saved OpenCode login\n");
+                        break :result .handled_failure;
+                    },
+                };
+            }
             const result = login_flow.logout(alloc, cfg.gateway_provider.oauth_transport) catch |err| switch (err) {
                 error.SessionDeleteFailed => {
                     try writeStderr(deps, "fx logout: failed to durably remove saved fx login\n");
@@ -1080,11 +1123,11 @@ fn runNonInteractiveWithDeps(
         },
         .provider => |rest| {
             if (rest.len != 1) {
-                try writeStderr(deps, "usage: fx provider <gateway|codex|grok>\n");
+                try writeStderr(deps, "usage: fx provider <gateway|codex|grok|opencode>\n");
                 return .handled_failure;
             }
             const target = model_provider.parse(rest[0]) orelse {
-                try writeStderr(deps, "fx provider: expected gateway, codex, or grok\n");
+                try writeStderr(deps, "fx provider: expected gateway, codex, grok, or opencode\n");
                 return .handled_failure;
             };
             return if (try activateProviderSelection(alloc, cfg, deps, target, .provider_command))
@@ -1180,6 +1223,7 @@ fn runNonInteractiveWithDeps(
                     .gateway => "fx models: Gateway model catalog is unavailable\n",
                     .codex => "fx models: Codex model catalog is unavailable\n",
                     .grok => "fx models: Grok model catalog is unavailable\n",
+                    .opencode => "fx models: OpenCode model catalog is unavailable\n",
                 });
                 return .handled_failure;
             };

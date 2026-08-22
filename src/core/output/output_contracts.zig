@@ -365,7 +365,7 @@ fn writeTerminalSafe(writer: *std.Io.Writer, alloc: Allocator, raw: []const u8) 
 
 fn gatewayProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
     const source = auth.active_source orelse return auth.gateway_connected;
-    return auth.gateway_connected or (source != .chatgpt_subscription and source != .grok_subscription);
+    return auth.gateway_connected or model_provider.authorizesCredential(.gateway, source);
 }
 
 fn chatGptProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
@@ -374,6 +374,10 @@ fn chatGptProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
 
 fn grokProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
     return auth.grok_connected or auth.active_source == .grok_subscription;
+}
+
+fn openCodeProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
+    return auth.opencode_connected or auth.active_source == .opencode_api_key;
 }
 
 fn writeConnectedProvidersText(writer: *std.Io.Writer, auth: auth_runtime.StatusSnapshot) !void {
@@ -390,6 +394,11 @@ fn writeConnectedProvidersText(writer: *std.Io.Writer, auth: auth_runtime.Status
     if (grokProviderConnected(auth)) {
         if (wrote_provider) try writer.writeAll(", Grok");
         if (!wrote_provider) try writer.writeAll("Grok");
+        wrote_provider = true;
+    }
+    if (openCodeProviderConnected(auth)) {
+        if (wrote_provider) try writer.writeAll(", OpenCode");
+        if (!wrote_provider) try writer.writeAll("OpenCode");
         wrote_provider = true;
     }
     if (!wrote_provider) try writer.writeAll("none");
@@ -623,6 +632,12 @@ pub const StatusSnapshot = struct {
             if (grokProviderConnected(self.auth)) {
                 if (wrote_provider) try writer.writeByte(',');
                 try std.json.Stringify.value("grok", .{}, writer);
+                wrote_provider = true;
+            }
+            if (openCodeProviderConnected(self.auth)) {
+                if (wrote_provider) try writer.writeByte(',');
+                try std.json.Stringify.value("opencode", .{}, writer);
+                wrote_provider = true;
             }
             try writer.writeByte(']');
         }
@@ -852,6 +867,7 @@ pub const ModelListSnapshot = struct {
             .gateway => "gateway",
             .codex => provider_catalog.label(.codex),
             .grok => provider_catalog.label(.grok),
+            .opencode => provider_catalog.label(.opencode),
         };
     }
 
@@ -2144,6 +2160,29 @@ test "status distinguishes the selected model route from connected providers" {
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.find(u8, json, "\"model_source\":\"Codex subscription\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"connected_providers\":[\"vercel-ai-gateway\",\"codex\"]") != null);
+}
+
+test "status renders OpenCode as the only connected provider" {
+    const snapshot = StatusSnapshot{
+        .model = "big-pickle",
+        .provider = .opencode,
+        .auth = .{
+            .active_source = .opencode_api_key,
+            .opencode_connected = true,
+        },
+        .permission_mode = .auto,
+        .workspace_root = "/tmp/fx",
+        .history_turns = 0,
+        .session_permission_grants = 0,
+        .agent_step_limit = 24,
+    };
+    const text = try snapshot.renderText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.find(u8, text, "connected_providers=OpenCode\n") != null);
+
+    const json = try snapshot.renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.find(u8, json, "\"connected_providers\":[\"opencode\"]") != null);
 }
 
 test "MCP config diagnostic renders in status text and JSON but not interactive body" {

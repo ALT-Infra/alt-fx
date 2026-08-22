@@ -9,6 +9,7 @@ const model_provider = @import("../config/model_provider.zig");
 const oauth = @import("oauth.zig");
 const oauth_session = @import("oauth_session.zig");
 const oauth_transport = @import("oauth_transport.zig");
+const opencode_session = @import("opencode_session.zig");
 const secret = @import("secret.zig");
 const types = @import("../shared/types.zig");
 
@@ -44,6 +45,7 @@ pub const CatalogAuthenticatedSource = enum {
     stored_key,
     chatgpt_subscription,
     grok_subscription,
+    opencode_api_key,
 
     fn credentialSource(self: CatalogAuthenticatedSource) Source {
         return switch (self) {
@@ -53,6 +55,7 @@ pub const CatalogAuthenticatedSource = enum {
             .stored_key => .stored_key,
             .chatgpt_subscription => .chatgpt_subscription,
             .grok_subscription => .grok_subscription,
+            .opencode_api_key => .opencode_api_key,
         };
     }
 };
@@ -91,7 +94,10 @@ pub const CatalogAccess = union(enum) {
     pub fn publicFallbackAfterRejection(self: CatalogAccess) ?CatalogAccess {
         return switch (self) {
             .public_only => null,
-            .authenticated => |access| if (access.source == .chatgpt_subscription or access.source == .grok_subscription)
+            .authenticated => |access| if (!model_provider.authorizesCredential(
+                .gateway,
+                access.source.credentialSource(),
+            ))
                 null
             else
                 .{
@@ -168,6 +174,7 @@ pub fn catalogAccessForCredentialAndAccount(
         .stored_key => .stored_key,
         .chatgpt_subscription => .chatgpt_subscription,
         .grok_subscription => .grok_subscription,
+        .opencode_api_key => .opencode_api_key,
         .fx_login => blk: {
             const team = team_context orelse
                 return .{ .public_only = .fx_login_team_required };
@@ -180,7 +187,7 @@ pub fn catalogAccessForCredentialAndAccount(
         .authenticated = .{
             .source = authenticated_source,
             .credential = credential,
-            .team_context = if (authenticated_source == .chatgpt_subscription or authenticated_source == .grok_subscription) null else team_context,
+            .team_context = if (model_provider.authorizesCredential(.gateway, selected_source)) team_context else null,
             .account_id = if (authenticated_source == .grok_subscription) account_id else null,
         },
     };
@@ -202,12 +209,40 @@ pub const missing_chatgpt_credential_message = "fx needs a Codex subscription lo
 pub const missing_chatgpt_interactive_credential_message = "Codex needs a subscription login. Run /login, open Connections, then choose Codex subscription.";
 pub const missing_grok_credential_message = "fx needs a Grok subscription login for this model. Run fx login grok.";
 pub const missing_grok_interactive_credential_message = "Grok needs a subscription login. Run /login, open Connections, then choose Grok subscription.";
+pub const missing_opencode_credential_message = "fx needs an OpenCode API key for this model. Set OPENCODE_API_KEY and run fx login opencode.";
+pub const missing_opencode_interactive_credential_message = "OpenCode needs an API key. Set OPENCODE_API_KEY, then run /login, open Connections, and choose OpenCode API key.";
 pub const unreadable_store_message = "fx could not read the stored API key from " ++ stored_key_backend_label ++ ". A key may be saved but unreadable. Set FX_TRACE_LOG for the failing step, or set AI_GATEWAY_API_KEY.";
 
 test "public credential guidance spells fx lowercase" {
     try std.testing.expect(std.mem.startsWith(u8, missing_credential_message, "fx needs"));
     try std.testing.expect(std.mem.startsWith(u8, missing_interactive_credential_message, "fx needs"));
     try std.testing.expect(std.mem.startsWith(u8, unreadable_store_message, "fx could"));
+}
+
+pub const MissingHelpSurface = enum {
+    cli,
+    interactive,
+};
+
+pub fn missingCredentialMessage(required_source: ?Source, surface: MissingHelpSurface) []const u8 {
+    return switch (required_source orelse .fx_login) {
+        .chatgpt_subscription => switch (surface) {
+            .cli => missing_chatgpt_credential_message,
+            .interactive => missing_chatgpt_interactive_credential_message,
+        },
+        .grok_subscription => switch (surface) {
+            .cli => missing_grok_credential_message,
+            .interactive => missing_grok_interactive_credential_message,
+        },
+        .opencode_api_key => switch (surface) {
+            .cli => missing_opencode_credential_message,
+            .interactive => missing_opencode_interactive_credential_message,
+        },
+        else => switch (surface) {
+            .cli => missing_credential_message,
+            .interactive => missing_interactive_credential_message,
+        },
+    };
 }
 
 pub const Credential = struct {
@@ -297,6 +332,10 @@ pub fn resolveForProvider(
             };
             return .{ .credential = credential };
         },
+        .opencode => {
+            const credential = try loadSource(alloc, transport, secret_store, .opencode_api_key);
+            return .{ .credential = credential };
+        },
         .gateway => {},
     }
     return resolvePreferring(
@@ -304,7 +343,7 @@ pub fn resolveForProvider(
         transport,
         secret_store,
         mode,
-        if (preferred == .chatgpt_subscription or preferred == .grok_subscription) null else preferred,
+        if (preferred != null and model_provider.authorizesCredential(.gateway, preferred)) preferred else null,
     );
 }
 
@@ -411,6 +450,7 @@ pub fn loadSource(
         .stored_key => loadStoredKeyCredential(alloc, secret_store),
         .chatgpt_subscription => loadChatGptCredential(alloc, transport, .if_needed),
         .grok_subscription => loadGrokCredential(alloc, transport, .if_needed),
+        .opencode_api_key => loadOpenCodeApiKeyCredential(alloc),
     };
 }
 
@@ -436,6 +476,7 @@ pub fn sourceExists(
         },
         .chatgpt_subscription => chatgpt_oauth.sourceExists(alloc),
         .grok_subscription => grok_oauth.sourceExists(alloc),
+        .opencode_api_key => try openCodeFileKeyExists(alloc),
         .stored_key => blk: {
             if (secret_store.isDisabled()) break :blk false;
             const stored = secret_store.load(alloc) catch |err| switch (err) {
@@ -471,6 +512,25 @@ fn loadStoredKeyCredential(
     if (secret_store.isDisabled()) return null;
     const value = (try secret_store.load(alloc)) orelse return null;
     return .{ .token = value, .source = .stored_key };
+}
+
+fn openCodeFileKeyExists(alloc: std.mem.Allocator) !bool {
+    var session = opencode_session.load(alloc) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            debug_trace.logf("auth", "source probe failed source=opencode_api_key err={s}", .{@errorName(err)});
+            return false;
+        },
+    };
+    defer if (session) |*loaded| loaded.deinit(alloc);
+    return session != null;
+}
+
+fn loadOpenCodeApiKeyCredential(alloc: std.mem.Allocator) !?Credential {
+    var session = try opencode_session.load(alloc);
+    defer if (session) |*loaded| loaded.deinit(alloc);
+    const stored = session orelse return null;
+    return .{ .token = try alloc.dupe(u8, stored.api_key), .source = .opencode_api_key };
 }
 
 fn loadChatGptCredential(
@@ -662,6 +722,7 @@ pub fn sourceLabel(source: Source) []const u8 {
         .stored_key => "stored API key (" ++ stored_key_backend_label ++ ")",
         .chatgpt_subscription => "Codex subscription",
         .grok_subscription => "Grok subscription",
+        .opencode_api_key => "OpenCode API key",
     };
 }
 
