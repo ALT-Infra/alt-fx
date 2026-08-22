@@ -382,7 +382,9 @@ fn adoptServerCredential(state: *ServerState, credential: *credentials.Credentia
         active.credential_refresh_after_ms = state.credential_refresh_after_ms;
         active.account_id = state.account_id;
         if (comptime !host_target.is_wasm) {
-            if (state.credential_source == .chatgpt_subscription or state.credential_source == .grok_subscription) {
+            if (state.credential_source != null and
+                !model_provider.authorizesCredential(.gateway, state.credential_source))
+            {
                 active.session_rt.usage.clearReconciliationCredential();
             }
         }
@@ -1814,12 +1816,10 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         if (routed_credential == null) {
             return state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.invalid_request,
-                .message = if (state.provider == .codex)
-                    credentials.missing_chatgpt_credential_message
-                else if (state.provider == .grok)
-                    credentials.missing_grok_credential_message
-                else
-                    credentials.missing_credential_message,
+                .message = credentials.missingCredentialMessage(
+                    model_provider.requiredCredentialSource(state.provider),
+                    .cli,
+                ),
             });
         }
         break :routed &routed_credential.?;
@@ -1827,12 +1827,10 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     if (credential.token.len == 0) {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
-            .message = if (state.provider == .codex)
-                credentials.missing_chatgpt_credential_message
-            else if (state.provider == .grok)
-                credentials.missing_grok_credential_message
-            else
-                credentials.missing_credential_message,
+            .message = credentials.missingCredentialMessage(
+                model_provider.requiredCredentialSource(state.provider),
+                .cli,
+            ),
         });
     }
     adoptServerCredential(state, credential);
@@ -2027,10 +2025,10 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 if (!try selectCredentialForProvider(state, session.provider)) {
                     return state.writer.writeError(alloc, msg.id, .{
                         .code = ErrorCode.invalid_request,
-                        .message = if (session.provider == .codex)
-                            credentials.missing_chatgpt_credential_message
-                        else
-                            credentials.missing_grok_credential_message,
+                        .message = credentials.missingCredentialMessage(
+                            model_provider.requiredCredentialSource(session.provider),
+                            .cli,
+                        ),
                     });
                 }
             }
@@ -2091,7 +2089,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             if (host_target.is_wasm) {
                 return state.writer.writeError(alloc, msg.id, .{
                     .code = ErrorCode.invalid_request,
-                    .message = "Subscription provider switching is unavailable in this WASM runtime",
+                    .message = "Non-Gateway provider switching is unavailable in this WASM runtime",
                 });
             }
             var staged_credential = if (target == .gateway and state.cfg.credential_override != null)
@@ -2109,12 +2107,10 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 )) orelse
                     return state.writer.writeError(alloc, msg.id, .{
                         .code = ErrorCode.invalid_request,
-                        .message = if (target == .codex)
-                            credentials.missing_chatgpt_credential_message
-                        else if (target == .grok)
-                            credentials.missing_grok_credential_message
-                        else
-                            credentials.missing_credential_message,
+                        .message = credentials.missingCredentialMessage(
+                            model_provider.requiredCredentialSource(target),
+                            .cli,
+                        ),
                     });
             };
             defer staged_credential.deinit(alloc);

@@ -2911,6 +2911,7 @@ const App = struct {
         );
 
         if (try self.model_cache.pollLoadTransition()) {
+            try AuthAppRuntime.reconcileLoadedProviderModel(self);
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }
         if (try app_commands.Handlers(App).collectUsageDashboardFacts(self)) {
@@ -4223,9 +4224,12 @@ test {
     _ = @import("gateway/openai_codex_permission_reviewer.zig");
     _ = @import("core/auth/grok_session.zig");
     _ = @import("core/auth/grok_oauth.zig");
+    _ = @import("core/auth/opencode_session.zig");
     _ = @import("gateway/xai_grok_models.zig");
     _ = @import("gateway/xai_grok.zig");
     _ = @import("gateway/xai_grok_permission_reviewer.zig");
+    _ = @import("gateway/opencode_models.zig");
+    _ = @import("gateway/opencode.zig");
     _ = credentials;
     _ = @import("core/auth/oauth.zig");
     _ = @import("core/auth/oauth_session.zig");
