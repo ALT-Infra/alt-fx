@@ -131,6 +131,7 @@ pub const StartupState = struct {
     context_limits: config_runtime.context_limits.Values = .{},
     context_enabled: bool = true,
     fast_mode: bool = false,
+    fast_mode_source: config_runtime.ConfigSource = .compiled_default,
     slash_menu_categories: bool = true,
     auto_upgrade: bool = true,
     update_channel: update_target.Channel = .stable,
@@ -421,7 +422,9 @@ fn loadStartupStateFromOwnedWorkspace(
     state.max_tool_result_bytes = tool_result_limits.resolveMaxToolResultBytes(settings.max_tool_result_bytes, tool_result_limits.default_max_tool_result_bytes);
     state.context_limits = config_runtime.resolveContextLimits(settings, &.{});
     state.context_enabled = settings.context orelse true;
-    state.fast_mode = settings.fast_mode orelse (state.provider == .gateway);
+    state.fast_mode = settings.fast_mode orelse
+        (state.provider == .gateway and state.model_source == .compiled_default);
+    state.fast_mode_source = detailed.sources.fast_mode;
     state.slash_menu_categories = settings.slash_menu_categories orelse true;
     state.auto_upgrade = settings.auto_upgrade orelse true;
     state.update_channel = settings.update_channel orelse .stable;
@@ -2011,14 +2014,14 @@ test "loadStartupState applies core env overrides" {
     try std.testing.expectEqualStrings("env-model", state.selected_model);
     try std.testing.expectEqualStrings("default-model", state.configured_model);
     try std.testing.expectEqual(config_runtime.ModelSource.process_override, state.model_source);
-    try std.testing.expect(state.fast_mode);
+    try std.testing.expect(!state.fast_mode);
     try std.testing.expectEqualStrings("gateway-key", state.apiKey().?);
     try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, state.credential.?.source);
     try std.testing.expectEqual(PermissionMode.auto, state.permission_mode);
     try std.testing.expectEqual(@as(usize, 37), state.agent_step_limit);
 }
 
-test "loadStartupState defaults fast mode on only for Gateway and preserves explicit preferences" {
+test "loadStartupState defaults fast mode on only for the compiled Gateway default and preserves explicit preferences" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2060,7 +2063,7 @@ test "loadStartupState defaults fast mode on only for Gateway and preserves expl
     defer configured.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("openai/gpt-5", configured.selected_model);
     try std.testing.expectEqualStrings("openai/gpt-5", configured.configured_model);
-    try std.testing.expect(configured.fast_mode);
+    try std.testing.expect(!configured.fast_mode);
 
     var disabled = try loadStartupStateForWorkspace(std.testing.allocator, disabled_root, "zai/glm-5.2", 25);
     defer disabled.deinit(std.testing.allocator);
