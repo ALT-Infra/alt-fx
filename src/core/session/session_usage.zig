@@ -484,7 +484,7 @@ pub const Usage = struct {
         team: ?[]const u8,
     ) !bool {
         self.checkpoint_mutex.lockUncancelable(io_mod.getIo());
-        self.finishObservedInvocation(
+        const accepted = self.finishObservedInvocationAccepted(
             alloc,
             sequence,
             duration_ms,
@@ -506,7 +506,7 @@ pub const Usage = struct {
         };
         _ = self.persistCheckpointBestEffortLocked();
         self.checkpoint_mutex.unlock(io_mod.getIo());
-        return true;
+        return accepted;
     }
 
     fn persistCheckpointRequiredLocked(self: *Usage) !void {
@@ -563,9 +563,30 @@ pub const Usage = struct {
         origin: []const u8,
         team: ?[]const u8,
     ) !void {
+        _ = try self.finishObservedInvocationAccepted(
+            alloc,
+            sequence,
+            duration_ms,
+            outcome,
+            id,
+            origin,
+            team,
+        );
+    }
+
+    fn finishObservedInvocationAccepted(
+        self: *Usage,
+        alloc: Allocator,
+        sequence: u64,
+        duration_ms: u64,
+        outcome: DeliveryOutcome,
+        id: []const u8,
+        origin: []const u8,
+        team: ?[]const u8,
+    ) !bool {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
-        if (!self.finishInvocationUnlocked(sequence, duration_ms, outcome)) return;
+        if (!self.finishInvocationUnlocked(sequence, duration_ms, outcome)) return false;
         try validateGenerationId(id);
         try validateOrigin(origin);
         if (team) |value| try validateTeam(value);
@@ -574,6 +595,7 @@ pub const Usage = struct {
             self.dirty = true;
             return err;
         };
+        return true;
     }
 
     fn finishInvocationUnlocked(
@@ -4001,6 +4023,67 @@ test "terminal Gateway billing settles the durable observation immediately" {
     try std.testing.expectEqual(@as(u64, 130), snapshot.input_tokens);
     try std.testing.expectEqual(@as(u64, 25), snapshot.output_tokens);
     try std.testing.expectEqual(@as(u64, 2), snapshot.billable_web_search_calls);
+}
+
+test "duplicate Gateway terminal callback does not republish inline billing" {
+    const alloc = std.testing.allocator;
+    const PublicationProbe = struct {
+        generations: usize = 0,
+
+        fn publish(raw: *anyopaque, event: usage_report.ProfileEvent) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            switch (event) {
+                .generation => self.generations += 1,
+                .pending, .incident => {},
+            }
+        }
+    };
+
+    var probe = PublicationProbe{};
+    var usage = Usage.initFresh();
+    defer usage.deinit(alloc);
+    usage.configurePublicationSink(.{
+        .context = &probe,
+        .allocator = alloc,
+        .publish = PublicationProbe.publish,
+    });
+
+    const observation = try GatewayObservation.begin(&usage);
+    const completion: types.GatewayCompletion = .{
+        .generation_id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        .billing = .{
+            .created_at_ms = 100,
+            .model = "provider/model",
+            .total_cost = 0.0123,
+            .input_tokens = 130,
+            .output_tokens = 25,
+            .cache_read_tokens = 20,
+            .cache_write_tokens = 10,
+            .reasoning_tokens = 5,
+            .billable_web_search_calls = 2,
+        },
+    };
+    try observation.complete(
+        alloc,
+        .ok,
+        completion,
+        "https://ai-gateway.vercel.sh",
+        null,
+    );
+    try observation.complete(
+        alloc,
+        .ok,
+        completion,
+        "https://ai-gateway.vercel.sh",
+        null,
+    );
+
+    var snapshot = try usage.snapshot(alloc);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), probe.generations);
+    try std.testing.expectEqual(@as(f64, 0.0123), snapshot.total_cost);
+    try std.testing.expectEqual(@as(u64, 130), snapshot.input_tokens);
+    try std.testing.expectEqual(@as(u64, 25), snapshot.output_tokens);
 }
 
 test "successful retry after ambiguous delivery retains known generation" {
