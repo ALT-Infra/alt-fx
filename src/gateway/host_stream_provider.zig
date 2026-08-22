@@ -34,8 +34,20 @@ pub const Transport = struct {
 
 pub const ProviderContext = struct {
     build_fn: *const fn (Allocator, stream_provider.RequestData) anyerror![]u8,
-    endpoint_fn: *const fn () []const u8,
+    endpoint: Endpoint,
     transport: Transport,
+};
+
+pub const Endpoint = union(enum) {
+    fixed: []const u8,
+    resolve: *const fn () []const u8,
+
+    fn url(self: Endpoint) []const u8 {
+        return switch (self) {
+            .fixed => |fixed| fixed,
+            .resolve => |resolve| resolve(),
+        };
+    }
 };
 
 pub fn provider(context: *ProviderContext) stream_provider.Provider {
@@ -47,10 +59,10 @@ pub fn provider(context: *ProviderContext) stream_provider.Provider {
 
 pub fn initContext(
     build_fn: *const fn (Allocator, stream_provider.RequestData) anyerror![]u8,
-    endpoint_fn: *const fn () []const u8,
+    endpoint: Endpoint,
     transport: Transport,
 ) ProviderContext {
-    return .{ .build_fn = build_fn, .endpoint_fn = endpoint_fn, .transport = transport };
+    return .{ .build_fn = build_fn, .endpoint = endpoint, .transport = transport };
 }
 
 fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequest) anyerror!stream_provider.Result {
@@ -86,7 +98,7 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
     try std.json.Stringify.value(headers.items, .{}, &headers_json.writer);
 
     request.delivery.markPossiblySent();
-    const handle = try transport.open("POST", context.endpoint_fn(), headers_json.writer.buffered(), payload);
+    const handle = try transport.open("POST", context.endpoint.url(), headers_json.writer.buffered(), payload);
     if (handle < 0) return error.HostStreamFailed;
     defer transport.close(handle);
 

@@ -655,7 +655,7 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
         .gateway_chat_url = gateway_chat_url,
         .thread = undefined,
     };
-    runtime.stream_context = host_stream_provider.initContext(builtin_gateway.buildAgentRequest, builtin_gateway.agentChatUrl, .{
+    runtime.stream_context = host_stream_provider.initContext(builtin_gateway.buildAgentRequest, .{ .fixed = runtime.gateway_chat_url }, .{
         .context = &runtime.fetch,
         .open_fn = FetchBridge.open,
         .status_fn = FetchBridge.statusFn,
