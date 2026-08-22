@@ -45,6 +45,7 @@ const debug_trace = @import("../core/shared/debug_trace.zig");
 const display_width = @import("../core/shared/display_width.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
 const tool_projection_mod = @import("../core/tooling/tool_projection.zig");
+const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const tool_admission = @import("../core/tooling/tool_admission.zig");
 const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 const tool_specs = @import("../core/tooling/tool_specs.zig");
@@ -622,6 +623,7 @@ pub fn handlePrompt(
         .skills_prompt_section = skills_section,
         .explicit_skills_prompt_section = explicit_skills.text,
         .advertised_tool_names = tool_projection.advertised_names,
+        .advertised_functions = tool_projection.advertised_functions,
         .custom_tool_guidance = tool_projection.custom_guidance,
     });
     agent_config.session_child_capability = if (session.writable) |*writable|
@@ -712,6 +714,7 @@ pub fn runSubagentChild(
         .skills_prompt_section = bounded_skills.text,
         .explicit_skills_prompt_section = explicit_skills.text,
         .advertised_tool_names = child_projection.advertised_names,
+        .advertised_functions = child_projection.advertised_functions,
         .custom_tool_guidance = child_projection.custom_guidance,
         .context_registry = state.cfg.context_registry,
         .context_enabled = state.context_enabled,
@@ -747,6 +750,7 @@ const AgentConfigSections = struct {
     skills_prompt_section: []const u8,
     explicit_skills_prompt_section: []const u8,
     advertised_tool_names: []const []const u8 = &.{},
+    advertised_functions: []const model_tool_schema.FunctionSchema = &.{},
     custom_tool_guidance: []const u8,
 };
 
@@ -759,6 +763,7 @@ fn buildAgentConfig(state: *server.ServerState, session: *server.ActiveSessionSt
         .gateway_retry_count = state.cfg.gateway_retry_count,
         .gateway_chat_url = state.cfg.gateway_chat_url,
         .advertised_tool_names = sections.advertised_tool_names,
+        .advertised_functions = sections.advertised_functions,
         .provider_capabilities = state.cfg.provider_set.select(session.provider).capabilities,
         .custom_tool_guidance = sections.custom_tool_guidance,
         .agent_step_limit = session.agent_step_limit,
@@ -4247,6 +4252,7 @@ test "ACP prompt agent config carries request options from active session" {
         .skills_prompt_section = "",
         .explicit_skills_prompt_section = "",
         .advertised_tool_names = &.{"read_file"},
+        .advertised_functions = &.{builtin_tools.read_file.model_schema},
         .custom_tool_guidance = "acp custom tool guidance",
     });
 

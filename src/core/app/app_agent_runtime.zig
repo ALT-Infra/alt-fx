@@ -34,6 +34,7 @@ const text_utils = @import("../shared/text_utils.zig");
 const tool_args = @import("../tooling/tool_args.zig");
 const tool_admission = @import("../tooling/tool_admission.zig");
 const tool_projection_mod = @import("../tooling/tool_projection.zig");
+const model_tool_schema = @import("../tooling/model_tool_schema.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const context_contract = @import("../workspace/context_contract.zig");
@@ -1046,6 +1047,7 @@ pub fn Runtime(comptime App: type) type {
                 .skills_prompt_section = bounded_skills.text,
                 .explicit_skills_prompt_section = explicit_skills.text,
                 .advertised_tool_names = child_projection.advertised_names,
+                .advertised_functions = child_projection.advertised_functions,
                 .custom_tool_guidance = child_projection.custom_guidance,
                 .context_registry = app.contextRegistry(),
                 .context_enabled = if (comptime @hasField(App, "context_enabled")) app.context_enabled else true,
@@ -1091,6 +1093,7 @@ pub fn Runtime(comptime App: type) type {
                     null,
                 .gateway_chat_url = gateway_chat_url,
                 .advertised_tool_names = tool_projection.advertised_names,
+                .advertised_functions = tool_projection.advertised_functions,
                 .provider_capabilities = if (comptime @hasDecl(App, "providerSet"))
                     app.providerSet().select(job.provider).capabilities
                 else if (job.provider == .gateway)
@@ -1561,8 +1564,11 @@ const FakeApp = struct {
         if (self.snapshot_tools_error) |err| return err;
         const advertised_names = try alloc.alloc([]const u8, 0);
         errdefer alloc.free(advertised_names);
+        const advertised_functions = try alloc.alloc(model_tool_schema.FunctionSchema, 0);
+        errdefer alloc.free(advertised_functions);
         return .{
             .advertised_names = advertised_names,
+            .advertised_functions = advertised_functions,
             .custom_guidance = try alloc.dupe(u8, self.snapshot_custom_guidance),
         };
     }
@@ -1583,8 +1589,11 @@ const FakeApp = struct {
         if (self.snapshot_tools_error) |err| return err;
         const advertised_names = try alloc.alloc([]const u8, 0);
         errdefer alloc.free(advertised_names);
+        const advertised_functions = try alloc.alloc(model_tool_schema.FunctionSchema, 0);
+        errdefer alloc.free(advertised_functions);
         return .{
             .advertised_names = advertised_names,
+            .advertised_functions = advertised_functions,
             .custom_guidance = try alloc.dupe(u8, self.snapshot_custom_guidance),
         };
     }
@@ -2831,6 +2840,7 @@ test "app agent runtime queued prompt config uses captured job settings over sta
     const custom_guidance = try alloc.dupe(u8, "app custom tool guidance");
     var tool_projection = tool_projection_mod.EffectiveToolProjection{
         .advertised_names = try alloc.alloc([]const u8, 0),
+        .advertised_functions = try alloc.alloc(model_tool_schema.FunctionSchema, 0),
         .custom_guidance = custom_guidance,
     };
     defer tool_projection.deinit(alloc);
@@ -2841,6 +2851,7 @@ test "app agent runtime queued prompt config uses captured job settings over sta
     try std.testing.expectEqual(@as(usize, 8192), config.max_tool_result_bytes);
     try std.testing.expectEqual(types.ToolChoice.none, config.first_call_tool_choice);
     try std.testing.expectEqualSlices([]const u8, tool_projection.advertised_names, config.advertised_tool_names);
+    try std.testing.expectEqualSlices(model_tool_schema.FunctionSchema, tool_projection.advertised_functions, config.advertised_functions);
     try std.testing.expectEqualStrings(tool_projection.custom_guidance, config.custom_tool_guidance);
     try std.testing.expectEqualStrings(test_prompt_policy.system_prompt, config.system_prompt);
     try std.testing.expectEqualStrings("test model overlay", config.model_prompt_overlay.?);

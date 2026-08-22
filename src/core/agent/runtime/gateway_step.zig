@@ -340,30 +340,31 @@ test "possibly sent gateway failure marks billing incomplete" {
     try std.testing.expectEqual(@as(u64, 1), snapshot.settled_through_sequence);
 }
 
-test "provider-local streams do not consume Gateway observation capacity" {
+test "provider-local immediate usage settles invocation capacity" {
     const LocalProvider = struct {
         calls: usize = 0,
 
         fn stream(
             raw: ?*anyopaque,
             _: Allocator,
-            request: agent_stream_provider.Request,
+            request: agent_stream_provider.ModelRequest,
         ) anyerror!agent_stream_provider.Result {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.calls += 1;
+            try request.admission.admit();
             request.delivery.markPossiblySent();
-            return .{
-                .status = .ok,
+            return .{ .completed = .{
                 .completion = .{
                     .generation_id = "resp_provider_local",
                     .finish_reason = .stop,
                     .usage = .{ .input_tokens = 3, .output_tokens = 1 },
                 },
-            };
+                .usage = .{ .immediate = null },
+            } };
         }
     };
     const Callbacks = struct {
-        fn content(_: *anyopaque, _: []const u8) void {}
+        fn event(_: *anyopaque, _: agent_stream_provider.Event) void {}
     };
 
     const alloc = std.testing.allocator;
@@ -371,7 +372,6 @@ test "provider-local streams do not consume Gateway observation capacity" {
     const provider = agent_stream_provider.Provider{
         .context = &local_provider,
         .stream_fn = LocalProvider.stream,
-        .observes_gateway_usage = false,
     };
     var usage = session_usage.Usage.initFresh();
     defer usage.deinit(alloc);
@@ -381,34 +381,34 @@ test "provider-local streams do not consume Gateway observation capacity" {
     for (0..65) |_| {
         var delivery = DeliveryCertainty.init();
         var attempt_evidence: AttemptEvidence = .{};
-        const result = try streamGatewayCompletion(
+        var result = try streamModelCompletion(
             provider,
             alloc,
-            "subscription-token",
-            .chatgpt_subscription,
-            "acct_test",
-            null,
-            "session-test",
-            "gpt-test",
-            1,
-            "https://provider.example/responses",
-            "{}",
-            null,
-            &delivery,
-            &attempt_evidence,
-            &callback_ctx,
-            Callbacks.content,
-            null,
-            null,
-            null,
-            &cancel_flag,
+            .{
+                .credential = .{
+                    .secret = "subscription-token",
+                    .source = .chatgpt_subscription,
+                    .account_id = "acct_test",
+                },
+                .session_id = "session-test",
+                .model = "gpt-test",
+                .retry_count = 1,
+                .messages = &.{},
+                .tool_choice = .auto,
+                .provider_options = .{},
+                .trace_ctx = .{},
+                .content_capture_limit = null,
+                .delivery = &delivery,
+                .attempt_evidence = &attempt_evidence,
+                .events = .{ .context = &callback_ctx, .emit_fn = Callbacks.event },
+                .cancel_flag = &cancel_flag,
+                .provider_attempt_owner = .agent,
+            },
             &usage,
             alloc,
-            .{},
-            null,
-            .agent,
         );
-        try std.testing.expectEqual(std.http.Status.ok, result.status);
+        defer result.deinit(alloc);
+        try std.testing.expect(std.meta.activeTag(result) == .completed);
     }
 
     try std.testing.expectEqual(@as(usize, 65), local_provider.calls);
@@ -416,7 +416,7 @@ test "provider-local streams do not consume Gateway observation capacity" {
     defer snapshot.deinit(alloc);
     try std.testing.expectEqual(session_usage.Availability.complete, snapshot.billing);
     try std.testing.expect(snapshot.api_duration_complete);
-    try std.testing.expectEqual(@as(u64, 1), snapshot.next_sequence);
-    try std.testing.expectEqual(@as(u64, 0), snapshot.settled_through_sequence);
+    try std.testing.expectEqual(@as(u64, 66), snapshot.next_sequence);
+    try std.testing.expectEqual(@as(u64, 65), snapshot.settled_through_sequence);
     try std.testing.expectEqual(@as(usize, 0), snapshot.pending.len);
 }

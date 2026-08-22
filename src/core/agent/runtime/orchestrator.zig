@@ -78,22 +78,16 @@ const PromptFinishTrace = runtime_finalization.PromptFinishTrace;
 const ToolExecutionResult = runtime_tool_contracts.ToolExecutionResult;
 
 fn terminal_request_schema_advertised(
-    registry: tool_dispatch.Registry,
-    advertised_names: []const []const u8,
+    advertised_functions: []const model_tool_schema.FunctionSchema,
 ) bool {
-    var advertised = false;
-    for (advertised_names) |name| {
-        if (std.mem.eql(u8, name, "terminal")) {
-            advertised = true;
-            break;
-        }
+    for (advertised_functions) |function| {
+        if (!std.mem.eql(u8, function.name, "terminal")) continue;
+        return model_tool_schema.isSingleRequiredObjectUnionField(
+            function.input_schema,
+            "request",
+        );
     }
-    if (!advertised) return false;
-    const terminal = registry.lookup("terminal") orelse return false;
-    return model_tool_schema.isSingleRequiredObjectUnionField(
-        terminal.model_schema.input_schema,
-        "request",
-    );
+    return false;
 }
 
 fn terminal_request_normalization_eligible(
@@ -273,9 +267,9 @@ test "terminal request normalization follows effective attempt advertisement" {
         .irreversible_fn = undefined,
     };
 
-    try std.testing.expect(terminal_request_schema_advertised(.{ .tools = &.{nested} }, &.{"terminal"}));
-    try std.testing.expect(!terminal_request_schema_advertised(.{ .tools = &.{flat} }, &.{"terminal"}));
-    try std.testing.expect(!terminal_request_schema_advertised(.{ .tools = &.{nested} }, &.{}));
+    try std.testing.expect(terminal_request_schema_advertised(&.{nested.model_schema}));
+    try std.testing.expect(!terminal_request_schema_advertised(&.{flat.model_schema}));
+    try std.testing.expect(!terminal_request_schema_advertised(&.{}));
     try std.testing.expect(terminal_request_normalization_eligible(true, .unavailable));
     try std.testing.expect(terminal_request_normalization_eligible(true, .optional));
     try std.testing.expect(!terminal_request_normalization_eligible(true, .required));
@@ -2309,8 +2303,7 @@ fn processQueuedPromptInner(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const base_nested_terminal_advertised = terminal_request_schema_advertised(
-        deps.tool_registry,
-        config.advertised_tool_names,
+        config.advertised_functions,
     );
 
     var stable_prefix: std.ArrayList(ChatMessage) = .empty;
@@ -3545,6 +3538,7 @@ fn processQueuedPromptLoop(
                 .tools = .{
                     .registry = deps.tool_registry,
                     .advertised_names = config.advertised_tool_names,
+                    .advertised_functions = config.advertised_functions,
                     .selected_dynamic = selected_dynamic_tools.items,
                 },
                 .tool_choice = tool_choice,

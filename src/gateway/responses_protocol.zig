@@ -136,15 +136,14 @@ pub fn writeTools(
     try out.writer.writeAll(",\"tools\":[");
 
     for (tools.advertised_names) |name| {
-        const tool = tools.registry.lookup(name) orelse continue;
-        if (tool.provider_executed or tool.write_provider_advertisement_fn != null) continue;
+        const tool = tools.advertisedFunction(name) orelse continue;
         if (count > 0) try out.writer.writeByte(',');
         try writeFunctionTool(
             &out.writer,
             alloc,
-            tool.model_schema.name,
-            tool.model_schema.description,
-            .{ .static = tool.model_schema.input_schema },
+            tool.name,
+            tool.description,
+            .{ .static = tool.input_schema },
         );
         count += 1;
     }
@@ -638,6 +637,7 @@ test "Responses tools serialize typed static and dynamic functions once" {
         .{
             .registry = .{ .tools = &registered },
             .advertised_names = &.{"read_file"},
+            .advertised_functions = &.{registered[0].model_schema},
             .selected_dynamic = &.{.{
                 .name = "mcp_search",
                 .description = "Search.",

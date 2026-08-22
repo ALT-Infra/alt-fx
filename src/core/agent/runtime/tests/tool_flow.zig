@@ -15,6 +15,7 @@ const diff = @import("../../../output/diff.zig");
 const file_mutation = @import("../../../tooling/file_mutation.zig");
 const command_result_mapping = @import("../../../tooling/command_result_mapping.zig");
 const tool_dispatch = @import("../../../tooling/tool_dispatch.zig");
+const model_tool_schema = @import("../../../tooling/model_tool_schema.zig");
 const tool_specs = @import("../../../tooling/tool_specs.zig");
 const tool_result_errors = @import("../../../tooling/tool_result_errors.zig");
 const context_contract = @import("../../../workspace/context_contract.zig");
@@ -65,6 +66,8 @@ const VisionAgentToolRuntime = test_support.VisionAgentToolRuntime;
 
 const read_file_advertised_names = [_][]const u8{"read_file"};
 const terminal_advertised_names = [_][]const u8{"terminal"};
+const read_file_advertised_functions = [_]model_tool_schema.FunctionSchema{builtin_tools.read_file.model_schema};
+const terminal_advertised_functions = [_]model_tool_schema.FunctionSchema{builtin_tools.terminal.model_schema};
 
 fn makeOwnedVisionCatalog(
     alloc: std.mem.Allocator,
@@ -1025,6 +1028,7 @@ test "borrowed nested terminal completion is flat before authority execution and
     var fixture = PromptFixture{};
     var config = fixture.config();
     config.advertised_tool_names = &terminal_advertised_names;
+    config.advertised_functions = &terminal_advertised_functions;
 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
@@ -1090,6 +1094,7 @@ test "terminal lifecycle resolves one display target before execution" {
     var fixture = PromptFixture{};
     var config = fixture.config();
     config.advertised_tool_names = &terminal_advertised_names;
+    config.advertised_functions = &terminal_advertised_functions;
 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
@@ -4009,6 +4014,7 @@ test "four automatic permission blocks finish with a normal blocker" {
     var config = fixture.config();
     config.agent_step_limit = 0;
     config.advertised_tool_names = &read_file_advertised_names;
+    config.advertised_functions = &read_file_advertised_functions;
     var job = fixture.job();
     job.permission_mode = .auto;
 

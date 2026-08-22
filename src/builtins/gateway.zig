@@ -264,14 +264,15 @@ fn buildAgentToolsJson(
     }
 
     for (request.tools.advertised_names) |name| {
-        if (std.mem.eql(u8, name, "vision")) continue;
-        const tool = request.tools.registry.lookup(name) orelse continue;
         if (!first) try out.writer.writeByte(',');
         first = false;
-        if (tool.write_provider_advertisement_fn) |write_advertisement| {
-            try write_advertisement(alloc, &out.writer);
+        if (request.tools.advertisedFunction(name)) |function| {
+            try model_tool_schema.writeBuiltinFunctionSchema(alloc, &out.writer, function);
         } else {
-            try model_tool_schema.writeBuiltinFunctionSchema(alloc, &out.writer, tool.model_schema);
+            const tool = request.tools.registry.lookup(name) orelse return error.AdvertisedToolNotRegistered;
+            const write_advertisement = tool.write_provider_advertisement_fn orelse
+                return error.AdvertisedToolSchemaMissing;
+            try write_advertisement(alloc, &out.writer);
         }
     }
     for (request.tools.additional_functions) |tool| {

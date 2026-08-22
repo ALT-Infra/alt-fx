@@ -12,6 +12,7 @@ const file_mutation = @import("../tooling/file_mutation.zig");
 const tool_admission = @import("../tooling/tool_admission.zig");
 const tool_presentation = @import("../tooling/tool_presentation.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
+const model_tool_schema = @import("../tooling/model_tool_schema.zig");
 const tool_runtime = @import("../tooling/tool_runtime.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const mcp_access = @import("../mcp/access_policy.zig");
@@ -40,6 +41,7 @@ pub const Config = struct {
     skills_prompt_section: []const u8 = "",
     explicit_skills_prompt_section: []const u8 = "",
     advertised_tool_names: []const []const u8 = &.{},
+    advertised_functions: []const model_tool_schema.FunctionSchema = &.{},
     custom_tool_guidance: []const u8 = "",
     context_registry: context_contract.Registry,
     context_enabled: bool,
@@ -228,6 +230,7 @@ pub fn run(
             .gateway_retry_count = config.tool_context.gateway_retry_count,
             .gateway_chat_url = config.tool_context.gateway_chat_url,
             .advertised_tool_names = config.advertised_tool_names,
+            .advertised_functions = config.advertised_functions,
             .provider_capabilities = config.provider_set.select(admission.provider).capabilities,
             .custom_tool_guidance = config.custom_tool_guidance,
             .agent_step_limit = config.tool_context.agent_step_limit,

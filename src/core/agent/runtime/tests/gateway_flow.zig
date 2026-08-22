@@ -18,6 +18,7 @@ const vision_executor = @import("../vision_executor.zig");
 const diagnostics = @import("../../../workspace/diagnostics.zig");
 const lifecycle_hooks = @import("../../../hooks/hooks.zig");
 const tool_dispatch = @import("../../../tooling/tool_dispatch.zig");
+const model_tool_schema = @import("../../../tooling/model_tool_schema.zig");
 
 const test_support = @import("support.zig");
 
@@ -59,6 +60,7 @@ const vision_read_and_terminal_tools = [_]tool_dispatch.Tool{
     builtin_tools.terminal,
 };
 const terminal_advertised_names = [_][]const u8{"terminal"};
+const terminal_advertised_functions = [_]model_tool_schema.FunctionSchema{builtin_tools.terminal.model_schema};
 
 const VisionAndReadExecutor = struct {
     vision: ExecuteDelegate,
@@ -983,6 +985,7 @@ test "required Vision rejects non-Vision before effects and stays required until
 
     var config = fixture.config();
     config.advertised_tool_names = &terminal_advertised_names;
+    config.advertised_functions = &terminal_advertised_functions;
     var lifecycle = test_support.testLifecycleContext(
         lifecycle_view,
         alloc,

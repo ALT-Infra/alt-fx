@@ -659,10 +659,14 @@ pub const EffectiveToolProjection = struct {
     /// Borrowed registry names selected for model advertisement. The slice
     /// storage is owned by this projection.
     advertised_names: []const []const u8,
+    /// Exact borrowed built-in schemas selected for model advertisement. The
+    /// slice storage is owned by this projection.
+    advertised_functions: []const model_tool_schema.FunctionSchema,
     custom_guidance: []u8,
 
     pub fn deinit(self: *EffectiveToolProjection, alloc: Allocator) void {
         alloc.free(self.advertised_names);
+        alloc.free(self.advertised_functions);
         alloc.free(self.custom_guidance);
         self.* = undefined;
     }
@@ -771,6 +775,8 @@ pub fn buildReadOnlyModelToolProjectionForSet(alloc: Allocator, tool_set: tool_s
 fn buildToolProjection(alloc: Allocator, tool_set: tool_set_contract.ToolSet, kind: BuildKind, options: Options) !EffectiveToolProjection {
     var advertised_names: std.ArrayList([]const u8) = .empty;
     errdefer advertised_names.deinit(alloc);
+    var advertised_functions: std.ArrayList(model_tool_schema.FunctionSchema) = .empty;
+    errdefer advertised_functions.deinit(alloc);
     var guidance_out: std.Io.Writer.Allocating = .init(alloc);
     errdefer guidance_out.deinit();
 
@@ -778,27 +784,31 @@ fn buildToolProjection(alloc: Allocator, tool_set: tool_set_contract.ToolSet, ki
 
     for (tool_set.order) |tool_name| {
         const tool = tool_set.registry.lookup(tool_name) orelse continue;
-        try appendBuiltinTool(alloc, &advertised_names, &guidance_out.writer, &first_custom_guidance, tool.*, kind, tool_set, options);
+        try appendBuiltinTool(alloc, &advertised_names, &advertised_functions, &guidance_out.writer, &first_custom_guidance, tool.*, kind, tool_set, options);
     }
 
     if (kind == .full) {
         for (tool_set.registry.tools) |tool| {
             if (isCanonicalToolName(tool_set, tool.name)) continue;
-            try appendBuiltinTool(alloc, &advertised_names, &guidance_out.writer, &first_custom_guidance, tool, kind, tool_set, options);
+            try appendBuiltinTool(alloc, &advertised_names, &advertised_functions, &guidance_out.writer, &first_custom_guidance, tool, kind, tool_set, options);
         }
     }
 
     const custom_guidance = try guidance_out.toOwnedSlice();
     errdefer alloc.free(custom_guidance);
     const names = try advertised_names.toOwnedSlice(alloc);
+    errdefer alloc.free(names);
+    const functions = try advertised_functions.toOwnedSlice(alloc);
     return .{
         .advertised_names = names,
+        .advertised_functions = functions,
         .custom_guidance = custom_guidance,
     };
 }
 fn appendBuiltinTool(
     alloc: Allocator,
     advertised_names: *std.ArrayList([]const u8),
+    advertised_functions: *std.ArrayList(model_tool_schema.FunctionSchema),
     guidance_writer: *std.Io.Writer,
     first_custom_guidance: *bool,
     tool: tool_dispatch.Tool,
@@ -814,6 +824,9 @@ fn appendBuiltinTool(
         if (permissions.rulesDenyAllTargetsForTool(options.permission_rules, tool.name)) return;
     }
     try advertised_names.append(alloc, tool.name);
+    if (!tool.provider_executed and tool.write_provider_advertisement_fn == null) {
+        try advertised_functions.append(alloc, tool.model_schema);
+    }
     if (tool.write_provider_advertisement_fn != null) {
         if (first_custom_guidance.*) {
             first_custom_guidance.* = false;

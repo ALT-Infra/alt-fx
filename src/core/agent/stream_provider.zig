@@ -136,8 +136,16 @@ pub const DynamicFunctionTool = struct {
 pub const ToolSelection = struct {
     registry: tool_dispatch.Registry = .{},
     advertised_names: []const []const u8 = &.{},
+    advertised_functions: []const model_tool_schema.FunctionSchema = &.{},
     additional_functions: []const model_tool_schema.FunctionSchema = &.{},
     selected_dynamic: []const DynamicFunctionTool = &.{},
+
+    pub fn advertisedFunction(self: ToolSelection, name: []const u8) ?model_tool_schema.FunctionSchema {
+        for (self.advertised_functions) |function| {
+            if (std.mem.eql(u8, function.name, name)) return function;
+        }
+        return null;
+    }
 };
 
 pub const CredentialLease = struct {
