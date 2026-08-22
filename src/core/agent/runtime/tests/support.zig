@@ -429,6 +429,7 @@ pub const FakeAgentRuntimeDeps = struct {
     tool_registry: tool_dispatch.Registry = test_tool_registry,
     context_registry: ?context_contract.Registry = null,
     context_enabled: bool = false,
+    root_permission_mode: ?PermissionMode = null,
     execute_mutex: std.Io.Mutex = .init,
     log: std.ArrayList([]u8) = .empty,
     texts: std.ArrayList([]u8) = .empty,
@@ -460,6 +461,7 @@ pub const FakeAgentRuntimeDeps = struct {
     last_execute_root_user_intent_context: ?[]u8 = null,
     last_execute_root_user_messages: std.ArrayList([]u8) = .empty,
     last_execute_root_user_evidence_complete: bool = false,
+    last_execute_permission_mode: ?PermissionMode = null,
     propagated_grants: std.ArrayList(PermissionGrant) = .empty,
     event_grants: std.ArrayList(PermissionGrant) = .empty,
     last_execute_grants: std.ArrayList(PermissionGrant) = .empty,
@@ -668,6 +670,10 @@ pub const FakeAgentRuntimeDeps = struct {
             .tool_activity_recorder = self.tool_activity_recorder,
             .context_registry = self.context_registry,
             .context_enabled = self.context_enabled,
+            .snapshot_root_permission_mode = if (self.root_permission_mode != null)
+                snapshotRootPermissionMode
+            else
+                null,
             .finalize_turn = finalizeTurn,
             .prepare_parent_turn_context = prepareParentTurnContext,
             .acknowledge_parent_turn_context = acknowledgeParentTurnContext,
@@ -723,6 +729,11 @@ pub const FakeAgentRuntimeDeps = struct {
                 cancel_flag.store(true, .seq_cst);
             }
         }
+    }
+
+    fn snapshotRootPermissionMode(raw: *anyopaque) PermissionMode {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        return self.root_permission_mode.?;
     }
 
     fn resolveModelCapabilities(raw: *anyopaque, _: Allocator, model: []const u8) !model_capabilities.Capabilities {
@@ -1264,6 +1275,7 @@ pub const FakeAgentRuntimeDeps = struct {
             }
             self.last_execute_root_user_evidence_complete =
                 request.root_user_evidence_complete;
+            self.last_execute_permission_mode = request.permission_mode;
             try self.record("execute:{s}", .{call.name});
             self.last_execute_grant_count = request.session_grants.len;
             for (self.last_execute_grants.items) |grant| {
