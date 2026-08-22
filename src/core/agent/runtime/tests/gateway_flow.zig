@@ -6,7 +6,7 @@ const token_estimate = @import("../../../shared/token_estimate.zig");
 const worker_runtime = @import("../../worker_runtime.zig");
 const session_runtime = @import("../../../session/session.zig");
 const session_codec = @import("../../../session/session_codec.zig");
-const gateway_json = @import("../../../gateway/gateway_json.zig");
+const vercel_protocol = @import("../../../../gateway/vercel_protocol.zig");
 const model_capabilities = @import("../../../config/model_capabilities.zig");
 const debug_trace = @import("../../../shared/debug_trace.zig");
 const image_attachments = @import("../../../images/image_attachments.zig");
@@ -58,8 +58,7 @@ const vision_read_and_terminal_tools = [_]tool_dispatch.Tool{
     builtin_tools.read_file,
     builtin_tools.terminal,
 };
-const terminal_nested_tools_json =
-    "[{\"type\":\"function\",\"name\":\"terminal\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"request\":{\"oneOf\":[{\"type\":\"object\"}]}},\"required\":[\"request\"],\"additionalProperties\":false}}]";
+const terminal_advertised_names = [_][]const u8{"terminal"};
 
 const VisionAndReadExecutor = struct {
     vision: ExecuteDelegate,
@@ -200,7 +199,7 @@ fn expectPromptEntryRole(entry: std.json.Value, expected_role: types.ChatRole) !
     try std.testing.expect(entry == .object);
     const role = entry.object.get("role") orelse return error.TestExpectedPromptRoleMissing;
     try std.testing.expect(role == .string);
-    try std.testing.expectEqualStrings(gateway_json.roleName(expected_role), role.string);
+    try std.testing.expectEqualStrings(vercel_protocol.roleName(expected_role), role.string);
 }
 
 fn expectGatewayPromptRoles(gateway: *const FakeGateway, index: usize, expected_roles: []const types.ChatRole) !void {
@@ -435,18 +434,24 @@ const VisionProviderScript = struct {
     fn stream(
         context: ?*anyopaque,
         _: Allocator,
-        request: agent_stream_provider.Request,
+        request: agent_stream_provider.ModelRequest,
     ) anyerror!agent_stream_provider.Result {
         const self: *VisionProviderScript = @ptrCast(@alignCast(context.?));
         if (self.calls >= self.responses.len) return error.TestVisionScriptExhausted;
         const response = self.responses[self.calls];
         self.calls += 1;
+        try request.admission.admit();
         return switch (response) {
-            .content => |text| .{ .status = .ok, .completion = .{ .content = text } },
-            .http_status => |status| .{ .status = status },
+            .content => |text| .{ .completed = .{ .completion = .{ .content = text } } },
+            .http_status => |status| .{ .failed = .{ .kind = switch (status) {
+                .unauthorized => .unauthorized,
+                .too_many_requests => .rate_limited,
+                .service_unavailable => .unavailable,
+                else => .provider_error,
+            } } },
             .cancel => blk: {
                 request.cancel_flag.store(true, .seq_cst);
-                break :blk .{ .status = .ok };
+                break :blk .{ .completed = .{} };
             },
         };
     }
@@ -467,7 +472,6 @@ fn runScriptedVision(
         .api_key = "key",
         .gateway_team = null,
         .retry_count = 1,
-        .chat_url = "https://example.invalid",
         .cancel_flag = null,
         .usage = null,
         .usage_allocator = alloc,
@@ -978,7 +982,7 @@ test "required Vision rejects non-Vision before effects and stays required until
     job.permission_mode = .ask;
 
     var config = fixture.config();
-    config.gateway_tools_json = terminal_nested_tools_json;
+    config.advertised_tool_names = &terminal_advertised_names;
     var lifecycle = test_support.testLifecycleContext(
         lifecycle_view,
         alloc,
@@ -2332,9 +2336,11 @@ test "processQueuedPrompt never uses the vision fallback for Codex" {
     job.images = &images;
     job.authorized_image_catalog = &images;
 
+    var config = fixture.config();
+    config.provider_capabilities = .{};
     try std.testing.expectError(
         error.SubscriptionNativeImageUnavailable,
-        runFakePrompt(&gateway, &hooks, fixture.config(), job),
+        runFakePrompt(&gateway, &hooks, config, job),
     );
     try std.testing.expectEqual(@as(usize, 0), gateway.request_bodies.items.len);
 }
@@ -4455,7 +4461,17 @@ test "processQueuedPrompt preserves fallback route and budget until selection ch
         .assistant_source = @constCast("partial"),
         .cause = .provider_unavailable,
         .action = .paused,
-        .route_model = @constCast("zai/glm-5.2"),
+        .authority = .{
+            .provider = .gateway,
+            .model = @constCast("zai/glm-5.2"),
+            .credential_source = .ai_gateway_api_key,
+            .credential_identity = @import("../../../auth/credential_authority.zig").derive(
+                .ai_gateway_api_key,
+                null,
+                null,
+                "key",
+            ),
+        },
         .requested_fast_mode = true,
         .fast_mode = false,
         .max_provider_attempts = 10,
@@ -4510,7 +4526,7 @@ test "processQueuedPrompt preserves fallback route and budget until selection ch
     }
 }
 
-test "processQueuedPrompt restores legacy connectivity checkpoints through evidence" {
+test "processQueuedPrompt fails closed for legacy recovery without credential authority" {
     const alloc = std.testing.allocator;
     var fixture = PromptFixture{};
     const checkpoint = session_codec.RecoveryCheckpoint{
@@ -4519,7 +4535,7 @@ test "processQueuedPrompt restores legacy connectivity checkpoints through evide
         .assistant_source = @constCast("partial response"),
         .cause = .system_resumed,
         .action = .waiting_for_connectivity,
-        .route_model = @constCast("zai/glm-5.2"),
+        .authority = .{ .provider = .gateway, .model = @constCast("zai/glm-5.2") },
         .requested_fast_mode = false,
         .fast_mode = false,
         .max_provider_attempts = 10,
@@ -4535,20 +4551,11 @@ test "processQueuedPrompt restores legacy connectivity checkpoints through evide
     job.model = @constCast("zai/glm-5.2");
     job.recovery_checkpoint = checkpoint;
 
-    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
-
-    try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
-    try std.testing.expect(std.mem.find(
-        u8,
-        gateway.request_bodies.items[0],
-        "<partial_assistant>\\npartial response\\n</partial_assistant>",
-    ) != null);
-    const reserved = hooks.recovery_checkpoints.items[0];
-    try std.testing.expectEqual(@as(usize, 3), reserved.consumed_provider_attempts);
-    try std.testing.expect(reserved.outstanding_reservation);
-    for (hooks.route_recovery_statuses.items) |status| {
-        try std.testing.expect(status.action != .waiting_for_connectivity);
-    }
+    try std.testing.expectError(
+        error.RecoveryCredentialAuthorityChanged,
+        runFakePrompt(&gateway, &hooks, fixture.config(), job),
+    );
+    try std.testing.expectEqual(@as(usize, 0), gateway.request_models.items.len);
 }
 
 test "processQueuedPrompt counts only failed provider attempts across tool followups" {
@@ -5962,8 +5969,8 @@ test "processQueuedPrompt trace records history shape returned tool calls and wa
     try std.testing.expect(std.mem.find(u8, trace, "event=projection_end") != null);
     try std.testing.expect(std.mem.find(u8, trace, "history_turn_kinds=interrupted") != null);
     try std.testing.expect(std.mem.find(u8, trace, "projected_message_roles=user,assistant,tool,user") != null);
-    try std.testing.expect(std.mem.find(u8, trace, "event=before_payload_build") != null);
-    try std.testing.expect(std.mem.find(u8, trace, "event=after_payload_build") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "event=before_provider_preflight") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "event=provider_admitted") != null);
     try std.testing.expect(std.mem.find(u8, trace, "event=returned_tool_call") != null);
     try std.testing.expect(std.mem.find(u8, trace, "call_id=call_1 tool_name=write_file") != null);
     try std.testing.expect(std.mem.find(u8, trace, "args_preview=<object_fields=3 values=[") != null);

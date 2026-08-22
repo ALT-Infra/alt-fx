@@ -33,7 +33,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_args = @import("../tooling/tool_args.zig");
 const tool_admission = @import("../tooling/tool_admission.zig");
-const tool_advertisement = @import("../tooling/tool_advertisement.zig");
+const tool_projection_mod = @import("../tooling/tool_projection.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const context_contract = @import("../workspace/context_contract.zig");
@@ -192,6 +192,13 @@ pub fn Runtime(comptime App: type) type {
                     app_session_runtime.Runtime(App).childCapability(app)
                 else
                     null;
+            const selected_provider = provider_runtime.provider(app);
+            const provider_capabilities = if (comptime @hasDecl(App, "providerSet"))
+                app.providerSet().select(selected_provider).capabilities
+            else if (selected_provider == .gateway)
+                provider_set.Bundle.Capabilities{ .fx_search = true, .vision_fallback = true }
+            else
+                provider_set.Bundle.Capabilities{};
             var ctx: tool_runtime.Context = .{
                 .workspace_root = workspace_root,
                 .access_scope = if (host_workspace != null)
@@ -213,7 +220,8 @@ pub fn Runtime(comptime App: type) type {
                 .gateway_team = app.auth.gatewayTeam(),
                 .credential_source = app.auth.credentialSource(),
                 .account_id = app.auth.accountId(),
-                .provider = provider_runtime.provider(app),
+                .provider = selected_provider,
+                .provider_capabilities = provider_capabilities,
                 .oauth_transport = app.auth.oauthTransport(),
                 .secret_store = if (comptime @hasDecl(@TypeOf(app.auth), "secretStore"))
                     app.auth.secretStore()
@@ -285,9 +293,10 @@ pub fn Runtime(comptime App: type) type {
                 ctx.on_web_fetch_progress = app_callbacks.Bindings(App).onWebFetchProgress;
             }
             if (comptime @hasField(App, "web_search_runtime")) {
-                if (model_provider.usesGatewayAuxiliaries(provider_runtime.provider(app))) {
+                if (provider_capabilities.fx_search) {
                     app.web_search_runtime.configure(.{
                         .api_key = app.auth.apiKey() orelse "",
+                        .credential_source = app.auth.credentialSource(),
                         .gateway_team = app.auth.gatewayTeam(),
                         .worker_model = provider_runtime.model(app),
                         .gateway_retry_count = gateway_retry_count,
@@ -926,7 +935,7 @@ pub fn Runtime(comptime App: type) type {
                     return error.McpRequiredServerUnavailable;
                 }
             }
-            var tool_projection = try app.snapshotGatewayToolProjection(
+            var tool_projection = try app.snapshotModelToolProjection(
                 std.heap.c_allocator,
                 job.permission_mode,
             );
@@ -985,7 +994,7 @@ pub fn Runtime(comptime App: type) type {
         ) subagent_execution.ServiceError!subagent_execution.RunOutcome {
             const app: *App = @ptrCast(@alignCast(raw.?));
             const alloc = std.heap.c_allocator;
-            var child_projection = app.snapshotSubagentGatewayToolProjection(
+            var child_projection = app.snapshotSubagentModelToolProjection(
                 alloc,
                 admission.permission_mode,
                 admission.rules,
@@ -1012,14 +1021,17 @@ pub fn Runtime(comptime App: type) type {
             else
                 provider_set.Set{
                     .gateway = .{
+                        .capabilities = tool_context.provider_capabilities,
                         .agent_stream = tool_context.agent_stream_provider,
                         .permission_reviewer = tool_context.permission_reviewer_provider,
                     },
                     .codex = .{
+                        .capabilities = tool_context.provider_capabilities,
                         .agent_stream = tool_context.agent_stream_provider,
                         .permission_reviewer = tool_context.permission_reviewer_provider,
                     },
                     .grok = .{
+                        .capabilities = tool_context.provider_capabilities,
                         .agent_stream = tool_context.agent_stream_provider,
                         .permission_reviewer = tool_context.permission_reviewer_provider,
                     },
@@ -1033,7 +1045,7 @@ pub fn Runtime(comptime App: type) type {
                 .model_prompt_overlay = prompt_policy.modelPromptOverlay(admission.model),
                 .skills_prompt_section = bounded_skills.text,
                 .explicit_skills_prompt_section = explicit_skills.text,
-                .gateway_tools_json = child_projection.tools_json,
+                .advertised_tool_names = child_projection.advertised_names,
                 .custom_tool_guidance = child_projection.custom_guidance,
                 .context_registry = app.contextRegistry(),
                 .context_enabled = if (comptime @hasField(App, "context_enabled")) app.context_enabled else true,
@@ -1063,7 +1075,7 @@ pub fn Runtime(comptime App: type) type {
             explicit_skills_section: []const u8,
             gateway_retry_count: usize,
             gateway_chat_url: []const u8,
-            tool_projection: *const tool_advertisement.EffectiveToolProjection,
+            tool_projection: *const tool_projection_mod.EffectiveToolProjection,
             session_child_capability: ?*session_child_store.SessionChildCapability,
         ) agent_runtime.Config {
             const prompt_policy = app.promptPolicy();
@@ -1078,7 +1090,13 @@ pub fn Runtime(comptime App: type) type {
                 else
                     null,
                 .gateway_chat_url = gateway_chat_url,
-                .gateway_tools_json = tool_projection.tools_json,
+                .advertised_tool_names = tool_projection.advertised_names,
+                .provider_capabilities = if (comptime @hasDecl(App, "providerSet"))
+                    app.providerSet().select(job.provider).capabilities
+                else if (job.provider == .gateway)
+                    .{ .fx_search = true, .vision_fallback = true }
+                else
+                    .{},
                 .custom_tool_guidance = tool_projection.custom_guidance,
                 .agent_step_limit = app.agent_step_limit,
                 .max_tool_result_bytes = job.agent_settings.max_tool_result_bytes,
@@ -1252,7 +1270,7 @@ const test_tool_registry = tool_dispatch.Registry{ .tools = test_tools[0..] };
 const custom_label_tool = tool_dispatch.Tool{
     .name = "custom_registered_tool",
     .description = "Custom registered test tool.",
-    .gateway_schema = .{
+    .model_schema = .{
         .name = "custom_registered_tool",
         .description = "Custom registered test tool.",
     },
@@ -1528,11 +1546,11 @@ const FakeApp = struct {
         );
     }
 
-    fn snapshotGatewayToolProjection(
+    fn snapshotModelToolProjection(
         self: *FakeApp,
         alloc: Allocator,
         permission_mode: PermissionMode,
-    ) !tool_advertisement.EffectiveToolProjection {
+    ) !tool_projection_mod.EffectiveToolProjection {
         self.snapshot_tools_count += 1;
         self.snapshot_permission_mode = permission_mode;
         if (self.snapshot_barrier) |barrier| barrier.wait();
@@ -1541,20 +1559,20 @@ const FakeApp = struct {
         else
             null;
         if (self.snapshot_tools_error) |err| return err;
-        const tools_json = try alloc.dupe(u8, "[]");
-        errdefer alloc.free(tools_json);
+        const advertised_names = try alloc.alloc([]const u8, 0);
+        errdefer alloc.free(advertised_names);
         return .{
-            .tools_json = tools_json,
+            .advertised_names = advertised_names,
             .custom_guidance = try alloc.dupe(u8, self.snapshot_custom_guidance),
         };
     }
 
-    fn snapshotSubagentGatewayToolProjection(
+    fn snapshotSubagentModelToolProjection(
         self: *FakeApp,
         alloc: Allocator,
         permission_mode: PermissionMode,
         permission_rules: types.PermissionRuleSet,
-    ) !tool_advertisement.EffectiveToolProjection {
+    ) !tool_projection_mod.EffectiveToolProjection {
         self.snapshot_tools_count += 1;
         self.snapshot_permission_mode = permission_mode;
         if (self.snapshot_barrier) |barrier| barrier.wait();
@@ -1563,10 +1581,10 @@ const FakeApp = struct {
         else
             null;
         if (self.snapshot_tools_error) |err| return err;
-        const tools_json = try alloc.dupe(u8, "[]");
-        errdefer alloc.free(tools_json);
+        const advertised_names = try alloc.alloc([]const u8, 0);
+        errdefer alloc.free(advertised_names);
         return .{
-            .tools_json = tools_json,
+            .advertised_names = advertised_names,
             .custom_guidance = try alloc.dupe(u8, self.snapshot_custom_guidance),
         };
     }
@@ -2440,21 +2458,19 @@ test "app direct ask delivers semantic presentation through the runtime sink" {
         fn stream(
             _: ?*anyopaque,
             _: Allocator,
-            request: agent_stream_provider.Request,
+            request: agent_stream_provider.ModelRequest,
         ) !agent_stream_provider.Result {
-            request.on_content_chunk(
-                request.callback_ctx,
-                "Before table.\n" ++
-                    "| Name | Count |\n" ++
-                    "|------|------:|\n" ++
-                    "| api | 7 |\n" ++
-                    "After table.\n\n" ++
-                    "```zig\n" ++
-                    "const ready = true;\n" ++
-                    "```\n\n" ++
-                    "---\n",
-            );
-            return .{ .status = .ok, .completion = .{ .content = "", .finish_reason = .stop } };
+            try request.admission.admit();
+            request.events.emit(.{ .content_delta = "Before table.\n" ++
+                "| Name | Count |\n" ++
+                "|------|------:|\n" ++
+                "| api | 7 |\n" ++
+                "After table.\n\n" ++
+                "```zig\n" ++
+                "const ready = true;\n" ++
+                "```\n\n" ++
+                "---\n" });
+            return .{ .completed = .{ .completion = .{ .content = "", .finish_reason = .stop } } };
         }
     };
 
@@ -2812,11 +2828,9 @@ test "app agent runtime queued prompt config uses captured job settings over sta
         .fast_mode = true,
         .effort = types.ReasoningEffort.literal("high"),
     };
-    const tools_json = try alloc.dupe(u8, "[]");
-    errdefer alloc.free(tools_json);
     const custom_guidance = try alloc.dupe(u8, "app custom tool guidance");
-    var tool_projection = tool_advertisement.EffectiveToolProjection{
-        .tools_json = tools_json,
+    var tool_projection = tool_projection_mod.EffectiveToolProjection{
+        .advertised_names = try alloc.alloc([]const u8, 0),
         .custom_guidance = custom_guidance,
     };
     defer tool_projection.deinit(alloc);
@@ -2826,7 +2840,7 @@ test "app agent runtime queued prompt config uses captured job settings over sta
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), config.effort);
     try std.testing.expectEqual(@as(usize, 8192), config.max_tool_result_bytes);
     try std.testing.expectEqual(types.ToolChoice.none, config.first_call_tool_choice);
-    try std.testing.expectEqualStrings(tool_projection.tools_json, config.gateway_tools_json);
+    try std.testing.expectEqualSlices([]const u8, tool_projection.advertised_names, config.advertised_tool_names);
     try std.testing.expectEqualStrings(tool_projection.custom_guidance, config.custom_tool_guidance);
     try std.testing.expectEqualStrings(test_prompt_policy.system_prompt, config.system_prompt);
     try std.testing.expectEqualStrings("test model overlay", config.model_prompt_overlay.?);

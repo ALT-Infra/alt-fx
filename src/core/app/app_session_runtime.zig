@@ -348,15 +348,10 @@ pub const SessionPreferencePatch = struct {
             .effort = self.effort,
             .fast_mode = self.fast_mode,
         };
-        if (self.provider) |provider| {
-            switch (provider) {
-                .gateway => patch.model = self.model,
-                .codex => patch.codex_model = self.model,
-                .grok => patch.grok_model = self.model,
-            }
-        } else {
-            patch.model = self.model;
-        }
+        if (self.model) |model| patch.model_preference = .{
+            .provider = self.provider orelse .gateway,
+            .model = model,
+        };
         return patch;
     }
 };
@@ -7497,7 +7492,7 @@ test "resumed recovery checkpoint replays its unfinished turn once" {
             .assistant_source = @constCast("Partial output before EOF."),
             .cause = .response_interrupted,
             .action = .continuing_response,
-            .route_model = @constCast("saved/model"),
+            .authority = .{ .provider = .gateway, .model = @constCast("saved/model") },
             .requested_fast_mode = false,
             .fast_mode = false,
             .max_provider_attempts = 10,
@@ -8921,10 +8916,10 @@ test "combined preference patch writes user defaults cleans legacy fields and ap
 
     var detailed = try config_runtime.loadMergedSettingsDetailed(alloc, paths.workspace);
     defer detailed.deinit(alloc);
-    try std.testing.expectEqualStrings("user/model", detailed.settings.model.?);
+    try std.testing.expectEqualStrings("user/model", detailed.settings.models.get(.gateway).?);
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), detailed.settings.effort.?);
     try std.testing.expectEqual(false, detailed.settings.fast_mode.?);
-    try std.testing.expectEqual(config_runtime.ConfigSource.user_global, detailed.sources.model);
+    try std.testing.expectEqual(config_runtime.ConfigSource.user_global, detailed.sources.models.get(.gateway));
     try std.testing.expectEqual(config_runtime.ConfigSource.user_global, detailed.sources.effort);
     try std.testing.expectEqual(config_runtime.ConfigSource.user_global, detailed.sources.fast_mode);
 }

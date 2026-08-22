@@ -1,8 +1,8 @@
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 const diff_mod = @import("../output/diff.zig");
-const gateway_json = @import("../gateway/gateway_json.zig");
-const gateway_schema = @import("../tooling/gateway_schema.zig");
+const vercel_protocol = @import("../../gateway/vercel_protocol.zig");
+const model_tool_schema = @import("../tooling/model_tool_schema.zig");
 const io_mod = @import("../shared/io.zig");
 const permissions = @import("permissions.zig");
 const session_usage = @import("../session/session_usage.zig");
@@ -127,7 +127,7 @@ pub const ReviewRequest = struct {
 };
 
 pub const OwnedCompletion = struct {
-    completion: types.GatewayCompletion,
+    completion: types.ModelCompletion,
     context: ?*anyopaque = null,
     deinit_fn: ?*const fn (*anyopaque, std.mem.Allocator) void = null,
 
@@ -191,6 +191,7 @@ pub const OverrideFn = *const fn (
 /// returns.
 pub const ProviderInput = struct {
     credential: []const u8 = "",
+    credential_source: ?types.CredentialSource = null,
     account_id: ?[]const u8 = null,
     tenant: ?[]const u8 = null,
     endpoint: []const u8 = "",
@@ -354,7 +355,7 @@ pub const Reviewer = struct {
                 cancel_flag,
             ) catch |err| return constructionFailure(err)
         else
-            gateway_json.buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
+            vercel_protocol.buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
                 alloc,
                 tools_json,
                 messages,
@@ -813,7 +814,7 @@ const risk_values = [_][]const u8{ "low", "medium", "high", "critical" };
 const authorization_values = [_][]const u8{ "unknown", "low", "medium", "high" };
 const decision_values = [_][]const u8{ "allow", "ask" };
 const schema_required = [_][]const u8{ "risk", "authorization", "decision", "rationale" };
-const schema_properties = [_]gateway_schema.Property{
+const schema_properties = [_]model_tool_schema.Property{
     .{
         .name = "risk",
         .json_type = .string,
@@ -839,7 +840,7 @@ const schema_properties = [_]gateway_schema.Property{
     },
 };
 
-const function_schema: gateway_schema.FunctionSchema = .{
+pub const function_schema: model_tool_schema.FunctionSchema = .{
     .name = tool_name,
     .description = "Return a strict automatic permission assessment for one exact Fx action.",
     .input_schema = .{
@@ -850,12 +851,12 @@ const function_schema: gateway_schema.FunctionSchema = .{
 };
 
 fn toolsJsonAlloc(alloc: std.mem.Allocator) ![]u8 {
-    const schema_json = try gateway_schema.builtinFunctionSchemaJsonAlloc(alloc, function_schema);
+    const schema_json = try model_tool_schema.builtinFunctionSchemaJsonAlloc(alloc, function_schema);
     defer alloc.free(schema_json);
     return std.fmt.allocPrint(alloc, "[{s}]", .{schema_json});
 }
 
-fn parseCompletion(alloc: std.mem.Allocator, completion: types.GatewayCompletion) !ParseOutcome {
+fn parseCompletion(alloc: std.mem.Allocator, completion: types.ModelCompletion) !ParseOutcome {
     if (completion.content) |content| {
         if (std.mem.trim(u8, content, " \t\r\n").len > 0) return .invalid;
     }
@@ -1061,7 +1062,7 @@ test "automatic review rejects malformed extra and legacy deny assessments" {
         .name = tool_name,
         .arguments_json = "{\"risk\":\"low\",\"authorization\":\"low\",\"decision\":\"allow\",\"rationale\":\"safe\"}",
     };
-    const completions = [_]types.GatewayCompletion{
+    const completions = [_]types.ModelCompletion{
         .{ .content = "allow" },
         .{ .tool_calls = &.{} },
         .{ .tool_calls = &.{ valid_call, valid_call } },

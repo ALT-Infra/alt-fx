@@ -12,8 +12,7 @@ const ToolCall = types.ToolCall;
 
 const removed_direct_question_guidance = "Treat it as interrupting any previous tool plan.";
 const removed_resume_guidance = "Continue from the latest meaningful state";
-const fixture_tools_json =
-    "[{\"type\":\"function\",\"name\":\"read_file\",\"description\":\"Read a file\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]";
+const read_file_advertised_names = [_][]const u8{"read_file"};
 
 const FakeCompletion = test_support.FakeCompletion;
 const FakeGateway = test_support.FakeGateway;
@@ -109,7 +108,7 @@ test "processQueuedPrompt sends former intent text normally with tools" {
         var job = fixture.job();
         job.prompt = @constCast(text);
         var config = fixture.config();
-        config.gateway_tools_json = fixture_tools_json;
+        config.advertised_tool_names = &read_file_advertised_names;
 
         try runFakePrompt(&gateway, &hooks, config, job);
 

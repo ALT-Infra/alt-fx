@@ -5,6 +5,7 @@ const model_capabilities = @import("../../config/model_capabilities.zig");
 const model_provider = @import("../../config/model_provider.zig");
 const types = @import("../../shared/types.zig");
 const worker_runtime = @import("../worker_runtime.zig");
+const agent_stream_provider = @import("../stream_provider.zig");
 const session_runtime = @import("../../session/session.zig");
 const session_codec = @import("../../session/session_codec.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
@@ -16,7 +17,9 @@ const io_mod = @import("../../shared/io.zig");
 const host_target = @import("../../hosts/target.zig");
 const secret = @import("../../auth/secret.zig");
 const credentials = @import("../../auth/credentials.zig");
+const credential_authority = @import("../../auth/credential_authority.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
+const model_tool_schema = @import("../../tooling/model_tool_schema.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
 const tooling_tool_admission = @import("../../tooling/tool_admission.zig");
 const hooks = @import("../../hooks/hooks.zig");
@@ -75,38 +78,22 @@ const PromptFinishTrace = runtime_finalization.PromptFinishTrace;
 const ToolExecutionResult = runtime_tool_contracts.ToolExecutionResult;
 
 fn terminal_request_schema_advertised(
-    alloc: Allocator,
-    tools_json: []const u8,
-) Allocator.Error!bool {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, tools_json, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return false,
-    };
-    defer parsed.deinit();
-    if (parsed.value != .array) return false;
-
-    for (parsed.value.array.items) |tool_value| {
-        if (tool_value != .object) continue;
-        const name = tool_value.object.get("name") orelse continue;
-        if (name != .string or !std.mem.eql(u8, name.string, "terminal")) continue;
-        const input_schema = tool_value.object.get("inputSchema") orelse return false;
-        if (input_schema != .object) return false;
-        const input_type = input_schema.object.get("type") orelse return false;
-        if (input_type != .string or !std.mem.eql(u8, input_type.string, "object")) return false;
-        const properties = input_schema.object.get("properties") orelse return false;
-        if (properties != .object or properties.object.count() != 1) return false;
-        const request = properties.object.get("request") orelse return false;
-        if (request != .object) return false;
-        const alternatives = request.object.get("oneOf") orelse return false;
-        if (alternatives != .array or alternatives.array.items.len == 0) return false;
-        const required = input_schema.object.get("required") orelse return false;
-        if (required != .array or required.array.items.len != 1) return false;
-        const required_name = required.array.items[0];
-        if (required_name != .string or !std.mem.eql(u8, required_name.string, "request")) return false;
-        const additional_properties = input_schema.object.get("additionalProperties") orelse return false;
-        return additional_properties == .bool and !additional_properties.bool;
+    registry: tool_dispatch.Registry,
+    advertised_names: []const []const u8,
+) bool {
+    var advertised = false;
+    for (advertised_names) |name| {
+        if (std.mem.eql(u8, name, "terminal")) {
+            advertised = true;
+            break;
+        }
     }
-    return false;
+    if (!advertised) return false;
+    const terminal = registry.lookup("terminal") orelse return false;
+    return model_tool_schema.isSingleRequiredObjectUnionField(
+        terminal.model_schema.input_schema,
+        "request",
+    );
 }
 
 fn terminal_request_normalization_eligible(
@@ -255,15 +242,40 @@ fn normalize_terminal_request_tool_calls(
 }
 
 test "terminal request normalization follows effective attempt advertisement" {
-    const nested_tools_json =
-        "[{\"type\":\"function\",\"name\":\"terminal\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"request\":{\"oneOf\":[{\"type\":\"object\"}]}},\"required\":[\"request\"],\"additionalProperties\":false}}]";
-    const flat_tools_json =
-        "[{\"type\":\"function\",\"name\":\"terminal\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\"}},\"required\":[\"action\"],\"additionalProperties\":false}}]";
+    const nested = tool_dispatch.Tool{
+        .name = "terminal",
+        .description = "terminal",
+        .model_schema = .{
+            .name = "terminal",
+            .description = "terminal",
+            .input_schema = .{
+                .properties = &.{.{
+                    .name = "request",
+                    .json_type = .object,
+                    .shape = &.{ .object = &.{ .one_of = &.{.{}} } },
+                }},
+                .required = &.{"request"},
+                .additional_properties = false,
+            },
+        },
+        .decode = undefined,
+        .call = undefined,
+        .reads_only_fn = undefined,
+        .irreversible_fn = undefined,
+    };
+    const flat = tool_dispatch.Tool{
+        .name = "terminal",
+        .description = "terminal",
+        .model_schema = .{ .name = "terminal", .description = "terminal" },
+        .decode = undefined,
+        .call = undefined,
+        .reads_only_fn = undefined,
+        .irreversible_fn = undefined,
+    };
 
-    try std.testing.expect(try terminal_request_schema_advertised(std.testing.allocator, nested_tools_json));
-    try std.testing.expect(!try terminal_request_schema_advertised(std.testing.allocator, flat_tools_json));
-    try std.testing.expect(!try terminal_request_schema_advertised(std.testing.allocator, "[]"));
-    try std.testing.expect(!try terminal_request_schema_advertised(std.testing.allocator, "{"));
+    try std.testing.expect(terminal_request_schema_advertised(.{ .tools = &.{nested} }, &.{"terminal"}));
+    try std.testing.expect(!terminal_request_schema_advertised(.{ .tools = &.{flat} }, &.{"terminal"}));
+    try std.testing.expect(!terminal_request_schema_advertised(.{ .tools = &.{nested} }, &.{}));
     try std.testing.expect(terminal_request_normalization_eligible(true, .unavailable));
     try std.testing.expect(terminal_request_normalization_eligible(true, .optional));
     try std.testing.expect(!terminal_request_normalization_eligible(true, .required));
@@ -278,7 +290,7 @@ test "terminal request projection wraps eligible flat objects without changing s
     const terminal_tool = tool_dispatch.Tool{
         .name = "terminal",
         .description = "terminal",
-        .gateway_schema = .{ .name = "terminal", .description = "terminal" },
+        .model_schema = .{ .name = "terminal", .description = "terminal" },
         .executor_kind = .terminal,
         .decode = undefined,
         .call = undefined,
@@ -345,7 +357,7 @@ fn check_terminal_request_projection_allocation_failures(alloc: Allocator) !void
     const terminal_tool = tool_dispatch.Tool{
         .name = "terminal",
         .description = "terminal",
-        .gateway_schema = .{ .name = "terminal", .description = "terminal" },
+        .model_schema = .{ .name = "terminal", .description = "terminal" },
         .executor_kind = .terminal,
         .decode = undefined,
         .call = undefined,
@@ -389,7 +401,7 @@ test "terminal request normalization unwraps only exact eligible native calls" {
     const native_terminal = tool_dispatch.Tool{
         .name = "terminal",
         .description = "terminal",
-        .gateway_schema = .{ .name = "terminal", .description = "terminal" },
+        .model_schema = .{ .name = "terminal", .description = "terminal" },
         .executor_kind = .terminal,
         .decode = undefined,
         .call = undefined,
@@ -463,15 +475,10 @@ test "terminal request normalization unwraps only exact eligible native calls" {
 }
 
 fn check_terminal_request_normalization_allocation_failures(alloc: Allocator) !void {
-    const nested_tools_json =
-        "[{\"type\":\"function\",\"name\":\"terminal\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"request\":{\"oneOf\":[{\"type\":\"object\"}]}},\"required\":[\"request\"],\"additionalProperties\":false}}]";
-    if (!try terminal_request_schema_advertised(alloc, nested_tools_json)) {
-        return error.TestUnexpectedResult;
-    }
     const native_terminal = tool_dispatch.Tool{
         .name = "terminal",
         .description = "terminal",
-        .gateway_schema = .{ .name = "terminal", .description = "terminal" },
+        .model_schema = .{ .name = "terminal", .description = "terminal" },
         .executor_kind = .terminal,
         .decode = undefined,
         .call = undefined,
@@ -1080,7 +1087,7 @@ fn materializeConfirmedProviderTools(
     arena: Allocator,
     config: Config,
     turn_id: u64,
-    completion: types.GatewayCompletion,
+    completion: types.ModelCompletion,
     advertised_dynamic_tool_names: []const []const u8,
     step_ctx: TraceContext,
     within_turn_suffix: *std.ArrayList(ChatMessage),
@@ -1354,7 +1361,7 @@ fn semanticAttemptLimit(max_provider_attempts: usize) usize {
     return if (max_provider_attempts == 0) 1 else max_provider_attempts;
 }
 
-fn completionContentBytes(completion: types.GatewayCompletion) usize {
+fn completionContentBytes(completion: types.ModelCompletion) usize {
     return if (completion.content) |content| content.len else 0;
 }
 
@@ -1400,7 +1407,7 @@ fn appendReadFailureRecoveryContext(
 }
 
 fn recoveryToolEvidence(
-    completion: ?types.GatewayCompletion,
+    completion: ?types.ModelCompletion,
     stream_ctx: *const runtime_assistant_stream.StreamChunkContext,
 ) model_response_recovery.ToolEvidence {
     if (completion) |value| {
@@ -1421,7 +1428,7 @@ fn recoveryToolEvidence(
 
 noinline fn effectiveRecoveryToolEvidence(
     preserved: model_response_recovery.ToolEvidence,
-    completion: ?types.GatewayCompletion,
+    completion: ?types.ModelCompletion,
     stream_ctx: *const runtime_assistant_stream.StreamChunkContext,
 ) model_response_recovery.ToolEvidence {
     const observed = recoveryToolEvidence(completion, stream_ctx);
@@ -1484,11 +1491,107 @@ fn recoverySelectionChanged(
     selected_model: []const u8,
     selected_fast_mode: bool,
 ) bool {
-    return checkpoint.route_provider != selected_provider or !std.mem.eql(
+    return checkpoint.authority.provider != selected_provider or !std.mem.eql(
         u8,
-        checkpoint.route_model,
+        checkpoint.authority.model,
         selected_model,
     ) or checkpoint.requested_fast_mode != selected_fast_mode;
+}
+
+fn recoveryCredentialAuthorityMatches(
+    checkpoint: session_codec.RecoveryCheckpoint,
+    source: ?types.CredentialSource,
+    account_id: ?[]const u8,
+    tenant: ?[]const u8,
+    secret_value: []const u8,
+) bool {
+    const expected_source = checkpoint.authority.credential_source orelse return false;
+    const expected_identity = checkpoint.authority.credential_identity orelse return false;
+    const current_source = source orelse return false;
+    if (current_source != expected_source) return false;
+    return expected_identity.eql(credential_authority.derive(
+        current_source,
+        account_id,
+        tenant,
+        secret_value,
+    ));
+}
+
+fn shouldRejectRecoveryAuthority(
+    checkpoint: session_codec.RecoveryCheckpoint,
+    source: ?types.CredentialSource,
+    account_id: ?[]const u8,
+    tenant: ?[]const u8,
+    secret_value: []const u8,
+) bool {
+    const provider_may_have_received_request = checkpoint.outstanding_reservation or
+        checkpoint.consumed_provider_attempts > 0;
+    return provider_may_have_received_request and !recoveryCredentialAuthorityMatches(
+        checkpoint,
+        source,
+        account_id,
+        tenant,
+        secret_value,
+    );
+}
+
+test "potentially sent recovery rejects missing or changed credential authority" {
+    const identity = credential_authority.derive(
+        .chatgpt_subscription,
+        "acct_1",
+        null,
+        "token-a",
+    );
+    const checkpoint = session_codec.RecoveryCheckpoint{
+        .turn_id = 1,
+        .user = .{ .text = @constCast("continue") },
+        .assistant_source = @constCast("partial"),
+        .cause = .response_interrupted,
+        .action = .continuing_response,
+        .authority = .{
+            .provider = .codex,
+            .model = @constCast("gpt-5.4"),
+            .credential_source = .chatgpt_subscription,
+            .credential_identity = identity,
+        },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 3,
+        .consumed_provider_attempts = 1,
+    };
+    try std.testing.expect(!shouldRejectRecoveryAuthority(
+        checkpoint,
+        .chatgpt_subscription,
+        "acct_1",
+        null,
+        "token-b",
+    ));
+    try std.testing.expect(shouldRejectRecoveryAuthority(
+        checkpoint,
+        .chatgpt_subscription,
+        "acct_2",
+        null,
+        "token-a",
+    ));
+
+    var legacy = checkpoint;
+    legacy.authority.credential_source = null;
+    legacy.authority.credential_identity = null;
+    try std.testing.expect(shouldRejectRecoveryAuthority(
+        legacy,
+        .chatgpt_subscription,
+        "acct_1",
+        null,
+        "token-a",
+    ));
+    legacy.consumed_provider_attempts = 0;
+    try std.testing.expect(!shouldRejectRecoveryAuthority(
+        legacy,
+        .chatgpt_subscription,
+        "acct_1",
+        null,
+        "token-a",
+    ));
 }
 
 fn checkpointCause(
@@ -1592,8 +1695,20 @@ fn persistRecoveryCheckpoint(
         .cause = checkpointCause(cause),
         .action = checkpointAction(strategy),
         .tool_state = checkpointToolState(tool_evidence),
-        .route_model = @constCast(route_model),
-        .route_provider = job.provider,
+        .authority = .{
+            .provider = job.provider,
+            .model = @constCast(route_model),
+            .credential_source = job.credential_source,
+            .credential_identity = if (job.credential_source) |source|
+                credential_authority.derive(
+                    source,
+                    job.account_id,
+                    job.gateway_team,
+                    job.api_key,
+                )
+            else
+                null,
+        },
         .requested_fast_mode = requested_fast_mode,
         .fast_mode = fast_mode,
         .max_provider_attempts = attempt_limit,
@@ -1615,15 +1730,50 @@ fn persistRecoveryCheckpoint(
     );
 }
 
-fn isRetryableModelStatus(status: std.http.Status) bool {
-    return switch (status) {
-        .too_many_requests,
-        .internal_server_error,
-        .bad_gateway,
-        .service_unavailable,
-        .gateway_timeout,
-        => true,
+fn streamSucceeded(result: runtime_gateway_step.StreamResult) bool {
+    return std.meta.activeTag(result) == .completed;
+}
+
+fn streamFailure(result: runtime_gateway_step.StreamResult) ?agent_stream_provider.Failure {
+    return switch (result) {
+        .completed => null,
+        .failed => |failure| failure,
+    };
+}
+
+fn streamCompletion(result: runtime_gateway_step.StreamResult) types.ModelCompletion {
+    return switch (result) {
+        .completed => |completed| completed.completion,
+        .failed => .{},
+    };
+}
+
+fn streamCompletionPtr(result: *runtime_gateway_step.StreamResult) ?*types.ModelCompletion {
+    return switch (result.*) {
+        .completed => |*completed| &completed.completion,
+        .failed => null,
+    };
+}
+
+fn isRetryableModelFailure(kind: agent_stream_provider.FailureKind) bool {
+    return switch (kind) {
+        .rate_limited, .server_error, .bad_gateway, .unavailable, .gateway_timeout => true,
         else => false,
+    };
+}
+
+fn failureHttpStatus(kind: agent_stream_provider.FailureKind) std.http.Status {
+    return switch (kind) {
+        .invalid_request => .bad_request,
+        .unauthorized => .unauthorized,
+        .forbidden => .forbidden,
+        .request_too_large => .payload_too_large,
+        .rate_limited => .too_many_requests,
+        .server_error => .internal_server_error,
+        .bad_gateway => .bad_gateway,
+        .unavailable => .service_unavailable,
+        .gateway_timeout => .gateway_timeout,
+        .provider_error => .bad_gateway,
     };
 }
 
@@ -1665,7 +1815,7 @@ fn recoveryPauseRequested(config: Config) bool {
 }
 
 fn providerFailureReplaySafe(
-    completion: types.GatewayCompletion,
+    completion: types.ModelCompletion,
     stream_ctx: *const runtime_assistant_stream.StreamChunkContext,
 ) bool {
     return completion.finish_reason == .provider_error and
@@ -1699,11 +1849,11 @@ fn disableFastRouteAfterFailure(
     return true;
 }
 
-fn routeFailureDetail(completion: types.GatewayCompletion) []const u8 {
+fn routeFailureDetail(completion: types.ModelCompletion) []const u8 {
     return if (completion.provider_failure_detail) |detail| debug_trace.preview(detail, 240) else "";
 }
 
-fn isTerminalProviderExecutedCompletion(completion: types.GatewayCompletion) bool {
+fn isTerminalProviderExecutedCompletion(completion: types.ModelCompletion) bool {
     if (completion.finish_reason != .stop) return false;
     const content = completion.content orelse return false;
     return content.len > 0 and types.allToolCallsProviderExecuted(completion.tool_calls);
@@ -1758,8 +1908,26 @@ fn onRequiredVisionStreamToolStart(
     );
 }
 
+const ProviderEventContext = struct {
+    stream: *runtime_assistant_stream.StreamChunkContext,
+    required_vision: bool,
+};
+
+fn onProviderEvent(raw: *anyopaque, event: agent_stream_provider.Event) void {
+    const ctx: *ProviderEventContext = @ptrCast(@alignCast(raw));
+    switch (event) {
+        .content_delta => |chunk| runtime_assistant_stream.onStreamContentChunk(ctx.stream, chunk),
+        .reasoning_delta => |chunk| runtime_assistant_stream.onStreamReasoningChunk(ctx.stream, chunk),
+        .tool_input_delta => |chunk| runtime_assistant_stream.onStreamToolInputChunk(ctx.stream, chunk),
+        .tool_started => |tool| if (ctx.required_vision)
+            onRequiredVisionStreamToolStart(ctx.stream, tool.id, tool.name, tool.label)
+        else
+            runtime_assistant_stream.onStreamToolStart(ctx.stream, tool.id, tool.name, tool.label),
+    }
+}
+
 fn unsafeNoRetryReason(
-    completion: types.GatewayCompletion,
+    completion: types.ModelCompletion,
     stream_ctx: *const runtime_assistant_stream.StreamChunkContext,
 ) types.RouteRecoveryUnsafeReason {
     return if (stream_ctx.saw_tool_start or completion.tool_calls.len > 0)
@@ -1871,7 +2039,7 @@ fn pushTerminalProviderFailureStatus(
     deps: *const AgentRuntimeDeps,
     attempts: usize,
     attempt_limit: usize,
-    completion: types.GatewayCompletion,
+    completion: types.ModelCompletion,
     diagnostic: types.ModelFailureDiagnostic,
 ) !void {
     const reason = completion.finish_reason orelse return;
@@ -1976,7 +2144,7 @@ fn hasDiagnosticIdentifier(text: []const u8) bool {
 
 fn providerCompletionDiagnostic(
     alloc: Allocator,
-    completion: types.GatewayCompletion,
+    completion: types.ModelCompletion,
     fallback: []const u8,
 ) !types.ModelFailureDiagnostic {
     return prepareExternalFailureDiagnostic(
@@ -2003,7 +2171,7 @@ fn traceRouteFailure(
     fast_mode: bool,
     semantic_attempt: usize,
     semantic_limit: usize,
-    completion: types.GatewayCompletion,
+    completion: types.ModelCompletion,
     stream_ctx: *const runtime_assistant_stream.StreamChunkContext,
     retry: bool,
 ) void {
@@ -2140,9 +2308,9 @@ fn processQueuedPromptInner(
     var arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const base_nested_terminal_advertised = try terminal_request_schema_advertised(
-        arena,
-        config.gateway_tools_json,
+    const base_nested_terminal_advertised = terminal_request_schema_advertised(
+        deps.tool_registry,
+        config.advertised_tool_names,
     );
 
     var stable_prefix: std.ArrayList(ChatMessage) = .empty;
@@ -2877,27 +3045,27 @@ fn executeActionBoundPermissionRequest(
 }
 
 fn visionFallbackMode(
-    provider: model_provider.ProviderId,
+    available: bool,
     tool_registered: bool,
 ) runtime_gateway_step.VisionToolMode {
-    if (!model_provider.usesGatewayAuxiliaries(provider) or !tool_registered) {
+    if (!available or !tool_registered) {
         return .unavailable;
     }
     return .optional;
 }
 
-test "vision fallback is available only through Gateway" {
+test "vision fallback follows the selected provider capability" {
     try std.testing.expectEqual(
         runtime_gateway_step.VisionToolMode.optional,
-        visionFallbackMode(.gateway, true),
+        visionFallbackMode(true, true),
     );
     try std.testing.expectEqual(
         runtime_gateway_step.VisionToolMode.unavailable,
-        visionFallbackMode(.gateway, false),
+        visionFallbackMode(true, false),
     );
     try std.testing.expectEqual(
         runtime_gateway_step.VisionToolMode.unavailable,
-        visionFallbackMode(.codex, true),
+        visionFallbackMode(false, true),
     );
 }
 
@@ -2973,7 +3141,7 @@ fn processQueuedPromptLoop(
     var last_tool_call_id: []const u8 = "none";
     var last_gateway_message_count: usize = stable_prefix.items.len + history_messages.items.len + 1;
     var selected_dynamic_tool_names: std.ArrayList([]const u8) = .empty;
-    var selected_dynamic_tool_schemas: std.ArrayList([]const u8) = .empty;
+    var selected_dynamic_tools: std.ArrayList(agent_stream_provider.DynamicFunctionTool) = .empty;
     const current_user_effective = current_user_message;
     const initial_pending_image_ids = try arena.alloc(usize, job.images.len);
     for (job.images, 0..) |attachment, index| initial_pending_image_ids[index] = attachment.id;
@@ -2992,6 +3160,17 @@ fn processQueuedPromptLoop(
         recoverySelectionChanged(checkpoint, job.provider, job.model, selected_fast_mode)
     else
         false;
+    if (job.recovery_checkpoint) |checkpoint| {
+        if (shouldRejectRecoveryAuthority(
+            checkpoint,
+            job.credential_source,
+            job.account_id,
+            job.gateway_team,
+            job.api_key,
+        )) {
+            return error.RecoveryCredentialAuthorityChanged;
+        }
+    }
     const restored_budget_exhausted = if (job.recovery_checkpoint) |checkpoint|
         !selection_changed and restored_attempts >= checkpoint.max_provider_attempts
     else
@@ -3243,10 +3422,10 @@ fn processQueuedPromptLoop(
                 current_user_effective,
                 within_turn_suffix.items,
             );
-            debug_trace.eventf("gateway", "before_payload_build", step_ctx, "model={s} gateway_messages={d}", .{ gateway_model, gateway_messages.items.len });
+            debug_trace.eventf("agent", "before_provider_preflight", step_ctx, "model={s} messages={d}", .{ gateway_model, gateway_messages.items.len });
             var vision_route: runtime_vision_contracts.VisionRoute = .native_images;
             var vision_mode = visionFallbackMode(
-                job.provider,
+                config.provider_capabilities.vision_fallback,
                 deps.tool_registry.lookup("vision") != null,
             );
             const recovery_source_messages = try appendReadFailureRecoveryContext(
@@ -3270,7 +3449,7 @@ fn processQueuedPromptLoop(
                         current_user_message_index,
                     );
                 }
-                if (!model_provider.usesGatewayAuxiliaries(job.provider)) {
+                if (!config.provider_capabilities.vision_fallback) {
                     return error.SubscriptionNativeImageUnavailable;
                 }
                 if (job.authorized_image_catalog.len == 0) {
@@ -3317,58 +3496,10 @@ fn processQueuedPromptLoop(
                     ));
                 }
             }
-            const request_payload = deps.agent_stream_provider.build(
-                overlay_arena,
-                .{
-                    .model = gateway_model,
-                    .tool_registry = deps.tool_registry,
-                    .serialized_tools = config.gateway_tools_json,
-                    .messages = request_messages,
-                    .tool_choice = tool_choice,
-                    .selected_dynamic_tool_schemas = selected_dynamic_tool_schemas.items,
-                    .vision_mode = vision_mode,
-                    .provider_options = provider_opts,
-                    .max_output_tokens = request_max_output_tokens(request_capabilities),
-                    .budget = .{ .cancel_flag = config.cancel_flag },
-                    .verified_images = if (verified_images.items.len > 0)
-                        verified_images.items
-                    else
-                        null,
-                },
-            ) catch |err| {
-                if (err == error.Cancelled) {
-                    runtime_telemetry.traceCancelObserved(step_ctx, false);
-                    try clearAutoRetryStatusIfNeeded(deps, recovery_strategy != null);
-                    try runtime_interruption.persistInterruptedTurnOnce(
-                        deps,
-                        finalization,
-                        job,
-                        null,
-                        null,
-                        completed_tool_names.items,
-                        &interrupted_persisted,
-                        step_ctx,
-                        within_turn_suffix.items,
-                        stop_state.retained_candidate,
-                        &stop_state.terminal_materializing,
-                    );
-                    finish_trace.finish("interrupted");
-                    return;
-                }
-                return err;
-            };
             summary_accumulator.prepareTokenRequest();
             runtime_assistant_stream.pushTokenProgressUpdate(&stream_ctx, .changed) catch |progress_err| {
                 debug_trace.logf("agent", "token progress publication failed source=gateway_prepare err={s}", .{@errorName(progress_err)});
             };
-            debug_trace.eventf("gateway", "after_payload_build", step_ctx, "payload_bytes={d} model={s} gateway_messages={d}", .{ request_payload.len, gateway_model, request_messages.len });
-            runtime_telemetry.traceGatewayRequestBuilt(
-                step_ctx,
-                gateway_model,
-                request_payload.len,
-                request_messages.len,
-                config.gateway_tools_json,
-            );
             if (job.provider == .gateway) {
                 try persistRecoveryCheckpoint(
                     deps,
@@ -3396,35 +3527,50 @@ fn processQueuedPromptLoop(
             const gateway_wait_started_ms = io_mod.milliTimestamp();
             var gateway_delivery = runtime_gateway_step.DeliveryCertainty.init();
             var gateway_attempt_evidence: runtime_gateway_step.AttemptEvidence = .{};
-            stream_result = runtime_gateway_step.streamGatewayCompletion(
+            var provider_events = ProviderEventContext{
+                .stream = &stream_ctx,
+                .required_vision = vision_mode == .required,
+            };
+            var model_request = agent_stream_provider.ModelRequest{
+                .credential = .{
+                    .secret = active_api_key,
+                    .source = job.credential_source,
+                    .account_id = job.account_id,
+                    .tenant = job.gateway_team,
+                },
+                .session_id = lifecycle.scope.session_id,
+                .model = gateway_model,
+                .retry_count = config.gateway_retry_count,
+                .messages = request_messages,
+                .tools = .{
+                    .registry = deps.tool_registry,
+                    .advertised_names = config.advertised_tool_names,
+                    .selected_dynamic = selected_dynamic_tools.items,
+                },
+                .tool_choice = tool_choice,
+                .vision_mode = vision_mode,
+                .provider_options = provider_opts,
+                .max_output_tokens = request_max_output_tokens(request_capabilities),
+                .budget = .{ .cancel_flag = config.cancel_flag },
+                .verified_images = if (verified_images.items.len > 0)
+                    verified_images.items
+                else
+                    null,
+                .trace_ctx = step_ctx,
+                .content_capture_limit = null,
+                .cooperative_pulse = deps.cooperative_transport_pulse,
+                .delivery = &gateway_delivery,
+                .attempt_evidence = &gateway_attempt_evidence,
+                .events = .{ .context = &provider_events, .emit_fn = onProviderEvent },
+                .cancel_flag = config.cancel_flag,
+                .provider_attempt_owner = .agent,
+            };
+            stream_result = runtime_gateway_step.streamModelCompletion(
                 deps.agent_stream_provider,
                 arena,
-                active_api_key,
-                job.credential_source,
-                job.account_id,
-                job.gateway_team,
-                lifecycle.scope.session_id,
-                gateway_model,
-                config.gateway_retry_count,
-                config.gateway_chat_url,
-                request_payload,
-                deps.cooperative_transport_pulse,
-                &gateway_delivery,
-                &gateway_attempt_evidence,
-                @ptrCast(&stream_ctx),
-                runtime_assistant_stream.onStreamContentChunk,
-                if (vision_mode == .required)
-                    onRequiredVisionStreamToolStart
-                else
-                    runtime_assistant_stream.onStreamToolStart,
-                runtime_assistant_stream.onStreamReasoningChunk,
-                runtime_assistant_stream.onStreamToolInputChunk,
-                config.cancel_flag,
+                model_request,
                 deps.usage,
                 deps.usage_allocator,
-                step_ctx,
-                null,
-                .agent,
             ) catch |err| {
                 parent_turn_delivery.observeGatewayDelivery(
                     deps,
@@ -3746,12 +3892,13 @@ fn processQueuedPromptLoop(
                 gateway_delivery.load(),
             );
             stream_result_set = true;
+            const first_failure = streamFailure(stream_result);
             if (job.provider != .gateway and
-                stream_result.status == .unauthorized and
+                first_failure != null and first_failure.?.kind == .unauthorized and
                 !auth_retry_used and
                 stream_ctx.raw_text.items.len == 0 and
                 !stream_ctx.saw_tool_start and
-                stream_result.completion.tool_calls.len == 0)
+                streamCompletion(stream_result).tool_calls.len == 0)
             {
                 if (try refreshGatewayCredentialForJob(
                     deps,
@@ -3765,35 +3912,15 @@ fn processQueuedPromptLoop(
                     auth_retry_used = true;
                     var replay_delivery = runtime_gateway_step.DeliveryCertainty.init();
                     var replay_evidence: runtime_gateway_step.AttemptEvidence = .{};
-                    stream_result = try runtime_gateway_step.streamGatewayCompletion(
+                    model_request.credential.secret = active_api_key;
+                    model_request.delivery = &replay_delivery;
+                    model_request.attempt_evidence = &replay_evidence;
+                    stream_result = try runtime_gateway_step.streamModelCompletion(
                         deps.agent_stream_provider,
                         arena,
-                        active_api_key,
-                        job.credential_source,
-                        job.account_id,
-                        job.gateway_team,
-                        lifecycle.scope.session_id,
-                        gateway_model,
-                        config.gateway_retry_count,
-                        config.gateway_chat_url,
-                        request_payload,
-                        deps.cooperative_transport_pulse,
-                        &replay_delivery,
-                        &replay_evidence,
-                        @ptrCast(&stream_ctx),
-                        runtime_assistant_stream.onStreamContentChunk,
-                        if (vision_mode == .required)
-                            onRequiredVisionStreamToolStart
-                        else
-                            runtime_assistant_stream.onStreamToolStart,
-                        runtime_assistant_stream.onStreamReasoningChunk,
-                        runtime_assistant_stream.onStreamToolInputChunk,
-                        config.cancel_flag,
+                        model_request,
                         deps.usage,
                         deps.usage_allocator,
-                        step_ctx,
-                        null,
-                        .agent,
                     );
                     parent_turn_delivery.observeGatewayDelivery(
                         deps,
@@ -3804,20 +3931,22 @@ fn processQueuedPromptLoop(
                         "auth",
                         "subscription_request_replayed",
                         step_ctx,
-                        "payload_bytes={d} semantic_attempt={d}",
-                        .{ request_payload.len, semantic_attempt + 1 },
+                        "semantic_attempt={d}",
+                        .{semantic_attempt + 1},
                     );
                 }
             }
-            stream_result.completion.tool_calls = try normalize_terminal_request_tool_calls(
-                arena,
-                deps.tool_registry,
-                terminal_request_eligible,
-                stream_result.completion.tool_calls,
-            );
+            if (streamCompletionPtr(&stream_result)) |completion| {
+                completion.tool_calls = try normalize_terminal_request_tool_calls(
+                    arena,
+                    deps.tool_registry,
+                    terminal_request_eligible,
+                    completion.tool_calls,
+                );
+            }
             if (recovery_strategy == .reconcile_tool and
-                stream_result.status == .ok and
-                (stream_result.completion.tool_calls.len > 0 or
+                streamSucceeded(stream_result) and
+                (streamCompletion(stream_result).tool_calls.len > 0 or
                     stream_ctx.saw_tool_start))
             {
                 debug_trace.eventf(
@@ -3825,7 +3954,7 @@ fn processQueuedPromptLoop(
                     "uncertain_provider_tool_rejected",
                     step_ctx,
                     "tool_call_count={d} tool_choice=none",
-                    .{stream_result.completion.tool_calls.len},
+                    .{streamCompletion(stream_result).tool_calls.len},
                 );
                 try persistRecoveryCheckpoint(
                     deps,
@@ -3861,11 +3990,13 @@ fn processQueuedPromptLoop(
                 );
                 return;
             }
-            const settled_disposition = if (stream_result.status == .ok)
-                types.classifyProviderCompletion(stream_result.completion)
+            const response_completion = streamCompletion(stream_result);
+            const response_failure = streamFailure(stream_result);
+            const settled_disposition = if (streamSucceeded(stream_result))
+                types.classifyProviderCompletion(response_completion)
             else
                 types.ProviderCompletionDisposition.completed;
-            if (stream_result.status == .ok and
+            if (streamSucceeded(stream_result) and
                 (settled_disposition == .interrupted or
                     settled_disposition == .provider_failure))
             {
@@ -3875,7 +4006,7 @@ fn processQueuedPromptLoop(
                     arena,
                     config,
                     turn_id,
-                    stream_result.completion,
+                    response_completion,
                     advertised_dynamic_tool_names,
                     step_ctx,
                     &within_turn_suffix,
@@ -3883,7 +4014,9 @@ fn processQueuedPromptLoop(
                 );
             }
             const settled_attempts = semantic_attempt + 1;
-            if (job.provider == .gateway or stream_result.status != .unauthorized) {
+            if (job.provider == .gateway or
+                response_failure == null or response_failure.?.kind != .unauthorized)
+            {
                 try persistRecoveryCheckpoint(
                     deps,
                     arena,
@@ -3904,16 +4037,16 @@ fn processQueuedPromptLoop(
                     recovery_strategy,
                     effectiveRecoveryToolEvidence(
                         preserved_tool_evidence,
-                        stream_result.completion,
+                        response_completion,
                         &stream_ctx,
                     ),
                     step_ctx,
                 );
             }
-            runtime_assistant_stream.pushTokenProgressUpdate(&stream_ctx, summary_accumulator.reconcileTokenRequest(stream_result.completion.usage, stream_result.completion.delivery_ambiguous)) catch |progress_err| {
+            runtime_assistant_stream.pushTokenProgressUpdate(&stream_ctx, summary_accumulator.reconcileTokenRequest(response_completion.usage, response_completion.delivery_ambiguous)) catch |progress_err| {
                 debug_trace.logf("agent", "token progress publication failed source=gateway_usage err={s}", .{@errorName(progress_err)});
             };
-            if (stream_result.status == .unauthorized and
+            if (response_failure != null and response_failure.?.kind == .unauthorized and
                 job.provider == .gateway and
                 !auth_retry_used and
                 semantic_attempt + 1 < semantic_limit)
@@ -3928,8 +4061,7 @@ fn processQueuedPromptLoop(
                     step_ctx,
                 )) {
                     auth_retry_used = true;
-                    if (stream_result.err_body) |body| mem_utils.free(arena, body);
-                    stream_result.err_body = null;
+                    stream_result.deinit(arena);
                     stream_result_set = false;
                     semantic_attempt += 1;
                     recovery_strategy = .retry_request;
@@ -3947,8 +4079,8 @@ fn processQueuedPromptLoop(
                 semantic_attempt + 1 < semantic_limit and
                 streamReplaySafe(&stream_ctx) and
                 isPostVisionAssistantPrefillRejection(
-                    stream_result.status,
-                    stream_result.err_body orelse "",
+                    if (response_failure) |failure| failureHttpStatus(failure.kind) else .ok,
+                    if (response_failure) |failure| failure.detail orelse "" else "",
                     request_messages,
                 ))
             {
@@ -3964,8 +4096,7 @@ fn processQueuedPromptLoop(
                     "tool_name=vision provider_attempt={d}/{d}",
                     .{ semantic_attempt + 1, semantic_limit },
                 );
-                if (stream_result.err_body) |body| mem_utils.free(arena, body);
-                stream_result.err_body = null;
+                stream_result.deinit(arena);
                 stream_result_set = false;
                 assistant_prefill_recovery_used = true;
                 semantic_attempt += 1;
@@ -3974,15 +4105,15 @@ fn processQueuedPromptLoop(
                 continue;
             }
 
-            if (isRetryableModelStatus(stream_result.status)) {
-                const cause: model_response_recovery.FailureCause = if (stream_result.status == .too_many_requests)
+            if (response_failure) |failure| if (isRetryableModelFailure(failure.kind)) {
+                const cause: model_response_recovery.FailureCause = if (failure.kind == .rate_limited)
                     .rate_limited
                 else
                     .provider_unavailable;
                 const diagnostic = try httpFailureDiagnostic(
                     arena,
-                    stream_result.status,
-                    stream_result.err_body orelse "",
+                    failureHttpStatus(failure.kind),
+                    failure.detail orelse "",
                 );
                 latest_recovery_diagnostic = diagnostic;
                 const route_changed = disableFastRouteAfterFailure(
@@ -4001,10 +4132,10 @@ fn processQueuedPromptLoop(
                     .output = if (stream_ctx.raw_text.items.len > 0) .partial else .none,
                     .tool = effectiveRecoveryToolEvidence(
                         preserved_tool_evidence,
-                        stream_result.completion,
+                        response_completion,
                         &stream_ctx,
                     ),
-                    .retry_after_seconds = stream_result.retry_after_seconds,
+                    .retry_after_seconds = failure.retry_after_seconds,
                     .cancelled = config.cancel_flag.load(.seq_cst),
                 });
                 if (decision.strategy == .pause) {
@@ -4028,7 +4159,7 @@ fn processQueuedPromptLoop(
                         .pause,
                         effectiveRecoveryToolEvidence(
                             preserved_tool_evidence,
-                            stream_result.completion,
+                            response_completion,
                             &stream_ctx,
                         ),
                         step_ctx,
@@ -4068,7 +4199,7 @@ fn processQueuedPromptLoop(
                             decision.strategy,
                             effectiveRecoveryToolEvidence(
                                 preserved_tool_evidence,
-                                stream_result.completion,
+                                response_completion,
                                 &stream_ctx,
                             ),
                             step_ctx,
@@ -4085,11 +4216,10 @@ fn processQueuedPromptLoop(
                     if (waitForRecoveryDelay(config.cancel_flag, decision.delay_ns)) {
                         preserved_tool_evidence = effectiveRecoveryToolEvidence(
                             preserved_tool_evidence,
-                            stream_result.completion,
+                            response_completion,
                             &stream_ctx,
                         );
-                        if (stream_result.err_body) |body| mem_utils.free(arena, body);
-                        stream_result.err_body = null;
+                        stream_result.deinit(arena);
                         stream_result_set = false;
                         semantic_attempt += 1;
                         recovery_strategy = decision.strategy;
@@ -4108,7 +4238,7 @@ fn processQueuedPromptLoop(
                             arena,
                             config,
                             turn_id,
-                            stream_result.completion.tool_calls,
+                            response_completion.tool_calls,
                             advertised_dynamic_tool_names,
                         );
                         try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, stream_ctx.raw_text.items, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
@@ -4116,11 +4246,11 @@ fn processQueuedPromptLoop(
                         return;
                     }
                 }
-            }
+            };
 
             try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
 
-            const attempt_completion = stream_result.completion;
+            const attempt_completion = response_completion;
             const current_partial_assistant = if (stream_ctx.raw_text.items.len > 0)
                 stream_ctx.raw_text.items
             else if (attempt_completion.content) |content|
@@ -4152,7 +4282,7 @@ fn processQueuedPromptLoop(
 
             const attempt_disposition = settled_disposition;
             var attempt_failure_diagnostic: ?types.ModelFailureDiagnostic = null;
-            if (stream_result.status == .ok and
+            if (streamSucceeded(stream_result) and
                 (attempt_disposition == .interrupted or
                     attempt_disposition == .provider_failure))
             {
@@ -4313,7 +4443,7 @@ fn processQueuedPromptLoop(
                     }
                 }
             }
-            if (stream_result.status == .ok and attempt_disposition == .provider_failure) {
+            if (streamSucceeded(stream_result) and attempt_disposition == .provider_failure) {
                 const finish_reason = attempt_completion.finish_reason.?;
                 const diagnostic = attempt_failure_diagnostic orelse
                     try providerCompletionDiagnostic(arena, attempt_completion, finish_reason.label());
@@ -4382,11 +4512,9 @@ fn processQueuedPromptLoop(
             if (vision_mode != .required) configured_first_tool_choice_pending = false;
             break;
         }
-        defer if (stream_result_set) {
-            if (stream_result.err_body) |b| mem_utils.free(arena, b);
-        };
+        defer if (stream_result_set) stream_result.deinit(arena);
 
-        var completion = stream_result.completion;
+        var completion = streamCompletion(stream_result);
         const filtered_provider_calls = try filterMaterializedProviderCalls(
             arena,
             within_turn_suffix.items,
@@ -4430,17 +4558,17 @@ fn processQueuedPromptLoop(
             "";
         const partial_assistant = current_partial_assistant;
 
-        if (stream_result.status != .ok) {
-            const detail = if (stream_result.err_body) |b| std.mem.trim(u8, b, " \r\n\t") else "";
+        if (streamFailure(stream_result)) |failure| {
+            const detail = if (failure.detail) |body| std.mem.trim(u8, body, " \r\n\t") else "";
             const clipped = detail[0..@min(detail.len, http_error_detail_max_bytes)];
             const http_detail = try runtime_gateway_step.gatewayHttpErrorDetail(
                 arena,
-                stream_result.status,
+                failureHttpStatus(failure.kind),
                 clipped,
                 job.model,
                 request_capabilities,
             );
-            try deps.push_http_error(deps.ctx, stream_result.status, http_detail, job.credential_source);
+            try deps.push_http_error(deps.ctx, failureHttpStatus(failure.kind), http_detail, job.credential_source);
             if (stop_state.retained_candidate != null) {
                 stop_state.terminal_materializing = true;
                 const assistant_text = try hooks.prompt.joinVisibleSegments(
@@ -7199,7 +7327,7 @@ fn processQueuedPromptLoop(
 
             debug_trace.eventf("tool", "after_tool_execution", step_ctx, "call_id={s} name={s} result_kind={s} model_output_bytes={d}", .{ tool_call.id, tool_call.name, runtime_telemetry.toolExecutionResultKind(execution), safe_tool_output.len });
             debug_trace.eventf("tool", "execution_result", step_ctx, "call_id={s} name={s} result_kind={s} model_output_bytes={d}", .{ tool_call.id, tool_call.name, runtime_telemetry.toolExecutionResultKind(execution), safe_tool_output.len });
-            try runtime_gateway_step.recordSelectedDynamicTool(arena, &selected_dynamic_tool_names, &selected_dynamic_tool_schemas, execution);
+            try runtime_gateway_step.recordSelectedDynamicTool(arena, &selected_dynamic_tool_names, &selected_dynamic_tools, execution);
             try runtime_tool_batch.appendOrdinaryExecutedResult(
                 deps.tool_registry,
                 arena,

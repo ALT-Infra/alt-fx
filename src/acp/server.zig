@@ -651,7 +651,7 @@ pub fn runWithTransport(
         .cfg = cfg,
         .writer = writer_value,
         .web_search_runtime = web_search_runtime.Runtime.init(.{
-            .provider = cfg.gateway_provider.web_search,
+            .provider = cfg.provider_set.gateway.fx_search.?,
         }),
         .background = background_runtime.BackgroundRuntime.init(
             cfg.background_process_provider,
@@ -1431,6 +1431,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
             .cancel_flag = &catalog_cancel_flag,
         },
         state.selected_model,
+        state.cfg.provider_set.select(state.provider).fallbackModelCapabilities(state.selected_model),
     );
 
     state.client_fs_read = request.client_fs_read;
@@ -1700,11 +1701,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             else
                 try config_runtime.loadMergedSettings(alloc, state.workspace_root);
             defer settings.deinit(alloc);
-            const saved_model = switch (target) {
-                .gateway => settings.model,
-                .codex => settings.codex_model,
-                .grok => settings.grok_model,
-            };
+            const saved_model = settings.models.get(target);
             var selected_model = catalog.items[0].id;
             if (saved_model) |saved| {
                 for (catalog.items) |entry| {

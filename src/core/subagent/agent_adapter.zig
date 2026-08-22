@@ -39,7 +39,7 @@ pub const Config = struct {
     model_prompt_overlay: ?[]const u8 = null,
     skills_prompt_section: []const u8 = "",
     explicit_skills_prompt_section: []const u8 = "",
-    gateway_tools_json: []const u8,
+    advertised_tool_names: []const []const u8 = &.{},
     custom_tool_guidance: []const u8 = "",
     context_registry: context_contract.Registry,
     context_enabled: bool,
@@ -161,7 +161,8 @@ pub fn run(
     }
     routed_config.tool_context.model = admission.model;
     routed_config.tool_context.provider = admission.provider;
-    if (!model_provider.usesGatewayAuxiliaries(admission.provider)) {
+    routed_config.tool_context.provider_capabilities = config.provider_set.select(admission.provider).capabilities;
+    if (!routed_config.tool_context.provider_capabilities.fx_search) {
         routed_config.tool_context.web_search_backend = null;
         routed_config.tool_context.web_search_runtime_ready = false;
     }
@@ -226,7 +227,8 @@ pub fn run(
             .explicit_skills_prompt_section = config.explicit_skills_prompt_section,
             .gateway_retry_count = config.tool_context.gateway_retry_count,
             .gateway_chat_url = config.tool_context.gateway_chat_url,
-            .gateway_tools_json = config.gateway_tools_json,
+            .advertised_tool_names = config.advertised_tool_names,
+            .provider_capabilities = config.provider_set.select(admission.provider).capabilities,
             .custom_tool_guidance = config.custom_tool_guidance,
             .agent_step_limit = config.tool_context.agent_step_limit,
             .max_tool_result_bytes = config.tool_context.max_tool_result_bytes,

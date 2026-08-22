@@ -4,6 +4,8 @@ const permission_auto_classifier = @import("../../core/permissions/auto_classifi
 const session_usage = @import("../../core/session/session_usage.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const types = @import("../../core/shared/types.zig");
+const stream_provider = @import("../../core/agent/stream_provider.zig");
+const credential_authority = @import("../../core/auth/credential_authority.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -27,6 +29,7 @@ var default_stream_ctx: u8 = 0;
 
 const GatewayConfig = struct {
     api_key: []const u8,
+    credential_source: ?types.CredentialSource = null,
     team: ?[]const u8 = null,
     chat_url: []const u8,
     cancel_flag: ?*std.atomic.Value(bool) = null,
@@ -46,6 +49,7 @@ fn reviewGateway(
 ) anyerror!permission_auto_classifier.ParseOutcome {
     return reviewGatewayConfig(.{
         .api_key = input.credential,
+        .credential_source = input.credential_source,
         .team = input.tenant,
         .chat_url = input.endpoint,
         .cancel_flag = input.cancel_flag,
@@ -100,7 +104,7 @@ fn sendGatewayReview(
         return .permanent_failure;
     }
 
-    const usage_observation = session_usage.GatewayObservation.begin(config.usage) catch |err| {
+    const usage_observation = session_usage.InvocationObservation.begin(config.usage) catch |err| {
         debug_trace.logf(
             "permission",
             "event=auto_review_usage result=permanent_failure phase=begin reason={s}",
@@ -137,13 +141,15 @@ fn sendGatewayReview(
     };
     var stream_owned = true;
     defer if (stream_owned) stream.deinit(alloc);
-    usage_observation.complete(
-        config.usage_allocator,
-        stream.status,
-        stream.completion,
-        gateway_client.generationBaseUrl(),
-        config.team,
-    ) catch |err| {
+    const usage_outcome = usageOutcome(config, stream.completion);
+    (if (stream.status == .ok)
+        usage_observation.complete(
+            config.usage_allocator,
+            stream.completion,
+            usage_outcome,
+        )
+    else
+        usage_observation.fail(.unbilled)) catch |err| {
         debug_trace.logf(
             "permission",
             "event=auto_review_usage result=permanent_failure phase=completion reason={s}",
@@ -151,9 +157,13 @@ fn sendGatewayReview(
         );
         return .permanent_failure;
     };
-    if (config.usage) |ledger| {
-        ledger.startReconciliation(config.usage_allocator, config.api_key);
-    }
+    if (stream.status == .ok and std.meta.activeTag(usage_outcome) == .deferred) if (config.usage) |ledger| {
+        ledger.startDeferredReconciliation(
+            config.usage_allocator,
+            usage_outcome.deferred,
+            config.api_key,
+        );
+    };
 
     if (cancel_flag.load(.seq_cst)) {
         return .cancelled;
@@ -185,6 +195,32 @@ fn sendGatewayReview(
         .context = @ptrCast(owned),
         .deinit_fn = deinitOwnedStream,
     } };
+}
+
+fn usageOutcome(
+    config: *const GatewayConfig,
+    completion: types.ModelCompletion,
+) stream_provider.UsageOutcome {
+    const generation_id = completion.generation_id orelse
+        return .{ .unavailable = .possibly_billed };
+    const source = config.credential_source orelse .ai_gateway_api_key;
+    const reference = stream_provider.DeferredUsageReference{
+        .provider = .gateway,
+        .generation_id = generation_id,
+        .scope = gateway_client.generationBaseUrl(),
+        .tenant = config.team,
+        .credential_source = source,
+        .credential_identity = credential_authority.derive(
+            source,
+            null,
+            config.team,
+            config.api_key,
+        ),
+    };
+    return if (completion.billing != null)
+        .{ .immediate = reference }
+    else
+        .{ .deferred = reference };
 }
 
 fn mapTransportError(

@@ -1644,7 +1644,7 @@ pub const Store = struct {
         return .{
             .model = try alloc.dupe(
                 u8,
-                detailed.settings.model orelse "anthropic/claude-opus-4.7",
+                detailed.settings.models.get(.gateway) orelse "anthropic/claude-opus-4.7",
             ),
             .effort = detailed.settings.effort orelse .auto,
             .fast_mode = detailed.settings.fast_mode orelse false,
@@ -6326,7 +6326,7 @@ test "pristine discard retains active recovery and permits cleared recovery" {
         .assistant_source = @constCast(""),
         .cause = .network_interrupted,
         .action = .retrying_request,
-        .route_model = @constCast("test/model"),
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
         .requested_fast_mode = false,
         .fast_mode = false,
         .max_provider_attempts = 10,
@@ -8710,7 +8710,7 @@ test "session store delegates schema v3 authority operations" {
 }
 
 test "schema v3 load repairs duplicate-key tool arguments before gateway projection" {
-    const gateway_json = @import("../gateway/gateway_json.zig");
+    const vercel_protocol = @import("../../gateway/vercel_protocol.zig");
     const types = @import("../shared/types.zig");
     const alloc = std.testing.allocator;
     const duplicate_arguments = "{\"depth\":1,\"depth\":2}";
@@ -8793,7 +8793,7 @@ test "schema v3 load repairs duplicate-key tool arguments before gateway project
     var messages: std.ArrayList(types.ChatMessage) = .empty;
     try session.appendHistoryChatMessages(arena, &messages, loaded.history);
     try messages.append(arena, .{ .role = .user, .content = "continue" });
-    const body = try gateway_json.buildGatewayRequestBodyWithOptions(
+    const body = try vercel_protocol.buildGatewayRequestBodyWithOptions(
         alloc,
         "[]",
         messages.items,

@@ -10,6 +10,7 @@ const terminal_ui_projection = @import("../terminal/ui_projection.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
+const vercel_model_policy = @import("../../gateway/vercel_model_policy.zig");
 const picker_state = @import("../input/picker_state.zig");
 const core_input_runtime = @import("../input/runtime.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
@@ -4552,10 +4553,13 @@ const CoordinatorTestApp = struct {
     pub fn resolvedModelCapabilities(self: *CoordinatorTestApp, model: []const u8) model_capabilities.Capabilities {
         if (self.gateway_metadata_model) |metadata_model| {
             if (std.mem.eql(u8, metadata_model, model)) {
-                return model_capabilities.resolveCapabilities(model, self.gateway_metadata);
+                return model_capabilities.mergeCapabilities(
+                    vercel_model_policy.capabilitiesForModel(model),
+                    self.gateway_metadata,
+                );
             }
         }
-        return model_capabilities.capabilitiesForModel(model);
+        return vercel_model_policy.capabilitiesForModel(model);
     }
 
     fn isFileIndexLoading(_: *CoordinatorTestApp) bool {

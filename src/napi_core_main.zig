@@ -5,7 +5,6 @@ const jsonrpc = @import("acp/jsonrpc.zig");
 const background_process_provider = @import("core/execution/background_process_provider.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
 const provider_set = @import("core/gateway/provider_set.zig");
-const generation_usage_provider = @import("core/session/generation_usage_provider.zig");
 const host = @import("core/hosts/host.zig");
 const debug_trace = @import("core/shared/debug_trace.zig");
 const io_mod = @import("core/shared/io.zig");
@@ -436,15 +435,11 @@ const Runtime = struct {
         const provider = gateway_provider.Provider{
             .oauth_transport = oauth_transport.unavailable_provider,
             .chat_url = builtin_gateway.provider.chat_url,
-            .credits = builtin_gateway.provider.credits,
-            .generation_usage = generation_usage_provider.unavailable_provider,
-            .web_search = builtin_gateway.provider.web_search,
         };
-        const providers = provider_set.gateway_only(.{
-            .agent_stream = host_stream_provider.provider(&self.stream_context),
-            .cli_model_catalog = builtin_gateway.cli_model_catalog_provider,
-            .model_catalog = builtin_gateway.model_catalog_provider,
-        });
+        var gateway = builtin_gateway.provider_bundle;
+        gateway.agent_stream = host_stream_provider.provider(&self.stream_context);
+        gateway.permission_reviewer = null;
+        const providers = provider_set.gateway_only(gateway);
         acp_server.runWithTransport(
             self.alloc,
             .{
@@ -660,7 +655,7 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
         .gateway_chat_url = gateway_chat_url,
         .thread = undefined,
     };
-    runtime.stream_context = host_stream_provider.initContext(builtin_gateway.buildAgentRequest, .{
+    runtime.stream_context = host_stream_provider.initContext(builtin_gateway.buildAgentRequest, builtin_gateway.agentChatUrl, .{
         .context = &runtime.fetch,
         .open_fn = FetchBridge.open,
         .status_fn = FetchBridge.statusFn,

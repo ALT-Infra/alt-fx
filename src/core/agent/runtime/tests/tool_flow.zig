@@ -63,10 +63,8 @@ const toolCall = test_support.toolCall;
 const vision_agent_test_tools = test_support.vision_agent_test_tools;
 const VisionAgentToolRuntime = test_support.VisionAgentToolRuntime;
 
-const fixture_tools_json =
-    "[{\"type\":\"function\",\"name\":\"read_file\",\"description\":\"Read a file\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]";
-const terminal_nested_tools_json =
-    "[{\"type\":\"function\",\"name\":\"terminal\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"request\":{\"oneOf\":[{\"type\":\"object\"}]}},\"required\":[\"request\"],\"additionalProperties\":false}}]";
+const read_file_advertised_names = [_][]const u8{"read_file"};
+const terminal_advertised_names = [_][]const u8{"terminal"};
 
 fn makeOwnedVisionCatalog(
     alloc: std.mem.Allocator,
@@ -1026,7 +1024,7 @@ test "borrowed nested terminal completion is flat before authority execution and
     hooks.permission_decisions = &.{.once};
     var fixture = PromptFixture{};
     var config = fixture.config();
-    config.gateway_tools_json = terminal_nested_tools_json;
+    config.advertised_tool_names = &terminal_advertised_names;
 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
@@ -1091,7 +1089,7 @@ test "terminal lifecycle resolves one display target before execution" {
     };
     var fixture = PromptFixture{};
     var config = fixture.config();
-    config.gateway_tools_json = terminal_nested_tools_json;
+    config.advertised_tool_names = &terminal_advertised_names;
 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
@@ -4010,7 +4008,7 @@ test "four automatic permission blocks finish with a normal blocker" {
     var fixture = PromptFixture{};
     var config = fixture.config();
     config.agent_step_limit = 0;
-    config.gateway_tools_json = fixture_tools_json;
+    config.advertised_tool_names = &read_file_advertised_names;
     var job = fixture.job();
     job.permission_mode = .auto;
 
@@ -4467,7 +4465,7 @@ test "initial session grants follow active registry metadata" {
 
     var provider_list = builtin_tools.list_files;
     provider_list.name = "provider_list";
-    provider_list.gateway_schema.name = "provider_list";
+    provider_list.model_schema.name = "provider_list";
     const tools = [_]tool_dispatch.Tool{provider_list};
 
     var hooks = FakeAgentRuntimeDeps.init(alloc);

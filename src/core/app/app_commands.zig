@@ -2339,7 +2339,7 @@ fn writeNetworkCallCompact(writer: *std.Io.Writer, call: diagnostics.NetworkCall
     if (call.terminalStopReason().len > 0) try writer.print(" stop_reason={s}", .{call.terminalStopReason()});
     if (call.turn_id != 0) try writer.print(" turn={d}", .{call.turn_id});
     if (call.step_id != 0) try writer.print(" step={d}", .{call.step_id});
-    if (call.gatewaySchemaDiagnostic().len > 0) try writer.print(" gateway_schema=\"{s}\"", .{call.gatewaySchemaDiagnostic()});
+    if (call.gatewaySchemaDiagnostic().len > 0) try writer.print(" model_tool_schema=\"{s}\"", .{call.gatewaySchemaDiagnostic()});
     if (call.gatewayRequestShape().len > 0) try writer.print(" request_shape=\"{s}\"", .{call.gatewayRequestShape()});
     try writer.writeByte('\n');
 }
@@ -3917,7 +3917,7 @@ test "trace renders gateway schema diagnostics without raw payload content" {
     try std.testing.expect(std.mem.find(u8, text, "status=400") != null);
     try std.testing.expect(std.mem.find(u8, text, "turn=12") != null);
     try std.testing.expect(std.mem.find(u8, text, "step=34") != null);
-    try std.testing.expect(std.mem.find(u8, text, "gateway_schema=\"path=prompt.0.content expected=string received=array\"") != null);
+    try std.testing.expect(std.mem.find(u8, text, "model_tool_schema=\"path=prompt.0.content expected=string received=array\"") != null);
     try std.testing.expect(std.mem.find(u8, text, "request_shape=\"bytes=123 prompt_count=1 prompt.0 role=system content=array") != null);
     try std.testing.expect(std.mem.find(u8, text, "SECRET_RAW_PROMPT") == null);
 }

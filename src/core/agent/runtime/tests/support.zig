@@ -15,8 +15,9 @@ const session_runtime = @import("../../../session/session.zig");
 const session_codec = @import("../../../session/session_codec.zig");
 const command_replay_store = @import("../../../session/command_replay_store.zig");
 const session_child_store = @import("../../../session/session_child_store.zig");
-const gateway_json = @import("../../../gateway/gateway_json.zig");
-const gateway_failure_diagnostics = @import("../../../gateway/gateway_failure_diagnostics.zig");
+const vercel_protocol = @import("../../../../gateway/vercel_protocol.zig");
+const vercel_failure_diagnostics = @import("../../../../gateway/vercel_failure_diagnostics.zig");
+const vercel_model_policy = @import("../../../../gateway/vercel_model_policy.zig");
 const lifecycle_hooks = @import("../../../hooks/hooks.zig");
 const model_capabilities = @import("../../../config/model_capabilities.zig");
 const file_mutation = @import("../../../tooling/file_mutation.zig");
@@ -261,17 +262,20 @@ pub const FakeGateway = struct {
     fn stream(
         self: *FakeGateway,
         alloc: Allocator,
-        request: agent_stream_provider.Request,
+        request: agent_stream_provider.ModelRequest,
     ) !agent_stream_provider.Result {
-        try self.request_bodies.append(self.alloc, try self.alloc.dupe(u8, request.payload));
+        const payload = try builtin_gateway.buildAgentRequest(alloc, request.data());
+        defer alloc.free(payload);
+        try self.request_bodies.append(self.alloc, try self.alloc.dupe(u8, payload));
         try self.request_models.append(self.alloc, try self.alloc.dupe(u8, request.model));
-        try self.request_api_keys.append(self.alloc, try self.alloc.dupe(u8, request.api_key));
+        try self.request_api_keys.append(self.alloc, try self.alloc.dupe(u8, request.credential.secret));
         const session_id = if (request.session_id) |id| try self.alloc.dupe(u8, id) else null;
         errdefer if (session_id) |id| self.alloc.free(id);
         try self.request_session_ids.append(self.alloc, session_id);
         if (self.index >= self.completions.len) return error.TestUnexpectedGatewayRequest;
         const completion = self.completions[self.index];
         self.index += 1;
+        try request.admission.admit();
 
         if (completion.pre_send_error) |err| {
             recordNetworkFailureEvidence(request, err);
@@ -291,24 +295,20 @@ pub const FakeGateway = struct {
         }
         if (completion.cancel_before_output) {
             request.cancel_flag.store(true, .seq_cst);
-            return .{ .status = .ok };
+            return .{ .completed = .{} };
         }
 
-        if (request.on_reasoning_chunk) |reasoning| {
-            for (completion.reasoning_chunks) |chunk| reasoning(request.callback_ctx, chunk);
-        }
+        for (completion.reasoning_chunks) |chunk| request.events.emit(.{ .reasoning_delta = chunk });
         for (completion.chunks) |chunk| {
-            request.on_content_chunk(request.callback_ctx, chunk);
+            request.events.emit(.{ .content_delta = chunk });
         }
         if (completion.cancel_after_chunks) request.cancel_flag.store(true, .seq_cst);
         if (completion.stream_error_after_chunks) |err| {
             recordNetworkFailureEvidence(request, err);
             return err;
         }
-        if (request.on_tool_start) |start| {
-            for (completion.streamed_tool_starts) |call| {
-                start(request.callback_ctx, call.id, call.name, null);
-            }
+        for (completion.streamed_tool_starts) |call| {
+            request.events.emit(.{ .tool_started = .{ .id = call.id, .name = call.name } });
         }
         if (completion.stream_error_after_tool_starts) |err| {
             recordNetworkFailureEvidence(request, err);
@@ -320,19 +320,20 @@ pub const FakeGateway = struct {
         }
         if (completion.status != .ok) {
             const err_body = if (completion.err_body) |body| try alloc.dupe(u8, body) else null;
-            const diagnostics = gateway_failure_diagnostics.collect(alloc, request.payload, err_body);
-            return .{
-                .status = completion.status,
-                .err_body = err_body,
+            const diagnostics = vercel_failure_diagnostics.collect(alloc, payload, err_body);
+            return .{ .failed = .{
+                .kind = failureKind(completion.status),
+                .detail = err_body,
                 .retry_after_seconds = completion.retry_after_seconds,
-                .failure_schema = diagnostics.schema,
-                .failure_request_shape = diagnostics.request_shape,
+                .diagnostics = .{
+                    .schema = diagnostics.schema,
+                    .request_shape = diagnostics.request_shape,
+                },
                 .ownership = .owned,
-            };
+            } };
         }
 
-        return .{
-            .status = .ok,
+        return .{ .completed = .{
             .completion = .{
                 .content = completion.content,
                 .tool_calls = completion.tool_calls,
@@ -345,18 +346,33 @@ pub const FakeGateway = struct {
                     completion.finish_reason orelse if (completion.tool_calls.len > 0) .tool_calls else .stop,
                 .usage = completion.usage,
             },
-            .generation_origin = "https://ai-gateway.vercel.sh",
-        };
+            .usage = .{ .unavailable = .possibly_billed },
+        } };
     }
 
     fn recordNetworkFailureEvidence(
-        request: agent_stream_provider.Request,
+        request: agent_stream_provider.ModelRequest,
         err: anyerror,
     ) void {
         request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(
             err,
             request.delivery.load(),
         );
+    }
+
+    fn failureKind(status: std.http.Status) agent_stream_provider.FailureKind {
+        return switch (status) {
+            .bad_request => .invalid_request,
+            .unauthorized => .unauthorized,
+            .forbidden => .forbidden,
+            .payload_too_large => .request_too_large,
+            .too_many_requests => .rate_limited,
+            .internal_server_error => .server_error,
+            .bad_gateway => .bad_gateway,
+            .service_unavailable => .unavailable,
+            .gateway_timeout => .gateway_timeout,
+            else => .provider_error,
+        };
     }
 };
 
@@ -368,7 +384,7 @@ pub const ModelCapabilityOverride = struct {
 fn fakeGatewayStream(
     context: ?*anyopaque,
     alloc: Allocator,
-    request: agent_stream_provider.Request,
+    request: agent_stream_provider.ModelRequest,
 ) !agent_stream_provider.Result {
     const gateway: *FakeGateway = @ptrCast(@alignCast(context.?));
     return gateway.stream(alloc, request);
@@ -747,7 +763,7 @@ pub const FakeAgentRuntimeDeps = struct {
             for (self.capability_overrides) |override| {
                 if (std.mem.eql(u8, override.model, model)) break :blk override.capabilities;
             }
-            break :blk model_capabilities.capabilitiesForModel(model);
+            break :blk vercel_model_policy.capabilitiesForModel(model);
         };
         if (self.cancel_after_capability_resolution) |cancel_flag| {
             cancel_flag.store(true, .seq_cst);
@@ -760,7 +776,7 @@ pub const FakeAgentRuntimeDeps = struct {
         for (self.available_capability_overrides) |override| {
             if (std.mem.eql(u8, override.model, model)) return override.capabilities;
         }
-        return model_capabilities.capabilitiesForModel(model);
+        return vercel_model_policy.capabilitiesForModel(model);
     }
 
     fn refreshGatewayCredential(raw: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: runtime_deps.CredentialRefreshMode, expected_account_id: ?[]const u8) !?[]u8 {
@@ -1635,6 +1651,7 @@ pub const PromptFixture = struct {
             .images = self.images[0..],
             .model = @constCast("anthropic/claude-opus-4.6"),
             .api_key = @constCast("key"),
+            .credential_source = .ai_gateway_api_key,
             .permission_mode = .ask,
             .history = self.history[0..],
             .grants = self.grants[0..],
@@ -1647,7 +1664,6 @@ pub const PromptFixture = struct {
             .gateway_retry_count = 1,
             .max_provider_attempts = model_response_recovery.default_max_provider_attempts,
             .gateway_chat_url = "https://example.invalid",
-            .gateway_tools_json = "[]",
             .agent_step_limit = 8,
             .cancel_flag = &self.cancel_flag,
             .workspace_root = self.workspace_root,
@@ -1950,7 +1966,7 @@ pub fn expectGatewayPromptFinalUserText(gateway: *const FakeGateway, index: usiz
         const entry = prompt[i];
         if (entry != .object) continue;
         const role = entry.object.get("role") orelse continue;
-        if (role != .string or !std.mem.eql(u8, role.string, gateway_json.roleName(.user))) continue;
+        if (role != .string or !std.mem.eql(u8, role.string, vercel_protocol.roleName(.user))) continue;
         try std.testing.expectEqual(@as(usize, 1), countPromptEntryText(entry, expected_text));
         return;
     }

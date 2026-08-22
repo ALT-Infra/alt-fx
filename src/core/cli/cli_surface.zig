@@ -203,7 +203,7 @@ const LocalSurfaceOptions = struct {
     format: output_contracts.OutputFormat = .text,
 };
 
-fn parseLoginProvider(rest: []const [:0]const u8) !?provider_catalog.Id {
+fn parseLoginProvider(rest: []const [:0]const u8) !?model_provider.ProviderId {
     if (rest.len == 0) return null;
     if (rest.len != 1) return error.InvalidLoginProviderArgs;
     return provider_catalog.parse(rest[0]) orelse error.InvalidLoginProviderArgs;
@@ -764,19 +764,14 @@ fn activateProviderSelection(
         },
     };
     defer model_catalog.freeModelCatalog(alloc, &loaded.catalog);
-    const saved_model = switch (target) {
-        .gateway => settings.model,
-        .codex => settings.codex_model,
-        .grok => settings.grok_model,
-    };
+    const saved_model = settings.models.get(target);
     const selected_model = selectCatalogModel(loaded.catalog.items, saved_model) orelse {
         try writeProviderActivationError(alloc, deps, caller, "target model catalog is empty");
         return false;
     };
-    var attempt = config_runtime.attemptUserPreferences(alloc, switch (target) {
-        .gateway => .{ .provider = target, .model = selected_model },
-        .codex => .{ .provider = target, .codex_model = selected_model },
-        .grok => .{ .provider = target, .grok_model = selected_model },
+    var attempt = config_runtime.attemptUserPreferences(alloc, .{
+        .provider = target,
+        .model_preference = .{ .provider = target, .model = selected_model },
     });
     defer attempt.deinit(alloc);
     switch (attempt) {
@@ -919,9 +914,9 @@ fn runNonInteractiveWithDeps(
                 return .handled_failure;
             };
             // Preserve the original `fx login` behavior for scripts and users.
-            const login_provider = maybe_login_provider orelse .vercel;
+            const login_provider = maybe_login_provider orelse .gateway;
             switch (login_provider) {
-                .vercel => login_flow.runLogin(
+                .gateway => login_flow.runLogin(
                     alloc,
                     cfg.gateway_provider.oauth_transport,
                     cfg.url_opener,
@@ -978,7 +973,7 @@ fn runNonInteractiveWithDeps(
                 return .handled_failure;
             };
             // Preserve the original `fx logout` behavior for scripts and users.
-            const login_provider = maybe_login_provider orelse .vercel;
+            const login_provider = maybe_login_provider orelse .gateway;
             if (login_provider == .codex) {
                 const outcome = chatgpt_oauth.logout() catch {
                     try writeStderr(deps, "fx logout: failed to durably remove saved Codex login\n");
@@ -1561,7 +1556,9 @@ fn runNonInteractiveWithDeps(
             defer startup.deinit(alloc);
             try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
 
-            var snapshot = cfg.gateway_provider.credits.fetch(alloc, .{
+            const credits = cfg.provider_set.select(startup.provider).credits orelse
+                gateway_provider.unavailable_credits_provider;
+            var snapshot = credits.fetch(alloc, .{
                 .credential = startup.apiKey(),
                 .credential_source = if (startup.credential) |credential| credential.source else null,
                 .tenant = startup.gatewayTeam(),
@@ -4864,7 +4861,7 @@ test "runIfRequested credits renders through the configured provider" {
     defer capture.deinit();
     var probe = CreditsProviderProbe{ .outcome = .success };
     var cfg = testConfig();
-    cfg.gateway_provider.credits = probe.provider();
+    cfg.provider_set.gateway.credits = probe.provider();
 
     var deps = capture.deps();
     deps.load_startup_state = stubLoadStartupState;
@@ -4884,7 +4881,7 @@ test "runIfRequested credits failures use nonzero text and json contracts" {
     defer text_capture.deinit();
     var text_probe = CreditsProviderProbe{ .outcome = .failure };
     var text_cfg = testConfig();
-    text_cfg.gateway_provider.credits = text_probe.provider();
+    text_cfg.provider_set.gateway.credits = text_probe.provider();
     var text_deps = text_capture.deps();
     text_deps.load_startup_state = stubLoadStartupState;
 
@@ -4905,7 +4902,7 @@ test "runIfRequested credits failures use nonzero text and json contracts" {
     defer json_capture.deinit();
     var json_probe = CreditsProviderProbe{ .outcome = .failure };
     var json_cfg = testConfig();
-    json_cfg.gateway_provider.credits = json_probe.provider();
+    json_cfg.provider_set.gateway.credits = json_probe.provider();
     var json_deps = json_capture.deps();
     json_deps.load_startup_state = stubLoadStartupState;
 
