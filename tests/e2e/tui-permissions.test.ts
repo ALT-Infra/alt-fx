@@ -171,7 +171,7 @@ function expectAtomicApprovalExit(tapePath: string, frameStart: number) {
   const syncStart = payload.indexOf("\x1b[?2026h");
   const syncEnd = payload.indexOf("\x1b[?2026l");
   const cursorHide = payload.indexOf("\x1b[?25l");
-  const resetClear = payload.indexOf("\x1b[0m\x1b[3J\x1b[2J\x1b[H");
+  const resetClear = payload.indexOf("\x1b[0m\x1b[2J\x1b[3J\x1b[H");
   expect(syncStart).toBeGreaterThanOrEqual(0);
   expect(cursorHide).toBeGreaterThan(syncStart);
   if (resetClear >= 0) {

@@ -574,7 +574,7 @@ function assertResizeResetFrames(path: string, failures: string[]): void {
     if (frame.kind !== 1) continue;
 
     const text = frame.payload.toString("binary");
-    const reset = text.includes("\x1b[0m\x1b[3J\x1b[2J\x1b[H");
+    const reset = text.includes("\x1b[0m\x1b[2J\x1b[3J\x1b[H");
     if (text.includes("\x1b[3J") && !reset) {
       failures.push(`resize reset used an unexpected clear sequence at tape frame ${frame.index}`);
     }
