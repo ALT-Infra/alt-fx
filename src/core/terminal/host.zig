@@ -458,13 +458,16 @@ fn runSupported(alloc: Allocator, config: Config) !void {
         if (!clients_drained) {
             debug_trace.logf(
                 "terminal_host",
-                "host exiting with {d} client thread(s) still running; keeping shared state alive",
+                "host exiting immediately with {d} client thread(s) still running; preserving shared state until process exit",
                 .{state.connected_clients.load(.acquire)},
             );
-            // The registry is not freed below, so nothing tears the session
-            // processes down either. Signal them here: killing a session another
-            // thread may be reading is defined behavior, freeing it is not.
+            // The registry cannot be freed while detached clients still hold
+            // pointers into this frame. Signal its child processes, then stop
+            // this dedicated host process before returning through the stack or
+            // deinitializing the threaded I/O runtime that those clients use.
+            // The next host startup removes the stale endpoint and identity.
             registry.shutdownSessionsOnly();
+            std.process.exit(1);
         }
     }
     var idle_thread = try std.Thread.spawn(.{}, idleOwner, .{&state});
@@ -481,6 +484,7 @@ fn runSupported(alloc: Allocator, config: Config) !void {
     );
 
     while (!state.stopping.load(.acquire)) {
+        if (testAcceptFailureRequested()) return error.InjectedAcceptFailure;
         if (!try listenerReady(server.socket.handle)) continue;
         if (state.stopping.load(.acquire)) break;
         var stream = server.accept(io_mod.getIo()) catch |err| switch (err) {
@@ -1146,6 +1150,13 @@ fn maybeDelayForTest(name: []const u8) void {
         std.time.ns_per_ms,
     ) catch return;
     io_mod.sleep(delay_ns);
+}
+
+fn testAcceptFailureRequested() bool {
+    const path = io_mod.getenv("FX_TERMINAL_TEST_ACCEPT_FAILURE_PATH") orelse
+        return false;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), path, .{}) catch return false;
+    return true;
 }
 
 fn noteTestOrderedAdmission(correlation_id: contracts.CorrelationId) !void {
