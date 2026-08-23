@@ -1622,7 +1622,10 @@ fn toolUpdateContentText(result: ToolExecutionResult) []const u8 {
         );
         return "binary or non-utf8 tool output omitted";
     }
-    if (result.status == .failure and tool_result_errors.isToolPermissionDeniedOutput(result.model_output)) {
+    if (result.status == .failure and
+        (tool_result_errors.isToolPermissionDeniedOutput(result.model_output) or
+            tool_result_errors.isToolReviewHeldOutput(result.model_output)))
+    {
         return result.model_output;
     }
     return text_utils.utf8PrefixByBytes(result.model_output, 200);

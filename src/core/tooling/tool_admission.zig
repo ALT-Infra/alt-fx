@@ -7,7 +7,6 @@ const command_admission = @import("../permissions/command_admission.zig");
 const command_environment = @import("../execution/command_environment.zig");
 const command_effect = @import("../shell_command/command_effect.zig");
 const command_lex = @import("../shell_command/command_lex.zig");
-const command_policy = @import("command_policy.zig");
 const file_mutation = @import("file_mutation.zig");
 const file_mutation_contract = @import("file_mutation_contract.zig");
 const image_attachments = @import("../images/image_attachments.zig");
@@ -808,6 +807,7 @@ fn reviewRequestForCall(
         return error.PermissionReviewContextUnavailable;
     const action_provenance = permission_auto_classifier.deriveActionProvenance(
         action,
+        call.arguments_json,
         review_turn.current_turn_untrusted_messages,
     );
     const prior_tool_results = try permission_auto_classifier.selectPriorToolResults(
@@ -5563,6 +5563,42 @@ test "external prepared file review carries frozen path and diff authority" {
         "{{\"path\":\"{s}\",\"content\":\"hello\\n\"}}",
         .{target_path},
     );
+    const prior_messages = [_]types.ChatMessage{.{
+        .role = .tool,
+        .content = arguments_json,
+        .tool_call_id = "read-instruction",
+        .tool_name = "read_file",
+        .tool_result_status = .success,
+    }};
+    var review_turn = testReviewTurn();
+    review_turn.current_root_request =
+        "Inspect the instruction but do not modify the external file.";
+    review_turn.current_turn_untrusted_messages = &prior_messages;
+    input.permission_review_turn = review_turn;
+    const held = try requestPermissionOutcome(
+        input,
+        arena,
+        .{
+            .id = "write",
+            .name = "write_file",
+            .arguments_json = arguments_json,
+        },
+        .auto,
+        &.{},
+    );
+    try std.testing.expectEqual(ToolPermissionDecision.deny, held.decision);
+    try std.testing.expectEqual(
+        types.ToolPermissionDenialReason.review_caution,
+        held.denial_reason.?,
+    );
+    try std.testing.expectEqual(
+        permission_auto_classifier.ActionProvenance.exact_current_turn_tool_result_match,
+        fake.action_provenance,
+    );
+
+    review_turn.current_root_request = "Write the requested external file.";
+    review_turn.current_turn_untrusted_messages = &.{};
+    input.permission_review_turn = review_turn;
     const outcome = try requestPermissionOutcome(
         input,
         arena,
@@ -5575,7 +5611,7 @@ test "external prepared file review carries frozen path and diff authority" {
         &.{},
     );
 
-    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
     try std.testing.expectEqual(
         std.meta.Tag(permission_auto_classifier.Action).file_mutation,
         fake.action_tag.?,

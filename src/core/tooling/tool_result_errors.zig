@@ -217,6 +217,10 @@ pub fn isToolPermissionDeniedOutput(output: []const u8) bool {
     return isToolErrorOutputType(output, "tool_permission_denied");
 }
 
+pub fn isToolReviewHeldOutput(output: []const u8) bool {
+    return isToolErrorOutputType(output, "tool_review_held");
+}
+
 pub fn toolPermissionDenialReason(output: []const u8) ?types.ToolPermissionDenialReason {
     var parsed = std.json.parseFromSlice(std.json.Value, std.heap.c_allocator, output, .{}) catch return null;
     defer parsed.deinit();
@@ -462,8 +466,11 @@ test "review hold JSON distinguishes caution and unavailable from permission den
     try std.testing.expect(std.mem.find(u8, caution, "super-secret") == null);
     try std.testing.expect(std.mem.find(u8, caution, "\"held\":true") != null);
     try std.testing.expect(std.mem.find(u8, caution, "approval_request_id") == null);
+    try std.testing.expect(isToolReviewHeldOutput(caution));
+    try std.testing.expect(!isToolPermissionDeniedOutput(caution));
     try std.testing.expect(std.mem.find(u8, unavailable, "\"reason\":\"review_unavailable\"") != null);
     try std.testing.expect(std.mem.find(u8, unavailable, "\"advice\"") == null);
+    try std.testing.expect(isToolReviewHeldOutput(unavailable));
 }
 
 test "tool permission denied JSON explains policy and headless blockers" {

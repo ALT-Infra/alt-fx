@@ -4550,6 +4550,14 @@ describe("acp: model-independent", () => {
             message.params.update.status === "failed"
           );
           expect(failedUpdateIndex).toBeGreaterThanOrEqual(0);
+          const heldText = blocked.messages[failedUpdateIndex]!.params.update
+            .content[0].content.text as string;
+          const held = JSON.parse(heldText) as {
+            error: { type: string; reason: string; held: boolean };
+          };
+          expect(held.error.type).toBe("tool_review_held");
+          expect(held.error.reason).toBe("review_caution");
+          expect(held.error.held).toBe(true);
           expect(readFileSync(blockedTarget, "utf-8")).toBe("before");
           expect(blockedGateway.classifierRequests).toHaveLength(1);
           expect(blockedGateway.classifierRequests[0]!.body).toContain(
