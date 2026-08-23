@@ -5954,7 +5954,7 @@ pub const McpRuntime = struct {
                             server.config.name,
                             searchable_instructions,
                             query,
-                    )) continue;
+                        )) continue;
                     server_matched = true;
                     if (match_count >= capped_limit) {
                         more_available = true;
