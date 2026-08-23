@@ -2786,7 +2786,7 @@ test.skipIf(!tmuxAvailable())("tmux resize checkpoint failures roll back without
     const connected = await handshake(paths.socket, { minimum: 4, current: 5 });
     const started = await startCommand(connected.client, connected.revision!, 135, {
       cwd: home,
-      command: "printf 'resize-ready\\n'; IFS= read -r input; printf 'resize-after:%s\\n' \"$input\"; sleep 30",
+      command: "printf 'resize-ready\\n'; IFS= read -r input; printf 'resize-after:%s\\n' \"$input\"",
       shell: { executable: { path: "/bin/zsh", clean_start: true } },
       backend: "tmux",
       returnWhen: { match: "resize-ready" },
@@ -2844,10 +2844,19 @@ test.skipIf(!tmuxAvailable())("tmux resize checkpoint failures roll back without
       "wait",
     );
     expect(continued.outcome, failurePoint).toEqual({ condition_met: {} });
-    success(
-      await requestAction(connected.client, connected.revision!, 141, "close", {
+    const exited = success(
+      await requestAction(connected.client, connected.revision!, 141, "wait", {
         session_id: sessionId,
-        policy: "force",
+        return_when: { exit: {} },
+        safety_ceiling_ms: 5_000,
+      }),
+      "wait",
+    );
+    expect(exited.outcome, failurePoint).toEqual({ exited: 0 });
+    success(
+      await requestAction(connected.client, connected.revision!, 142, "close", {
+        session_id: sessionId,
+        policy: "graceful",
       }),
       "close",
     );
