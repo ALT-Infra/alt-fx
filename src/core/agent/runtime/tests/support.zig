@@ -9,15 +9,11 @@ const worker_runtime = @import("../../worker_runtime.zig");
 const background_runtime = @import("../../../background/background_runtime.zig");
 const builtin_context = @import("../../../../builtins/context.zig");
 const builtin_gateway = @import("../../../../builtins/gateway.zig");
-const gateway_client = @import("../../../../gateway/client.zig");
 const builtin_tools = @import("../../../../builtins/tools.zig");
 const session_runtime = @import("../../../session/session.zig");
 const session_codec = @import("../../../session/session_codec.zig");
 const command_replay_store = @import("../../../session/command_replay_store.zig");
 const session_child_store = @import("../../../session/session_child_store.zig");
-const vercel_protocol = @import("../../../../gateway/vercel_protocol.zig");
-const vercel_failure_diagnostics = @import("../../../../gateway/vercel_failure_diagnostics.zig");
-const vercel_model_policy = @import("../../../../gateway/vercel_model_policy.zig");
 const lifecycle_hooks = @import("../../../hooks/hooks.zig");
 const model_capabilities = @import("../../../config/model_capabilities.zig");
 const file_mutation = @import("../../../tooling/file_mutation.zig");
@@ -203,6 +199,8 @@ fn testExecutionAuthority(call: ToolCall) command_admission.ToolExecutionAuthori
 pub const FakeCompletion = struct {
     status: std.http.Status = .ok,
     err_body: ?[]const u8 = null,
+    failure_schema: ?[]const u8 = null,
+    failure_request_shape: ?[]const u8 = null,
     retry_after_seconds: ?u64 = null,
     pre_send_error: ?anyerror = null,
     stream_error: ?anyerror = null,
@@ -320,14 +318,17 @@ pub const FakeGateway = struct {
         }
         if (completion.status != .ok) {
             const err_body = if (completion.err_body) |body| try alloc.dupe(u8, body) else null;
-            const diagnostics = vercel_failure_diagnostics.collect(alloc, payload, err_body);
+            errdefer if (err_body) |value| alloc.free(value);
+            const failure_schema = if (completion.failure_schema) |value| try alloc.dupe(u8, value) else null;
+            errdefer if (failure_schema) |value| alloc.free(value);
+            const failure_request_shape = if (completion.failure_request_shape) |value| try alloc.dupe(u8, value) else null;
             return .{ .failed = .{
                 .kind = failureKind(completion.status),
                 .detail = err_body,
                 .retry_after_seconds = completion.retry_after_seconds,
                 .diagnostics = .{
-                    .schema = diagnostics.schema,
-                    .request_shape = diagnostics.request_shape,
+                    .schema = failure_schema,
+                    .request_shape = failure_request_shape,
                 },
                 .ownership = .owned,
             } };
@@ -354,10 +355,34 @@ pub const FakeGateway = struct {
         request: agent_stream_provider.ModelRequest,
         err: anyerror,
     ) void {
-        request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(
-            err,
-            request.delivery.load(),
-        );
+        const cause: agent_stream_provider.NetworkFailureCause = if (err == error.SystemResumed)
+            .system_resumed
+        else if (err == error.TlsInitializationFailed or
+            err == error.ConnectionSetupTimedOut or
+            err == error.UnknownHostName or
+            err == error.NameServerFailure or
+            err == error.NoAddressReturned or
+            err == error.DetectingNetworkConfigurationFailed or
+            err == error.AddressUnavailable or
+            err == error.ConnectionPending or
+            err == error.ConnectionRefused or
+            err == error.HostUnreachable or
+            err == error.NetworkUnreachable or
+            err == error.NetworkDown or
+            err == error.WouldBlock or
+            err == error.WriteFailed or
+            err == error.ReadFailed or
+            err == error.HttpConnectionClosing or
+            err == error.ConnectionResetByPeer or
+            err == error.ConnectionTimedOut or
+            err == error.Timeout)
+            .transport_interrupted
+        else
+            return;
+        request.attempt_evidence.network_failure = .{
+            .cause = cause,
+            .delivery = request.delivery.load(),
+        };
     }
 
     fn failureKind(status: std.http.Status) agent_stream_provider.FailureKind {
@@ -597,6 +622,10 @@ pub const FakeAgentRuntimeDeps = struct {
     last_route_recovery_fast_mode: bool = false,
     last_route_recovery_finish_reason: ?types.ProviderFinishReason = null,
     last_route_recovery_unsafe_reason: ?types.RouteRecoveryUnsafeReason = null,
+    default_model_capabilities: model_capabilities.Capabilities = .{
+        .prompt_caching = true,
+        .context_window = 1_000_000,
+    },
     capability_overrides: []const ModelCapabilityOverride = &.{},
     available_capability_overrides: []const ModelCapabilityOverride = &.{},
     capability_queries: std.ArrayList([]u8) = .empty,
@@ -763,7 +792,7 @@ pub const FakeAgentRuntimeDeps = struct {
             for (self.capability_overrides) |override| {
                 if (std.mem.eql(u8, override.model, model)) break :blk override.capabilities;
             }
-            break :blk vercel_model_policy.capabilitiesForModel(model);
+            break :blk self.default_model_capabilities;
         };
         if (self.cancel_after_capability_resolution) |cancel_flag| {
             cancel_flag.store(true, .seq_cst);
@@ -776,7 +805,7 @@ pub const FakeAgentRuntimeDeps = struct {
         for (self.available_capability_overrides) |override| {
             if (std.mem.eql(u8, override.model, model)) return override.capabilities;
         }
-        return vercel_model_policy.capabilitiesForModel(model);
+        return self.default_model_capabilities;
     }
 
     fn refreshGatewayCredential(raw: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: runtime_deps.CredentialRefreshMode, expected_account_id: ?[]const u8) !?[]u8 {
@@ -1966,7 +1995,7 @@ pub fn expectGatewayPromptFinalUserText(gateway: *const FakeGateway, index: usiz
         const entry = prompt[i];
         if (entry != .object) continue;
         const role = entry.object.get("role") orelse continue;
-        if (role != .string or !std.mem.eql(u8, role.string, vercel_protocol.roleName(.user))) continue;
+        if (role != .string or !std.mem.eql(u8, role.string, @tagName(types.ChatRole.user))) continue;
         try std.testing.expectEqual(@as(usize, 1), countPromptEntryText(entry, expected_text));
         return;
     }

@@ -1,7 +1,6 @@
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 const diff_mod = @import("../output/diff.zig");
-const vercel_protocol = @import("../../gateway/vercel_protocol.zig");
 const model_tool_schema = @import("../tooling/model_tool_schema.zig");
 const io_mod = @import("../shared/io.zig");
 const permissions = @import("permissions.zig");
@@ -157,7 +156,7 @@ pub const Transport = struct {
         std.Io.Clock.Timestamp,
         *std.atomic.Value(bool),
     ) anyerror!TransportOutcome,
-    build_fn: ?*const fn (
+    build_fn: *const fn (
         *anyopaque,
         std.mem.Allocator,
         []const u8,
@@ -166,7 +165,7 @@ pub const Transport = struct {
         []const u8,
         std.Io.Clock.Timestamp,
         *std.atomic.Value(bool),
-    ) anyerror![]u8 = null,
+    ) anyerror![]u8,
 
     pub fn send(
         self: Transport,
@@ -343,28 +342,16 @@ pub const Reviewer = struct {
         message_index += 1;
         messages[message_index] = .{ .role = .system, .content = instruction };
 
-        const payload = if (transport.build_fn) |build_fn|
-            build_fn(
-                transport.context,
-                alloc,
-                self.model,
-                tools_json,
-                messages,
-                review_turn.target_call_id,
-                deadline,
-                cancel_flag,
-            ) catch |err| return constructionFailure(err)
-        else
-            vercel_protocol.buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
-                alloc,
-                tools_json,
-                messages,
-                review_turn.target_call_id,
-                .{},
-                2048,
-                deadline,
-                cancel_flag,
-            ) catch |err| return constructionFailure(err);
+        const payload = transport.build_fn(
+            transport.context,
+            alloc,
+            self.model,
+            tools_json,
+            messages,
+            review_turn.target_call_id,
+            deadline,
+            cancel_flag,
+        ) catch |err| return constructionFailure(err);
         defer alloc.free(payload);
         debug_trace.logf(
             "permission",
@@ -856,6 +843,49 @@ fn toolsJsonAlloc(alloc: std.mem.Allocator) ![]u8 {
     return std.fmt.allocPrint(alloc, "[{s}]", .{schema_json});
 }
 
+fn buildTestReviewPayload(
+    _: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    tools_json: []const u8,
+    messages: []const types.ChatMessage,
+    target_call_id: []const u8,
+    _: std.Io.Clock.Timestamp,
+    cancel_flag: *std.atomic.Value(bool),
+) ![]u8 {
+    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try out.writer.writeAll("{\"model\":");
+    try std.json.Stringify.value(model, .{}, &out.writer);
+    try out.writer.writeAll(",\"maxOutputTokens\":2048,\"toolChoice\":{\"type\":\"required\"},\"tools\":");
+    try out.writer.writeAll(tools_json);
+    try out.writer.writeAll(",\"messages\":[");
+    var first = true;
+    for (messages) |message| {
+        if (!first) try out.writer.writeByte(',');
+        first = false;
+        try out.writer.writeAll("{\"role\":");
+        try std.json.Stringify.value(@tagName(message.role), .{}, &out.writer);
+        if (message.content) |content| {
+            try out.writer.writeAll(",\"content\":");
+            try std.json.Stringify.value(content, .{}, &out.writer);
+        }
+        if (message.tool_calls.len > 0) {
+            try out.writer.writeAll(",\"tool_calls\":");
+            try std.json.Stringify.value(message.tool_calls, .{}, &out.writer);
+        }
+        try out.writer.writeByte('}');
+        if (message.role == .assistant) {
+            try out.writer.writeAll(",{\"role\":\"tool\",\"tool_call_id\":");
+            try std.json.Stringify.value(target_call_id, .{}, &out.writer);
+            try out.writer.writeAll(",\"content\":\"pending review\"}");
+        }
+    }
+    try out.writer.writeAll("]}");
+    return out.toOwnedSlice();
+}
+
 fn parseCompletion(alloc: std.mem.Allocator, completion: types.ModelCompletion) !ParseOutcome {
     if (completion.content) |content| {
         if (std.mem.trim(u8, content, " \t\r\n").len > 0) return .invalid;
@@ -1110,6 +1140,7 @@ test "automatic review does not send redacted action evidence" {
     const reviewer = Reviewer.withTransport(.{
         .context = @ptrCast(&fake),
         .send_fn = FakeTransport.send,
+        .build_fn = buildTestReviewPayload,
     }, null, 1000);
     const pending_assistant = types.ChatMessage{
         .role = .assistant,
@@ -1262,11 +1293,11 @@ test "automatic review serializes the pending call structurally" {
             const self: *@This() = @ptrCast(@alignCast(raw_ctx));
             self.saw_pending_assistant =
                 std.mem.find(u8, payload, "\"role\":\"assistant\"") != null and
-                std.mem.find(u8, payload, "\"toolCallId\":\"call_install\"") != null and
-                std.mem.find(u8, payload, "\"toolCallId\":\"call_read\"") == null;
+                std.mem.find(u8, payload, "\"id\":\"call_install\"") != null and
+                std.mem.find(u8, payload, "\"id\":\"call_read\"") == null;
             self.saw_pending_results =
                 std.mem.count(u8, payload, "\"role\":\"tool\"") == 1 and
-                std.mem.count(u8, payload, "Tool call has not executed; it is pending permission review.") == 1;
+                std.mem.count(u8, payload, "pending review") == 1;
             self.saw_reviewer_model = std.mem.eql(u8, model, gateway_reviewer_model);
             self.saw_review_settings =
                 std.mem.find(u8, payload, "\"maxOutputTokens\":2048") != null and
@@ -1296,6 +1327,7 @@ test "automatic review serializes the pending call structurally" {
     const reviewer = Reviewer.withTransport(.{
         .context = @ptrCast(&fake),
         .send_fn = FakeTransport.send,
+        .build_fn = buildTestReviewPayload,
     }, null, 1000);
     const pending_assistant = types.ChatMessage{
         .role = .assistant,
@@ -1379,6 +1411,7 @@ test "subagent automatic review sends only the current root request" {
     const reviewer = Reviewer.withTransport(.{
         .context = @ptrCast(&fake),
         .send_fn = FakeTransport.send,
+        .build_fn = buildTestReviewPayload,
     }, null, 1000);
     var outcome = try reviewer.review(std.testing.allocator, .{
         .workspace_root = "/tmp/workspace",
@@ -1435,6 +1468,7 @@ test "automatic review rejects an oversized complete packet without sending" {
     const reviewer = Reviewer.withTransport(.{
         .context = @ptrCast(&fake),
         .send_fn = FakeTransport.send,
+        .build_fn = buildTestReviewPayload,
     }, null, 1000);
     const oversized_root = "x" ** (max_review_packet_bytes + 1);
     const outcome = try reviewer.review(std.testing.allocator, .{
@@ -1491,6 +1525,7 @@ test "automatic review sends complete action evidence above sixteen kib" {
     const reviewer = Reviewer.withTransport(.{
         .context = @ptrCast(&fake),
         .send_fn = FakeTransport.send,
+        .build_fn = buildTestReviewPayload,
     }, null, 1000);
     var outcome = try reviewer.review(std.testing.allocator, .{
         .workspace_root = "/tmp/workspace",
@@ -1563,6 +1598,7 @@ test "automatic review excludes assistant preamble and images" {
     const reviewer = Reviewer.withTransport(.{
         .context = @ptrCast(&fake),
         .send_fn = FakeTransport.send,
+        .build_fn = buildTestReviewPayload,
     }, null, 1000);
     var outcome = try reviewer.review(std.testing.allocator, .{
         .workspace_root = "/tmp/workspace",
@@ -1626,6 +1662,7 @@ test "automatic review ignores legacy authority completeness" {
     const reviewer = Reviewer.withTransport(.{
         .context = @ptrCast(&fake),
         .send_fn = FakeTransport.send,
+        .build_fn = buildTestReviewPayload,
     }, null, 1000);
     const outcome = try reviewer.review(std.testing.allocator, .{
         .workspace_root = "/tmp/workspace",
@@ -1765,6 +1802,7 @@ test "expired review budget fails closed before transport" {
     const reviewer = Reviewer.withTransport(.{
         .context = @ptrCast(&fake),
         .send_fn = FakeTransport.send,
+        .build_fn = buildTestReviewPayload,
     }, null, 0);
     const outcome = try reviewer.review(std.testing.allocator, .{
         .workspace_root = "/tmp/workspace",

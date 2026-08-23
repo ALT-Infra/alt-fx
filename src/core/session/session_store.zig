@@ -8710,7 +8710,6 @@ test "session store delegates schema v3 authority operations" {
 }
 
 test "schema v3 load repairs duplicate-key tool arguments before gateway projection" {
-    const vercel_protocol = @import("../../gateway/vercel_protocol.zig");
     const types = @import("../shared/types.zig");
     const alloc = std.testing.allocator;
     const duplicate_arguments = "{\"depth\":1,\"depth\":2}";
@@ -8793,17 +8792,8 @@ test "schema v3 load repairs duplicate-key tool arguments before gateway project
     var messages: std.ArrayList(types.ChatMessage) = .empty;
     try session.appendHistoryChatMessages(arena, &messages, loaded.history);
     try messages.append(arena, .{ .role = .user, .content = "continue" });
-    const body = try vercel_protocol.buildGatewayRequestBodyWithOptions(
-        alloc,
-        "[]",
-        messages.items,
-        .{},
-        .auto,
-    );
-    defer alloc.free(body);
-    try std.testing.expect(std.mem.find(u8, body, "\"input\":{}") != null);
-    try std.testing.expect(std.mem.find(u8, body, "tool_execution_failed") != null);
-    try std.testing.expect(std.mem.find(u8, body, duplicate_arguments) == null);
+    try std.testing.expectEqualStrings("{}", messages.items[1].tool_calls[0].arguments_json);
+    try std.testing.expect(std.mem.find(u8, messages.items[2].content.?, "tool_execution_failed") != null);
 
     debug_trace.shutdown();
     var trace_file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});

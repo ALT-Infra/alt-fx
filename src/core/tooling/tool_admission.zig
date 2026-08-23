@@ -3799,6 +3799,19 @@ test "incomplete review authority maps to auto denial without reviewer transport
             return .permanent_failure;
         }
 
+        fn build(
+            _: *anyopaque,
+            alloc: Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const types.ChatMessage,
+            _: []const u8,
+            _: std.Io.Clock.Timestamp,
+            _: *std.atomic.Value(bool),
+        ) ![]u8 {
+            return alloc.dupe(u8, "{}");
+        }
+
         fn review(
             raw_ctx: *anyopaque,
             alloc: Allocator,
@@ -3809,6 +3822,7 @@ test "incomplete review authority maps to auto denial without reviewer transport
             return permission_auto_classifier.Reviewer.withTransport(.{
                 .context = raw_ctx,
                 .send_fn = send,
+                .build_fn = build,
             }, null, 1000).review(alloc, request);
         }
     };

@@ -6,6 +6,7 @@ const debug_trace = @import("../../core/shared/debug_trace.zig");
 const types = @import("../../core/shared/types.zig");
 const stream_provider = @import("../../core/agent/stream_provider.zig");
 const credential_authority = @import("../../core/auth/credential_authority.zig");
+const vercel_protocol = @import("../../gateway/vercel_protocol.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -68,10 +69,33 @@ fn reviewGatewayConfig(
         .{
             .context = @ptrCast(&local),
             .send_fn = sendGatewayReview,
+            .build_fn = buildGatewayReview,
         },
         local.cancel_flag,
         permission_auto_classifier.Reviewer.default_timeout_ms,
     ).review(alloc, request);
+}
+
+fn buildGatewayReview(
+    _: *anyopaque,
+    alloc: Allocator,
+    _: []const u8,
+    tools_json: []const u8,
+    messages: []const types.ChatMessage,
+    target_call_id: []const u8,
+    deadline: std.Io.Clock.Timestamp,
+    cancel_flag: *std.atomic.Value(bool),
+) ![]u8 {
+    return vercel_protocol.buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
+        alloc,
+        tools_json,
+        messages,
+        target_call_id,
+        .{},
+        2048,
+        deadline,
+        cancel_flag,
+    );
 }
 
 const OwnedStream = struct {

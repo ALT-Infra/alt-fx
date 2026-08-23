@@ -2418,7 +2418,6 @@ test "durable state round trips live history while discarding legacy authority" 
 }
 
 test "durable state repairs duplicate-key execution and interrupted tool arguments" {
-    const vercel_protocol = @import("../../gateway/vercel_protocol.zig");
     const alloc = std.testing.allocator;
     const duplicate_arguments = "{\"depth\":1,\"depth\":2}";
 
@@ -2492,13 +2491,6 @@ test "durable state repairs duplicate-key execution and interrupted tool argumen
     const interrupted = decoded.history[1].interrupted.tool_call.?;
     try std.testing.expectEqualStrings("{}", interrupted.arguments_json);
     try std.testing.expectEqual(types.ToolArgumentIntegrity.valid, interrupted.argument_integrity);
-
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var messages: std.ArrayList(types.ChatMessage) = .empty;
-    try session.appendHistoryChatMessages(arena, &messages, decoded.history);
-    try vercel_protocol.validateToolMessageHistory(arena, messages.items);
 }
 
 test "current history decode rejects ambiguous malformed tool result pairings" {
