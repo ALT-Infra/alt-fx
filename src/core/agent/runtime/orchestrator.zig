@@ -1496,22 +1496,32 @@ fn recoveryCredentialAuthorityMatches(
     checkpoint: session_codec.RecoveryCheckpoint,
     source: ?types.CredentialSource,
     account_id: ?[]const u8,
+    tenant: ?[]const u8,
+    secret_value: []const u8,
 ) bool {
     const expected_source = checkpoint.authority.credential_source orelse return false;
-    const expected_identity = checkpoint.authority.credential_identity orelse return false;
     const current_source = source orelse return false;
     if (current_source != expected_source) return false;
-    const current_identity = credential_authority.derive(
+    if (checkpoint.authority.credential_identity) |expected_identity| {
+        if (credential_authority.derive(current_source, account_id)) |current_identity| {
+            if (expected_identity.eql(current_identity)) return true;
+        }
+    }
+    const expected_verifier = checkpoint.ephemeral_credential_verifier orelse return false;
+    return expected_verifier.eql(credential_authority.deriveEphemeralVerifier(
         current_source,
         account_id,
-    ) orelse return false;
-    return expected_identity.eql(current_identity);
+        tenant,
+        secret_value,
+    ));
 }
 
 fn shouldRejectRecoveryAuthority(
     checkpoint: session_codec.RecoveryCheckpoint,
     source: ?types.CredentialSource,
     account_id: ?[]const u8,
+    tenant: ?[]const u8,
+    secret_value: []const u8,
 ) bool {
     const provider_may_have_received_request = checkpoint.outstanding_reservation or
         checkpoint.consumed_provider_attempts > 0;
@@ -1519,6 +1529,8 @@ fn shouldRejectRecoveryAuthority(
         checkpoint,
         source,
         account_id,
+        tenant,
+        secret_value,
     );
 }
 
@@ -1548,11 +1560,15 @@ test "potentially sent recovery rejects missing or changed credential authority"
         checkpoint,
         .chatgpt_subscription,
         "acct_1",
+        null,
+        "token-b",
     ));
     try std.testing.expect(shouldRejectRecoveryAuthority(
         checkpoint,
         .chatgpt_subscription,
         "acct_2",
+        null,
+        "token-a",
     ));
 
     var legacy = checkpoint;
@@ -1562,19 +1578,46 @@ test "potentially sent recovery rejects missing or changed credential authority"
         legacy,
         .chatgpt_subscription,
         "acct_1",
+        null,
+        "token-a",
     ));
     legacy.authority.credential_source = .ai_gateway_api_key;
     try std.testing.expect(shouldRejectRecoveryAuthority(
         legacy,
         .ai_gateway_api_key,
         null,
+        null,
+        "token-a",
     ));
+    legacy.ephemeral_credential_verifier = credential_authority.deriveEphemeralVerifier(
+        .ai_gateway_api_key,
+        null,
+        null,
+        "token-a",
+    );
+    try std.testing.expect(!shouldRejectRecoveryAuthority(
+        legacy,
+        .ai_gateway_api_key,
+        null,
+        null,
+        "token-a",
+    ));
+    try std.testing.expect(shouldRejectRecoveryAuthority(
+        legacy,
+        .ai_gateway_api_key,
+        null,
+        null,
+        "token-b",
+    ));
+    legacy.ephemeral_credential_verifier = null;
     legacy.authority.credential_source = null;
     legacy.consumed_provider_attempts = 0;
     try std.testing.expect(!shouldRejectRecoveryAuthority(
         legacy,
         .chatgpt_subscription,
         "acct_1",
+        null,
+        "token-a",
     ));
 }
 
@@ -1696,6 +1739,15 @@ fn persistRecoveryCheckpoint(
         .max_provider_attempts = attempt_limit,
         .consumed_provider_attempts = consumed_attempts,
         .outstanding_reservation = outstanding_reservation,
+        .ephemeral_credential_verifier = if (job.credential_source) |source|
+            credential_authority.deriveEphemeralVerifier(
+                source,
+                job.account_id,
+                job.gateway_team,
+                job.api_key,
+            )
+        else
+            null,
     });
     debug_trace.eventf(
         "agent",
@@ -3153,6 +3205,8 @@ fn processQueuedPromptLoop(
             checkpoint,
             job.credential_source,
             job.account_id,
+            job.gateway_team,
+            job.api_key,
         )) {
             return error.RecoveryCredentialAuthorityChanged;
         }

@@ -1338,7 +1338,7 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "ACP refuses paused recovery without stable credential authority",
+    "ACP reports a paused recovery and continues it only on explicit metadata",
     async () => {
       const root = createIsolatedRoot("fx-acp-model-recovery-");
       const partialText = "ACP partial output before EOF.";
@@ -1372,16 +1372,18 @@ describe("acp: model-independent", () => {
         expect(pausedUpdates).toContain(partialText);
 
         const resumed = await continueRecovery(client, TIMEOUT);
-        expect(resumed.promptResult.error).toEqual({
-          code: -32603,
-          message: "RecoveryCredentialAuthorityChanged",
-        });
-        expect(gateway.requests).toHaveLength(10);
+        expect(resumed.promptResult.error).toBeUndefined();
+        expect(resumed.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(11);
         const resumedUpdates = JSON.stringify(resumed.messages);
-        expect(resumedUpdates).not.toContain('"state":"recovered"');
+        expect(resumedUpdates).toContain('"state":"recovered"');
+        expect(resumedUpdates).not.toContain("provider temporarily unavailable");
+        expect(gateway.requests[10]!.body).toContain(
+          "Preserve this ACP prompt through recovery.",
+        );
         const allUpdates = JSON.stringify([...paused.messages, ...resumed.messages]);
         expect(occurrenceCount(allUpdates, partialText)).toBe(1);
-        expect(occurrenceCount(allUpdates, finalTextSuffix)).toBe(0);
+        expect(occurrenceCount(allUpdates, finalTextSuffix)).toBe(1);
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();

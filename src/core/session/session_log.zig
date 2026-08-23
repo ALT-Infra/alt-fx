@@ -673,6 +673,14 @@ pub const LoadedWritableSession = struct {
             self.state_replacement_pending = true;
             return err;
         };
+        switch (event) {
+            .recovery_checkpoint_set => |payload| {
+                const checkpoint = &(self.state.recovery_checkpoint orelse
+                    return error.InvalidSessionFormat);
+                checkpoint.ephemeral_credential_verifier = payload.checkpoint.ephemeral_credential_verifier;
+            },
+            else => {},
+        }
         if (!lifecycle_published) {
             self.state_replacement_pending = true;
         } else {
@@ -690,6 +698,10 @@ pub const LoadedWritableSession = struct {
         failed_tail: FailedTailDisposition,
         options: Options,
     ) !CommitPosition {
+        const ephemeral_credential_verifier = if (state.recovery_checkpoint) |checkpoint|
+            checkpoint.ephemeral_credential_verifier
+        else
+            null;
         const usage_sidecar_bytes = if (state.usage) |usage|
             encodeUsageSidecarBestEffort(
                 alloc,
@@ -735,6 +747,9 @@ pub const LoadedWritableSession = struct {
             self.state_replacement_pending = true;
             return err;
         };
+        if (self.state.recovery_checkpoint) |*checkpoint| {
+            checkpoint.ephemeral_credential_verifier = ephemeral_credential_verifier;
+        }
         if (!lifecycle_published) self.state_replacement_pending = true;
         return self.position;
     }
