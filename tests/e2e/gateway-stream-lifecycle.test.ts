@@ -4764,7 +4764,7 @@ describe("gateway stream lifecycle", () => {
     }
   }, 30_000);
 
-  test("exhausted retry budget pauses once and explicit continue preserves context", async () => {
+  test("exhausted retry budget refuses cross-process continuation without stable authority", async () => {
     const root = createFixtureRoot("retry-budget-pause-continue");
     const tracePath = join(root.root, "trace.log");
     let continued = false;
@@ -4818,22 +4818,18 @@ describe("gateway stream lifecycle", () => {
           timeoutMs: 15_000,
         },
       );
-      const recovered = parseAskJson(resumed.stdout);
-      expect(resumed.code).toBe(0);
-      expect(recovered.output).toContain("Recovered after explicit continuation.");
-      expect(gateway.requestCount()).toBe(11);
-      expect(gateway.requests[10]!.body).toContain("Pause after exhausting recovery.");
+      expect(resumed.code).toBe(1);
+      expect(gateway.requestCount()).toBe(10);
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
     }
   });
 
-  test("CLI continuation prints one complete response after checkpointed partial output", async () => {
+  test("CLI continuation refuses checkpointed partial output without stable authority", async () => {
     const root = createFixtureRoot("partial-pause-continue");
     const tracePath = join(root.root, "trace.log");
     const partialText = "CLI partial output before EOF.";
-    const finalText = "CLI recovery completed.";
     const responses = [
       sse(
         `data: ${JSON.stringify({
@@ -4843,7 +4839,7 @@ describe("gateway stream lifecycle", () => {
         })}\n\n`,
       ),
       ...Array.from({ length: 9 }, () => unavailableResponse("0")),
-      fakeGatewayFinalText(`${partialText}${finalText}`),
+      fakeGatewayFinalText("must not send"),
     ];
     const gateway = startGateway(() =>
       responses.shift() ?? new Response("unexpected request", { status: 500 })
@@ -4878,14 +4874,8 @@ describe("gateway stream lifecycle", () => {
           timeoutMs: 15_000,
         },
       );
-      const recovered = parseAskJson(resumed.stdout);
-      expect(resumed.code).toBe(0);
-      expect(recovered.output).toBe(`${partialText}${finalText}`);
-      expect(recovered.recovery?.state).toBe("recovered");
-      expect(recovered.recovery?.message).not.toContain(
-        "provider temporarily unavailable",
-      );
-      expect(gateway.requestCount()).toBe(11);
+      expect(resumed.code).toBe(1);
+      expect(gateway.requestCount()).toBe(10);
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });

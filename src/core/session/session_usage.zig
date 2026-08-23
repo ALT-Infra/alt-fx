@@ -1600,6 +1600,19 @@ pub const Usage = struct {
         credential: []const u8,
     ) void {
         const identity = credential_authority.derive(source, account_id) orelse {
+            self.mutex.lockUncancelable(io_mod.getIo());
+            const has_pending = self.pending.items.len > 0;
+            self.mutex.unlock(io_mod.getIo());
+            if (!has_pending) {
+                self.startReconciliationWithCredential(
+                    alloc,
+                    credential,
+                    .{ .provider = provider, .credential_identity = null },
+                    true,
+                    null,
+                );
+                return;
+            }
             self.clearReconciliationCredential();
             debug_trace.logf(
                 "session",
@@ -5433,6 +5446,22 @@ test "resumed provider reconciliation requires stable account identity" {
     const alloc = std.testing.allocator;
     var usage = Usage.initFresh();
     defer usage.deinit(alloc);
+
+    usage.replaceProviderReconciliationCredential(
+        alloc,
+        .gateway,
+        .ai_gateway_api_key,
+        null,
+        "fresh-secret-key",
+    );
+    try std.testing.expect(usage.reconciliation_key_digest != null);
+    try std.testing.expect(!usage.reconciliation_credential_blocked);
+
+    const observation = try InvocationObservation.begin(&usage);
+    try observation.complete(alloc, .{}, .{ .deferred = testGatewayUsageReference(
+        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "https://ai-gateway.vercel.sh",
+    ) });
 
     usage.replaceProviderReconciliationCredential(
         alloc,

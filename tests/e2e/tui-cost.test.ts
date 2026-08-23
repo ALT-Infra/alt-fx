@@ -398,7 +398,7 @@ test("fx usage reports a missing generation identity as incomplete", async () =>
 describe.skipIf(!tmuxAvailable())("tui: durable session cost", () => {
   for (const resumeMode of ["startup", "picker"] as const) {
     test(
-      `pending generation reconciliation survives ${resumeMode} resume`,
+      `pending generation stays unresolved across ${resumeMode} without stable authority`,
       async () => {
         root = mkdtempSync(join(tmpdir(), `fx-cost-${resumeMode}-resume-`));
         const home = join(root, "home");
@@ -407,12 +407,6 @@ describe.skipIf(!tmuxAvailable())("tui: durable session cost", () => {
         mkdirSync(home, { recursive: true });
         mkdirSync(workspace, { recursive: true });
 
-        let originalGenerationRequests = 0;
-        let releaseResumeGeneration: (() => void) | null = null;
-        const heldResumeGeneration = new Promise<Response>((resolve) => {
-          releaseResumeGeneration = () =>
-            resolve(authoritativeGeneration(GENERATION_ID));
-        });
         gateway = startFakeGateway(
           [
             fakeGatewaySse([
@@ -447,11 +441,7 @@ describe.skipIf(!tmuxAvailable())("tui: durable session cost", () => {
               if (generationId !== GENERATION_ID) {
                 return new Response("not found", { status: 404 });
               }
-              originalGenerationRequests += 1;
-              if (originalGenerationRequests === 1) {
-                return new Promise<Response>(() => {});
-              }
-              return heldResumeGeneration;
+              return new Promise<Response>(() => {});
             },
           },
         );
@@ -495,19 +485,8 @@ describe.skipIf(!tmuxAvailable())("tui: durable session cost", () => {
           await session.waitForText("● Session resumed:", TIMEOUT);
         }
 
-        await waitForGenerationRequests(gateway, 2);
-        expect(releaseResumeGeneration).not.toBeNull();
-        releaseResumeGeneration!();
-        await waitForProfileUsage(home, GENERATION_ID);
-
-        await session.sendText("/cost");
-        const cost = await session.waitForText(/\$0\.0123/, TIMEOUT);
-        expect(cost).toMatch(/Total tokens +155/);
-        expect(cost).toMatch(/Input +130/);
-        expect(cost).toMatch(/Output +25/);
-        expect(cost).toMatch(/Cache +20 read · 10 write/);
-        await session.sendKeys("Escape");
-        await session.waitForComposer(TIMEOUT);
+        await Bun.sleep(500);
+        expect(gateway.generationRequests).toEqual([GENERATION_ID]);
         await session.sendText("Confirm resumed input still works.");
         await session.waitForText(FOLLOW_UP_TEXT, TIMEOUT);
         await session.sendLiteral("/re");
@@ -522,10 +501,8 @@ describe.skipIf(!tmuxAvailable())("tui: durable session cost", () => {
         expect(readFileSync(stderrPath, "utf8")).toBe("");
         const resumedEvents = readFileSync(resumedEventsPath, "utf8");
         const afterResume = latestUsageCheckpoint(resumedEvents);
-        expect(afterResume.pending).toEqual([]);
-        expect(afterResume.total_cost).toBe(0.0123);
-        expect(afterResume.models.map((item) => item.model))
-          .toContain(MODEL);
+        expect(afterResume.pending.map((item) => item.id)).toEqual([GENERATION_ID]);
+        expect(afterResume.total_cost).toBe(0);
         expect(
           eventRecords(resumedEvents)
             .filter((record) => record.kind === "history_turn_committed"),

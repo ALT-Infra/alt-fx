@@ -3062,14 +3062,13 @@ describe("effect-aware command permissions", () => {
   );
 
   test(
-    "fx ask pauses and resumes provider recovery for a child",
+    "fx ask refuses child recovery without stable credential authority",
     async () => {
       const root = createIsolatedRoot();
       const childPrompt = "Trigger the deterministic provider failure.";
       const secret = "sk-abcdefghijklmnop";
       let childId = "";
       let childProviderAttempts = 0;
-      let resumedChildBody = "";
       let watchingPause = false;
       let inspectedPause: {
         ok: boolean;
@@ -3080,7 +3079,7 @@ describe("effect-aware command permissions", () => {
           messages: Array<{ status: string; cancellation_reason: string | null }>;
         };
       } | null = null;
-      let inspectedCompleted: {
+      let inspectedAfterResume: {
         ok: boolean;
         status: string;
         requested: { messages: Array<{ status: string }> };
@@ -3092,19 +3091,20 @@ describe("effect-aware command permissions", () => {
       });
       const route = (body: string): Response | Promise<Response> => {
         if (body.includes('"toolCallId":"failed_inspect_2"')) {
-          inspectedCompleted = JSON.parse(
+          inspectedAfterResume = JSON.parse(
             toolResultText(body, "failed_inspect_2"),
-          ) as typeof inspectedCompleted;
-          return finalText("parent resumed the paused child recovery");
+          ) as typeof inspectedAfterResume;
+          return finalText("parent observed the refused child recovery");
         }
         if (body.includes('"toolCallId":"failed_resume_1"')) {
           resumeOutcome = JSON.parse(
             toolResultText(body, "failed_resume_1"),
           ) as typeof resumeOutcome;
           return (async () => {
+            await Bun.sleep(250);
             const deadline = Date.now() + TIMEOUT;
             while (Date.now() < deadline) {
-              if (subagentState(root, childId) === "completed") {
+              if (subagentState(root, childId) === "failed") {
                 return gatewayToolCall("subagent", {
                   command: {
                     inspect: {
@@ -3118,7 +3118,7 @@ describe("effect-aware command permissions", () => {
               await Bun.sleep(20);
             }
             throw new Error(
-              `Timed out waiting for recovered child=${childId} state=${subagentState(root, childId)}`,
+              `Timed out waiting for refused child=${childId} state=${subagentState(root, childId)}`,
             );
           })();
         }
@@ -3142,8 +3142,7 @@ describe("effect-aware command permissions", () => {
         if (body.includes(childPrompt)) {
           childProviderAttempts += 1;
           if (childProviderAttempts > 10) {
-            resumedChildBody = body;
-            return finalText("child recovered from the provider outage");
+            throw new Error("child recovery sent without stable credential authority");
           }
           if (!watchingPause) {
             watchingPause = true;
@@ -3194,7 +3193,7 @@ describe("effect-aware command permissions", () => {
 
       expect(result.code).toBe(0);
       expect(result.stdout).toContain(
-        "parent resumed the paused child recovery",
+        "parent observed the refused child recovery",
       );
       expect(inspectedPause?.ok).toBe(true);
       expect(inspectedPause?.status).toBe("interrupted");
@@ -3207,13 +3206,11 @@ describe("effect-aware command permissions", () => {
       );
       expect(resumeOutcome?.ok).toBe(true);
       expect(resumeOutcome?.status).toBe("lifecycle_changed");
-      expect(inspectedCompleted?.ok).toBe(true);
-      expect(inspectedCompleted?.status).toBe("completed");
-      expect(inspectedCompleted?.requested.messages[0]?.status).toBe("completed");
-      expect(childProviderAttempts).toBe(11);
-      expect(resumedChildBody).toContain("<network_recovery>");
-      expect(resumedChildBody).toContain(childPrompt);
-      expect(gateway.requests).toHaveLength(16);
+      expect(inspectedAfterResume?.ok).toBe(true);
+      expect(inspectedAfterResume?.status).toBe("failed");
+      expect(inspectedAfterResume?.requested.messages[0]?.status).toBe("failed");
+      expect(childProviderAttempts).toBe(10);
+      expect(gateway.requests).toHaveLength(15);
       expect(result.stderr).not.toContain(secret);
       expectNoHostileExecutables(root);
       expectNoCommandArtifacts(root);
