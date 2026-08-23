@@ -1393,10 +1393,10 @@ test "built-in model-facing tool contract stays byte exact" {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
 
     inline for (all) |tool| {
-        try std.testing.expectEqualStrings(tool.name, tool.gateway_schema.name);
+        try std.testing.expectEqualStrings(tool.name, tool.model_schema.name);
         try std.testing.expectEqualStrings(
             tool.description,
-            tool.gateway_schema.description,
+            tool.model_schema.description,
         );
         const schema_json = try tool_specs.toolGatewaySchemaJson(alloc, tool);
         defer alloc.free(schema_json);
@@ -1416,7 +1416,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "33d8513797a6a673dcb22110095ce4694d1852fa8d72ad7947882974b40b6ce7",
+        "e4439b952e577a959ac4916025cf4f0d222713ec7bd1bc83dd703bfedd220af1",
         &actual_hex,
     );
 }

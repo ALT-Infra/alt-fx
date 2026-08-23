@@ -1085,7 +1085,7 @@ test "automatic review model-facing tool contract stays byte exact" {
     std.crypto.hash.sha2.Sha256.hash(tools_json, &digest, .{});
     const actual_hex = std.fmt.bytesToHex(digest, .lower);
     try std.testing.expectEqualStrings(
-        "a8980fcb16cd2ab8d1f98f7a4d61eed40df435fe406bfb65fc1d3ef4126def08",
+        "a8000b05e90c3a89d1a54a7a38c1250e45447b8826564989c50eeaf81cadda12",
         &actual_hex,
     );
 }

@@ -68,10 +68,10 @@ test "browser workspace projects exactly one command-only terminal" {
 }
 
 test "browser workspace model-facing tool contract stays byte exact" {
-    const gateway_schema = @import("../core/tooling/gateway_schema.zig");
-    const schema_json = try gateway_schema.builtinFunctionSchemaJsonAlloc(
+    const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
+    const schema_json = try model_tool_schema.builtinFunctionSchemaJsonAlloc(
         std.testing.allocator,
-        registry.tools[0].gateway_schema,
+        registry.tools[0].model_schema,
     );
     defer std.testing.allocator.free(schema_json);
 

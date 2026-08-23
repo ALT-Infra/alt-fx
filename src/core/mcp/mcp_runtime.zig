@@ -5929,8 +5929,8 @@ pub const McpRuntime = struct {
             self.catalog_mutex.lockSharedUncancelable(io_mod.getIo());
             defer self.catalog_mutex.unlockShared(io_mod.getIo());
             const capped_limit = @min(if (limit == 0) default_mcp_search_limit else limit, max_mcp_search_limit);
-            var matches: std.ArrayList(ToolSearchMatch) = .empty;
-            defer matches.deinit(alloc);
+            var match_storage: [max_mcp_search_limit]ToolSearchMatch = undefined;
+            var match_count: usize = 0;
             var auth_witnesses: std.ArrayList(CatalogAuthWitness) = .empty;
             defer auth_witnesses.deinit(alloc);
             var more_available = false;
@@ -5954,16 +5954,17 @@ pub const McpRuntime = struct {
                             server.config.name,
                             searchable_instructions,
                             query,
-                        )) continue;
+                    )) continue;
                     server_matched = true;
-                    if (matches.items.len >= capped_limit) {
+                    if (match_count >= capped_limit) {
                         more_available = true;
                         break;
                     }
-                    try matches.append(alloc, .{
+                    match_storage[match_count] = .{
                         .server = server,
                         .tool = tool,
-                    });
+                    };
+                    match_count += 1;
                 }
                 if (server_matched) {
                     if (catalogAuthWitness(server)) |generation| {
@@ -5975,7 +5976,8 @@ pub const McpRuntime = struct {
                 }
                 if (more_available) break :server_loop;
             }
-            if (matches.items.len == 0) {
+            const matches = match_storage[0..match_count];
+            if (matches.len == 0) {
                 if (try renderAuthenticationRequired(
                     alloc,
                     self.servers.items,
@@ -5988,8 +5990,8 @@ pub const McpRuntime = struct {
 
             const full = try renderSearchResult(
                 alloc,
-                matches.items,
-                matches.items.len,
+                matches,
+                matches.len,
                 limits.mcp_description_bytes,
                 limits.mcp_search_result_bytes,
                 0,
@@ -6000,19 +6002,19 @@ pub const McpRuntime = struct {
             const effective_bytes = limits.mcp_search_result_bytes.effectiveBytes();
             if (full.len <= effective_bytes) {
                 errdefer alloc.free(full);
-                const notice = try renderSearchNotice(alloc, matches.items, matches.items.len, limits, observed_bytes, false);
+                const notice = try renderSearchNotice(alloc, matches, matches.len, limits, observed_bytes, false);
                 errdefer if (notice) |value| alloc.free(value);
                 try validateCatalogAuthWitnesses(auth_witnesses.items);
                 break :result tool_mcp_runtime.SearchResult{ .model_output = full, .notice = notice };
             }
             alloc.free(full);
 
-            var selected_count = matches.items.len;
+            var selected_count = matches.len;
             var model_output: ?[]u8 = null;
             while (true) {
                 const candidate = try renderSearchResult(
                     alloc,
-                    matches.items,
+                    matches,
                     selected_count,
                     limits.mcp_description_bytes,
                     limits.mcp_search_result_bytes,
@@ -6033,7 +6035,7 @@ pub const McpRuntime = struct {
             }
             const output = model_output.?;
             errdefer alloc.free(output);
-            const notice = try renderSearchNotice(alloc, matches.items, selected_count, limits, observed_bytes, true);
+            const notice = try renderSearchNotice(alloc, matches, selected_count, limits, observed_bytes, true);
             errdefer if (notice) |value| alloc.free(value);
             try validateCatalogAuthWitnesses(auth_witnesses.items);
             break :result tool_mcp_runtime.SearchResult{ .model_output = output, .notice = notice };
@@ -17772,6 +17774,47 @@ test "MCP search matches each retained source field" {
         missing.model_output,
     );
     try std.testing.expect(missing.notice == null);
+}
+
+test "MCP search keeps bounded matches off the allocator" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "github"),
+        .command = try alloc.dupe(u8, "fixture"),
+    });
+    runtime.servers.items[0].state = .ready;
+
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+    try parseAndStoreTools(
+        alloc,
+        &runtime.servers.items[0],
+        .{},
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"create_issue","description":"Create issue","inputSchema":{"type":"object"}}]}}
+    ,
+        &used,
+    );
+
+    var counting = std.testing.FailingAllocator.init(alloc, .{});
+    const search_alloc = counting.allocator();
+    var result = try runtime.searchTools(
+        search_alloc,
+        "github issue",
+        max_mcp_search_limit,
+        .{},
+        .{},
+        .unrestricted,
+    );
+    defer result.deinit(search_alloc);
+
+    try std.testing.expectEqualStrings(
+        "{\"tools\":[{\"name\":\"mcp_github_create_issue\",\"server\":\"github\",\"description\":\"Create issue\",\"purpose\":\"Create issue\",\"usage\":[\"mcp\",\"github\",\"create_issue\"]}],\"count\":1}",
+        result.model_output,
+    );
+    try std.testing.expectEqual(@as(usize, 18), counting.allocations);
 }
 
 test "MCP search preserves exact identities and scopes authentication guidance" {
