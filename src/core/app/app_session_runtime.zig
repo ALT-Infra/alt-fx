@@ -5,6 +5,7 @@ const config_runtime = @import("../config/config_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
+const tool_admission = @import("../agent/runtime/tool_admission.zig");
 const tool_presentation = @import("../agent/runtime/tool_presentation.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
@@ -32,6 +33,7 @@ const result_store = @import("../session/result_store.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
 const command_output_content = @import("../tooling/command_output_content.zig");
 const captured_command = @import("../tooling/captured_command.zig");
+const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
 const session_log = @import("../session/session_log.zig");
 const session_resume_view = @import("../session/session_resume_view.zig");
@@ -3946,6 +3948,7 @@ pub fn Runtime(comptime App: type) type {
             );
             const context_deferred = types.isContextDeferredToolResult(result);
             const deferred = types.isDeferredToolResult(result);
+            const permission_denial_reason = tool_result_errors.toolPermissionDenialReason(result.output);
             const process_ran = result.command_process_presentation != null;
 
             var action_arena = std.heap.ArenaAllocator.init(app.alloc);
@@ -3959,6 +3962,14 @@ pub fn Runtime(comptime App: type) type {
                         types.context_deferred_tool_status_label
                     else
                         types.deferred_tool_result_output,
+                    &.{},
+                )
+            else if (permission_denial_reason) |reason|
+                try app.describeToolActionDeniedWithAdvertised(
+                    action_arena.allocator(),
+                    call,
+                    null,
+                    tool_admission.permissionDeniedStatusLabel(reason),
                     &.{},
                 )
             else if (result.status == .success or process_ran)
@@ -3981,7 +3992,7 @@ pub fn Runtime(comptime App: type) type {
 
             const outcome: types.ToolOutcomeKind = if (context_deferred)
                 .deferred
-            else if (deferred)
+            else if (deferred or permission_denial_reason != null)
                 .denied
             else if (result.status == .success or process_ran)
                 .completed
@@ -3992,7 +4003,7 @@ pub fn Runtime(comptime App: type) type {
                 outcome,
                 action,
             );
-            if (!is_command or deferred) {
+            if (!is_command or deferred or permission_denial_reason != null) {
                 try sink.attachHistoricalToolDetail(entry_id, call, result);
                 return;
             }
@@ -6565,6 +6576,69 @@ test "execution replay renders persisted permission feedback after its tool resu
     try std.testing.expectEqual(@as(usize, 1), app.cards.items.len);
     try std.testing.expectEqualStrings("Then read the file and report its exact contents.", app.cards.items[0].text);
     try std.testing.expect(app.cards.items[0].has_prior_turns);
+}
+
+test "execution replay preserves permission denial reasons" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+
+    const reasons = [_]types.ToolPermissionDenialReason{
+        .user_denied,
+        .auto_denied,
+        .policy_denied,
+        .permission_required,
+    };
+    const call_ids = [_][]const u8{
+        "call_user_denied",
+        "call_auto_denied",
+        "call_policy_denied",
+        "call_permission_required",
+    };
+    var outputs: [reasons.len][]u8 = undefined;
+    var allocated_outputs: usize = 0;
+    defer for (outputs[0..allocated_outputs]) |output| alloc.free(output);
+    var calls: [reasons.len]types.ToolCall = undefined;
+    var results: [reasons.len]types.PersistedToolResult = undefined;
+    for (reasons, 0..) |reason, index| {
+        outputs[index] = try tool_result_errors.toolPermissionDeniedJson(
+            alloc,
+            "run_command",
+            reason,
+        );
+        allocated_outputs += 1;
+        calls[index] = .{
+            .id = call_ids[index],
+            .name = "run_command",
+            .arguments_json = "{\"command\":\"pwd\"}",
+        };
+        results[index] = .{
+            .tool_call_id = @constCast(call_ids[index]),
+            .tool_name = @constCast("run_command"),
+            .status = .failure,
+            .output = outputs[index],
+            .output_bytes = outputs[index].len,
+            .stored_output_bytes = outputs[index].len,
+        };
+    }
+    var steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = calls[0..],
+        .tool_results = results[0..],
+    }};
+
+    try Runtime(TestApp).writeExecutionHistory(&app, .{ .tool_steps = steps[0..] });
+
+    try std.testing.expectEqualSlices(
+        types.ToolOutcomeKind,
+        &.{ .denied, .denied, .denied, .denied },
+        app.completed_tool_outcomes.items,
+    );
+    try std.testing.expectEqual(@as(usize, 4), app.completed_tool_statuses.items.len);
+    try std.testing.expectEqualStrings("● Denied run_command\n", app.completed_tool_statuses.items[0]);
+    try std.testing.expectEqualStrings("● Denied by auto agent run_command\n", app.completed_tool_statuses.items[1]);
+    try std.testing.expectEqualStrings("● Denied run_command\n", app.completed_tool_statuses.items[2]);
+    try std.testing.expectEqualStrings("● Permission required run_command\n", app.completed_tool_statuses.items[3]);
+    try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
 }
 
 test "execution replay writes completed status before saved command output" {

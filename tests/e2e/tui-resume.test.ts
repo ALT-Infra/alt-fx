@@ -4133,8 +4133,12 @@ test.skipIf(!tmuxAvailable())(
     function expectDeferredPresentation(scrollback: string): void {
       expect(scrollback).toContain("1 failed");
       expect(scrollback).toContain("1 deferred");
-      expect(scrollback).not.toContain("Context updated");
+      expect(scrollback).toContain(`Context updated ${command}`);
       expect(scrollback).not.toContain("Not executed");
+      expect(scrollback).not.toContain("├ terminal");
+      expect(scrollback).not.toContain("└ terminal");
+      expect(scrollback).not.toContain("├ read_file");
+      expect(scrollback).not.toContain("└ read_file");
       expect(scrollback).not.toContain("● Failed nested/input.txt");
       expect(scrollback).not.toContain(`● Failed ${command}`);
       expect(scrollback).toContain("Read nested/input.txt");
@@ -4185,7 +4189,7 @@ test.skipIf(!tmuxAvailable())(
       await active.sendKeys("C-o");
       const detail = await active.waitForPane(
         (pane) =>
-          pane.includes(`↻ Context updated ${command}`) &&
+          pane.includes(`Context updated ${command}`) &&
           pane.includes("ordinary-failure-control"),
         TIMEOUT,
       );

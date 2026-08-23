@@ -6476,7 +6476,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       expect(queuedGateway.requests).toHaveLength(2);
       expect(pane).toContain("● 1 tool call · 1 read · 1 failed");
-      expect(pane).toContain("└ Connection interrupted before read_file ran");
+      expect(pane).toContain("└ Connection interrupted before tool call ran");
       expect(pane).not.toContain("● Reading");
     },
     TIMEOUT,
