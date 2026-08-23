@@ -1453,7 +1453,12 @@ test "ephemeral command replay unlinks backing before publication and remains re
         return error.TestExpectedReplay;
     defer capture.releaseRetained(arena);
 
-    var entries = tmp.dir.iterate();
+    var inspect_dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), temp_path, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer inspect_dir.close(io_mod.getIo());
+    var entries = inspect_dir.iterate();
     try std.testing.expect(try entries.next(io_mod.getIo()) == null);
 
     var reader = try Reader.openEphemeralHandle(alloc, &store, descriptor.handle);
