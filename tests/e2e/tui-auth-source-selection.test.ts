@@ -2838,8 +2838,7 @@ test(
       }
       expect(readSingleUsageSnapshot(home)).toMatchObject({
         billing: "complete",
-        next_sequence: 1,
-        settled_through_sequence: 0,
+        api_duration_complete: true,
         pending: [],
       });
     } finally {
@@ -2899,8 +2898,7 @@ test(
       }
       expect(readSingleUsageSnapshot(home)).toMatchObject({
         billing: "complete",
-        next_sequence: 1,
-        settled_through_sequence: 0,
+        api_duration_complete: true,
         pending: [],
       });
     } finally {

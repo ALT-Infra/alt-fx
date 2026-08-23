@@ -1749,6 +1749,13 @@ fn streamCompletionPtr(result: *runtime_gateway_step.StreamResult) ?*types.Model
     };
 }
 
+fn retainCompletedResultInTurnArena(result: *runtime_gateway_step.StreamResult) void {
+    switch (result.*) {
+        .completed => |*completed| completed.ownership = .borrowed,
+        .failed => {},
+    }
+}
+
 fn isRetryableModelFailure(kind: agent_stream_provider.FailureKind) bool {
     return switch (kind) {
         .rate_limited, .server_error, .bad_gateway, .unavailable, .gateway_timeout => true,
@@ -4503,6 +4510,7 @@ fn processQueuedPromptLoop(
             successful_vision_route = vision_route;
             successful_vision_mode = vision_mode;
             successful_recovery_strategy = recovery_strategy;
+            retainCompletedResultInTurnArena(&stream_result);
             if (vision_mode != .required) configured_first_tool_choice_pending = false;
             break;
         }
