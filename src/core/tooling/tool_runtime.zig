@@ -187,6 +187,7 @@ pub const Context = struct {
     command_artifact_dir: ?[]const u8 = null,
     tool_result_dir: ?[]const u8 = null,
     session_child_capability: ?*session_child_store.SessionChildCapability = null,
+    ephemeral_command_replay: ?*command_replay_store.EphemeralStore = null,
     terminal_client: ?*terminal_client_runtime.Runtime = null,
     command_timeout_ms: ?usize = null,
     command_timeout_started_ms: ?i64 = null,
@@ -876,6 +877,7 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .max_tool_result_bytes = ctx.max_tool_result_bytes,
         .tool_result_dir = ctx.tool_result_dir,
         .session_child_capability = ctx.session_child_capability,
+        .ephemeral_command_replay = ctx.ephemeral_command_replay,
         .terminal_client = ctx.terminal_client,
         .terminal_owner_session_id = ctx.lifecycle_scope.session_id,
         .terminal_transport_role = switch (ctx.lifecycle_scope.kind) {
@@ -1170,6 +1172,34 @@ pub fn withAdvertisedDynamicToolNames(ctx: Context, advertised_dynamic_tool_name
     return copy;
 }
 
+const EffectiveCommandTimeout = struct {
+    timeout_ms: usize,
+    started_ms: i64,
+};
+
+fn effectiveCommandTimeout(
+    request_timeout_ms: u64,
+    ambient_timeout_ms: ?usize,
+    ambient_started_ms: ?i64,
+    now_ms: i64,
+) !EffectiveCommandTimeout {
+    const requested = std.math.cast(usize, request_timeout_ms) orelse
+        return error.InvalidToolArguments;
+    const ambient = ambient_timeout_ms orelse return .{
+        .timeout_ms = requested,
+        .started_ms = now_ms,
+    };
+    const ambient_started = ambient_started_ms orelse now_ms;
+    const elapsed: usize = if (now_ms <= ambient_started)
+        0
+    else
+        std.math.cast(usize, now_ms - ambient_started) orelse std.math.maxInt(usize);
+    return .{
+        .timeout_ms = @min(requested, ambient -| elapsed),
+        .started_ms = now_ms,
+    };
+}
+
 fn toolRunCommand(
     ctx: Context,
     arena: Allocator,
@@ -1185,8 +1215,17 @@ fn toolRunCommand(
         .target_os = builtin.os.tag,
         .environment = request.environment,
     };
-    const timeout_started_ms = ctx.command_timeout_started_ms orelse
-        if (ctx.command_timeout_ms != null) io_mod.milliTimestamp() else null;
+    const timeout = try effectiveCommandTimeout(
+        request.timeout_ms,
+        ctx.command_timeout_ms,
+        ctx.command_timeout_started_ms,
+        io_mod.milliTimestamp(),
+    );
+    const replay_required = ctx.session_child_capability != null or
+        ctx.ephemeral_command_replay != null;
+    const replay_enabled = ctx.interactive or
+        replay_required or
+        ctx.command_replay_capture != null;
 
     if (comptime builtin.os.tag == .wasi or builtin.is_test) {
         if (ctx.workspace_executor) |executor| {
@@ -1196,7 +1235,7 @@ fn toolRunCommand(
                 command_ctx,
                 authority,
                 executor,
-                ctx.command_timeout_ms,
+                timeout.timeout_ms,
             );
         }
     }
@@ -1215,12 +1254,14 @@ fn toolRunCommand(
     );
     if (compatibility_result) |compatibility| {
         if (route != .approved_shell) return error.CommandAdmissionChanged;
-        const intercepted_replay = initCommandReplayCapture(
+        const intercepted_replay = try initCommandReplayCapture(
             arena,
-            ctx.interactive,
+            replay_enabled,
+            replay_required,
             ctx.max_command_output_bytes,
             ctx.max_command_output_bytes,
             ctx.session_child_capability,
+            ctx.ephemeral_command_replay,
             ctx.command_replay_capture,
             ctx.command_replay_unavailable,
         );
@@ -1232,22 +1273,43 @@ fn toolRunCommand(
         var callback = CommandReplayCaptureCallback{
             .alloc = arena,
             .capture = capture,
+            .required = replay_required,
         };
         const output = switch (compatibility) {
             .success => |body| body,
             .failure => |body| body,
         };
-        if (compatibility == .success and ctx.interactive and output.len > 0) {
-            try callback.accept(
+        if (compatibility == .success and capture != null and output.len > 0) {
+            callback.accept(
                 ctx.output_chunk_lifecycle_id,
                 .stdout,
                 output,
-            );
+            ) catch |err| {
+                if (err != error.CommandOutputCaptureFailed) return err;
+                return finishCommandToolResult(
+                    capture,
+                    false,
+                    &transferred,
+                    null,
+                    try command_result_mapping.Foreground.outputCaptureFailure(arena),
+                );
+            };
+        }
+        if (compatibility == .success and ctx.interactive and output.len > 0) {
             try ctx.on_output_chunk(
                 ctx.output_chunk_ctx,
                 ctx.output_chunk_lifecycle_id,
                 .stdout,
                 output,
+            );
+        }
+        if (try requiredCaptureFailure(arena, capture, replay_required)) |capture_failure| {
+            return finishCommandToolResult(
+                capture,
+                false,
+                &transferred,
+                null,
+                capture_failure,
             );
         }
         return finishCommandToolResult(
@@ -1266,15 +1328,17 @@ fn toolRunCommand(
         );
     }
 
-    const replay_init = initCommandReplayCapture(
+    const replay_init = try initCommandReplayCapture(
         arena,
-        ctx.interactive,
+        replay_enabled,
+        replay_required,
         ctx.max_command_output_bytes,
         execution_router.foregroundResultComparisonLimit(
             route,
             ctx.max_command_output_bytes,
         ),
         ctx.session_child_capability,
+        ctx.ephemeral_command_replay,
         ctx.command_replay_capture,
         ctx.command_replay_unavailable,
     );
@@ -1286,6 +1350,7 @@ fn toolRunCommand(
     var replay_callback = CommandReplayCaptureCallback{
         .alloc = arena,
         .capture = replay_capture,
+        .required = replay_required,
     };
 
     const routed = execution_router.executePreparedRoute(.{
@@ -1294,34 +1359,69 @@ fn toolRunCommand(
         .output_chunk_lifecycle_id = ctx.output_chunk_lifecycle_id,
         .output_chunk_ctx = ctx.output_chunk_ctx,
         .on_output_chunk = ctx.on_output_chunk,
-        .accepted_output_chunk_ctx = if (ctx.interactive) @ptrCast(&replay_callback) else null,
-        .on_accepted_output_chunk = if (ctx.interactive) CommandReplayCaptureCallback.onChunk else null,
+        .accepted_output_chunk_ctx = if (replay_capture != null) @ptrCast(&replay_callback) else null,
+        .on_accepted_output_chunk = if (replay_capture != null) CommandReplayCaptureCallback.onChunk else null,
         .callback_projection = if (ctx.interactive) .raw else .model_safe,
-        .timeout_ms = ctx.command_timeout_ms,
-        .timeout_started_ms = timeout_started_ms,
+        .timeout_ms = timeout.timeout_ms,
+        .timeout_started_ms = timeout.started_ms,
         .command_artifact_capability = ctx.session_child_capability,
         .command_artifact_dir = ctx.command_artifact_dir,
     }, arena, route) catch |err| {
-        if (err == error.TimeoutExpired) return finishCommandToolResult(
+        if (err == error.TimeoutExpired) {
+            if (try requiredCaptureFailure(arena, replay_capture, replay_required)) |capture_failure| {
+                return finishCommandToolResult(
+                    replay_capture,
+                    false,
+                    &replay_transferred,
+                    null,
+                    capture_failure,
+                );
+            }
+            return finishCommandToolResult(
+                replay_capture,
+                replay_init.unavailable and
+                    (ctx.command_replay_unavailable or replay_callback.had_accepted_output),
+                &replay_transferred,
+                null,
+                try command_result_mapping.Foreground.timeoutFailure(
+                    arena,
+                    command,
+                    cwd,
+                    timeout.timeout_ms,
+                    timeout.started_ms,
+                ),
+            );
+        }
+        if (err == error.CommandOutputCaptureFailed) return finishCommandToolResult(
             replay_capture,
-            replay_init.unavailable and
-                (ctx.command_replay_unavailable or replay_callback.had_accepted_output),
+            false,
             &replay_transferred,
             null,
-            try command_result_mapping.Foreground.timeoutFailure(
-                arena,
-                command,
-                cwd,
-                ctx.command_timeout_ms,
-                timeout_started_ms,
-            ),
+            try command_result_mapping.Foreground.outputCaptureFailure(arena),
         );
         return err;
     };
     const result = routed.result;
 
+    if (try requiredCaptureFailure(arena, replay_capture, replay_required)) |capture_failure| {
+        return finishCommandToolResult(
+            replay_capture,
+            false,
+            &replay_transferred,
+            result,
+            capture_failure,
+        );
+    }
+
     if (try command_result_mapping.Foreground.cancelledFailure(arena, result)) |cancelled| {
-        return cancelled;
+        return finishCommandToolResult(
+            replay_capture,
+            replay_init.unavailable and
+                (ctx.command_replay_unavailable or replay_callback.had_accepted_output),
+            &replay_transferred,
+            result,
+            cancelled,
+        );
     }
 
     if (try command_result_mapping.Foreground.nonZeroFailure(arena, result)) |failure| {
@@ -1423,6 +1523,7 @@ fn executeWorkspaceRunCommand(
 const CommandReplayCaptureCallback = struct {
     alloc: Allocator,
     capture: ?*command_replay_store.Capture,
+    required: bool,
     had_accepted_output: bool = false,
 
     fn onChunk(
@@ -1445,7 +1546,11 @@ const CommandReplayCaptureCallback = struct {
         if (chunk.len == 0) return;
         self.had_accepted_output = true;
         if (self.capture) |capture| {
-            capture.appendAccepted(self.alloc, stream, chunk);
+            if (self.required) {
+                try capture.appendAcceptedRequired(self.alloc, stream, chunk);
+            } else {
+                capture.appendAccepted(self.alloc, stream, chunk);
+            }
         }
     }
 };
@@ -1457,24 +1562,32 @@ const CommandReplayCaptureInit = struct {
 
 fn initCommandReplayCapture(
     arena: Allocator,
-    interactive: bool,
+    enabled: bool,
+    required: bool,
     inline_limit: usize,
     comparison_limit: usize,
     capability: ?*session_child_store.SessionChildCapability,
+    ephemeral_store: ?*command_replay_store.EphemeralStore,
     continued_capture: ?*command_replay_store.Capture,
     continued_unavailable: bool,
-) CommandReplayCaptureInit {
-    if (!interactive) return .{};
-    if (continued_unavailable) return .{ .unavailable = true };
+) !CommandReplayCaptureInit {
+    if (!enabled) return .{};
+    if (continued_unavailable) {
+        if (required) return error.CommandOutputCaptureFailed;
+        return .{ .unavailable = true };
+    }
     if (continued_capture) |capture| {
         capture.setComparisonLimit(comparison_limit);
         return .{ .capture = capture };
     }
-    const capture = command_replay_store.Capture.create(
-        arena,
-        inline_limit,
-        capability,
-    ) catch |err| {
+    const capture_inline_limit = if (required) 0 else inline_limit;
+    const capture = (if (capability) |saved|
+        command_replay_store.Capture.create(arena, capture_inline_limit, saved)
+    else if (ephemeral_store) |ephemeral|
+        command_replay_store.Capture.createEphemeral(arena, capture_inline_limit, ephemeral)
+    else
+        command_replay_store.Capture.create(arena, capture_inline_limit, null)) catch |err| {
+        if (required) return err;
         debug_trace.logf(
             "session",
             "command replay capture initialization unavailable err={s}",
@@ -1484,6 +1597,22 @@ fn initCommandReplayCapture(
     };
     capture.setComparisonLimit(comparison_limit);
     return .{ .capture = capture };
+}
+
+fn requiredCaptureFailure(
+    arena: Allocator,
+    capture: ?*command_replay_store.Capture,
+    required: bool,
+) !?ToolExecutionResult {
+    if (!required) return null;
+    const candidate = capture orelse {
+        return @as(?ToolExecutionResult, try command_result_mapping.Foreground.outputCaptureFailure(arena));
+    };
+    candidate.sealRequired(arena) catch return @as(
+        ?ToolExecutionResult,
+        try command_result_mapping.Foreground.outputCaptureFailure(arena),
+    );
+    return null;
 }
 
 fn finishCommandToolResult(
@@ -2024,7 +2153,7 @@ const test_context_registry = context_contract.Registry{ .default_provider = .{
 } };
 
 const test_review_calls = [_]ToolCall{
-    .{ .id = "test-review", .name = "terminal", .arguments_json = "{\"action\":\"exec\",\"command\":\"printf test\"}" },
+    .{ .id = "test-review", .name = "terminal", .arguments_json = "{\"action\":\"exec\",\"command\":\"printf test\",\"timeout_ms\":600000}" },
 };
 const test_review_root_messages = [_][]const u8{"test root request"};
 
@@ -2071,6 +2200,7 @@ const TestRuntime = struct {
     context_limits: context_limits.Values = .{},
     command_artifact_dir: ?[]const u8 = null,
     session_child_capability: ?*session_child_store.SessionChildCapability = null,
+    ephemeral_command_replay: ?*command_replay_store.EphemeralStore = null,
     command_timeout_ms: ?usize = null,
     interactive: bool = true,
     mcp_ctx: ?*anyopaque = null,
@@ -2145,6 +2275,7 @@ const TestRuntime = struct {
             .on_background_url_ready = noopBackgroundReady,
             .command_artifact_dir = self.command_artifact_dir,
             .session_child_capability = self.session_child_capability,
+            .ephemeral_command_replay = self.ephemeral_command_replay,
             .command_timeout_ms = self.command_timeout_ms,
             .tracker = self.tracker,
             .mcp_ctx = self.mcp_ctx,
@@ -3180,7 +3311,7 @@ fn runCommandArgsForTest(alloc: Allocator, command: []const u8) ![]u8 {
     defer out.deinit();
     try out.writer.writeAll("{\"action\":\"exec\",\"command\":");
     try std.json.Stringify.value(command, .{}, &out.writer);
-    try out.writer.writeByte('}');
+    try out.writer.writeAll(",\"timeout_ms\":600000}");
     return out.toOwnedSlice();
 }
 
@@ -3189,7 +3320,7 @@ fn runCommandArgsWithCleanProfileForTest(alloc: Allocator, command: []const u8) 
     defer out.deinit();
     try out.writer.writeAll("{\"action\":\"exec\",\"command\":");
     try std.json.Stringify.value(command, .{}, &out.writer);
-    try out.writer.writeAll(",\"profile\":\"clean\"}");
+    try out.writer.writeAll(",\"profile\":\"clean\",\"timeout_ms\":600000}");
     return out.toOwnedSlice();
 }
 
@@ -3225,6 +3356,7 @@ fn terminalExecCallForTest(arena: Allocator, call: ToolCall) !ToolCall {
     );
     if (args != .object) return error.InvalidToolArguments;
     try args.object.put(arena, "action", .{ .string = "exec" });
+    try args.object.put(arena, "timeout_ms", .{ .integer = 600_000 });
     var out: std.Io.Writer.Allocating = .init(arena);
     defer out.deinit();
     try std.json.Stringify.value(args, .{}, &out.writer);
@@ -3244,7 +3376,7 @@ test "registered terminal exec preserves invalid execution authority error" {
     const call = ToolCall{
         .id = "invalid-authority",
         .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf should-not-run\"}",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf should-not-run\",\"timeout_ms\":600000}",
     };
 
     try std.testing.expectError(
@@ -3273,6 +3405,7 @@ test "captured command compatibility bypasses compound commands" {
         .command = "fx-compatibility-probe; printf shell-fallback",
         .resolved_cwd = "/tmp",
         .environment = .legacy,
+        .timeout_ms = 600_000,
     })) == null);
 
     for ([_]command_environment.Environment{
@@ -3286,6 +3419,7 @@ test "captured command compatibility bypasses compound commands" {
                 .command = "fx-compatibility-probe",
                 .resolved_cwd = "/tmp",
                 .environment = environment,
+                .timeout_ms = 600_000,
             },
         )) == null);
     }
@@ -3307,6 +3441,7 @@ test "run command compatibility returns installer failure without shell fallback
             .command = "fx-compatibility-probe",
             .resolved_cwd = "/tmp",
             .environment = .legacy,
+            .timeout_ms = 600_000,
         },
     )) orelse return error.TestExpectedEqual;
 
@@ -4163,7 +4298,7 @@ test "terminal exec execution uses supplied registry entry" {
     const call = ToolCall{
         .id = "run-command-registry",
         .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf bypassed\"}",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf bypassed\",\"timeout_ms\":600000}",
     };
 
     var rt = TestRuntime{ .tool_registry = registry };
@@ -6009,6 +6144,210 @@ test "request tool permission checks copy and rename destinations" {
     try std.testing.expect(absolutePathExists(try std.fs.path.join(arena, &.{ root, "src/source.txt" })));
 }
 
+test "effective command timeout uses the earlier remaining budget" {
+    try std.testing.expectEqual(
+        EffectiveCommandTimeout{ .timeout_ms = 5000, .started_ms = 700 },
+        try effectiveCommandTimeout(5000, null, null, 700),
+    );
+    try std.testing.expectEqual(
+        EffectiveCommandTimeout{ .timeout_ms = 700, .started_ms = 400 },
+        try effectiveCommandTimeout(5000, 1000, 100, 400),
+    );
+    try std.testing.expectEqual(
+        EffectiveCommandTimeout{ .timeout_ms = 100, .started_ms = 400 },
+        try effectiveCommandTimeout(100, 5000, 100, 400),
+    );
+    try std.testing.expectEqual(
+        EffectiveCommandTimeout{ .timeout_ms = 0, .started_ms = 1200 },
+        try effectiveCommandTimeout(5000, 1000, 100, 1200),
+    );
+}
+
+test "terminal exec request timeout reaches execution without an ambient timeout" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var rt = TestRuntime{};
+    defer rt.deinit(alloc);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const result = try executeTestRunCommand(rt.context(), arena, .{
+        .id = "request-timeout",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"sleep 1\",\"profile\":\"clean\",\"timeout_ms\":25}",
+    });
+
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
+    try expectContains(result.model_output, "timeout=true\n");
+    try expectContains(result.model_output, "timeout_ms=25\n");
+    const structured = result.command_result_json orelse return error.TestExpectedEqual;
+    try expectCommandResultBool(structured, "timed_out", true);
+}
+
+test "saved noninteractive terminal exec captures replay by capability" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(
+        io_mod.getIo(),
+        "session",
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer session_dir.close(io_mod.getIo());
+    const session_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "session");
+    defer alloc.free(session_path);
+    var capability = try session_child_store.SessionChildCapability.initForTesting(
+        alloc,
+        session_dir,
+        session_path,
+        .writable,
+        .{},
+    );
+    defer capability.deinit();
+
+    var rt = TestRuntime{
+        .interactive = false,
+        .session_child_capability = &capability,
+    };
+    defer rt.deinit(alloc);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+
+    const result = try executeTestRunCommand(rt.context(), arena_state.allocator(), .{
+        .id = "saved-noninteractive",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf replay\",\"profile\":\"clean\",\"timeout_ms\":600000}",
+    });
+    defer if (result.command_replay_capture) |capture| capture.abort(arena_state.allocator());
+
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
+    try std.testing.expect(result.command_replay_capture != null);
+}
+
+test "no-save terminal exec publishes one readable ephemeral replay" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const runtime_execution_memory = @import("../agent/runtime/execution_memory.zig");
+    const read_tool_result = @import("../../tools/session/read_tool_result.zig");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const temp_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(temp_path);
+    var store = command_replay_store.EphemeralStore.initForTesting(alloc, temp_path);
+    defer store.deinit();
+    var rt = TestRuntime{
+        .interactive = false,
+        .ephemeral_command_replay = &store,
+    };
+    defer rt.deinit(alloc);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const tool_call = ToolCall{
+        .id = "no-save-replay",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf ephemeral-needle\",\"profile\":\"clean\",\"timeout_ms\":600000}",
+    };
+
+    const result = try executeTestRunCommand(rt.context(), arena, tool_call);
+    const capture = result.command_replay_capture orelse return error.TestExpectedReplay;
+    var handed_off = false;
+    defer if (!handed_off) capture.discard(arena);
+    var cancel = std.atomic.Value(bool).init(false);
+    var prepared = try runtime_execution_memory.prepareToolModelOutput(
+        arena,
+        .{
+            .system_prompt = "",
+            .gateway_retry_count = 0,
+            .gateway_chat_url = "",
+            .agent_step_limit = 1,
+            .cancel_flag = &cancel,
+            .ephemeral_command_replay = &store,
+        },
+        tool_call,
+        result.model_output,
+    );
+    try std.testing.expect(prepared.memory.output_handle == null);
+    try runtime_execution_memory.finalizeCommandReplay(
+        arena,
+        tool_call,
+        &prepared,
+        null,
+        capture,
+    );
+    const replay = prepared.memory.command_output_replay orelse
+        return error.TestExpectedReplay;
+    const descriptor = switch (replay) {
+        .available => |value| value,
+        .unavailable => return error.TestExpectedReplay,
+    };
+    try std.testing.expect(std.mem.find(u8, prepared.model_output, descriptor.handle) != null);
+    const read_arguments = try std.fmt.allocPrint(
+        arena,
+        "{{\"handle\":\"{s}\",\"start_byte\":1,\"byte_count\":4096}}",
+        .{descriptor.handle},
+    );
+    const read_ctx = tool_dispatch.DispatchContext{
+        .allocator = arena,
+        .ephemeral_command_replay = &store,
+    };
+    const decoded = try read_tool_result.decode(read_ctx, read_arguments);
+    const read_input = switch (decoded) {
+        .input => |value| value,
+        .failure => return error.TestUnexpectedDecodeFailure,
+    };
+    defer read_input.deinit(arena);
+    const read_result = try read_tool_result.call(read_ctx, read_input);
+    defer read_result.deinit(arena);
+    switch (read_result) {
+        .success => |page| try expectContains(page, "ephemeral-needle"),
+        .failure => return error.TestExpectedReplay,
+    }
+    capture.releaseRetained(arena);
+    handed_off = true;
+
+    var entries = tmp.dir.iterate();
+    try std.testing.expect(try entries.next(io_mod.getIo()) == null);
+}
+
+test "required replay spill failure returns recoverable capture failure" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var store = command_replay_store.EphemeralStore.initForTesting(
+        alloc,
+        "/definitely/missing/fx-replay-dir",
+    );
+    defer store.deinit();
+    var rt = TestRuntime{
+        .interactive = false,
+        .ephemeral_command_replay = &store,
+        .max_command_output_bytes = 1,
+    };
+    defer rt.deinit(alloc);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+
+    const result = try executeTestRunCommand(rt.context(), arena_state.allocator(), .{
+        .id = "capture-failure",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf xx\",\"profile\":\"clean\",\"timeout_ms\":600000}",
+    });
+    defer if (result.command_replay_capture) |capture| capture.abort(arena_state.allocator());
+
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
+    try expectContains(result.model_output, "\"output_capture_failed\":true");
+}
+
 test "run_command timeout returns model-visible failure" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
 
@@ -6048,7 +6387,7 @@ test "run_command timeout returns model-visible failure" {
     const tool_call: ToolCall = .{
         .id = "cmd",
         .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf 'PRE-TIMEOUT-OUT\\n'; printf 'PRE-TIMEOUT-ERR\\n' >&2; sleep 5\",\"profile\":\"clean\"}",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf 'PRE-TIMEOUT-OUT\\n'; printf 'PRE-TIMEOUT-ERR\\n' >&2; sleep 5\",\"profile\":\"clean\",\"timeout_ms\":5000}",
     };
 
     const result = try executeTestRunCommand(rt.context(), arena, tool_call);
@@ -6113,7 +6452,7 @@ test "run_command timeout returns model-visible failure" {
     );
     var replay_finalized = false;
     defer if (!replay_finalized) capture.abort(arena);
-    runtime_execution_memory.finalizeCommandReplay(
+    try runtime_execution_memory.finalizeCommandReplay(
         arena,
         tool_call,
         &prepared,
@@ -6215,11 +6554,13 @@ test "interactive command replay capture allocation fails open" {
         std.testing.allocator,
         .{ .fail_index = 0 },
     );
-    const init = initCommandReplayCapture(
+    const init = try initCommandReplayCapture(
         failing.allocator(),
         true,
+        false,
         64 * 1024,
         64 * 1024,
+        null,
         null,
         null,
         false,
@@ -6230,6 +6571,7 @@ test "interactive command replay capture allocation fails open" {
     var callback = CommandReplayCaptureCallback{
         .alloc = std.testing.allocator,
         .capture = null,
+        .required = false,
     };
     try CommandReplayCaptureCallback.onChunk(
         @ptrCast(&callback),
@@ -6393,7 +6735,7 @@ test "run_command success exposes structured foreground metadata" {
     const result = try executeTestRunCommand(rt.context(), arena_state.allocator(), .{
         .id = "cmd",
         .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf '\\\\150\\\\145\\\\154\\\\154\\\\157'\"}",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf '\\\\150\\\\145\\\\154\\\\154\\\\157'\",\"timeout_ms\":600000}",
     });
 
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
@@ -6575,7 +6917,7 @@ test "run_command propagates output callback failure" {
         executeTestRunCommand(ctx, arena_state.allocator(), .{
             .id = "cmd",
             .name = "terminal",
-            .arguments_json = "{\"action\":\"exec\",\"command\":\"printf 'handoff\\\\n'\"}",
+            .arguments_json = "{\"action\":\"exec\",\"command\":\"printf 'handoff\\\\n'\",\"timeout_ms\":600000}",
         }),
     );
 }
@@ -6594,7 +6936,7 @@ test "run_command returns model output and structured metadata" {
     const result = try executeTestRunCommand(rt.context(), arena_state.allocator(), .{
         .id = "cmd",
         .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf 'quiet-stdout\\\\n'; printf 'quiet-stderr\\\\n' >&2\"}",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf 'quiet-stdout\\\\n'; printf 'quiet-stderr\\\\n' >&2\",\"timeout_ms\":600000}",
     });
 
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
@@ -6625,7 +6967,7 @@ test "run_command nonzero exit returns structured masked failure" {
     const result = try executeTestRunCommand(rt.context(), arena_state.allocator(), .{
         .id = "cmd",
         .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf 'bad AKIA0123456789ABCDEF\\\\n' >&2; exit 7\"}",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf 'bad AKIA0123456789ABCDEF\\\\n' >&2; exit 7\",\"timeout_ms\":600000}",
     });
 
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
@@ -6677,7 +7019,7 @@ test "run_command huge output exposes truncation and artifact paths without stdo
     const result = try executeTestRunCommand(rt.context(), arena_state.allocator(), .{
         .id = "cmd",
         .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf %026d 0\"}",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf %026d 0\",\"timeout_ms\":600000}",
     });
 
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);

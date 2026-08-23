@@ -99,6 +99,21 @@ pub const Foreground = struct {
             } }).toJson(arena),
         };
     }
+
+    pub fn outputCaptureFailure(arena: Allocator) !ToolExecutionResult {
+        const details = [_]tool_result_errors.Detail{
+            .{ .name = "output_capture_failed", .value = .{ .boolean = true } },
+        };
+        return .{
+            .status = .failure,
+            .model_output = try tool_result_errors.toolExecutionFailureJson(arena, .{
+                .tool_name = "terminal",
+                .message = "Command output could not be retained",
+                .details = &details,
+                .suggestion = "Do not retry unchanged. Inspect available command evidence, free storage if needed, or explain that complete output capture failed.",
+            }),
+        };
+    }
 };
 
 pub const Background = struct {
@@ -382,6 +397,15 @@ test "command result mapping preserves timeout JSON" {
         timeout.model_output,
     );
     try expectContains(timeout.command_result_json.?, "\"timed_out\":true");
+}
+
+test "foreground output capture failure is structured and recoverable" {
+    const result = try Foreground.outputCaptureFailure(std.testing.allocator);
+    defer std.testing.allocator.free(@constCast(result.model_output));
+
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
+    try expectContains(result.model_output, "\"output_capture_failed\":true");
+    try expectContains(result.model_output, "Command output could not be retained");
 }
 
 test "command result mapping projects background reuse output and JSON" {

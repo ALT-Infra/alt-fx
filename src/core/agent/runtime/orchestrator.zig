@@ -20,6 +20,7 @@ const credentials = @import("../../auth/credentials.zig");
 const credential_authority = @import("../../auth/credential_authority.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
 const model_tool_schema = @import("../../tooling/model_tool_schema.zig");
+const command_result_mapping = @import("../../tooling/command_result_mapping.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
 const tooling_tool_admission = @import("../../tooling/tool_admission.zig");
 const hooks = @import("../../hooks/hooks.zig");
@@ -6756,7 +6757,21 @@ fn processQueuedPromptLoop(
                 &prepared,
                 config.session_child_capability,
                 execution.command_replay_capture,
-            );
+            ) catch |err| switch (err) {
+                error.CommandOutputCaptureFailed => {
+                    const capture_failure = try command_result_mapping.Foreground.outputCaptureFailure(arena);
+                    execution.status = .failure;
+                    execution.model_output = capture_failure.model_output;
+                    prepared.model_output = capture_failure.model_output;
+                    prepared.memory.command_output_replay = .unavailable;
+                    if (execution.command_replay_capture) |capture| {
+                        capture.discard(arena);
+                        execution.command_replay_capture = null;
+                    }
+                    replay_handed_off = true;
+                },
+                else => return err,
+            };
             const safe_tool_output = prepared.model_output;
             try runtime_tool_presentation.finishExecutedToolStatus(
                 deps,
