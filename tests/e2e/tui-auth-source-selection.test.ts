@@ -1034,7 +1034,9 @@ tmuxTest(
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/login");
-    await session.waitForText("Sign in with Codex", TIMEOUT);
+    await session.waitForText("Connections", TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForText("Vercel account", TIMEOUT);
     await session.sendKeys("Enter");
     const signInScreen = await session.waitForPane(
       (pane) =>
@@ -1077,7 +1079,9 @@ tmuxTest(
     );
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/login");
-    await session.waitForText("Sign in with Codex", TIMEOUT);
+    await session.waitForText("Connections", TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForText("Codex subscription", TIMEOUT);
     await session.sendKeys("Down");
     await session.sendKeys("Enter");
     const signInScreen = await session.waitForPane(
@@ -1293,7 +1297,9 @@ tmuxTest(
     );
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/login");
-    await session.waitForText("Sign in with Codex", TIMEOUT);
+    await session.waitForText("Connections", TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForText("Codex subscription", TIMEOUT);
     await session.sendKeys("Down");
     await session.sendKeys("Enter");
     await completeDisplayedCodexLogin(session, chatgptOauth);
@@ -1368,20 +1374,22 @@ tmuxTest(
     const root = await session.waitForPane(
       (pane) =>
         pane.includes("Setup") &&
-        pane.includes("Sign in with Vercel") &&
-        pane.includes("Sign in with Codex") &&
-        pane.includes("Sign in with Grok") &&
-        pane.includes("API key") &&
-        pane.includes("Switch provider"),
+        pane.includes("Connections") &&
+        pane.includes("Model provider") &&
+        pane.includes("Vercel team") &&
+        pane.includes("Credential source"),
       TIMEOUT,
     );
-    expect(root).not.toContain("AI_GATEWAY_API_KEY");
+    expect(root).toContain("AI_GATEWAY_API_KEY");
     expect(root).not.toContain("fx login");
+    expect(root).not.toContain("Vercel account");
 
+    await session.sendKeys("Enter");
+    await session.waitForText("Vercel account", TIMEOUT);
     await session.sendKeys("Enter");
     await session.waitForText("Enter reopens browser · Esc cancels", TIMEOUT);
     await session.sendKeys("Escape");
-    await session.waitForText("Setup", TIMEOUT);
+    await session.waitForText("Connections", TIMEOUT);
 
     await session.sendKeys("Down");
     await session.sendKeys("Down");
@@ -1390,23 +1398,31 @@ tmuxTest(
     const apiKey = await session.waitForText("Paste your AI Gateway API key", TIMEOUT);
     expect(apiKey).toContain("Saves to");
     await session.sendKeys("Escape");
-    await session.waitForText("Setup", TIMEOUT);
-
-    await session.sendKeys("Down");
-    await session.sendKeys("Enter");
-    await session.waitForText("Switch provider", TIMEOUT);
+    await session.waitForText("Connections", TIMEOUT);
     await session.sendKeys("Escape");
     await session.waitForText("Setup", TIMEOUT);
 
     await session.sendKeys("Down");
     await session.sendKeys("Enter");
-    await session.waitForText("Choose a Vercel team", TIMEOUT);
+    await session.waitForPane(
+      (pane) => pane.includes("Model provider") && pane.includes("Grok subscription"),
+      TIMEOUT,
+    );
     await session.sendKeys("Escape");
-    await session.waitForText("Switch credential", TIMEOUT);
+    await session.waitForText("Setup", TIMEOUT);
 
     await session.sendKeys("Down");
     await session.sendKeys("Enter");
-    const sources = await session.waitForText("Use this credential", TIMEOUT);
+    await session.waitForText("Vercel team · Search:", TIMEOUT);
+    await session.sendKeys("Escape");
+    await session.waitForText("Credential source", TIMEOUT);
+
+    await session.sendKeys("Down");
+    await session.sendKeys("Enter");
+    const sources = await session.waitForPane(
+      (pane) => pane.includes("Credential source") && pane.includes("Automatic"),
+      TIMEOUT,
+    );
     expect(sources).toContain("AI_GATEWAY_API_KEY");
     expect(sources).toContain("fx login");
     await session.sendKeys("Escape");
@@ -1472,21 +1488,23 @@ async function waitForTrace(tracePath: string, needle: string): Promise<void> {
 }
 
 async function enterSwitchCredential(pickerSession: TmuxSession): Promise<void> {
-  for (let index = 0; index < 6; index += 1) {
-    await pickerSession.sendKeys("Down");
-  }
+  await pickerSession.sendKeys("Up");
   await pickerSession.sendKeys("Enter");
-  await pickerSession.waitForText("Use this credential", TIMEOUT);
+  await pickerSession.waitForPane(
+    (pane) => pane.includes("Credential source") && pane.includes("Automatic"),
+    TIMEOUT,
+  );
 }
 
 async function openProviderPicker(pickerSession: TmuxSession): Promise<void> {
   await pickerSession.sendText("/setup");
   await pickerSession.waitForText("Setup", TIMEOUT);
-  for (let index = 0; index < 4; index += 1) {
-    await pickerSession.sendKeys("Down");
-  }
+  await pickerSession.sendKeys("Down");
   await pickerSession.sendKeys("Enter");
-  await pickerSession.waitForText("Switch provider", TIMEOUT);
+  await pickerSession.waitForPane(
+    (pane) => pane.includes("Model provider") && pane.includes("Grok subscription"),
+    TIMEOUT,
+  );
 }
 
 async function openSwitchCredential(pickerSession: TmuxSession): Promise<void> {
@@ -1572,7 +1590,9 @@ tmuxTest(
     await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
 
     await session.sendText("/login");
-    await session.waitForText("Sign in with Codex", TIMEOUT);
+    await session.waitForText("Connections", TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForText("Vercel account", TIMEOUT);
     await session.sendKeys("Enter");
     await session.waitForText("Signed in to Vercel", TIMEOUT);
     await session.sendText("/status");
@@ -1648,7 +1668,7 @@ tmuxTest(
     await session.sendKeys("Down");
     await session.sendKeys("Down");
     await session.sendKeys("Enter");
-    await session.waitForText("Choose a Vercel team", TIMEOUT);
+    await session.waitForText("Vercel team · Search:", TIMEOUT);
     await session.sendKeys("Enter");
     await session.waitForText("Changed Vercel team to Vercel Labs", TIMEOUT);
     await session.sendText("/status");
@@ -1742,7 +1762,9 @@ tmuxTest(
     expect(gateway.requests[2].headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
 
     await session.sendText("/login");
-    await session.waitForText("Sign in with Codex", TIMEOUT);
+    await session.waitForText("Connections", TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForText("Vercel account", TIMEOUT);
     await session.sendKeys("Enter");
     const loginCompleted = await session.waitForText("Signed in to Vercel", TIMEOUT);
     expect(loginCompleted).not.toContain("Setup");
@@ -1865,9 +1887,11 @@ tmuxTest(
     expect(gateway.modelRequests[0].headers.get("authorization")).toBeNull();
 
     await session.sendText("/login");
-    await session.waitForText("Sign in with Codex", TIMEOUT);
+    await session.waitForText("Connections", TIMEOUT);
     await session.sendKeys("Enter");
-    await session.waitForText("Choose a Vercel team", TIMEOUT);
+    await session.waitForText("Vercel account", TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForText("Vercel team · Search:", TIMEOUT);
     await session.resizeWindow(80, 5);
     await session.sendLiteralText("example");
     await session.waitForPane((pane) => pane.includes("Search: example"), TIMEOUT);
@@ -1884,7 +1908,7 @@ tmuxTest(
     await session.resizeWindow(80, 24);
     await session.waitForPane(
       (pane) =>
-        pane.includes("Choose a Vercel team") &&
+        pane.includes("Vercel team · Search:") &&
         pane.includes("Search: example") &&
         pane.includes("Example Internal Team") &&
         !pane.includes("Other Team"),
@@ -2362,7 +2386,9 @@ tmuxTest(
       await session.waitForText("auto ·", TIMEOUT);
 
       await session.sendText("/login");
-      await session.waitForText("Sign in with Grok", TIMEOUT);
+      await session.waitForText("Connections", TIMEOUT);
+      await session.sendKeys("Enter");
+      await session.waitForText("Grok subscription", TIMEOUT);
       await session.sendKeys("Down");
       await session.sendKeys("Down");
       await session.sendKeys("Enter");
@@ -3103,7 +3129,7 @@ tmuxTest(
     await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
     await openSwitchCredential(session);
     const inventory = await session.waitForPane(
-      (pane) => pane.includes("AI_GATEWAY_API_KEY") && pane.includes("Use this credential"),
+      (pane) => pane.includes("AI_GATEWAY_API_KEY") && pane.includes("Automatic"),
       TIMEOUT,
     );
     expect(inventory).not.toMatch(/^\s+fx login\s+(?:current|available)\s*$/m);
@@ -3263,16 +3289,17 @@ tmuxTest(
     const inventory = await session.waitForPane(
       (pane) =>
         pane.includes("Setup") &&
-        pane.includes("Sign in with Vercel") &&
-        pane.includes("Sign in with Grok") &&
-        pane.includes("API key") &&
-        pane.includes("Switch provider"),
+        pane.includes("Connections") &&
+        pane.includes("Vercel account") &&
+        pane.includes("Grok subscription") &&
+        pane.includes("AI Gateway API key") &&
+        pane.includes("Model provider"),
       TIMEOUT,
     );
     expect(inventory).not.toMatch(/^\s+fx login\s+/m);
     await session.sendKeys("Escape");
     await session.waitForPane(
-      (pane) => !pane.includes("   Setup"),
+      (pane) => !pane.includes("Connections") && !pane.includes("Routing"),
       TIMEOUT,
     );
 
@@ -3364,7 +3391,7 @@ tmuxTest(
         pane.includes("fx login credential refresh failed.") &&
         pane.includes("Choose another source below") &&
         pane.includes("Setup") &&
-        pane.includes("Switch provider"),
+        pane.includes("Model provider"),
       TIMEOUT,
     );
     expect(failed).toContain(`${promptHead}${promptTail}`);
@@ -3598,14 +3625,14 @@ tmuxTest(
       (pane) =>
         pane.includes(blockedPrompt) &&
         pane.includes("fx login credential refresh failed.") &&
-        pane.includes("Switch provider"),
+        pane.includes("Model provider"),
       TIMEOUT,
     );
     expect(gateway.requests).toHaveLength(0);
 
     await session.sendKeys("Escape");
     await session.waitForPane(
-      (pane) => pane.includes(blockedPrompt) && !pane.includes("   Setup"),
+      (pane) => pane.includes(blockedPrompt) && !pane.includes("Connections"),
       TIMEOUT,
     );
     await session.sendKeys("C-u");
@@ -3670,7 +3697,7 @@ tmuxTest(
       (pane) =>
         pane.includes(firstPrompt) &&
         pane.includes("fx login credential refresh failed.") &&
-        pane.includes("Switch provider"),
+        pane.includes("Model provider"),
       TIMEOUT,
     );
     expect(firstFailure).toContain("Choose another source below.");
@@ -3683,7 +3710,7 @@ tmuxTest(
 
     await session.sendKeys("Escape");
     await session.waitForPane(
-      (pane) => pane.includes(firstPrompt) && !pane.includes("   Setup"),
+      (pane) => pane.includes(firstPrompt) && !pane.includes("Connections"),
       TIMEOUT,
     );
     await session.sendKeys("C-u");
@@ -3705,7 +3732,7 @@ tmuxTest(
       (pane) =>
         pane.includes(secondPrompt) &&
         pane.includes("fx login credential refresh failed.") &&
-        pane.includes("Switch provider"),
+        pane.includes("Model provider"),
       TIMEOUT,
     );
     expect(gateway.requests).toHaveLength(0);

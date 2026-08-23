@@ -276,6 +276,7 @@ pub fn Runtime(comptime App: type) type {
                 .provider => |provider| try switchProvider(app, provider, true, .manual),
                 .source => |source| try applySourceChoice(app, source),
                 .action => |action| switch (action) {
+                    .connections => unreachable,
                     .login => try beginSignIn(app, true),
                     .chatgpt_login => try beginChatGptSignIn(app),
                     .grok_login => try beginGrokSignIn(app),
