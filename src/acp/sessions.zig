@@ -796,13 +796,18 @@ fn activateSession(
     };
     server.enableSubagentHost(state);
     state.active_session.?.session_rt.attachProfileUsagePublisher(state.alloc);
-    if (state.credential_source == .chatgpt_subscription or state.credential_source == .grok_subscription) {
+    if (state.cfg.provider_set.select(activation.provider).deferred_usage == null) {
         state.active_session.?.session_rt.usage.clearReconciliationCredential();
-    } else {
-        state.active_session.?.session_rt.usage.startReconciliation(
+    } else if (state.credential_source) |source| {
+        state.active_session.?.session_rt.usage.replaceProviderReconciliationCredential(
             state.alloc,
+            activation.provider,
+            source,
+            state.account_id,
             state.api_key,
         );
+    } else {
+        state.active_session.?.session_rt.usage.clearReconciliationCredential();
     }
     activateManagedBackground(state, store);
 }

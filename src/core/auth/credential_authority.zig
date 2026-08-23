@@ -14,39 +14,26 @@ pub const Identity = struct {
 pub fn derive(
     source: types.CredentialSource,
     account_id: ?[]const u8,
-    tenant: ?[]const u8,
-    secret: []const u8,
-) Identity {
+) ?Identity {
+    const account = account_id orelse return null;
+    if (account.len == 0) return null;
     var hash = Sha256.init(.{});
     hash.update("fx-credential-authority-v1\x00");
     hash.update(@tagName(source));
-    hash.update("\x00");
-    if (account_id) |account| {
-        hash.update("account\x00");
-        hash.update(account);
-    } else {
-        hash.update("credential\x00");
-        hash.update(secret);
-        if (tenant) |value| {
-            hash.update("\x00tenant\x00");
-            hash.update(value);
-        }
-    }
+    hash.update("\x00account\x00");
+    hash.update(account);
     var bytes: [Sha256.digest_length]u8 = undefined;
     hash.final(&bytes);
     return .{ .bytes = bytes };
 }
 
-test "credential authority prefers stable account identity and never stores the secret" {
-    const first = derive(.chatgpt_subscription, "acct_1", null, "token-a");
-    const refreshed = derive(.chatgpt_subscription, "acct_1", null, "token-b");
-    const other = derive(.chatgpt_subscription, "acct_2", null, "token-a");
+test "credential authority uses only stable account identity" {
+    const first = derive(.chatgpt_subscription, "acct_1").?;
+    const refreshed = derive(.chatgpt_subscription, "acct_1").?;
+    const other = derive(.chatgpt_subscription, "acct_2").?;
     try std.testing.expect(first.eql(refreshed));
     try std.testing.expect(!first.eql(other));
-
-    const key_a = derive(.ai_gateway_api_key, null, null, "secret-a");
-    const key_b = derive(.ai_gateway_api_key, null, null, "secret-b");
-    try std.testing.expect(!key_a.eql(key_b));
+    try std.testing.expect(derive(.ai_gateway_api_key, null) == null);
     try std.testing.expect(@sizeOf(Identity) == 32);
     _ = types.CredentialSource;
 }

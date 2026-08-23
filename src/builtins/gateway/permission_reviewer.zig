@@ -237,8 +237,6 @@ fn usageOutcome(
         .credential_identity = credential_authority.derive(
             source,
             null,
-            config.team,
-            config.api_key,
         ),
     };
     return if (completion.billing != null)

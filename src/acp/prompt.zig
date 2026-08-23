@@ -611,7 +611,6 @@ pub fn handlePrompt(
                     session.provider,
                     source,
                     session.account_id,
-                    state.gateway_team,
                     session.api_key,
                 );
             }

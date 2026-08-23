@@ -245,7 +245,7 @@ pub const DeferredUsageReference = struct {
     tenant: ?[]const u8 = null,
     account_id: ?[]const u8 = null,
     credential_source: types.CredentialSource,
-    credential_identity: credential_authority.Identity,
+    credential_identity: ?credential_authority.Identity,
 };
 
 pub const UsageUnavailable = enum {

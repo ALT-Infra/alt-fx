@@ -1,6 +1,5 @@
 const std = @import("std");
 const permission_auto_classifier = @import("../core/permissions/auto_classifier.zig");
-const session_usage = @import("../core/session/session_usage.zig");
 const stream_provider = @import("../core/agent/stream_provider.zig");
 const types = @import("../core/shared/types.zig");
 const io_mod = @import("../core/shared/io.zig");
@@ -125,6 +124,16 @@ const OwnedResult = struct {
     result: stream_provider.Result,
 };
 
+const ReviewAdmission = struct {
+    evidence: *stream_provider.AttemptEvidence,
+
+    fn admit(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.evidence.provider_admitted) return error.ProviderAdmissionRepeated;
+        self.evidence.provider_admitted = true;
+    }
+};
+
 fn deinitOwnedResult(raw: *anyopaque, alloc: Allocator) void {
     const owned: *OwnedResult = @ptrCast(@alignCast(raw));
     owned.result.deinit(alloc);
@@ -151,8 +160,8 @@ fn sendReview(
 
     var delivery = stream_provider.DeliveryCertainty.init();
     var evidence: stream_provider.AttemptEvidence = .{};
+    var admission = ReviewAdmission{ .evidence = &evidence };
     var callback_context: u8 = 0;
-    const usage_observation = try session_usage.InvocationObservation.begin(runtime.input.usage);
     var result = runtime.adapter.send_fn(alloc, .{
         .credential = .{
             .secret = runtime.input.credential,
@@ -171,13 +180,10 @@ fn sendReview(
         .delivery = &delivery,
         .attempt_evidence = &evidence,
         .events = .{ .context = &callback_context, .emit_fn = ignoreEvent },
+        .admission = .{ .context = &admission, .admit_fn = ReviewAdmission.admit },
         .cancel_flag = cancel_flag,
         .provider_attempt_owner = .transport,
     }, payload) catch |err| {
-        usage_observation.fail(if (delivery.load() == .possibly_sent)
-            .ambiguous_delivery
-        else
-            .unbilled) catch return .permanent_failure;
         if (err == error.OutOfMemory) return error.OutOfMemory;
         if (err == error.Cancelled or cancel_flag.load(.seq_cst)) return .cancelled;
         if (err == error.Timeout) return .timed_out;
@@ -185,14 +191,6 @@ fn sendReview(
     };
     var result_owned = true;
     defer if (result_owned) result.deinit(alloc);
-    usage_observation.complete(
-        runtime.input.usage_allocator,
-        switch (result) {
-            .completed => |completed| completed.completion,
-            .failed => .{},
-        },
-        .{ .immediate = null },
-    ) catch return .permanent_failure;
     if (cancel_flag.load(.seq_cst)) return .cancelled;
     if (std.meta.activeTag(result) == .failed) return switch (result.failed.kind) {
         .rate_limited, .server_error, .bad_gateway, .unavailable, .gateway_timeout => .transient_failure,

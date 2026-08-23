@@ -7942,8 +7942,6 @@ const VisionGatewayFixture = struct {
                 .credential_identity = credential_authority.derive(
                     request.credential.source orelse .ai_gateway_api_key,
                     request.credential.account_id,
-                    request.credential.tenant,
-                    request.credential.secret,
                 ),
             } },
         } };

@@ -70,7 +70,6 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
     const transport = context.transport;
     const payload = try context.build_fn(alloc, request.data());
     defer alloc.free(payload);
-    try request.admission.admit();
     const auth = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.credential.secret});
     defer alloc.free(auth);
 
@@ -97,8 +96,10 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
     defer headers_json.deinit();
     try std.json.Stringify.value(headers.items, .{}, &headers_json.writer);
 
+    const endpoint = context.endpoint.url();
+    try request.admission.admit();
     request.delivery.markPossiblySent();
-    const handle = try transport.open("POST", context.endpoint.url(), headers_json.writer.buffered(), payload);
+    const handle = try transport.open("POST", endpoint, headers_json.writer.buffered(), payload);
     if (handle < 0) return error.HostStreamFailed;
     defer transport.close(handle);
 
@@ -170,8 +171,6 @@ fn gatewayUsageReference(
         .credential_identity = credential_authority.derive(
             source,
             request.credential.account_id,
-            request.credential.tenant,
-            request.credential.secret,
         ),
     };
 }

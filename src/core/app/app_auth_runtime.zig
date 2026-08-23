@@ -1159,7 +1159,6 @@ pub fn Runtime(comptime App: type) type {
                                 .gateway,
                                 credential.source,
                                 null,
-                                credential.gateway_team,
                                 credential.api_key,
                             );
                         } else {

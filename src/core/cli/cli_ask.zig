@@ -1557,7 +1557,6 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
                 ctx.provider,
                 credential.source,
                 credential.accountId(),
-                credential.gatewayTeam(),
                 credential.token,
             );
         }

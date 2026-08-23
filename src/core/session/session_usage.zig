@@ -1597,20 +1597,23 @@ pub const Usage = struct {
         provider: model_provider.ProviderId,
         source: types.CredentialSource,
         account_id: ?[]const u8,
-        tenant: ?[]const u8,
         credential: []const u8,
     ) void {
+        const identity = credential_authority.derive(source, account_id) orelse {
+            self.clearReconciliationCredential();
+            debug_trace.logf(
+                "session",
+                "usage reconciliation withheld provider={s} source={s} reason=stable_credential_identity_unavailable",
+                .{ @tagName(provider), @tagName(source) },
+            );
+            return;
+        };
         self.startReconciliationWithCredential(
             alloc,
             credential,
             .{
                 .provider = provider,
-                .credential_identity = credential_authority.derive(
-                    source,
-                    account_id,
-                    tenant,
-                    credential,
-                ),
+                .credential_identity = identity,
             },
             true,
             null,
@@ -2097,7 +2100,7 @@ pub fn validateSnapshot(snapshot: Snapshot) !void {
         try validateOrigin(generation.origin);
         if (generation.team) |team| try validateTeam(team);
         if (generation.account_id) |account_id| try validateIdentifier(account_id);
-        if ((generation.credential_source == null) != (generation.credential_identity == null)) {
+        if (generation.credential_identity != null and generation.credential_source == null) {
             return error.InvalidUsageSnapshot;
         }
         if (generation.credential_source) |source| {
@@ -3232,8 +3235,6 @@ fn testGatewayUsageReference(
         .credential_identity = credential_authority.derive(
             .ai_gateway_api_key,
             null,
-            null,
-            "test-key",
         ),
     };
 }
@@ -4280,25 +4281,24 @@ test "deferred usage preserves provider and credential authority" {
     var usage = Usage.initFresh();
     defer usage.deinit(alloc);
     const identity = @import("../auth/credential_authority.zig").derive(
-        .ai_gateway_api_key,
-        null,
-        "team_1",
-        "secret",
-    );
+        .fx_login,
+        "acct_1",
+    ).?;
     const observation = try InvocationObservation.begin(&usage);
     try observation.complete(alloc, .{}, .{ .deferred = .{
         .provider = .gateway,
         .generation_id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
         .scope = "https://ai-gateway.vercel.sh",
         .tenant = "team_1",
-        .credential_source = .ai_gateway_api_key,
+        .account_id = "acct_1",
+        .credential_source = .fx_login,
         .credential_identity = identity,
     } });
 
     var snapshot = try usage.snapshot(alloc);
     defer snapshot.deinit(alloc);
     try std.testing.expectEqual(model_provider.ProviderId.gateway, snapshot.pending[0].provider);
-    try std.testing.expectEqual(types.CredentialSource.ai_gateway_api_key, snapshot.pending[0].credential_source.?);
+    try std.testing.expectEqual(types.CredentialSource.fx_login, snapshot.pending[0].credential_source.?);
     try std.testing.expect(snapshot.pending[0].credential_identity.?.eql(identity));
 }
 
@@ -5426,5 +5426,33 @@ test "stale reconciliation credential cannot replace a refreshed credential" {
         &replacement_expected,
         &(usage.reconciliation_key_digest orelse return error.TestUnexpectedResult),
     );
+    try std.testing.expect(!usage.reconciliation_credential_blocked);
+}
+
+test "resumed provider reconciliation requires stable account identity" {
+    const alloc = std.testing.allocator;
+    var usage = Usage.initFresh();
+    defer usage.deinit(alloc);
+
+    usage.replaceProviderReconciliationCredential(
+        alloc,
+        .gateway,
+        .ai_gateway_api_key,
+        null,
+        "secret-key",
+    );
+    try std.testing.expect(usage.reconciliation_key_digest == null);
+    try std.testing.expect(usage.reconciliation_authority == null);
+    try std.testing.expect(usage.reconciliation_credential_blocked);
+
+    usage.replaceProviderReconciliationCredential(
+        alloc,
+        .gateway,
+        .fx_login,
+        "acct_1",
+        "oauth-token",
+    );
+    try std.testing.expect(usage.reconciliation_key_digest != null);
+    try std.testing.expect(usage.reconciliation_authority.?.credential_identity != null);
     try std.testing.expect(!usage.reconciliation_credential_blocked);
 }

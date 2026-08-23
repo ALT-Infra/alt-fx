@@ -135,7 +135,7 @@ pub const agent_stream_provider = agent_stream_provider_contract.Provider{
 };
 
 pub const provider_bundle = provider_set.Bundle{
-    .capabilities = .{ .fx_search = true, .vision_fallback = true },
+    .capabilities = .{ .fx_search = true, .vision_fallback = true, .deferred_usage = true },
     .presentation = provider_catalog.find(.gateway),
     .auth_strategy = .vercel,
     .fallback_model_capabilities_fn = vercel_model_policy.capabilitiesForModel,
@@ -506,7 +506,6 @@ fn streamAgentCompletion(
     }
     const payload = try buildAgentRequest(alloc, request.data());
     defer alloc.free(payload);
-    try request.admission.admit();
     var events = request.events;
     const result = gateway_client.streamGatewayCompletion(
         alloc,
@@ -521,6 +520,7 @@ fn streamAgentCompletion(
             .trace_ctx = request.trace_ctx,
             .content_capture_limit = request.content_capture_limit,
             .delivery = request.delivery,
+            .admission = request.admission,
             .on_reasoning_chunk = EventBridge.reasoning,
             .on_tool_input_chunk = EventBridge.toolInput,
             .provider_attempt_owner = switch (request.provider_attempt_owner) {
@@ -588,8 +588,6 @@ fn gatewayUsageReference(
         .credential_identity = credential_authority.derive(
             source,
             request.credential.account_id,
-            request.credential.tenant,
-            request.credential.secret,
         ),
     };
 }
@@ -1061,8 +1059,6 @@ fn gatewayWorkerUsageOutcome(
         .credential_identity = credential_authority.derive(
             source,
             null,
-            config.team,
-            config.api_key,
         ),
     };
     return if (completion.billing != null)

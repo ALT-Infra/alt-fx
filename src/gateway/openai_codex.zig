@@ -140,7 +140,6 @@ fn streamCompletion(
     try validateModel(request.model);
     const payload = try buildRequest(alloc, request.data());
     defer alloc.free(payload);
-    try request.admission.admit();
     return streamPrepared(alloc, request, payload) catch |err| {
         if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
         request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(err, request.delivery.load());
@@ -229,6 +228,7 @@ pub fn streamPrepared(
         .clock = .awake,
         .raw = .fromMilliseconds(connect_timeout_ms),
     });
+    try request.admission.admit();
     var opened = try gateway_client.runBoundedHttpOperation(
         OpenedRequest,
         alloc,

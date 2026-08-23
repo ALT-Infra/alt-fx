@@ -130,7 +130,6 @@ fn streamCompletion(
     try validateModel(request.model);
     const payload = try buildRequest(alloc, request.data());
     defer alloc.free(payload);
-    try request.admission.admit();
     var result = streamPrepared(alloc, request, payload) catch |err| {
         if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
         if (requestDeadlineExpired(request)) return error.Timeout;
@@ -239,6 +238,7 @@ pub fn streamPrepared(
             connect_deadline = deadline;
         }
     }
+    try request.admission.admit();
     var opened = try gateway_client.runBoundedHttpOperation(
         OpenedRequest,
         alloc,

@@ -430,13 +430,18 @@ pub fn releaseActiveSession(state: *ServerState) !void {
         active.session_rt.usage.cancelReconciliation();
         active.session_rt.usage.finishProfilePublicationsBeforeShutdown();
         flushActiveSessionUsage(state) catch |err| {
-            if (state.credential_source == .chatgpt_subscription or state.credential_source == .grok_subscription) {
+            if (state.cfg.provider_set.select(active.provider).deferred_usage == null) {
                 active.session_rt.usage.clearReconciliationCredential();
-            } else {
-                active.session_rt.usage.startReconciliation(
+            } else if (active.credential_source) |source| {
+                active.session_rt.usage.replaceProviderReconciliationCredential(
                     state.alloc,
+                    active.provider,
+                    source,
+                    active.account_id,
                     state.api_key,
                 );
+            } else {
+                active.session_rt.usage.clearReconciliationCredential();
             }
             return err;
         };

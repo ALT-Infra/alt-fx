@@ -340,7 +340,7 @@ test "possibly sent gateway failure marks billing incomplete" {
     try std.testing.expectEqual(@as(u64, 1), snapshot.settled_through_sequence);
 }
 
-test "provider-local immediate usage settles invocation capacity" {
+test "provider-local immediate usage bypasses durable Gateway observations" {
     const LocalProvider = struct {
         calls: usize = 0,
 
@@ -404,7 +404,7 @@ test "provider-local immediate usage settles invocation capacity" {
                 .cancel_flag = &cancel_flag,
                 .provider_attempt_owner = .agent,
             },
-            &usage,
+            null,
             alloc,
         );
         defer result.deinit(alloc);
@@ -416,7 +416,7 @@ test "provider-local immediate usage settles invocation capacity" {
     defer snapshot.deinit(alloc);
     try std.testing.expectEqual(session_usage.Availability.complete, snapshot.billing);
     try std.testing.expect(snapshot.api_duration_complete);
-    try std.testing.expectEqual(@as(u64, 66), snapshot.next_sequence);
-    try std.testing.expectEqual(@as(u64, 65), snapshot.settled_through_sequence);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.next_sequence);
+    try std.testing.expectEqual(@as(u64, 0), snapshot.settled_through_sequence);
     try std.testing.expectEqual(@as(usize, 0), snapshot.pending.len);
 }

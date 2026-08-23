@@ -1824,7 +1824,6 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !@hasField(App, "auth") or !provider_runtime.supported(App)) return;
             if (comptime !@hasDecl(@TypeOf(app.auth), "credentialSource") or
                 !@hasDecl(@TypeOf(app.auth), "accountId") or
-                !@hasDecl(@TypeOf(app.auth), "gatewayTeam") or
                 !@hasDecl(@TypeOf(app.session.usage), "replaceProviderReconciliationCredential")) return;
 
             const source = app.auth.credentialSource() orelse return;
@@ -1834,7 +1833,6 @@ pub fn Runtime(comptime App: type) type {
                 provider_runtime.provider(app),
                 source,
                 app.auth.accountId(),
-                app.auth.gatewayTeam(),
                 credential,
             );
         }
@@ -9766,7 +9764,6 @@ const ReconciliationOriginUsage = struct {
         _: Allocator,
         provider: model_provider.ProviderId,
         source: types.CredentialSource,
-        _: ?[]const u8,
         _: ?[]const u8,
         _: []const u8,
     ) void {

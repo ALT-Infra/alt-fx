@@ -576,8 +576,8 @@ fn validateStateWithPermissionMigration(
             return error.InvalidDurableField;
         }
         try validateModel(checkpoint.authority.model);
-        if ((checkpoint.authority.credential_source == null) !=
-            (checkpoint.authority.credential_identity == null))
+        if (checkpoint.authority.credential_identity != null and
+            checkpoint.authority.credential_source == null)
         {
             return error.InvalidDurableField;
         }
@@ -1050,7 +1050,7 @@ fn parseTurnAuthority(alloc: Allocator, value: std.json.Value) !TurnAuthority {
         },
         else => return error.InvalidDurableField,
     } else return error.InvalidSessionFormat;
-    if ((credential_source == null) != (credential_identity == null)) {
+    if (credential_identity != null and credential_source == null) {
         return error.InvalidDurableField;
     }
     return .{
@@ -3338,8 +3338,6 @@ test "recovery checkpoint round trips while legacy state stays absent" {
             .credential_identity = credential_authority.derive(
                 .chatgpt_subscription,
                 "acct_1",
-                null,
-                "token",
             ),
         },
         .requested_fast_mode = true,
