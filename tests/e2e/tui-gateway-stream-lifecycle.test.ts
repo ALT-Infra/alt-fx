@@ -7539,6 +7539,7 @@ describe.skipIf(!tmuxAvailable())("transcript scrollback release", () => {
               input: {
                 action: "exec",
                 command: "sleep 5; printf HELD_COMMAND_DONE",
+                timeout_ms: 600_000,
               },
             },
           ],

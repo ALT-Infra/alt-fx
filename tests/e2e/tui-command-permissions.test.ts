@@ -1653,7 +1653,7 @@ describe("effect-aware command permissions", () => {
       expect(losslessCompactOutput).toBe("");
       expect(losslessCompact).toContain("Ran printf");
       for (const row of losslessRows) expect(losslessCompact).not.toContain(`│ ${row}`);
-      expect(commandReplayFiles(root)).toEqual([]);
+      expect(commandReplayFiles(root)).toHaveLength(1);
       const losslessGrid = await activeSession.capturePaneGrid();
 
       await activeSession.sendKeys("C-o");
@@ -1683,7 +1683,7 @@ describe("effect-aware command permissions", () => {
       expect(lossyCompactOutput).toBe("");
       expect(lossyCompact).toContain("Ran printf");
       for (const row of lossyRows) expect(lossyCompact).not.toContain(`│ ${row}`);
-      expect(commandReplayFiles(root)).toHaveLength(1);
+      expect(commandReplayFiles(root)).toHaveLength(2);
       const lossyGrid = await activeSession.capturePaneGrid();
 
       await activeSession.sendKeys("C-o");
@@ -1734,7 +1734,7 @@ describe("effect-aware command permissions", () => {
       expect(publicSession.stdout).not.toContain("command_replay");
       expect(publicSession.stdout).not.toContain("command_process_presentation");
       expect(publicSession.stdout).not.toContain("process_presentation");
-      expect(publicSession.stdout).not.toContain("fx-command-replay-");
+      expect(publicSession.stdout).toContain("<command_output_handle>fx-command-replay-");
 
       await activeSession.sendText("/quit");
       expect(await activeSession.waitForSessionEnd(TIMEOUT)).toBe(true);
@@ -2405,7 +2405,7 @@ describe("effect-aware command permissions", () => {
           gateway.requests[1]!.body,
           "terminal_session_command",
         );
-        expect(commandResult).toBe(
+        expect(commandResult).toContain(
           "exit_code=0\n" +
             "<stdout>\n" +
             "TTY_SESSION_STDOUT_BEGIN\n" +
@@ -2414,6 +2414,9 @@ describe("effect-aware command permissions", () => {
             "<stderr>\n" +
             "TTY_SESSION_STDERR\n" +
             "</stderr>\n",
+        );
+        expect(commandResult).toMatch(
+          /<command_output_handle>fx-command-replay-[^<]+<\/command_output_handle>/,
         );
         expect(gateway.requests[1]!.body).not.toContain("\\u001e");
         expect(gateway.requests[1]!.body).not.toContain("\\u0006");
