@@ -2778,6 +2778,7 @@ test.skipIf(!tmuxAvailable())("tmux resize checkpoint failures roll back without
   if (!existsSync("/bin/zsh")) return;
   for (const failurePoint of ["allocation", "storage", "checkpoint"]) {
     const home = makeHome();
+    const releasePath = join(home, "resize-release");
     const paths = hostPaths(home);
     const host = startHost(home, undefined, 30_000, {
       FX_TERMINAL_TEST_TMUX_RESIZE_CHECKPOINT_FAILURE: failurePoint,
@@ -2786,7 +2787,9 @@ test.skipIf(!tmuxAvailable())("tmux resize checkpoint failures roll back without
     const connected = await handshake(paths.socket, { minimum: 4, current: 5 });
     const started = await startCommand(connected.client, connected.revision!, 135, {
       cwd: home,
-      command: "printf 'resize-ready\\n'; IFS= read -r input; printf 'resize-after:%s\\n' \"$input\"",
+      command:
+        "printf 'resize-ready\\n'; IFS= read -r input; printf 'resize-after:%s\\n' \"$input\"; " +
+        `while [ ! -f ${JSON.stringify(releasePath)} ]; do sleep 0.01; done`,
       shell: { executable: { path: "/bin/zsh", clean_start: true } },
       backend: "tmux",
       returnWhen: { match: "resize-ready" },
@@ -2844,6 +2847,7 @@ test.skipIf(!tmuxAvailable())("tmux resize checkpoint failures roll back without
       "wait",
     );
     expect(continued.outcome, failurePoint).toEqual({ condition_met: {} });
+    writeFileSync(releasePath, "release");
     const exited = success(
       await requestAction(connected.client, connected.revision!, 141, "wait", {
         session_id: sessionId,
