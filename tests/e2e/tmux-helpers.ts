@@ -122,7 +122,7 @@ export function hasEmptyComposer(pane: string): boolean {
   return pane.split("\n").some(isEmptyComposerLine);
 }
 
-function withNativeExecTimeout(event: object): object {
+export function withNativeExecTimeout(event: object): object {
   const value = event as Record<string, unknown>;
   if (value.type !== "tool-call" || value.toolName !== "terminal") return event;
   if (typeof value.input === "string") {

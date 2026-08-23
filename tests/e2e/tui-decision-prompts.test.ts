@@ -24,6 +24,7 @@ import {
   fakeGatewaySerializedToolCall,
   TmuxSession,
   tmuxAvailable,
+  withNativeExecTimeout,
 } from "./tmux-helpers";
 import { stdoutFrames } from "./render-lab/tape";
 
@@ -139,7 +140,9 @@ afterEach(async () => {
 
 function sse(events: object[], done = true) {
   return new Response(
-    events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("") +
+    events.map((event) =>
+      `data: ${JSON.stringify(withNativeExecTimeout(event))}\n\n`
+    ).join("") +
       (done ? "data: [DONE]\n\n" : ""),
     { headers: { "content-type": "text/event-stream" } },
   );

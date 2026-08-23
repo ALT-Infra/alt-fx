@@ -12,6 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EVAL_MODEL, HAS_API_KEY, runFx } from "../evals/eval-helpers";
+import { withNativeExecTimeout } from "./tmux-helpers";
 
 const TIMEOUT = 20_000;
 const MODEL = "openai/gpt-5";
@@ -29,7 +30,9 @@ type GatewayResponse =
 
 function sse(events: object[]) {
   return new Response(
-    events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("") +
+    events.map((event) =>
+      `data: ${JSON.stringify(withNativeExecTimeout(event))}\n\n`
+    ).join("") +
       "data: [DONE]\n\n",
     { headers: { "content-type": "text/event-stream" } },
   );

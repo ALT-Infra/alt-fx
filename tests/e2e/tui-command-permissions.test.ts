@@ -27,6 +27,7 @@ import {
   startDynamicFakeGateway,
   TmuxSession,
   tmuxAvailable,
+  withNativeExecTimeout,
 } from "./tmux-helpers";
 
 const TIMEOUT = 30_000;
@@ -96,7 +97,7 @@ afterEach(async () => {
 
 function sse(events: object[]) {
   return new Response(
-    `${events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`,
+    `${events.map((event) => `data: ${JSON.stringify(withNativeExecTimeout(event))}\n\n`).join("")}data: [DONE]\n\n`,
     { headers: { "content-type": "text/event-stream" } },
   );
 }
