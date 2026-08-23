@@ -1490,7 +1490,7 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "ACP reload preserves execution and clears refused recovery without replay",
+    "ACP reload replays pending execution once and clears recovery after completion",
     async () => {
       const root = createIsolatedRoot("fx-acp-reload-model-recovery-");
       const toolEvidence = "ACP_RESTART_TOOL_EVIDENCE";
@@ -1553,17 +1553,16 @@ describe("acp: model-independent", () => {
         expect(occurrenceCount(loadUpdates, partialText)).toBe(1);
 
         const resumed = await continueRecovery(client, TIMEOUT);
-        expect(resumed.promptResult.error).toEqual({
-          code: -32603,
-          message: "RecoveryCredentialAuthorityChanged",
-        });
-        expect(gateway.requests).toHaveLength(11);
+        expect(resumed.promptResult.error).toBeUndefined();
+        expect(resumed.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(12);
+        expect(gateway.requests[11]!.body).toContain(toolEvidence);
         const restartedUpdates = JSON.stringify([
           ...loadMessages,
           ...resumed.messages,
         ]);
         expect(occurrenceCount(restartedUpdates, partialText)).toBe(1);
-        expect(occurrenceCount(restartedUpdates, finalTextSuffix)).toBe(0);
+        expect(occurrenceCount(restartedUpdates, finalTextSuffix)).toBe(1);
 
         await client.close();
         client = await AcpClient.create({
@@ -1591,8 +1590,8 @@ describe("acp: model-independent", () => {
         const completedLoadUpdates = JSON.stringify(completedLoadMessages);
         expect(completedLoadUpdates).not.toContain("modelResponseRecovery");
         expect(occurrenceCount(completedLoadUpdates, toolEvidence)).toBe(1);
-        expect(occurrenceCount(completedLoadUpdates, partialText)).toBe(0);
-        expect(occurrenceCount(completedLoadUpdates, finalTextSuffix)).toBe(0);
+        expect(occurrenceCount(completedLoadUpdates, partialText)).toBe(1);
+        expect(occurrenceCount(completedLoadUpdates, finalTextSuffix)).toBe(1);
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();

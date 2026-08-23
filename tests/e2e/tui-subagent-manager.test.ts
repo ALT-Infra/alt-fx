@@ -2936,7 +2936,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
   );
 
   test(
-    "restart preserves child context and refuses resume without stable credential authority",
+    "restart preserves auto child permission context until explicit resume",
     async () => {
       const fixture = createFixture();
       writeFileSync(
@@ -2946,6 +2946,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
       const resumedStderrPath = join(root!, "resumed-stderr.log");
       const childPrompt = "CHECKPOINT3_RESTART_INTERRUPTED_CHILD";
       const interruptedPrefix = "CHECKPOINT3_INTERRUPTED_STREAM_";
+      const resumedText = "CHECKPOINT3_EXPLICIT_RESUME_COMPLETE";
       const resumedMarker = join(fixture.workspace, "restart-auto-child.txt");
       const childStream = controlledTextResponse(interruptedPrefix);
       let childAttempts = 0;
@@ -2955,7 +2956,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           return fakeGatewayFinalText("CHECKPOINT3_PARENT_CREATED_CHILD");
         }
         if (body.includes('"toolCallId":"checkpoint3_restart_write"')) {
-          return fakeGatewayFinalText("must not send");
+          return fakeGatewayFinalText(resumedText);
         }
         if (body.includes(childPrompt)) {
           childAttempts += 1;
@@ -3144,17 +3145,17 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await active.sendLiteralText("x");
         await active.waitForText("Actions — restart-child", TIMEOUT);
         await active.sendLiteralText("r");
-        const refused = await active.waitForPane(
-          (pane) =>
-            pane.includes("status: idle") &&
-            pane.includes("Latest failure: agent_turn_failed"),
+        const completed = await active.waitForPane(
+          (pane) => pane.includes(resumedText) && pane.includes("status: idle"),
           TIMEOUT,
         );
-        expect(refused).toContain("AgentExecutionFailed");
-        expect(childAttempts).toBe(1);
-        expect(gateway.requestCount()).toBe(requestsAfterCrash);
+        expect(completed.match(new RegExp(resumedText, "g"))).toHaveLength(1);
+        expect(childAttempts).toBe(2);
+        expect(gateway.requestCount()).toBe(requestsAfterCrash + 2);
         expect(gateway.classifierRequests).toHaveLength(0);
-        expect(existsSync(resumedMarker)).toBe(false);
+        expect(readFileSync(resumedMarker, "utf8")).toBe(
+          "restored auto context\n",
+        );
 
         const recoveredControl = JSON.parse(readFileSync(controlPath, "utf8")) as {
           parent_id: string;
@@ -3177,7 +3178,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
             content: childPrompt,
             root_user_intent_context:
               controlBeforeCrash.queue[0]?.root_user_intent_context,
-            status: "failed",
+            status: "completed",
           }),
         ]);
         expect(recoveredControl.events.some((event) =>

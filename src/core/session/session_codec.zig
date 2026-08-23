@@ -74,7 +74,6 @@ pub const RecoveryCheckpoint = struct {
     max_provider_attempts: usize,
     consumed_provider_attempts: usize,
     outstanding_reservation: bool = false,
-    ephemeral_credential_verifier: ?credential_authority.EphemeralVerifier = null,
 
     pub fn deinit(self: *RecoveryCheckpoint, alloc: Allocator) void {
         session.freeUserTurn(alloc, self.user);
@@ -107,7 +106,6 @@ pub const RecoveryCheckpoint = struct {
             .max_provider_attempts = self.max_provider_attempts,
             .consumed_provider_attempts = self.consumed_provider_attempts,
             .outstanding_reservation = self.outstanding_reservation,
-            .ephemeral_credential_verifier = self.ephemeral_credential_verifier,
         };
     }
 };
@@ -3347,12 +3345,6 @@ test "recovery checkpoint round trips while legacy state stays absent" {
         .max_provider_attempts = 10,
         .consumed_provider_attempts = 4,
         .outstanding_reservation = true,
-        .ephemeral_credential_verifier = credential_authority.deriveEphemeralVerifier(
-            .chatgpt_subscription,
-            "acct_1",
-            null,
-            "token",
-        ),
     };
     const state = DurableSessionState{
         .id = @constCast("session-recovery"),
@@ -3376,7 +3368,6 @@ test "recovery checkpoint round trips while legacy state stays absent" {
     var encoded: std.Io.Writer.Allocating = .init(alloc);
     defer encoded.deinit();
     _ = try encodeState(state, &encoded.writer);
-    try std.testing.expect(std.mem.find(u8, encoded.written(), "ephemeral_credential") == null);
     var source = std.Io.Reader.fixed(encoded.written());
     var decoded = try decodeState(alloc, &source, .{});
     defer decoded.deinit(alloc);
@@ -3392,7 +3383,6 @@ test "recovery checkpoint round trips while legacy state stays absent" {
     try std.testing.expectEqualStrings("gpt-5.4-mini", restored.authority.model);
     try std.testing.expectEqual(types.CredentialSource.chatgpt_subscription, restored.authority.credential_source.?);
     try std.testing.expect(restored.authority.credential_identity != null);
-    try std.testing.expect(restored.ephemeral_credential_verifier == null);
     try std.testing.expectEqual(model_provider.ProviderId.codex, decoded.preferences.provider);
     try std.testing.expect(restored.requested_fast_mode);
     try std.testing.expect(restored.fast_mode);

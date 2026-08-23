@@ -2100,12 +2100,13 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "process restart during backoff refuses recovery without stable credential authority",
+    "process restart during backoff preserves a direct Fast model ID",
     async () => {
       const directFastModel = `${GLM_MODEL}-fast`;
+      const finalText = "Canonical route recovered after process restart.";
       const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
         "fx-tui-recovery-fast-backoff-restart-",
-        [retryAfterUnavailable(5), fakeGatewayFinalText("must not send")],
+        [retryAfterUnavailable(5), fakeGatewayFinalText(finalText)],
         {
           model: directFastModel,
           models: [
@@ -2151,9 +2152,12 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       });
       await session.waitForComposer(TIMEOUT);
       await session.sendText("/continue");
-      await session.waitForText("RecoveryCredentialAuthorityChanged", TIMEOUT);
+      await session.waitForText(finalText, TIMEOUT);
 
-      expect(queuedGateway.requests).toHaveLength(1);
+      expect(queuedGateway.requests).toHaveLength(2);
+      expect(queuedGateway.requests[1]!.headers.get("ai-language-model-id")).toBe(
+        directFastModel,
+      );
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
     },

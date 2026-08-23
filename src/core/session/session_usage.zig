@@ -5442,7 +5442,7 @@ test "stale reconciliation credential cannot replace a refreshed credential" {
     try std.testing.expect(!usage.reconciliation_credential_blocked);
 }
 
-test "resumed provider reconciliation requires stable account identity" {
+test "resumed provider reconciliation uses Gateway credential slot identity" {
     const alloc = std.testing.allocator;
     var usage = Usage.initFresh();
     defer usage.deinit(alloc);
@@ -5470,18 +5470,18 @@ test "resumed provider reconciliation requires stable account identity" {
         null,
         "secret-key",
     );
-    try std.testing.expect(usage.reconciliation_key_digest == null);
-    try std.testing.expect(usage.reconciliation_authority == null);
-    try std.testing.expect(usage.reconciliation_credential_blocked);
-
-    usage.replaceProviderReconciliationCredential(
-        alloc,
-        .gateway,
-        .fx_login,
-        "acct_1",
-        "oauth-token",
-    );
     try std.testing.expect(usage.reconciliation_key_digest != null);
     try std.testing.expect(usage.reconciliation_authority.?.credential_identity != null);
     try std.testing.expect(!usage.reconciliation_credential_blocked);
+
+    usage.replaceProviderReconciliationCredential(
+        alloc,
+        .codex,
+        .chatgpt_subscription,
+        null,
+        "subscription-token",
+    );
+    try std.testing.expect(usage.reconciliation_key_digest == null);
+    try std.testing.expect(usage.reconciliation_authority == null);
+    try std.testing.expect(usage.reconciliation_credential_blocked);
 }
