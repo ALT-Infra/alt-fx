@@ -289,7 +289,7 @@ describe("fx ask presentation", () => {
     };
     const terminalTool = firstRequest.tools.find(({ name }) => name === "terminal");
     expect(terminalTool?.description).toBe(
-      "Run one captured command and return its result.",
+      "Run one captured command with a required finite timeout_ms and return its result.",
     );
     const terminalSchema = terminalTool?.inputSchema;
     expect(terminalSchema?.properties?.action?.enum).toEqual(["exec"]);
@@ -298,8 +298,15 @@ describe("fx ask presentation", () => {
       "command",
       "cwd",
       "profile",
+      "timeout_ms",
     ]);
-    expect(terminalSchema?.required).toEqual(["action", "command", "cwd", "profile"]);
+    expect(terminalSchema?.required).toEqual([
+      "action",
+      "command",
+      "cwd",
+      "profile",
+      "timeout_ms",
+    ]);
     expect(terminalSchema?.additionalProperties).toBe(false);
     expect(terminalSchema?.properties?.command?.description).toBe(
       "Command to run. Set null when the selected action does not use this field.",
@@ -309,6 +316,9 @@ describe("fx ask presentation", () => {
     );
     expect(terminalSchema?.properties?.profile?.description).toBe(
       "Profile for exec; omission defaults to user, while clean skips user initialization files. User execution supports the configured Bash or zsh login shell. Bash login execution reads login initialization files; .bashrc is available only when sourced by the login profile. Set null when the selected action does not use this field.",
+    );
+    expect(terminalSchema?.properties?.timeout_ms?.description).toBe(
+      "Maximum foreground runtime in milliseconds. Choose the shortest realistic finite budget; use terminal start for work that must remain alive.",
     );
     const serializedTerminalTool = JSON.stringify(terminalTool);
     expect(serializedTerminalTool).not.toContain("Use start");
