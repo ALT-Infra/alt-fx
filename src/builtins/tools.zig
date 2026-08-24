@@ -197,7 +197,7 @@ const terminal_properties = [_]model_tool_schema.Property{
     .{ .name = "cwd", .json_type = .string, .description = "Working directory for exec or start; defaults to the workspace." },
     .{ .name = "command", .json_type = .string, .bounds = &.{ .max_length = terminal_contracts.max_command_bytes }, .description = "Command for exec, or optional command for start; omit on start for an interactive shell." },
     .{ .name = "profile", .json_type = .string, .shape = &.{ .enum_values = &.{ "clean", "user" } }, .description = "Startup profile for exec or start; omission defaults to user, while clean skips user startup files. User-profile execution supports the configured Bash or zsh login shell. Bash login execution reads login startup files; .bashrc is available only when sourced by the login profile. For start, an explicit shell is used instead of the default profile and is mutually exclusive with profile." },
-    .{ .name = "timeout_ms", .json_type = .integer, .minimum = terminal_impl.exec_timeout_min_ms, .maximum = terminal_impl.exec_timeout_max_ms, .description = "Required for exec. Maximum foreground runtime in milliseconds; use start for persistent work." },
+    .{ .name = "timeout_ms", .json_type = .integer, .bounds = &.{ .minimum = terminal_impl.exec_timeout_min_ms, .maximum = terminal_impl.exec_timeout_max_ms }, .description = "Required for exec. Maximum foreground runtime in milliseconds; use start for persistent work." },
     .{ .name = "shell", .json_type = .object, .shape = &.{ .object = &terminal_shell_schema } },
     .{ .name = "backend", .json_type = .string, .shape = &.{ .enum_values = &.{ "native", "tmux" } }, .description = "Start backend or optional list filter." },
     .{ .name = "return_when", .json_type = .object, .shape = &.{ .object = &terminal_return_schema }, .description = "Only for start or wait; required for every wait. After a signal intended to stop the session, use kind exit. For output matching, use kind match with pattern; output_contains is monitor-only." },
@@ -1416,7 +1416,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "e4439b952e577a959ac4916025cf4f0d222713ec7bd1bc83dd703bfedd220af1",
+        "e1bde312041e1b39f641b5034d59afcaee8159c93884aa2f812ada8cab334187",
         &actual_hex,
     );
 }
@@ -1516,9 +1516,9 @@ test "terminal tool schema derives one closed branch per terminal action" {
     const close_schema = terminal_action_schema(.close);
     const exec_timeout = schemaProperty(exec_schema, "timeout_ms").?;
     try std.testing.expectEqual(model_tool_schema.JsonType.integer, exec_timeout.json_type);
-    try std.testing.expectEqual(@as(?u64, terminal_impl.exec_timeout_min_ms), exec_timeout.minimum);
-    try std.testing.expectEqual(@as(?u64, terminal_impl.exec_timeout_max_ms), exec_timeout.maximum);
-    try std.testing.expect(!exec_timeout.nullable);
+    try std.testing.expectEqual(@as(?u64, terminal_impl.exec_timeout_min_ms), exec_timeout.bounds.?.minimum);
+    try std.testing.expectEqual(@as(?u64, terminal_impl.exec_timeout_max_ms), exec_timeout.bounds.?.maximum);
+    try std.testing.expect(exec_timeout.nullable == null);
     try std.testing.expectEqualSlices(
         []const u8,
         &.{ "native", "tmux" },
@@ -1620,9 +1620,9 @@ test "terminal exec-only schema reuses exec structure with focused descriptions"
         terminal_exec_only_timeout_description,
         timeout.description,
     );
-    try std.testing.expectEqual(@as(?u64, terminal_impl.exec_timeout_min_ms), timeout.minimum);
-    try std.testing.expectEqual(@as(?u64, terminal_impl.exec_timeout_max_ms), timeout.maximum);
-    try std.testing.expect(!timeout.nullable);
+    try std.testing.expectEqual(@as(?u64, terminal_impl.exec_timeout_min_ms), timeout.bounds.?.minimum);
+    try std.testing.expectEqual(@as(?u64, terminal_impl.exec_timeout_max_ms), timeout.bounds.?.maximum);
+    try std.testing.expect(timeout.nullable == null);
 }
 
 test "terminal gateway advertisement projects a provider-compatible object schema" {
