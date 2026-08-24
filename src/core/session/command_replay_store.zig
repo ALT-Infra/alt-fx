@@ -16,6 +16,10 @@ const max_frame_payload_bytes: usize = 1024 * 1024;
 const max_agent_line_bytes: usize = max_frame_payload_bytes;
 const agent_projection_overlap_bytes: usize = 64;
 pub const max_public_handle_bytes: usize = 128;
+pub const CapturePolicy = enum {
+    best_effort,
+    required,
+};
 const model_handle_prefix = "\n<command_output_handle>";
 const model_handle_suffix = "</command_output_handle>\n" ++
     "Full captured command output is available through read_tool_result with this handle.";
@@ -153,68 +157,51 @@ pub const EphemeralStore = struct {
         self.* = undefined;
     }
 
-    fn createSpool(self: *EphemeralStore, alloc: Allocator) !OpenSpool {
+    fn createSpoolWithStem(
+        self: *EphemeralStore,
+        alloc: Allocator,
+        stem: []const u8,
+    ) !OpenSpool {
         if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
             return error.EphemeralReplayUnavailable;
         }
-        var attempt: usize = 0;
-        while (attempt < 8) : (attempt += 1) {
-            var random: [16]u8 = undefined;
-            try std.Io.randomSecure(io_mod.getIo(), &random);
-            const random_hex = std.fmt.bytesToHex(random, .lower);
-            const handle = try std.fmt.allocPrint(
-                alloc,
-                "fx-command-replay-{s}.bin",
-                .{&random_hex},
-            );
-            errdefer alloc.free(handle);
-            const temp_name = try std.fmt.allocPrint(
-                alloc,
-                ".fx-command-replay-{s}.tmp",
-                .{&random_hex},
-            );
-            defer alloc.free(temp_name);
-            const temp_path = try std.fs.path.join(alloc, &.{ self.temp_dir, temp_name });
-            defer alloc.free(temp_path);
-            var writer_file = std.Io.Dir.createFileAbsolute(io_mod.getIo(), temp_path, .{
-                .read = true,
-                .exclusive = true,
-                .permissions = std.Io.File.Permissions.fromMode(0o600),
-            }) catch |err| switch (err) {
-                error.PathAlreadyExists => return error.ReplayNameCollision,
-                else => return error.EphemeralReplayUnavailable,
-            };
-            errdefer writer_file.close(io_mod.getIo());
-            std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), temp_path) catch
-                return error.EphemeralReplayUnavailable;
-            const stored_file = try duplicateFile(writer_file);
-            errdefer stored_file.close(io_mod.getIo());
-            const owned_handle = try self.alloc.dupe(u8, handle);
-            errdefer self.alloc.free(owned_handle);
+        const handle = try std.fmt.allocPrint(alloc, "{s}.bin", .{stem});
+        errdefer alloc.free(handle);
+        const temp_name = try std.fmt.allocPrint(alloc, ".{s}.tmp", .{stem});
+        defer alloc.free(temp_name);
+        const temp_path = try std.fs.path.join(alloc, &.{ self.temp_dir, temp_name });
+        defer alloc.free(temp_path);
+        var writer_file = std.Io.Dir.createFileAbsolute(io_mod.getIo(), temp_path, .{
+            .read = true,
+            .exclusive = true,
+            .permissions = std.Io.File.Permissions.fromMode(0o600),
+        }) catch |err| switch (err) {
+            error.PathAlreadyExists => return error.ReplayNameCollision,
+            else => return error.EphemeralReplayUnavailable,
+        };
+        errdefer writer_file.close(io_mod.getIo());
+        std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), temp_path) catch
+            return error.EphemeralReplayUnavailable;
+        const stored_file = try duplicateFile(writer_file);
+        errdefer stored_file.close(io_mod.getIo());
+        const owned_handle = try self.alloc.dupe(u8, handle);
+        errdefer self.alloc.free(owned_handle);
 
-            const io = io_mod.getIo();
-            self.mutex.lockUncancelable(io);
-            defer self.mutex.unlock(io);
-            if (self.files.contains(handle)) {
-                self.alloc.free(owned_handle);
-                stored_file.close(io);
-                writer_file.close(io);
-                alloc.free(handle);
-                continue;
-            }
-            try self.files.put(self.alloc, owned_handle, stored_file);
-            @import("../shared/debug_trace.zig").logf(
-                "session",
-                "command replay ephemeral backing opened handle_bytes={d}",
-                .{handle.len},
-            );
-            return .{
-                .file = .{ .ephemeral = writer_file },
-                .handle = handle,
-                .framed_bytes = 0,
-            };
-        }
-        return error.ReplayNameCollision;
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.files.contains(handle)) return error.ReplayNameCollision;
+        try self.files.put(self.alloc, owned_handle, stored_file);
+        @import("../shared/debug_trace.zig").logf(
+            "session",
+            "command replay ephemeral backing opened handle_bytes={d}",
+            .{handle.len},
+        );
+        return .{
+            .file = .{ .ephemeral = writer_file },
+            .handle = handle,
+            .framed_bytes = 0,
+        };
     }
 
     fn open(self: *EphemeralStore, handle: []const u8) !ReplayFile {
@@ -285,6 +272,7 @@ pub const Capture = struct {
     inline_limit: usize,
     comparison_limit: usize,
     backing: ?ReplayBacking,
+    capture_policy: CapturePolicy = .best_effort,
     state: CaptureState = .{ .buffered = .empty },
     had_output: bool = false,
     sealed: bool = false,
@@ -317,6 +305,15 @@ pub const Capture = struct {
             .backing = .{ .ephemeral = store },
         };
         return capture;
+    }
+
+    pub fn setPolicyBeforeCapture(self: *Capture, replay_policy: CapturePolicy) void {
+        std.debug.assert(!self.had_output and !self.sealed);
+        self.capture_policy = replay_policy;
+    }
+
+    pub fn policy(self: *const Capture) CapturePolicy {
+        return self.capture_policy;
     }
 
     /// Records bytes only after the downstream callback accepted them.
@@ -807,31 +804,53 @@ fn createSpool(
     alloc: Allocator,
     backing: ReplayBacking,
 ) !OpenSpool {
-    if (backing == .ephemeral) return backing.ephemeral.createSpool(alloc);
-    const capability = backing.saved;
-    var attempt: usize = 0;
-    while (attempt < 8) : (attempt += 1) {
-        const handle = try std.fmt.allocPrint(
-            alloc,
-            "fx-command-replay-{d}-{d}-{d}.bin",
-            .{ std.c.getpid(), io_mod.nanoTimestamp(), attempt },
-        );
-        const file = capability.createExclusiveFile(
-            alloc,
-            .command_artifacts,
-            handle,
-        ) catch |err| {
-            alloc.free(handle);
-            if (err == error.PathAlreadyExists) continue;
-            return err;
-        };
-        return .{
-            .file = .{ .saved = file },
-            .handle = handle,
-            .framed_bytes = 0,
+    for (0..8) |_| {
+        const stem = try randomReplayStem(alloc);
+        defer alloc.free(stem);
+        return createSpoolWithStem(alloc, backing, stem) catch |err| switch (err) {
+            error.ReplayNameCollision => continue,
+            else => return err,
         };
     }
     return error.ReplayNameCollision;
+}
+
+fn randomReplayStem(alloc: Allocator) ![]u8 {
+    var random: [16]u8 = undefined;
+    try std.Io.randomSecure(io_mod.getIo(), &random);
+    const random_hex = std.fmt.bytesToHex(random, .lower);
+    return std.fmt.allocPrint(
+        alloc,
+        "fx-command-replay-{s}",
+        .{&random_hex},
+    );
+}
+
+fn createSpoolWithStem(
+    alloc: Allocator,
+    backing: ReplayBacking,
+    stem: []const u8,
+) !OpenSpool {
+    return switch (backing) {
+        .ephemeral => |store| store.createSpoolWithStem(alloc, stem),
+        .saved => |capability| blk: {
+            const handle = try std.fmt.allocPrint(alloc, "{s}.bin", .{stem});
+            errdefer alloc.free(handle);
+            const file = capability.createExclusiveFile(
+                alloc,
+                .command_artifacts,
+                handle,
+            ) catch |err| switch (err) {
+                error.PathAlreadyExists => return error.ReplayNameCollision,
+                else => return err,
+            };
+            break :blk .{
+                .file = .{ .saved = file },
+                .handle = handle,
+                .framed_bytes = 0,
+            };
+        },
+    };
 }
 
 fn contentAddressedHandle(
@@ -1434,6 +1453,67 @@ test "required command replay reports unavailable backing instead of dropping ou
     try std.testing.expectError(
         error.CommandOutputCaptureFailed,
         capture.appendAcceptedRequired(arena, .stderr, "still required\n"),
+    );
+}
+
+test "saved and ephemeral replay backings share collision handling" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(
+        io_mod.getIo(),
+        "session",
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer session_dir.close(io_mod.getIo());
+    const display_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "session");
+    defer alloc.free(display_path);
+    var capability = try session_child_store.SessionChildCapability.initForTesting(
+        alloc,
+        session_dir,
+        display_path,
+        .writable,
+        .{},
+    );
+    defer capability.deinit();
+
+    const stem = "fx-command-replay-fixed-collision";
+    var saved = try createSpoolWithStem(alloc, .{ .saved = &capability }, stem);
+    defer {
+        saved.file.deinit();
+        capability.delete(.command_artifacts, saved.handle) catch {};
+        alloc.free(saved.handle);
+    }
+    try std.testing.expectError(
+        error.ReplayNameCollision,
+        createSpoolWithStem(alloc, .{ .saved = &capability }, stem),
+    );
+
+    const temp_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(temp_path);
+    var ephemeral_store = EphemeralStore.initForTesting(alloc, temp_path);
+    defer ephemeral_store.deinit();
+    var ephemeral = try createSpoolWithStem(
+        alloc,
+        .{ .ephemeral = &ephemeral_store },
+        stem,
+    );
+    defer {
+        ephemeral.file.deinit();
+        ephemeral_store.delete(ephemeral.handle);
+        alloc.free(ephemeral.handle);
+    }
+    try std.testing.expectError(
+        error.ReplayNameCollision,
+        createSpoolWithStem(
+            alloc,
+            .{ .ephemeral = &ephemeral_store },
+            stem,
+        ),
     );
 }
 

@@ -135,17 +135,21 @@ pub fn retainCancelledCommandReplay(
     capture: ?*command_replay_store.Capture,
 ) ?types.CancelledCommandPresentation {
     if (capture) |candidate| {
-        const descriptor = candidate.retainRequired(arena) catch |err| {
-            debug_trace.logf(
-                "session",
-                "cancelled command replay retention unavailable err={s}",
-                .{@errorName(err)},
-            );
-            return .{ .output_replay = .unavailable };
+        const replay: ?types.CommandOutputReplay = switch (candidate.policy()) {
+            .required => blk: {
+                const descriptor = candidate.retainRequired(arena) catch |err| {
+                    debug_trace.logf(
+                        "session",
+                        "cancelled command replay retention unavailable err={s}",
+                        .{@errorName(err)},
+                    );
+                    break :blk .unavailable;
+                } orelse break :blk null;
+                break :blk .{ .available = descriptor };
+            },
+            .best_effort => candidate.retain(arena),
         };
-        if (descriptor) |value| {
-            return .{ .output_replay = .{ .available = value } };
-        }
+        if (replay) |retained| return .{ .output_replay = retained };
     }
     const replay = if (result_memory) |memory|
         memory.command_output_replay
@@ -192,10 +196,32 @@ fn hasToolResultForCall(
     return false;
 }
 
-pub fn prepareToolModelOutput(arena: Allocator, config: Config, tool_call: ToolCall, raw_output: []const u8) !result_store.PreparedResult {
-    const required_command_replay = (config.session_child_capability != null or
-        config.ephemeral_command_replay != null) and
-        isRequiredTerminalExec(arena, tool_call);
+pub fn prepareToolModelOutput(
+    arena: Allocator,
+    config: Config,
+    tool_call: ToolCall,
+    raw_output: []const u8,
+) !result_store.PreparedResult {
+    return prepareCapturedToolModelOutput(
+        arena,
+        config,
+        tool_call,
+        raw_output,
+        null,
+    );
+}
+
+pub fn prepareCapturedToolModelOutput(
+    arena: Allocator,
+    config: Config,
+    tool_call: ToolCall,
+    raw_output: []const u8,
+    capture: ?*command_replay_store.Capture,
+) !result_store.PreparedResult {
+    const required_command_replay = if (capture) |candidate|
+        candidate.policy() == .required
+    else
+        false;
     if (!required_command_replay and
         (config.session_child_capability != null or config.tool_result_dir != null) and
         raw_output.len > result_store.large_result_threshold_bytes)
@@ -273,15 +299,11 @@ pub fn finalizeCommandReplay(
     capture: ?*command_replay_store.Capture,
 ) !void {
     const candidate = capture orelse return;
-    if (!isCapturedCommandCall(arena, tool_call)) {
-        candidate.abort(arena);
-        return;
-    }
     if (!candidate.hasOutput()) {
         candidate.discard(arena);
         return;
     }
-    if (isRequiredTerminalExec(arena, tool_call)) {
+    if (candidate.policy() == .required) {
         const descriptor = (try candidate.retainRequired(arena)) orelse return;
         prepared.memory.command_output_replay = .{ .available = descriptor };
         prepared.model_output = try command_replay_store.appendModelHandleNotice(
@@ -292,7 +314,6 @@ pub fn finalizeCommandReplay(
         prepared.memory.stored_output_bytes = prepared.model_output.len;
         return;
     }
-
     var captured = candidate.canonicalizeForComparison(arena) catch |err| {
         debug_trace.logf(
             "session",
@@ -347,27 +368,6 @@ pub fn finalizeCommandReplay(
         return;
     }
     retainCommandReplay(arena, candidate, &prepared.memory);
-}
-
-fn isCapturedCommandCall(arena: Allocator, call: ToolCall) bool {
-    if (std.mem.eql(u8, call.name, "run_command")) return true;
-    if (!std.mem.eql(u8, call.name, "terminal")) return false;
-    var parsed = std.json.parseFromSlice(std.json.Value, arena, call.arguments_json, .{}) catch return false;
-    defer parsed.deinit();
-    if (parsed.value != .object) return false;
-    const action = parsed.value.object.get("action") orelse return false;
-    return action == .string and std.mem.eql(u8, action.string, "exec");
-}
-
-fn isRequiredTerminalExec(arena: Allocator, call: ToolCall) bool {
-    if (!std.mem.eql(u8, call.name, "terminal")) return false;
-    var parsed = std.json.parseFromSlice(std.json.Value, arena, call.arguments_json, .{}) catch return false;
-    defer parsed.deinit();
-    if (parsed.value != .object) return false;
-    const action = parsed.value.object.get("action") orelse return false;
-    if (action != .string or !std.mem.eql(u8, action.string, "exec")) return false;
-    const timeout = parsed.value.object.get("timeout_ms") orelse return false;
-    return timeout == .integer;
 }
 
 fn selectedCommandSource(
@@ -573,7 +573,7 @@ test "exact command sources delete replay and missing handles retain it" {
     stored_capture.setComparisonLimit(body.items.len);
     stored_capture.appendAccepted(arena, .stdout, body.items);
     stored_capture.seal(arena);
-    var stored_prepared = try prepareToolModelOutput(
+    var stored_prepared = try prepareCapturedToolModelOutput(
         arena,
         .{
             .system_prompt = "",
@@ -585,6 +585,7 @@ test "exact command sources delete replay and missing handles retain it" {
         },
         toolCall("command_stored_exact", "run_command", "{}"),
         stored_source,
+        stored_capture,
     );
     try std.testing.expect(stored_prepared.memory.output_handle != null);
     try finalizeCommandReplay(
@@ -737,6 +738,7 @@ test "required terminal exec retains exact replay and publishes its handle" {
     const arena = arena_state.allocator();
 
     const capture = try command_replay_store.Capture.create(arena, 64 * 1024, &capability);
+    capture.setPolicyBeforeCapture(.required);
     capture.appendAccepted(arena, .stdout, "one\n");
     capture.seal(arena);
     var prepared = result_store.PreparedResult{
@@ -807,11 +809,12 @@ test "required terminal exec stores large output only as replay" {
     const tool_call = toolCall(
         "terminal_large",
         "terminal",
-        "{\"action\":\"exec\",\"command\":\"large\",\"timeout_ms\":600000}",
+        "{}",
     );
     const capture = try command_replay_store.Capture.create(arena, 1024, &capability);
+    capture.setPolicyBeforeCapture(.required);
     try capture.appendAcceptedRequired(arena, .stdout, body);
-    var prepared = try prepareToolModelOutput(arena, .{
+    var prepared = try prepareCapturedToolModelOutput(arena, .{
         .system_prompt = "",
         .gateway_retry_count = 0,
         .gateway_chat_url = "",
@@ -819,7 +822,7 @@ test "required terminal exec stores large output only as replay" {
         .max_tool_result_bytes = tool_result_limits.min_configured_tool_result_bytes,
         .cancel_flag = &cancel,
         .session_child_capability = &capability,
-    }, tool_call, raw_output);
+    }, tool_call, raw_output, capture);
     try std.testing.expect(prepared.memory.output_handle == null);
     try finalizeCommandReplay(
         arena,

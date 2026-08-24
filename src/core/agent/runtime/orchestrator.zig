@@ -6792,7 +6792,13 @@ fn processQueuedPromptLoop(
             defer if (!replay_handed_off) {
                 execution.command_replay_capture.?.discard(arena);
             };
-            var prepared = try runtime_execution_memory.prepareToolModelOutput(arena, config, tool_call, execution.model_output);
+            var prepared = try runtime_execution_memory.prepareCapturedToolModelOutput(
+                arena,
+                config,
+                tool_call,
+                execution.model_output,
+                execution.command_replay_capture,
+            );
             runtime_execution_memory.applyToolResultMemory(
                 &prepared.memory,
                 execution.tool_result_memory,

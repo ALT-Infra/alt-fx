@@ -1200,6 +1200,28 @@ fn effectiveCommandTimeout(
     };
 }
 
+fn commandReplayPolicy(
+    environment: command_environment.Environment,
+    has_replay_capability: bool,
+    interactive: bool,
+    continued: ?command_replay_store.CapturePolicy,
+) ?command_replay_store.CapturePolicy {
+    if (continued) |policy| return policy;
+    return switch (environment) {
+        .workspace_clean => null,
+        .legacy => if (has_replay_capability or interactive)
+            .best_effort
+        else
+            null,
+        .clean, .user => if (has_replay_capability)
+            .required
+        else if (interactive)
+            .best_effort
+        else
+            null,
+    };
+}
+
 fn toolRunCommand(
     ctx: Context,
     arena: Allocator,
@@ -1221,11 +1243,13 @@ fn toolRunCommand(
         ctx.command_timeout_started_ms,
         io_mod.milliTimestamp(),
     );
-    const replay_required = ctx.session_child_capability != null or
-        ctx.ephemeral_command_replay != null;
-    const replay_enabled = ctx.interactive or
-        replay_required or
-        ctx.command_replay_capture != null;
+    const replay_policy = commandReplayPolicy(
+        request.environment,
+        ctx.session_child_capability != null or
+            ctx.ephemeral_command_replay != null,
+        ctx.interactive,
+        if (ctx.command_replay_capture) |capture| capture.policy() else null,
+    );
 
     if (comptime builtin.os.tag == .wasi or builtin.is_test) {
         if (ctx.workspace_executor) |executor| {
@@ -1256,8 +1280,7 @@ fn toolRunCommand(
         if (route != .approved_shell) return error.CommandAdmissionChanged;
         const intercepted_replay = try initCommandReplayCapture(
             arena,
-            replay_enabled,
-            replay_required,
+            replay_policy,
             ctx.max_command_output_bytes,
             ctx.max_command_output_bytes,
             ctx.session_child_capability,
@@ -1273,7 +1296,6 @@ fn toolRunCommand(
         var callback = CommandReplayCaptureCallback{
             .alloc = arena,
             .capture = capture,
-            .required = replay_required,
         };
         const output = switch (compatibility) {
             .success => |body| body,
@@ -1303,7 +1325,7 @@ fn toolRunCommand(
                 output,
             );
         }
-        if (try requiredCaptureFailure(arena, capture, replay_required)) |capture_failure| {
+        if (try requiredCaptureFailure(arena, capture, replay_policy)) |capture_failure| {
             return finishCommandToolResult(
                 capture,
                 false,
@@ -1330,8 +1352,7 @@ fn toolRunCommand(
 
     const replay_init = try initCommandReplayCapture(
         arena,
-        replay_enabled,
-        replay_required,
+        replay_policy,
         ctx.max_command_output_bytes,
         execution_router.foregroundResultComparisonLimit(
             route,
@@ -1350,7 +1371,6 @@ fn toolRunCommand(
     var replay_callback = CommandReplayCaptureCallback{
         .alloc = arena,
         .capture = replay_capture,
-        .required = replay_required,
     };
 
     const routed = execution_router.executePreparedRoute(.{
@@ -1368,7 +1388,7 @@ fn toolRunCommand(
         .command_artifact_dir = ctx.command_artifact_dir,
     }, arena, route) catch |err| {
         if (err == error.TimeoutExpired) {
-            if (try requiredCaptureFailure(arena, replay_capture, replay_required)) |capture_failure| {
+            if (try requiredCaptureFailure(arena, replay_capture, replay_policy)) |capture_failure| {
                 return finishCommandToolResult(
                     replay_capture,
                     false,
@@ -1400,7 +1420,7 @@ fn toolRunCommand(
             try command_result_mapping.Foreground.outputCaptureFailure(arena),
         );
         if (err == error.Cancelled and runtimeCancelFlag(ctx).load(.seq_cst)) {
-            if (try requiredCaptureFailure(arena, replay_capture, replay_required)) |capture_failure| {
+            if (try requiredCaptureFailure(arena, replay_capture, replay_policy)) |capture_failure| {
                 return finishCommandToolResult(
                     replay_capture,
                     false,
@@ -1426,7 +1446,7 @@ fn toolRunCommand(
     };
     const result = routed.result;
 
-    if (try requiredCaptureFailure(arena, replay_capture, replay_required)) |capture_failure| {
+    if (try requiredCaptureFailure(arena, replay_capture, replay_policy)) |capture_failure| {
         return finishCommandToolResult(
             replay_capture,
             false,
@@ -1546,7 +1566,6 @@ fn executeWorkspaceRunCommand(
 const CommandReplayCaptureCallback = struct {
     alloc: Allocator,
     capture: ?*command_replay_store.Capture,
-    required: bool,
     had_accepted_output: bool = false,
 
     fn onChunk(
@@ -1569,10 +1588,13 @@ const CommandReplayCaptureCallback = struct {
         if (chunk.len == 0) return;
         self.had_accepted_output = true;
         if (self.capture) |capture| {
-            if (self.required) {
-                try capture.appendAcceptedRequired(self.alloc, stream, chunk);
-            } else {
-                capture.appendAccepted(self.alloc, stream, chunk);
+            switch (capture.policy()) {
+                .required => try capture.appendAcceptedRequired(
+                    self.alloc,
+                    stream,
+                    chunk,
+                ),
+                .best_effort => capture.appendAccepted(self.alloc, stream, chunk),
             }
         }
     }
@@ -1585,8 +1607,7 @@ const CommandReplayCaptureInit = struct {
 
 fn initCommandReplayCapture(
     arena: Allocator,
-    enabled: bool,
-    required: bool,
+    replay_policy: ?command_replay_store.CapturePolicy,
     inline_limit: usize,
     comparison_limit: usize,
     capability: ?*session_child_store.SessionChildCapability,
@@ -1594,23 +1615,23 @@ fn initCommandReplayCapture(
     continued_capture: ?*command_replay_store.Capture,
     continued_unavailable: bool,
 ) !CommandReplayCaptureInit {
-    if (!enabled) return .{};
+    const policy = replay_policy orelse return .{};
     if (continued_unavailable) {
-        if (required) return error.CommandOutputCaptureFailed;
+        if (policy == .required) return error.CommandOutputCaptureFailed;
         return .{ .unavailable = true };
     }
     if (continued_capture) |capture| {
         capture.setComparisonLimit(comparison_limit);
         return .{ .capture = capture };
     }
-    const capture_inline_limit = if (required) 0 else inline_limit;
+    const capture_inline_limit = if (policy == .required) 0 else inline_limit;
     const capture = (if (capability) |saved|
         command_replay_store.Capture.create(arena, capture_inline_limit, saved)
     else if (ephemeral_store) |ephemeral|
         command_replay_store.Capture.createEphemeral(arena, capture_inline_limit, ephemeral)
     else
         command_replay_store.Capture.create(arena, capture_inline_limit, null)) catch |err| {
-        if (required) return err;
+        if (policy == .required) return err;
         debug_trace.logf(
             "session",
             "command replay capture initialization unavailable err={s}",
@@ -1618,6 +1639,7 @@ fn initCommandReplayCapture(
         );
         return .{ .unavailable = true };
     };
+    capture.setPolicyBeforeCapture(policy);
     capture.setComparisonLimit(comparison_limit);
     return .{ .capture = capture };
 }
@@ -1625,9 +1647,9 @@ fn initCommandReplayCapture(
 fn requiredCaptureFailure(
     arena: Allocator,
     capture: ?*command_replay_store.Capture,
-    required: bool,
+    policy: ?command_replay_store.CapturePolicy,
 ) !?ToolExecutionResult {
-    if (!required) return null;
+    if (policy != .required) return null;
     const candidate = capture orelse {
         return @as(?ToolExecutionResult, try command_result_mapping.Foreground.outputCaptureFailure(arena));
     };
@@ -6186,6 +6208,67 @@ test "effective command timeout uses the earlier remaining budget" {
     );
 }
 
+test "command replay policy is decided once from typed execution context" {
+    const Case = struct {
+        environment: command_environment.Environment,
+        has_replay_capability: bool,
+        interactive: bool,
+        continued: ?command_replay_store.CapturePolicy = null,
+        expected: ?command_replay_store.CapturePolicy,
+    };
+    const cases = [_]Case{
+        .{
+            .environment = .{ .clean = "/bin/zsh" },
+            .has_replay_capability = true,
+            .interactive = false,
+            .expected = .required,
+        },
+        .{
+            .environment = .{ .user = "/bin/zsh" },
+            .has_replay_capability = false,
+            .interactive = true,
+            .expected = .best_effort,
+        },
+        .{
+            .environment = .{ .clean = "/bin/zsh" },
+            .has_replay_capability = false,
+            .interactive = false,
+            .expected = null,
+        },
+        .{
+            .environment = .legacy,
+            .has_replay_capability = true,
+            .interactive = false,
+            .expected = .best_effort,
+        },
+        .{
+            .environment = .workspace_clean,
+            .has_replay_capability = true,
+            .interactive = true,
+            .expected = null,
+        },
+        .{
+            .environment = .{ .clean = "/bin/zsh" },
+            .has_replay_capability = true,
+            .interactive = false,
+            .continued = .best_effort,
+            .expected = .best_effort,
+        },
+    };
+
+    for (cases) |case| {
+        try std.testing.expectEqual(
+            case.expected,
+            commandReplayPolicy(
+                case.environment,
+                case.has_replay_capability,
+                case.interactive,
+                case.continued,
+            ),
+        );
+    }
+}
+
 test "terminal exec request timeout reaches execution without an ambient timeout" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
 
@@ -6249,10 +6332,15 @@ test "saved noninteractive terminal exec captures replay by capability" {
         .name = "terminal",
         .arguments_json = "{\"action\":\"exec\",\"command\":\"printf replay\",\"profile\":\"clean\",\"timeout_ms\":600000}",
     });
-    defer if (result.command_replay_capture) |capture| capture.abort(arena_state.allocator());
+    defer if (result.command_replay_capture) |capture| {
+        capture.abort(arena_state.allocator());
+    };
 
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
-    try std.testing.expect(result.command_replay_capture != null);
+    try std.testing.expectEqual(
+        command_replay_store.CapturePolicy.required,
+        result.command_replay_capture.?.policy(),
+    );
 }
 
 test "no-save terminal exec publishes one readable ephemeral replay" {
@@ -6286,7 +6374,7 @@ test "no-save terminal exec publishes one readable ephemeral replay" {
     var handed_off = false;
     defer if (!handed_off) capture.discard(arena);
     var cancel = std.atomic.Value(bool).init(false);
-    var prepared = try runtime_execution_memory.prepareToolModelOutput(
+    var prepared = try runtime_execution_memory.prepareCapturedToolModelOutput(
         arena,
         .{
             .system_prompt = "",
@@ -6298,6 +6386,7 @@ test "no-save terminal exec publishes one readable ephemeral replay" {
         },
         tool_call,
         result.model_output,
+        capture,
     );
     try std.testing.expect(prepared.memory.output_handle == null);
     try runtime_execution_memory.finalizeCommandReplay(
@@ -6370,7 +6459,9 @@ test "required replay spill failure returns recoverable capture failure" {
         .name = "terminal",
         .arguments_json = "{\"action\":\"exec\",\"command\":\"printf xx\",\"profile\":\"clean\",\"timeout_ms\":600000}",
     });
-    defer if (result.command_replay_capture) |capture| capture.abort(arena_state.allocator());
+    defer if (result.command_replay_capture) |capture| {
+        capture.abort(arena_state.allocator());
+    };
 
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
     try expectContains(result.model_output, "\"output_capture_failed\":true");
@@ -6468,11 +6559,12 @@ test "run_command timeout returns model-visible failure" {
         .cancel_flag = &cancel,
         .session_child_capability = &capability,
     };
-    var prepared = try runtime_execution_memory.prepareToolModelOutput(
+    var prepared = try runtime_execution_memory.prepareCapturedToolModelOutput(
         arena,
         config,
         tool_call,
         result.model_output,
+        capture,
     );
     runtime_execution_memory.applyToolResultMemory(
         &prepared.memory,
@@ -6584,8 +6676,7 @@ test "interactive command replay capture allocation fails open" {
     );
     const init = try initCommandReplayCapture(
         failing.allocator(),
-        true,
-        false,
+        .best_effort,
         64 * 1024,
         64 * 1024,
         null,
@@ -6599,7 +6690,6 @@ test "interactive command replay capture allocation fails open" {
     var callback = CommandReplayCaptureCallback{
         .alloc = std.testing.allocator,
         .capture = null,
-        .required = false,
     };
     try CommandReplayCaptureCallback.onChunk(
         @ptrCast(&callback),
