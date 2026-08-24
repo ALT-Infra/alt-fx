@@ -1601,6 +1601,52 @@ test "agent command replay keeps split utf8 valid and omits oversized secret-bea
     try std.testing.expect(std.mem.find(u8, page, "after oversized line") != null);
 }
 
+test "agent command replay omits oversized sensitive assignments split after delimiters" {
+    const alloc = std.testing.allocator;
+    const delimiters = [_][]const u8{ "=", "=\"", "='" };
+
+    for (delimiters) |delimiter| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const temp_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+        defer alloc.free(temp_path);
+        var store = EphemeralStore.initForTesting(alloc, temp_path);
+        defer store.deinit();
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const key =
+            "MY_VERY_LONG_TOKEN_KEY_THAT_CONTINUES_BEYOND_THE_RETAINED_" ++
+            "SIXTY_FOUR_BYTE_SUFFIX";
+        const prefix_len = max_agent_line_bytes - key.len - delimiter.len;
+        const prefix = try arena.alloc(u8, prefix_len);
+        @memset(prefix, 'x');
+
+        const capture = try Capture.createEphemeral(arena, 0, &store);
+        try capture.appendAcceptedRequired(arena, .stdout, prefix);
+        try capture.appendAcceptedRequired(arena, .stdout, key);
+        try capture.appendAcceptedRequired(arena, .stdout, delimiter);
+        try capture.appendAcceptedRequired(arena, .stdout, "secret-after-boundary\nafter line\n");
+        const descriptor = (try capture.retainRequired(arena)) orelse
+            return error.TestExpectedReplay;
+        defer capture.releaseRetained(arena);
+
+        const page = try readAgentPageEphemeral(
+            alloc,
+            &store,
+            descriptor.handle,
+            1,
+            4096,
+        );
+        defer alloc.free(page);
+        try std.testing.expect(std.mem.find(u8, page, "output line omitted") != null);
+        try std.testing.expect(std.mem.find(u8, page, "MY_VERY_LONG_TOKEN_KEY") == null);
+        try std.testing.expect(std.mem.find(u8, page, "secret-after-boundary") == null);
+        try std.testing.expect(std.mem.find(u8, page, "after line") != null);
+    }
+}
+
 test "agent command replay streams non-secret oversized lines without omission" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

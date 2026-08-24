@@ -453,6 +453,27 @@ pub fn maskSecrets(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
 pub fn secretMayCrossBoundary(text: []const u8, retained_suffix_bytes: usize) bool {
     const retained_start = text.len -| retained_suffix_bytes;
 
+    var assignment_end = text.len;
+    if (assignment_end > 0 and
+        (text[assignment_end - 1] == '"' or text[assignment_end - 1] == '\''))
+    {
+        assignment_end -= 1;
+    }
+    if (assignment_end > 0 and text[assignment_end - 1] == '=') {
+        const key_end = assignment_end - 1;
+        var unfinished_key_start = key_end;
+        while (unfinished_key_start > 0 and
+            isAssignmentKeyChar(text[unfinished_key_start - 1]))
+        {
+            unfinished_key_start -= 1;
+        }
+        if (unfinished_key_start < retained_start and
+            sensitiveAssignmentKey(text[unfinished_key_start..key_end]))
+        {
+            return true;
+        }
+    }
+
     var key_start = text.len;
     while (key_start > 0 and isAssignmentKeyChar(text[key_start - 1])) {
         key_start -= 1;
@@ -986,6 +1007,18 @@ test "secret boundary analysis preserves resolved URLs and catches unfinished ca
     ));
     try std.testing.expect(secretMayCrossBoundary(
         "MY_VERY_LONG_TOKEN_KEY",
+        4,
+    ));
+    try std.testing.expect(secretMayCrossBoundary(
+        "MY_VERY_LONG_TOKEN_KEY=",
+        4,
+    ));
+    try std.testing.expect(secretMayCrossBoundary(
+        "MY_VERY_LONG_TOKEN_KEY=\"",
+        4,
+    ));
+    try std.testing.expect(secretMayCrossBoundary(
+        "MY_VERY_LONG_TOKEN_KEY='",
         4,
     ));
     try std.testing.expect(secretMayCrossBoundary(
