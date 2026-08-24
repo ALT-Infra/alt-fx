@@ -1896,6 +1896,15 @@ tmuxTest(
     await session.waitForText("Vercel account", TIMEOUT);
     await session.sendKeys("Enter");
     await session.waitForText("Vercel team · Search:", TIMEOUT);
+    await session.sendKeys("Escape");
+    const setupAfterSignIn = await session.waitForPane(
+      (pane) => pane.includes("Setup") && /Connections\s+connected/.test(pane),
+      TIMEOUT,
+    );
+    expect(setupAfterSignIn).toMatch(/^› Vercel team\s+choose a team$/m);
+    expect(setupAfterSignIn).not.toContain("sign in to manage");
+    await session.sendKeys("Enter");
+    await session.waitForText("Vercel team · Search:", TIMEOUT);
     await session.resizeWindow(80, 5);
     await session.sendLiteralText("example");
     await session.waitForPane((pane) => pane.includes("Search: example"), TIMEOUT);

@@ -1444,6 +1444,7 @@ pub const Runtime = struct {
         credential.team_id = null;
         credential.team_slug = null;
         self.source_inventory.insert(source);
+        if (source == .fx_login) self.fx_login_session_available = true;
         if (source == .stored_key) self.stored_key_status = .not_attempted;
         return changed;
     }
@@ -2450,6 +2451,20 @@ test "setup picker projects the active Vercel team" {
     const current_team = runtime.pickerView().current_team;
     try std.testing.expect(current_team != null);
     try std.testing.expectEqualStrings("team_1", current_team.?);
+}
+
+test "adopting fx login publishes Vercel session availability to setup" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    var credential = try makeTestCredential(alloc, "token", .fx_login, null, null);
+    defer credential.deinit(alloc);
+
+    _ = runtime.adoptCredential(alloc, &credential);
+
+    const picker = runtime.pickerView();
+    try std.testing.expect(picker.fx_login_session_available);
+    try std.testing.expect(picker.choiceEnabled(.{ .action = .change_team }));
 }
 
 test "connections picker closes before returning its typed choice" {

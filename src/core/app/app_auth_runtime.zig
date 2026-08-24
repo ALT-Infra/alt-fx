@@ -1499,10 +1499,6 @@ const TestAuth = struct {
         self.refresh_failure_source = source;
     }
 
-    fn openPicker(self: *TestAuth, _: std.mem.Allocator) void {
-        self.picker_opened = true;
-    }
-
     fn openPickerForProvider(
         self: *TestAuth,
         _: std.mem.Allocator,
