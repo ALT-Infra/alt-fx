@@ -136,6 +136,31 @@ pub fn buildInterruptedExecutionMemory(
     return buildExecutionMemory(alloc, filtered.items);
 }
 
+pub fn retainCancelledCommandReplay(
+    arena: Allocator,
+    result_memory: ?types.ToolResultMemory,
+    capture: ?*command_replay_store.Capture,
+) ?types.CancelledCommandPresentation {
+    if (capture) |candidate| {
+        const descriptor = candidate.retainRequired(arena) catch |err| {
+            debug_trace.logf(
+                "session",
+                "cancelled command replay retention unavailable err={s}",
+                .{@errorName(err)},
+            );
+            return .{ .output_replay = .unavailable };
+        };
+        if (descriptor) |value| {
+            return .{ .output_replay = .{ .available = value } };
+        }
+    }
+    const replay = if (result_memory) |memory|
+        memory.command_output_replay
+    else
+        null;
+    return if (replay) |value| .{ .output_replay = value } else null;
+}
+
 test "interrupted execution memory retains marked feedback through mixed user tail" {
     const alloc = std.testing.allocator;
     var calls = [_]ToolCall{

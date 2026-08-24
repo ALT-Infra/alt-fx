@@ -3118,6 +3118,118 @@ describe("gateway stream lifecycle", () => {
     }
   }, 20_000);
 
+  test("saved SIGINT retains cancelled terminal output for resume without re-execution", async () => {
+    const root = createFixtureRoot("saved-cancelled-terminal-replay");
+    const firstTracePath = join(root.root, "first-trace.log");
+    const resumeTracePath = join(root.root, "resume-trace.log");
+    const readyPath = join(root.workspace, "cancelled-command.ready");
+    const executionsPath = join(root.workspace, "cancelled-executions.txt");
+    const commandCallId = "saved_cancelled_terminal_1";
+    const readCallId = "saved_cancelled_replay_read_1";
+    const command = [
+      "printf 'run\\n' >> cancelled-executions.txt",
+      "printf 'CANCELLED-REPLAY-NEEDLE\\n'",
+      `printf ready > ${JSON.stringify(readyPath)}`,
+      "trap 'exit 0' TERM",
+      "while :; do sleep 1; done",
+    ].join("; ");
+    let phase: "initial" | "resume" = "initial";
+    let resumeStep = 0;
+    let replayHandle = "";
+    const gateway = startGateway((body) => {
+      if (phase === "initial") {
+        return fakeGatewayToolCall(commandCallId, "terminal", {
+          action: "exec",
+          command,
+          profile: "clean",
+          timeout_ms: 600_000,
+        });
+      }
+      if (resumeStep++ === 0) {
+        return fakeGatewayToolCall(readCallId, "read_tool_result", {
+          handle: replayHandle,
+          query: "CANCELLED-REPLAY-NEEDLE",
+        });
+      }
+      expect(toolResultOutput(body, readCallId)).toContain(
+        "CANCELLED-REPLAY-NEEDLE",
+      );
+      return fakeGatewayFinalText("Cancelled replay inspected after resume.");
+    });
+    const proc = Bun.spawn(
+      [FX_BIN, "ask", "--json", "--yolo", "Run the cancellable command fixture."],
+      {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, firstTracePath),
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    );
+
+    try {
+      const startDeadline = Date.now() + 10_000;
+      while (!existsSync(readyPath)) {
+        if (Date.now() >= startDeadline) {
+          throw new Error("cancellable terminal command did not start");
+        }
+        await Bun.sleep(10);
+      }
+      proc.kill("SIGINT");
+      const exitCode = await proc.exited;
+      const stderr = await new Response(proc.stderr).text();
+      expect(exitCode).toBe(130);
+      expect(proc.signalCode).toBe("SIGINT");
+      expect(stderr).not.toContain("panic: reached unreachable code");
+
+      const latest = await runFx(["session", "last", "--json"], {
+        cwd: root.workspace,
+        env: { HOME: root.home },
+      });
+      expect(latest.code).toBe(0);
+      const sessionId = JSON.parse(latest.stdout).id as string;
+      const sessionRoot = join(root.home, ".fx", "sessions", sessionId);
+      const events = readFileSync(join(sessionRoot, "events.jsonl"), "utf8");
+      const replayMatch = events.match(
+        /"cancelled_command":\{"output_replay":\{"kind":"available","handle":"([^"]+)"/,
+      );
+      replayHandle = replayMatch?.[1] ?? "";
+      expect(replayHandle).not.toBe("");
+      expect(
+        readdirSync(join(sessionRoot, "logs", "commands")).filter((name) =>
+          name.endsWith(".bin")
+        ),
+      ).toHaveLength(1);
+
+      phase = "resume";
+      const resumed = await runFx(
+        [
+          "ask",
+          "--json",
+          "--yolo",
+          "--resume-id",
+          sessionId,
+          "Inspect the cancelled command output.",
+        ],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, resumeTracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      expect(resumed.code).toBe(0);
+      expect(parseAskJson(resumed.stdout).output).toContain(
+        "Cancelled replay inspected after resume.",
+      );
+      expect(readFileSync(executionsPath, "utf8")).toBe("run\n");
+      expect(gateway.requestCount()).toBe(3);
+    } finally {
+      if (proc.exitCode === null) proc.kill("SIGKILL");
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test(
     "nine saved turns stay canonical while the next request uses bounded context",
     async () => {

@@ -17,10 +17,10 @@ pub const Foreground = struct {
         result: command_contract.RunCommandResult,
     ) !?ToolExecutionResult {
         if (!result.cancelled) return null;
-        const command_result_json = if (result.command_result) |command_result|
-            command_result.toJson(arena) catch |err| {
+        const command_result_json: ?[]const u8 = if (result.command_result) |command_result|
+            command_result.toJson(arena) catch |err| blk: {
                 debug_trace.logf("tool", "cancelled command result metadata omitted err={s}", .{@errorName(err)});
-                return error.Cancelled;
+                break :blk null;
             }
         else
             null;
@@ -368,17 +368,18 @@ test "cancelled command mapping survives metadata serialization failure" {
         std.testing.allocator,
         .{ .fail_index = 0 },
     );
-    try std.testing.expectError(
-        error.Cancelled,
-        Foreground.cancelledFailure(failing.allocator(), .{
-            .output = "ignored",
-            .cancelled = true,
-            .command_result = .{ .foreground = .{
-                .command = "sleep 5",
-                .cwd = "/tmp",
-            } },
-        }),
-    );
+    const result = (try Foreground.cancelledFailure(failing.allocator(), .{
+        .output = "ignored",
+        .cancelled = true,
+        .command_result = .{ .foreground = .{
+            .command = "sleep 5",
+            .cwd = "/tmp",
+        } },
+    })) orelse return error.TestExpectedEqual;
+    try std.testing.expect(result.cancelled);
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
+    try std.testing.expectEqualStrings("command cancelled\n", result.model_output);
+    try std.testing.expect(result.command_result_json == null);
 }
 
 test "command result mapping preserves timeout JSON" {

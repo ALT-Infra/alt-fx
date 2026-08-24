@@ -1399,6 +1399,29 @@ fn toolRunCommand(
             null,
             try command_result_mapping.Foreground.outputCaptureFailure(arena),
         );
+        if (err == error.Cancelled and runtimeCancelFlag(ctx).load(.seq_cst)) {
+            if (try requiredCaptureFailure(arena, replay_capture, replay_required)) |capture_failure| {
+                return finishCommandToolResult(
+                    replay_capture,
+                    false,
+                    &replay_transferred,
+                    null,
+                    capture_failure,
+                );
+            }
+            return finishCommandToolResult(
+                replay_capture,
+                replay_init.unavailable and
+                    (ctx.command_replay_unavailable or replay_callback.had_accepted_output),
+                &replay_transferred,
+                null,
+                .{
+                    .status = .failure,
+                    .cancelled = true,
+                    .model_output = "command cancelled\n",
+                },
+            );
+        }
         return err;
     };
     const result = routed.result;

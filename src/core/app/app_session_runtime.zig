@@ -2629,6 +2629,31 @@ pub fn Runtime(comptime App: type) type {
                 return appendHistoryTurnWithOutcome(app, turn, mode, snapshot_file_ownership);
             }
 
+            if (interrupted.cancelled_command) |authoritative| {
+                const shares_replay = pendingReplayMatchesAuthoritative(
+                    app.alloc,
+                    &pending,
+                    authoritative.output_replay,
+                );
+                defer if (shares_replay)
+                    pending.releaseRetained(app.alloc)
+                else
+                    pending.discard(app.alloc);
+                var enriched_presentation = authoritative;
+                if (enriched_presentation.command_artifact_handle == null) {
+                    enriched_presentation.command_artifact_handle =
+                        pending.command_artifact_handle;
+                }
+                var enriched_interrupted = interrupted;
+                enriched_interrupted.cancelled_command = enriched_presentation;
+                return appendHistoryTurnWithExternallyOwnedCancelledReplay(
+                    app,
+                    .{ .interrupted = enriched_interrupted },
+                    mode,
+                    snapshot_file_ownership,
+                );
+            }
+
             const output_replay = if (pending.capture) |capture|
                 capture.retain(app.alloc)
             else
@@ -2641,6 +2666,28 @@ pub fn Runtime(comptime App: type) type {
             const enriched: types.HistoryTurn = .{ .interrupted = enriched_interrupted };
             defer pending.releaseRetained(app.alloc);
             return appendHistoryTurnWithOutcome(app, enriched, mode, snapshot_file_ownership);
+        }
+
+        fn pendingReplayMatchesAuthoritative(
+            alloc: Allocator,
+            pending: *PendingCancelledCommand,
+            authoritative: ?types.CommandOutputReplay,
+        ) bool {
+            const authoritative_descriptor = switch (authoritative orelse
+                return false) {
+                .available => |descriptor| descriptor,
+                .unavailable => return false,
+            };
+            const capture = pending.capture orelse return false;
+            const fallback = capture.retain(alloc) orelse return false;
+            return switch (fallback) {
+                .available => |descriptor| std.mem.eql(
+                    u8,
+                    descriptor.handle,
+                    authoritative_descriptor.handle,
+                ),
+                .unavailable => false,
+            };
         }
 
         fn ensurePendingCancelledCommand(
@@ -2723,10 +2770,48 @@ pub fn Runtime(comptime App: type) type {
             mode: AppendHistoryMode,
             snapshot_file_ownership: ?types.SnapshotFileOwnership,
         ) !HistoryAppendOutcome {
+            return appendHistoryTurnWithReplayCleanup(
+                app,
+                turn,
+                mode,
+                snapshot_file_ownership,
+                .app_owned,
+            );
+        }
+
+        fn appendHistoryTurnWithExternallyOwnedCancelledReplay(
+            app: *App,
+            turn: types.HistoryTurn,
+            mode: AppendHistoryMode,
+            snapshot_file_ownership: ?types.SnapshotFileOwnership,
+        ) !HistoryAppendOutcome {
+            return appendHistoryTurnWithReplayCleanup(
+                app,
+                turn,
+                mode,
+                snapshot_file_ownership,
+                .external,
+            );
+        }
+
+        const CancelledReplayCleanupOwner = enum {
+            app_owned,
+            external,
+        };
+
+        fn appendHistoryTurnWithReplayCleanup(
+            app: *App,
+            turn: types.HistoryTurn,
+            mode: AppendHistoryMode,
+            snapshot_file_ownership: ?types.SnapshotFileOwnership,
+            replay_owner: CancelledReplayCleanupOwner,
+        ) !HistoryAppendOutcome {
             var inserted = false;
             defer {
                 if (comptime @hasField(App, "session_persistence")) {
-                    if (!inserted) discardUncommittedCancelledReplay(app, turn);
+                    if (!inserted and replay_owner == .app_owned) {
+                        discardUncommittedCancelledReplay(app, turn);
+                    }
                 }
             }
             app.session.appendHistoryEntry(app.alloc, turn) catch |err| {
@@ -8311,6 +8396,122 @@ test "cancelled command capture creation failure preserves the row" {
     try std.testing.expect(presentation.output_replay == null);
 }
 
+fn expectAuthoritativeCancelledReplayReconciliation(
+    fallback_output: []const u8,
+) !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    const capability = Runtime(TestApp).childCapability(&app) orelse
+        return error.TestExpectedSessionCapability;
+    const authoritative = try command_replay_store.Capture.create(
+        alloc,
+        1,
+        capability,
+    );
+    try authoritative.appendAcceptedRequired(
+        alloc,
+        .stdout,
+        "SHARED-CANCELLED-OUTPUT\n",
+    );
+    const descriptor = (try authoritative.retainRequired(alloc)) orelse
+        return error.TestExpectedReplay;
+    var published = false;
+    defer {
+        if (published)
+            authoritative.releaseRetained(alloc)
+        else
+            authoritative.discard(alloc);
+        alloc.destroy(authoritative);
+    }
+
+    const lifecycle_id = types.ToolLifecycleId{
+        .turn_id = 9,
+        .call_id = "authoritative-cancelled-command",
+    };
+    Runtime(TestApp).recordAppliedCommandOutput(
+        &app,
+        lifecycle_id,
+        .stdout,
+        fallback_output,
+    );
+    Runtime(TestApp).recordToolTerminal(
+        &app,
+        .{ .terminal = .{
+            .id = lifecycle_id,
+            .outcome = .{ .kind = .cancelled, .summary = "Cancelled" },
+            .command_artifact_handle = "fx-command-cancelled.log",
+        } },
+        true,
+    );
+    Runtime(TestApp).recordCommandOutputComplete(&app, lifecycle_id);
+
+    try Runtime(TestApp).appendHistoryTurn(&app, .{ .interrupted = .{
+        .user = .{ .text = @constCast("cancel") },
+        .tool_call = .{
+            .id = "authoritative-cancelled-command",
+            .name = "terminal",
+            .arguments_json = "{\"action\":\"exec\",\"command\":\"slow\",\"timeout_ms\":600000}",
+        },
+        .cancelled_command = .{
+            .output_replay = .{ .available = descriptor },
+        },
+    } });
+    published = true;
+
+    const history = try app.session.snapshotHistory(alloc);
+    defer session_runtime.freeHistoryTurnSlice(alloc, history);
+    const stored = switch (history[0].interrupted.cancelled_command.?
+        .output_replay orelse return error.TestExpectedReplay) {
+        .available => |value| value,
+        .unavailable => return error.TestExpectedReplay,
+    };
+    try std.testing.expectEqualStrings(descriptor.handle, stored.handle);
+    try std.testing.expectEqualStrings(
+        "fx-command-cancelled.log",
+        history[0].interrupted.cancelled_command.?
+            .command_artifact_handle orelse return error.TestExpectedArtifactHandle,
+    );
+    const page = try command_replay_store.readAgentPageManaged(
+        alloc,
+        capability,
+        stored.handle,
+        1,
+        4096,
+    );
+    defer alloc.free(page);
+    try std.testing.expect(
+        std.mem.find(u8, page, "SHARED-CANCELLED-OUTPUT") != null,
+    );
+    if (!std.mem.eql(u8, fallback_output, "SHARED-CANCELLED-OUTPUT\n")) {
+        try std.testing.expect(std.mem.find(u8, page, fallback_output) == null);
+    }
+    var artifacts = try capability.iterate(alloc, .command_artifacts);
+    defer artifacts.deinit();
+    try std.testing.expectEqual(@as(usize, 1), artifacts.names.len);
+}
+
+test "authoritative cancelled replay reconciles shared and distinct app captures" {
+    try expectAuthoritativeCancelledReplayReconciliation(
+        "SHARED-CANCELLED-OUTPUT\n",
+    );
+    try expectAuthoritativeCancelledReplayReconciliation(
+        "DISTINCT-APP-CAPTURE\n",
+    );
+}
+
 test "cancelled command identity failure never persists a replay suffix" {
     const alloc = std.testing.allocator;
     var failing = std.testing.FailingAllocator.init(alloc, .{});
@@ -8707,6 +8908,73 @@ test "cancelled replay is deleted when history insertion fails" {
         error.FileNotFound,
         capability.stat(.command_artifacts, descriptor.handle),
     );
+}
+
+test "externally owned cancelled replay survives history insertion failure" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    const capability = Runtime(TestApp).childCapability(&app).?;
+    var capture_arena = std.heap.ArenaAllocator.init(alloc);
+    defer capture_arena.deinit();
+    const capture_alloc = capture_arena.allocator();
+    const capture = try command_replay_store.Capture.create(
+        capture_alloc,
+        1,
+        capability,
+    );
+    try capture.appendAcceptedRequired(
+        capture_alloc,
+        .stdout,
+        "externally owned\n",
+    );
+    const descriptor = (try capture.retainRequired(capture_alloc)) orelse
+        return error.TestExpectedReplay;
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    app.alloc = failing.allocator();
+    defer app.alloc = alloc;
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        Runtime(TestApp).appendHistoryTurnWithExternallyOwnedCancelledReplay(
+            &app,
+            .{ .interrupted = .{
+                .user = .{ .text = @constCast("cancel") },
+                .tool_call = .{
+                    .id = "failed-external-insert",
+                    .name = "terminal",
+                    .arguments_json = "{\"action\":\"exec\",\"command\":\"slow\",\"timeout_ms\":600000}",
+                },
+                .cancelled_command = .{
+                    .output_replay = .{ .available = descriptor },
+                },
+            } },
+            .strict,
+            null,
+        ),
+    );
+    _ = try capability.stat(.command_artifacts, descriptor.handle);
+    const page = try command_replay_store.readAgentPageManaged(
+        alloc,
+        capability,
+        descriptor.handle,
+        1,
+        4096,
+    );
+    defer alloc.free(page);
+    try std.testing.expect(std.mem.find(u8, page, "externally owned") != null);
 }
 
 test "appendHistoryTurn commits canonical history event and totals" {
