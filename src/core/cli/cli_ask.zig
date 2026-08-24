@@ -3904,6 +3904,23 @@ fn testProcessQueuedPromptRecoveryLifecycle(deps: *const agent_runtime.AgentRunt
     try testPushAssistantText(deps, "assistant text");
 }
 
+fn testProcessQueuedPromptRetryAdmissionFailure(deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
+    try std.testing.expect(semantic_presentation == null);
+    try deps.push_route_recovery_status(deps.ctx, .{
+        .kind = .auto_retry,
+        .failed_attempt = 1,
+        .attempt_limit = 2,
+        .delay_seconds = 4,
+    });
+    try deps.push_route_recovery_status(deps.ctx, .{
+        .kind = .terminal_provider_error,
+        .failed_attempt = 1,
+        .attempt_limit = 2,
+        .diagnostic = types.ModelFailureDiagnostic.init("TestProviderSerializationFailed"),
+    });
+    return error.TestProviderSerializationFailed;
+}
+
 fn testProcessQueuedPromptPartialThenReadFailed(deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
     try std.testing.expect(semantic_presentation == null);
     try testPushAssistantText(deps, "partial ");
@@ -8955,6 +8972,34 @@ test "fx ask JSON recovery keeps stdout structured and reports progress on stder
         "[notice] ⚠ Network interrupted · waiting for connection · attempt 1/10\n",
         stderr_capture.bytes.items,
     );
+}
+
+test "fx ask JSON reports the consumed attempt after retry admission failure" {
+    const alloc = std.testing.allocator;
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    const deps = testPromptRunDepsWithProcess(
+        &stdout_capture,
+        &stderr_capture,
+        testProcessQueuedPromptRetryAdmissionFailure,
+    );
+
+    const exit_code = try runWithDeps(alloc, &.{ "--json", "hello" }, testConfig(), deps);
+    try std.testing.expectEqual(@as(u8, 1), exit_code);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stdout_capture.bytes.items, .{});
+    defer parsed.deinit();
+    const recovery = parsed.value.object.get("recovery").?.object;
+    try std.testing.expectEqualStrings("paused", recovery.get("state").?.string);
+    try std.testing.expectEqual(@as(i64, 1), recovery.get("attempt").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), recovery.get("delay_seconds").?.integer);
+    try std.testing.expectEqualStrings(
+        "TestProviderSerializationFailed",
+        parsed.value.object.get("error").?.string,
+    );
+    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "retrying request in 4s · attempt 1/2") != null);
+    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "recovery paused after 1/2 attempts") != null);
 }
 
 test "fx ask JSON preserves partial output on prompt failure" {

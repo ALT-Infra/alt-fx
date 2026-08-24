@@ -305,6 +305,7 @@ pub const RouteRecoveryStatus = struct {
     action: ?ModelRecoveryAction = null,
     required_action: ModelRecoveryRequiredAction = .none,
     delay_seconds: u64 = 0,
+    retry_deadline: ?std.Io.Clock.Timestamp = null,
     diagnostic: ?ModelFailureDiagnostic = null,
 
     pub fn tone(self: RouteRecoveryStatus) RouteRecoveryStatusTone {

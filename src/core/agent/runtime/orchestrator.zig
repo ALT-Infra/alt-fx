@@ -1792,18 +1792,27 @@ fn isPostVisionAssistantPrefillRejection(
         std.mem.find(u8, detail, "must end with a user message") != null;
 }
 
-fn waitForRecoveryDelay(
+fn recovery_deadline(delay_ns: u64) std.Io.Clock.Timestamp {
+    const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    return .{
+        .clock = .awake,
+        .raw = started.raw.addDuration(.fromNanoseconds(@intCast(delay_ns))),
+    };
+}
+
+fn wait_for_recovery_deadline(
     cancel_flag: *std.atomic.Value(bool),
-    delay_ns: u64,
+    deadline: std.Io.Clock.Timestamp,
 ) bool {
     if (comptime builtin.is_test) return !cancel_flag.load(.seq_cst);
-    var remaining = delay_ns;
-    const quantum = 25 * std.time.ns_per_ms;
-    while (remaining > 0) {
+    std.debug.assert(deadline.clock == .awake);
+    const quantum: i96 = 25 * std.time.ns_per_ms;
+    while (true) {
         if (cancel_flag.load(.seq_cst)) return false;
-        const current = @min(remaining, quantum);
-        io_mod.sleep(current);
-        remaining -= current;
+        const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+        if (!std.Io.Clock.Timestamp.compare(now, .lt, deadline)) break;
+        const remaining = now.raw.durationTo(deadline.raw).toNanoseconds();
+        io_mod.getIo().sleep(.fromNanoseconds(@min(remaining, quantum)), .awake) catch {};
     }
     return !cancel_flag.load(.seq_cst);
 }
@@ -1986,15 +1995,16 @@ fn refreshGatewayCredentialForJob(
     return true;
 }
 
-fn pushAutoRetryStatus(
-    deps: *const AgentRuntimeDeps,
+fn auto_retry_status(
     failed_attempt: usize,
     attempt_limit: usize,
     cause: model_response_recovery.FailureCause,
-    decision: model_response_recovery.Decision,
+    strategy: model_response_recovery.Strategy,
+    delay_seconds: u64,
+    retry_deadline: ?std.Io.Clock.Timestamp,
     diagnostic: types.ModelFailureDiagnostic,
-) !void {
-    try pushRouteRecoveryStatus(deps, .{
+) types.RouteRecoveryStatus {
+    return .{
         .kind = .auto_retry,
         .failed_attempt = failed_attempt,
         .attempt_limit = attempt_limit,
@@ -2008,7 +2018,7 @@ fn pushAutoRetryStatus(
             .request_limit_reached => .request_limit_reached,
             .content_filter => null,
         },
-        .action = switch (decision.strategy) {
+        .action = switch (strategy) {
             .retry_request => .retrying_request,
             .continue_response => .continuing_response,
             .regenerate_tool => .regenerating_tool,
@@ -2017,10 +2027,47 @@ fn pushAutoRetryStatus(
             .pause => .paused,
             .stop => null,
         },
-        .delay_seconds = decision.delay_ns / std.time.ns_per_s,
+        .delay_seconds = delay_seconds,
+        .retry_deadline = retry_deadline,
         .diagnostic = diagnostic,
-    });
+    };
 }
+
+fn pushAutoRetryStatus(
+    deps: *const AgentRuntimeDeps,
+    failed_attempt: usize,
+    attempt_limit: usize,
+    cause: model_response_recovery.FailureCause,
+    decision: model_response_recovery.Decision,
+    diagnostic: types.ModelFailureDiagnostic,
+) !std.Io.Clock.Timestamp {
+    const deadline = recovery_deadline(decision.delay_ns);
+    try pushRouteRecoveryStatus(deps, auto_retry_status(
+        failed_attempt,
+        attempt_limit,
+        cause,
+        decision.strategy,
+        decision.delay_ns / std.time.ns_per_s,
+        deadline,
+        diagnostic,
+    ));
+    return deadline;
+}
+
+const AutoRetryAdmission = struct {
+    deps: *const AgentRuntimeDeps,
+    pending_status: *?types.RouteRecoveryStatus,
+    published: bool = false,
+
+    fn admit(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.published) return;
+        const status = self.pending_status.* orelse return;
+        try pushRouteRecoveryStatus(self.deps, status);
+        self.pending_status.* = null;
+        self.published = true;
+    }
+};
 
 fn pushAutoRecoveredStatus(
     deps: *const AgentRuntimeDeps,
@@ -2789,6 +2836,16 @@ fn processQueuedPromptLoop(
     else
         .transport_interrupted;
     var latest_recovery_diagnostic: ?types.ModelFailureDiagnostic = null;
+    var pending_auto_retry_status: ?types.RouteRecoveryStatus = null;
+    errdefer if (pending_auto_retry_status != null) {
+        clearAutoRetryStatusIfNeeded(deps, true) catch |clear_err| {
+            debug_trace.logf(
+                "agent",
+                "failed to clear due retry status err={s}",
+                .{@errorName(clear_err)},
+            );
+        };
+    };
     var preserved_tool_evidence: model_response_recovery.ToolEvidence = if (job.recovery_checkpoint) |checkpoint|
         restoredRecoveryToolEvidence(checkpoint.tool_state)
     else
@@ -2935,6 +2992,7 @@ fn processQueuedPromptLoop(
                     pausedRequiredAction(preserved_tool_evidence),
                     latest_recovery_diagnostic,
                 );
+                pending_auto_retry_status = null;
                 return;
             }
             if (semantic_attempt >= semantic_limit) {
@@ -2971,6 +3029,7 @@ fn processQueuedPromptLoop(
                     pausedRequiredAction(preserved_tool_evidence),
                     defaultRecoveryDiagnostic(.request_limit_reached),
                 );
+                pending_auto_retry_status = null;
                 return;
             }
             if (skip_next_preflight_refresh) {
@@ -3103,6 +3162,10 @@ fn processQueuedPromptLoop(
                 .stream = &stream_ctx,
                 .required_vision = vision_mode == .required,
             };
+            var auto_retry_admission = AutoRetryAdmission{
+                .deps = deps,
+                .pending_status = &pending_auto_retry_status,
+            };
             var model_request = agent_stream_provider.ModelRequest{
                 .credential = .{
                     .secret = active_api_key,
@@ -3135,6 +3198,10 @@ fn processQueuedPromptLoop(
                 .delivery = &gateway_delivery,
                 .attempt_evidence = &gateway_attempt_evidence,
                 .events = .{ .context = &provider_events, .emit_fn = onProviderEvent },
+                .admission = if (pending_auto_retry_status != null)
+                    .{ .context = &auto_retry_admission, .admit_fn = AutoRetryAdmission.admit }
+                else
+                    .{},
                 .cancel_flag = config.cancel_flag,
                 .provider_attempt_owner = .agent,
             };
@@ -3207,6 +3274,7 @@ fn processQueuedPromptLoop(
                         )),
                         failure_diagnostic,
                     );
+                    pending_auto_retry_status = null;
                     return;
                 }
                 var recovery_decision = if (network_failure) |evidence|
@@ -3289,8 +3357,9 @@ fn processQueuedPromptLoop(
                     step_ctx,
                 );
                 const auto_retry_status_published = will_auto_retry;
+                var retry_deadline: ?std.Io.Clock.Timestamp = null;
                 if (auto_retry_status_published) {
-                    try pushAutoRetryStatus(
+                    retry_deadline = try pushAutoRetryStatus(
                         deps,
                         consumed_attempts,
                         semantic_limit,
@@ -3299,9 +3368,9 @@ fn processQueuedPromptLoop(
                         failure_diagnostic,
                     );
                 }
-                const delay_completed = !will_auto_retry or waitForRecoveryDelay(
+                const delay_completed = !will_auto_retry or wait_for_recovery_deadline(
                     config.cancel_flag,
-                    recovery_decision.delay_ns,
+                    retry_deadline.?,
                 );
                 if (recoveryPauseRequested(config)) {
                     try persistRecoveryCheckpoint(
@@ -3352,6 +3421,7 @@ fn processQueuedPromptLoop(
                         deps,
                         recovery_strategy != null or auto_retry_status_published,
                     );
+                    pending_auto_retry_status = null;
                     try stream_ctx.provisional_statuses.finishTrackedCancelled(
                         deps,
                         stream_ctx.alloc,
@@ -3363,6 +3433,16 @@ fn processQueuedPromptLoop(
                     return;
                 }
                 if (will_auto_retry) {
+                    std.debug.assert(pending_auto_retry_status == null);
+                    pending_auto_retry_status = auto_retry_status(
+                        consumed_attempts + 1,
+                        semantic_limit,
+                        failure_cause,
+                        recovery_decision.strategy,
+                        0,
+                        null,
+                        failure_diagnostic,
+                    );
                     preserved_tool_evidence = effectiveRecoveryToolEvidence(
                         preserved_tool_evidence,
                         null,
@@ -3396,14 +3476,15 @@ fn processQueuedPromptLoop(
                     const exhausted_retryable =
                         stream_ctx.raw_text.items.len == 0 and
                         !stream_ctx.saw_provider_tool_start and
-                        semantic_attempt + 1 >= semantic_limit;
+                        consumed_attempts >= semantic_limit;
                     if (replay_safe or exhausted_retryable) {
                         try pushRouteRecoveryStatus(deps, .{
                             .kind = .terminal_provider_error,
-                            .failed_attempt = semantic_attempt + 1,
+                            .failed_attempt = consumed_attempts,
                             .attempt_limit = semantic_limit,
                             .diagnostic = failure_diagnostic,
                         });
+                        pending_auto_retry_status = null;
                     } else {
                         try pushUnsafeNoRetryStatus(
                             deps,
@@ -3417,10 +3498,11 @@ fn processQueuedPromptLoop(
                 } else if (semantic_attempt > 0) {
                     try pushRouteRecoveryStatus(deps, .{
                         .kind = .terminal_provider_error,
-                        .failed_attempt = semantic_attempt + 1,
+                        .failed_attempt = consumed_attempts,
                         .attempt_limit = semantic_limit,
                         .diagnostic = failure_diagnostic,
                     });
+                    pending_auto_retry_status = null;
                 }
                 try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
                 const failed_assistant_source = stream_ctx.raw_text.items;
@@ -3778,7 +3860,7 @@ fn processQueuedPromptLoop(
                             step_ctx,
                         );
                     }
-                    try pushAutoRetryStatus(
+                    const retry_deadline = try pushAutoRetryStatus(
                         deps,
                         semantic_attempt + 1,
                         semantic_limit,
@@ -3786,7 +3868,17 @@ fn processQueuedPromptLoop(
                         decision,
                         diagnostic,
                     );
-                    if (waitForRecoveryDelay(config.cancel_flag, decision.delay_ns)) {
+                    if (wait_for_recovery_deadline(config.cancel_flag, retry_deadline)) {
+                        std.debug.assert(pending_auto_retry_status == null);
+                        pending_auto_retry_status = auto_retry_status(
+                            semantic_attempt + 2,
+                            semantic_limit,
+                            cause,
+                            decision.strategy,
+                            0,
+                            null,
+                            diagnostic,
+                        );
                         preserved_tool_evidence = effectiveRecoveryToolEvidence(
                             preserved_tool_evidence,
                             response_completion,
@@ -3973,7 +4065,7 @@ fn processQueuedPromptLoop(
                             step_ctx,
                         );
                     }
-                    try pushAutoRetryStatus(
+                    const retry_deadline = try pushAutoRetryStatus(
                         deps,
                         semantic_attempt + 1,
                         semantic_limit,
@@ -3981,7 +4073,17 @@ fn processQueuedPromptLoop(
                         decision,
                         diagnostic,
                     );
-                    if (waitForRecoveryDelay(config.cancel_flag, decision.delay_ns)) {
+                    if (wait_for_recovery_deadline(config.cancel_flag, retry_deadline)) {
+                        std.debug.assert(pending_auto_retry_status == null);
+                        pending_auto_retry_status = auto_retry_status(
+                            semantic_attempt + 2,
+                            semantic_limit,
+                            cause,
+                            decision.strategy,
+                            0,
+                            null,
+                            diagnostic,
+                        );
                         preserved_tool_evidence = effectiveRecoveryToolEvidence(
                             preserved_tool_evidence,
                             attempt_completion,

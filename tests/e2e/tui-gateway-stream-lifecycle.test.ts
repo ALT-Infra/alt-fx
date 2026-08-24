@@ -1866,7 +1866,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "provider route recovery renders retry, transient recovery, and normal summary row",
+    "provider route recovery counts down, times out a silent head, and recovers",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-route-recovery-")));
       const home = join(root, "home");
@@ -1878,16 +1878,13 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const workspace = realpathSync(workspacePath);
 
       const finalText = "TUI route recovery completed.";
-      let releaseFinalResponse: (() => void) | null = null;
-      const finalResponseRelease = new Promise<void>((resolve) => {
-        releaseFinalResponse = resolve;
-      });
       const queuedGateway = startFakeGateway([
-        providerErrorResponse("tui route failed once"),
+        retryAfterUnavailable(4),
         async () => {
-          await finalResponseRelease;
-          return fakeGatewayFinalText(finalText);
+          await Bun.sleep(35_000);
+          return fakeGatewayFinalText("late response must be ignored");
         },
+        fakeGatewayFinalText(finalText),
       ], {
         models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
       });
@@ -1913,32 +1910,37 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       });
 
       await session.waitForComposer(TIMEOUT);
-      const retryVisible = session.waitForText(
-        "provider_error: tui route failed once",
-        TIMEOUT,
-      );
       await session.sendText("Recover from provider route failure.");
-      await Promise.all([
-        retryVisible,
-        waitForCondition(
-          () => queuedGateway.requests.length === 2,
-          "second route recovery request",
-        ),
-      ]);
+      await session.waitForText("retrying request in 4s", TIMEOUT);
+      await session.waitForText("retrying request in 3s", TIMEOUT);
+      await session.waitForText("retrying request in 2s", TIMEOUT);
+      await session.waitForText("retrying request in 1s", TIMEOUT);
+      await waitForCondition(
+        () => queuedGateway.requests.length === 2,
+        "silent-head retry request",
+      );
+      await session.waitForText("attempt 2/10", TIMEOUT);
+
+      const inFlightPane = await session.capturePane();
+      expect(inFlightPane).toContain("attempt 2/10");
+      expect(inFlightPane).not.toContain("retrying request in 1s");
 
       await session.resizeWindow(32, 24);
       const narrowPane = await session.capturePane();
       expect(narrowPane).toContain("⚠ Provider unavailable");
-      expect(narrowPane).toContain("provider_error:");
-      expect(narrowPane).toContain("attempt 1/10");
+      expect(narrowPane).toContain("attempt 2/10");
       expect(narrowPane).not.toContain("▲");
 
       await session.resizeWindow(72, 24);
-      releaseFinalResponse?.();
+      await waitForCondition(
+        () => queuedGateway.requests.length === 3,
+        "retry after silent response head timeout",
+        TIMEOUT * 2,
+      );
       await session.waitForText(finalText, TIMEOUT);
       const scrollback = await session.captureFullScrollback();
 
-      expect(queuedGateway.requests.length).toBe(2);
+      expect(queuedGateway.requests.length).toBe(3);
       expect(scrollback).not.toContain("System");
       expect(scrollback).not.toContain("Attempt 1 failed. Retrying route.");
       expect(scrollback).not.toContain("✓ recovered");
@@ -1946,7 +1948,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(scrollback).toContain(finalText);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
-    TIMEOUT,
+    TIMEOUT * 2,
   );
 
   test(
