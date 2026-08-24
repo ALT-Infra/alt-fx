@@ -2538,7 +2538,9 @@ tmuxTest(
       });
       await session.waitForComposer(TIMEOUT);
       await session.sendText("/login");
-      await session.waitForText("Sign in with Grok", TIMEOUT);
+      await session.waitForText("Connections", TIMEOUT);
+      await session.sendKeys("Enter");
+      await session.waitForText("Grok subscription", TIMEOUT);
       await session.sendKeys("Down");
       await session.sendKeys("Down");
       await session.sendKeys("Enter");
