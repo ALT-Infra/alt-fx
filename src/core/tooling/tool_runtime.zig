@@ -1309,6 +1309,7 @@ fn toolRunCommand(
             ) catch |err| {
                 if (err != error.CommandOutputCaptureFailed) return err;
                 return finishCommandToolResult(
+                    arena,
                     capture,
                     false,
                     &transferred,
@@ -1325,16 +1326,8 @@ fn toolRunCommand(
                 output,
             );
         }
-        if (try requiredCaptureFailure(arena, capture, replay_policy)) |capture_failure| {
-            return finishCommandToolResult(
-                capture,
-                false,
-                &transferred,
-                null,
-                capture_failure,
-            );
-        }
         return finishCommandToolResult(
+            arena,
             capture,
             intercepted_replay.unavailable and
                 (ctx.command_replay_unavailable or callback.had_accepted_output),
@@ -1388,16 +1381,8 @@ fn toolRunCommand(
         .command_artifact_dir = ctx.command_artifact_dir,
     }, arena, route) catch |err| {
         if (err == error.TimeoutExpired) {
-            if (try requiredCaptureFailure(arena, replay_capture, replay_policy)) |capture_failure| {
-                return finishCommandToolResult(
-                    replay_capture,
-                    false,
-                    &replay_transferred,
-                    null,
-                    capture_failure,
-                );
-            }
             return finishCommandToolResult(
+                arena,
                 replay_capture,
                 replay_init.unavailable and
                     (ctx.command_replay_unavailable or replay_callback.had_accepted_output),
@@ -1413,6 +1398,7 @@ fn toolRunCommand(
             );
         }
         if (err == error.CommandOutputCaptureFailed) return finishCommandToolResult(
+            arena,
             replay_capture,
             false,
             &replay_transferred,
@@ -1420,16 +1406,8 @@ fn toolRunCommand(
             try command_result_mapping.Foreground.outputCaptureFailure(arena),
         );
         if (err == error.Cancelled and runtimeCancelFlag(ctx).load(.seq_cst)) {
-            if (try requiredCaptureFailure(arena, replay_capture, replay_policy)) |capture_failure| {
-                return finishCommandToolResult(
-                    replay_capture,
-                    false,
-                    &replay_transferred,
-                    null,
-                    capture_failure,
-                );
-            }
             return finishCommandToolResult(
+                arena,
                 replay_capture,
                 replay_init.unavailable and
                     (ctx.command_replay_unavailable or replay_callback.had_accepted_output),
@@ -1446,18 +1424,9 @@ fn toolRunCommand(
     };
     const result = routed.result;
 
-    if (try requiredCaptureFailure(arena, replay_capture, replay_policy)) |capture_failure| {
-        return finishCommandToolResult(
-            replay_capture,
-            false,
-            &replay_transferred,
-            result,
-            capture_failure,
-        );
-    }
-
     if (try command_result_mapping.Foreground.cancelledFailure(arena, result)) |cancelled| {
         return finishCommandToolResult(
+            arena,
             replay_capture,
             replay_init.unavailable and
                 (ctx.command_replay_unavailable or replay_callback.had_accepted_output),
@@ -1469,6 +1438,7 @@ fn toolRunCommand(
 
     if (try command_result_mapping.Foreground.nonZeroFailure(arena, result)) |failure| {
         return finishCommandToolResult(
+            arena,
             replay_capture,
             replay_init.unavailable and
                 (ctx.command_replay_unavailable or replay_callback.had_accepted_output),
@@ -1479,6 +1449,7 @@ fn toolRunCommand(
     }
 
     return finishCommandToolResult(
+        arena,
         replay_capture,
         replay_init.unavailable and
             (ctx.command_replay_unavailable or replay_callback.had_accepted_output),
@@ -1532,6 +1503,7 @@ fn executeWorkspaceRunCommand(
     var replay_transferred = false;
     if (try command_result_mapping.Foreground.cancelledFailure(arena, result)) |cancelled| {
         return finishCommandToolResult(
+            arena,
             null,
             false,
             &replay_transferred,
@@ -1541,6 +1513,7 @@ fn executeWorkspaceRunCommand(
     }
     if (try command_result_mapping.Foreground.nonZeroFailure(arena, result)) |failure| {
         return finishCommandToolResult(
+            arena,
             null,
             false,
             &replay_transferred,
@@ -1549,6 +1522,7 @@ fn executeWorkspaceRunCommand(
         );
     }
     return finishCommandToolResult(
+        arena,
         null,
         false,
         &replay_transferred,
@@ -1644,23 +1618,8 @@ fn initCommandReplayCapture(
     return .{ .capture = capture };
 }
 
-fn requiredCaptureFailure(
-    arena: Allocator,
-    capture: ?*command_replay_store.Capture,
-    policy: ?command_replay_store.CapturePolicy,
-) !?ToolExecutionResult {
-    if (policy != .required) return null;
-    const candidate = capture orelse {
-        return @as(?ToolExecutionResult, try command_result_mapping.Foreground.outputCaptureFailure(arena));
-    };
-    candidate.sealRequired(arena) catch return @as(
-        ?ToolExecutionResult,
-        try command_result_mapping.Foreground.outputCaptureFailure(arena),
-    );
-    return null;
-}
-
 fn finishCommandToolResult(
+    arena: Allocator,
     capture: ?*command_replay_store.Capture,
     replay_unavailable: bool,
     replay_transferred: *bool,
@@ -1668,6 +1627,12 @@ fn finishCommandToolResult(
     result: ToolExecutionResult,
 ) !ToolExecutionResult {
     var owned = result;
+    if (capture) |candidate| switch (candidate.policy()) {
+        .required => candidate.sealRequired(arena) catch {
+            owned = try command_result_mapping.Foreground.outputCaptureFailure(arena);
+        },
+        .best_effort => {},
+    };
     if (process_result) |command_result| {
         if (commandProcessPresentation(command_result)) |presentation| {
             var memory = owned.tool_result_memory orelse types.ToolResultMemory{};
@@ -6701,6 +6666,7 @@ test "interactive command replay capture allocation fails open" {
 
     var transferred = false;
     const result = try finishCommandToolResult(
+        std.testing.allocator,
         null,
         init.unavailable and callback.had_accepted_output,
         &transferred,
@@ -6711,6 +6677,42 @@ test "interactive command replay capture allocation fails open" {
     switch (result.tool_result_memory.?.command_output_replay.?) {
         .unavailable => {},
         .available => return error.TestExpectedUnavailableReplay,
+    }
+}
+
+test "required replay finalizer overrides every recoverable command result" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const initial_results = [_]ToolExecutionResult{
+        .{ .status = .success, .model_output = "compatibility success\n" },
+        .{ .status = .failure, .model_output = "timeout\n" },
+        .{ .status = .failure, .cancelled = true, .model_output = "cancelled\n" },
+        .{ .status = .failure, .model_output = "nonzero\n" },
+        .{ .status = .success, .model_output = "success\n" },
+    };
+
+    for (initial_results) |initial| {
+        const capture = try command_replay_store.Capture.create(arena, 0, null);
+        defer capture.abort(arena);
+        capture.setPolicyBeforeCapture(.required);
+        try std.testing.expectError(
+            error.CommandOutputCaptureFailed,
+            capture.appendAcceptedRequired(arena, .stdout, "accepted\n"),
+        );
+        var transferred = false;
+        const result = try finishCommandToolResult(
+            arena,
+            capture,
+            false,
+            &transferred,
+            null,
+            initial,
+        );
+        try std.testing.expect(transferred);
+        try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
+        try expectContains(result.model_output, "\"output_capture_failed\":true");
     }
 }
 
