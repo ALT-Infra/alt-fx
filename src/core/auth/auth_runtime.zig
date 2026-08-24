@@ -38,6 +38,7 @@ const StoredKeyStoreFn = *const fn (?*anyopaque, Allocator, []const u8) anyerror
 
 const max_api_key_entry_bytes: usize = 8 * 1024;
 const max_api_key_mask_glyphs: usize = 32;
+const max_manual_code_mask_glyphs: usize = 32;
 const max_team_query_bytes: usize = 256;
 
 fn sourceLabelOrMissing(source: ?credentials.Source) []const u8 {
@@ -339,6 +340,13 @@ const ApiKeyExitReason = enum {
     runtime_deinit,
 };
 
+const ManualCodeClearReason = enum {
+    cancel,
+    submitted,
+    screen_replacement,
+    runtime_deinit,
+};
+
 pub const Choice = union(enum) {
     provider: model_provider.ProviderId,
     source: credentials.Source,
@@ -381,6 +389,7 @@ pub const PickerView = struct {
     team_query: []const u8 = &.{},
     sign_in: login_flow.SignInSnapshot = .{},
     sign_in_source: credentials.Source = .fx_login,
+    sign_in_code_mask_count: usize = 0,
     api_key_mask_count: usize = 0,
 
     pub fn activeSourceLabel(self: PickerView) []const u8 {
@@ -774,6 +783,7 @@ pub const Runtime = struct {
     sign_in_flow: login_flow.SignInRuntime = .{},
     sign_in_source: credentials.Source = .fx_login,
     sign_in_returns_to_root: bool = false,
+    sign_in_code_input: std.ArrayList(u8) = .empty,
     api_key_input: std.ArrayList(u8) = .empty,
     api_key_returns_to_root: bool = false,
     api_key_save: ApiKeySaveRuntime = .{},
@@ -793,6 +803,7 @@ pub const Runtime = struct {
     pub fn deinit(self: *Self, alloc: Allocator) void {
         self.api_key_save.deinit(alloc);
         self.sign_in_flow.deinit(alloc);
+        self.clearSignInCodeInput(alloc, .runtime_deinit);
         self.exitApiKeyStage(alloc, .runtime_deinit);
         self.clearTeamSelection(alloc);
         self.team_query.deinit(alloc);
@@ -1000,6 +1011,7 @@ pub const Runtime = struct {
             .team_query = self.team_query.items,
             .sign_in = self.sign_in_flow.snapshot(),
             .sign_in_source = self.sign_in_source,
+            .sign_in_code_mask_count = @min(self.sign_in_code_input.items.len, max_manual_code_mask_glyphs),
             .api_key_mask_count = @min(self.api_key_input.items.len, max_api_key_mask_glyphs),
         };
     }
@@ -1174,6 +1186,10 @@ pub const Runtime = struct {
         return self.picker_active and self.picker_stage == .sign_in;
     }
 
+    pub fn signInCodeEntryActive(self: *const Self) bool {
+        return self.signInEntryActive() and self.sign_in_flow.snapshot().accepts_manual_code;
+    }
+
     pub fn signInReturnsToRoot(self: *const Self) bool {
         return self.sign_in_returns_to_root;
     }
@@ -1189,6 +1205,47 @@ pub const Runtime = struct {
 
     pub fn pulseSignIn(self: *Self, alloc: Allocator) void {
         self.sign_in_flow.pulse(alloc);
+    }
+
+    pub fn appendSignInCodeByte(self: *Self, alloc: Allocator, byte: u8) !bool {
+        if (!self.signInCodeEntryActive()) return false;
+        if (byte <= 0x20 or byte > 0x7e) return true;
+        if (self.sign_in_code_input.items.len >= login_flow.max_manual_code_bytes) return true;
+        try self.sign_in_code_input.ensureTotalCapacityPrecise(alloc, login_flow.max_manual_code_bytes);
+        self.sign_in_code_input.appendAssumeCapacity(byte);
+        return true;
+    }
+
+    pub fn deleteSignInCodeByte(self: *Self) bool {
+        if (!self.signInCodeEntryActive()) return false;
+        if (self.sign_in_code_input.items.len > 0) {
+            self.sign_in_code_input.items.len -= 1;
+            self.sign_in_code_input.allocatedSlice()[self.sign_in_code_input.items.len] = 0;
+        }
+        return true;
+    }
+
+    pub fn replaceSignInCodeInput(self: *Self, alloc: Allocator, input: []const u8) !bool {
+        if (!self.signInCodeEntryActive()) return false;
+        const code = std.mem.trim(u8, input, " \t\r\n");
+        if (code.len == 0 or code.len > login_flow.max_manual_code_bytes) return false;
+        for (code) |byte| {
+            if (byte < 0x21 or byte > 0x7e) return false;
+        }
+        if (self.sign_in_code_input.capacity > 0) {
+            self.sign_in_code_input.clearRetainingCapacity();
+            @memset(self.sign_in_code_input.allocatedSlice(), 0);
+        }
+        try self.sign_in_code_input.ensureTotalCapacityPrecise(alloc, login_flow.max_manual_code_bytes);
+        self.sign_in_code_input.appendSliceAssumeCapacity(code);
+        return true;
+    }
+
+    pub fn submitSignInCode(self: *Self, alloc: Allocator) !bool {
+        if (!self.signInCodeEntryActive() or self.sign_in_code_input.items.len == 0) return false;
+        if (!try self.sign_in_flow.submitManualCode(alloc, self.sign_in_code_input.items)) return false;
+        self.clearSignInCodeInput(alloc, .submitted);
+        return true;
     }
 
     pub fn apiKeyEntryActive(self: *const Self) bool {
@@ -1288,6 +1345,7 @@ pub const Runtime = struct {
         if (stage == .sign_in) {
             const returns_to_root = self.sign_in_returns_to_root;
             _ = self.sign_in_flow.cancel(alloc);
+            self.clearSignInCodeInput(alloc, .cancel);
             self.sign_in_returns_to_root = false;
             if (!returns_to_root) {
                 self.picker_active = false;
@@ -1416,7 +1474,23 @@ pub const Runtime = struct {
     fn exitSignInStage(self: *Self, alloc: Allocator) void {
         if (self.picker_stage != .sign_in) return;
         _ = self.sign_in_flow.cancel(alloc);
+        self.clearSignInCodeInput(alloc, .screen_replacement);
         self.sign_in_returns_to_root = false;
+    }
+
+    fn clearSignInCodeInput(self: *Self, alloc: Allocator, reason: ManualCodeClearReason) void {
+        const byte_count = self.sign_in_code_input.items.len;
+        if (self.sign_in_code_input.capacity > 0) {
+            secret.zeroAndFree(alloc, self.sign_in_code_input.allocatedSlice());
+            self.sign_in_code_input = .empty;
+        }
+        if (byte_count > 0) {
+            debug_trace.logf(
+                "auth",
+                "authorization code entry cleared reason={s} bytes={d}",
+                .{ @tagName(reason), byte_count },
+            );
+        }
     }
 
     pub fn teamSelection(self: *Self) ?*login_flow.TeamSelection {

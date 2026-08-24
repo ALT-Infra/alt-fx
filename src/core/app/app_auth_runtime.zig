@@ -303,10 +303,19 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn routeAuthPickerByte(app: *App, byte: u8) !bool {
             if (app.auth.signInEntryActive()) {
-                switch (byte) {
-                    3, 4 => _ = app.auth.popPickerStage(app.alloc),
-                    '\r', '\n' => try openSignInBrowser(app),
-                    else => {},
+                if (app.auth.signInCodeEntryActive()) {
+                    switch (byte) {
+                        3, 4 => _ = app.auth.popPickerStage(app.alloc),
+                        '\r', '\n' => if (!try app.auth.submitSignInCode(app.alloc)) try openSignInBrowser(app),
+                        8, 127 => _ = app.auth.deleteSignInCodeByte(),
+                        else => _ = try app.auth.appendSignInCodeByte(app.alloc, byte),
+                    }
+                } else {
+                    switch (byte) {
+                        3, 4 => _ = app.auth.popPickerStage(app.alloc),
+                        '\r', '\n' => try openSignInBrowser(app),
+                        else => {},
+                    }
                 }
                 app.shell.render_requests.request(.footer);
                 return true;
@@ -336,6 +345,7 @@ pub fn Runtime(comptime App: type) type {
             if (!app.auth.signInEntryActive() and !app.auth.apiKeyEntryActive()) return false;
             return switch (action) {
                 .escape, .remapped_byte => false,
+                .paste_start, .paste_end => !app.auth.signInCodeEntryActive(),
                 else => true,
             };
         }
