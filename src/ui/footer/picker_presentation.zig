@@ -266,12 +266,14 @@ pub noinline fn composeAuthPickerRow(
     width: u16,
 ) !std.ArrayList(u8) {
     if (view.stage == .sign_in) {
+        const source_row_index = signInProjectedRowIndex(view.sign_in, row_index, row_count);
         return composeSignInPickerRow(
             alloc,
             view.sign_in,
             view.sign_in_source,
             view.sign_in_code_mask_count,
-            row_index,
+            source_row_index,
+            row_count,
             width,
         );
     }
@@ -285,6 +287,28 @@ pub noinline fn composeAuthPickerRow(
         return composeSetupPickerRow(alloc, view, row_index, row_count, width);
     }
     unreachable;
+}
+
+fn signInProjectedRowIndex(snapshot: login_flow.SignInSnapshot, row_index: u16, row_count: u16) u16 {
+    if (row_count >= 7) return row_index;
+
+    const manual_code_priority = [_]u16{ 4, 6, 3, 0, 2, 5, 1 };
+    const device_code_priority = [_]u16{ 2, 3, 6, 0, 5, 1, 4 };
+    const priority = if (snapshot.accepts_manual_code)
+        manual_code_priority
+    else
+        device_code_priority;
+
+    var projected_index: u16 = 0;
+    for (0..7) |source_row| {
+        for (priority[0..@min(row_count, priority.len)]) |included_row| {
+            if (source_row != included_row) continue;
+            if (projected_index == row_index) return @intCast(source_row);
+            projected_index += 1;
+            break;
+        }
+    }
+    return 6;
 }
 
 const onboarding_note = "   ⚠︎ Note: fx is experimental and defaults to auto mode.";
@@ -369,6 +393,7 @@ fn composeSignInPickerRow(
     source: credentials.Source,
     manual_code_mask_count: usize,
     row_index: u16,
+    row_count: u16,
     width: u16,
 ) !std.ArrayList(u8) {
     var row: std.ArrayList(u8) = .empty;
@@ -406,11 +431,19 @@ fn composeSignInPickerRow(
     }
     if (accepts_manual_code and row_index == 4) {
         try row_text.appendClipped(alloc, &row, "   ┃ ", width);
+        var used: u16 = @min(5, width);
         if (manual_code_mask_count == 0) {
             try row.appendSlice(alloc, ui_render.dim_style);
-            try row_text.appendClipped(alloc, &row, "Paste or type the code", width -| 5);
+            const placeholder = "Paste or type the code";
+            try row_text.appendClipped(alloc, &row, placeholder, width -| used);
+            used +|= @intCast(@min(display_width.visibleWidth(placeholder), width -| used));
         } else {
-            for (0..@min(manual_code_mask_count, width -| 5)) |_| try row.appendSlice(alloc, "•");
+            const visible_mask_count = @min(manual_code_mask_count, width -| used);
+            for (0..visible_mask_count) |_| try row.appendSlice(alloc, "•");
+            used +|= @intCast(visible_mask_count);
+        }
+        if (row_count == 1 and used < width) {
+            try row_text.appendClipped(alloc, &row, " · Enter submits · Esc cancels", width - used);
         }
         try row.appendSlice(alloc, ui_render.reset_style);
         return row;
@@ -2109,6 +2142,32 @@ test "Codex sign-in stage renders a bounded clickable authorization action" {
     var hint = try composeAuthPickerRow(alloc, view, 6, authPickerRowCount(view), 80);
     defer hint.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, hint.items, "Enter submits or reopens browser") != null);
+}
+
+test "compact Grok sign-in keeps masked code entry and controls visible" {
+    const alloc = std.testing.allocator;
+    const view = auth_runtime.PickerView{
+        .active = true,
+        .available_sources = .empty,
+        .selected_choice = null,
+        .active_source = null,
+        .include_skip = false,
+        .stage = .sign_in,
+        .sign_in_source = .grok_subscription,
+        .sign_in = .{
+            .state = .polling,
+            .verification_uri = "https://x.ai/authorize",
+            .accepts_manual_code = true,
+        },
+        .sign_in_code_mask_count = 3,
+    };
+
+    var row = try composeAuthPickerRow(alloc, view, 0, 1, 80);
+    defer row.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, row.items, "•••") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "Enter submits") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "Esc cancels") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, ui_render.selected_completion_style) != null);
 }
 
 test "partially visible auth picker shows a source window without duplicates" {

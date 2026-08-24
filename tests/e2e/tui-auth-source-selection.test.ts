@@ -2545,7 +2545,20 @@ tmuxTest(
       await session.sendKeys("Down");
       await session.sendKeys("Enter");
       await session.waitForText("Paste the code shown by xAI", TIMEOUT);
+      await session.resizeWindow(80, 5);
+      const compactEntry = await session.waitForPane(
+        (pane) =>
+          pane.includes("Paste or type the code") &&
+          pane.includes("Enter submits") &&
+          pane.includes("Esc cancels"),
+        TIMEOUT,
+      );
+      expect(compactEntry).not.toContain("Paste the code shown by xAI");
       await session.pasteText("grok-code");
+      await session.waitForPane(
+        (pane) => pane.includes("•••••••••") && pane.includes("Enter submits"),
+        TIMEOUT,
+      );
       await session.sendKeys("Enter");
       await session.waitForText("Switched to Grok subscription with grok-4.20.", TIMEOUT);
 
