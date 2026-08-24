@@ -4,6 +4,7 @@ import base64
 import json
 import os
 import pathlib
+import re
 import subprocess
 import tempfile
 import textwrap
@@ -17,6 +18,7 @@ PGSO_WORKFLOW_PATH = (
     REPO_ROOT / ".github" / "workflows" / "pgso-macos-arm64.yml"
 )
 DEV_RELEASE_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "dev-release.yml"
+PGSO_SETUP_ACTION_PATH = REPO_ROOT / ".github" / "actions" / "setup-pgso" / "action.yml"
 SIGNING_IDENTITY = "Developer ID Application: Vercel, Inc (JW6Y669B67)"
 TEST_CDHASH = "0123456789abcdef0123456789abcdef01234567"
 SECRET_NAMES = (
@@ -390,6 +392,21 @@ class MacosSigningWorkflowTests(unittest.TestCase):
             self.assertNotIn(secret_name, aggregate)
             self.assertNotIn(secret_name, dev_release)
         self.assertNotIn("sign-and-notarize-macos", dev_release)
+
+    def test_pgso_release_chain_pins_every_external_action(self) -> None:
+        mutable_references: list[str] = []
+        for path in (PGSO_WORKFLOW_PATH, PGSO_SETUP_ACTION_PATH):
+            for line_number, line in enumerate(
+                path.read_text(encoding="utf-8").splitlines(),
+                start=1,
+            ):
+                match = re.search(r"uses:\s+([^\s@]+)@([^\s#]+)", line)
+                if match and not re.fullmatch(r"[0-9a-f]{40}", match.group(2)):
+                    mutable_references.append(
+                        f"{path.relative_to(REPO_ROOT)}:{line_number}: {line.strip()}"
+                    )
+
+        self.assertEqual([], mutable_references)
 
 
 if __name__ == "__main__":
