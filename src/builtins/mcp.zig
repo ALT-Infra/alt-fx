@@ -163,6 +163,29 @@ fn handleCommand(alloc: Allocator, rest: []const u8, command_request: CommandReq
                 false,
             );
         }
+        if (result.repaired_entries > 0) {
+            const text = if (result.revocation_failed)
+                try std.fmt.allocPrint(
+                    alloc,
+                    "Logged out of MCP server '{s}' locally; remote revocation failed. Removed {d} unreadable MCP credential {s}.",
+                    .{
+                        name,
+                        result.repaired_entries,
+                        if (result.repaired_entries == 1) "entry" else "entries",
+                    },
+                )
+            else
+                try std.fmt.allocPrint(
+                    alloc,
+                    "Logged out of MCP server '{s}'. Removed {d} unreadable MCP credential {s}.",
+                    .{
+                        name,
+                        result.repaired_entries,
+                        if (result.repaired_entries == 1) "entry" else "entries",
+                    },
+                );
+            return .{ .display = .{ .line = text }, .reload = true };
+        }
         if (result.revocation_failed) {
             return lineParts(
                 alloc,
@@ -1790,6 +1813,7 @@ test "MCP auth requires explicit browser confirmation and logout stays non-secre
         auth_calls: usize = 0,
         logout_calls: usize = 0,
         logout_busy: bool = false,
+        logout_repaired_entries: usize = 0,
 
         fn list(_: *anyopaque, alloc: Allocator) ![]u8 {
             return alloc.dupe(u8, "");
@@ -1825,7 +1849,10 @@ test "MCP auth requires explicit browser confirmation and logout stays non-secre
             try std.testing.expectEqualStrings("remote", name);
             self.logout_calls += 1;
             if (self.logout_busy) return .{ .busy = true };
-            return .{ .removed = true };
+            return .{
+                .removed = true,
+                .repaired_entries = self.logout_repaired_entries,
+            };
         }
     };
     const alloc = std.testing.allocator;
@@ -1902,6 +1929,15 @@ test "MCP auth requires explicit browser confirmation and logout stays non-secre
     defer logged_out.deinit(alloc);
     try expectLine(logged_out, "Logged out of MCP server 'remote'.", true);
     try std.testing.expectEqual(@as(usize, 2), fixture.logout_calls);
+
+    fixture.logout_repaired_entries = 2;
+    var repaired = try handleCommand(alloc, "logout remote", command_request);
+    defer repaired.deinit(alloc);
+    try expectLine(
+        repaired,
+        "Logged out of MCP server 'remote'. Removed 2 unreadable MCP credential entries.",
+        true,
+    );
 }
 
 test "loadConfigFromJson parses canonical local config with command array" {
