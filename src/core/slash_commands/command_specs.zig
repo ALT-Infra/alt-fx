@@ -63,6 +63,7 @@ pub const SlashKind = enum {
     feedback,
     trace,
     compact,
+    steer,
     settings,
     alias,
     credits,

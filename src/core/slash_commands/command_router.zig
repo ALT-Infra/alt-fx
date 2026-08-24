@@ -129,6 +129,9 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .copy => .copy,
         .feedback => .feedback,
         .trace => .trace,
+        // Interactive submission handles /steer before command routing so its
+        // payload follows the ordinary prompt admission path.
+        .steer => .unknown,
         .compact => .compact,
         .settings => .{ .settings = payload },
         .alias => .{ .alias = payload },

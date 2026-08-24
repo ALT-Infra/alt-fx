@@ -1028,7 +1028,12 @@ const App = struct {
             prompt,
             skill_tokens,
             null,
+            .queue,
         );
+    }
+
+    pub fn steerPrompt(self: *App, prompt: []const u8) !bool {
+        return self.enqueuePromptWithOptionalReview(prompt, &.{}, null, .steer);
     }
 
     pub fn enqueuePromptWithReviewDraft(
@@ -1057,14 +1062,18 @@ const App = struct {
                 .image_tokens = @constCast(review_image_tokens),
                 .skill_display_spans = review_skill_spans,
             },
+            .queue,
         );
     }
+
+    const PromptSubmitIntent = enum { queue, steer };
 
     fn enqueuePromptWithOptionalReview(
         self: *App,
         prompt: []const u8,
         skill_tokens: []const registered_entities.SkillTokenSpan,
         review_draft: ?worker_runtime.QueueReviewDraft,
+        intent: PromptSubmitIntent,
     ) !bool {
         const context_targets = if (self.context_enabled)
             try context_contract.applicableTargetsForImages(self.alloc, self.pending_images.items)
@@ -1089,6 +1098,7 @@ const App = struct {
             prompt,
             skill_tokens,
             review_draft,
+            intent,
         )) return false;
         WorkerAppRuntime.syncState(
             self,
@@ -1223,12 +1233,14 @@ const App = struct {
         prompt: []const u8,
         skill_tokens: []const registered_entities.SkillTokenSpan,
         review_draft: ?worker_runtime.QueueReviewDraft,
+        intent: PromptSubmitIntent,
     ) !bool {
         return self.snapshotAndQueuePrompt(
             prompt,
             skill_tokens,
             review_draft,
             null,
+            intent,
         );
     }
 
@@ -1245,6 +1257,7 @@ const App = struct {
             &.{},
             null,
             checkpoint,
+            .queue,
         )) return false;
         WorkerAppRuntime.syncState(
             self,
@@ -1259,6 +1272,7 @@ const App = struct {
         skill_tokens: []const registered_entities.SkillTokenSpan,
         review_draft: ?worker_runtime.QueueReviewDraft,
         recovery_checkpoint: ?*const session_codec.RecoveryCheckpoint,
+        intent: PromptSubmitIntent,
     ) !bool {
         try self.reloadSkills();
 
@@ -1366,7 +1380,7 @@ const App = struct {
             .context_snapshot = context_snapshot_copy,
             .recovery_checkpoint = recovery_checkpoint_copy,
             .recovery_source_already_presented = recovery_checkpoint != null,
-        }, recovery_checkpoint == null);
+        }, recovery_checkpoint == null and intent == .steer);
         HerdrAppRuntime.reportWorking(self);
         return true;
     }

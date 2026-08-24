@@ -30,11 +30,21 @@ pub fn SubmitRuntime(comptime App: type) type {
             }
         };
 
+        pub const Intent = enum { queue, steer };
+
         pub fn submitInput(app: *App, max_prompt_history: usize) !void {
-            try submit(app, max_prompt_history);
+            try submitWithIntent(app, max_prompt_history, .queue);
+        }
+
+        pub fn submitSteering(app: *App, max_prompt_history: usize) !void {
+            try submitWithIntent(app, max_prompt_history, .steer);
         }
 
         pub fn submit(app: *App, max_prompt_history: usize) !void {
+            try submitWithIntent(app, max_prompt_history, .queue);
+        }
+
+        fn submitWithIntent(app: *App, max_prompt_history: usize, intent: Intent) !void {
             const expanded_len = paste_blocks.expandedLen(
                 app.input_runtime.edit_state.input.items,
                 app.input_runtime.entities.pasted_blocks.items,
@@ -62,6 +72,20 @@ pub fn SubmitRuntime(comptime App: type) type {
                 if (comptime @hasDecl(App, "submitDirectTerminal")) {
                     try App.submitDirectTerminal(app, command);
                     return;
+                }
+            }
+
+            if (intent == .queue) {
+                if (steerCommandPayload(expanded.text)) |payload| {
+                    if (!try preflightPrompt(app)) return;
+                    if (comptime @hasDecl(App, "steerPrompt")) {
+                        if (!try App.steerPrompt(app, payload)) return;
+                        recordAcceptedInput(app, payload);
+                        app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                        paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
+                        app.shell.render_requests.request(.footer);
+                        return;
+                    }
                 }
             }
 
@@ -101,7 +125,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             if (trimmed.len == 0) {
                 if (app.pending_images.items.len > 0) {
                     if (!try preflightPrompt(app)) return;
-                    if (!try enqueuePromptForSubmit(app, "", &.{}, null)) return;
+                    if (!try enqueuePromptForSubmit(app, "", &.{}, null, intent)) return;
                     releasePendingImages(app);
                     app.input_runtime.inputResetState().clearCurrent(app.alloc);
                     if (acceptedPromptNeedsImmediateFooter(app)) {
@@ -225,6 +249,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                     display_skill_tokens,
                     &accepted_draft,
                     images,
+                    intent,
                 )
             else
                 try enqueuePromptForSubmit(
@@ -232,6 +257,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                     visual_text.text,
                     display_skill_tokens,
                     &accepted_draft,
+                    intent,
                 );
             if (!queued) return;
             commitStableExtractedImageIds(app, extracted.images);
@@ -253,6 +279,15 @@ pub fn SubmitRuntime(comptime App: type) type {
             if (acceptedPromptNeedsImmediateFooter(app)) {
                 app.shell.render_requests.request(.footer);
             }
+        }
+
+        fn steerCommandPayload(text: []const u8) ?[]const u8 {
+            const trimmed = std.mem.trim(u8, text, " \t\r\n");
+            if (!std.mem.startsWith(u8, trimmed, "/steer")) return null;
+            if (trimmed.len == "/steer".len) return null;
+            if (!std.ascii.isWhitespace(trimmed["/steer".len])) return null;
+            const payload = std.mem.trim(u8, trimmed["/steer".len..], " \t\r\n");
+            return if (payload.len > 0) payload else null;
         }
 
         fn acceptedPromptNeedsImmediateFooter(app: *const App) bool {
@@ -445,6 +480,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             prompt: []const u8,
             skill_tokens: []const registered_entities.SkillTokenSpan,
             accepted_draft: ?*const AcceptedDraftProjection,
+            intent: Intent,
         ) !bool {
             const resume_review = if (comptime @hasField(App, "queued_prompt_review"))
                 app.queued_prompt_review.active()
@@ -466,7 +502,11 @@ pub fn SubmitRuntime(comptime App: type) type {
                 }
             }
 
-            const accepted = if (comptime @hasDecl(App, "enqueuePromptWithReviewDraft")) blk: {
+            const accepted = if (intent == .steer and
+                skill_tokens.len == 0 and
+                (comptime @hasDecl(App, "steerPrompt")))
+                try App.steerPrompt(app, prompt)
+            else if (comptime @hasDecl(App, "enqueuePromptWithReviewDraft")) blk: {
                 if (accepted_draft) |draft| {
                     break :blk try App.enqueuePromptWithReviewDraft(
                         app,
@@ -520,6 +560,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             skill_tokens: []const registered_entities.SkillTokenSpan,
             accepted_draft: *const AcceptedDraftProjection,
             staged_images: *std.ArrayList(types.ImageAttachment),
+            intent: Intent,
         ) !bool {
             const original_images = app.pending_images;
             app.pending_images = staged_images.*;
@@ -534,6 +575,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                 prompt,
                 skill_tokens,
                 accepted_draft,
+                intent,
             )) {
                 staged_images.* = app.pending_images;
                 app.pending_images = original_images;
