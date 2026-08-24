@@ -1536,7 +1536,9 @@ profileStoredKeyTmuxTest(
     await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
 
     await session.sendText("/setup");
-    await session.waitForText("API key", TIMEOUT);
+    await session.waitForText("Connections", TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForText("AI Gateway API key", TIMEOUT);
     await session.sendKeys("Down");
     await session.sendKeys("Down");
     await session.sendKeys("Down");
@@ -1662,9 +1664,6 @@ tmuxTest(
 
     await session.sendText("/setup");
     await session.waitForText("Setup", TIMEOUT);
-    await session.sendKeys("Down");
-    await session.sendKeys("Down");
-    await session.sendKeys("Down");
     await session.sendKeys("Down");
     await session.sendKeys("Down");
     await session.sendKeys("Enter");
@@ -3290,10 +3289,9 @@ tmuxTest(
       (pane) =>
         pane.includes("Setup") &&
         pane.includes("Connections") &&
-        pane.includes("Vercel account") &&
-        pane.includes("Grok subscription") &&
-        pane.includes("AI Gateway API key") &&
-        pane.includes("Model provider"),
+        pane.includes("Model provider") &&
+        pane.includes("Vercel team") &&
+        pane.includes("Credential source"),
       TIMEOUT,
     );
     expect(inventory).not.toMatch(/^\s+fx login\s+/m);
