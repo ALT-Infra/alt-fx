@@ -544,6 +544,7 @@ test "built-in slash commands register exact active order" {
         "/feedback",
         "/trace",
         "/compact",
+        "/steer",
         "/settings",
         "/alias",
         "/credits",
