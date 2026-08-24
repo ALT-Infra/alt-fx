@@ -1152,8 +1152,8 @@ const App = struct {
         try InputSubmitRuntime.acceptPresentedPrompt(self, turn_id);
     }
 
-    pub fn cancelUncommittedPendingSubmission(self: *App) bool {
-        return InputSubmitRuntime.cancelUncommittedPendingSubmission(self);
+    pub fn cancelPendingSubmission(self: *App) bool {
+        return InputSubmitRuntime.cancelPendingSubmission(self);
     }
 
     pub fn clearPendingSubmission(self: *App, reason: []const u8) void {

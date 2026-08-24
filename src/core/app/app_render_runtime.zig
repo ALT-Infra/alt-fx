@@ -2,7 +2,6 @@ const std = @import("std");
 const question_prompt = @import("../agent/question_prompt.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const input_queue_runtime = @import("input_queue_runtime.zig");
-const input_submit_runtime = @import("input_submit_runtime.zig");
 const app_commands = @import("app_commands.zig");
 const app_lifecycle = @import("app_lifecycle.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
@@ -262,6 +261,7 @@ fn buildPendingCardProjection(
         checkpoint,
     );
     defer app.alloc.free(card);
+    if (card.len == 0) return null;
     const bytes = try pendingCardTerminalWireBytes(app.alloc, card);
     const rendered_line_count: u16 = @intCast(@min(
         std.mem.count(u8, card, "\n"),
@@ -279,6 +279,77 @@ fn buildPendingCardProjection(
         .paint_row_count = paint_row_count,
         .leading_blank_rows = leading_blank_rows,
     };
+}
+
+test "pending prompt projection waits for a paintable terminal width" {
+    const alloc = std.testing.allocator;
+    const input_submit_runtime = @import("input_submit_runtime.zig");
+    const TestApp = struct {
+        alloc: std.mem.Allocator,
+        submission: input_submit_runtime.State,
+    };
+    const prompt = try alloc.dupe(u8, "visible prompt");
+    var app = TestApp{
+        .alloc = alloc,
+        .submission = .{ .pending = .{ .draft = .{
+            .turn_id = 1,
+            .prompt = prompt,
+            .images = &.{},
+            .skill_display_spans = &.{},
+        } } },
+    };
+    defer app.submission.pending.?.deinit(alloc);
+
+    for ([_]u16{ 1, 2 }) |cols| {
+        var shell = transcript_runtime.TranscriptRuntime{
+            .layout = .{
+                .rows = 4,
+                .cols = cols,
+                .content_bottom = 1,
+                .divider_top_row = 2,
+                .input_row = 2,
+                .divider_bottom_row = 3,
+                .hint_row = 4,
+            },
+            .cursor_row = 1,
+            .cursor_col = 1,
+        };
+        defer shell.deinit(alloc);
+
+        try std.testing.expect((try buildPendingCardProjection(
+            TestApp,
+            &app,
+            &shell,
+            null,
+        )) == null);
+        try std.testing.expectEqual(
+            input_submit_runtime.PendingPhase.awaiting_frame,
+            app.submission.pending.?.phase,
+        );
+    }
+
+    var resized_shell = transcript_runtime.TranscriptRuntime{
+        .layout = .{
+            .rows = 4,
+            .cols = 80,
+            .content_bottom = 1,
+            .divider_top_row = 2,
+            .input_row = 2,
+            .divider_bottom_row = 3,
+            .hint_row = 4,
+        },
+        .cursor_row = 1,
+        .cursor_col = 1,
+    };
+    defer resized_shell.deinit(alloc);
+    var projection = (try buildPendingCardProjection(
+        TestApp,
+        &app,
+        &resized_shell,
+        null,
+    )).?;
+    defer projection.deinit(alloc);
+    try std.testing.expect(projection.paint_row_count > 0);
 }
 
 fn pendingCardTerminalWireBytes(

@@ -19,13 +19,13 @@ pub const PendingPhase = enum {
     queued,
 };
 
-pub const PendingPhaseError = error{InvalidPendingPhase};
+const PendingPhaseError = error{InvalidPendingPhase};
 
 pub const PendingSubmission = struct {
     draft: worker_runtime.QueuedPromptDraft,
     phase: PendingPhase = .awaiting_frame,
 
-    pub fn init(draft: worker_runtime.QueuedPromptDraft) PendingSubmission {
+    fn init(draft: worker_runtime.QueuedPromptDraft) PendingSubmission {
         std.debug.assert(draft.turn_id != 0);
         return .{ .draft = draft };
     }
@@ -35,22 +35,22 @@ pub const PendingSubmission = struct {
         self.* = undefined;
     }
 
-    pub fn ownsTurnStartHold(self: PendingSubmission) bool {
+    fn ownsTurnStartHold(self: PendingSubmission) bool {
         return self.phase != .queued;
     }
 
-    pub fn markFrameCommitted(self: *PendingSubmission) bool {
+    fn markFrameCommitted(self: *PendingSubmission) bool {
         if (self.phase != .awaiting_frame) return false;
         self.phase = .awaiting_adoption;
         return true;
     }
 
-    pub fn markAdopted(self: *PendingSubmission) PendingPhaseError!void {
+    fn markAdopted(self: *PendingSubmission) PendingPhaseError!void {
         if (self.phase != .awaiting_adoption) return error.InvalidPendingPhase;
         self.phase = .adopted;
     }
 
-    pub fn markQueued(self: *PendingSubmission) bool {
+    fn markQueued(self: *PendingSubmission) bool {
         if (self.phase != .adopted) return false;
         self.phase = .queued;
         return true;
@@ -61,7 +61,7 @@ pub const State = struct {
     pending: ?PendingSubmission = null,
 };
 
-pub fn buildQueuedPromptDraft(
+fn buildQueuedPromptDraft(
     alloc: std.mem.Allocator,
     turn_id: u64,
     prompt_source: []const u8,
@@ -222,11 +222,45 @@ pub fn SubmitRuntime(comptime App: type) type {
             clearPendingSubmission(app, "worker_begin_presented");
         }
 
-        pub fn cancelUncommittedPendingSubmission(app: *App) bool {
+        pub fn cancelPendingSubmission(app: *App) bool {
             if (comptime !@hasField(App, "submission")) return false;
             const pending = app.submission.pending orelse return false;
-            if (pending.phase != .awaiting_frame) return false;
-            clearPendingSubmission(app, "ctrl_c_before_frame");
+            if (pending.phase == .queued) {
+                if (comptime !@hasDecl(@TypeOf(app.worker), "deleteQueuedPromptDraft")) {
+                    return false;
+                }
+                if (!app.worker.deleteQueuedPromptDraft(
+                    std.heap.c_allocator,
+                    pending.draft.turn_id,
+                    pending.draft.images,
+                )) {
+                    if (comptime @hasDecl(@TypeOf(app.worker), "activeTurnId") and
+                        @hasDecl(@TypeOf(app.worker), "requestCancel"))
+                    {
+                        if (app.worker.activeTurnId() == pending.draft.turn_id) {
+                            app.worker.requestCancel();
+                            debug_trace.eventf(
+                                "input",
+                                "pending_prompt_active_cancel_requested",
+                                .{ .turn_id = pending.draft.turn_id },
+                                "",
+                                .{},
+                            );
+                            app.shell.render_requests.request(.footer);
+                            return true;
+                        }
+                    }
+                    debug_trace.eventf(
+                        "input",
+                        "pending_prompt_cancel_missed",
+                        .{ .turn_id = pending.draft.turn_id },
+                        "phase={s}",
+                        .{@tagName(pending.phase)},
+                    );
+                    return false;
+                }
+            }
+            clearPendingSubmission(app, "ctrl_c_pending_submission");
             app.shell.render_requests.request(.transcript);
             app.shell.render_requests.request(.footer);
             return true;
@@ -306,6 +340,18 @@ pub fn SubmitRuntime(comptime App: type) type {
         }
 
         pub fn submit(app: *App, max_prompt_history: usize) !void {
+            if (comptime @hasField(App, "submission")) {
+                if (app.submission.pending) |pending| {
+                    debug_trace.eventf(
+                        "input",
+                        "prompt_submit_deferred_for_pending",
+                        .{ .turn_id = pending.draft.turn_id },
+                        "phase={s}",
+                        .{@tagName(pending.phase)},
+                    );
+                    return;
+                }
+            }
             const expanded_len = paste_blocks.expandedLen(
                 app.input_runtime.edit_state.input.items,
                 app.input_runtime.entities.pasted_blocks.items,
@@ -1893,12 +1939,39 @@ const PendingLifecycleFake = struct {
     worker: struct {
         held: bool = true,
         release_count: usize = 0,
+        queued_turn_id: ?u64 = null,
+        active_turn_id: u64 = 0,
+        delete_count: usize = 0,
+        cancel_count: usize = 0,
 
         pub fn releaseTurnStartHold(self: *@This()) void {
             if (!self.held) return;
             self.held = false;
             self.release_count += 1;
         }
+
+        pub fn deleteQueuedPromptDraft(
+            self: *@This(),
+            _: std.mem.Allocator,
+            turn_id: u64,
+            _: []const types.ImageAttachment,
+        ) bool {
+            if (self.queued_turn_id == null or self.queued_turn_id.? != turn_id) return false;
+            self.queued_turn_id = null;
+            self.delete_count += 1;
+            return true;
+        }
+
+        pub fn activeTurnId(self: *@This()) u64 {
+            return self.active_turn_id;
+        }
+
+        pub fn requestCancel(self: *@This()) void {
+            self.cancel_count += 1;
+        }
+    } = .{},
+    shell: struct {
+        render_requests: @import("../../ui/render_request.zig").RenderRequestState = .{},
     } = .{},
     adoption_failures_remaining: usize = 0,
     adoption_count: usize = 0,
@@ -1923,10 +1996,11 @@ const PendingLifecycleFake = struct {
 
     pub fn finalizePendingSubmission(
         self: *PendingLifecycleFake,
-        _: *const worker_runtime.QueuedPromptDraft,
+        draft: *const worker_runtime.QueuedPromptDraft,
     ) !void {
         self.finalization_count += 1;
         if (self.finalization_error) return error.InjectedFinalizationFailure;
+        self.worker.queued_turn_id = draft.turn_id;
     }
 
     pub fn writeDomainNotice(
@@ -1996,4 +2070,62 @@ test "post-ack finalization failure leaves notice and consumes pending owner" {
     try std.testing.expectEqual(@as(usize, 1), app.adoption_count);
     try std.testing.expectEqual(@as(usize, 1), app.finalization_count);
     try std.testing.expectEqual(@as(usize, 1), app.notice_count);
+}
+
+test "Ctrl+C cancels pending ownership from every pre-worker phase" {
+    const Runtime = SubmitRuntime(PendingLifecycleFake);
+
+    var awaiting_frame = try pendingLifecycleFake(std.testing.allocator, 801);
+    defer awaiting_frame.deinit();
+    try std.testing.expect(Runtime.cancelPendingSubmission(&awaiting_frame));
+    try std.testing.expect(awaiting_frame.submission.pending == null);
+    try std.testing.expectEqual(@as(usize, 1), awaiting_frame.worker.release_count);
+
+    var awaiting_adoption = try pendingLifecycleFake(std.testing.allocator, 802);
+    defer awaiting_adoption.deinit();
+    awaiting_adoption.adoption_failures_remaining = 1;
+    Runtime.noteCommittedFrame(&awaiting_adoption);
+    try std.testing.expectEqual(PendingPhase.awaiting_adoption, awaiting_adoption.submission.pending.?.phase);
+    try std.testing.expect(Runtime.cancelPendingSubmission(&awaiting_adoption));
+    try std.testing.expect(awaiting_adoption.submission.pending == null);
+    try std.testing.expectEqual(@as(usize, 1), awaiting_adoption.worker.release_count);
+    try std.testing.expect(awaiting_adoption.shell.render_requests.hasReason(.transcript));
+    try std.testing.expect(awaiting_adoption.shell.render_requests.hasReason(.footer));
+
+    var adopted = try pendingLifecycleFake(std.testing.allocator, 803);
+    defer adopted.deinit();
+    Runtime.noteCommittedFrame(&adopted);
+    try std.testing.expectEqual(PendingPhase.adopted, adopted.submission.pending.?.phase);
+    try std.testing.expect(Runtime.cancelPendingSubmission(&adopted));
+    try std.testing.expect(adopted.submission.pending == null);
+    try std.testing.expectEqual(@as(usize, 1), adopted.worker.release_count);
+
+    var queued = try pendingLifecycleFake(std.testing.allocator, 804);
+    defer queued.deinit();
+    Runtime.noteCommittedFrame(&queued);
+    Runtime.collectPendingSubmissionFacts(&queued);
+    try std.testing.expectEqual(PendingPhase.queued, queued.submission.pending.?.phase);
+    try std.testing.expectEqual(@as(?u64, 804), queued.worker.queued_turn_id);
+    try std.testing.expect(Runtime.cancelPendingSubmission(&queued));
+    try std.testing.expect(queued.submission.pending == null);
+    try std.testing.expectEqual(@as(?u64, null), queued.worker.queued_turn_id);
+    try std.testing.expectEqual(@as(usize, 1), queued.worker.delete_count);
+    try std.testing.expectEqual(@as(usize, 1), queued.worker.release_count);
+}
+
+test "Ctrl+C requests cancellation after the pending turn leaves the queue" {
+    const Runtime = SubmitRuntime(PendingLifecycleFake);
+    var app = try pendingLifecycleFake(std.testing.allocator, 805);
+    defer app.deinit();
+    Runtime.noteCommittedFrame(&app);
+    Runtime.collectPendingSubmissionFacts(&app);
+    app.worker.queued_turn_id = null;
+    app.worker.active_turn_id = 805;
+
+    try std.testing.expect(Runtime.cancelPendingSubmission(&app));
+    try std.testing.expectEqual(@as(usize, 1), app.worker.cancel_count);
+    try std.testing.expect(app.submission.pending != null);
+    try Runtime.acceptPresentedPrompt(&app, 805);
+    try std.testing.expect(app.submission.pending == null);
+    try std.testing.expectEqual(@as(usize, 1), app.worker.release_count);
 }
