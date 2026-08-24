@@ -1835,7 +1835,7 @@ fn collectOutput(
                     } else {
                         debug_trace.logf(
                             "core",
-                            "captured command leader completed during {s}; remaining process group retains termination grace",
+                            "captured command leader completed during {s}; termination cleanup continuing",
                             .{@tagName(source.*)},
                         );
                     }
@@ -2012,10 +2012,9 @@ fn updateTerminationSignal(
         if (signal_started_ms.* == null) {
             if (cfg.timeout_ms) |timeout_ms| {
                 if (now_ms - started_ms >= @as(i64, @intCast(timeout_ms))) {
-                    // Timeout uses the same signal path as cancellation but
-                    // records a distinct source for the post-wait mapping.
                     source.* = .timed_out;
-                    try signalChild(child, process_group_id, false);
+                    try signalChild(child, process_group_id, true);
+                    force_kill_sent.* = true;
                     debug_trace.logf("core", "command termination requested source=timeout", .{});
                     signal_started_ms.* = now_ms;
                 }
@@ -3310,6 +3309,40 @@ test "timeout source is distinct from cancellation" {
     }, std.testing.allocator, "sleep 5", "/tmp"));
 }
 
+test "timeout prevents captured user shell from evaluating trailing statements" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
+        return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const effect_path = try std.fs.path.join(alloc, &.{ workspace, "post-timeout-effect.txt" });
+    defer alloc.free(effect_path);
+    const quoted_effect = try shellQuote(alloc, effect_path);
+    defer alloc.free(quoted_effect);
+    var capture = StreamCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const command = try std.fmt.allocPrint(
+        alloc,
+        "sleep 2; printf 'SHOULD-NOT-RUN\\n'; printf 'SHOULD-NOT-RUN' > {s}",
+        .{quoted_effect},
+    );
+    defer alloc.free(command);
+
+    try std.testing.expectError(error.TimeoutExpired, executeCommandInEnvironment(.{
+        .max_command_output_bytes = 1024,
+        .output_chunk_ctx = @ptrCast(&capture),
+        .on_output_chunk = StreamCapture.onChunk,
+        .timeout_ms = 120,
+    }, alloc, command, workspace, .{ .user = "/bin/zsh" }));
+    try std.testing.expect(!capture.contains(.stdout, "SHOULD-NOT-RUN\n"));
+    try std.testing.expect(!absoluteFileExists(effect_path));
+}
+
 test "timeout remains dominant when its output callback fails" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
 
@@ -3319,7 +3352,7 @@ test "timeout remains dominant when its output callback fails" {
         .output_chunk_ctx = @ptrCast(&trigger),
         .on_output_chunk = FailOutput.onChunk,
         .timeout_ms = 120,
-    }, std.testing.allocator, "trap 'echo TIMEOUT-FAIL; exit 0' TERM; while :; do :; done", "/tmp"));
+    }, std.testing.allocator, "printf 'TIMEOUT-FAIL'; sleep 5", "/tmp"));
     try std.testing.expect(trigger.seen);
 }
 

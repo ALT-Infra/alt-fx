@@ -2876,6 +2876,72 @@ describe("gateway stream lifecycle", () => {
     }
   }, 30_000);
 
+  test("terminal timeout prevents the default user shell from evaluating trailing statements", async () => {
+    const root = createFixtureRoot("terminal-timeout-stops-trailing-statements");
+    const tracePath = join(root.root, "trace.log");
+    const effectPath = join(root.workspace, "post-timeout-effect.txt");
+    const timeoutCallId = "terminal_timeout_stops_trailing_1";
+    const readCallId = "terminal_timeout_stops_trailing_read_1";
+    const trailingMarker = "POST-TIMEOUT-SHOULD-NOT-RUN";
+    let step = 0;
+    let replayHandle = "";
+    const gateway = startGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeGatewayToolCall(timeoutCallId, "terminal", {
+            action: "exec",
+            command: `printf 'PRE-TIMEOUT\n'; sleep 2; printf '${trailingMarker}\n'; printf '${trailingMarker}' > ${JSON.stringify(effectPath)}`,
+            timeout_ms: 500,
+          });
+        case 1: {
+          const timedOut = toolResultOutput(body, timeoutCallId);
+          expect(timedOut).toContain("timeout=true");
+          expect(existsSync(effectPath)).toBe(false);
+          const match = timedOut.match(
+            /<command_output_handle>([^<]+)<\/command_output_handle>/,
+          );
+          replayHandle = match?.[1] ?? "";
+          expect(replayHandle).not.toBe("");
+          return fakeGatewayToolCall(readCallId, "read_tool_result", {
+            handle: replayHandle,
+            query: trailingMarker,
+          });
+        }
+        case 2: {
+          const replay = toolResultOutput(body, readCallId);
+          expect(replay).toContain("(no matches)");
+          expect(replay).not.toContain(`[stdout]\n${trailingMarker}`);
+          return fakeGatewayFinalText("Post-timeout statements were blocked.");
+        }
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "--no-save", "Run the strict timeout fixture."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+
+      expect(result.code).toBe(0);
+      expect(json.output).toContain("Post-timeout statements were blocked.");
+      expect(gateway.requestCount()).toBe(3);
+      expect(existsSync(effectPath)).toBe(false);
+      expect(readFileSync(tracePath, "utf8")).toContain(
+        "command termination requested source=timeout",
+      );
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("saved terminal replay handle remains readable after resume without re-execution", async () => {
     const root = createFixtureRoot("saved-terminal-replay");
     const firstTracePath = join(root.root, "first-trace.log");
