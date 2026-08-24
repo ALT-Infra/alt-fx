@@ -39,9 +39,10 @@ pub const PendingSubmission = struct {
         return self.phase != .queued;
     }
 
-    pub fn markFrameCommitted(self: *PendingSubmission) PendingPhaseError!void {
-        if (self.phase != .awaiting_frame) return error.InvalidPendingPhase;
+    pub fn markFrameCommitted(self: *PendingSubmission) bool {
+        if (self.phase != .awaiting_frame) return false;
         self.phase = .awaiting_adoption;
+        return true;
     }
 
     pub fn markAdopted(self: *PendingSubmission) PendingPhaseError!void {
@@ -49,9 +50,10 @@ pub const PendingSubmission = struct {
         self.phase = .adopted;
     }
 
-    pub fn markQueued(self: *PendingSubmission) PendingPhaseError!void {
-        if (self.phase != .adopted) return error.InvalidPendingPhase;
+    pub fn markQueued(self: *PendingSubmission) bool {
+        if (self.phase != .adopted) return false;
         self.phase = .queued;
+        return true;
     }
 };
 
@@ -142,8 +144,7 @@ pub fn SubmitRuntime(comptime App: type) type {
         pub fn noteCommittedFrame(app: *App) void {
             if (comptime !@hasField(App, "submission")) return;
             const pending = if (app.submission.pending) |*value| value else return;
-            if (pending.phase != .awaiting_frame) return;
-            pending.markFrameCommitted() catch unreachable;
+            if (!pending.markFrameCommitted()) return;
             debug_trace.eventf(
                 "input",
                 "pending_prompt_frame_committed",
@@ -191,8 +192,17 @@ pub fn SubmitRuntime(comptime App: type) type {
                 finishPendingSubmissionFailure(app, err);
                 return;
             };
+            if (!pending.markQueued()) {
+                debug_trace.eventf(
+                    "input",
+                    "pending_prompt_queue_phase_invalid",
+                    .{ .turn_id = pending.draft.turn_id },
+                    "phase={s}",
+                    .{@tagName(pending.phase)},
+                );
+                return;
+            }
             app.worker.releaseTurnStartHold();
-            pending.markQueued() catch unreachable;
             debug_trace.eventf(
                 "input",
                 "pending_prompt_queued",
@@ -1826,20 +1836,20 @@ test "pending submission phase methods keep hold ownership explicit" {
     try std.testing.expect(pending.ownsTurnStartHold());
     try std.testing.expectError(error.InvalidPendingPhase, pending.markAdopted());
 
-    try pending.markFrameCommitted();
+    try std.testing.expect(pending.markFrameCommitted());
     try std.testing.expectEqual(PendingPhase.awaiting_adoption, pending.phase);
     try std.testing.expect(pending.ownsTurnStartHold());
-    try std.testing.expectError(error.InvalidPendingPhase, pending.markFrameCommitted());
+    try std.testing.expect(!pending.markFrameCommitted());
 
     try pending.markAdopted();
     try std.testing.expectEqual(PendingPhase.adopted, pending.phase);
     try std.testing.expect(pending.ownsTurnStartHold());
     try std.testing.expectError(error.InvalidPendingPhase, pending.markAdopted());
 
-    try pending.markQueued();
+    try std.testing.expect(pending.markQueued());
     try std.testing.expectEqual(PendingPhase.queued, pending.phase);
     try std.testing.expect(!pending.ownsTurnStartHold());
-    try std.testing.expectError(error.InvalidPendingPhase, pending.markQueued());
+    try std.testing.expect(!pending.markQueued());
     try std.testing.expectEqual(@as(u64, 41), pending.draft.turn_id);
     try std.testing.expectEqualStrings("use $review", pending.draft.prompt);
     try std.testing.expectEqual(@as(usize, 1), pending.draft.skill_display_spans.len);
