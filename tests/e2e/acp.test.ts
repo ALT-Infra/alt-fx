@@ -6516,9 +6516,14 @@ describe("acp: model-independent", () => {
           },
           TIMEOUT,
         );
+        if (!control) throw new Error("ACP one-off control was not persisted");
+        await waitForPersistedAcpDeliveryId(
+          root,
+          control.id,
+          "ACP_ONE_OFF_LOAD_CHILD_DONE",
+        );
         await client.close();
 
-        if (!control) throw new Error("ACP one-off control was not persisted");
         const controlBefore = readFileSync(control.path, "utf8");
 
         client = await AcpClient.create({
