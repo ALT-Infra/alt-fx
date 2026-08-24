@@ -285,6 +285,7 @@ fn awaitBrowserCallback(
         listener,
         &parser_context,
         cancel_flag,
+        null,
     ) catch |err| switch (err) {
         error.OAuthCallbackListenerFailed => error.ChatGptOAuthCallbackListenerFailed,
         else => err,

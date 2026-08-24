@@ -54,46 +54,7 @@ pub fn await(
     listener: *std.Io.net.Server,
     parser_context: ?*anyopaque,
     cancel_flag: *std.atomic.Value(bool),
-) !?Accepted(Callback) {
-    return awaitConfigured(
-        Callback,
-        parse,
-        alloc,
-        listener,
-        parser_context,
-        cancel_flag,
-        null,
-    );
-}
-
-pub fn awaitWithCors(
-    comptime Callback: type,
-    comptime parse: fn (?*anyopaque, Allocator, []const u8) ParseResult(Callback),
-    alloc: Allocator,
-    listener: *std.Io.net.Server,
-    parser_context: ?*anyopaque,
-    cancel_flag: *std.atomic.Value(bool),
-    cors_origin: []const u8,
-) !?Accepted(Callback) {
-    return awaitConfigured(
-        Callback,
-        parse,
-        alloc,
-        listener,
-        parser_context,
-        cancel_flag,
-        cors_origin,
-    );
-}
-
-fn awaitConfigured(
-    comptime Callback: type,
-    comptime parse: fn (?*anyopaque, Allocator, []const u8) ParseResult(Callback),
-    alloc: Allocator,
-    listener: *std.Io.net.Server,
-    parser_context: ?*anyopaque,
-    cancel_flag: *std.atomic.Value(bool),
-    cors_origin: ?[]const u8,
+    allowed_cors_origin: ?[]const u8,
 ) !?Accepted(Callback) {
     var accepts: usize = 0;
     while (accepts < max_accepts_per_poll) : (accepts += 1) {
@@ -106,7 +67,7 @@ fn awaitConfigured(
         defer if (!handed_off) stream.close(io_mod.getIo());
         setSocketTimeouts(stream.socket.handle);
 
-        const maybe_request = readRequest(alloc, stream, cancel_flag, cors_origin) catch |err| switch (err) {
+        const maybe_request = readRequest(alloc, stream, cancel_flag, allowed_cors_origin) catch |err| switch (err) {
             error.Cancelled => return err,
             error.InvalidOAuthCallbackRequest, error.OAuthCallbackRequestTooLarge => {
                 writeResponse(stream, .unrelated, null) catch {};
@@ -118,7 +79,7 @@ fn awaitConfigured(
         defer request.deinit(alloc);
         switch (request.kind) {
             .preflight => {
-                writePreflightResponse(stream, cors_origin.?) catch {};
+                writePreflightResponse(stream, allowed_cors_origin.?) catch {};
                 continue;
             },
             .unrelated => {
@@ -551,6 +512,7 @@ test "browser callback outruns an idle preconnect held open" {
         &listener,
         null,
         &cancel_flag,
+        null,
     )) orelse return error.CallbackNeverArrived;
     defer accepted.deinit();
     try std.testing.expectEqualStrings("granted", accepted.callback.code);
@@ -587,6 +549,7 @@ test "browser callback cancels while an idle preconnect is open" {
             &listener,
             null,
             &cancel_flag,
+            null,
         ),
     );
     try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1_000);
@@ -615,6 +578,7 @@ test "browser callback survives unrelated requests before the redirect" {
         &listener,
         null,
         &cancel_flag,
+        null,
     )) orelse return error.CallbackNeverArrived;
     defer accepted.deinit();
     try accepted.respond(.ok);
@@ -642,6 +606,7 @@ fn expectResetPreconnectSurvives(hold_ms: u64) !void {
         &listener,
         null,
         &cancel_flag,
+        null,
     )) orelse return error.CallbackNeverArrived;
     defer accepted.deinit();
     try std.testing.expectEqualStrings("granted", accepted.callback.code);
@@ -714,7 +679,7 @@ test "browser callback permits the xAI CORS private-network preflight" {
     const thread = try std.Thread.spawn(.{}, CorsCallbackProbe.run, .{&probe});
 
     var cancel_flag = std.atomic.Value(bool).init(false);
-    var accepted = (try awaitWithCors(
+    var accepted = (try await(
         TestCallback,
         parseTestCallback,
         std.testing.allocator,
@@ -740,4 +705,7 @@ test "browser callback permits the xAI CORS private-network preflight" {
     const callback = probe.callback_response[0..probe.callback_len];
     try std.testing.expect(std.mem.startsWith(u8, callback, "HTTP/1.1 200 OK\r\n"));
     try std.testing.expect(std.mem.find(u8, callback, "Access-Control-Allow-Origin: https://accounts.x.ai\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, callback, "Content-Type: text/html; charset=utf-8\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, callback, "<h1>Authorization complete</h1>") != null);
+    try std.testing.expect(std.mem.find(u8, callback, "prefers-color-scheme:dark") != null);
 }

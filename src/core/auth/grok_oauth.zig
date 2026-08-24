@@ -312,7 +312,7 @@ fn awaitBrowserCallback(
     cancel_flag: *std.atomic.Value(bool),
 ) !?browser_callback.Accepted(BrowserCallback) {
     var parser_context = BrowserCallbackParserContext{ .expected_state = expected_state };
-    return browser_callback.awaitWithCors(
+    return browser_callback.await(
         BrowserCallback,
         classifyBrowserCallback,
         alloc,

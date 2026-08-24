@@ -247,11 +247,12 @@ fn composeSignInPickerRow(
     var row: std.ArrayList(u8) = .empty;
     errdefer row.deinit(alloc);
     if (width == 0) return row;
+    const accepts_manual_code = snapshot.accepts_manual_code;
 
     try row.appendSlice(
         alloc,
-        if ((source == .grok_subscription and row_index == 4) or
-            (source != .grok_subscription and (row_index == 2 or row_index == 3)))
+        if ((accepts_manual_code and row_index == 4) or
+            (!accepts_manual_code and (row_index == 2 or row_index == 3)))
             ui_render.selected_completion_style
         else
             ui_render.dim_style,
@@ -271,12 +272,12 @@ fn composeSignInPickerRow(
         try row.appendSlice(alloc, ui_render.reset_style);
         return row;
     }
-    if (source == .grok_subscription and row_index == 3) {
+    if (accepts_manual_code and row_index == 3) {
         try row_text.appendClipped(alloc, &row, "   Paste the code shown by xAI if the browser doesn't return", width);
         try row.appendSlice(alloc, ui_render.reset_style);
         return row;
     }
-    if (source == .grok_subscription and row_index == 4) {
+    if (accepts_manual_code and row_index == 4) {
         try row_text.appendClipped(alloc, &row, "   ┃ ", width);
         if (manual_code_mask_count == 0) {
             try row.appendSlice(alloc, ui_render.dim_style);
@@ -321,7 +322,7 @@ fn composeSignInPickerRow(
             .failed => "   Sign-in failed",
             .cancelled => "   Sign-in cancelled",
         },
-        6 => if (source == .grok_subscription)
+        6 => if (accepts_manual_code)
             "   Enter submits or reopens browser · Esc cancels"
         else
             "   Enter reopens browser · Esc cancels",
@@ -1882,7 +1883,7 @@ test "sign-in stage renders the complete device authorization screen" {
 test "Codex sign-in stage renders a bounded clickable authorization action" {
     const alloc = std.testing.allocator;
     const url = "https://auth.openai.test/oauth/authorize?response_type=code&client_id=test&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&state=full-state";
-    const view = auth_runtime.PickerView{
+    var view = auth_runtime.PickerView{
         .active = true,
         .available_sources = .empty,
         .selected_choice = null,
@@ -1904,6 +1905,16 @@ test "Codex sign-in stage renders a bounded clickable authorization action" {
     try std.testing.expect(std.mem.find(u8, row.items, url) != null);
     try std.testing.expect(std.mem.find(u8, row.items, "\x1b]8;;\x1b\\") != null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 40);
+
+    view.sign_in.accepts_manual_code = true;
+    view.sign_in_code_mask_count = 3;
+    var manual = try composeAuthPickerRow(alloc, view, 4, authPickerRowCount(view), 40);
+    defer manual.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, manual.items, "•••") != null);
+    try std.testing.expect(std.mem.find(u8, manual.items, ui_render.selected_completion_style) != null);
+    var hint = try composeAuthPickerRow(alloc, view, 6, authPickerRowCount(view), 80);
+    defer hint.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, hint.items, "Enter submits or reopens browser") != null);
 }
 
 test "partially visible auth picker shows a source window without duplicates" {
