@@ -198,7 +198,7 @@ const PendingCardPaintContext = struct {
         surface: *render_engine.frame_surface.FrameSurface,
     ) anyerror!void {
         const self: *PendingCardPaintContext = @ptrCast(@alignCast(raw));
-        _ = try surface.writeAnsiBand(
+        _ = try surface.writeAnsiBandNoWrap(
             self.row,
             self.max_rows,
             self.bytes,
@@ -238,28 +238,36 @@ fn buildPendingCardProjection(
         };
     }
 
-    const card = try user_message_card.buildUserPromptCardWithSkillTokensForTerminalPresentationInterruptible(
+    const has_prior_turns = if (comptime @hasField(App, "session"))
+        app.session.historyLen() > 0
+    else
+        false;
+    const cursor_row = @min(
+        @max(presentation_shell.cursor_row, 1),
+        presentation_shell.layout.content_bottom,
+    );
+    const leading_blank_rows: u16 = @intFromBool(
+        !has_prior_turns and
+            presentation_shell.cursor_col != 1 and
+            cursor_row < presentation_shell.layout.content_bottom,
+    );
+    const available_rows = presentation_shell.layout.content_bottom - cursor_row + 1 -| leading_blank_rows;
+    const card = try user_message_card.buildUserPromptCardTailForTerminalPresentationInterruptible(
         app.alloc,
         pending.draft.prompt,
         pending.draft.images,
         presentation_shell.layout.cols,
         skill_tokens,
+        @max(available_rows, 1),
         checkpoint,
     );
     defer app.alloc.free(card);
-    const has_prior_turns = if (comptime @hasField(App, "session"))
-        app.session.historyLen() > 0
-    else
-        false;
-    const leading_blank_rows: u16 = @intFromBool(
-        !has_prior_turns and presentation_shell.cursor_col != 1,
-    );
     const bytes = try pendingCardTerminalWireBytes(app.alloc, card);
     const rendered_line_count: u16 = @intCast(@min(
         std.mem.count(u8, card, "\n"),
         @as(usize, std.math.maxInt(u16)),
     ));
-    const paint_row_count = rendered_line_count +| 1;
+    const paint_row_count = rendered_line_count;
     const row_count = rendered_line_count +| leading_blank_rows;
     if (row_count == 0) {
         app.alloc.free(bytes);
@@ -277,21 +285,25 @@ fn pendingCardTerminalWireBytes(
     alloc: std.mem.Allocator,
     logical: []const u8,
 ) ![]u8 {
+    var logical_end = logical.len;
+    if (logical_end > 0 and logical[logical_end - 1] == '\n') logical_end -= 1;
+    if (logical_end > 0 and logical[logical_end - 1] == '\r') logical_end -= 1;
+    const source = logical[0..logical_end];
     var missing_carriage_returns: usize = 0;
-    for (logical, 0..) |byte, index| {
-        if (byte == '\n' and (index == 0 or logical[index - 1] != '\r')) {
+    for (source, 0..) |byte, index| {
+        if (byte == '\n' and (index == 0 or source[index - 1] != '\r')) {
             missing_carriage_returns += 1;
         }
     }
     const wire_len = try std.math.add(
         usize,
-        logical.len,
+        source.len,
         missing_carriage_returns,
     );
     const wire = try alloc.alloc(u8, wire_len);
     var written: usize = 0;
-    for (logical, 0..) |byte, index| {
-        if (byte == '\n' and (index == 0 or logical[index - 1] != '\r')) {
+    for (source, 0..) |byte, index| {
+        if (byte == '\n' and (index == 0 or source[index - 1] != '\r')) {
             wire[written] = '\r';
             written += 1;
         }
@@ -3581,6 +3593,15 @@ fn FixedPointTranscriptContext(comptime App: type) type {
             const candidate_rows = candidate.transcript_area.height();
             if (!self.prepare_transcript or candidate.transcript_area.isEmpty()) {
                 return .{ .occupied_transcript_rows = candidate_rows };
+            }
+            if (transcriptAreaBeforePendingTail(
+                candidate.transcript_area,
+                self.pending_tail_rows,
+            ).isEmpty()) {
+                return .{ .occupied_transcript_rows = @min(
+                    self.pending_tail_rows,
+                    candidate_rows,
+                ) };
             }
             const source = self.source orelse return error.MissingTranscriptPreparationSource;
             const prepared = if (self.prepared_transcript.*) |*value| value else return error.MissingTranscriptPaint;

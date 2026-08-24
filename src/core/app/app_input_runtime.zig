@@ -10757,7 +10757,12 @@ const FakeSubmitApp = struct {
     pending_images: std.ArrayList(types.ImageAttachment) = .empty,
     stream: types.StreamState = .{},
     pacer: struct {
+        pending: bool = false,
         completed_assistant_presentation_tail: bool = false,
+
+        pub fn hasPending(self: *const @This()) bool {
+            return self.pending;
+        }
 
         pub fn hasCompletedAssistantPresentationTail(self: *const @This()) bool {
             return self.completed_assistant_presentation_tail;
@@ -10784,6 +10789,7 @@ const FakeSubmitApp = struct {
     submission: input_submit_runtime.State = .{},
     shell: struct {
         render_requests: render_request.RenderRequestState = .{},
+        full_transcript_active: bool = false,
         layout: types.Layout = .{
             .rows = 24,
             .cols = 80,
@@ -10793,6 +10799,10 @@ const FakeSubmitApp = struct {
             .divider_bottom_row = 23,
             .hint_row = 24,
         },
+
+        pub fn fullTranscriptActive(self: *const @This()) bool {
+            return self.full_transcript_active;
+        }
     } = .{},
     next_image_id_counter: usize = 1,
     transcript: std.ArrayList(u8) = .empty,
@@ -11963,6 +11973,7 @@ test "app_input_runtime accepted prompt repaints while a turn is active" {
     const alloc = std.testing.allocator;
     var app = FakeSubmitApp{ .alloc = alloc, .stream = .{ .active = true } };
     defer app.deinit();
+    app.worker.hold_available = true;
 
     try app.input_runtime.edit_state.input.appendSlice(alloc, "queued follow-up");
     app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
@@ -11970,6 +11981,7 @@ test "app_input_runtime accepted prompt repaints while a turn is active" {
     try Runtime(FakeSubmitApp).submit(&app, 100);
 
     try std.testing.expectEqualStrings("queued follow-up", app.last_prompt.?);
+    try std.testing.expect(app.submission.pending == null);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
     try std.testing.expect(!app.shell.render_requests.blocksFrameCommit());
 }
@@ -11991,6 +12003,42 @@ test "app_input_runtime completed presentation tail keeps the active queue path 
     try std.testing.expectEqualStrings("paced-tail follow-up", app.last_prompt.?);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
     try std.testing.expect(!app.shell.render_requests.blocksFrameCommit());
+}
+
+test "app_input_runtime pending paced output keeps the active queue path" {
+    const alloc = std.testing.allocator;
+    var app = FakeSubmitApp{
+        .alloc = alloc,
+        .pacer = .{ .pending = true },
+    };
+    defer app.deinit();
+    app.worker.hold_available = true;
+
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "paced-output follow-up");
+    app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
+
+    try Runtime(FakeSubmitApp).submit(&app, 100);
+
+    try std.testing.expectEqualStrings("paced-output follow-up", app.last_prompt.?);
+    try std.testing.expect(app.submission.pending == null);
+    try std.testing.expect(!app.worker.held);
+}
+
+test "app_input_runtime full transcript keeps the active queue path" {
+    const alloc = std.testing.allocator;
+    var app = FakeSubmitApp{ .alloc = alloc };
+    defer app.deinit();
+    app.worker.hold_available = true;
+    app.shell.full_transcript_active = true;
+
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "full-transcript follow-up");
+    app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
+
+    try Runtime(FakeSubmitApp).submit(&app, 100);
+
+    try std.testing.expectEqualStrings("full-transcript follow-up", app.last_prompt.?);
+    try std.testing.expect(app.submission.pending == null);
+    try std.testing.expect(!app.worker.held);
 }
 
 test "app_input_runtime blank submit repaints without a worker event" {

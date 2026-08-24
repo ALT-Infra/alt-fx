@@ -773,6 +773,19 @@ pub fn SubmitRuntime(comptime App: type) type {
             {
                 return .unavailable;
             }
+            if (comptime @hasField(App, "stream")) {
+                if (app.stream.active) return .unavailable;
+            }
+            if (comptime @hasField(App, "pacer") and
+                @hasDecl(@TypeOf(app.pacer), "hasPending"))
+            {
+                if (app.pacer.hasPending()) return .unavailable;
+            }
+            if (comptime @hasField(App, "shell") and
+                @hasDecl(@TypeOf(app.shell), "fullTranscriptActive"))
+            {
+                if (app.shell.fullTranscriptActive()) return .unavailable;
+            }
             if (app.submission.pending != null) return .deferred;
             if (!app.worker.tryHoldTurnStart()) return .unavailable;
             errdefer app.worker.releaseTurnStartHold();
