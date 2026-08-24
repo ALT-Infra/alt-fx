@@ -27,6 +27,7 @@ pub fn Accepted(comptime Callback: type) type {
     return struct {
         stream: std.Io.net.Stream,
         callback: Callback,
+        cors_origin: ?[]const u8 = null,
 
         pub fn deinit(self: *@This()) void {
             self.stream.close(io_mod.getIo());
@@ -34,7 +35,7 @@ pub fn Accepted(comptime Callback: type) type {
         }
 
         pub fn respond(self: *@This(), outcome: Response) !void {
-            try writeResponse(self.stream, outcome);
+            try writeResponse(self.stream, outcome, self.cors_origin);
         }
     };
 }
@@ -54,6 +55,46 @@ pub fn await(
     parser_context: ?*anyopaque,
     cancel_flag: *std.atomic.Value(bool),
 ) !?Accepted(Callback) {
+    return awaitConfigured(
+        Callback,
+        parse,
+        alloc,
+        listener,
+        parser_context,
+        cancel_flag,
+        null,
+    );
+}
+
+pub fn awaitWithCors(
+    comptime Callback: type,
+    comptime parse: fn (?*anyopaque, Allocator, []const u8) ParseResult(Callback),
+    alloc: Allocator,
+    listener: *std.Io.net.Server,
+    parser_context: ?*anyopaque,
+    cancel_flag: *std.atomic.Value(bool),
+    cors_origin: []const u8,
+) !?Accepted(Callback) {
+    return awaitConfigured(
+        Callback,
+        parse,
+        alloc,
+        listener,
+        parser_context,
+        cancel_flag,
+        cors_origin,
+    );
+}
+
+fn awaitConfigured(
+    comptime Callback: type,
+    comptime parse: fn (?*anyopaque, Allocator, []const u8) ParseResult(Callback),
+    alloc: Allocator,
+    listener: *std.Io.net.Server,
+    parser_context: ?*anyopaque,
+    cancel_flag: *std.atomic.Value(bool),
+    cors_origin: ?[]const u8,
+) !?Accepted(Callback) {
     var accepts: usize = 0;
     while (accepts < max_accepts_per_poll) : (accepts += 1) {
         if (!try listenerReady(listener, cancel_flag)) return null;
@@ -65,35 +106,67 @@ pub fn await(
         defer if (!handed_off) stream.close(io_mod.getIo());
         setSocketTimeouts(stream.socket.handle);
 
-        const maybe_target = readTarget(alloc, stream, cancel_flag) catch |err| switch (err) {
+        const maybe_request = readRequest(alloc, stream, cancel_flag, cors_origin) catch |err| switch (err) {
             error.Cancelled => return err,
             error.InvalidOAuthCallbackRequest, error.OAuthCallbackRequestTooLarge => {
-                writeResponse(stream, .unrelated) catch {};
+                writeResponse(stream, .unrelated, null) catch {};
                 continue;
             },
             else => return err,
         };
-        const target = maybe_target orelse continue;
-        defer alloc.free(target);
+        var request = maybe_request orelse continue;
+        defer request.deinit(alloc);
+        switch (request.kind) {
+            .preflight => {
+                writePreflightResponse(stream, cors_origin.?) catch {};
+                continue;
+            },
+            .unrelated => {
+                writeResponse(stream, .unrelated, null) catch {};
+                continue;
+            },
+            .callback => {},
+        }
 
-        const parsed = parse(parser_context, alloc, target);
+        const parsed = parse(parser_context, alloc, request.target);
         switch (parsed) {
             .accepted => |callback| {
                 handed_off = true;
-                return .{ .stream = stream, .callback = callback };
+                return .{
+                    .stream = stream,
+                    .callback = callback,
+                    .cors_origin = request.cors_origin,
+                };
             },
             .unrelated => {
-                writeResponse(stream, .unrelated) catch {};
+                writeResponse(stream, .unrelated, request.cors_origin) catch {};
                 continue;
             },
             .failed => |err| {
-                writeResponse(stream, .failed) catch {};
+                writeResponse(stream, .failed, request.cors_origin) catch {};
                 return err;
             },
         }
     }
     return null;
 }
+
+const RequestKind = enum {
+    callback,
+    preflight,
+    unrelated,
+};
+
+const Request = struct {
+    kind: RequestKind,
+    target: []u8,
+    cors_origin: ?[]const u8 = null,
+
+    fn deinit(self: *Request, alloc: Allocator) void {
+        alloc.free(self.target);
+        self.* = undefined;
+    }
+};
 
 fn listenerReady(
     listener: *std.Io.net.Server,
@@ -138,13 +211,14 @@ fn requestReadable(
     }
 }
 
-/// Reads the request target, or returns null when the connection remains
+/// Reads one bounded HTTP request, or returns null when the connection remains
 /// silent for the speculative-preconnect budget.
-fn readTarget(
+fn readRequest(
     alloc: Allocator,
     stream: std.Io.net.Stream,
     cancel_flag: *std.atomic.Value(bool),
-) !?[]u8 {
+    allowed_cors_origin: ?[]const u8,
+) !?Request {
     const deadline_ms = io_mod.milliTimestamp() + silence_ms;
     var socket_buffer: [4096]u8 = undefined;
     var reader = stream.reader(io_mod.getIo(), &socket_buffer);
@@ -177,12 +251,56 @@ fn readTarget(
     const line_end = std.mem.find(u8, request_bytes[0..request_len], "\r\n") orelse
         return error.InvalidOAuthCallbackRequest;
     const request_line = request_bytes[0..line_end];
-    if (!std.mem.startsWith(u8, request_line, "GET ")) {
+    const method_end = std.mem.findScalar(u8, request_line, ' ') orelse
         return error.InvalidOAuthCallbackRequest;
+    const target_start = method_end + 1;
+    const target_end = std.mem.findScalarPos(u8, request_line, target_start, ' ') orelse
+        return error.InvalidOAuthCallbackRequest;
+    const method = request_line[0..method_end];
+    const target = request_line[target_start..target_end];
+    const origin = requestHeaderValue(request_bytes[line_end + 2 .. request_len], "origin");
+    const cors_origin = allowed_cors_origin orelse {
+        if (!std.mem.eql(u8, method, "GET")) return error.InvalidOAuthCallbackRequest;
+        return .{
+            .kind = .callback,
+            .target = try alloc.dupe(u8, target),
+        };
+    };
+    const origin_allowed = if (origin) |value| std.mem.eql(u8, value, cors_origin) else false;
+
+    if (std.mem.eql(u8, method, "OPTIONS")) {
+        const requested_method = requestHeaderValue(
+            request_bytes[line_end + 2 .. request_len],
+            "access-control-request-method",
+        );
+        const callback_path = std.mem.eql(u8, target, "/callback") or
+            std.mem.startsWith(u8, target, "/callback?");
+        const valid = origin_allowed and
+            requested_method != null and
+            std.ascii.eqlIgnoreCase(requested_method.?, "GET") and
+            callback_path;
+        return .{
+            .kind = if (valid) .preflight else .unrelated,
+            .target = try alloc.dupe(u8, target),
+        };
     }
-    const target_end = std.mem.findScalarPos(u8, request_line, 4, ' ') orelse
-        return error.InvalidOAuthCallbackRequest;
-    return try alloc.dupe(u8, request_line[4..target_end]);
+    if (!std.mem.eql(u8, method, "GET")) return error.InvalidOAuthCallbackRequest;
+    return .{
+        .kind = if (origin == null or origin_allowed) .callback else .unrelated,
+        .target = try alloc.dupe(u8, target),
+        .cors_origin = if (origin_allowed) cors_origin else null,
+    };
+}
+
+fn requestHeaderValue(headers: []const u8, name: []const u8) ?[]const u8 {
+    var lines = std.mem.splitSequence(u8, headers, "\r\n");
+    while (lines.next()) |line| {
+        if (line.len == 0) break;
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
+        if (!std.ascii.eqlIgnoreCase(line[0..colon], name)) continue;
+        return std.mem.trim(u8, line[colon + 1 ..], " \t");
+    }
+    return null;
 }
 
 fn callbackPage(comptime title: []const u8, comptime detail: []const u8) []const u8 {
@@ -200,7 +318,7 @@ fn callbackPage(comptime title: []const u8, comptime detail: []const u8) []const
         "</style></head><body><main><h1>" ++ title ++ "</h1><p>" ++ detail ++ "</p></main></body></html>";
 }
 
-fn writeResponse(stream: std.Io.net.Stream, outcome: Response) !void {
+fn writeResponse(stream: std.Io.net.Stream, outcome: Response, cors_origin: ?[]const u8) !void {
     const reply: struct { status: []const u8, body: []const u8 } = switch (outcome) {
         .ok => .{
             .status = "200 OK",
@@ -223,9 +341,30 @@ fn writeResponse(stream: std.Io.net.Stream, outcome: Response) !void {
     };
     var buffer: [4096]u8 = undefined;
     var writer = stream.writer(io_mod.getIo(), &buffer);
+    try writer.interface.print("HTTP/1.1 {s}\r\n", .{reply.status});
+    if (cors_origin) |origin| {
+        try writer.interface.print("Access-Control-Allow-Origin: {s}\r\nVary: Origin\r\n", .{origin});
+    }
     try writer.interface.print(
-        "HTTP/1.1 {s}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
-        .{ reply.status, reply.body.len, reply.body },
+        "Content-Type: text/html; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        .{ reply.body.len, reply.body },
+    );
+    try writer.interface.flush();
+}
+
+fn writePreflightResponse(stream: std.Io.net.Stream, origin: []const u8) !void {
+    var buffer: [1024]u8 = undefined;
+    var writer = stream.writer(io_mod.getIo(), &buffer);
+    try writer.interface.print(
+        "HTTP/1.1 204 No Content\r\n" ++
+            "Access-Control-Allow-Origin: {s}\r\n" ++
+            "Access-Control-Allow-Methods: GET\r\n",
+        .{origin},
+    );
+    try writer.interface.writeAll(
+        "Access-Control-Allow-Private-Network: true\r\n" ++
+            "Vary: Origin, Access-Control-Request-Method, Access-Control-Request-Private-Network\r\n" ++
+            "Content-Length: 0\r\nConnection: close\r\n\r\n",
     );
     try writer.interface.flush();
 }
@@ -514,4 +653,91 @@ test "browser callback survives a reset preconnect before the redirect" {
 
 test "browser callback survives a reset queued before accept" {
     try expectResetPreconnectSurvives(0);
+}
+
+const CorsCallbackProbe = struct {
+    port: u16,
+    preflight_response: [1024]u8 = undefined,
+    preflight_len: usize = 0,
+    callback_response: [4096]u8 = undefined,
+    callback_len: usize = 0,
+    failed: bool = false,
+
+    fn run(self: *CorsCallbackProbe) void {
+        self.preflight_len = self.exchange(
+            "OPTIONS /callback HTTP/1.1\r\n" ++
+                "Host: 127.0.0.1\r\n" ++
+                "Origin: https://accounts.x.ai\r\n" ++
+                "Access-Control-Request-Method: GET\r\n" ++
+                "Access-Control-Request-Private-Network: true\r\n\r\n",
+            &self.preflight_response,
+        ) orelse return self.markFailed();
+        self.callback_len = self.exchange(
+            "GET /callback?code=granted HTTP/1.1\r\n" ++
+                "Host: 127.0.0.1\r\n" ++
+                "Origin: https://accounts.x.ai\r\n\r\n",
+            &self.callback_response,
+        ) orelse return self.markFailed();
+    }
+
+    fn exchange(self: *CorsCallbackProbe, request: []const u8, response: []u8) ?usize {
+        const io = io_mod.getIo();
+        var address = std.Io.net.IpAddress.parse("127.0.0.1", self.port) catch return null;
+        var stream = address.connect(io, .{ .mode = .stream }) catch return null;
+        defer stream.close(io);
+        var write_buffer: [1024]u8 = undefined;
+        var writer = stream.writer(io, &write_buffer);
+        writer.interface.writeAll(request) catch return null;
+        writer.interface.flush() catch return null;
+
+        var read_buffer: [1024]u8 = undefined;
+        var reader = stream.reader(io, &read_buffer);
+        var total: usize = 0;
+        while (total < response.len) {
+            const read_len = reader.interface.readSliceShort(response[total..]) catch return null;
+            if (read_len == 0) break;
+            total += read_len;
+        }
+        return total;
+    }
+
+    fn markFailed(self: *CorsCallbackProbe) void {
+        self.failed = true;
+    }
+};
+
+test "browser callback permits the xAI CORS private-network preflight" {
+    var listener = try bindTestListener();
+    defer listener.deinit(io_mod.getIo());
+
+    var probe = CorsCallbackProbe{ .port = listener.socket.address.getPort() };
+    const thread = try std.Thread.spawn(.{}, CorsCallbackProbe.run, .{&probe});
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var accepted = (try awaitWithCors(
+        TestCallback,
+        parseTestCallback,
+        std.testing.allocator,
+        &listener,
+        null,
+        &cancel_flag,
+        "https://accounts.x.ai",
+    )) orelse return error.CallbackNeverArrived;
+    accepted.respond(.ok) catch |err| {
+        accepted.deinit();
+        thread.join();
+        return err;
+    };
+    accepted.deinit();
+    thread.join();
+
+    try std.testing.expect(!probe.failed);
+    const preflight = probe.preflight_response[0..probe.preflight_len];
+    try std.testing.expect(std.mem.startsWith(u8, preflight, "HTTP/1.1 204 No Content\r\n"));
+    try std.testing.expect(std.mem.find(u8, preflight, "Access-Control-Allow-Origin: https://accounts.x.ai\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, preflight, "Access-Control-Allow-Methods: GET\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, preflight, "Access-Control-Allow-Private-Network: true\r\n") != null);
+    const callback = probe.callback_response[0..probe.callback_len];
+    try std.testing.expect(std.mem.startsWith(u8, callback, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.find(u8, callback, "Access-Control-Allow-Origin: https://accounts.x.ai\r\n") != null);
 }

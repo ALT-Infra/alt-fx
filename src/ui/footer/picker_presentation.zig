@@ -67,7 +67,14 @@ pub noinline fn composeAuthPickerRow(
     width: u16,
 ) !std.ArrayList(u8) {
     if (view.stage == .sign_in) {
-        return composeSignInPickerRow(alloc, view.sign_in, view.sign_in_source, row_index, width);
+        return composeSignInPickerRow(
+            alloc,
+            view.sign_in,
+            view.sign_in_source,
+            view.sign_in_code_mask_count,
+            row_index,
+            width,
+        );
     }
     if (view.stage == .api_key) {
         return composeApiKeyPickerRow(alloc, view.api_key_mask_count, row_index, width);
@@ -233,6 +240,7 @@ fn composeSignInPickerRow(
     alloc: Allocator,
     snapshot: login_flow.SignInSnapshot,
     source: credentials.Source,
+    manual_code_mask_count: usize,
     row_index: u16,
     width: u16,
 ) !std.ArrayList(u8) {
@@ -242,7 +250,8 @@ fn composeSignInPickerRow(
 
     try row.appendSlice(
         alloc,
-        if (row_index == 2 or row_index == 3)
+        if ((source == .grok_subscription and row_index == 4) or
+            (source != .grok_subscription and (row_index == 2 or row_index == 3)))
             ui_render.selected_completion_style
         else
             ui_render.dim_style,
@@ -258,6 +267,22 @@ fn composeSignInPickerRow(
             try row.appendSlice(alloc, "\x1b\\\x1b[4m");
             try row_text.appendClipped(alloc, &row, "Authorize with Codex", remaining);
             try row.appendSlice(alloc, "\x1b[24m\x1b]8;;\x1b\\");
+        }
+        try row.appendSlice(alloc, ui_render.reset_style);
+        return row;
+    }
+    if (source == .grok_subscription and row_index == 3) {
+        try row_text.appendClipped(alloc, &row, "   Paste the code shown by xAI if the browser doesn't return", width);
+        try row.appendSlice(alloc, ui_render.reset_style);
+        return row;
+    }
+    if (source == .grok_subscription and row_index == 4) {
+        try row_text.appendClipped(alloc, &row, "   ┃ ", width);
+        if (manual_code_mask_count == 0) {
+            try row.appendSlice(alloc, ui_render.dim_style);
+            try row_text.appendClipped(alloc, &row, "Paste or type the code", width -| 5);
+        } else {
+            for (0..@min(manual_code_mask_count, width -| 5)) |_| try row.appendSlice(alloc, "•");
         }
         try row.appendSlice(alloc, ui_render.reset_style);
         return row;
@@ -296,7 +321,10 @@ fn composeSignInPickerRow(
             .failed => "   Sign-in failed",
             .cancelled => "   Sign-in cancelled",
         },
-        6 => "   Enter reopens browser · Esc cancels",
+        6 => if (source == .grok_subscription)
+            "   Enter submits or reopens browser · Esc cancels"
+        else
+            "   Enter reopens browser · Esc cancels",
         else => "",
     };
     try row_text.appendClipped(alloc, &row, label, width);

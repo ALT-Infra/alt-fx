@@ -60,13 +60,41 @@ const BrowserLoginContext = struct {
     code_verifier: []u8,
     state: []u8,
     transport: oauth_transport.Provider,
+    manual_code_mutex: std.Io.Mutex = .init,
+    manual_code: ?[]u8 = null,
 
     fn deinit(self: *BrowserLoginContext, alloc: Allocator) void {
         self.listener.deinit(io_mod.getIo());
         alloc.free(self.redirect_uri);
         secret.zeroAndFree(alloc, self.code_verifier);
         secret.zeroAndFree(alloc, self.state);
+        if (self.manual_code) |code| secret.zeroAndFree(alloc, code);
         self.* = undefined;
+    }
+
+    fn submitManualCode(self: *BrowserLoginContext, alloc: Allocator, input: []const u8) !void {
+        const code = std.mem.trim(u8, input, " \t\r\n");
+        if (code.len == 0 or code.len > login_flow.max_manual_code_bytes) {
+            return error.InvalidGrokAuthorizationCode;
+        }
+        for (code) |byte| {
+            if (byte < 0x21 or byte > 0x7e) return error.InvalidGrokAuthorizationCode;
+        }
+        const owned = try alloc.dupe(u8, code);
+        errdefer secret.zeroAndFree(alloc, owned);
+
+        self.manual_code_mutex.lockUncancelable(io_mod.getIo());
+        defer self.manual_code_mutex.unlock(io_mod.getIo());
+        if (self.manual_code) |pending| secret.zeroAndFree(alloc, pending);
+        self.manual_code = owned;
+    }
+
+    fn takeManualCode(self: *BrowserLoginContext) ?[]u8 {
+        self.manual_code_mutex.lockUncancelable(io_mod.getIo());
+        defer self.manual_code_mutex.unlock(io_mod.getIo());
+        const code = self.manual_code;
+        self.manual_code = null;
+        return code;
     }
 };
 
@@ -94,8 +122,14 @@ pub fn startSignIn(
             },
             .complete = completeSignIn,
             .save = saveSignIn,
+            .submit_manual_code = submitBrowserManualCode,
         },
     );
+}
+
+fn submitBrowserManualCode(raw: ?*anyopaque, alloc: Allocator, code: []const u8) !void {
+    const context: *BrowserLoginContext = @ptrCast(@alignCast(raw.?));
+    try context.submitManualCode(alloc, code);
 }
 
 fn prepareBrowserSignIn(alloc: Allocator, transport: oauth_transport.Provider) !PreparedBrowserLogin {
@@ -217,32 +251,38 @@ fn pollBrowserToken(
     if (comptime host_target.is_wasm) return error.GrokOAuthUnavailable;
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     const context: *BrowserLoginContext = @ptrCast(@alignCast(raw.?));
-    var accepted = (try awaitBrowserCallback(
-        alloc,
-        &context.listener,
-        context.state,
-        cancel_flag,
-    )) orelse return .pending;
-    defer {
-        accepted.callback.deinit(alloc);
-        accepted.deinit();
-    }
+    const manual_code = context.takeManualCode();
+    defer if (manual_code) |code| secret.zeroAndFree(alloc, code);
+    var accepted: ?browser_callback.Accepted(BrowserCallback) = null;
+    defer if (accepted) |*callback| {
+        callback.callback.deinit(alloc);
+        callback.deinit();
+    };
+    const code = manual_code orelse code: {
+        accepted = (try awaitBrowserCallback(
+            alloc,
+            &context.listener,
+            context.state,
+            cancel_flag,
+        )) orelse return .pending;
+        break :code accepted.?.callback.code;
+    };
 
     var token = exchangeAuthorizationCodeForRedirectWithBounds(
         alloc,
         transport,
         metadata.token_endpoint,
-        accepted.callback.code,
+        code,
         context.code_verifier,
         context.redirect_uri,
         cancel_flag,
         deadline,
     ) catch |err| {
-        accepted.respond(.failed) catch {};
+        if (accepted) |*callback| callback.respond(.failed) catch {};
         return err;
     };
     errdefer token.deinit(alloc);
-    try accepted.respond(.ok);
+    if (accepted) |*callback| try callback.respond(.ok);
 
     const scope = try alloc.dupe(u8, "");
     errdefer if (scope.len > 0) alloc.free(scope);
@@ -272,13 +312,14 @@ fn awaitBrowserCallback(
     cancel_flag: *std.atomic.Value(bool),
 ) !?browser_callback.Accepted(BrowserCallback) {
     var parser_context = BrowserCallbackParserContext{ .expected_state = expected_state };
-    return browser_callback.await(
+    return browser_callback.awaitWithCors(
         BrowserCallback,
         classifyBrowserCallback,
         alloc,
         listener,
         &parser_context,
         cancel_flag,
+        "https://accounts.x.ai",
     ) catch |err| switch (err) {
         error.OAuthCallbackListenerFailed => error.GrokOAuthCallbackListenerFailed,
         else => err,
@@ -347,11 +388,18 @@ pub fn runLogin(
     try writeStdout("Open this URL to sign in with Grok:\n");
     try writeStdout(authorization_url);
     try writeStdout("\n\nWaiting for browser authorization...\n");
+    try writeStdout("Paste the code shown by xAI and press Enter if the browser doesn't return.\n");
     if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) {
         _ = url_opener.open(alloc, authorization_url) catch false;
     }
 
+    var stdin_code: StdinManualCodeReader = .{};
+    defer stdin_code.deinit();
     while (true) {
+        if (try stdin_code.poll()) |code| {
+            _ = try runtime.submitManualCode(alloc, code);
+            stdin_code.clear();
+        }
         switch (runtime.pollTransition(alloc)) {
             .none => try io_mod.getIo().sleep(.fromMilliseconds(50), .awake),
             .succeeded => |completion| {
@@ -364,6 +412,51 @@ pub fn runLogin(
         }
     }
 }
+
+const StdinManualCodeReader = struct {
+    buffer: [login_flow.max_manual_code_bytes]u8 = undefined,
+    len: usize = 0,
+    closed: bool = false,
+
+    fn poll(self: *StdinManualCodeReader) !?[]const u8 {
+        if (self.closed) return null;
+        var fds = [_]std.posix.pollfd{.{
+            .fd = std.posix.STDIN_FILENO,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = try std.posix.poll(&fds, 0);
+        if (ready == 0 or
+            (fds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) == 0) return null;
+
+        var chunk: [512]u8 = undefined;
+        defer @memset(&chunk, 0);
+        const read_len = try std.posix.read(std.posix.STDIN_FILENO, &chunk);
+        if (read_len == 0) {
+            self.closed = true;
+            return if (self.len == 0) null else self.buffer[0..self.len];
+        }
+        const line_end = std.mem.findScalar(u8, chunk[0..read_len], '\n') orelse read_len;
+        if (line_end > self.buffer.len - self.len) return error.GrokAuthorizationCodeTooLong;
+        @memcpy(self.buffer[self.len..][0..line_end], chunk[0..line_end]);
+        self.len += line_end;
+        if (line_end < read_len) {
+            self.closed = true;
+            return self.buffer[0..self.len];
+        }
+        return null;
+    }
+
+    fn clear(self: *StdinManualCodeReader) void {
+        @memset(self.buffer[0..self.len], 0);
+        self.len = 0;
+    }
+
+    fn deinit(self: *StdinManualCodeReader) void {
+        @memset(&self.buffer, 0);
+        self.* = undefined;
+    }
+};
 
 pub const LogoutResult = struct {
     deletion: grok_session.DeleteOutcome,
