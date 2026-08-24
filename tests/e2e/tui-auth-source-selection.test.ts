@@ -895,7 +895,7 @@ function startFakeCodexAutoReview() {
       if (mainRequests === 1) {
         return new Response(
           'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_terminal","name":"terminal"}}\n\n' +
-            'data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\\"action\\":\\"exec\\",\\"command\\":\\"pwd\\"}"}\n\n' +
+            'data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\\"action\\":\\"exec\\",\\"command\\":\\"pwd\\",\\"timeout_ms\\":600000}"}\n\n' +
             'data: {"type":"response.completed","response":{"id":"gen_main_1","status":"completed","usage":{"input_tokens":5,"output_tokens":2}}}\n\n',
           { headers: { "content-type": "text/event-stream" } },
         );
@@ -961,7 +961,7 @@ function startFakeGrokAutoReview() {
       if (mainRequests === 1) {
         return new Response(
           'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_terminal","name":"terminal"}}\n\n' +
-            'data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\\"action\\":\\"exec\\",\\"command\\":\\"pwd\\"}"}\n\n' +
+            'data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\\"action\\":\\"exec\\",\\"command\\":\\"pwd\\",\\"timeout_ms\\":600000}"}\n\n' +
             'data: {"type":"response.completed","response":{"id":"gen_main_1","status":"completed","usage":{"input_tokens":5,"output_tokens":2}}}\n\n',
           { headers: { "content-type": "text/event-stream" } },
         );

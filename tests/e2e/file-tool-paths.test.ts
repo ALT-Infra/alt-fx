@@ -427,7 +427,7 @@ describe("filesystem path handling", () => {
           {
             id: "added_cwd_1",
             name: "terminal",
-            input: { action: "exec", command: "pwd", cwd: root.external },
+            input: { action: "exec", timeout_ms: 600_000, command: "pwd", cwd: root.external },
             expected: root.external,
           },
         ];
@@ -607,6 +607,7 @@ describe("filesystem path handling", () => {
       const gateway = startFakeGateway([
         toolCall("added_command_write_1", "terminal", {
           action: "exec",
+          timeout_ms: 600_000,
           command: "printf COMMAND_ADDED_WRITE > command-proof.txt",
           cwd: root.external,
         }),
@@ -763,6 +764,7 @@ describe("filesystem path handling", () => {
           const gateway = startFakeGateway([
             toolCall(scenario.id, "terminal", {
               action: "exec",
+              timeout_ms: 600_000,
               command: `pwd; printf ${scenario.id} > ${scenario.id}.txt`,
               cwd: scenario.cwd,
             }),

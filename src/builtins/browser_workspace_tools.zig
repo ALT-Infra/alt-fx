@@ -88,6 +88,19 @@ test "browser workspace rejects missing action native fields and unknown argumen
     try expectDecodeFailure("{\"action\":\"exec\",\"command\":\"pwd\",\"profile\":\"clean\"}");
 }
 
+test "browser workspace supplies its private timeout without widening public input" {
+    const decoded = try registry.tools[0].decode(.{
+        .allocator = std.testing.allocator,
+    }, "{\"action\":\"exec\",\"command\":\"pwd\"}");
+    switch (decoded) {
+        .failure => |body| {
+            defer std.testing.allocator.free(body);
+            return error.TestUnexpectedDecodeFailure;
+        },
+        .input => |input| input.deinit(std.testing.allocator),
+    }
+}
+
 test "tool set selection preserves native and gates the browser projection" {
     const native = selectToolSet(true, false);
     try std.testing.expectEqual(builtin_tools.registry.tools.len, native.registry.tools.len);
