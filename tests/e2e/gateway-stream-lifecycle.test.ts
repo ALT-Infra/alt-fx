@@ -3146,6 +3146,14 @@ describe("gateway stream lifecycle", () => {
         });
       }
       if (resumeStep++ === 0) {
+        const replayMatches = [
+          ...body.matchAll(
+            /<command_output_handle>([^<]+)<\/command_output_handle>/g,
+          ),
+        ];
+        expect(replayMatches).toHaveLength(1);
+        replayHandle = replayMatches[0]?.[1] ?? "";
+        expect(replayHandle).not.toBe("");
         return fakeGatewayToolCall(readCallId, "read_tool_result", {
           handle: replayHandle,
           query: "CANCELLED-REPLAY-NEEDLE",
@@ -3189,12 +3197,6 @@ describe("gateway stream lifecycle", () => {
       expect(latest.code).toBe(0);
       const sessionId = JSON.parse(latest.stdout).id as string;
       const sessionRoot = join(root.home, ".fx", "sessions", sessionId);
-      const events = readFileSync(join(sessionRoot, "events.jsonl"), "utf8");
-      const replayMatch = events.match(
-        /"cancelled_command":\{"output_replay":\{"kind":"available","handle":"([^"]+)"/,
-      );
-      replayHandle = replayMatch?.[1] ?? "";
-      expect(replayHandle).not.toBe("");
       expect(
         readdirSync(join(sessionRoot, "logs", "commands")).filter((name) =>
           name.endsWith(".bin")

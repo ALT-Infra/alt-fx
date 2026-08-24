@@ -629,7 +629,10 @@ test "processQueuedPrompt retains cancelled command replay in interrupted histor
     try expectBodyNotContains(&follow_gateway, 0, "RESULT-JSON-ONLY-SENTINEL");
     try expectBodyNotContains(&follow_gateway, 0, "TERM-TAIL-SENTINEL");
     try expectBodyNotContains(&follow_gateway, 0, replay_output);
-    try expectBodyNotContains(&follow_gateway, 0, descriptor.handle);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, follow_gateway.request_bodies.items[0], descriptor.handle),
+    );
     try expectBodyNotContains(&follow_gateway, 0, artifact_handle);
     try expectBodyNotContains(&follow_gateway, 0, artifact_path);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, follow_gateway.request_bodies.items[0], session_runtime.aborted_tool_output));

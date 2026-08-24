@@ -16,6 +16,25 @@ const max_frame_payload_bytes: usize = 1024 * 1024;
 const max_agent_line_bytes: usize = max_frame_payload_bytes;
 const agent_projection_overlap_bytes: usize = 64;
 pub const max_public_handle_bytes: usize = 128;
+const model_handle_prefix = "\n<command_output_handle>";
+const model_handle_suffix = "</command_output_handle>\n" ++
+    "Full captured command output is available through read_tool_result with this handle.";
+pub const model_handle_notice_reserve_bytes = model_handle_prefix.len +
+    max_public_handle_bytes +
+    model_handle_suffix.len;
+
+pub fn appendModelHandleNotice(
+    alloc: Allocator,
+    model_output: []const u8,
+    handle: []const u8,
+) ![]u8 {
+    if (handle.len > max_public_handle_bytes) return error.InvalidReplayHandle;
+    return std.fmt.allocPrint(
+        alloc,
+        "{s}{s}{s}{s}",
+        .{ model_output, model_handle_prefix, handle, model_handle_suffix },
+    );
+}
 
 const DecodedFrameHeader = struct {
     stream: Stream,

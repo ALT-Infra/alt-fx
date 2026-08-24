@@ -16,15 +16,8 @@ const runtime_tool_contracts = @import("tool_contracts.zig");
 
 const Allocator = std.mem.Allocator;
 
-const command_replay_handle_prefix = "\n<command_output_handle>";
-const command_replay_handle_suffix = "</command_output_handle>\n" ++
-    "Full captured command output is available through read_tool_result with this handle.";
-const command_replay_handle_reserve_bytes = command_replay_handle_prefix.len +
-    command_replay_store.max_public_handle_bytes +
-    command_replay_handle_suffix.len;
-
 comptime {
-    std.debug.assert(command_replay_handle_reserve_bytes < tool_result_limits.min_configured_tool_result_bytes);
+    std.debug.assert(command_replay_store.model_handle_notice_reserve_bytes < tool_result_limits.min_configured_tool_result_bytes);
 }
 const ChatMessage = types.ChatMessage;
 const ToolCall = types.ToolCall;
@@ -233,7 +226,7 @@ pub fn prepareToolModelOutput(arena: Allocator, config: Config, tool_call: ToolC
         );
     }
     const model_output_budget = if (required_command_replay)
-        config.max_tool_result_bytes -| command_replay_handle_reserve_bytes
+        config.max_tool_result_bytes -| command_replay_store.model_handle_notice_reserve_bytes
     else
         config.max_tool_result_bytes;
     const safe_output = try tool_result_limits.prepareModelOutput(
@@ -291,7 +284,7 @@ pub fn finalizeCommandReplay(
     if (isRequiredTerminalExec(arena, tool_call)) {
         const descriptor = (try candidate.retainRequired(arena)) orelse return;
         prepared.memory.command_output_replay = .{ .available = descriptor };
-        prepared.model_output = try appendCommandReplayHandle(
+        prepared.model_output = try command_replay_store.appendModelHandleNotice(
             arena,
             prepared.model_output,
             descriptor.handle,
@@ -354,26 +347,6 @@ pub fn finalizeCommandReplay(
         return;
     }
     retainCommandReplay(arena, candidate, &prepared.memory);
-}
-
-fn appendCommandReplayHandle(
-    arena: Allocator,
-    model_output: []const u8,
-    handle: []const u8,
-) ![]const u8 {
-    if (handle.len > command_replay_store.max_public_handle_bytes) {
-        return error.InvalidReplayHandle;
-    }
-    return std.fmt.allocPrint(
-        arena,
-        "{s}{s}{s}{s}",
-        .{
-            model_output,
-            command_replay_handle_prefix,
-            handle,
-            command_replay_handle_suffix,
-        },
-    );
 }
 
 fn isCapturedCommandCall(arena: Allocator, call: ToolCall) bool {
