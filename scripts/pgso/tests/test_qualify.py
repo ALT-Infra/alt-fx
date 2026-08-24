@@ -281,7 +281,7 @@ class PgsoQualificationTests(unittest.TestCase):
         self.assertEqual(("startup-doctor",), tuple(item.name for item in results))
         self.assertEqual(100, sum(command[0] == str(hyperfine) for command in calls))
 
-    def test_startup_measurement_alternates_every_measured_sample(self) -> None:
+    def test_startup_measurement_uses_one_thousand_samples_in_balanced_blocks(self) -> None:
         control = self.root / "control" / "fx"
         candidate = self.root / "candidate" / "fx"
         hyperfine = self.root / "tools" / "hyperfine"
@@ -314,7 +314,7 @@ class PgsoQualificationTests(unittest.TestCase):
             for round_index, command in enumerate(command_rounds):
                 self.assertIn("--shell=none", command)
                 self.assertEqual("10", command[command.index("--warmup") + 1])
-                self.assertEqual("1", command[command.index("--runs") + 1])
+                self.assertEqual("10", command[command.index("--runs") + 1])
                 expected_order = (
                     ["control", "candidate"]
                     if round_index % 2 == 0
@@ -328,11 +328,11 @@ class PgsoQualificationTests(unittest.TestCase):
                         if value == "--command-name"
                     ],
                 )
-        self.assertTrue(all(result.requested_samples == 100 for result in results))
-        self.assertTrue(all(len(result.control_samples) == 100 for result in results))
-        self.assertTrue(all(len(result.candidate_samples) == 100 for result in results))
+        self.assertTrue(all(result.requested_samples == 1_000 for result in results))
+        self.assertTrue(all(len(result.control_samples) == 1_000 for result in results))
+        self.assertTrue(all(len(result.candidate_samples) == 1_000 for result in results))
 
-    def test_startup_measurement_keeps_large_campaigns_sample_interleaved(self) -> None:
+    def test_startup_measurement_caps_large_campaign_blocks_at_ten_runs(self) -> None:
         control = self.root / "control" / "fx"
         candidate = self.root / "candidate" / "fx"
         hyperfine = self.root / "tools" / "hyperfine"
@@ -360,9 +360,9 @@ class PgsoQualificationTests(unittest.TestCase):
         hyperfine_calls = [
             command for command in calls if command[0] == str(hyperfine)
         ]
-        self.assertEqual(1_000, len(hyperfine_calls))
+        self.assertEqual(100, len(hyperfine_calls))
         self.assertTrue(
-            all(command[command.index("--runs") + 1] == "1" for command in hyperfine_calls)
+            all(command[command.index("--runs") + 1] == "10" for command in hyperfine_calls)
         )
         for round_index, command in enumerate(hyperfine_calls):
             expected_order = (
