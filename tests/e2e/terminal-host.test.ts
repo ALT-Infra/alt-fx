@@ -2921,9 +2921,7 @@ test.skipIf(!tmuxAvailable() || process.platform !== "linux")(
     await waitFor(() => existsSync(paths.socket));
     const connected = await handshake(paths.socket, { minimum: 4, current: 5 });
 
-    // Same sequence as `zig build`: unlink the running name, then put a
-    // different executable in its place. Realpath-based spawn would now hit
-    // /bin/sh or FileNotFound; helpers must keep the live inode.
+    // Simulate `zig build` replacing the running binary.
     unlinkSync(liveBin);
     copyFileSync("/bin/sh", liveBin);
     chmodSync(liveBin, 0o755);

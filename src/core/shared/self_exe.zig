@@ -7,43 +7,25 @@ const Allocator = std.mem.Allocator;
 
 const linux_self_exe = "/proc/self/exe";
 
-/// Path used to spawn another copy of *this* process.
-///
-/// `zig build` replaces `zig-out/bin/fx` by unlink+rename. The running
-/// inode stays alive, but `std.process.executablePathAlloc` realpaths
-/// `/proc/self/exe` to the old on-disk name, and the next spawn is
-/// `FileNotFound`. Linux `/proc/self/exe` still execs the live inode.
+/// Returns an owned path that re-execs this process. Linux uses
+/// `/proc/self/exe` so replacing the on-disk binary does not break later spawns.
 pub fn pathForReexec(alloc: Allocator) ![]u8 {
     if (testProductExe()) |path| return alloc.dupe(u8, path);
     return productionPathForReexec(alloc);
 }
 
-/// `pathForReexec` without the test-only override.
-///
-/// `FX_TEST_PRODUCT_EXE` is set for every `zig build test` run, so a test that
-/// calls `pathForReexec` never reaches the branch that ships. Tests cover this
-/// entry point instead.
 fn productionPathForReexec(alloc: Allocator) ![]u8 {
     if (comptime builtin.os.tag == .linux) return alloc.dupe(u8, linux_self_exe);
     return std.process.executablePathAlloc(io_mod.getIo(), alloc);
 }
 
-/// Path another process can use to exec this fx.
-///
-/// Tmux bootstraps and `pipe-pane` commands run later, so `/proc/self/exe`
-/// would be the shell, not fx. Prefer the resolved on-disk path: it is the
-/// only form that still works once this process is gone, and a recovered
-/// session outlives the fx that created it. `/proc/<pid>/exe` is the
-/// fallback for a replaced binary, where an on-disk path would be
-/// `FileNotFound`; it dies with this process, so it is used only when
-/// there is no on-disk file left to name.
+/// Returns an owned path another process can use to launch fx. Linux prefers
+/// the on-disk path, falling back to `/proc/<pid>/exe` after replacement.
 pub fn pathForPeerReexec(alloc: Allocator) ![]u8 {
     if (testProductExe()) |path| return alloc.dupe(u8, path);
     return productionPathForPeerReexec(alloc);
 }
 
-/// `pathForPeerReexec` without the test-only override. See
-/// `productionPathForReexec` for why this split exists.
 fn productionPathForPeerReexec(alloc: Allocator) ![]u8 {
     if (comptime builtin.os.tag == .linux) {
         const pid = std.c.getpid();
@@ -69,8 +51,6 @@ fn productionPathForPeerReexec(alloc: Allocator) ![]u8 {
     return alloc.dupe(u8, path_z);
 }
 
-/// True when `path` still names a file this process could exec. A rebuild
-/// unlinks the old binary, so the resolved name can point at nothing.
 fn onDiskPathIsExecutable(path: []const u8) bool {
     if (!std.fs.path.isAbsolute(path)) return false;
     var file = std.Io.Dir.cwd().openFile(io_mod.getIo(), path, .{}) catch return false;
@@ -78,8 +58,6 @@ fn onDiskPathIsExecutable(path: []const u8) bool {
     return true;
 }
 
-/// True when both paths resolve to the same file. Used to prove a procfs path
-/// and the on-disk name are the same executable while they are still linked.
 fn sameFile(left: []const u8, right: []const u8) !bool {
     var left_file = try std.Io.Dir.cwd().openFile(io_mod.getIo(), left, .{});
     defer left_file.close(io_mod.getIo());
@@ -101,8 +79,7 @@ test "linux re-exec paths name the live inode, not the replaced on-disk file" {
     if (builtin.os.tag != .linux) return;
     const alloc = std.testing.allocator;
 
-    // Covers the shipping branch directly. `pathForReexec` would return the
-    // `FX_TEST_PRODUCT_EXE` override here, so it can never reach this code.
+    // Bypass the test override to cover the Linux production branch.
     const same_process = try productionPathForReexec(alloc);
     defer alloc.free(same_process);
     try std.testing.expectEqualStrings(linux_self_exe, same_process);
@@ -110,8 +87,6 @@ test "linux re-exec paths name the live inode, not the replaced on-disk file" {
     const peer = try productionPathForPeerReexec(alloc);
     defer alloc.free(peer);
 
-    // Same-process re-exec stays on procfs. Peer paths prefer the on-disk
-    // name so a tmux bootstrap or pipe-pane still works after this pid exits.
     const resolved = std.process.executablePathAlloc(io_mod.getIo(), alloc) catch null;
     defer if (resolved) |owned| alloc.free(owned);
     if (resolved) |on_disk| {
@@ -132,9 +107,7 @@ test "peer re-exec path prefers a name that outlives this process" {
     const alloc = std.testing.allocator;
     const path = try productionPathForPeerReexec(alloc);
     defer alloc.free(path);
-    // A tmux pipe-pane command and a recovered session both run after this
-    // process exits, so a /proc/<pid>/exe path would be dangling by then.
-    // Only fall back to it when no on-disk name is left to use.
+    // Fall back to procfs only after the durable on-disk name disappears.
     if (std.mem.startsWith(u8, path, "/proc/")) {
         const resolved = std.process.executablePathAlloc(io_mod.getIo(), alloc) catch return;
         defer alloc.free(resolved);
@@ -148,9 +121,6 @@ test "on-disk probe rejects a replaced binary so the peer path falls back" {
     if (builtin.os.tag != .linux) return;
     const alloc = std.testing.allocator;
 
-    // The probe is what decides between the durable name and procfs, so cover
-    // the rebuild case directly: a path unlinked while a process holds the
-    // inode must read as unusable.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
@@ -167,7 +137,6 @@ test "on-disk probe rejects a replaced binary so the peer path falls back" {
     try std.Io.Dir.cwd().deleteFile(io_mod.getIo(), victim);
     try std.testing.expect(!onDiskPathIsExecutable(victim));
 
-    // A relative name could resolve against the spawned process's cwd, so it
-    // is never trusted as a peer path.
+    // Peer paths must be absolute.
     try std.testing.expect(!onDiskPathIsExecutable("fx"));
 }
