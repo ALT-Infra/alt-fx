@@ -6463,6 +6463,7 @@ describe("acp: model-independent", () => {
       const root = createIsolatedRoot("fx-acp-one-off-load-");
       const childName = "acp-readonly-child";
       const childPrompt = "ACP_ONE_OFF_LOAD_CHILD";
+      const childCompletion = heldFakeGatewayFinalText();
       const gateway = startDynamicFakeGateway((body) => {
         if (body.includes("Acknowledge the completed one-off result.")) {
           return finalText("ACP_ONE_OFF_RETIREMENT_ACK_DONE");
@@ -6471,7 +6472,7 @@ describe("acp: model-independent", () => {
           return finalText("ACP_ONE_OFF_LOAD_PARENT_DONE");
         }
         if (body.includes(childPrompt)) {
-          return finalText("ACP_ONE_OFF_LOAD_CHILD_DONE");
+          return childCompletion.response;
         }
         return fakeGatewayToolCall("acp_one_off_load_create", "subagent", {
           command: { create: {
@@ -6493,6 +6494,7 @@ describe("acp: model-independent", () => {
           TIMEOUT,
         );
         expect(result.promptResult.result.stopReason).toBe("end_turn");
+        childCompletion.release("ACP_ONE_OFF_LOAD_CHILD_DONE");
         const sessionsDir = join(root.home, ".fx", "sessions");
         let control: { id: string; path: string } | undefined;
         await waitForCondition(
@@ -6517,9 +6519,14 @@ describe("acp: model-independent", () => {
           },
           TIMEOUT,
         );
+        if (!control) throw new Error("ACP one-off control was not persisted");
+        await waitForPersistedAcpDeliveryId(
+          root,
+          control.id,
+          "ACP_ONE_OFF_LOAD_CHILD_DONE",
+        );
         await client.close();
 
-        if (!control) throw new Error("ACP one-off control was not persisted");
         const controlBefore = readFileSync(control.path, "utf8");
 
         client = await AcpClient.create({
@@ -6588,6 +6595,7 @@ describe("acp: model-independent", () => {
         expect(gateway.requests).toHaveLength(4);
         expect(client.stderr).toBe("");
       } finally {
+        childCompletion.dispose();
         await client?.close();
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
