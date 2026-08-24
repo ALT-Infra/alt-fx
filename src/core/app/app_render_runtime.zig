@@ -2,6 +2,7 @@ const std = @import("std");
 const question_prompt = @import("../agent/question_prompt.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const input_queue_runtime = @import("input_queue_runtime.zig");
+const input_submit_runtime = @import("input_submit_runtime.zig");
 const app_commands = @import("app_commands.zig");
 const app_lifecycle = @import("app_lifecycle.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
@@ -60,6 +61,7 @@ const resume_projection = @import("../../ui/transcript/resume_projection.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 const ui_render = @import("../../ui/render.zig");
 const assistant_pacer = @import("../../ui/assistant/pacer.zig");
+const user_message_card = @import("../../ui/assistant/user_message_card.zig");
 
 fn set_transcript_assistant_tail_writable(
     runtime: *transcript_runtime.TranscriptRuntime,
@@ -83,6 +85,7 @@ const FrameAttemptResult = struct {
     shadow_state: render_engine.terminal_diff.ShadowCommitState,
     animation_visible: bool,
     yolo_warning_visible: bool = false,
+    pending_prompt_presented: bool = false,
 
     fn is_committed(self: FrameAttemptResult) bool {
         return self.shadow_state.is_committed();
@@ -172,6 +175,149 @@ const QueuedCardProjection = struct {
         self.* = .{};
     }
 };
+
+const PendingCardProjection = struct {
+    bytes: []u8,
+    row_count: u16,
+    paint_row_count: u16,
+    leading_blank_rows: u16,
+
+    fn deinit(self: *PendingCardProjection, alloc: std.mem.Allocator) void {
+        alloc.free(self.bytes);
+        self.* = undefined;
+    }
+};
+
+const PendingCardPaintContext = struct {
+    bytes: []const u8,
+    row: u16,
+    max_rows: u16,
+
+    fn paint(
+        raw: *anyopaque,
+        surface: *render_engine.frame_surface.FrameSurface,
+    ) anyerror!void {
+        const self: *PendingCardPaintContext = @ptrCast(@alignCast(raw));
+        _ = try surface.writeAnsiBand(
+            self.row,
+            self.max_rows,
+            self.bytes,
+            .transcript,
+            .same_owner,
+        );
+    }
+};
+
+fn buildPendingCardProjection(
+    comptime App: type,
+    app: *App,
+    presentation_shell: *const transcript_runtime.TranscriptRuntime,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) !?PendingCardProjection {
+    if (comptime !@hasField(App, "submission")) return null;
+    const pending = app.submission.pending orelse return null;
+    switch (pending.phase) {
+        .awaiting_frame, .awaiting_adoption => {},
+        .adopted, .queued => return null,
+    }
+
+    const spans = pending.draft.skill_display_spans;
+    const skill_tokens: []registered_entities.SkillTokenSpan = if (spans.len == 0)
+        &.{}
+    else
+        try app.alloc.alloc(registered_entities.SkillTokenSpan, spans.len);
+    defer if (skill_tokens.len > 0) app.alloc.free(skill_tokens);
+    for (spans, 0..) |span, index| {
+        skill_tokens[index] = .{
+            .raw_start = span.raw_start,
+            .raw_end = span.raw_end,
+            .name = span.name,
+            .path = span.path,
+            .display_source = span.display_source,
+            .owns_trailing_separator = span.owns_trailing_separator,
+        };
+    }
+
+    const card = try user_message_card.buildUserPromptCardWithSkillTokensForTerminalPresentationInterruptible(
+        app.alloc,
+        pending.draft.prompt,
+        pending.draft.images,
+        presentation_shell.layout.cols,
+        skill_tokens,
+        checkpoint,
+    );
+    defer app.alloc.free(card);
+    const has_prior_turns = if (comptime @hasField(App, "session"))
+        app.session.historyLen() > 0
+    else
+        false;
+    const leading_blank_rows: u16 = @intFromBool(
+        !has_prior_turns and presentation_shell.cursor_col != 1,
+    );
+    const bytes = try pendingCardTerminalWireBytes(app.alloc, card);
+    const rendered_line_count: u16 = @intCast(@min(
+        std.mem.count(u8, card, "\n"),
+        @as(usize, std.math.maxInt(u16)),
+    ));
+    const paint_row_count = rendered_line_count +| 1;
+    const row_count = rendered_line_count +| leading_blank_rows;
+    if (row_count == 0) {
+        app.alloc.free(bytes);
+        return error.EmptyPendingPromptCard;
+    }
+    return .{
+        .bytes = bytes,
+        .row_count = row_count,
+        .paint_row_count = paint_row_count,
+        .leading_blank_rows = leading_blank_rows,
+    };
+}
+
+fn pendingCardTerminalWireBytes(
+    alloc: std.mem.Allocator,
+    logical: []const u8,
+) ![]u8 {
+    var missing_carriage_returns: usize = 0;
+    for (logical, 0..) |byte, index| {
+        if (byte == '\n' and (index == 0 or logical[index - 1] != '\r')) {
+            missing_carriage_returns += 1;
+        }
+    }
+    const wire_len = try std.math.add(
+        usize,
+        logical.len,
+        missing_carriage_returns,
+    );
+    const wire = try alloc.alloc(u8, wire_len);
+    var written: usize = 0;
+    for (logical, 0..) |byte, index| {
+        if (byte == '\n' and (index == 0 or logical[index - 1] != '\r')) {
+            wire[written] = '\r';
+            written += 1;
+        }
+        wire[written] = byte;
+        written += 1;
+    }
+    std.debug.assert(written == wire.len);
+    return wire;
+}
+
+fn previewWithPendingCard(
+    preview: render_engine.frame_layout.TranscriptFlowPreview,
+    pending: ?PendingCardProjection,
+) render_engine.frame_layout.TranscriptFlowPreview {
+    const card = pending orelse return preview;
+    var next = preview;
+    next.natural_visual_rows +|= card.row_count;
+    next.cursor_row +|= card.row_count;
+    next.cursor_col = 1;
+    next.replaceable_row = next.cursor_row;
+    next.tail_kind = .user_turn;
+    next.replaceable_active = false;
+    next.trailing_boundary_blank_rows = 0;
+    next.footer_boundary_gap_rows = 0;
+    return next;
+}
 
 // Queued prompts stay collapsed behind their summary row until the review is
 // opened; only then does the banner expand into one card per queued prompt.
@@ -962,6 +1108,7 @@ pub fn Runtime(comptime App: type) type {
                 },
                 .begin_prompt,
                 .begin_prompt_with_skill_bindings,
+                .begin_presented_prompt,
                 .append_user_feedback,
                 .notification,
                 .question_requested,
@@ -1361,6 +1508,11 @@ pub fn Runtime(comptime App: type) type {
                 render_request.animation_interval_ms,
                 result.animation_visible,
             );
+            if (comptime @hasDecl(App, "notePendingFrameCommitted")) {
+                if (result.pending_prompt_presented) {
+                    App.notePendingFrameCommitted(app);
+                }
+            }
             if (comptime @hasField(App, "permission_state") and
                 @hasField(App, "permission_engine"))
             {
@@ -1676,6 +1828,11 @@ pub fn Runtime(comptime App: type) type {
                 app.terminal.alternate_frame_layout
             else
                 app.shell.committed_frame_layout;
+            var pending_card = if (!render_reconciliation.alternate_screen_owns_rendering and child_view == null)
+                try buildPendingCardProjection(App, app, presentation_shell, checkpoint)
+            else
+                null;
+            defer if (pending_card) |*card| card.deinit(app.alloc);
 
             var attempt_invalidations = snapshot.invalidations;
             presentation_shell.normalizeFrameInvalidations(&attempt_invalidations);
@@ -1779,7 +1936,7 @@ pub fn Runtime(comptime App: type) type {
             );
             var planned_scroll_next_start_line: usize = 0;
             {
-                const transcript_preview = if (transcript_source) |source|
+                const canonical_transcript_preview = if (transcript_source) |source|
                     source.preview
                 else
                     render_engine.frame_layout.TranscriptFlowPreview{
@@ -1788,6 +1945,10 @@ pub fn Runtime(comptime App: type) type {
                         .cursor_col = presentation_shell.cursor_col,
                         .replaceable_row = presentation_shell.replaceable_row,
                     };
+                const transcript_preview = previewWithPendingCard(
+                    canonical_transcript_preview,
+                    pending_card,
+                );
                 const neutral_footer = if (footer_measurement) |*measurement|
                     measurement.frameLayoutMeasurement()
                 else
@@ -1821,6 +1982,7 @@ pub fn Runtime(comptime App: type) type {
                     else
                         footer_frame.paint.invalidation,
                     .attempt_invalidations = attempt_invalidations,
+                    .pending_tail_rows = if (pending_card) |card| card.row_count else 0,
                 };
                 const fixed_point = try render_engine.frame_fixed_point.solve(
                     FixedPointTranscriptContext(App),
@@ -2063,11 +2225,51 @@ pub fn Runtime(comptime App: type) type {
                 transition.document_append
             else
                 render_engine.frame_scroll_plan.FrameDocumentAppend{};
-            const transcript_body: render_engine.frame_builder.TranscriptBodyDisposition =
+            var transcript_body: render_engine.frame_builder.TranscriptBodyDisposition =
                 if (transcript_transition) |*transition| switch (transition.body_disposition) {
                     .paint => .paint,
                     .retain_committed => |retained| .{ .retain = retained },
                 } else .paint;
+            var pending_paint_ctx: ?PendingCardPaintContext = if (pending_card) |card| .{
+                .bytes = card.bytes,
+                .row = (if (prepared_transcript) |*prepared|
+                    prepared.cursor.cursor_row
+                else
+                    presentation_shell.cursor_row) +| card.leading_blank_rows,
+                .max_rows = card.paint_row_count,
+            } else null;
+            if (pending_paint_ctx) |paint_ctx| switch (transcript_body) {
+                .paint => {},
+                .retain => |retained_source| {
+                    const first_changed_row = paint_ctx.row;
+                    if (first_changed_row <= retained_source.source_area.top) {
+                        transcript_body = .paint;
+                    } else if (first_changed_row <= retained_source.source_area.bottom) {
+                        var narrowed = retained_source;
+                        narrowed.source_area.bottom = first_changed_row - 1;
+                        narrowed.occupied_last_row = @min(
+                            narrowed.occupied_last_row,
+                            narrowed.source_area.bottom,
+                        );
+                        transcript_body = .{ .retain = narrowed };
+                    }
+                },
+            };
+            if (pending_paint_ctx) |paint_ctx| {
+                debug_trace.logf(
+                    "frame_plan",
+                    "pending_prompt_tail start={d} paint_rows={d} layout_rows={d} bytes={d} transcript={d}..{d} body={s}",
+                    .{
+                        paint_ctx.row,
+                        paint_ctx.max_rows,
+                        pending_card.?.row_count,
+                        paint_ctx.bytes.len,
+                        footer_frame.paint.transcript_band.top,
+                        footer_frame.paint.transcript_band.bottom,
+                        @tagName(transcript_body),
+                    },
+                );
+            }
             const observation_rows = if (transcript_transition) |*transition|
                 switch (transition.body_disposition) {
                     .paint => transition.row_provenance,
@@ -2100,6 +2302,10 @@ pub fn Runtime(comptime App: type) type {
                     .document_append = document_append,
                     .terminal_transition = render_reconciliation.terminal_transition,
                     .body_painter = .{ .ctx = &frame_ctx, .paint = FramePaintContext(App).paintBody },
+                    .transcript_tail_painter = if (pending_paint_ctx) |*paint_ctx| .{
+                        .ctx = paint_ctx,
+                        .paint = PendingCardPaintContext.paint,
+                    } else null,
                     .footer_painter = .{ .ctx = &frame_ctx, .paint = FramePaintContext(App).paintFooter },
                     .activity_painter = .{ .ctx = &frame_ctx, .paint = FramePaintContext(App).paintActivity },
                     .trace_counters = &counters,
@@ -2195,6 +2401,7 @@ pub fn Runtime(comptime App: type) type {
                 .animation_visible = frame_ctx.activity_result.painted,
                 .yolo_warning_visible = !render_reconciliation.alternate_screen_owns_rendering and
                     footer_frame.composed.danger_status_visible,
+                .pending_prompt_presented = pending_card != null,
             };
         }
 
@@ -3307,6 +3514,7 @@ fn FixedPointTranscriptContext(comptime App: type) type {
         frame_activity: render_engine.frame_layout.ActivityState,
         base_invalidation: render_engine.paint_plan.FrameInvalidationSet,
         attempt_invalidations: render_engine.paint_plan.FrameInvalidationSet,
+        pending_tail_rows: u16 = 0,
         scroll_facts: ?transcript_runtime.TranscriptScrollFacts = null,
 
         fn prepareCandidate(
@@ -3324,12 +3532,23 @@ fn FixedPointTranscriptContext(comptime App: type) type {
                 .occupied_transcript_rows = candidate.transcript_area.height(),
             };
             const source = self.source orelse return error.MissingTranscriptPreparationSource;
+            const canonical_area = transcriptAreaBeforePendingTail(
+                candidate.transcript_area,
+                self.pending_tail_rows,
+            );
+            if (canonical_area.isEmpty()) return .{
+                .inline_advance_rows = 0,
+                .occupied_transcript_rows = @min(
+                    self.pending_tail_rows,
+                    candidate.transcript_area.height(),
+                ),
+            };
 
             self.prepared_transcript.* = try self.presentation_shell.prepareTranscriptSurfacePaintFromSourceForFrame(
                 self.app.alloc,
                 &self.app.metrics,
                 source,
-                candidate.transcript_area,
+                canonical_area,
                 self.footer_reservation_changed,
             );
             const prepared = &self.prepared_transcript.*.?;
@@ -3341,13 +3560,16 @@ fn FixedPointTranscriptContext(comptime App: type) type {
                 self.replay_displaced_footer_history,
             );
             self.scroll_facts = scroll_facts;
-            const occupied_transcript_rows = if (prepared.selection.last_visible_row >= candidate.transcript_area.top)
-                prepared.selection.last_visible_row - candidate.transcript_area.top + 1
+            const canonical_occupied_rows = if (prepared.selection.last_visible_row >= canonical_area.top)
+                prepared.selection.last_visible_row - canonical_area.top + 1
             else
                 0;
             return .{
                 .inline_advance_rows = scroll_facts.planned_rows,
-                .occupied_transcript_rows = occupied_transcript_rows,
+                .occupied_transcript_rows = @min(
+                    canonical_occupied_rows +| self.pending_tail_rows,
+                    candidate.transcript_area.height(),
+                ),
             };
         }
 
@@ -3410,9 +3632,21 @@ fn FixedPointTranscriptContext(comptime App: type) type {
                 activity == .overlay_entry,
             );
             self.resolved_target.* = target;
-            return .{ .occupied_transcript_rows = target.occupiedTranscriptRows() };
+            return .{ .occupied_transcript_rows = @min(
+                target.occupiedTranscriptRows() +| self.pending_tail_rows,
+                candidate.transcript_area.height(),
+            ) };
         }
     };
+}
+
+fn transcriptAreaBeforePendingTail(
+    area: render_engine.frame_layout.FrameRect,
+    tail_rows: u16,
+) render_engine.frame_layout.FrameRect {
+    if (area.isEmpty() or tail_rows == 0) return area;
+    if (tail_rows >= area.height()) return .empty();
+    return .{ .top = area.top, .bottom = area.bottom - tail_rows };
 }
 
 fn FramePaintContext(comptime App: type) type {

@@ -1558,6 +1558,10 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
 
+            if (comptime @hasDecl(App, "cancelUncommittedPendingSubmission")) {
+                if (App.cancelUncommittedPendingSubmission(app)) return;
+            }
+
             if (draftHasState(app)) clearDraftState(app, "ctrl_c");
             app.shell.render_requests.request(.footer);
         }
@@ -10760,10 +10764,24 @@ const FakeSubmitApp = struct {
         }
     } = .{},
     worker: struct {
+        hold_available: bool = false,
+        held: bool = false,
+
         pub fn queuedPromptCount(_: *@This()) usize {
             return 0;
         }
+
+        pub fn tryHoldTurnStart(self: *@This()) bool {
+            if (!self.hold_available or self.held) return false;
+            self.held = true;
+            return true;
+        }
+
+        pub fn releaseTurnStartHold(self: *@This()) void {
+            self.held = false;
+        }
     } = .{},
+    submission: input_submit_runtime.State = .{},
     shell: struct {
         render_requests: render_request.RenderRequestState = .{},
         layout: types.Layout = .{
@@ -10806,6 +10824,8 @@ const FakeSubmitApp = struct {
     }
 
     fn deinit(self: *FakeSubmitApp) void {
+        if (self.submission.pending) |*pending| pending.deinit(self.alloc);
+        self.submission.pending = null;
         self.prompt_history.deinit(self.alloc);
         self.clearPendingImages();
         self.pending_images.deinit(self.alloc);
@@ -11278,6 +11298,51 @@ test "app_input_runtime submit resolves slash completion through core command sp
     try std.testing.expect(app.last_prompt == null);
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+}
+
+test "app_input_runtime idle submit installs one pending owner before queue effects" {
+    const alloc = std.testing.allocator;
+    var app = FakeSubmitApp{ .alloc = alloc };
+    defer app.deinit();
+    app.worker.hold_available = true;
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "pending first");
+    app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
+
+    try Runtime(FakeSubmitApp).submit(&app, 100);
+
+    try std.testing.expect(app.submission.pending != null);
+    try std.testing.expectEqualStrings("pending first", app.submission.pending.?.draft.prompt);
+    try std.testing.expectEqual(
+        input_submit_runtime.PendingPhase.awaiting_frame,
+        app.submission.pending.?.phase,
+    );
+    try std.testing.expect(app.worker.held);
+    try std.testing.expectEqual(@as(usize, 0), app.queue_accept_count);
+    try std.testing.expect(app.last_prompt == null);
+    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.composer_history.count());
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
+    try std.testing.expect(app.shell.render_requests.hasReason(.transcript));
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+}
+
+test "app_input_runtime second Enter preserves the newer draft until pending acknowledgement" {
+    const alloc = std.testing.allocator;
+    var app = FakeSubmitApp{ .alloc = alloc };
+    defer app.deinit();
+    app.worker.hold_available = true;
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "pending first");
+    app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
+    try Runtime(FakeSubmitApp).submit(&app, 100);
+
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "newer draft");
+    app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
+    try Runtime(FakeSubmitApp).submit(&app, 100);
+
+    try std.testing.expectEqualStrings("pending first", app.submission.pending.?.draft.prompt);
+    try std.testing.expectEqualStrings("newer draft", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 0), app.queue_accept_count);
+    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.composer_history.count());
+    try std.testing.expect(app.worker.held);
 }
 
 test "app_input_runtime recalls a submitted slash command with history previous" {
@@ -11834,10 +11899,11 @@ test "app_input_runtime slash command records output without a pre-frame termina
     try std.testing.expectEqual(@as(u64, 0), try sink.length(io_mod.getIo()));
 }
 
-test "app_input_runtime idle pasted prompt defers frames until worker presentation" {
+test "app_input_runtime idle pasted prompt enters the pending acknowledgement frame" {
     const alloc = std.testing.allocator;
     var app = FakeSubmitApp{ .alloc = alloc };
     defer app.deinit();
+    app.worker.hold_available = true;
 
     try app.input_runtime.edit_state.input.appendSlice(alloc, "before [Pasted text #7, 2 lines] after");
     app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
@@ -11854,11 +11920,15 @@ test "app_input_runtime idle pasted prompt defers frames until worker presentati
     try Runtime(FakeSubmitApp).submit(&app, 100);
 
     try std.testing.expect(app.last_command == null);
-    try std.testing.expectEqualStrings("before alpha\nbeta after", app.last_prompt.?);
+    try std.testing.expect(app.last_prompt == null);
+    try std.testing.expectEqualStrings(
+        "before alpha\nbeta after",
+        app.submission.pending.?.draft.prompt,
+    );
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.entities.pasted_blocks.items.len);
-    try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
-    try std.testing.expect(app.shell.render_requests.submittedPromptTransitionPending());
-    try std.testing.expect(app.shell.render_requests.blocksFrameCommit());
+    try std.testing.expect(app.shell.render_requests.hasReason(.transcript));
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+    try std.testing.expect(!app.shell.render_requests.blocksFrameCommit());
 }
 
 test "app_input_runtime submit rejects oversized registered paste backing" {
@@ -11901,11 +11971,10 @@ test "app_input_runtime accepted prompt repaints while a turn is active" {
 
     try std.testing.expectEqualStrings("queued follow-up", app.last_prompt.?);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
-    try std.testing.expect(!app.shell.render_requests.submittedPromptTransitionPending());
     try std.testing.expect(!app.shell.render_requests.blocksFrameCommit());
 }
 
-test "app_input_runtime completed presentation tail defers prompt frames until canonical admission" {
+test "app_input_runtime completed presentation tail keeps the active queue path unblocked" {
     const alloc = std.testing.allocator;
     var app = FakeSubmitApp{
         .alloc = alloc,
@@ -11921,8 +11990,7 @@ test "app_input_runtime completed presentation tail defers prompt frames until c
 
     try std.testing.expectEqualStrings("paced-tail follow-up", app.last_prompt.?);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
-    try std.testing.expect(app.shell.render_requests.submittedPromptTransitionPending());
-    try std.testing.expect(app.shell.render_requests.blocksFrameCommit());
+    try std.testing.expect(!app.shell.render_requests.blocksFrameCommit());
 }
 
 test "app_input_runtime blank submit repaints without a worker event" {
@@ -11938,23 +12006,24 @@ test "app_input_runtime blank submit repaints without a worker event" {
     try std.testing.expect(app.last_prompt == null);
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
-    try std.testing.expect(!app.shell.render_requests.submittedPromptTransitionPending());
 }
 
-test "app_input_runtime idle image-only prompt waits for begin prompt repaint" {
+test "app_input_runtime idle image-only prompt enters the pending acknowledgement frame" {
     const alloc = std.testing.allocator;
     var app = FakeSubmitApp{ .alloc = alloc };
     defer app.deinit();
+    app.worker.hold_available = true;
     try appendOwnedPendingImage(&app, 1, "/tmp/image.png");
 
     try Runtime(FakeSubmitApp).submit(&app, 100);
 
-    try std.testing.expectEqualStrings("", app.last_prompt.?);
-    try std.testing.expectEqual(@as(usize, 1), app.last_images.len);
+    try std.testing.expect(app.last_prompt == null);
+    try std.testing.expectEqualStrings("", app.submission.pending.?.draft.prompt);
+    try std.testing.expectEqual(@as(usize, 1), app.submission.pending.?.draft.images.len);
     try std.testing.expectEqual(@as(usize, 0), app.pending_images.items.len);
-    try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
-    try std.testing.expect(app.shell.render_requests.submittedPromptTransitionPending());
-    try std.testing.expect(app.shell.render_requests.blocksFrameCommit());
+    try std.testing.expect(app.shell.render_requests.hasReason(.transcript));
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+    try std.testing.expect(!app.shell.render_requests.blocksFrameCommit());
 }
 
 test "app_input_runtime submit preserves direct prompt boundary whitespace" {

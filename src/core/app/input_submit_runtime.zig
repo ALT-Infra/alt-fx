@@ -7,14 +7,123 @@ const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const entity_spans = @import("../shared/entity_spans.zig");
 const types = @import("../shared/types.zig");
+const worker_runtime = @import("../agent/worker_runtime.zig");
 const input_queue_runtime = @import("input_queue_runtime.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const input_limit_feedback = @import("input_limit_feedback.zig");
+
+pub const PendingPhase = enum {
+    awaiting_frame,
+    awaiting_adoption,
+    adopted,
+    queued,
+};
+
+pub const PendingPhaseError = error{InvalidPendingPhase};
+
+pub const PendingSubmission = struct {
+    draft: worker_runtime.QueuedPromptDraft,
+    phase: PendingPhase = .awaiting_frame,
+
+    pub fn init(draft: worker_runtime.QueuedPromptDraft) PendingSubmission {
+        std.debug.assert(draft.turn_id != 0);
+        return .{ .draft = draft };
+    }
+
+    pub fn deinit(self: *PendingSubmission, alloc: std.mem.Allocator) void {
+        worker_runtime.freeQueuedPromptDraft(alloc, self.draft);
+        self.* = undefined;
+    }
+
+    pub fn ownsTurnStartHold(self: PendingSubmission) bool {
+        return self.phase != .queued;
+    }
+
+    pub fn markFrameCommitted(self: *PendingSubmission) PendingPhaseError!void {
+        if (self.phase != .awaiting_frame) return error.InvalidPendingPhase;
+        self.phase = .awaiting_adoption;
+    }
+
+    pub fn markAdopted(self: *PendingSubmission) PendingPhaseError!void {
+        if (self.phase != .awaiting_adoption) return error.InvalidPendingPhase;
+        self.phase = .adopted;
+    }
+
+    pub fn markQueued(self: *PendingSubmission) PendingPhaseError!void {
+        if (self.phase != .adopted) return error.InvalidPendingPhase;
+        self.phase = .queued;
+    }
+};
+
+pub const State = struct {
+    pending: ?PendingSubmission = null,
+};
+
+pub fn buildQueuedPromptDraft(
+    alloc: std.mem.Allocator,
+    turn_id: u64,
+    prompt_source: []const u8,
+    image_source: []const types.ImageAttachment,
+    skill_tokens: []const registered_entities.SkillTokenSpan,
+) !worker_runtime.QueuedPromptDraft {
+    if (turn_id == 0) return error.InvalidTurnId;
+
+    const prompt = try alloc.dupe(u8, prompt_source);
+    errdefer alloc.free(prompt);
+    const images = try types.dupeImageAttachmentSlice(alloc, image_source);
+    errdefer types.freeImageAttachmentSlice(alloc, images);
+
+    const spans: []worker_runtime.SkillDisplaySpan = if (skill_tokens.len == 0)
+        @constCast(&.{})
+    else
+        try alloc.alloc(worker_runtime.SkillDisplaySpan, skill_tokens.len);
+    var span_count: usize = 0;
+    errdefer {
+        for (spans[0..span_count]) |span| {
+            alloc.free(span.name);
+            alloc.free(span.path);
+        }
+        if (spans.len > 0) alloc.free(spans);
+    }
+    while (span_count < skill_tokens.len) : (span_count += 1) {
+        const token = skill_tokens[span_count];
+        const name = try alloc.dupe(u8, token.name);
+        errdefer alloc.free(name);
+        spans[span_count] = .{
+            .raw_start = token.raw_start,
+            .raw_end = token.raw_end,
+            .name = name,
+            .path = try alloc.dupe(u8, token.path),
+            .display_source = token.display_source,
+            .owns_trailing_separator = token.owns_trailing_separator,
+        };
+    }
+
+    return .{
+        .turn_id = turn_id,
+        .prompt = prompt,
+        .images = images,
+        .skill_display_spans = spans,
+    };
+}
 
 pub fn SubmitRuntime(comptime App: type) type {
     return struct {
         const queue_rt = input_queue_runtime.Runtime(App);
         const completion_rt = input_completion_runtime.CompletionRuntime(App);
+
+        const PromptAdmission = enum {
+            rejected,
+            deferred,
+            pending,
+            enqueued,
+        };
+
+        const PendingInstall = enum {
+            unavailable,
+            deferred,
+            installed,
+        };
 
         const AcceptedDraftProjection = struct {
             input: []const u8,
@@ -29,6 +138,158 @@ pub fn SubmitRuntime(comptime App: type) type {
                 self.* = undefined;
             }
         };
+
+        pub fn noteCommittedFrame(app: *App) void {
+            if (comptime !@hasField(App, "submission")) return;
+            const pending = if (app.submission.pending) |*value| value else return;
+            if (pending.phase != .awaiting_frame) return;
+            pending.markFrameCommitted() catch unreachable;
+            debug_trace.eventf(
+                "input",
+                "pending_prompt_frame_committed",
+                .{ .turn_id = pending.draft.turn_id },
+                "",
+                .{},
+            );
+            adoptPendingSubmission(app) catch |err| {
+                debug_trace.eventf(
+                    "input",
+                    "pending_prompt_adoption_retry",
+                    .{ .turn_id = pending.draft.turn_id },
+                    "err={s}",
+                    .{@errorName(err)},
+                );
+            };
+        }
+
+        pub fn collectPendingSubmissionFacts(app: *App) void {
+            if (comptime !@hasField(App, "submission")) return;
+            var pending = if (app.submission.pending) |*value| value else return;
+            if (pending.phase == .awaiting_adoption) {
+                adoptPendingSubmission(app) catch |err| {
+                    debug_trace.eventf(
+                        "input",
+                        "pending_prompt_adoption_retry",
+                        .{ .turn_id = pending.draft.turn_id },
+                        "err={s}",
+                        .{@errorName(err)},
+                    );
+                    return;
+                };
+                pending = &app.submission.pending.?;
+            }
+            if (pending.phase != .adopted) return;
+
+            if (pending.draft.prompt.len > 0 and pending.draft.images.len == 0) {
+                recordAcceptedInput(app, pending.draft.prompt);
+            }
+            if (comptime !@hasDecl(App, "finalizePendingSubmission")) {
+                finishPendingSubmissionFailure(app, error.PendingFinalizationUnsupported);
+                return;
+            }
+            App.finalizePendingSubmission(app, &pending.draft) catch |err| {
+                finishPendingSubmissionFailure(app, err);
+                return;
+            };
+            app.worker.releaseTurnStartHold();
+            pending.markQueued() catch unreachable;
+            debug_trace.eventf(
+                "input",
+                "pending_prompt_queued",
+                .{ .turn_id = pending.draft.turn_id },
+                "",
+                .{},
+            );
+        }
+
+        pub fn acceptPresentedPrompt(app: *App, turn_id: u64) !void {
+            if (comptime !@hasField(App, "submission")) {
+                return error.PendingSubmissionUnsupported;
+            }
+            const pending = app.submission.pending orelse return error.MissingPendingSubmission;
+            if (pending.phase != .queued) return error.InvalidPendingPhase;
+            if (pending.draft.turn_id != turn_id) return error.PendingTurnIdMismatch;
+            clearPendingSubmission(app, "worker_begin_presented");
+        }
+
+        pub fn cancelUncommittedPendingSubmission(app: *App) bool {
+            if (comptime !@hasField(App, "submission")) return false;
+            const pending = app.submission.pending orelse return false;
+            if (pending.phase != .awaiting_frame) return false;
+            clearPendingSubmission(app, "ctrl_c_before_frame");
+            app.shell.render_requests.request(.transcript);
+            app.shell.render_requests.request(.footer);
+            return true;
+        }
+
+        pub fn clearPendingSubmission(app: *App, reason: []const u8) void {
+            if (comptime !@hasField(App, "submission")) return;
+            var pending = app.submission.pending orelse return;
+            app.submission.pending = null;
+            if (pending.ownsTurnStartHold()) app.worker.releaseTurnStartHold();
+            debug_trace.eventf(
+                "input",
+                "pending_prompt_cleared",
+                .{ .turn_id = pending.draft.turn_id },
+                "reason={s} phase={s}",
+                .{ reason, @tagName(pending.phase) },
+            );
+            pending.deinit(app.alloc);
+        }
+
+        fn adoptPendingSubmission(app: *App) !void {
+            const pending = &app.submission.pending.?;
+            if (pending.phase != .awaiting_adoption) return error.InvalidPendingPhase;
+            if (comptime !@hasDecl(App, "adoptPendingUserPrompt")) {
+                return error.PendingAdoptionUnsupported;
+            }
+            try App.adoptPendingUserPrompt(app, &pending.draft);
+            try pending.markAdopted();
+            debug_trace.eventf(
+                "input",
+                "pending_prompt_adopted",
+                .{ .turn_id = pending.draft.turn_id },
+                "",
+                .{},
+            );
+        }
+
+        fn finishPendingSubmissionFailure(app: *App, err: anyerror) void {
+            const turn_id = app.submission.pending.?.draft.turn_id;
+            const body = std.fmt.allocPrint(
+                app.alloc,
+                "failed to submit prompt after presentation ({s})",
+                .{@errorName(err)},
+            ) catch |notice_err| {
+                debug_trace.logf(
+                    "input",
+                    "pending prompt failure notice allocation failed err={s}",
+                    .{@errorName(notice_err)},
+                );
+                clearPendingSubmission(app, "finalization_failure");
+                return;
+            };
+            defer app.alloc.free(body);
+            app.writeDomainNotice(.{
+                .topic = "prompt",
+                .tone = .@"error",
+                .body = body,
+            }, true) catch |notice_err| {
+                debug_trace.logf(
+                    "input",
+                    "pending prompt failure notice output failed err={s}",
+                    .{@errorName(notice_err)},
+                );
+            };
+            debug_trace.eventf(
+                "input",
+                "pending_prompt_finalization_failed",
+                .{ .turn_id = turn_id },
+                "err={s}",
+                .{@errorName(err)},
+            );
+            clearPendingSubmission(app, "finalization_failure");
+        }
 
         pub fn submitInput(app: *App, max_prompt_history: usize) !void {
             try submit(app, max_prompt_history);
@@ -101,7 +362,8 @@ pub fn SubmitRuntime(comptime App: type) type {
             if (trimmed.len == 0) {
                 if (app.pending_images.items.len > 0) {
                     if (!try preflightPrompt(app)) return;
-                    if (!try enqueuePromptForSubmit(app, "", &.{}, null)) return;
+                    const admission = try enqueuePromptForSubmit(app, "", &.{}, null);
+                    if (admission == .rejected or admission == .deferred) return;
                     releasePendingImages(app);
                     app.input_runtime.inputResetState().clearCurrent(app.alloc);
                     if (acceptedPromptNeedsImmediateFooter(app)) {
@@ -111,7 +373,6 @@ pub fn SubmitRuntime(comptime App: type) type {
                 }
                 if (comptime @hasField(App, "queued_prompt_review")) {
                     if (try queue_rt.submitPausedQueueUnchanged(app)) {
-                        beginIdleSubmittedPromptTransition(app);
                         return;
                     }
                 }
@@ -218,7 +479,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             else
                 app.pending_images.items.len > 0;
 
-            const queued = if (staged_images) |*images|
+            const admission = if (staged_images) |*images|
                 try enqueuePromptWithStagedImages(
                     app,
                     visual_text.text,
@@ -233,7 +494,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                     display_skill_tokens,
                     &accepted_draft,
                 );
-            if (!queued) return;
+            if (admission == .rejected or admission == .deferred) return;
             commitStableExtractedImageIds(app, extracted.images);
             commitRemappedImageIds(app, visual_text.next_image_id);
             if (visual_text.text.len > 0) {
@@ -243,7 +504,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                     &accepted_draft,
                 );
             }
-            if (!has_images_for_submit and visual_text.text.len > 0) {
+            if (admission == .enqueued and !has_images_for_submit and visual_text.text.len > 0) {
                 recordAcceptedInput(app, visual_text.text);
             }
             discard_extracted = false;
@@ -445,7 +706,12 @@ pub fn SubmitRuntime(comptime App: type) type {
             prompt: []const u8,
             skill_tokens: []const registered_entities.SkillTokenSpan,
             accepted_draft: ?*const AcceptedDraftProjection,
-        ) !bool {
+        ) !PromptAdmission {
+            switch (try installPendingSubmission(app, prompt, skill_tokens)) {
+                .installed => return .pending,
+                .deferred => return .deferred,
+                .unavailable => {},
+            }
             const resume_review = if (comptime @hasField(App, "queued_prompt_review"))
                 app.queued_prompt_review.active()
             else
@@ -459,8 +725,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                     if (accepted_draft) |draft| draft.skill_tokens.items else skill_tokens,
                 )) {
                     .replaced => {
-                        beginIdleSubmittedPromptTransition(app);
-                        return true;
+                        return .enqueued;
                     },
                     .enqueue => {},
                 }
@@ -487,31 +752,49 @@ pub fn SubmitRuntime(comptime App: type) type {
                 try App.enqueuePromptWithSkillBindings(app, prompt, skill_tokens)
             else
                 try App.enqueuePrompt(app, prompt);
-            if (!accepted) return false;
+            if (!accepted) return .rejected;
             if (resume_review) {
                 if (comptime @hasField(App, "queued_prompt_review")) {
                     queue_rt.resumeAfterNewPrompt(app);
                 }
             }
-            beginIdleSubmittedPromptTransition(app);
-            return true;
+            return .enqueued;
         }
 
-        fn beginIdleSubmittedPromptTransition(app: *App) void {
-            if (comptime @hasField(App, "stream")) {
-                if (app.stream.active) {
-                    if (comptime @hasField(App, "pacer") and
-                        @hasDecl(@TypeOf(app.pacer), "hasCompletedAssistantPresentationTail"))
-                    {
-                        if (!app.pacer.hasCompletedAssistantPresentationTail()) return;
-                    } else {
-                        return;
-                    }
-                }
-            } else {
-                return;
+        fn installPendingSubmission(
+            app: *App,
+            prompt: []const u8,
+            skill_tokens: []const registered_entities.SkillTokenSpan,
+        ) !PendingInstall {
+            if (comptime !@hasField(App, "submission") or
+                !@hasField(App, "worker") or
+                !@hasDecl(@TypeOf(app.worker), "tryHoldTurnStart") or
+                !@hasDecl(@TypeOf(app.worker), "releaseTurnStartHold"))
+            {
+                return .unavailable;
             }
-            app.shell.render_requests.beginSubmittedPromptTransition();
+            if (app.submission.pending != null) return .deferred;
+            if (!app.worker.tryHoldTurnStart()) return .unavailable;
+            errdefer app.worker.releaseTurnStartHold();
+
+            const draft = try buildQueuedPromptDraft(
+                app.alloc,
+                debug_trace.nextTurnId(),
+                prompt,
+                app.pending_images.items,
+                skill_tokens,
+            );
+            app.submission.pending = PendingSubmission.init(draft);
+            app.shell.render_requests.request(.transcript);
+            app.shell.render_requests.request(.footer);
+            debug_trace.eventf(
+                "input",
+                "pending_prompt_installed",
+                .{ .turn_id = draft.turn_id },
+                "prompt_bytes={d} images={d} skill_spans={d}",
+                .{ draft.prompt.len, draft.images.len, draft.skill_display_spans.len },
+            );
+            return .installed;
         }
 
         fn enqueuePromptWithStagedImages(
@@ -520,7 +803,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             skill_tokens: []const registered_entities.SkillTokenSpan,
             accepted_draft: *const AcceptedDraftProjection,
             staged_images: *std.ArrayList(types.ImageAttachment),
-        ) !bool {
+        ) !PromptAdmission {
             const original_images = app.pending_images;
             app.pending_images = staged_images.*;
             staged_images.* = .empty;
@@ -529,20 +812,21 @@ pub fn SubmitRuntime(comptime App: type) type {
                 app.pending_images = original_images;
             }
 
-            if (!try enqueuePromptForSubmit(
+            const admission = try enqueuePromptForSubmit(
                 app,
                 prompt,
                 skill_tokens,
                 accepted_draft,
-            )) {
+            );
+            if (admission == .rejected or admission == .deferred) {
                 staged_images.* = app.pending_images;
                 app.pending_images = original_images;
-                return false;
+                return admission;
             }
 
             var committed_images = original_images;
             deinitOwnedImageList(app.alloc, &committed_images);
-            return true;
+            return admission;
         }
 
         fn firstAvailableImageId(images: []const types.ImageAttachment) !usize {
@@ -1507,4 +1791,186 @@ test "direct terminal route requires the literal first character" {
     try std.testing.expectEqualStrings("", directCommand("!").?);
     try std.testing.expect(directCommand(" !printf prompt") == null);
     try std.testing.expect(directCommand("ordinary prompt") == null);
+}
+
+test "pending submission phase methods keep hold ownership explicit" {
+    const alloc = std.testing.allocator;
+    var pending = PendingSubmission.init(try buildQueuedPromptDraft(
+        alloc,
+        41,
+        "use $review",
+        &.{},
+        &.{.{
+            .raw_start = 4,
+            .raw_end = 11,
+            .name = "review",
+            .path = "/tmp/review/SKILL.md",
+        }},
+    ));
+    defer pending.deinit(alloc);
+
+    try std.testing.expectEqual(PendingPhase.awaiting_frame, pending.phase);
+    try std.testing.expect(pending.ownsTurnStartHold());
+    try std.testing.expectError(error.InvalidPendingPhase, pending.markAdopted());
+
+    try pending.markFrameCommitted();
+    try std.testing.expectEqual(PendingPhase.awaiting_adoption, pending.phase);
+    try std.testing.expect(pending.ownsTurnStartHold());
+    try std.testing.expectError(error.InvalidPendingPhase, pending.markFrameCommitted());
+
+    try pending.markAdopted();
+    try std.testing.expectEqual(PendingPhase.adopted, pending.phase);
+    try std.testing.expect(pending.ownsTurnStartHold());
+    try std.testing.expectError(error.InvalidPendingPhase, pending.markAdopted());
+
+    try pending.markQueued();
+    try std.testing.expectEqual(PendingPhase.queued, pending.phase);
+    try std.testing.expect(!pending.ownsTurnStartHold());
+    try std.testing.expectError(error.InvalidPendingPhase, pending.markQueued());
+    try std.testing.expectEqual(@as(u64, 41), pending.draft.turn_id);
+    try std.testing.expectEqualStrings("use $review", pending.draft.prompt);
+    try std.testing.expectEqual(@as(usize, 1), pending.draft.skill_display_spans.len);
+}
+
+fn checkPendingDraftConstructionAllocationFailure(alloc: std.mem.Allocator) !void {
+    const draft = try buildQueuedPromptDraft(
+        alloc,
+        77,
+        "hello $review",
+        &.{.{
+            .id = 5,
+            .path = @constCast("/tmp/image.png"),
+            .media_type = @constCast("image/png"),
+        }},
+        &.{.{
+            .raw_start = 6,
+            .raw_end = 13,
+            .name = "review",
+            .path = "/tmp/review/SKILL.md",
+        }},
+    );
+    defer worker_runtime.freeQueuedPromptDraft(alloc, draft);
+    try std.testing.expectEqual(@as(u64, 77), draft.turn_id);
+    try std.testing.expectEqualStrings("hello $review", draft.prompt);
+    try std.testing.expectEqual(@as(usize, 1), draft.images.len);
+    try std.testing.expectEqual(@as(usize, 1), draft.skill_display_spans.len);
+}
+
+test "pending draft construction frees every partial allocation" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkPendingDraftConstructionAllocationFailure,
+        .{},
+    );
+}
+
+const PendingLifecycleFake = struct {
+    alloc: std.mem.Allocator,
+    submission: State = .{},
+    worker: struct {
+        held: bool = true,
+        release_count: usize = 0,
+
+        pub fn releaseTurnStartHold(self: *@This()) void {
+            if (!self.held) return;
+            self.held = false;
+            self.release_count += 1;
+        }
+    } = .{},
+    adoption_failures_remaining: usize = 0,
+    adoption_count: usize = 0,
+    finalization_count: usize = 0,
+    finalization_error: bool = false,
+    notice_count: usize = 0,
+
+    fn deinit(self: *PendingLifecycleFake) void {
+        SubmitRuntime(PendingLifecycleFake).clearPendingSubmission(self, "test_deinit");
+    }
+
+    pub fn adoptPendingUserPrompt(
+        self: *PendingLifecycleFake,
+        _: *const worker_runtime.QueuedPromptDraft,
+    ) !void {
+        if (self.adoption_failures_remaining > 0) {
+            self.adoption_failures_remaining -= 1;
+            return error.InjectedAdoptionFailure;
+        }
+        self.adoption_count += 1;
+    }
+
+    pub fn finalizePendingSubmission(
+        self: *PendingLifecycleFake,
+        _: *const worker_runtime.QueuedPromptDraft,
+    ) !void {
+        self.finalization_count += 1;
+        if (self.finalization_error) return error.InjectedFinalizationFailure;
+    }
+
+    pub fn writeDomainNotice(
+        self: *PendingLifecycleFake,
+        _: types.SemanticNotice,
+        _: bool,
+    ) !void {
+        self.notice_count += 1;
+    }
+};
+
+fn pendingLifecycleFake(alloc: std.mem.Allocator, turn_id: u64) !PendingLifecycleFake {
+    return .{
+        .alloc = alloc,
+        .submission = .{ .pending = PendingSubmission.init(try buildQueuedPromptDraft(
+            alloc,
+            turn_id,
+            "visible prompt",
+            &.{},
+            &.{},
+        )) },
+    };
+}
+
+test "post-commit adoption failure keeps one retryable owner and hold" {
+    const Runtime = SubmitRuntime(PendingLifecycleFake);
+    var app = try pendingLifecycleFake(std.testing.allocator, 501);
+    defer app.deinit();
+    app.adoption_failures_remaining = 1;
+
+    Runtime.noteCommittedFrame(&app);
+    try std.testing.expectEqual(PendingPhase.awaiting_adoption, app.submission.pending.?.phase);
+    try std.testing.expect(app.worker.held);
+    try std.testing.expectEqual(@as(usize, 0), app.adoption_count);
+    try std.testing.expectEqual(@as(usize, 0), app.finalization_count);
+
+    Runtime.collectPendingSubmissionFacts(&app);
+    try std.testing.expectEqual(PendingPhase.queued, app.submission.pending.?.phase);
+    try std.testing.expect(!app.worker.held);
+    try std.testing.expectEqual(@as(usize, 1), app.worker.release_count);
+    try std.testing.expectEqual(@as(usize, 1), app.adoption_count);
+    try std.testing.expectEqual(@as(usize, 1), app.finalization_count);
+
+    try std.testing.expectError(
+        error.PendingTurnIdMismatch,
+        Runtime.acceptPresentedPrompt(&app, 999),
+    );
+    try std.testing.expect(app.submission.pending != null);
+    try Runtime.acceptPresentedPrompt(&app, 501);
+    try std.testing.expect(app.submission.pending == null);
+    try std.testing.expectEqual(@as(usize, 1), app.worker.release_count);
+}
+
+test "post-ack finalization failure leaves notice and consumes pending owner" {
+    const Runtime = SubmitRuntime(PendingLifecycleFake);
+    var app = try pendingLifecycleFake(std.testing.allocator, 777);
+    defer app.deinit();
+    app.finalization_error = true;
+
+    Runtime.noteCommittedFrame(&app);
+    try std.testing.expectEqual(PendingPhase.adopted, app.submission.pending.?.phase);
+    Runtime.collectPendingSubmissionFacts(&app);
+
+    try std.testing.expect(app.submission.pending == null);
+    try std.testing.expect(!app.worker.held);
+    try std.testing.expectEqual(@as(usize, 1), app.worker.release_count);
+    try std.testing.expectEqual(@as(usize, 1), app.adoption_count);
+    try std.testing.expectEqual(@as(usize, 1), app.finalization_count);
+    try std.testing.expectEqual(@as(usize, 1), app.notice_count);
 }

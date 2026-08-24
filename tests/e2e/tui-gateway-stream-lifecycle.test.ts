@@ -2518,8 +2518,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const workspacePath = join(root, "workspace");
       const stderrPath = join(root, "stderr.log");
       const tapePath = join(root, "session.fxtape");
+      const tracePath = join(root, "fx-trace.log");
       const framesRoot = join(root, "replay-frames");
       const submittedPrompt = "IDLE_SUBMIT_ORDER_SENTINEL";
+      const newerDraft = "RAPID_SECOND_DRAFT_SENTINEL";
       const hold: HoldState = { started: false, cancelled: false };
       mkdirSync(join(home, ".fx"), { recursive: true });
       mkdirSync(workspacePath, { recursive: true });
@@ -2551,11 +2553,15 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_MODEL: MODEL,
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "input,worker",
         },
       });
 
       await session.waitForComposer(TIMEOUT);
-      await session.sendText(submittedPrompt);
+      await session.sendLiteral(submittedPrompt);
+      session.sendKeysImmediate(["Enter"]);
+      session.sendLiteralImmediate(newerDraft);
       await waitForCondition(
         () => heldGateway.requests.length === 1 && hold.started,
         "held idle submitted prompt stream",
@@ -2563,13 +2569,21 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForText("Thinking", TIMEOUT);
       await Bun.sleep(250);
       await session.sendKeys("C-c");
-      await session.waitForText("cancelled", TIMEOUT);
+      const cancelledPane = await session.waitForText("cancelled", TIMEOUT);
 
       execFileSync(FX_BIN, ["replay", tapePath, "--frames-dir", framesRoot], {
         encoding: "utf8",
       });
       assertFirstPostEnterOutputShowsSubmittedPrompt(tapePath, submittedPrompt);
       assertThinkingFramesShowSubmittedPrompt(framesRoot, submittedPrompt);
+      const trace = readFileSync(tracePath, "utf8");
+      const frameCommitted = trace.indexOf("event=pending_prompt_frame_committed");
+      const promptQueued = trace.indexOf("event=prompt_enqueue");
+      const workerBegin = trace.indexOf("event=worker_begin");
+      expect(frameCommitted).toBeGreaterThanOrEqual(0);
+      expect(promptQueued).toBeGreaterThan(frameCommitted);
+      expect(workerBegin).toBeGreaterThan(promptQueued);
+      expect(composerContains(cancelledPane, newerDraft)).toBe(true);
 
       expect(hold.cancelled).toBe(true);
       expect(readFileSync(stderrPath, "utf8")).toBe("");

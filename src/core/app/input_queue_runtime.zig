@@ -137,7 +137,6 @@ pub fn Runtime(comptime App: type) type {
                 app.alloc,
                 app.input_runtime.kill_ring.images.items,
             );
-            app.shell.render_requests.finishSubmittedPromptTransition();
             state.clear(app.alloc);
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
@@ -186,7 +185,6 @@ pub fn Runtime(comptime App: type) type {
                 app.alloc.free(state.entries);
                 state.entries = &.{};
                 removed.deinit(app.alloc);
-                app.shell.render_requests.finishSubmittedPromptTransition();
                 debug_trace.eventf("input", "queue_review_draft_deleted", .{ .turn_id = turn_id }, "remaining=0", .{});
                 app.input_runtime.inputResetState().clearCurrent(app.alloc);
                 paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);

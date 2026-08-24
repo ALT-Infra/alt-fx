@@ -82,6 +82,10 @@ pub const QueuedPrompt = struct {
     /// assistant source. Recovery still restores the source for overlap and
     /// persistence, but publishes only novel continuation text.
     recovery_source_already_presented: bool = false,
+    /// The interactive transcript already contains this exact user turn.
+    /// Worker begin publishes only its identity so the UI can consume the
+    /// pending owner without painting a duplicate card.
+    user_prompt_already_presented: bool = false,
 };
 
 pub const ActivePromptSnapshotOwnership = struct {
@@ -452,6 +456,7 @@ pub const PendingQuestionBatchSnapshot = struct {
 pub const WorkerEvent = union(enum) {
     begin_prompt: types.UserTurn,
     begin_prompt_with_skill_bindings: BeginPromptWithSkillBindings,
+    begin_presented_prompt: u64,
     append_user_feedback: []u8,
     assistant_presentation: assistant_presentation.Event,
     notification: notification_contract.Notification,
@@ -1006,7 +1011,11 @@ pub const WorkerRuntime = struct {
         if (self.worker_stop_requested or self.queued_prompts.items.len == 0) return null;
 
         const queued = self.queued_prompts.items[0];
-        if (queued.recovery_checkpoint == null) {
+        if (queued.recovery_checkpoint == null and queued.user_prompt_already_presented) {
+            try self.worker_events.append(alloc, .{
+                .begin_presented_prompt = queued.turn_id,
+            });
+        } else if (queued.recovery_checkpoint == null) {
             const begin_prompt = try types.dupeUserTurn(alloc, .{ .text = queued.prompt, .images = queued.images });
             errdefer types.freeUserTurn(alloc, begin_prompt);
             if (queued.skill_bindings.len > 0 or queued.skill_display_spans.len > 0) {
@@ -2492,6 +2501,7 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
                 .skill_display_spans = skill_display_spans,
             } };
         },
+        .begin_presented_prompt => |turn_id| .{ .begin_presented_prompt = turn_id },
         .append_user_feedback => |text| .{ .append_user_feedback = try alloc.dupe(u8, text) },
         .assistant_presentation => |presentation| .{
             .assistant_presentation = try presentation.clone(alloc),
@@ -2565,6 +2575,7 @@ pub fn freeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) void {
             freeSkillBindings(alloc, begin.skill_bindings);
             freeSkillDisplaySpans(alloc, begin.skill_display_spans);
         },
+        .begin_presented_prompt => {},
         .append_user_feedback => |text| alloc.free(text),
         .assistant_presentation => |presentation| {
             var owned = presentation;
@@ -3883,6 +3894,26 @@ test "waitAndTakeNextPrompt assigns turn id and resets cancellation for next pro
     defer freeEventList(alloc, &events);
     try std.testing.expectEqual(@as(usize, 1), events.items.len);
     try std.testing.expect(events.items[0] == .begin_prompt);
+}
+
+test "already-presented queued prompt emits identity without duplicating user payload" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+
+    var queued = try makePrompt(alloc, "already visible", "model");
+    queued.turn_id = 9001;
+    queued.user_prompt_already_presented = true;
+    try runtime.enqueuePrompt(alloc, queued);
+
+    const job = (try runtime.tryTakeNextPrompt(alloc)).?;
+    defer freeQueuedPrompt(alloc, job);
+    var events = runtime.takeEvents();
+    defer freeEventList(alloc, &events);
+
+    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+    try std.testing.expect(events.items[0] == .begin_presented_prompt);
+    try std.testing.expectEqual(@as(u64, 9001), events.items[0].begin_presented_prompt);
 }
 
 test "requestRecoveryPause wakes the active operation without losing pause intent" {
