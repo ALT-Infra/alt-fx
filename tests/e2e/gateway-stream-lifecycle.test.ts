@@ -2980,7 +2980,7 @@ describe("gateway stream lifecycle", () => {
     const root = createFixtureRoot("no-save-replay-sigkill");
     const tracePath = join(root.root, "trace.log");
     const before = new Set(
-      readdirSync(tmpdir()).filter((name) =>
+      readdirSync("/tmp").filter((name) =>
         name.startsWith(".fx-command-replay-")
       ),
     );
@@ -3025,7 +3025,7 @@ describe("gateway stream lifecycle", () => {
       proc.kill("SIGKILL");
       await proc.exited;
       await Bun.sleep(50);
-      const after = readdirSync(tmpdir()).filter((name) =>
+      const after = readdirSync("/tmp").filter((name) =>
         name.startsWith(".fx-command-replay-") && !before.has(name)
       );
       expect(after).toEqual([]);
@@ -3844,6 +3844,7 @@ describe("gateway stream lifecycle", () => {
       if (responseIndex++ === 0) {
         return fakeGatewayToolCall("prompt_too_long_tool_1", "terminal", {
           action: "exec",
+          timeout_ms: 600_000,
           command: `printf 'once\\n' >> '${sideEffectPath}'`,
         });
       }

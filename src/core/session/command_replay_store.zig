@@ -15,6 +15,7 @@ const frame_header_bytes: usize = 9;
 const max_frame_payload_bytes: usize = 1024 * 1024;
 const max_agent_line_bytes: usize = max_frame_payload_bytes;
 const agent_projection_overlap_bytes: usize = 64;
+pub const max_public_handle_bytes: usize = 128;
 
 const DecodedFrameHeader = struct {
     stream: Stream,
@@ -325,6 +326,7 @@ pub const Capture = struct {
         bytes: []const u8,
     ) !void {
         if (bytes.len == 0 or self.sealed) return;
+        if (self.state == .unavailable) return error.CommandOutputCaptureFailed;
         self.had_output = true;
         self.appendAcceptedFallible(alloc, stream, bytes) catch |err| {
             self.makeUnavailable(alloc, err);
@@ -1094,7 +1096,14 @@ const AgentProjectionReader = struct {
                 continue;
             }
             if (self.line.items.len == max_agent_line_bytes) {
-                if (containsModelSecretTrigger(self.line.items)) {
+                const masked = try text_utils.maskSecrets(alloc, self.line.items);
+                defer if (masked.ptr != self.line.items.ptr) alloc.free(@constCast(masked));
+                if (masked.ptr != self.line.items.ptr or
+                    text_utils.secretMayCrossBoundary(
+                        self.line.items,
+                        agent_projection_overlap_bytes,
+                    ))
+                {
                     self.line.clearRetainingCapacity();
                     self.discarding_sensitive_line = true;
                     if (next_byte.value == '\n') return try self.finishLine(alloc);
@@ -1144,42 +1153,6 @@ const AgentProjectionReader = struct {
     }
 };
 
-fn containsModelSecretTrigger(bytes: []const u8) bool {
-    const triggers = [_][]const u8{
-        "password",
-        "passwd",
-        "api_key",
-        "apikey",
-        "secret",
-        "token",
-        "private_key",
-        "access_key",
-        "https://",
-        "sk-",
-        "sk_live_",
-        "pk_live_",
-        "github_pat_",
-        "xoxb-",
-        "xoxp-",
-        "bearer ",
-        "ghp_",
-        "gho_",
-        "ghu_",
-        "ghs_",
-        "ghr_",
-        "akia",
-        "asia",
-        "aida",
-        "agpa",
-        "aroa",
-        "anpa",
-    };
-    for (triggers) |trigger| {
-        if (text_utils.containsIgnoreCase(bytes, trigger)) return true;
-    }
-    return false;
-}
-
 pub fn readAgentPageManaged(
     alloc: Allocator,
     capability: *session_child_store.SessionChildCapability,
@@ -1213,6 +1186,8 @@ fn readAgentPage(
 ) ![]u8 {
     const requested_start = if (start_byte == 0) 0 else start_byte - 1;
     var projected_offset: usize = 0;
+    var page_start: ?usize = null;
+    var page_closed = false;
     var page: std.ArrayList(u8) = .empty;
     defer page.deinit(alloc);
     var projector: AgentProjectionReader = .{ .reader = reader };
@@ -1221,12 +1196,13 @@ fn readAgentPage(
     while (try projector.next(alloc)) |block| {
         defer alloc.free(block);
         const block_end = try std.math.add(usize, projected_offset, block.len);
-        if (block_end > requested_start and page.items.len < byte_count) {
+        if (!page_closed and block_end > requested_start and page.items.len < byte_count) {
             const local_start = if (requested_start > projected_offset)
                 requested_start - projected_offset
             else
                 0;
             const safe_start = text_utils.utf8ForwardBoundary(block, local_start);
+            if (page_start == null) page_start = projected_offset + safe_start;
             const available = block.len - safe_start;
             const remaining = byte_count - page.items.len;
             const raw_end = safe_start + @min(available, remaining);
@@ -1234,11 +1210,14 @@ fn readAgentPage(
             if (safe_end > safe_start) {
                 try page.appendSlice(alloc, block[safe_start..safe_end]);
             }
+            if (safe_end < raw_end or page.items.len == byte_count) {
+                page_closed = true;
+            }
         }
         projected_offset = block_end;
     }
 
-    const response_start = @min(requested_start, projected_offset);
+    const response_start = page_start orelse @min(requested_start, projected_offset);
     const response_end = try std.math.add(usize, response_start, page.items.len);
     return std.fmt.allocPrint(
         alloc,
@@ -1433,6 +1412,10 @@ test "required command replay reports unavailable backing instead of dropping ou
         error.CommandOutputCaptureFailed,
         capture.appendAcceptedRequired(arena, .stdout, "required\n"),
     );
+    try std.testing.expectError(
+        error.CommandOutputCaptureFailed,
+        capture.appendAcceptedRequired(arena, .stderr, "still required\n"),
+    );
 }
 
 test "ephemeral command replay unlinks backing before publication and remains readable" {
@@ -1526,6 +1509,58 @@ test "agent command replay masks secrets split across callback frames" {
     try std.testing.expect(std.mem.find(u8, query, "needle split across frames") != null);
 }
 
+test "agent command replay pages stay contiguous across utf8 boundaries" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const temp_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(temp_path);
+    var store = EphemeralStore.initForTesting(alloc, temp_path);
+    defer store.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const capture = try Capture.createEphemeral(arena, 0, &store);
+    try capture.appendAcceptedRequired(arena, .stdout, "ab\xe2\x98\x83cd\n");
+    const descriptor = (try capture.retainRequired(arena)) orelse
+        return error.TestExpectedReplay;
+    defer capture.releaseRetained(arena);
+
+    const first = try readAgentPageEphemeral(
+        alloc,
+        &store,
+        descriptor.handle,
+        1,
+        12,
+    );
+    defer alloc.free(first);
+    try std.testing.expect(std.mem.find(u8, first, "start_byte=\"1\"") != null);
+    try std.testing.expect(std.mem.find(u8, first, "end_byte=\"11\"") != null);
+    const first_body_start = (std.mem.find(u8, first, ">\n") orelse
+        return error.TestExpectedReplay) + 2;
+    const first_body_end = std.mem.findPos(
+        u8,
+        first,
+        first_body_start,
+        "</command_output>",
+    ) orelse return error.TestExpectedReplay;
+    const first_body = first[first_body_start..first_body_end];
+    try std.testing.expect(std.mem.find(u8, first_body, "ab") != null);
+    try std.testing.expect(std.mem.find(u8, first_body, "cd") == null);
+
+    const second = try readAgentPageEphemeral(
+        alloc,
+        &store,
+        descriptor.handle,
+        12,
+        4096,
+    );
+    defer alloc.free(second);
+    try std.testing.expect(std.mem.find(u8, second, "start_byte=\"12\"") != null);
+    try std.testing.expect(std.mem.find(u8, second, "\xe2\x98\x83cd") != null);
+}
+
 test "agent command replay keeps split utf8 valid and omits oversized secret-bearing lines" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1581,6 +1616,7 @@ test "agent command replay streams non-secret oversized lines without omission" 
     const capture = try Capture.createEphemeral(arena, 0, &store);
     const chunk = try arena.alloc(u8, max_agent_line_bytes / 2);
     @memset(chunk, 'x');
+    try capture.appendAcceptedRequired(arena, .stdout, "https://example.com ");
     try capture.appendAcceptedRequired(arena, .stdout, chunk);
     try capture.appendAcceptedRequired(arena, .stdout, chunk);
     try capture.appendAcceptedRequired(arena, .stdout, "NONSECRET-LATE-SENTINEL\n");

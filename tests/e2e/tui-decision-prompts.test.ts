@@ -24,7 +24,6 @@ import {
   fakeGatewaySerializedToolCall,
   TmuxSession,
   tmuxAvailable,
-  withNativeExecTimeout,
 } from "./tmux-helpers";
 import { stdoutFrames } from "./render-lab/tape";
 
@@ -140,9 +139,7 @@ afterEach(async () => {
 
 function sse(events: object[], done = true) {
   return new Response(
-    events.map((event) =>
-      `data: ${JSON.stringify(withNativeExecTimeout(event))}\n\n`
-    ).join("") +
+    events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("") +
       (done ? "data: [DONE]\n\n" : ""),
     { headers: { "content-type": "text/event-stream" } },
   );
@@ -170,7 +167,7 @@ function outerCommandCall() {
     {
       id: "command_outer_1",
       name: "terminal",
-      input: { action: "exec", command: "touch generic-preview-accepted.txt" },
+      input: { action: "exec", timeout_ms: 600_000, command: "touch generic-preview-accepted.txt" },
     },
   ]);
 }
@@ -189,7 +186,7 @@ function outerLongCommandCall() {
     {
       id: "long_command_outer_1",
       name: "terminal",
-      input: { action: "exec", command },
+      input: { action: "exec", timeout_ms: 600_000, command },
     },
   ]);
 }
@@ -206,7 +203,7 @@ function outerScrollableLongCommandCall() {
     {
       id: "scrollable_long_command_outer_1",
       name: "terminal",
-      input: { action: "exec", command },
+      input: { action: "exec", timeout_ms: 600_000, command },
     },
   ]);
 }
@@ -219,7 +216,7 @@ function outerFittingCommandCall() {
     {
       id: "fitting_command_outer_1",
       name: "terminal",
-      input: { action: "exec", command },
+      input: { action: "exec", timeout_ms: 600_000, command },
     },
   ]);
 }

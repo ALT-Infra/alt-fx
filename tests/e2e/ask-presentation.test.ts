@@ -145,13 +145,13 @@ describe("fx ask presentation", () => {
           type: "tool-call",
           toolCallId: "no-final-newline",
           toolName: "terminal",
-          input: { action: "exec", command: "printf no-final-newline" },
+          input: { action: "exec", timeout_ms: 600_000, command: "printf no-final-newline" },
         },
         {
           type: "tool-call",
           toolCallId: "next-command",
           toolName: "terminal",
-          input: { action: "exec", command: "printf 'next-output\\n'" },
+          input: { action: "exec", timeout_ms: 600_000, command: "printf 'next-output\\n'" },
         },
         {
           type: "finish",
@@ -216,15 +216,18 @@ describe("fx ask presentation", () => {
     const gateway = startFakeGateway([
       fakeGatewayToolCall("terminal-omitted", "terminal", {
         action: "exec",
+        timeout_ms: 600_000,
         command: profileCommand,
       }),
       fakeGatewayToolCall("terminal-clean", "terminal", {
         action: "exec",
+        timeout_ms: 600_000,
         command: profileCommand,
         profile: "clean",
       }),
       fakeGatewayToolCall("terminal-user", "terminal", {
         action: "exec",
+        timeout_ms: 600_000,
         command: profileCommand,
         profile: "user",
       }),
@@ -237,11 +240,13 @@ describe("fx ask presentation", () => {
       fakeGatewayToolCall("terminal-nested-exec", "terminal", {
         request: {
           action: "exec",
+          timeout_ms: 600_000,
           command: `printf nested > ${JSON.stringify(nestedExecMarker)}`,
         },
       }),
       fakeGatewayToolCall("terminal-neighbor-exec", "terminal", {
         action: "exec",
+        timeout_ms: 600_000,
         command: "printf neighbor-exec",
       }),
       fakeGatewayFinalText("Terminal no-save profiles verified.\n"),
@@ -842,6 +847,7 @@ describe("fx ask presentation", () => {
         [
           fakeGatewayToolCall("write_fixture", "terminal", {
             action: "exec",
+            timeout_ms: 600_000,
             command: "printf notice-test > ask-notice.txt",
           }),
           fakeGatewayFinalText("Notice filtering complete.\n"),

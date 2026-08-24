@@ -122,37 +122,9 @@ export function hasEmptyComposer(pane: string): boolean {
   return pane.split("\n").some(isEmptyComposerLine);
 }
 
-export function withNativeExecTimeout(event: object): object {
-  const value = event as Record<string, unknown>;
-  if (value.type !== "tool-call" || value.toolName !== "terminal") return event;
-  if (typeof value.input === "string") {
-    try {
-      const parsed = JSON.parse(value.input) as Record<string, unknown>;
-      if (
-        parsed.action === "exec" &&
-        !Object.prototype.hasOwnProperty.call(parsed, "timeout_ms")
-      ) {
-        return { ...value, input: JSON.stringify({ ...parsed, timeout_ms: 600_000 }) };
-      }
-    } catch {
-      return event;
-    }
-    return event;
-  }
-  if (value.input === null || typeof value.input !== "object") return event;
-  const input = value.input as Record<string, unknown>;
-  if (
-    input.action !== "exec" ||
-    Object.prototype.hasOwnProperty.call(input, "timeout_ms")
-  ) {
-    return event;
-  }
-  return { ...value, input: { ...input, timeout_ms: 600_000 } };
-}
-
 export function fakeGatewaySse(events: object[]) {
   return new Response(
-    `${events.map((event) => `data: ${JSON.stringify(withNativeExecTimeout(event))}\n\n`).join("")}data: [DONE]\n\n`,
+    `${events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`,
     { headers: { "content-type": "text/event-stream" } },
   );
 }

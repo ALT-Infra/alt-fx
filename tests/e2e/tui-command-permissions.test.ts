@@ -27,7 +27,6 @@ import {
   startDynamicFakeGateway,
   TmuxSession,
   tmuxAvailable,
-  withNativeExecTimeout,
 } from "./tmux-helpers";
 
 const TIMEOUT = 30_000;
@@ -97,7 +96,7 @@ afterEach(async () => {
 
 function sse(events: object[]) {
   return new Response(
-    `${events.map((event) => `data: ${JSON.stringify(withNativeExecTimeout(event))}\n\n`).join("")}data: [DONE]\n\n`,
+    `${events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`,
     { headers: { "content-type": "text/event-stream" } },
   );
 }
@@ -122,7 +121,7 @@ function toolCall(
   options: Record<string, unknown> = {},
   toolCallId = "command_1",
 ) {
-  return gatewayToolCall("terminal", { action: "exec", command, ...options }, toolCallId);
+  return gatewayToolCall("terminal", { action: "exec", timeout_ms: 600_000, command, ...options }, toolCallId);
 }
 
 function permissionDecision(
@@ -175,7 +174,7 @@ function toolCalls(command: string, callIds: string[]) {
       type: "tool-call",
       toolCallId,
       toolName: "terminal",
-      input: { action: "exec", command },
+      input: { action: "exec", timeout_ms: 600_000, command },
     })),
     {
       type: "finish",
@@ -190,13 +189,13 @@ function twoEffectfulCommandBatch(first: string, second: string) {
       type: "tool-call",
       toolCallId: "history_feedback_first",
       toolName: "terminal",
-      input: { action: "exec", command: first },
+      input: { action: "exec", timeout_ms: 600_000, command: first },
     },
     {
       type: "tool-call",
       toolCallId: "history_feedback_second",
       toolName: "terminal",
-      input: { action: "exec", command: second },
+      input: { action: "exec", timeout_ms: 600_000, command: second },
     },
     {
       type: "finish",
@@ -1110,6 +1109,7 @@ async function expectSavedTerminalExec(
   expect(JSON.parse(call.arguments_json)).toEqual(
     expect.objectContaining({
       action: "exec",
+      timeout_ms: 600_000,
       command,
       ...(background ? { background: true } : {}),
     }),
@@ -1369,7 +1369,7 @@ describe("effect-aware command permissions", () => {
             type: "tool-call",
             toolCallId: "command_1",
             toolName: "terminal",
-            input: { action: "exec", command: "pwd" },
+            input: { action: "exec", timeout_ms: 600_000, command: "pwd" },
           },
           {
             type: "finish",
@@ -1477,7 +1477,7 @@ describe("effect-aware command permissions", () => {
             type: "tool-call",
             toolCallId: call.id,
             toolName: "terminal",
-            input: { action: "exec", command: call.command },
+            input: { action: "exec", timeout_ms: 600_000, command: call.command },
           })),
           {
             type: "finish",
@@ -2196,7 +2196,7 @@ describe("effect-aware command permissions", () => {
               type: "tool-call",
               toolCallId: "scrollback_command",
               toolName: "terminal",
-              input: { action: "exec", command: "seq 1 1" },
+              input: { action: "exec", timeout_ms: 600_000, command: "seq 1 1" },
             },
             {
               type: "finish",
@@ -4720,6 +4720,7 @@ describe("effect-aware command permissions", () => {
         if (userText.includes(childPrompt)) {
           return gatewayToolCall("terminal", {
             action: "exec",
+            timeout_ms: 600_000,
             command: `/usr/bin/touch ${shellQuote(markerPath)}`,
           }, childCommandCallId);
         }
@@ -4867,6 +4868,7 @@ describe("effect-aware command permissions", () => {
             if (childRequestCount > 1) expect(body).toContain("review_caution");
             return gatewayToolCall("terminal", {
               action: "exec",
+              timeout_ms: 600_000,
               command: `/usr/bin/touch ${shellQuote(markerPath)}`,
             }, `child_auto_command_${childRequestCount}`);
           }

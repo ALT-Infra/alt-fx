@@ -12,7 +12,6 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EVAL_MODEL, HAS_API_KEY, runFx } from "../evals/eval-helpers";
-import { withNativeExecTimeout } from "./tmux-helpers";
 
 const TIMEOUT = 20_000;
 const MODEL = "openai/gpt-5";
@@ -30,9 +29,7 @@ type GatewayResponse =
 
 function sse(events: object[]) {
   return new Response(
-    events.map((event) =>
-      `data: ${JSON.stringify(withNativeExecTimeout(event))}\n\n`
-    ).join("") +
+    events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("") +
       "data: [DONE]\n\n",
     { headers: { "content-type": "text/event-stream" } },
   );
@@ -430,7 +427,7 @@ describe("filesystem path handling", () => {
           {
             id: "added_cwd_1",
             name: "terminal",
-            input: { action: "exec", command: "pwd", cwd: root.external },
+            input: { action: "exec", timeout_ms: 600_000, command: "pwd", cwd: root.external },
             expected: root.external,
           },
         ];
@@ -610,6 +607,7 @@ describe("filesystem path handling", () => {
       const gateway = startFakeGateway([
         toolCall("added_command_write_1", "terminal", {
           action: "exec",
+          timeout_ms: 600_000,
           command: "printf COMMAND_ADDED_WRITE > command-proof.txt",
           cwd: root.external,
         }),
@@ -766,6 +764,7 @@ describe("filesystem path handling", () => {
           const gateway = startFakeGateway([
             toolCall(scenario.id, "terminal", {
               action: "exec",
+              timeout_ms: 600_000,
               command: `pwd; printf ${scenario.id} > ${scenario.id}.txt`,
               cwd: scenario.cwd,
             }),

@@ -15,6 +15,17 @@ const runtime_config = @import("config.zig");
 const runtime_tool_contracts = @import("tool_contracts.zig");
 
 const Allocator = std.mem.Allocator;
+
+const command_replay_handle_prefix = "\n<command_output_handle>";
+const command_replay_handle_suffix = "</command_output_handle>\n" ++
+    "Full captured command output is available through read_tool_result with this handle.";
+const command_replay_handle_reserve_bytes = command_replay_handle_prefix.len +
+    command_replay_store.max_public_handle_bytes +
+    command_replay_handle_suffix.len;
+
+comptime {
+    std.debug.assert(command_replay_handle_reserve_bytes < tool_result_limits.min_configured_tool_result_bytes);
+}
 const ChatMessage = types.ChatMessage;
 const ToolCall = types.ToolCall;
 const Config = runtime_config.Config;
@@ -196,11 +207,15 @@ pub fn prepareToolModelOutput(arena: Allocator, config: Config, tool_call: ToolC
             config.max_tool_result_bytes,
         );
     }
+    const model_output_budget = if (required_command_replay)
+        config.max_tool_result_bytes -| command_replay_handle_reserve_bytes
+    else
+        config.max_tool_result_bytes;
     const safe_output = try tool_result_limits.prepareModelOutput(
         arena,
         tool_call.name,
         raw_output,
-        config.max_tool_result_bytes,
+        model_output_budget,
     );
     return .{
         .model_output = safe_output,
@@ -256,6 +271,7 @@ pub fn finalizeCommandReplay(
             prepared.model_output,
             descriptor.handle,
         );
+        prepared.memory.stored_output_bytes = prepared.model_output.len;
         return;
     }
 
@@ -320,11 +336,18 @@ fn appendCommandReplayHandle(
     model_output: []const u8,
     handle: []const u8,
 ) ![]const u8 {
+    if (handle.len > command_replay_store.max_public_handle_bytes) {
+        return error.InvalidReplayHandle;
+    }
     return std.fmt.allocPrint(
         arena,
-        "{s}\n<command_output_handle>{s}</command_output_handle>\n" ++
-            "Full captured command output is available through read_tool_result with this handle.",
-        .{ model_output, handle },
+        "{s}{s}{s}{s}",
+        .{
+            model_output,
+            command_replay_handle_prefix,
+            handle,
+            command_replay_handle_suffix,
+        },
     );
 }
 
@@ -795,6 +818,7 @@ test "required terminal exec stores large output only as replay" {
         .gateway_retry_count = 0,
         .gateway_chat_url = "",
         .agent_step_limit = 1,
+        .max_tool_result_bytes = tool_result_limits.min_configured_tool_result_bytes,
         .cancel_flag = &cancel,
         .session_child_capability = &capability,
     }, tool_call, raw_output);
@@ -807,6 +831,10 @@ test "required terminal exec stores large output only as replay" {
         capture,
     );
     defer capture.releaseRetained(arena);
+    try std.testing.expect(
+        prepared.model_output.len <= tool_result_limits.min_configured_tool_result_bytes,
+    );
+    try std.testing.expect(std.mem.find(u8, prepared.model_output, "<command_output_handle>") != null);
 
     var command_artifacts = try capability.iterate(alloc, .command_artifacts);
     defer command_artifacts.deinit();
