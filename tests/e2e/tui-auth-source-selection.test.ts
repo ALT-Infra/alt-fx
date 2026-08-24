@@ -1547,6 +1547,11 @@ profileStoredKeyTmuxTest(
     await session.sendLiteralText(STORED_TOKEN);
     await session.sendKeys("Enter");
     await session.waitForText("Saved the API key to profile file and made it active", TIMEOUT);
+    const returnedConnections = await session.waitForPane(
+      (pane) => pane.includes("Connections") && pane.includes("AI Gateway API key"),
+      TIMEOUT,
+    );
+    expect(returnedConnections).toMatch(/^› AI Gateway API key\s+stored$/m);
     await session.sendText("/status");
     await session.waitForText("auth=stored API key (profile file)", TIMEOUT);
     expect(savedCredentialSource(home)).toBe("stored_key");

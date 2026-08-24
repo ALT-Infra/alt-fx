@@ -954,6 +954,15 @@ pub const Runtime = struct {
     }
 
     pub fn openPicker(self: *Self, alloc: Allocator) void {
+        self.openPickerForProvider(alloc, .gateway);
+    }
+
+    pub fn openPickerForProvider(
+        self: *Self,
+        alloc: Allocator,
+        active_provider: model_provider.ProviderId,
+    ) void {
+        self.provider_picker_active = active_provider;
         self.openPickerWithSkip(alloc, false);
     }
 
@@ -1224,8 +1233,13 @@ pub const Runtime = struct {
         const returns_to_root = self.api_key_returns_to_root;
         self.exitApiKeyStage(alloc, .saved);
         self.picker_active = returns_to_root;
-        self.picker_stage = .root;
-        self.picker_selection = if (returns_to_root) .{ .action = .setup } else null;
+        if (!returns_to_root or self.picker_include_skip) {
+            self.picker_stage = .root;
+            self.picker_selection = if (returns_to_root) .{ .action = .setup } else null;
+        } else {
+            self.picker_stage = .connections;
+            self.picker_selection = .{ .action = .setup };
+        }
 
         return if (self.api_key_save.start(alloc, key, deps)) .started else .busy;
     }
@@ -2675,6 +2689,33 @@ test "an api key save runs off the event loop and is reaped" {
     try std.testing.expectEqual(@as(usize, 1), fixture.store_calls);
     try std.testing.expect(!runtime.apiKeySaveInFlight());
     try std.testing.expect(runtime.api_key_save.thread == null);
+}
+
+test "api key save from setup returns to the selected Connections row" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    var fixture: ApiKeySaveFixture = .{};
+
+    runtime.openPicker(alloc);
+    try std.testing.expect(runtime.takePickerChoice(alloc) == null);
+    try std.testing.expectEqual(PickerStage.connections, runtime.pickerView().stage);
+    for (0..3) |_| try std.testing.expect(runtime.movePicker(1));
+    try std.testing.expect((Choice{ .action = .setup }).eql(runtime.takePickerChoice(alloc).?));
+
+    runtime.openApiKeyPickerFromRoot(alloc);
+    for ("vck_setup_parent") |byte| _ = try runtime.appendApiKeyByte(alloc, byte);
+    try std.testing.expectEqual(ApiKeySaveStart.started, runtime.beginApiKeySaveWithDeps(alloc, .{
+        .ctx = @ptrCast(&fixture),
+        .validator = fixture.validator(),
+        .store = ApiKeySaveFixture.store,
+        .loader = ApiKeySaveFixture.load,
+    }));
+
+    const picker = runtime.pickerView();
+    try std.testing.expectEqual(PickerStage.connections, picker.stage);
+    try std.testing.expect((Choice{ .action = .setup }).eql(picker.selected_choice.?));
+    try std.testing.expect(picker.choiceIsSelected(picker.choiceAt(3).?));
 }
 
 test "auth runtime saves and reloads through its injected secret store" {
