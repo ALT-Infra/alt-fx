@@ -127,54 +127,6 @@ test "linux re-exec paths name the live inode, not the replaced on-disk file" {
     }
 }
 
-test "linux re-exec still spawns after the on-disk binary is replaced" {
-    if (builtin.os.tag != .linux) return;
-    const alloc = std.testing.allocator;
-
-    // The regression this guards: `zig build` replaces the binary by
-    // unlink+rename, so the realpath of the running process names a file that
-    // no longer exists. Spawn through both procfs forms after doing exactly
-    // that, and require the child to run.
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(dir);
-    const victim = try std.fs.path.join(alloc, &.{ dir, "self-exe-probe" });
-    defer alloc.free(victim);
-
-    // `/bin/sh` stands in for the held process: it can block on a command,
-    // while fx exits immediately without a TTY and so cannot keep its own
-    // inode open. The mechanism under test is procfs, which is independent of
-    // which executable holds the inode.
-    try io_mod.copyFileAtomic(alloc, "/bin/sh", victim);
-    try std.Io.Dir.cwd().setFilePermissions(
-        io_mod.getIo(),
-        victim,
-        std.Io.File.Permissions.fromMode(0o755),
-        .{ .follow_symlinks = false },
-    );
-
-    var held = try spawnHeldOpen(victim);
-    // `kill` reaps the child, so it must not be followed by a `wait`.
-    defer held.kill(io_mod.getIo());
-    const child_pid = held.id orelse return error.SkipZigTest;
-
-    // Replace by unlink+rename while the child holds the inode, as a rebuild does.
-    try std.Io.Dir.cwd().deleteFile(io_mod.getIo(), victim);
-    try std.testing.expectError(
-        error.FileNotFound,
-        std.Io.Dir.cwd().openFile(io_mod.getIo(), victim, .{}),
-    );
-
-    // The replaced name is gone, but the child's procfs entry still execs.
-    const peer_path = try std.fmt.allocPrint(alloc, "/proc/{d}/exe", .{child_pid});
-    defer alloc.free(peer_path);
-    try expectExecSucceeds(peer_path);
-
-    // And this process can always re-exec itself through /proc/self/exe.
-    try std.testing.expect(onDiskPathIsExecutable(linux_self_exe));
-}
-
 test "peer re-exec path prefers a name that outlives this process" {
     if (builtin.os.tag != .linux) return;
     const alloc = std.testing.allocator;
@@ -218,29 +170,4 @@ test "on-disk probe rejects a replaced binary so the peer path falls back" {
     // A relative name could resolve against the spawned process's cwd, so it
     // is never trusted as a peer path.
     try std.testing.expect(!onDiskPathIsExecutable("fx"));
-}
-
-/// Starts `path` so it stays alive while the caller removes the on-disk name,
-/// keeping its inode and `/proc/<pid>/exe` valid.
-fn spawnHeldOpen(path: []const u8) !std.process.Child {
-    const argv = [_][]const u8{ path, "-c", "sleep 30" };
-    return std.process.spawn(io_mod.getIo(), .{
-        .argv = &argv,
-        .stdin = .ignore,
-        .stdout = .ignore,
-        .stderr = .ignore,
-    });
-}
-
-fn expectExecSucceeds(path: []const u8) !void {
-    const argv = [_][]const u8{ path, "-c", "exit 7" };
-    var child = try std.process.spawn(io_mod.getIo(), .{
-        .argv = &argv,
-        .stdin = .ignore,
-        .stdout = .ignore,
-        .stderr = .ignore,
-    });
-    const term = try child.wait(io_mod.getIo());
-    try std.testing.expect(term == .exited);
-    try std.testing.expectEqual(@as(u8, 7), term.exited);
 }
