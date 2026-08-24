@@ -1435,6 +1435,43 @@ tmuxTest(
   60_000,
 );
 
+tmuxTest(
+  "first-run Vercel team Escape continues into the setup hub",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-onboarding-team-back-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    oauth = startFakeOAuth(
+      ACQUIRED_LOGIN_TOKEN,
+      undefined,
+      3600,
+      Number.POSITIVE_INFINITY,
+      {
+        teams: [{ id: "team_123", slug: "vercel-labs", name: "Vercel Labs" }],
+      },
+    );
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+      FX_SKIP_ONBOARDING: "0",
+    });
+    await session.waitForText("Welcome to fx", TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForText("Vercel team · Search:", TIMEOUT);
+    await session.sendKeys("Escape");
+    const setup = await session.waitForPane(
+      (pane) => pane.includes("Setup") && /Connections\s+connected/.test(pane),
+      TIMEOUT,
+    );
+    expect(setup).toMatch(/^› Vercel team\s+choose a team$/m);
+    expect(setup).not.toContain("Welcome to fx");
+    expect(setup).not.toContain("sign in to manage");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
 async function startFxWithoutAuth(
   testHome: string,
   testStderrPath: string,

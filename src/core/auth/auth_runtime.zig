@@ -1030,6 +1030,7 @@ pub const Runtime = struct {
         self.exitApiKeyStage(alloc, .screen_replacement);
         self.clearTeamSelection(alloc);
         self.team_selection = selection.take();
+        self.picker_include_skip = false;
         self.picker_stage = .change_team;
         self.picker_selection = self.currentTeamChoice() orelse self.pickerView().choiceAt(0);
     }
@@ -2598,6 +2599,26 @@ test "change team stage owns fetched rows and releases them when popped" {
     try std.testing.expect(runtime.popPickerStage(alloc));
     try std.testing.expectEqual(PickerStage.root, runtime.pickerView().stage);
     try std.testing.expectEqual(@as(usize, 0), runtime.pickerView().teams.len);
+}
+
+test "team selection reached from onboarding returns to the setup hub" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    runtime.fx_login_session_available = true;
+    runtime.openOnboardingPicker(alloc);
+
+    var selection: login_flow.TeamSelection = .{};
+    defer selection.deinit(alloc);
+    try appendTestTeam(&selection, alloc, "team_123", "vercel-labs", "Vercel Labs");
+    runtime.openTeamPicker(alloc, &selection);
+
+    try std.testing.expect(runtime.popPickerStage(alloc));
+    const root = runtime.pickerView();
+    try std.testing.expectEqual(PickerStage.root, root.stage);
+    try std.testing.expect(!root.include_skip);
+    try std.testing.expect((Choice{ .action = .change_team }).eql(root.selected_choice.?));
+    try std.testing.expect(root.choiceEnabled(root.selected_choice.?));
 }
 
 test "change team search filters by name and slug without losing original indexes" {
