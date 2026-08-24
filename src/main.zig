@@ -1345,7 +1345,7 @@ const App = struct {
                 review,
             );
 
-        try self.worker.enqueuePrompt(std.heap.c_allocator, .{
+        _ = try self.worker.admitPrompt(std.heap.c_allocator, .{
             .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else 0,
             .prompt = prompt_copy,
             .images = images_copy,
@@ -1366,7 +1366,7 @@ const App = struct {
             .context_snapshot = context_snapshot_copy,
             .recovery_checkpoint = recovery_checkpoint_copy,
             .recovery_source_already_presented = recovery_checkpoint != null,
-        });
+        }, recovery_checkpoint == null);
         HerdrAppRuntime.reportWorking(self);
         return true;
     }
