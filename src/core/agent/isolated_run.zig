@@ -11,9 +11,11 @@ const tool_admission = @import("../tooling/tool_admission.zig");
 const tool_presentation = @import("../tooling/tool_presentation.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const tool_runtime = @import("../tooling/tool_runtime.zig");
+const gateway_error_format = @import("../shared/gateway_error_format.zig");
 const diff_mod = @import("../output/diff.zig");
 const hooks = @import("../hooks/hooks.zig");
 const types = @import("../shared/types.zig");
+const run_failure = @import("run_failure.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -39,9 +41,11 @@ pub const Result = struct {
     input_tokens: u64,
     output_tokens: u64,
     outcome: types.TurnPresentationOutcome,
+    failure: ?run_failure.Snapshot = null,
 
     pub fn deinit(self: Result, alloc: Allocator) void {
         alloc.free(self.output);
+        if (self.failure) |failure| alloc.free(failure.message);
     }
 };
 
@@ -53,9 +57,11 @@ const Context = struct {
     input_tokens: u64 = 0,
     output_tokens: u64 = 0,
     outcome: ?types.TurnPresentationOutcome = null,
+    failure: ?run_failure.Snapshot = null,
 
     fn deinit(self: *Context) void {
         self.output.deinit(self.config.alloc);
+        if (self.failure) |failure| self.config.alloc.free(failure.message);
     }
 
     fn toolContext(self: *Context) tool_runtime.Context {
@@ -164,11 +170,15 @@ pub fn run(
     }) catch |err| return err;
     const output = context.output.toOwnedSlice(config.alloc) catch
         return error.OutOfMemory;
+    errdefer config.alloc.free(output);
+    const failure = context.failure;
+    context.failure = null;
     return .{
         .output = output,
         .input_tokens = context.input_tokens,
         .output_tokens = context.output_tokens,
         .outcome = context.outcome orelse .completed,
+        .failure = failure,
     };
 }
 
@@ -202,7 +212,7 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .push_system_notice = discardNotice,
         .push_route_recovery_status = discardRouteRecoveryStatus,
         .push_command_output_complete = discardCommandOutputComplete,
-        .push_http_error = discardHttpError,
+        .push_http_error = captureHttpError,
         .refresh_gateway_credential = refreshGatewayCredential,
         .format_tool_execution_error = formatToolExecutionError,
         .report_usage = reportUsage,
@@ -334,7 +344,33 @@ fn discardDiff(_: *anyopaque, payload: agent_runtime.DiffEntryPayload) !void {
 fn discardNotice(_: *anyopaque, _: []const u8) !void {}
 fn discardRouteRecoveryStatus(_: *anyopaque, _: types.RouteRecoveryStatus) !void {}
 fn discardCommandOutputComplete(_: *anyopaque, _: ?types.ToolLifecycleId) !void {}
-fn discardHttpError(_: *anyopaque, _: std.http.Status, _: []const u8, _: ?types.CredentialSource) !void {}
+fn captureHttpError(raw: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) !void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    const failure = try formatHttpFailure(context.config.alloc, status, detail, credential_source);
+    errdefer context.config.alloc.free(failure.message);
+    if (context.failure) |previous| context.config.alloc.free(previous.message);
+    context.failure = failure;
+}
+
+fn formatHttpFailure(
+    alloc: Allocator,
+    status: std.http.Status,
+    detail: []const u8,
+    credential_source: ?types.CredentialSource,
+) !run_failure.Snapshot {
+    const auth_failure = auth_runtime.FailureSnapshot.fromHttp(status, credential_source);
+    const message = if (detail.len > 0)
+        try gateway_error_format.formatHttpErrorMessage(alloc, status, detail)
+    else if (auth_failure) |failure|
+        try failure.renderText(alloc)
+    else
+        try gateway_error_format.formatHttpErrorMessage(alloc, status, detail);
+    return .{
+        .kind = run_failure.kindForHttpStatus(status),
+        .http_status = @intFromEnum(status),
+        .message = message,
+    };
+}
 fn discardGrant(_: *anyopaque, _: []const u8, _: []const u8) !void {}
 fn discardOutputChunk(_: *anyopaque, _: ?types.ToolLifecycleId, _: @import("../tooling/command_output_content.zig").Stream, _: []const u8) anyerror!void {}
 fn discardBackgroundUrl(_: *anyopaque, _: u64, _: []const u8) void {}
@@ -347,6 +383,22 @@ fn refreshGatewayCredential(raw: *anyopaque, alloc: Allocator, source: types.Cre
     const context: *Context = @ptrCast(@alignCast(raw));
     const tool_ctx = context.toolContext();
     return auth_runtime.refreshCredentialTokenForAccount(tool_ctx.oauth_transport, alloc, source, mode, expected_account_id);
+}
+
+test "isolated HTTP failure retains sanitized provider billing detail" {
+    const failure = try formatHttpFailure(
+        std.testing.allocator,
+        .unauthorized,
+        \\{"error":{"type":"CreditsError","message":"Insufficient balance. Manage billing at https://example.invalid/billing"}}
+    ,
+        .opencode_api_key,
+    );
+    defer std.testing.allocator.free(failure.message);
+
+    try std.testing.expectEqual(run_failure.Kind.authentication, failure.kind);
+    try std.testing.expectEqual(@as(?u16, 401), failure.http_status);
+    try std.testing.expect(std.mem.find(u8, failure.message, "CreditsError") != null);
+    try std.testing.expect(std.mem.find(u8, failure.message, "Insufficient balance") != null);
 }
 
 fn formatToolExecutionError(_: *anyopaque, arena: Allocator, tool_name: []const u8, err: anyerror) ![]const u8 {

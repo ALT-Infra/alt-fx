@@ -1,6 +1,17 @@
 const std = @import("std");
 
-pub const api_version: u16 = 8;
+pub const api_version: u16 = 9;
+pub const AgentRunFailureKind = enum {
+    interrupted,
+    authentication,
+    forbidden,
+    invalid_request,
+    request_too_large,
+    rate_limited,
+    provider_unavailable,
+    provider_error,
+    runtime,
+};
 
 pub const ExtensionDescriptor = struct {
     api_version: u16 = api_version,
@@ -150,6 +161,8 @@ pub const AgentRunFailed = struct {
     run_id: []const u8,
     message: []const u8,
     interrupted: bool = false,
+    kind: AgentRunFailureKind = .runtime,
+    http_status: ?u16 = null,
 };
 
 pub const HostEvent = union(enum) {

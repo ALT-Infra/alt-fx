@@ -303,6 +303,18 @@ pub fn drainRunEvents(
                 .run_id = failed.run_id,
                 .message = failed.message,
                 .interrupted = failed.interrupted,
+                .kind = switch (failed.kind) {
+                    .interrupted => .interrupted,
+                    .authentication => .authentication,
+                    .forbidden => .forbidden,
+                    .invalid_request => .invalid_request,
+                    .request_too_large => .request_too_large,
+                    .rate_limited => .rate_limited,
+                    .provider_unavailable => .provider_unavailable,
+                    .provider_error => .provider_error,
+                    .runtime => .runtime,
+                },
+                .http_status = failed.http_status,
             } },
         };
         const sink = intentSink(Host, Extension, App, app);

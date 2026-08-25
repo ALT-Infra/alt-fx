@@ -1454,6 +1454,22 @@ pub fn Runtime(comptime host: type) type {
                 try self.trace(sink, self.runTrace("run_failure_ignored", failed.run_id, current_run_id, "", "stale_run"));
                 return;
             }
+            const failed_agent_id = session.current_agent_id;
+            const failure_detail = try formatRunFailureDetail(
+                self.allocator,
+                failed.kind,
+                failed.http_status,
+                failed.message,
+            );
+            defer self.allocator.free(failure_detail);
+            const failure_notice = try formatRunFailureNotice(
+                self.allocator,
+                self.team,
+                failed_agent_id,
+                failed.kind,
+                failed.message,
+            );
+            defer self.allocator.free(failure_notice);
             self.allocator.free(current_run_id);
             session.current_run_id = null;
             session.current_agent_id = "";
@@ -1467,12 +1483,12 @@ pub fn Runtime(comptime host: type) type {
                 "agent_run_failed",
                 failed.run_id,
                 "",
-                "",
-                if (failed.interrupted) "interrupted" else "provider_or_runtime_failure",
+                failed_agent_id,
+                failure_detail,
             ));
             try sink.emit(.{ .notice = .{
                 .tone = .failure,
-                .text = "An fx-owned ALT agent run failed. Native fx remains available.",
+                .text = failure_notice,
             } });
             try sink.emit(.turn_failed);
         }
@@ -1837,6 +1853,68 @@ pub fn Runtime(comptime host: type) type {
             };
         }
     };
+}
+
+fn formatRunFailureDetail(
+    allocator: std.mem.Allocator,
+    kind: test_host.AgentRunFailureKind,
+    http_status: ?u16,
+    message: []const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try out.writer.print("kind={s}", .{@tagName(kind)});
+    if (http_status) |status| try out.writer.print(" http_status={d}", .{status});
+    if (message.len > 0) try out.writer.print(" message={s}", .{message});
+    return out.toOwnedSlice();
+}
+
+fn formatRunFailureNotice(
+    allocator: std.mem.Allocator,
+    team: team_mod.Team,
+    agent_id: []const u8,
+    kind: test_host.AgentRunFailureKind,
+    message: []const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+
+    try out.writer.print("Team \"{s}\" could not run", .{team.name});
+    if (agent_id.len > 0) try out.writer.print(" {s}", .{agent_id});
+    if (team.agent(agent_id)) |agent| {
+        if (team.model(agent.model_id)) |model| {
+            try out.writer.print(" ({s} {s}/{s})", .{ team.provider_id, model.route, model.name });
+        }
+    }
+    if (message.len > 0) try out.writer.print(": {s}", .{message});
+
+    const recovery = switch (kind) {
+        .authentication, .forbidden => "Check this Team model's provider access, choose another Team model, or sign in again.",
+        .rate_limited => "Retry later or choose another Team model.",
+        .invalid_request, .request_too_large => "Choose a compatible Team model or revise the Team configuration.",
+        .provider_unavailable, .provider_error => "Retry or choose another Team model.",
+        .interrupted => "The run was interrupted.",
+        .runtime => "Check the orchestration trace for the retained runtime diagnosis.",
+    };
+    try out.writer.print(" · {s} Native fx remains available.", .{recovery});
+    return out.toOwnedSlice();
+}
+
+test "top-level failure notice identifies pinned Team role model and recovery" {
+    const notice = try formatRunFailureNotice(
+        std.testing.allocator,
+        team_mod.fixture(),
+        "coder",
+        .authentication,
+        "API access denied · HTTP 401 · CreditsError: Insufficient balance",
+    );
+    defer std.testing.allocator.free(notice);
+
+    try std.testing.expect(std.mem.find(u8, notice, "Coding team") != null);
+    try std.testing.expect(std.mem.find(u8, notice, "coder") != null);
+    try std.testing.expect(std.mem.find(u8, notice, "opencode free/deepseek-code") != null);
+    try std.testing.expect(std.mem.find(u8, notice, "Insufficient balance") != null);
+    try std.testing.expect(std.mem.find(u8, notice, "Native fx remains available") != null);
 }
 
 fn buildAgentSystemPrompt(
