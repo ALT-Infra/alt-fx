@@ -126,8 +126,8 @@ pub fn SubmitRuntime(comptime App: type) type {
         };
 
         const PendingSnapshotCleanup = enum {
-            automatic,
-            transferred_to_composer_history,
+            discard,
+            preserve,
         };
 
         const AcceptedDraftProjection = struct {
@@ -222,7 +222,11 @@ pub fn SubmitRuntime(comptime App: type) type {
             const pending = app.submission.pending orelse return error.MissingPendingSubmission;
             if (pending.phase != .queued) return error.InvalidPendingPhase;
             if (pending.draft.turn_id != turn_id) return error.PendingTurnIdMismatch;
-            clearPendingSubmission(app, "worker_begin_presented");
+            clearPendingSubmissionWithSnapshots(
+                app,
+                "worker_begin_presented",
+                .preserve,
+            );
         }
 
         pub fn cancelPendingSubmission(app: *App) bool {
@@ -262,10 +266,6 @@ pub fn SubmitRuntime(comptime App: type) type {
                     );
                     return false;
                 }
-                image_attachments.discardImageSnapshots(
-                    app.alloc,
-                    app.submission.pending.?.draft.images,
-                );
             }
             clearPendingSubmission(app, "ctrl_c_pending_submission");
             app.shell.render_requests.request(.transcript);
@@ -274,7 +274,11 @@ pub fn SubmitRuntime(comptime App: type) type {
         }
 
         pub fn clearPendingSubmission(app: *App, reason: []const u8) void {
-            clearPendingSubmissionWithSnapshots(app, reason, .automatic);
+            const snapshot_cleanup: PendingSnapshotCleanup = if (transferPendingImageSnapshotsToComposerHistory(app))
+                .preserve
+            else
+                .discard;
+            clearPendingSubmissionWithSnapshots(app, reason, snapshot_cleanup);
         }
 
         fn clearPendingSubmissionWithSnapshots(
@@ -286,7 +290,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             var pending = app.submission.pending orelse return;
             app.submission.pending = null;
             if (pending.ownsTurnStartHold()) app.worker.releaseTurnStartHold();
-            if (snapshot_cleanup == .automatic and pending.phase != .queued) {
+            if (snapshot_cleanup == .discard) {
                 image_attachments.discardImageSnapshots(app.alloc, pending.draft.images);
             }
             debug_trace.eventf(
@@ -318,10 +322,6 @@ pub fn SubmitRuntime(comptime App: type) type {
 
         fn finishPendingSubmissionFailure(app: *App, err: anyerror) void {
             const turn_id = app.submission.pending.?.draft.turn_id;
-            const snapshot_cleanup: PendingSnapshotCleanup = if (transferPendingImageSnapshotsToComposerHistory(app))
-                .transferred_to_composer_history
-            else
-                .automatic;
             const body = std.fmt.allocPrint(
                 app.alloc,
                 "failed to submit prompt after presentation ({s})",
@@ -332,11 +332,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                     "pending prompt failure notice allocation failed err={s}",
                     .{@errorName(notice_err)},
                 );
-                clearPendingSubmissionWithSnapshots(
-                    app,
-                    "finalization_failure",
-                    snapshot_cleanup,
-                );
+                clearPendingSubmission(app, "finalization_failure");
                 return;
             };
             defer app.alloc.free(body);
@@ -358,11 +354,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                 "err={s}",
                 .{@errorName(err)},
             );
-            clearPendingSubmissionWithSnapshots(
-                app,
-                "finalization_failure",
-                snapshot_cleanup,
-            );
+            clearPendingSubmission(app, "finalization_failure");
         }
 
         fn transferPendingImageSnapshotsToComposerHistory(app: *App) bool {

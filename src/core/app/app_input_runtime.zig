@@ -10771,6 +10771,7 @@ const FakeSubmitApp = struct {
     worker: struct {
         hold_available: bool = false,
         held: bool = false,
+        queued_turn_id: ?u64 = null,
 
         pub fn queuedPromptCount(_: *@This()) usize {
             return 0;
@@ -10785,6 +10786,23 @@ const FakeSubmitApp = struct {
         pub fn releaseTurnStartHold(self: *@This()) void {
             self.held = false;
         }
+
+        pub fn deleteQueuedPromptDraft(
+            self: *@This(),
+            _: std.mem.Allocator,
+            turn_id: u64,
+            _: []const types.ImageAttachment,
+        ) bool {
+            if (self.queued_turn_id != turn_id) return false;
+            self.queued_turn_id = null;
+            return true;
+        }
+
+        pub fn activeTurnId(_: *const @This()) u64 {
+            return 0;
+        }
+
+        pub fn requestCancel(_: *@This()) void {}
     } = .{},
     submission: input_submit_runtime.State = .{},
     shell: struct {
@@ -10918,11 +10936,12 @@ const FakeSubmitApp = struct {
 
     pub fn finalizePendingSubmission(
         self: *FakeSubmitApp,
-        _: *const worker_runtime.QueuedPromptDraft,
+        draft: *const worker_runtime.QueuedPromptDraft,
     ) !void {
         if (self.fail_pending_finalization) {
             return error.InjectedPendingFinalizationFailure;
         }
+        self.worker.queued_turn_id = draft.turn_id;
     }
 
     pub fn enqueuePrompt(self: *FakeSubmitApp, text: []const u8) !bool {
@@ -12315,6 +12334,70 @@ test "app_input_runtime recalls image after post-ack finalization failure" {
     try std.testing.expectEqual(@as(usize, 1), try countTestSnapshotFiles(snapshot_dir));
     app.input_runtime.composer_history.clear(alloc);
     try std.testing.expectEqual(@as(usize, 0), try countTestSnapshotFiles(snapshot_dir));
+}
+
+test "app_input_runtime terminal pending cleanup preserves image history" {
+    const alloc = std.testing.allocator;
+    const PendingRuntime = input_submit_runtime.SubmitRuntime(FakeSubmitApp);
+    const cases = [_]struct {
+        name: []const u8,
+        queued: bool,
+        session_transition: bool,
+    }{
+        .{ .name = "ctrl-c-awaiting.png", .queued = false, .session_transition = false },
+        .{ .name = "ctrl-c-queued.png", .queued = true, .session_transition = false },
+        .{ .name = "reset-awaiting.png", .queued = false, .session_transition = true },
+        .{ .name = "reset-queued.png", .queued = true, .session_transition = true },
+    };
+
+    for (cases) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try writeTestImage(&tmp, case.name);
+        const image_path = try realTmpPath(alloc, &tmp, case.name);
+        defer alloc.free(image_path);
+        const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+        defer alloc.free(root);
+        const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+        defer alloc.free(snapshot_dir);
+
+        var app = FakeSubmitApp{ .alloc = alloc, .snapshot_dir = snapshot_dir };
+        defer app.deinit();
+        app.worker.hold_available = true;
+        try app.input_runtime.edit_state.input.appendSlice(alloc, image_path);
+        app.input_runtime.edit_state.cursor = image_path.len;
+        try Runtime(FakeSubmitApp).submit(&app, 100);
+        if (case.queued) {
+            PendingRuntime.noteCommittedFrame(&app);
+            PendingRuntime.collectPendingSubmissionFacts(&app);
+            try std.testing.expectEqual(
+                input_submit_runtime.PendingPhase.queued,
+                app.submission.pending.?.phase,
+            );
+        }
+
+        if (case.session_transition) {
+            PendingRuntime.clearPendingSubmission(&app, "session_transition");
+            app.input_runtime.inputResetState().resetForSession(alloc);
+            app.worker.queued_turn_id = null;
+        } else {
+            try std.testing.expect(PendingRuntime.cancelPendingSubmission(&app));
+        }
+
+        try std.testing.expect(app.submission.pending == null);
+        try std.testing.expectEqual(@as(usize, 1), try countTestSnapshotFiles(snapshot_dir));
+        try input_completion_runtime.CompletionRuntime(FakeSubmitApp).navigatePromptHistory(
+            &app,
+            -1,
+        );
+        try std.testing.expectEqualStrings("[Image #2]", app.input_runtime.edit_state.input.items);
+        try std.testing.expectEqual(@as(usize, 2), try countTestSnapshotFiles(snapshot_dir));
+
+        app.clearPendingImages();
+        try std.testing.expectEqual(@as(usize, 1), try countTestSnapshotFiles(snapshot_dir));
+        app.input_runtime.composer_history.clear(alloc);
+        try std.testing.expectEqual(@as(usize, 0), try countTestSnapshotFiles(snapshot_dir));
+    }
 }
 
 test "app_input_runtime missing auth preserves the complete composer before prompt admission" {
