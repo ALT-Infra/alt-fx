@@ -89,6 +89,8 @@ pub const QueuedPrompt = struct {
 };
 
 pub const ActivePromptSnapshotOwnership = struct {
+    /// Owns snapshot deletion until the files are transferred to accepted
+    /// history or handed to a reference-counted finished-turn owner.
     images: []const types.ImageAttachment,
     state: enum {
         active,
@@ -1446,8 +1448,12 @@ pub const WorkerRuntime = struct {
         var preserved = false;
         if (self.active_turn_id == turn_id) {
             if (self.active_prompt_snapshot_ownership) |ownership| {
-                preserved = ownership.preserve();
+                if (sameImageSnapshots(ownership.images, images)) {
+                    preserved = ownership.preserve();
+                }
             } else {
+                // The unique active turn bridges queue take to ownership
+                // registration while both operations remain mutex-serialized.
                 self.preserve_prompt_snapshot_turn_id = turn_id;
                 preserved = true;
             }
@@ -2181,6 +2187,47 @@ test "session transfer preserves active and finished prompt snapshots" {
         try std.Io.Dir.accessAbsolute(std.testing.io, path, .{});
         try std.Io.Dir.deleteFileAbsolute(std.testing.io, path);
     }
+}
+
+test "session transfer discards mismatched active prompt snapshots" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "active.bin", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "snapshot");
+    }
+    const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "active.bin");
+    defer alloc.free(path);
+    const active_images = [_]types.ImageAttachment{.{
+        .id = 1,
+        .path = @constCast("/tmp/source.png"),
+        .media_type = @constCast("image/png"),
+        .snapshot_path = path,
+        .snapshot_sha256 = @constCast("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    }};
+    const unrelated_images = [_]types.ImageAttachment{.{
+        .id = 1,
+        .path = @constCast("/tmp/other.png"),
+        .media_type = @constCast("image/png"),
+        .snapshot_path = @constCast("/tmp/other.bin"),
+        .snapshot_sha256 = @constCast("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+    }};
+
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.active_turn_id = 42;
+    var active = ActivePromptSnapshotOwnership.init(&active_images);
+    runtime.beginActivePromptSnapshots(&active);
+
+    runtime.clearQueuedPromptsForSessionTransition(alloc, 42, &unrelated_images);
+    runtime.endActivePromptSnapshots(&active);
+
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.accessAbsolute(std.testing.io, path, .{}),
+    );
 }
 
 test "accepted active prompt ownership does not delete history files" {

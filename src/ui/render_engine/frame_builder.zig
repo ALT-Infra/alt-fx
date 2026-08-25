@@ -52,6 +52,8 @@ pub const BuildFrameOptions = struct {
     document_append: frame_scroll_plan.FrameDocumentAppend = .{},
     terminal_transition: terminal_diff.FrameTerminalTransition = .none,
     body_painter: ?SurfacePainter = null,
+    /// Paints a bounded prompt tail after retained transcript rows and before
+    /// footer/activity surfaces. It never replaces the transcript body owner.
     transcript_tail_painter: ?SurfacePainter = null,
     footer_painter: ?SurfacePainter = null,
     activity_painter: ?SurfacePainter = null,

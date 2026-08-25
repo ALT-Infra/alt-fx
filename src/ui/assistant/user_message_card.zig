@@ -149,6 +149,8 @@ pub fn buildUserPromptCardTailForTerminalPresentationInterruptible(
     max_rows: usize,
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
 ) ![]u8 {
+    // The pending-frame path retains only the newest rows that fit its current
+    // transcript band; canonical formatting remains shared with ordinary turns.
     return buildUserPromptCardWithSkillTokensAndLinksInterruptible(
         alloc,
         text,
