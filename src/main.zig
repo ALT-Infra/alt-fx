@@ -1373,8 +1373,9 @@ const App = struct {
         return true;
     }
 
-    pub fn installInitialMcpRuntime(self: *App, runtime: ?*mcp_runtime_mod.McpRuntime) void {
+    pub fn installInitialMcpRuntime(self: *App, runtime: ?*mcp_runtime_mod.McpRuntime) !void {
         self.mcp.installInitial(runtime);
+        try self.mcp.refreshProjectPrompt(self.alloc);
     }
 
     pub fn acquireMcpRuntime(self: *App) ?app_mcp_runtime.Lease {
@@ -1412,6 +1413,7 @@ const App = struct {
             self.workspace_root,
             .{ .form = true, .url = true },
             if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
+            builtin_mcp.previewNativeWorkspaceAuthority,
             self.toolRegistry(),
             @intCast(@max(io_mod.milliTimestamp(), 0)),
         );
@@ -1464,8 +1466,40 @@ const App = struct {
         self.mcp.startDiscovery(self.toolRegistry());
     }
 
-    pub fn pendingWorkspaceMcpNames(self: *App, alloc: Allocator) ![][]u8 {
-        return self.mcp.pendingWorkspaceNames(alloc);
+    pub fn presentProjectMcpPrompt(self: *App) !void {
+        const name = (try self.mcp.projectPromptDisplayName(self.alloc)) orelse return;
+        defer self.alloc.free(name);
+        var notice: std.Io.Writer.Allocating = .init(self.alloc);
+        defer notice.deinit();
+        try notice.writer.print(
+            "Project MCP server '{s}' is defined in .mcp.json.\n  [1] Approve  [2] Approve all  [3] Reject  [Esc] Dismiss remaining prompts\n",
+            .{name},
+        );
+        try self.writeTranscriptClassified(
+            notice.writer.buffered(),
+            true,
+            .unknown_raw,
+        );
+    }
+
+    pub fn projectMcpPromptActive(self: *App) bool {
+        return self.mcp.projectPromptActive();
+    }
+
+    pub fn refreshProjectMcpPrompt(self: *App) !void {
+        try self.mcp.refreshProjectPrompt(self.alloc);
+    }
+
+    pub fn projectMcpPromptName(self: *App, alloc: Allocator) !?[]u8 {
+        return self.mcp.projectPromptName(alloc);
+    }
+
+    pub fn clearProjectMcpPrompt(self: *App) void {
+        self.mcp.clearProjectPrompt(self.alloc);
+    }
+
+    pub fn suppressProjectMcpPrompts(self: *App) void {
+        self.mcp.suppressProjectPrompts(self.alloc);
     }
 
     fn effectiveToolSet(self: *const App) tool_set_contract.ToolSet {
@@ -2292,6 +2326,7 @@ const App = struct {
             self.terminal_input_runtime.hasPendingTerminalAction() or
             self.question_prompt.isActive() or
             self.approval_prompt.isActive() or
+            @constCast(&self.mcp).projectPromptActive() or
             self.auth.apiKeyEntryActive() or
             self.subagents.isViewActive() or
             !self.shell.has_committed_frame or

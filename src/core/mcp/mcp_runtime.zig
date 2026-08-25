@@ -96,6 +96,11 @@ pub const LoadRuntimeFn = *const fn (
     elicitation.Capabilities,
 ) anyerror!?*McpRuntime;
 
+pub const PreviewNativeWorkspaceAuthorityFn = *const fn (
+    Allocator,
+    []const u8,
+) anyerror![][]u8;
+
 const ConnectionControl = struct {
     deadline: ?std.Io.Clock.Timestamp = null,
     cancel_flag: ?*std.atomic.Value(bool) = null,
@@ -4879,6 +4884,31 @@ pub const McpRuntime = struct {
         return false;
     }
 
+    pub fn workspaceAuthorityReducedAgainstNames(
+        self: *const McpRuntime,
+        next_names: []const []const u8,
+        phase: startup_admission.Phase,
+    ) bool {
+        for (self.servers.items) |current| {
+            if (current.config.source != .workspace or
+                startup_admission.decide(
+                    current.config.enabled,
+                    current.config.required,
+                    current.config.workspace_admission,
+                    phase,
+                ) != .connect) continue;
+            var retained = false;
+            for (next_names) |name| {
+                if (std.mem.eql(u8, current.config.name, name)) {
+                    retained = true;
+                    break;
+                }
+            }
+            if (!retained) return true;
+        }
+        return false;
+    }
+
     pub fn pendingWorkspaceNamesForPhase(
         self: *const McpRuntime,
         alloc: Allocator,
@@ -4898,7 +4928,7 @@ pub const McpRuntime = struct {
                     server.config.workspace_admission,
                     phase,
                 ) != .connect) continue;
-            const owned_name = try alloc.dupe(u8, server.config.name);
+            const owned_name = try terminalSafeOwned(alloc, server.config.name, 256);
             errdefer alloc.free(owned_name);
             try names.append(alloc, owned_name);
         }
@@ -4918,11 +4948,24 @@ pub const McpRuntime = struct {
             if (!server.config.enabled or
                 server.config.source != .workspace or
                 server.config.workspace_admission != .pending) continue;
-            const owned_name = try alloc.dupe(u8, server.config.name);
+            const owned_name = try terminalSafeOwned(alloc, server.config.name, 256);
             errdefer alloc.free(owned_name);
             try names.append(alloc, owned_name);
         }
         return names.toOwnedSlice(alloc);
+    }
+
+    pub fn firstPendingWorkspaceName(
+        self: *const McpRuntime,
+        alloc: Allocator,
+    ) !?[]u8 {
+        for (self.servers.items) |server| {
+            if (!server.config.enabled or
+                server.config.source != .workspace or
+                server.config.workspace_admission != .pending) continue;
+            return @as(?[]u8, try alloc.dupe(u8, server.config.name));
+        }
+        return null;
     }
 
     pub fn waitForDiscovery(
@@ -18776,6 +18819,25 @@ test "interactive authentication requires approved workspace admission" {
         runtime.validateAuthenticationServer("rejected"),
     );
     try runtime.validateAuthenticationServer("approved");
+}
+
+test "pending workspace presentation names escape repository control bytes" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "bad\n\x1b]0;owned\x07"),
+        .source = .workspace,
+        .scope = .profile,
+        .command = try alloc.dupe(u8, "unused"),
+        .workspace_admission = .pending,
+    });
+    const names = try runtime.pendingWorkspaceNames(alloc);
+    defer mcp_contract.freeOwnedStrings(alloc, names);
+    try std.testing.expectEqual(@as(usize, 1), names.len);
+    try std.testing.expect(text_utils.isTerminalSafe(names[0]));
+    try std.testing.expect(std.mem.findScalar(u8, names[0], '\n') == null);
+    try std.testing.expect(std.mem.findScalar(u8, names[0], 0x1b) == null);
 }
 
 test "tool schema uses prefixed name and call request uses raw name" {

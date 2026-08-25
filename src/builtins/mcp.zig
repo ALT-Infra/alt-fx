@@ -5,7 +5,6 @@ const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
 const command_provider_contract = @import("../core/mcp/command_provider.zig");
 const mcp_contract = @import("../core/mcp/mcp_contract.zig");
-const mcp_auth = @import("../core/mcp/mcp_auth.zig");
 const project_config = @import("../core/mcp/project_config.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
@@ -17,16 +16,8 @@ const text_utils = @import("../core/shared/text_utils.zig");
 const Allocator = std.mem.Allocator;
 const CommandRequest = command_provider_contract.Request;
 const CommandResult = command_provider_contract.Result;
-const McpEnvVar = mcp_contract.McpEnvVar;
-const McpHttpHeader = mcp_contract.McpHttpHeader;
-const McpHttpHeaderEnv = mcp_contract.McpHttpHeaderEnv;
-const McpAuthConfig = mcp_contract.McpAuthConfig;
 const McpServerConfig = mcp_contract.McpServerConfig;
 const McpTransport = mcp_contract.McpTransport;
-const freeEnvVars = mcp_contract.freeEnvVars;
-const freeHttpHeaders = mcp_contract.freeHttpHeaders;
-const freeHttpHeaderEnv = mcp_contract.freeHttpHeaderEnv;
-const freeOwnedStrings = mcp_contract.freeOwnedStrings;
 
 const add_usage = "Usage: /mcp add <name> <command> [args...] or /mcp add --transport http <name> <url>";
 
@@ -450,9 +441,10 @@ pub fn loadRuntime(
         profile = try loadConfigFromPath(alloc, config_path);
     }
 
-    var choice_load = config_runtime.loadProjectMcpChoices(alloc, workspace_root) catch |err| blk: {
+    var choice_load = config_runtime.loadProjectMcpChoices(alloc, workspace_root) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
         debug_trace.logf("mcp", "workspace MCP choices unavailable err={s}", .{@errorName(err)});
-        break :blk config_runtime.ProjectMcpChoiceLoad{};
+        return runtimeFromConfigs(alloc, &profile, elicitation_capabilities);
     };
     defer choice_load.deinit(alloc);
     for (choice_load.diagnostics.items) |diagnostic| {
@@ -475,6 +467,26 @@ pub fn loadRuntime(
     var configs = try project_config.mergeNative(alloc, &profile, &workspace.configs);
     defer freeConfigs(alloc, &configs);
     return runtimeFromConfigs(alloc, &configs, elicitation_capabilities);
+}
+
+pub fn previewNativeWorkspaceAuthority(
+    alloc: Allocator,
+    workspace_root: []const u8,
+) ![][]u8 {
+    var choice_load = config_runtime.loadProjectMcpChoices(alloc, workspace_root) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        debug_trace.logf("mcp", "workspace MCP authority unavailable err={s}", .{@errorName(err)});
+        return alloc.alloc([]u8, 0);
+    };
+    defer choice_load.deinit(alloc);
+    var workspace = try loadWorkspaceConfig(
+        alloc,
+        workspace_root,
+        .profile,
+        choice_load.choices,
+    );
+    defer workspace.deinit(alloc);
+    return project_config.authorityNames(alloc, workspace.configs.items, .all);
 }
 
 pub fn loadWorkspaceConfig(
@@ -689,389 +701,6 @@ fn findConfig(configs: []const McpServerConfig, name: []const u8) ?*const McpSer
     return null;
 }
 
-fn parseServerConfig(alloc: Allocator, name: []const u8, value: std.json.Value) !McpServerConfig {
-    if (value != .object) {
-        debug_trace.logf("mcp", "invalid server {s}: expected object", .{name});
-        return error.McpConfigServerMustBeObject;
-    }
-
-    const object = value.object;
-    const type_string = if (object.get("type")) |kind_value|
-        (if (kind_value == .string) kind_value.string else return error.McpConfigInvalidType)
-    else
-        "local";
-
-    const transport: McpTransport = if (std.mem.eql(u8, type_string, "sse"))
-        .sse
-    else if (std.mem.eql(u8, type_string, "http"))
-        .http
-    else
-        .stdio;
-
-    if (transport == .stdio and !std.mem.eql(u8, type_string, "local") and !std.mem.eql(u8, type_string, "stdio")) {
-        debug_trace.logf("mcp", "invalid server {s}: unsupported type {s}", .{ name, type_string });
-        return error.McpConfigInvalidType;
-    }
-
-    const enabled = if (object.get("enabled")) |enabled_value|
-        if (enabled_value == .bool) enabled_value.bool else return error.McpConfigInvalidEnabled
-    else
-        true;
-    const required = if (object.get("required")) |required_value|
-        if (required_value == .bool) required_value.bool else return error.McpConfigInvalidRequired
-    else
-        false;
-
-    if (transport != .stdio) {
-        const url_value = object.get("url") orelse {
-            debug_trace.logf("mcp", "invalid remote server {s}: missing url", .{name});
-            return error.McpConfigMissingUrl;
-        };
-        if (url_value != .string) {
-            debug_trace.logf("mcp", "invalid remote server {s}: url is not a string", .{name});
-            return error.McpConfigInvalidUrl;
-        }
-        streamable_http.validateEndpoint(url_value.string) catch |err| {
-            debug_trace.logf("mcp", "invalid remote server {s}: invalid endpoint: {s}", .{ name, @errorName(err) });
-            return error.McpConfigInvalidUrl;
-        };
-
-        const startup_timeout_ms = parseUnsignedPolicy(
-            object,
-            "startup_timeout_ms",
-            mcp_contract.default_startup_timeout_ms,
-            1,
-            std.math.maxInt(u32),
-        ) catch {
-            debug_trace.logf("mcp", "invalid remote server {s}: invalid startup_timeout_ms", .{name});
-            return error.McpConfigInvalidStartupTimeout;
-        };
-        const operation_timeout_ms = parseUnsignedPolicy(
-            object,
-            "operation_timeout_ms",
-            mcp_contract.default_operation_timeout_ms,
-            1,
-            std.math.maxInt(u32),
-        ) catch {
-            debug_trace.logf("mcp", "invalid remote server {s}: invalid operation_timeout_ms", .{name});
-            return error.McpConfigInvalidOperationTimeout;
-        };
-
-        const env = try parseSelectedEnvironment(alloc, object, name);
-        errdefer freeEnvVars(alloc, env);
-
-        const headers = parseProfileRemoteHeaders(alloc, object, name) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return error.McpConfigInvalidHeaders,
-        };
-        errdefer freeHttpHeaders(alloc, headers);
-        const header_env = parseProfileRemoteHeaderEnv(alloc, object, name) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return error.McpConfigInvalidHeaders,
-        };
-        errdefer freeHttpHeaderEnv(alloc, header_env);
-        const bearer_token_env = try parseOptionalOwnedString(
-            alloc,
-            object,
-            "bearer_token_env",
-        );
-        errdefer if (bearer_token_env) |env_name| alloc.free(env_name);
-        if (bearer_token_env) |env_name| {
-            if (!isValidEnvName(env_name)) {
-                debug_trace.logf("mcp", "invalid remote server {s}: invalid bearer_token_env", .{name});
-                return error.McpConfigInvalidBearerEnvironment;
-            }
-        }
-        var auth = parseProfileAuth(alloc, object, name) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return error.McpConfigInvalidOAuth,
-        };
-        errdefer if (auth) |*auth_config| auth_config.deinit(alloc);
-
-        const owned_name = try alloc.dupe(u8, name);
-        errdefer alloc.free(owned_name);
-
-        const owned_url = try alloc.dupe(u8, url_value.string);
-        errdefer alloc.free(owned_url);
-
-        return .{
-            .name = owned_name,
-            .source = .profile,
-            .scope = .profile,
-            .required = required,
-            .transport = transport,
-            .url = owned_url,
-            .env = env,
-            .headers = headers,
-            .header_env = header_env,
-            .bearer_token_env = bearer_token_env,
-            .auth = auth,
-            .allow_stored_credentials = true,
-            .enabled = enabled,
-            .startup_timeout_ms = @intCast(startup_timeout_ms),
-            .operation_timeout_ms = @intCast(operation_timeout_ms),
-        };
-    }
-
-    const startup_timeout_ms = parseUnsignedPolicy(
-        object,
-        "startup_timeout_ms",
-        mcp_contract.default_startup_timeout_ms,
-        1,
-        std.math.maxInt(u32),
-    ) catch {
-        debug_trace.logf("mcp", "invalid stdio server {s}: invalid startup_timeout_ms", .{name});
-        return error.McpConfigInvalidStartupTimeout;
-    };
-    const operation_timeout_ms = parseUnsignedPolicy(
-        object,
-        "operation_timeout_ms",
-        mcp_contract.default_operation_timeout_ms,
-        1,
-        std.math.maxInt(u32),
-    ) catch {
-        debug_trace.logf("mcp", "invalid stdio server {s}: invalid operation_timeout_ms", .{name});
-        return error.McpConfigInvalidOperationTimeout;
-    };
-    const restart_limit = parseUnsignedPolicy(
-        object,
-        "restart_limit",
-        mcp_contract.default_restart_limit,
-        0,
-        std.math.maxInt(u8),
-    ) catch {
-        debug_trace.logf("mcp", "invalid stdio server {s}: invalid restart_limit", .{name});
-        return error.McpConfigInvalidRestartLimit;
-    };
-
-    const parsed_command = parseCommandSpec(alloc, object) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => {
-            debug_trace.logf("mcp", "invalid stdio server {s}: invalid command spec: {s}", .{ name, @errorName(err) });
-            return error.McpConfigInvalidCommand;
-        },
-    };
-    errdefer freeParsedCommandSpec(alloc, parsed_command);
-
-    const env = try parseSelectedEnvironment(alloc, object, name);
-    errdefer freeEnvVars(alloc, env);
-
-    return .{
-        .name = try alloc.dupe(u8, name),
-        .source = .profile,
-        .scope = .profile,
-        .required = required,
-        .transport = .stdio,
-        .command = parsed_command.command,
-        .args = parsed_command.args,
-        .env = env,
-        .enabled = enabled,
-        .startup_timeout_ms = @intCast(startup_timeout_ms),
-        .operation_timeout_ms = @intCast(operation_timeout_ms),
-        .restart_limit = @intCast(restart_limit),
-    };
-}
-
-fn parseProfileRemoteHeaders(
-    alloc: Allocator,
-    object: std.json.ObjectMap,
-    server_name: []const u8,
-) ![]McpHttpHeader {
-    const value = object.get("headers") orelse return @constCast(&.{});
-    if (value != .object) {
-        debug_trace.logf("mcp", "invalid remote server {s}: headers must be an object", .{server_name});
-        return error.McpInvalidHttpHeaders;
-    }
-
-    var headers: std.ArrayList(McpHttpHeader) = .empty;
-    errdefer {
-        for (headers.items) |header| {
-            alloc.free(header.name);
-            alloc.free(header.value);
-        }
-        headers.deinit(alloc);
-    }
-    try headers.ensureTotalCapacity(alloc, value.object.count());
-    var it = value.object.iterator();
-    while (it.next()) |entry| {
-        if (entry.value_ptr.* != .string) {
-            debug_trace.logf("mcp", "invalid remote server {s}: header value must be a string", .{server_name});
-            return error.McpInvalidHttpHeaders;
-        }
-        if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "authorization")) {
-            debug_trace.logf(
-                "mcp",
-                "invalid remote server {s}: Authorization must use bearer_token_env or OAuth",
-                .{server_name},
-            );
-            return error.McpInvalidHttpHeaders;
-        }
-        const owned_name = try alloc.dupe(u8, entry.key_ptr.*);
-        errdefer alloc.free(owned_name);
-        const owned_value = try alloc.dupe(u8, entry.value_ptr.*.string);
-        headers.appendAssumeCapacity(.{
-            .name = owned_name,
-            .value = owned_value,
-        });
-    }
-
-    streamable_http.validateStaticHeaders(headers.items) catch |err| {
-        debug_trace.logf("mcp", "invalid remote server {s}: invalid headers: {s}", .{ server_name, @errorName(err) });
-        return error.McpInvalidHttpHeaders;
-    };
-    return try headers.toOwnedSlice(alloc);
-}
-
-fn parseProfileRemoteHeaderEnv(
-    alloc: Allocator,
-    object: std.json.ObjectMap,
-    server_name: []const u8,
-) ![]McpHttpHeaderEnv {
-    const value = object.get("header_env") orelse return @constCast(&.{});
-    if (value != .object) {
-        debug_trace.logf("mcp", "invalid remote server {s}: header_env must be an object", .{server_name});
-        return error.McpInvalidHttpHeaders;
-    }
-
-    var refs: std.ArrayList(McpHttpHeaderEnv) = .empty;
-    errdefer {
-        for (refs.items) |ref| {
-            alloc.free(ref.name);
-            alloc.free(ref.env);
-        }
-        refs.deinit(alloc);
-    }
-    var it = value.object.iterator();
-    while (it.next()) |entry| {
-        if (entry.value_ptr.* != .string or
-            !isValidEnvName(entry.value_ptr.*.string) or
-            std.ascii.eqlIgnoreCase(entry.key_ptr.*, "authorization"))
-        {
-            debug_trace.logf("mcp", "invalid remote server {s}: invalid header_env entry", .{server_name});
-            return error.McpInvalidHttpHeaders;
-        }
-        try refs.append(alloc, .{
-            .name = try alloc.dupe(u8, entry.key_ptr.*),
-            .env = try alloc.dupe(u8, entry.value_ptr.*.string),
-        });
-    }
-
-    const validation_headers = try alloc.alloc(McpHttpHeader, refs.items.len);
-    defer alloc.free(validation_headers);
-    for (refs.items, 0..) |ref, index| {
-        validation_headers[index] = .{ .name = ref.name, .value = @constCast("value") };
-    }
-    streamable_http.validateStaticHeaders(validation_headers) catch {
-        debug_trace.logf("mcp", "invalid remote server {s}: invalid header_env names", .{server_name});
-        return error.McpInvalidHttpHeaders;
-    };
-    for (refs.items, 0..) |ref, index| {
-        for (refs.items[0..index]) |previous| {
-            if (std.ascii.eqlIgnoreCase(ref.name, previous.name)) {
-                return error.McpInvalidHttpHeaders;
-            }
-        }
-    }
-    return refs.toOwnedSlice(alloc);
-}
-
-fn parseProfileAuth(
-    alloc: Allocator,
-    object: std.json.ObjectMap,
-    server_name: []const u8,
-) !?McpAuthConfig {
-    const value = object.get("oauth") orelse return null;
-    if (value != .object) {
-        debug_trace.logf("mcp", "invalid remote server {s}: oauth must be an object", .{server_name});
-        return error.InvalidMcpOAuthConfig;
-    }
-    const auth_object = value.object;
-    var auth: McpAuthConfig = .{};
-    errdefer auth.deinit(alloc);
-    auth.resource = try parseOptionalOwnedString(alloc, auth_object, "resource");
-    auth.issuer = try parseOptionalOwnedString(alloc, auth_object, "issuer");
-    auth.client_id = try parseOptionalOwnedString(alloc, auth_object, "client_id");
-    auth.client_secret_env = try parseOptionalOwnedString(
-        alloc,
-        auth_object,
-        "client_secret_env",
-    );
-    auth.client_metadata_url = try parseOptionalOwnedString(
-        alloc,
-        auth_object,
-        "client_metadata_url",
-    );
-    if (auth_object.get("scopes")) |scopes_value| {
-        auth.scopes = parseStringArray(alloc, scopes_value) catch
-            return error.InvalidMcpOAuthConfig;
-    }
-
-    if (auth.client_secret_env) |env_name| {
-        if (!isValidEnvName(env_name) or auth.client_id == null) {
-            return error.InvalidMcpOAuthConfig;
-        }
-    }
-    if (auth.resource) |resource| {
-        const canonical = mcp_auth.canonicalResource(alloc, resource) catch
-            return error.InvalidMcpOAuthConfig;
-        defer alloc.free(canonical);
-    }
-    if (auth.client_metadata_url) |url| {
-        mcp_auth.validateClientMetadataUrl(url) catch
-            return error.InvalidMcpOAuthConfig;
-    }
-    return auth;
-}
-
-fn parseOptionalOwnedString(
-    alloc: Allocator,
-    object: std.json.ObjectMap,
-    key: []const u8,
-) !?[]u8 {
-    const value = object.get(key) orelse return null;
-    if (value == .null) return null;
-    if (value != .string or std.mem.trim(u8, value.string, " \t\r\n").len == 0) {
-        return error.InvalidMcpOAuthConfig;
-    }
-    return try alloc.dupe(u8, value.string);
-}
-
-fn isValidEnvName(value: []const u8) bool {
-    if (value.len == 0 or !(std.ascii.isAlphabetic(value[0]) or value[0] == '_')) {
-        return false;
-    }
-    for (value[1..]) |byte| {
-        if (!std.ascii.isAlphanumeric(byte) and byte != '_') return false;
-    }
-    return true;
-}
-
-fn parseUnsignedPolicy(
-    object: std.json.ObjectMap,
-    field_name: []const u8,
-    default_value: anytype,
-    min_value: u64,
-    max_value: u64,
-) !u64 {
-    const value = object.get(field_name) orelse return @intCast(default_value);
-    if (value != .integer or value.integer < 0) return error.InvalidMcpPolicy;
-    const parsed = std.math.cast(u64, value.integer) orelse return error.InvalidMcpPolicy;
-    if (parsed < min_value or parsed > max_value) return error.InvalidMcpPolicy;
-    return parsed;
-}
-
-fn parseSelectedEnvironment(alloc: Allocator, object: std.json.ObjectMap, server_name: []const u8) ![]McpEnvVar {
-    const maybe_value = if (object.get("environment")) |environment| environment else object.get("env") orelse return @constCast(&.{});
-
-    return parseEnvironment(alloc, maybe_value) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => {
-            debug_trace.logf("mcp", "invalid environment for server {s}: {s}", .{ server_name, @errorName(err) });
-            return error.McpConfigInvalidEnvironment;
-        },
-    };
-}
-
 fn configFromCommandVector(alloc: Allocator, name: []const u8, command: []const []const u8) !McpServerConfig {
     const args: [][]u8 = if (command.len > 1) try alloc.alloc([]u8, command.len - 1) else &.{};
     errdefer if (args.len > 0) alloc.free(args);
@@ -1215,102 +844,6 @@ fn writeOptionalJsonField(
     try std.json.Stringify.value(key, .{}, writer);
     try writer.writeByte(':');
     try std.json.Stringify.value(value, .{}, writer);
-}
-
-const ParsedCommandSpec = struct {
-    command: []u8,
-    args: [][]u8,
-};
-
-fn parseCommandSpec(alloc: Allocator, object: std.json.ObjectMap) !ParsedCommandSpec {
-    const command_value = object.get("command") orelse return error.McpMissingCommand;
-
-    switch (command_value) {
-        .string => {
-            const args: [][]u8 = if (object.get("args")) |args_value| try parseStringArray(alloc, args_value) else &.{};
-            errdefer freeOwnedStrings(alloc, args);
-            return .{
-                .command = try alloc.dupe(u8, command_value.string),
-                .args = args,
-            };
-        },
-        .array => {
-            if (command_value.array.items.len == 0) return error.McpMissingCommand;
-
-            const command = if (command_value.array.items[0] == .string)
-                try alloc.dupe(u8, command_value.array.items[0].string)
-            else
-                return error.McpMissingCommand;
-            errdefer alloc.free(command);
-
-            const args = try alloc.alloc([]u8, command_value.array.items.len - 1);
-            errdefer alloc.free(args);
-            var parsed: usize = 0;
-            errdefer {
-                var i: usize = 0;
-                while (i < parsed) : (i += 1) alloc.free(args[i]);
-            }
-
-            for (command_value.array.items[1..], 0..) |arg, i| {
-                if (arg != .string) return error.McpMissingCommand;
-                args[i] = try alloc.dupe(u8, arg.string);
-                parsed += 1;
-            }
-
-            return .{ .command = command, .args = args };
-        },
-        else => return error.McpMissingCommand,
-    }
-}
-
-fn freeParsedCommandSpec(alloc: Allocator, spec: ParsedCommandSpec) void {
-    alloc.free(spec.command);
-    freeOwnedStrings(alloc, spec.args);
-}
-
-fn parseEnvironment(alloc: Allocator, value: std.json.Value) ![]McpEnvVar {
-    if (value != .object) return error.McpInvalidEnvironment;
-
-    var vars: std.ArrayList(McpEnvVar) = .empty;
-    errdefer {
-        for (vars.items) |entry| {
-            alloc.free(entry.key);
-            alloc.free(entry.value);
-        }
-        vars.deinit(alloc);
-    }
-
-    var it = value.object.iterator();
-    while (it.next()) |entry| {
-        if (entry.value_ptr.* != .string) return error.McpInvalidEnvironment;
-        try vars.append(alloc, .{
-            .key = try alloc.dupe(u8, entry.key_ptr.*),
-            .value = try alloc.dupe(u8, entry.value_ptr.*.string),
-        });
-    }
-
-    return try vars.toOwnedSlice(alloc);
-}
-
-fn parseStringArray(alloc: Allocator, value: std.json.Value) ![][]u8 {
-    if (value != .array) return error.McpMissingCommand;
-    if (value.array.items.len == 0) return &.{};
-
-    const items = try alloc.alloc([]u8, value.array.items.len);
-    errdefer alloc.free(items);
-
-    var parsed: usize = 0;
-    errdefer {
-        var i: usize = 0;
-        while (i < parsed) : (i += 1) alloc.free(items[i]);
-    }
-
-    for (value.array.items, 0..) |item, i| {
-        if (item != .string) return error.McpMissingCommand;
-        items[i] = try alloc.dupe(u8, item.string);
-        parsed += 1;
-    }
-    return items;
 }
 
 fn isValidServerName(name: []const u8) bool {

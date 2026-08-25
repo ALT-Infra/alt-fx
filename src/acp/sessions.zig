@@ -470,8 +470,7 @@ fn handleRestoreSession(
         try appendProjectMcpConfigs(state, alloc, &mcp_configs);
     }
     if (state.active_session) |*active| {
-        if (sameSessionId(active.session_id, session_id) and
-            active.mcp != null and
+        if (active.mcp != null and
             active.mcp.?.workspaceAuthorityReducedAgainstConfigs(
                 mcp_configs.items.items,
                 .acp_startup,
@@ -692,14 +691,16 @@ fn appendProjectMcpConfigs(
     configs: *mcp_servers.OwnedServerConfigs,
 ) !void {
     var choices = if (state.cfg.home_override) |home|
-        config_runtime.loadProjectMcpChoicesFromHome(alloc, home, state.workspace_root) catch |err| blk: {
+        config_runtime.loadProjectMcpChoicesFromHome(alloc, home, state.workspace_root) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
             debug_trace.logf("mcp", "ACP workspace MCP choices unavailable err={s}", .{@errorName(err)});
-            break :blk config_runtime.ProjectMcpChoiceLoad{};
+            return;
         }
     else
-        config_runtime.loadProjectMcpChoices(alloc, state.workspace_root) catch |err| blk: {
+        config_runtime.loadProjectMcpChoices(alloc, state.workspace_root) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
             debug_trace.logf("mcp", "ACP workspace MCP choices unavailable err={s}", .{@errorName(err)});
-            break :blk config_runtime.ProjectMcpChoiceLoad{};
+            return;
         };
     defer choices.deinit(alloc);
 

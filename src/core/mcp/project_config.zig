@@ -162,8 +162,10 @@ pub fn parseWorkspaceJson(
         }) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
+                const server_name = try alloc.dupe(u8, entry.key_ptr.*);
+                errdefer alloc.free(server_name);
                 try result.diagnostics.append(alloc, .{
-                    .server_name = try alloc.dupe(u8, entry.key_ptr.*),
+                    .server_name = server_name,
                     .cause = .invalid_entry,
                 });
                 continue;
@@ -190,12 +192,14 @@ pub fn parseChoices(
         try parseUniqueStringArray(alloc, field)
     else
         @constCast(&.{});
-    errdefer freeOwnedStrings(alloc, approved);
+    var approved_owned = true;
+    errdefer if (approved_owned) freeOwnedStrings(alloc, approved);
     const rejected: [][]u8 = if (object.get(disabled_servers_key)) |field|
         try parseUniqueStringArray(alloc, field)
     else
         @constCast(&.{});
-    errdefer freeOwnedStrings(alloc, rejected);
+    var rejected_owned = true;
+    errdefer if (rejected_owned) freeOwnedStrings(alloc, rejected);
     const enable_all = if (object.get(enable_all_key)) |field| blk: {
         if (field != .bool) return error.InvalidProjectMcpChoices;
         break :blk field.bool;
@@ -206,8 +210,10 @@ pub fn parseChoices(
     try normalized_approved.ensureTotalCapacity(alloc, approved.len);
     for (approved) |name| {
         if (containsName(rejected, name)) {
+            const server_name = try alloc.dupe(u8, name);
+            errdefer alloc.free(server_name);
             try diagnostics.append(alloc, .{
-                .server_name = try alloc.dupe(u8, name),
+                .server_name = server_name,
                 .cause = .approved_rejected_overlap,
             });
             continue;
@@ -215,9 +221,13 @@ pub fn parseChoices(
         normalized_approved.appendAssumeCapacity(try alloc.dupe(u8, name));
     }
     freeOwnedStrings(alloc, approved);
+    approved_owned = false;
+    const normalized = try normalized_approved.toOwnedSlice(alloc);
+    errdefer freeOwnedStrings(alloc, normalized);
+    rejected_owned = false;
     return .{
         .enable_all = enable_all,
-        .approved = try normalized_approved.toOwnedSlice(alloc),
+        .approved = normalized,
         .rejected = rejected,
     };
 }
@@ -255,6 +265,9 @@ pub fn applyAction(
         .reject => |name| current.enable_all or containsName(current.approved, name),
         .reset => current.enable_all or current.approved.len > 0,
     };
+    const approved_slice = try approved.toOwnedSlice(alloc);
+    errdefer freeOwnedStrings(alloc, approved_slice);
+    const rejected_slice = try rejected.toOwnedSlice(alloc);
     return .{
         .choices = .{
             .enable_all = switch (action) {
@@ -262,8 +275,8 @@ pub fn applyAction(
                 .reset => false,
                 else => current.enable_all,
             },
-            .approved = try approved.toOwnedSlice(alloc),
-            .rejected = try rejected.toOwnedSlice(alloc),
+            .approved = approved_slice,
+            .rejected = rejected_slice,
         },
         .authority_reduced = authority_reduced,
     };
@@ -335,41 +348,6 @@ pub fn authorityNames(
         }
     }
     return names.toOwnedSlice(alloc);
-}
-
-pub fn authorityReduced(current: []const []const u8, next: []const []const u8) bool {
-    for (current) |name| if (!containsName(next, name)) return true;
-    return false;
-}
-
-pub fn configAuthorityReduced(
-    current: []const McpServerConfig,
-    next: []const McpServerConfig,
-    phase: startup_admission.Phase,
-) bool {
-    for (current) |current_config| {
-        if (current_config.source != .workspace or
-            startup_admission.decide(
-                current_config.enabled,
-                current_config.required,
-                current_config.workspace_admission,
-                phase,
-            ) != .connect) continue;
-        var retained = false;
-        for (next) |next_config| {
-            if (next_config.source != .workspace or
-                !std.mem.eql(u8, current_config.name, next_config.name)) continue;
-            retained = startup_admission.decide(
-                next_config.enabled,
-                next_config.required,
-                next_config.workspace_admission,
-                phase,
-            ) == .connect;
-            if (retained) break;
-        }
-        if (!retained) return true;
-    }
-    return false;
 }
 
 pub fn configRetainsWorkspaceAuthority(
@@ -462,7 +440,10 @@ pub fn parseServerEntry(
         const bearer_token_env = try parseOptionalOwnedString(alloc, object, "bearer_token_env");
         errdefer if (bearer_token_env) |field| alloc.free(field);
         if (bearer_token_env) |field| if (!isValidEnvName(field)) return error.McpConfigInvalidBearerEnvironment;
-        var auth = try parseProfileAuth(alloc, object);
+        var auth = parseProfileAuth(alloc, object) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.McpConfigInvalidOAuth,
+        };
         errdefer if (auth) |*field| field.deinit(alloc);
         const owned_name = try alloc.dupe(u8, name);
         errdefer alloc.free(owned_name);
@@ -494,7 +475,10 @@ pub fn parseServerEntry(
         0,
         std.math.maxInt(u8),
     ) catch return error.McpConfigInvalidRestartLimit;
-    const command = try parseCommandSpec(alloc, object);
+    const command = parseCommandSpec(alloc, object) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.McpConfigInvalidCommand,
+    };
     errdefer freeParsedCommandSpec(alloc, command);
     return .{
         .name = try alloc.dupe(u8, name),
@@ -548,9 +532,11 @@ fn parseRemoteHeaderEnv(alloc: Allocator, object: std.json.ObjectMap) ![]McpHttp
         }
         const owned_name = try alloc.dupe(u8, entry.key_ptr.*);
         errdefer alloc.free(owned_name);
+        const owned_env = try alloc.dupe(u8, entry.value_ptr.*.string);
+        errdefer alloc.free(owned_env);
         try refs.append(alloc, .{
             .name = owned_name,
-            .env = try alloc.dupe(u8, entry.value_ptr.*.string),
+            .env = owned_env,
         });
     }
     const validation = try alloc.alloc(McpHttpHeader, refs.items.len);
@@ -675,9 +661,11 @@ fn parseEnvironment(alloc: Allocator, value: std.json.Value) ![]McpEnvVar {
         if (entry.value_ptr.* != .string) return error.McpConfigInvalidEnvironment;
         const key = try alloc.dupe(u8, entry.key_ptr.*);
         errdefer alloc.free(key);
+        const entry_value = try alloc.dupe(u8, entry.value_ptr.*.string);
+        errdefer alloc.free(entry_value);
         try vars.append(alloc, .{
             .key = key,
-            .value = try alloc.dupe(u8, entry.value_ptr.*.string),
+            .value = entry_value,
         });
     }
     return vars.toOwnedSlice(alloc);
@@ -699,7 +687,8 @@ fn parseStringArray(alloc: Allocator, value: std.json.Value) ![][]u8 {
 
 fn parseUniqueStringArray(alloc: Allocator, value: std.json.Value) ![][]u8 {
     const parsed = try parseStringArray(alloc, value);
-    errdefer freeOwnedStrings(alloc, parsed);
+    var parsed_owned = true;
+    errdefer if (parsed_owned) freeOwnedStrings(alloc, parsed);
     var unique: std.ArrayList([]u8) = .empty;
     errdefer freeOwnedList(alloc, &unique);
     for (parsed) |name| {
@@ -707,6 +696,7 @@ fn parseUniqueStringArray(alloc: Allocator, value: std.json.Value) ![][]u8 {
         if (!containsName(unique.items, name)) try appendOwnedName(alloc, &unique, name);
     }
     freeOwnedStrings(alloc, parsed);
+    parsed_owned = false;
     return unique.toOwnedSlice(alloc);
 }
 
@@ -934,6 +924,83 @@ test "authority projection detects only removed workspace names" {
     const headless = try authorityNames(alloc, &configs, .acp_startup);
     defer freeOwnedStrings(alloc, headless);
     try std.testing.expectEqual(@as(usize, 2), headless.len);
-    try std.testing.expect(authorityReduced(headless, interactive));
-    try std.testing.expect(!authorityReduced(interactive, headless));
+    try std.testing.expectEqualStrings("approved", headless[0]);
+    try std.testing.expectEqualStrings("pending", headless[1]);
+}
+
+test "workspace parsing releases every partial allocation failure" {
+    const json =
+        \\{"mcpServers":{"bad":{"command":3},"remote":{"type":"http","url":"https://example.test/mcp","env":{"TOKEN":"value"},"header_env":{"X-Test":"TEST_ENV"}},"local":{"command":"node","args":["server.js"],"env":{"A":"B"}}}}
+    ;
+    var fail_index: usize = 0;
+    while (fail_index < 256) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(
+            std.testing.allocator,
+            .{ .fail_index = fail_index },
+        );
+        var result = parseWorkspaceJson(failing.allocator(), json, .profile, .{}) catch |err| switch (err) {
+            error.OutOfMemory => continue,
+        };
+        result.deinit(failing.allocator());
+        break;
+    }
+    try std.testing.expect(fail_index < 256);
+}
+
+test "choice parsing and mutation release every partial allocation failure" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"enabledMcpjsonServers\":[\"alpha\",\"overlap\"],\"disabledMcpjsonServers\":[\"overlap\",\"beta\"],\"enableAllProjectMcpServers\":true}",
+        .{},
+    );
+    defer parsed.deinit();
+    var fail_index: usize = 0;
+    while (fail_index < 128) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(
+            alloc,
+            .{ .fail_index = fail_index },
+        );
+        var diagnostics: std.ArrayList(WorkspaceDiagnostic) = .empty;
+        defer {
+            for (diagnostics.items) |*diagnostic| diagnostic.deinit(failing.allocator());
+            diagnostics.deinit(failing.allocator());
+        }
+        var choices = parseChoices(
+            failing.allocator(),
+            parsed.value,
+            &diagnostics,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => continue,
+            else => return err,
+        };
+        choices.deinit(failing.allocator());
+        break;
+    }
+    try std.testing.expect(fail_index < 128);
+
+    var current = ProjectMcpChoices{
+        .enable_all = true,
+        .approved = try cloneStrings(alloc, &.{ "alpha", "beta" }),
+        .rejected = try cloneStrings(alloc, &.{ "gamma", "delta" }),
+    };
+    defer current.deinit(alloc);
+    fail_index = 0;
+    while (fail_index < 128) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(
+            alloc,
+            .{ .fail_index = fail_index },
+        );
+        var transition = applyAction(
+            failing.allocator(),
+            current,
+            .{ .reject = "alpha" },
+        ) catch |err| switch (err) {
+            error.OutOfMemory => continue,
+        };
+        transition.choices.deinit(failing.allocator());
+        break;
+    }
+    try std.testing.expect(fail_index < 128);
 }

@@ -1894,7 +1894,9 @@ describe("MCP remote authentication lifecycle", () => {
         stderrPath: root.stderr,
       });
       await tui.waitForComposer(15_000);
-      await tui.waitForText("Project MCP servers pending approval: fixture", 10_000);
+      await tui.waitForText("Project MCP server 'fixture' is defined in .mcp.json", 10_000);
+      await tui.sendKeys("Escape");
+      await tui.waitForText("Project MCP approval prompts dismissed for this process", 10_000);
 
       await tui.sendText("/mcp auth fixture --open");
       await tui.waitForText("McpWorkspaceApprovalRequired", 10_000);

@@ -520,6 +520,36 @@ describe("modern MCP stdio compatibility", () => {
     await expectFixtureProcessesExited(readWire(root.wireLogPath));
   }, 25_000);
 
+  test("fx ask skips workspace MCP when profile choices are unreadable", async () => {
+    const root = createRoot("workspace-choice-failure", MODERN_FIXTURE, {
+      recordLaunchAttempts: true,
+    });
+    moveProfileFixtureToWorkspace(root);
+    writeFileSync(
+      join(root.home, ".fx", "settings.json"),
+      JSON.stringify({
+        workspaces: {
+          [root.workspace]: { disabledMcpjsonServers: "fixture" },
+        },
+      }),
+    );
+    gateway = startFakeGateway([fakeGatewayFinalText("CHOICES_FAILED_CLOSED")], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Confirm the workspace is available."],
+      {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway),
+        timeoutMs: 20_000,
+      },
+    );
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("CHOICES_FAILED_CLOSED");
+    expect(existsSync(root.launchLogPath)).toBe(false);
+    expect(result.stderr).not.toContain("loaded project MCP servers");
+  }, 25_000);
+
   test.skipIf(process.platform === "win32" || !tmuxAvailable())(
     "interactive workspace MCP stays inert until approved and retires after rejection",
     async () => {
@@ -541,22 +571,25 @@ describe("modern MCP stdio compatibility", () => {
       });
 
       await tui.waitForComposer(15_000);
-      await tui.waitForText("Project MCP servers pending approval: fixture", 10_000);
+      await tui.waitForText("Project MCP server 'fixture' is defined in .mcp.json", 10_000);
       expect(existsSync(root.launchLogPath)).toBe(false);
-      await tui.sendText("/mcp list");
-      let pane = await tui.waitForText("admission=pending", 10_000);
-      expect(pane).toContain("source=workspace");
-      expect(pane).toContain("state=disabled");
 
-      await tui.sendText("/mcp trust approve fixture");
+      await tui.sendLiteral("1");
+      await Bun.sleep(250);
+      expect(readFileSync(root.traceLogPath, "utf8")).toContain(
+        "project prompt input byte=49 owns_input=true",
+      );
       await tui.waitForText("MCP configuration reloaded successfully", 15_000);
       await tui.sendText("/mcp list");
-      pane = await tui.waitForText("admission=approved", 10_000);
+      let pane = await tui.waitForText("admission=approved", 10_000);
       expect(pane).toContain("state=ready");
       expect(readFileSync(join(root.home, ".fx", "settings.json"), "utf8"))
         .toContain("enabledMcpjsonServers");
 
-      await tui.sendText("/mcp trust reject fixture");
+      await tui.sendText("/mcp trust reset");
+      await tui.waitForText("MCP configuration reloaded successfully", 15_000);
+      await tui.waitForText("Project MCP server 'fixture' is defined in .mcp.json", 10_000);
+      await tui.sendLiteral("3");
       await tui.waitForText("MCP configuration reloaded successfully", 15_000);
       await tui.sendText("/mcp list");
       pane = await tui.waitForText("admission=rejected", 10_000);
@@ -569,6 +602,46 @@ describe("modern MCP stdio compatibility", () => {
       await expectFixtureProcessesExited(readWire(root.wireLogPath));
     },
     50_000,
+  );
+
+  test.skipIf(process.platform === "win32" || !tmuxAvailable())(
+    "Escape suppresses project MCP prompts only for the current process",
+    async () => {
+      const root = createRoot("workspace-escape", MODERN_FIXTURE, {
+        recordLaunchAttempts: true,
+      });
+      moveProfileFixtureToWorkspace(root);
+      gateway = startFakeGateway([], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      const env = fixtureEnv(root, gateway);
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 140,
+        height: 36,
+        env,
+      });
+      await tui.waitForComposer(15_000);
+      await tui.waitForText("[Esc] Dismiss remaining prompts", 10_000);
+      await tui.sendKeys("Escape");
+      await tui.waitForText("Project MCP approval prompts dismissed for this process", 10_000);
+      expect(existsSync(root.launchLogPath)).toBe(false);
+      await tui.kill();
+      tui = null;
+
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 140,
+        height: 36,
+        env,
+      });
+      await tui.waitForComposer(15_000);
+      await tui.waitForText("Project MCP server 'fixture' is defined in .mcp.json", 10_000);
+      expect(existsSync(root.launchLogPath)).toBe(false);
+    },
+    40_000,
   );
 
   test("fresh and resumed native sessions reconstruct MCP from the current profile", async () => {

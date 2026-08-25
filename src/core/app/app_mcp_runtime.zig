@@ -17,6 +17,7 @@ const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const tool_set = @import("../tooling/tool_set.zig");
 const types = @import("../shared/types.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -118,6 +119,7 @@ const PendingReload = struct {
     workspace_root: []u8,
     elicitation_capabilities: elicitation.Capabilities,
     loader: mcp_runtime.LoadRuntimeFn,
+    preview_workspace_authority: ?mcp_runtime.PreviewNativeWorkspaceAuthorityFn = null,
     registry: tool_dispatch.Registry,
     captured_at_ms: u64,
     cancel_requested: std.atomic.Value(bool) = .init(false),
@@ -138,6 +140,7 @@ const PendingReload = struct {
                 self.workspace_root,
                 self.elicitation_capabilities,
                 self.loader,
+                self.preview_workspace_authority.?,
                 self.registry,
                 self.captured_at_ms,
                 &self.cancel_requested,
@@ -264,6 +267,12 @@ const PendingAuthentication = struct {
     }
 };
 
+const SpawnPendingReloadFn = *const fn (*PendingReload) anyerror!std.Thread;
+
+fn spawnPendingReload(pending: *PendingReload) !std.Thread {
+    return std.Thread.spawn(.{}, PendingReload.run, .{pending});
+}
+
 fn deinitAuthenticationResult(result: anyerror!mcp_auth.AuthenticationResult) void {
     var owned = result catch return;
     owned.deinit();
@@ -276,10 +285,70 @@ pub const State = struct {
     runtime: ?*mcp_runtime.McpRuntime = null,
     pending_reload: ?*PendingReload = null,
     pending_authentication: ?*PendingAuthentication = null,
+    project_prompt_name: ?[]u8 = null,
+    project_prompts_suppressed: bool = false,
 
     pub fn installInitial(self: *State, runtime: ?*mcp_runtime.McpRuntime) void {
         std.debug.assert(self.runtime == null);
         self.runtime = runtime;
+    }
+
+    pub fn refreshProjectPrompt(self: *State, alloc: Allocator) !void {
+        var lease = self.acquire();
+        const next = if (lease) |*active|
+            try active.runtime.firstPendingWorkspaceName(alloc)
+        else
+            null;
+        if (lease) |*active| active.deinit();
+        var next_owned = next;
+        errdefer if (next_owned) |name| alloc.free(name);
+
+        self.lock.lockUncancelable(io_mod.getIo());
+        defer self.lock.unlock(io_mod.getIo());
+        if (self.project_prompts_suppressed) {
+            if (next_owned) |name| alloc.free(name);
+            next_owned = null;
+        }
+        if (self.project_prompt_name) |name| alloc.free(name);
+        self.project_prompt_name = next_owned;
+        next_owned = null;
+    }
+
+    pub fn projectPromptActive(self: *State) bool {
+        self.lock.lockSharedUncancelable(io_mod.getIo());
+        defer self.lock.unlockShared(io_mod.getIo());
+        return self.project_prompt_name != null and !self.project_prompts_suppressed;
+    }
+
+    pub fn projectPromptName(self: *State, alloc: Allocator) !?[]u8 {
+        self.lock.lockSharedUncancelable(io_mod.getIo());
+        defer self.lock.unlockShared(io_mod.getIo());
+        const name = self.project_prompt_name orelse return null;
+        return @as(?[]u8, try alloc.dupe(u8, name));
+    }
+
+    pub fn projectPromptDisplayName(self: *State, alloc: Allocator) !?[]u8 {
+        self.lock.lockSharedUncancelable(io_mod.getIo());
+        defer self.lock.unlockShared(io_mod.getIo());
+        const name = self.project_prompt_name orelse return null;
+        const encoded = try text_utils.encodeTerminalSafe(alloc, name, 256);
+        return @as(?[]u8, encoded.bytes);
+    }
+
+    pub fn clearProjectPrompt(self: *State, alloc: Allocator) void {
+        self.lock.lockUncancelable(io_mod.getIo());
+        defer self.lock.unlock(io_mod.getIo());
+        if (self.project_prompt_name) |name| alloc.free(name);
+        self.project_prompt_name = null;
+    }
+
+    pub fn suppressProjectPrompts(self: *State, alloc: Allocator) void {
+        self.lock.lockUncancelable(io_mod.getIo());
+        defer self.lock.unlock(io_mod.getIo());
+        if (self.project_prompt_name) |name| alloc.free(name);
+        self.project_prompt_name = null;
+        self.project_prompts_suppressed = true;
+        debug_trace.logf("mcp", "project MCP approval prompts suppressed for process", .{});
     }
 
     pub fn startDiscovery(self: *State, registry: tool_dispatch.Registry) void {
@@ -557,6 +626,7 @@ pub const State = struct {
         workspace_root: []const u8,
         elicitation_capabilities: elicitation.Capabilities,
         loader: mcp_runtime.LoadRuntimeFn,
+        preview_workspace_authority: mcp_runtime.PreviewNativeWorkspaceAuthorityFn,
         registry: tool_dispatch.Registry,
         captured_at_ms: u64,
     ) !ReloadOutcome {
@@ -566,6 +636,7 @@ pub const State = struct {
             workspace_root,
             elicitation_capabilities,
             loader,
+            preview_workspace_authority,
             registry,
             captured_at_ms,
             &cancel_requested,
@@ -579,20 +650,47 @@ pub const State = struct {
         workspace_root: []const u8,
         elicitation_capabilities: elicitation.Capabilities,
         loader: mcp_runtime.LoadRuntimeFn,
+        preview_workspace_authority: mcp_runtime.PreviewNativeWorkspaceAuthorityFn,
         registry: tool_dispatch.Registry,
         captured_at_ms: u64,
+    ) !void {
+        return self.beginReloadWithSpawner(
+            alloc,
+            workspace_root,
+            elicitation_capabilities,
+            loader,
+            preview_workspace_authority,
+            registry,
+            captured_at_ms,
+            spawnPendingReload,
+        );
+    }
+
+    fn beginReloadWithSpawner(
+        self: *State,
+        alloc: Allocator,
+        workspace_root: []const u8,
+        elicitation_capabilities: elicitation.Capabilities,
+        loader: mcp_runtime.LoadRuntimeFn,
+        preview_workspace_authority: mcp_runtime.PreviewNativeWorkspaceAuthorityFn,
+        registry: tool_dispatch.Registry,
+        captured_at_ms: u64,
+        spawn_reload: SpawnPendingReloadFn,
     ) !void {
         self.cancelPendingReload();
 
         const pending = try alloc.create(PendingReload);
-        errdefer alloc.destroy(pending);
-        const owned_workspace_root = try alloc.dupe(u8, workspace_root);
+        const owned_workspace_root = alloc.dupe(u8, workspace_root) catch |err| {
+            alloc.destroy(pending);
+            return err;
+        };
         pending.* = .{
             .owner = self,
             .alloc = alloc,
             .workspace_root = owned_workspace_root,
             .elicitation_capabilities = elicitation_capabilities,
             .loader = loader,
+            .preview_workspace_authority = preview_workspace_authority,
             .registry = registry,
             .captured_at_ms = captured_at_ms,
         };
@@ -607,7 +705,7 @@ pub const State = struct {
         if (comptime builtin.single_threaded) {
             pending.run();
         } else {
-            pending.thread = std.Thread.spawn(.{}, PendingReload.run, .{pending}) catch |err| {
+            pending.thread = spawn_reload(pending) catch |err| {
                 self.lock.lockUncancelable(io_mod.getIo());
                 if (self.pending_reload == pending) self.pending_reload = null;
                 self.lock.unlock(io_mod.getIo());
@@ -628,8 +726,10 @@ pub const State = struct {
         rebuild: bool,
     ) !void {
         const pending = try alloc.create(PendingReload);
-        errdefer alloc.destroy(pending);
-        const owned_workspace_root = try alloc.dupe(u8, workspace_root);
+        const owned_workspace_root = alloc.dupe(u8, workspace_root) catch |err| {
+            alloc.destroy(pending);
+            return err;
+        };
         pending.* = .{
             .owner = self,
             .alloc = alloc,
@@ -732,35 +832,67 @@ pub const State = struct {
         workspace_root: []const u8,
         elicitation_capabilities: elicitation.Capabilities,
         loader: mcp_runtime.LoadRuntimeFn,
+        preview_workspace_authority: mcp_runtime.PreviewNativeWorkspaceAuthorityFn,
         registry: tool_dispatch.Registry,
         captured_at_ms: u64,
         cancel_requested: *std.atomic.Value(bool),
         pending: ?*PendingReload,
     ) !ReloadOutcome {
         if (cancel_requested.load(.acquire)) return error.Cancelled;
+        const next_authority = preview_workspace_authority(alloc, workspace_root) catch |err| {
+            const detached = try self.detachForReducingReload(cancel_requested, pending);
+            if (detached) |runtime| destroyRuntime(alloc, runtime);
+            return err;
+        };
+        defer mcp_contract.freeOwnedStrings(alloc, next_authority);
+        var authority_reduced = false;
+        var detached_reduced_runtime: ?*mcp_runtime.McpRuntime = null;
+        self.lock.lockUncancelable(io_mod.getIo());
+        if (cancel_requested.load(.acquire) or
+            (pending != null and self.pending_reload != pending.?))
+        {
+            self.lock.unlock(io_mod.getIo());
+            return error.Cancelled;
+        }
+        if (self.runtime) |current| {
+            authority_reduced = current.workspaceAuthorityReducedAgainstNames(
+                next_authority,
+                .all,
+            );
+            if (authority_reduced) {
+                detached_reduced_runtime = current;
+                self.runtime = null;
+            }
+        }
+        self.lock.unlock(io_mod.getIo());
+        if (detached_reduced_runtime) |runtime| {
+            detached_reduced_runtime = null;
+            destroyRuntime(alloc, runtime);
+        }
+
         const candidate = try loader(alloc, workspace_root, elicitation_capabilities);
         var candidate_owned = candidate != null;
         errdefer if (candidate_owned) destroyRuntime(alloc, candidate.?);
         if (cancel_requested.load(.acquire)) return error.Cancelled;
 
-        var authority_reduced = false;
-        var detached_reduced_runtime: ?*mcp_runtime.McpRuntime = null;
-        if (candidate) |next| {
-            self.lock.lockUncancelable(io_mod.getIo());
-            if (cancel_requested.load(.acquire) or
-                (pending != null and self.pending_reload != pending.?))
-            {
-                self.lock.unlock(io_mod.getIo());
-                return error.Cancelled;
-            }
-            if (self.runtime) |current| {
-                authority_reduced = current.workspaceAuthorityReducedAgainst(next, .all);
-                if (authority_reduced) {
-                    detached_reduced_runtime = current;
-                    self.runtime = null;
+        if (!authority_reduced) {
+            if (candidate) |next| {
+                self.lock.lockUncancelable(io_mod.getIo());
+                if (cancel_requested.load(.acquire) or
+                    (pending != null and self.pending_reload != pending.?))
+                {
+                    self.lock.unlock(io_mod.getIo());
+                    return error.Cancelled;
                 }
+                if (self.runtime) |current| {
+                    authority_reduced = current.workspaceAuthorityReducedAgainst(next, .all);
+                    if (authority_reduced) {
+                        detached_reduced_runtime = current;
+                        self.runtime = null;
+                    }
+                }
+                self.lock.unlock(io_mod.getIo());
             }
-            self.lock.unlock(io_mod.getIo());
         }
         if (detached_reduced_runtime) |runtime| destroyRuntime(alloc, runtime);
 
@@ -799,6 +931,23 @@ pub const State = struct {
 
         if (previous) |runtime| destroyRuntime(alloc, runtime);
         return .{ .published = published };
+    }
+
+    fn detachForReducingReload(
+        self: *State,
+        cancel_requested: *std.atomic.Value(bool),
+        pending: ?*PendingReload,
+    ) !?*mcp_runtime.McpRuntime {
+        self.lock.lockUncancelable(io_mod.getIo());
+        defer self.lock.unlock(io_mod.getIo());
+        if (cancel_requested.load(.acquire) or
+            (pending != null and self.pending_reload != pending.?))
+        {
+            return error.Cancelled;
+        }
+        const runtime = self.runtime;
+        self.runtime = null;
+        return runtime;
     }
 
     fn reloadAuthorityReducedControlled(
@@ -853,8 +1002,11 @@ pub const State = struct {
         self.lock.lockUncancelable(io_mod.getIo());
         const previous = self.runtime;
         self.runtime = null;
+        const project_prompt_name = self.project_prompt_name;
+        self.project_prompt_name = null;
         self.lock.unlock(io_mod.getIo());
         if (previous) |runtime| destroyRuntime(alloc, runtime);
+        if (project_prompt_name) |name| alloc.free(name);
         self.* = .{};
     }
 };
@@ -961,6 +1113,14 @@ fn loadTestReloadRuntime(
     return runtime;
 }
 
+fn previewTestWorkspaceAuthority(alloc: Allocator, _: []const u8) ![][]u8 {
+    return alloc.alloc([]u8, 0);
+}
+
+fn failPendingReloadSpawn(_: *PendingReload) !std.Thread {
+    return error.TestSpawnFailed;
+}
+
 test "transactional reload retains old runtime and publishes only accepted candidates" {
     const alloc = std.testing.allocator;
     var state: State = .{};
@@ -973,7 +1133,7 @@ test "transactional reload retains old runtime and publishes only accepted candi
     test_reload_mode = .parse_failure;
     try std.testing.expectError(
         error.McpConfigInvalidJson,
-        state.reload(alloc, "/workspace", .{}, loadTestReloadRuntime, .{}, 10),
+        state.reload(alloc, "/workspace", .{}, loadTestReloadRuntime, previewTestWorkspaceAuthority, .{}, 10),
     );
     {
         var lease = state.acquire() orelse return error.TestUnexpectedResult;
@@ -982,7 +1142,7 @@ test "transactional reload retains old runtime and publishes only accepted candi
     }
 
     test_reload_mode = .required_disabled;
-    var rejected = try state.reload(alloc, "/workspace", .{}, loadTestReloadRuntime, .{}, 20);
+    var rejected = try state.reload(alloc, "/workspace", .{}, loadTestReloadRuntime, previewTestWorkspaceAuthority, .{}, 20);
     defer rejected.deinit(alloc);
     switch (rejected) {
         .retained_required_failure => |failure| {
@@ -998,7 +1158,7 @@ test "transactional reload retains old runtime and publishes only accepted candi
     }
 
     test_reload_mode = .optional_failed;
-    var degraded = try state.reload(alloc, "/workspace", .{}, loadTestReloadRuntime, .{}, 30);
+    var degraded = try state.reload(alloc, "/workspace", .{}, loadTestReloadRuntime, previewTestWorkspaceAuthority, .{}, 30);
     defer degraded.deinit(alloc);
     switch (degraded) {
         .published => |published| {
@@ -1012,7 +1172,7 @@ test "transactional reload retains old runtime and publishes only accepted candi
     }
 
     test_reload_mode = .empty;
-    var empty = try state.reload(alloc, "/workspace", .{}, loadTestReloadRuntime, .{}, 40);
+    var empty = try state.reload(alloc, "/workspace", .{}, loadTestReloadRuntime, previewTestWorkspaceAuthority, .{}, 40);
     defer empty.deinit(alloc);
     switch (empty) {
         .published => |published| {
@@ -1023,6 +1183,38 @@ test "transactional reload retains old runtime and publishes only accepted candi
         },
         .retained_required_failure => return error.TestUnexpectedResult,
     }
+    try std.testing.expect(state.acquire() == null);
+}
+
+test "reducing preflight retires workspace authority before strict loader failure" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+    const runtime = try alloc.create(mcp_runtime.McpRuntime);
+    runtime.* = mcp_runtime.McpRuntime.init(alloc);
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "workspace"),
+        .source = .workspace,
+        .scope = .profile,
+        .command = try alloc.dupe(u8, "unused"),
+        .workspace_admission = .approved,
+    });
+    state.installInitial(runtime);
+
+    test_reload_mode = .parse_failure;
+    defer test_reload_mode = .empty;
+    try std.testing.expectError(
+        error.McpConfigInvalidJson,
+        state.reload(
+            alloc,
+            "/workspace",
+            .{},
+            loadTestReloadRuntime,
+            previewTestWorkspaceAuthority,
+            .{},
+            10,
+        ),
+    );
     try std.testing.expect(state.acquire() == null);
 }
 
@@ -1037,7 +1229,7 @@ test "pending reload returns immediately and publishes one completion" {
 
     test_reload_mode = .delayed_empty;
     const started_ms = io_mod.milliTimestamp();
-    try state.beginReload(alloc, "/workspace", .{}, loadTestReloadRuntime, .{}, 50);
+    try state.beginReload(alloc, "/workspace", .{}, loadTestReloadRuntime, previewTestWorkspaceAuthority, .{}, 50);
     try std.testing.expect(io_mod.milliTimestamp() - started_ms < 50);
     {
         var lease = state.acquire() orelse return error.TestUnexpectedResult;
@@ -1070,13 +1262,34 @@ test "pending reload returns immediately and publishes one completion" {
     try std.testing.expect(state.acquire() == null);
 }
 
+test "reload thread start failure frees the task and copied workspace root once" {
+    if (comptime builtin.single_threaded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+    try std.testing.expectError(
+        error.TestSpawnFailed,
+        state.beginReloadWithSpawner(
+            alloc,
+            "/workspace",
+            .{},
+            loadTestReloadRuntime,
+            previewTestWorkspaceAuthority,
+            .{},
+            50,
+            failPendingReloadSpawn,
+        ),
+    );
+    try std.testing.expect(state.pending_reload == null);
+}
+
 test "authentication admission is busy while reload is pending" {
     const alloc = std.testing.allocator;
     var state: State = .{};
     defer state.deinit(alloc);
 
     test_reload_mode = .delayed_empty;
-    try state.beginReload(alloc, "/workspace", .{}, loadTestReloadRuntime, .{}, 55);
+    try state.beginReload(alloc, "/workspace", .{}, loadTestReloadRuntime, previewTestWorkspaceAuthority, .{}, 55);
     try std.testing.expectEqual(
         mcp_command_provider.AuthenticationStart.busy,
         try state.startAuthentication(
@@ -1134,11 +1347,11 @@ test "superseding and deinitializing a stalled pending reload cancel before join
     state.installInitial(original);
 
     test_reload_mode = .stalled_candidate;
-    try state.beginReload(alloc, "/workspace", .{}, loadTestReloadRuntime, .{}, 60);
+    try state.beginReload(alloc, "/workspace", .{}, loadTestReloadRuntime, previewTestWorkspaceAuthority, .{}, 60);
     io_mod.sleep(25 * std.time.ns_per_ms);
     test_reload_mode = .empty;
     const supersede_started_ms = io_mod.milliTimestamp();
-    try state.beginReload(alloc, "/workspace", .{}, loadTestReloadRuntime, .{}, 70);
+    try state.beginReload(alloc, "/workspace", .{}, loadTestReloadRuntime, previewTestWorkspaceAuthority, .{}, 70);
     try std.testing.expect(io_mod.milliTimestamp() - supersede_started_ms < 1_000);
 
     var completion: ?ReloadCompletion = null;
@@ -1151,7 +1364,7 @@ test "superseding and deinitializing a stalled pending reload cancel before join
     loaded.deinit(alloc);
 
     test_reload_mode = .stalled_candidate;
-    try state.beginReload(alloc, "/workspace", .{}, loadTestReloadRuntime, .{}, 80);
+    try state.beginReload(alloc, "/workspace", .{}, loadTestReloadRuntime, previewTestWorkspaceAuthority, .{}, 80);
     io_mod.sleep(25 * std.time.ns_per_ms);
     const deinit_started_ms = io_mod.milliTimestamp();
     state.deinit(alloc);

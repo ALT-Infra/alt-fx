@@ -16,7 +16,6 @@ const record_tape = @import("../workspace/record_tape.zig");
 const statusline_identity = @import("../workspace/statusline_identity.zig");
 const shared_io = @import("../shared/io.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
-const mcp_contract = @import("../mcp/mcp_contract.zig");
 const permissions = @import("../permissions/permissions.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
@@ -327,7 +326,7 @@ pub fn Runtime(comptime App: type) type {
                 .{ .form = true, .url = true },
             );
             if (comptime @hasDecl(App, "installInitialMcpRuntime")) {
-                app.installInitialMcpRuntime(profile_mcp);
+                try app.installInitialMcpRuntime(profile_mcp);
             } else {
                 app.mcp_runtime = profile_mcp;
             }
@@ -358,24 +357,8 @@ pub fn Runtime(comptime App: type) type {
                     },
                 );
                 try app.writeTranscriptClassified(welcome_message, true, .welcome);
-                if (comptime @hasDecl(App, "pendingWorkspaceMcpNames")) {
-                    const pending_names = try app.pendingWorkspaceMcpNames(app.alloc);
-                    defer mcp_contract.freeOwnedStrings(app.alloc, pending_names);
-                    if (pending_names.len > 0) {
-                        var notice: std.Io.Writer.Allocating = .init(app.alloc);
-                        defer notice.deinit();
-                        try notice.writer.writeAll("Project MCP servers pending approval: ");
-                        for (pending_names, 0..) |name, index| {
-                            if (index > 0) try notice.writer.writeAll(", ");
-                            try notice.writer.writeAll(name);
-                        }
-                        try notice.writer.writeAll(". Use /mcp trust approve <server> or /mcp trust approve-all.\n");
-                        try app.writeTranscriptClassified(
-                            notice.writer.buffered(),
-                            true,
-                            .unknown_raw,
-                        );
-                    }
+                if (comptime @hasDecl(App, "presentProjectMcpPrompt")) {
+                    try app.presentProjectMcpPrompt();
                 }
             }
             if (app.skills.diagnostics.len > 0) {
