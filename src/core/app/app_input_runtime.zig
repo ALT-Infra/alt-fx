@@ -24,6 +24,7 @@ const paste_framing = @import("../input/paste_framing.zig");
 const text_scalar = @import("../input/text_scalar.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const image_commands = @import("../images/image_commands.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
@@ -684,7 +685,6 @@ pub fn Runtime(comptime App: type) type {
             input_limits: paste_framing.InputLimits,
             max_prompt_history: usize,
         ) !void {
-            if (byte != 0x1b and try routeProjectMcpPromptByte(app, byte)) return;
             var context = try prepareTerminalDecode(app) orelse return;
             var ingress = app.terminal_input_runtime.decodeTerminalByte(
                 byte,
@@ -859,6 +859,15 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !@hasDecl(App, "projectMcpPromptActive")) return false;
             if (!app.projectMcpPromptActive()) return false;
             if (app.question_prompt.isActive() or app.approval_prompt.isActive()) return false;
+            if (comptime runtime_profile.allows(App, .subagents)) {
+                if (app.subagents.isViewActive()) return false;
+            }
+            if (activeCompactCommandMenu(app) != null or
+                settingsMenuActive(app) or
+                skillsMenuActive(app) or
+                modelMenuActive(app) or
+                sessionMenuActive(app) or
+                helpMenuActive(app)) return false;
             if (comptime runtime_profile.allows(App, .native_auth)) {
                 if (app.auth.apiKeyEntryActive()) return false;
             }
@@ -878,10 +887,12 @@ pub fn Runtime(comptime App: type) type {
                 '1' => {
                     const name = (try app.projectMcpPromptName(app.alloc)) orelse return true;
                     defer app.alloc.free(name);
+                    const display = try text_utils.encodeTerminalSafe(app.alloc, name, 256);
+                    defer app.alloc.free(display.bytes);
                     const body = try std.fmt.allocPrint(
                         app.alloc,
                         "Approving project MCP server '{s}'.",
-                        .{name},
+                        .{display.bytes},
                     );
                     defer app.alloc.free(body);
                     try app_commands.Handlers(App).applyProjectMcpAction(
@@ -895,10 +906,12 @@ pub fn Runtime(comptime App: type) type {
                 '3' => {
                     const name = (try app.projectMcpPromptName(app.alloc)) orelse return true;
                     defer app.alloc.free(name);
+                    const display = try text_utils.encodeTerminalSafe(app.alloc, name, 256);
+                    defer app.alloc.free(display.bytes);
                     const body = try std.fmt.allocPrint(
                         app.alloc,
                         "Rejecting project MCP server '{s}'.",
-                        .{name},
+                        .{display.bytes},
                     );
                     defer app.alloc.free(body);
                     try app_commands.Handlers(App).applyProjectMcpAction(

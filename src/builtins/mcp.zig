@@ -448,10 +448,17 @@ pub fn loadRuntime(
     };
     defer choice_load.deinit(alloc);
     for (choice_load.diagnostics.items) |diagnostic| {
+        var name_buf: [256]u8 = undefined;
         debug_trace.logf(
             "mcp",
             "workspace MCP choice diagnostic cause={s} server={s}",
-            .{ @tagName(diagnostic.cause), diagnostic.server_name orelse "none" },
+            .{
+                @tagName(diagnostic.cause),
+                if (diagnostic.server_name) |name|
+                    debug_trace.terminalPreview(name_buf[0..], name)
+                else
+                    "none",
+            },
         );
     }
 
@@ -489,7 +496,7 @@ pub fn previewNativeWorkspaceAuthority(
     return project_config.authorityNames(alloc, workspace.configs.items, .all);
 }
 
-pub fn loadWorkspaceConfig(
+fn loadWorkspaceConfig(
     alloc: Allocator,
     workspace_root: []const u8,
     scope: mcp_contract.ConfigScope,
@@ -529,10 +536,17 @@ pub fn loadWorkspaceConfig(
 
 fn traceWorkspaceDiagnostics(diagnostics: []const project_config.WorkspaceDiagnostic) void {
     for (diagnostics) |diagnostic| {
+        var name_buf: [256]u8 = undefined;
         debug_trace.logf(
             "mcp",
             "workspace MCP config skipped cause={s} server={s}",
-            .{ @tagName(diagnostic.cause), diagnostic.server_name orelse "none" },
+            .{
+                @tagName(diagnostic.cause),
+                if (diagnostic.server_name) |name|
+                    debug_trace.terminalPreview(name_buf[0..], name)
+                else
+                    "none",
+            },
         );
     }
 }

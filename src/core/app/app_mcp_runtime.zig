@@ -294,12 +294,11 @@ pub const State = struct {
     }
 
     pub fn refreshProjectPrompt(self: *State, alloc: Allocator) !void {
-        var lease = self.acquire();
-        const next = if (lease) |*active|
-            try active.runtime.firstPendingWorkspaceName(alloc)
-        else
-            null;
-        if (lease) |*active| active.deinit();
+        const next = if (self.acquire()) |lease_value| next: {
+            var lease = lease_value;
+            defer lease.deinit();
+            break :next try lease.runtime.firstPendingWorkspaceName(alloc);
+        } else null;
         var next_owned = next;
         errdefer if (next_owned) |name| alloc.free(name);
 
@@ -510,12 +509,6 @@ pub const State = struct {
             permission_rules,
             include_ask_deferred,
         );
-    }
-
-    pub fn pendingWorkspaceNames(self: *State, alloc: Allocator) ![][]u8 {
-        var lease = self.acquire() orelse return alloc.alloc([]u8, 0);
-        defer lease.deinit();
-        return lease.runtime.pendingWorkspaceNames(alloc);
     }
 
     pub fn waitForRequired(
@@ -841,7 +834,15 @@ pub const State = struct {
         if (cancel_requested.load(.acquire)) return error.Cancelled;
         const next_authority = preview_workspace_authority(alloc, workspace_root) catch |err| {
             const detached = try self.detachForReducingReload(cancel_requested, pending);
-            if (detached) |runtime| destroyRuntime(alloc, runtime);
+            if (detached) |runtime| {
+                destroyRuntime(alloc, runtime);
+                debug_trace.logf(
+                    "mcp",
+                    "authority-reducing reload preflight failed after retirement err={s}",
+                    .{@errorName(err)},
+                );
+                return error.McpAuthorityReducedReloadFailed;
+            }
             return err;
         };
         defer mcp_contract.freeOwnedStrings(alloc, next_authority);
@@ -870,7 +871,17 @@ pub const State = struct {
             destroyRuntime(alloc, runtime);
         }
 
-        const candidate = try loader(alloc, workspace_root, elicitation_capabilities);
+        const candidate = loader(alloc, workspace_root, elicitation_capabilities) catch |err| {
+            if (authority_reduced) {
+                debug_trace.logf(
+                    "mcp",
+                    "authority-reducing reload failed after retirement err={s}",
+                    .{@errorName(err)},
+                );
+                return error.McpAuthorityReducedReloadFailed;
+            }
+            return err;
+        };
         var candidate_owned = candidate != null;
         errdefer if (candidate_owned) destroyRuntime(alloc, candidate.?);
         if (cancel_requested.load(.acquire)) return error.Cancelled;
@@ -1204,7 +1215,7 @@ test "reducing preflight retires workspace authority before strict loader failur
     test_reload_mode = .parse_failure;
     defer test_reload_mode = .empty;
     try std.testing.expectError(
-        error.McpConfigInvalidJson,
+        error.McpAuthorityReducedReloadFailed,
         state.reload(
             alloc,
             "/workspace",
@@ -1216,6 +1227,52 @@ test "reducing preflight retires workspace authority before strict loader failur
         ),
     );
     try std.testing.expect(state.acquire() == null);
+}
+
+test "project prompt display escapes repository control bytes" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+    const runtime = try alloc.create(mcp_runtime.McpRuntime);
+    runtime.* = mcp_runtime.McpRuntime.init(alloc);
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "bad\n\x1b]0;owned\x07"),
+        .source = .workspace,
+        .scope = .profile,
+        .command = try alloc.dupe(u8, "unused"),
+        .workspace_admission = .pending,
+    });
+    state.installInitial(runtime);
+    try state.refreshProjectPrompt(alloc);
+    const display = (try state.projectPromptDisplayName(alloc)).?;
+    defer alloc.free(display);
+    try std.testing.expect(text_utils.isTerminalSafe(display));
+    try std.testing.expect(std.mem.findScalar(u8, display, '\n') == null);
+    try std.testing.expect(std.mem.findScalar(u8, display, 0x1b) == null);
+}
+
+test "project prompt allocation failure releases the runtime lease" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    const runtime = try alloc.create(mcp_runtime.McpRuntime);
+    runtime.* = mcp_runtime.McpRuntime.init(alloc);
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "pending"),
+        .source = .workspace,
+        .scope = .profile,
+        .command = try alloc.dupe(u8, "unused"),
+        .workspace_admission = .pending,
+    });
+    state.installInitial(runtime);
+    var failing = std.testing.FailingAllocator.init(
+        alloc,
+        .{ .fail_index = 0 },
+    );
+    try std.testing.expectError(
+        error.OutOfMemory,
+        state.refreshProjectPrompt(failing.allocator()),
+    );
+    state.deinit(alloc);
 }
 
 test "pending reload returns immediately and publishes one completion" {

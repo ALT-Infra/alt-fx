@@ -12,6 +12,7 @@ const session_store = @import("../core/session/session_store.zig");
 const js_host_session_store = @import("../core/session/js_host_session_store.zig");
 const session_runtime = @import("../core/session/session.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
+const mcp_contract = @import("../core/mcp/mcp_contract.zig");
 const project_config = @import("../core/mcp/project_config.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
@@ -144,6 +145,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         });
     }
     if (state.cfg.allow_acp_mcp) try appendProjectMcpConfigs(state, alloc, &mcp_configs);
+    retireReducedActiveMcp(state, alloc, mcp_configs.items.items);
     var mcp_preparation = try mcp_servers.prepare(
         alloc,
         &mcp_configs,
@@ -469,20 +471,7 @@ fn handleRestoreSession(
     } else {
         try appendProjectMcpConfigs(state, alloc, &mcp_configs);
     }
-    if (state.active_session) |*active| {
-        if (active.mcp != null and
-            active.mcp.?.workspaceAuthorityReducedAgainstConfigs(
-                mcp_configs.items.items,
-                .acp_startup,
-            ))
-        {
-            const previous = detachActiveMcpForAuthorityReduction(state, active);
-            previous.retireAndWait();
-            previous.deinit();
-            alloc.destroy(previous);
-            server.enableSubagentHost(state);
-        }
-    }
+    retireReducedActiveMcp(state, alloc, mcp_configs.items.items);
     var mcp_preparation = try mcp_servers.prepare(
         alloc,
         &mcp_configs,
@@ -685,6 +674,24 @@ fn detachActiveMcpForAuthorityReduction(
     return previous;
 }
 
+fn retireReducedActiveMcp(
+    state: *server.ServerState,
+    alloc: Allocator,
+    next_configs: []const mcp_contract.McpServerConfig,
+) void {
+    const active = if (state.active_session) |*value| value else return;
+    const runtime = active.mcp orelse return;
+    if (!runtime.workspaceAuthorityReducedAgainstConfigs(
+        next_configs,
+        .acp_startup,
+    )) return;
+    const previous = detachActiveMcpForAuthorityReduction(state, active);
+    previous.retireAndWait();
+    previous.deinit();
+    alloc.destroy(previous);
+    server.enableSubagentHost(state);
+}
+
 fn appendProjectMcpConfigs(
     state: *server.ServerState,
     alloc: Allocator,
@@ -711,10 +718,17 @@ fn appendProjectMcpConfigs(
     );
     defer workspace.deinit(alloc);
     for (workspace.diagnostics.items) |diagnostic| {
+        var name_buf: [256]u8 = undefined;
         debug_trace.logf(
             "mcp",
             "ACP workspace MCP config skipped cause={s} server={s}",
-            .{ @tagName(diagnostic.cause), diagnostic.server_name orelse "none" },
+            .{
+                @tagName(diagnostic.cause),
+                if (diagnostic.server_name) |name|
+                    debug_trace.terminalPreview(name_buf[0..], name)
+                else
+                    "none",
+            },
         );
     }
     try project_config.appendWorkspaceAfterAcpPrimary(

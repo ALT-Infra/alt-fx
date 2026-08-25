@@ -2189,6 +2189,14 @@ describe("acp: model-independent", () => {
     async () => {
       const root = createIsolatedRoot("fx-acp-project-mcp-optional-");
       const pidPath = join(root.root, "rejected-project-mcp.pid");
+      let unavailableAttempts = 0;
+      const unavailable = Bun.serve({
+        port: 0,
+        fetch() {
+          unavailableAttempts += 1;
+          return new Response("optional failure", { status: 500 });
+        },
+      });
       writeFileSync(
         join(root.home, ".fx", "settings.json"),
         JSON.stringify({
@@ -2208,7 +2216,7 @@ describe("acp: model-independent", () => {
             },
             unavailable: {
               type: "http",
-              url: "http://127.0.0.1:1/mcp",
+              url: `http://127.0.0.1:${unavailable.port}/mcp`,
               startup_timeout_ms: 100,
             },
           },
@@ -2229,6 +2237,96 @@ describe("acp: model-independent", () => {
         expect(created.error).toBeUndefined();
         expect(created.result.sessionId).toBeTruthy();
         expect(existsSync(pidPath)).toBe(false);
+        expect(unavailableAttempts).toBe(1);
+      } finally {
+        await client?.close();
+        client = null;
+        gateway.stop();
+        unavailable.stop(true);
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP cross-session restore retires reduced project authority before required failure",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-project-mcp-reduce-");
+      const pidPath = join(root.root, "active-project-mcp.pid");
+      const wirePath = join(root.root, "active-project-mcp-wire.jsonl");
+      writeFileSync(
+        join(root.workspace, ".mcp.json"),
+        JSON.stringify({
+          mcpServers: {
+            fixture: {
+              command: process.execPath,
+              args: [MCP_STDIO_FIXTURE],
+              env: {
+                FX_MCP_PID_PATH: pidPath,
+                FX_MCP_WIRE_LOG: wirePath,
+                FX_MCP_MODE: "stall_operation",
+              },
+            },
+          },
+        }),
+      );
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("select_reducing", "mcp_select_tool", {
+          name: MCP_TOOL_NAME,
+        }),
+        fakeGatewayToolCall("call_reducing", MCP_TOOL_NAME, { text: "stall" }),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request(
+          "session/new",
+          { cwd: root.workspace, mcpServers: [] },
+          2,
+        ) as any;
+        expect(created.error).toBeUndefined();
+        await client.readLine();
+        await waitForPath(pidPath, 5_000);
+        sendPrompt(client, 4, "Start the project MCP operation.");
+        await waitForCondition(
+          "stalled project MCP call",
+          () => existsSync(wirePath) &&
+            readFileSync(wirePath, "utf8").includes("tools/call"),
+          5_000,
+        );
+
+        const targetSession = "project-reduction-target";
+        writeAcpSession(root.home, root.workspace, targetSession, Date.now());
+        writeFileSync(
+          join(root.home, ".fx", "settings.json"),
+          JSON.stringify({
+            workspaces: {
+              [root.workspace]: { disabledMcpjsonServers: ["fixture"] },
+            },
+          }),
+        );
+        client.send({
+          jsonrpc: "2.0",
+          id: 5,
+          method: "session/load",
+          params: {
+            sessionId: targetSession,
+            cwd: root.workspace,
+            mcpServers: [{
+              name: "required-failure",
+              command: "/bin/false",
+              args: [],
+              env: [],
+            }],
+          },
+        });
+        const loaded = await readResponse(client, 5, TIMEOUT);
+        expect(loaded.error?.message).toContain("Required MCP server");
+        await expectMcpProcessExited(pidPath);
       } finally {
         await client?.close();
         client = null;
@@ -2240,9 +2338,9 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "ACP cross-session restore retires reduced project authority before required failure",
+    "ACP session/new retires reduced active project authority before required failure",
     async () => {
-      const root = createIsolatedRoot("fx-acp-project-mcp-reduce-");
+      const root = createIsolatedRoot("fx-acp-project-mcp-new-reduce-");
       const pidPath = join(root.root, "active-project-mcp.pid");
       writeFileSync(
         join(root.workspace, ".mcp.json"),
@@ -2271,9 +2369,6 @@ describe("acp: model-independent", () => {
         expect(created.error).toBeUndefined();
         await client.readLine();
         await waitForPath(pidPath, 5_000);
-
-        const targetSession = "project-reduction-target";
-        writeAcpSession(root.home, root.workspace, targetSession, Date.now());
         writeFileSync(
           join(root.home, ".fx", "settings.json"),
           JSON.stringify({
@@ -2282,10 +2377,9 @@ describe("acp: model-independent", () => {
             },
           }),
         );
-        const loaded = await client.request(
-          "session/load",
+        const replacement = await client.request(
+          "session/new",
           {
-            sessionId: targetSession,
             cwd: root.workspace,
             mcpServers: [{
               name: "required-failure",
@@ -2296,7 +2390,7 @@ describe("acp: model-independent", () => {
           },
           3,
         ) as any;
-        expect(loaded.error?.message).toContain("Required MCP server");
+        expect(replacement.error?.message).toContain("Required MCP server");
         await expectMcpProcessExited(pidPath);
       } finally {
         await client?.close();

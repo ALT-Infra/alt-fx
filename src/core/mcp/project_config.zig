@@ -32,16 +32,6 @@ pub const ProjectMcpChoices = struct {
         freeOwnedStrings(alloc, self.rejected);
         self.* = undefined;
     }
-
-    pub fn clone(self: ProjectMcpChoices, alloc: Allocator) !ProjectMcpChoices {
-        const approved = try cloneStrings(alloc, self.approved);
-        errdefer freeOwnedStrings(alloc, approved);
-        return .{
-            .enable_all = self.enable_all,
-            .approved = approved,
-            .rejected = try cloneStrings(alloc, self.rejected),
-        };
-    }
 };
 
 pub const ProjectMcpAction = union(enum) {
@@ -56,7 +46,7 @@ pub const ProjectMcpTransition = struct {
     authority_reduced: bool,
 };
 
-pub const ParsePolicy = struct {
+const ParsePolicy = struct {
     source: mcp_contract.ConfigSource,
     scope: mcp_contract.ConfigScope,
     force_optional: bool = false,
@@ -375,7 +365,7 @@ pub fn configRetainsWorkspaceAuthority(
     return false;
 }
 
-pub fn parseServerEntry(
+fn parseServerEntry(
     alloc: Allocator,
     name: []const u8,
     value: std.json.Value,

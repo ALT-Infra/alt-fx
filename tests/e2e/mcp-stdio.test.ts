@@ -624,6 +624,12 @@ describe("modern MCP stdio compatibility", () => {
       });
       await tui.waitForComposer(15_000);
       await tui.waitForText("[Esc] Dismiss remaining prompts", 10_000);
+      await tui.pasteText("2");
+      await Bun.sleep(250);
+      expect((await tui.capturePane())).toContain("[2] Approve all");
+      expect(existsSync(root.launchLogPath)).toBe(false);
+      expect(readFileSync(join(root.home, ".fx", "settings.json"), "utf8"))
+        .not.toContain("enableAllProjectMcpServers");
       await tui.sendKeys("Escape");
       await tui.waitForText("Project MCP approval prompts dismissed for this process", 10_000);
       expect(existsSync(root.launchLogPath)).toBe(false);

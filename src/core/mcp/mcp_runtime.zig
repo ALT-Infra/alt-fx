@@ -4935,26 +4935,6 @@ pub const McpRuntime = struct {
         return names.toOwnedSlice(alloc);
     }
 
-    pub fn pendingWorkspaceNames(
-        self: *const McpRuntime,
-        alloc: Allocator,
-    ) ![][]u8 {
-        var names: std.ArrayList([]u8) = .empty;
-        errdefer {
-            for (names.items) |name| alloc.free(name);
-            names.deinit(alloc);
-        }
-        for (self.servers.items) |server| {
-            if (!server.config.enabled or
-                server.config.source != .workspace or
-                server.config.workspace_admission != .pending) continue;
-            const owned_name = try terminalSafeOwned(alloc, server.config.name, 256);
-            errdefer alloc.free(owned_name);
-            try names.append(alloc, owned_name);
-        }
-        return names.toOwnedSlice(alloc);
-    }
-
     pub fn firstPendingWorkspaceName(
         self: *const McpRuntime,
         alloc: Allocator,
@@ -5365,7 +5345,12 @@ pub const McpRuntime = struct {
             )) {
                 .disabled => {
                     server.state = .disabled;
-                    debug_trace.logf("mcp", "skipped disabled server {s}", .{server.config.name});
+                    var name_buf: [256]u8 = undefined;
+                    debug_trace.logf(
+                        "mcp",
+                        "skipped disabled server {s}",
+                        .{debug_trace.terminalPreview(name_buf[0..], server.config.name)},
+                    );
                     continue;
                 },
                 .deferred => continue,
@@ -5379,7 +5364,15 @@ pub const McpRuntime = struct {
                 server_timeout,
             ) catch |err| {
                 if (cancel_requested.load(.acquire)) return;
-                debug_trace.logf("mcp", "connection failed for server {s}: {s}", .{ server.config.name, @errorName(err) });
+                var name_buf: [256]u8 = undefined;
+                debug_trace.logf(
+                    "mcp",
+                    "connection failed for server {s}: {s}",
+                    .{
+                        debug_trace.terminalPreview(name_buf[0..], server.config.name),
+                        @errorName(err),
+                    },
+                );
                 if (server.last_error == null) {
                     server.setFailed(self.alloc, @errorName(err));
                 } else {
@@ -18819,25 +18812,6 @@ test "interactive authentication requires approved workspace admission" {
         runtime.validateAuthenticationServer("rejected"),
     );
     try runtime.validateAuthenticationServer("approved");
-}
-
-test "pending workspace presentation names escape repository control bytes" {
-    const alloc = std.testing.allocator;
-    var runtime = McpRuntime.init(alloc);
-    defer runtime.deinit();
-    try runtime.addServer(.{
-        .name = try alloc.dupe(u8, "bad\n\x1b]0;owned\x07"),
-        .source = .workspace,
-        .scope = .profile,
-        .command = try alloc.dupe(u8, "unused"),
-        .workspace_admission = .pending,
-    });
-    const names = try runtime.pendingWorkspaceNames(alloc);
-    defer mcp_contract.freeOwnedStrings(alloc, names);
-    try std.testing.expectEqual(@as(usize, 1), names.len);
-    try std.testing.expect(text_utils.isTerminalSafe(names[0]));
-    try std.testing.expect(std.mem.findScalar(u8, names[0], '\n') == null);
-    try std.testing.expect(std.mem.findScalar(u8, names[0], 0x1b) == null);
 }
 
 test "tool schema uses prefixed name and call request uses raw name" {

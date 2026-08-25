@@ -437,6 +437,17 @@ pub fn Handlers(comptime App: type) type {
                 },
                 .failed => |err| failed: {
                     warning = true;
+                    if (err == error.McpAuthorityReducedReloadFailed) {
+                        debug_trace.logf(
+                            "mcp",
+                            "authority-reducing reload left MCP unavailable",
+                            .{},
+                        );
+                        break :failed try app.alloc.dupe(
+                            u8,
+                            "MCP configuration could not be reloaded after project authority was reduced. MCP is unavailable; check the configuration and run /mcp reload.",
+                        );
+                    }
                     debug_trace.logf(
                         "mcp",
                         "profile reload retained current runtime err={s}",
