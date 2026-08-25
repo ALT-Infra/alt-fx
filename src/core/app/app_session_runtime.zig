@@ -1531,10 +1531,14 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasField(App, "queued_prompt_review")) {
                 input_queue_runtime.Runtime(App).reset(app);
             }
-            if (comptime @hasDecl(App, "clearPendingSubmission")) {
-                App.clearPendingSubmission(app, "session_transition");
+            if (comptime @hasDecl(App, "clearPendingSubmissionForSessionTransition")) {
+                App.clearPendingSubmissionForSessionTransition(app);
+            } else {
+                if (comptime @hasDecl(App, "clearPendingSubmission")) {
+                    App.clearPendingSubmission(app, "session_transition");
+                }
+                app.worker.clearQueuedPrompts(std.heap.c_allocator, &.{});
             }
-            app.worker.clearQueuedPrompts(std.heap.c_allocator, &.{});
         }
 
         fn applyIdleLiveSessionTransition(

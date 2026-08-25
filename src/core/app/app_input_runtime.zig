@@ -10772,6 +10772,8 @@ const FakeSubmitApp = struct {
         hold_available: bool = false,
         held: bool = false,
         queued_turn_id: ?u64 = null,
+        queued_images: []types.ImageAttachment = &.{},
+        queued_images_alloc: ?std.mem.Allocator = null,
 
         pub fn queuedPromptCount(_: *@This()) usize {
             return 0;
@@ -10791,11 +10793,45 @@ const FakeSubmitApp = struct {
             self: *@This(),
             _: std.mem.Allocator,
             turn_id: u64,
-            _: []const types.ImageAttachment,
+            retained_images: []const types.ImageAttachment,
         ) bool {
             if (self.queued_turn_id != turn_id) return false;
+            image_attachments.deleteUnreferencedImageSnapshots(
+                self.queued_images,
+                retained_images,
+            );
+            self.freeQueuedImageMetadata();
             self.queued_turn_id = null;
             return true;
+        }
+
+        pub fn clearQueuedPrompts(
+            self: *@This(),
+            _: std.mem.Allocator,
+            retained_images: []const types.ImageAttachment,
+        ) void {
+            image_attachments.deleteUnreferencedImageSnapshots(
+                self.queued_images,
+                retained_images,
+            );
+            self.freeQueuedImageMetadata();
+            self.queued_turn_id = null;
+        }
+
+        fn freeQueuedImageMetadata(self: *@This()) void {
+            if (self.queued_images_alloc) |alloc| {
+                types.freeImageAttachmentSlice(alloc, self.queued_images);
+            }
+            self.queued_images = &.{};
+            self.queued_images_alloc = null;
+        }
+
+        pub fn preservePromptSnapshots(
+            _: *@This(),
+            _: u64,
+            _: []const types.ImageAttachment,
+        ) bool {
+            return false;
         }
 
         pub fn activeTurnId(_: *const @This()) u64 {
@@ -10867,6 +10903,7 @@ const FakeSubmitApp = struct {
         types.freeImageAttachmentSlice(self.alloc, self.last_images);
         self.clearLastSkillTokens();
         self.last_skill_tokens.deinit(self.alloc);
+        self.worker.freeQueuedImageMetadata();
     }
 
     pub fn writeDomainNotice(self: *FakeSubmitApp, notice: types.SemanticNotice, _: bool) !void {
@@ -10941,6 +10978,12 @@ const FakeSubmitApp = struct {
         if (self.fail_pending_finalization) {
             return error.InjectedPendingFinalizationFailure;
         }
+        self.worker.freeQueuedImageMetadata();
+        self.worker.queued_images = try types.dupeImageAttachmentSlice(
+            self.alloc,
+            draft.images,
+        );
+        self.worker.queued_images_alloc = self.alloc;
         self.worker.queued_turn_id = draft.turn_id;
     }
 
@@ -12377,9 +12420,8 @@ test "app_input_runtime terminal pending cleanup preserves image history" {
         }
 
         if (case.session_transition) {
-            PendingRuntime.clearPendingSubmission(&app, "session_transition");
+            PendingRuntime.clearPendingSubmissionForSessionTransition(&app);
             app.input_runtime.inputResetState().resetForSession(alloc);
-            app.worker.queued_turn_id = null;
         } else {
             try std.testing.expect(PendingRuntime.cancelPendingSubmission(&app));
         }

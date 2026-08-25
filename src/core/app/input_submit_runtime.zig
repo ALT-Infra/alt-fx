@@ -281,6 +281,46 @@ pub fn SubmitRuntime(comptime App: type) type {
             clearPendingSubmissionWithSnapshots(app, reason, snapshot_cleanup);
         }
 
+        pub fn clearPendingSubmissionForSessionTransition(app: *App) void {
+            if (comptime !@hasField(App, "submission")) {
+                app.worker.clearQueuedPrompts(std.heap.c_allocator, &.{});
+                return;
+            }
+            const pending = app.submission.pending orelse {
+                app.worker.clearQueuedPrompts(std.heap.c_allocator, &.{});
+                return;
+            };
+            const history_owns_snapshots =
+                transferPendingImageSnapshotsToComposerHistory(app);
+            if (pending.phase == .queued) {
+                if (history_owns_snapshots) {
+                    if (comptime @hasDecl(@TypeOf(app.worker), "preservePromptSnapshots")) {
+                        _ = app.worker.preservePromptSnapshots(
+                            pending.draft.turn_id,
+                            pending.draft.images,
+                        );
+                    }
+                }
+                app.worker.clearQueuedPrompts(
+                    std.heap.c_allocator,
+                    if (history_owns_snapshots) pending.draft.images else &.{},
+                );
+                clearPendingSubmissionWithSnapshots(
+                    app,
+                    "session_transition",
+                    .preserve,
+                );
+                return;
+            }
+
+            app.worker.clearQueuedPrompts(std.heap.c_allocator, &.{});
+            clearPendingSubmissionWithSnapshots(
+                app,
+                "session_transition",
+                if (history_owns_snapshots) .preserve else .discard,
+            );
+        }
+
         fn clearPendingSubmissionWithSnapshots(
             app: *App,
             reason: []const u8,

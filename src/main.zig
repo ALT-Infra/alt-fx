@@ -1160,6 +1160,10 @@ const App = struct {
         InputSubmitRuntime.clearPendingSubmission(self, reason);
     }
 
+    pub fn clearPendingSubmissionForSessionTransition(self: *App) void {
+        InputSubmitRuntime.clearPendingSubmissionForSessionTransition(self);
+    }
+
     pub fn writeUserPromptCard(self: *App, user: types.UserTurn) !void {
         try self.writeUserPromptCardWithSpacing(user, self.session.historyLen() > 0);
     }

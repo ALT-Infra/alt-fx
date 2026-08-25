@@ -93,6 +93,7 @@ pub const ActivePromptSnapshotOwnership = struct {
     state: enum {
         active,
         handed_off,
+        preserved,
         discarded,
     } = .active,
     shared_ownership: ?types.SnapshotFileOwnership = null,
@@ -120,6 +121,23 @@ pub const ActivePromptSnapshotOwnership = struct {
         const ownership = (try self.ensureSharedOwnership(alloc)).?;
         self.state = .handed_off;
         return ownership;
+    }
+
+    fn preserve(self: *ActivePromptSnapshotOwnership) bool {
+        if (self.images.len == 0) return false;
+        switch (self.state) {
+            .active => {
+                if (self.shared_ownership) |ownership| ownership.transfer();
+                self.state = .preserved;
+                return true;
+            },
+            .handed_off => {
+                if (self.shared_ownership) |ownership| ownership.transfer();
+                return true;
+            },
+            .preserved => return true,
+            .discarded => return false,
+        }
     }
 
     fn deinit(self: *ActivePromptSnapshotOwnership) void {
@@ -184,6 +202,36 @@ const SnapshotFileOwnershipState = struct {
         self.transferred.store(true, .seq_cst);
     }
 };
+
+fn historyTurnImages(turn: types.HistoryTurn) []const types.ImageAttachment {
+    return switch (turn) {
+        .assistant => |value| value.user.images,
+        .background_command => |value| value.user.images,
+        .interrupted => |value| value.user.images,
+        .compacted_summary => &.{},
+    };
+}
+
+fn sameImageSnapshots(
+    left: []const types.ImageAttachment,
+    right: []const types.ImageAttachment,
+) bool {
+    if (left.len == 0 or left.len != right.len) return false;
+    for (left) |image| {
+        const other = image_attachments.findById(right, image.id) orelse return false;
+        if (!optionalBytesEqual(image.snapshot_path, other.snapshot_path) or
+            !optionalBytesEqual(image.snapshot_sha256, other.snapshot_sha256))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn optionalBytesEqual(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, left.?, right.?);
+}
 
 pub const PermissionSnapshot = struct {
     mode: types.PermissionMode,
@@ -1331,6 +1379,8 @@ pub const WorkerRuntime = struct {
         self: *WorkerRuntime,
         ownership: *ActivePromptSnapshotOwnership,
     ) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
         std.debug.assert(self.active_prompt_snapshot_ownership == null);
         self.active_prompt_snapshot_ownership = ownership;
     }
@@ -1339,6 +1389,8 @@ pub const WorkerRuntime = struct {
         self: *WorkerRuntime,
         alloc: std.mem.Allocator,
     ) !?types.SnapshotFileOwnership {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
         const ownership = self.active_prompt_snapshot_ownership orelse return null;
         return ownership.handoff(alloc);
     }
@@ -1347,9 +1399,41 @@ pub const WorkerRuntime = struct {
         self: *WorkerRuntime,
         ownership: *ActivePromptSnapshotOwnership,
     ) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
         std.debug.assert(self.active_prompt_snapshot_ownership == ownership);
         self.active_prompt_snapshot_ownership = null;
         ownership.deinit();
+    }
+
+    /// Relinquishes deletion for the matching active or finished prompt. The
+    /// caller must already have established another owner for these files.
+    pub fn preservePromptSnapshots(
+        self: *WorkerRuntime,
+        turn_id: u64,
+        images: []const types.ImageAttachment,
+    ) bool {
+        if (turn_id == 0 or images.len == 0) return false;
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+
+        var preserved = false;
+        if (self.active_turn_id == turn_id) {
+            if (self.active_prompt_snapshot_ownership) |ownership| {
+                preserved = ownership.preserve();
+            }
+        }
+        for (self.worker_events.items) |*event| {
+            if (event.* != .finish_prompt) continue;
+            const finished = &event.finish_prompt;
+            const finished_images = historyTurnImages(finished.turn);
+            if (!sameImageSnapshots(finished_images, images)) continue;
+            if (finished.snapshot_file_ownership) |ownership| {
+                ownership.transfer();
+                preserved = true;
+            }
+        }
+        return preserved;
     }
 
     pub fn propagateGrant(self: *WorkerRuntime, alloc: std.mem.Allocator, tool_name: []const u8, target_path: []const u8) !void {
@@ -2008,6 +2092,55 @@ test "active prompt snapshot ownership discards every pre-transfer boundary" {
             error.FileNotFound,
             std.Io.Dir.accessAbsolute(std.testing.io, path, .{}),
         );
+    }
+}
+
+test "session transfer preserves active and finished prompt snapshots" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |finished_before_transfer| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const name = if (finished_before_transfer) "finished.bin" else "active.bin";
+        {
+            var file = try tmp.dir.createFile(std.testing.io, name, .{});
+            defer file.close(std.testing.io);
+            try file.writeStreamingAll(std.testing.io, "snapshot");
+        }
+        const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, name);
+        defer alloc.free(path);
+        const images = [_]types.ImageAttachment{.{
+            .id = 1,
+            .path = @constCast("/tmp/source.png"),
+            .media_type = @constCast("image/png"),
+            .snapshot_path = path,
+            .snapshot_sha256 = @constCast("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        }};
+
+        var runtime = WorkerRuntime{};
+        defer runtime.deinit(alloc);
+        runtime.active_turn_id = 41;
+        var active = ActivePromptSnapshotOwnership.init(&images);
+        runtime.beginActivePromptSnapshots(&active);
+        if (finished_before_transfer) {
+            const ownership = (try runtime.handoffActivePromptSnapshots(alloc)) orelse
+                return error.TestExpectedSnapshotOwnership;
+            try runtime.pushEvent(alloc, .{ .finish_prompt = .{
+                .turn = .{ .assistant = .{
+                    .user = .{ .text = @constCast("prompt"), .images = @constCast(&images) },
+                    .assistant = @constCast("done"),
+                } },
+                .snapshot_file_ownership = ownership,
+            } });
+            ownership.release();
+            runtime.endActivePromptSnapshots(&active);
+            runtime.active_turn_id = 0;
+        }
+
+        try std.testing.expect(runtime.preservePromptSnapshots(41, &images));
+        if (!finished_before_transfer) runtime.endActivePromptSnapshots(&active);
+        runtime.discardEvents(alloc);
+        try std.Io.Dir.accessAbsolute(std.testing.io, path, .{});
+        try std.Io.Dir.deleteFileAbsolute(std.testing.io, path);
     }
 }
 
