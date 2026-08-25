@@ -1582,8 +1582,11 @@ describe("MCP remote authentication lifecycle", () => {
         fakeGatewayToolCall("search_exact", "mcp_search_tools", {
           query: "Please use mcp_linear_echo for this request",
         }),
-        fakeGatewayToolCall("search_unrelated", "mcp_search_tools", {
+        fakeGatewayToolCall("search_noisy", "mcp_search_tools", {
           query: "linear issue",
+        }),
+        fakeGatewayToolCall("search_auth_collision", "mcp_search_tools", {
+          query: "slack data",
         }),
         fakeGatewayToolCall("search_targeted", "mcp_search_tools", {
           query: "authenticate slack now",
@@ -1614,9 +1617,13 @@ describe("MCP remote authentication lifecycle", () => {
       const exact = toolResultText(finalBody, "search_exact");
       expect(exact).toContain("mcp_linear_echo");
       expect(exact).not.toContain("authentication_required");
-      const unrelated = toolResultText(finalBody, "search_unrelated");
-      expect(unrelated).toContain('\"tools\":[],\"count\":0');
-      expect(unrelated).not.toContain("authentication_required");
+      const noisy = toolResultText(finalBody, "search_noisy");
+      expect(noisy).toContain("mcp_linear_echo");
+      expect(noisy).not.toContain("authentication_required");
+      const collision = toolResultText(finalBody, "search_auth_collision");
+      expect(collision).toContain("authentication_required");
+      expect(collision).toContain('\"server\":\"slack\"');
+      expect(collision).not.toContain("mcp_linear_echo");
       const targeted = toolResultText(finalBody, "search_targeted");
       expect(targeted).toContain("authentication_required");
       expect(targeted).toContain('\"server\":\"slack\"');

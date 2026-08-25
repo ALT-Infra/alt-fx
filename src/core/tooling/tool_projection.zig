@@ -494,6 +494,21 @@ const test_skill = blk: {
     break :blk spec;
 };
 
+const test_skill_search = blk: {
+    var spec = test_skill;
+    spec.name = "skill_search";
+    spec.description = "Test skill search. When to use: exercise registered skill discovery. When NOT to use: load an exact skill.";
+    spec.model_schema = .{
+        .name = "skill_search",
+        .description = spec.description,
+    };
+    spec.action_label = "Searching skills";
+    spec.completed_action_label = "Searched skills";
+    spec.label_arg_kind = .query;
+    spec.label_arg_default = "skills";
+    break :blk spec;
+};
+
 const test_install_skill = blk: {
     var spec = test_skill;
     spec.name = "install_skill";
@@ -695,6 +710,7 @@ const test_all_tools = [_]tool_dispatch.Tool{
     test_web_fetch,
     test_web_search,
     test_terminal,
+    test_skill_search,
     test_skill,
     test_install_skill,
     test_subagent,
@@ -720,6 +736,7 @@ const test_order = [_][]const u8{
     "create_folder",
     "terminal",
     "subagent",
+    "skill_search",
     "skill",
     "install_skill",
     "mcp_search_tools",
