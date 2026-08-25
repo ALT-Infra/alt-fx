@@ -141,6 +141,7 @@ pub const McpTransport = enum { stdio, http, sse };
 pub const ConfigSource = enum {
     profile,
     acp,
+    workspace,
 };
 
 pub const ConfigScope = enum {
@@ -152,6 +153,23 @@ pub fn sourceAllowsScope(source: ConfigSource, scope: ConfigScope) bool {
     return switch (source) {
         .profile => scope == .profile,
         .acp => scope == .acp_session,
+        .workspace => scope == .profile or scope == .acp_session,
+    };
+}
+
+pub const WorkspaceAdmission = enum {
+    pending,
+    approved,
+    rejected,
+};
+
+pub fn sourceAllowsWorkspaceAdmission(
+    source: ConfigSource,
+    admission: ?WorkspaceAdmission,
+) bool {
+    return switch (source) {
+        .workspace => admission != null,
+        .profile, .acp => admission == null,
     };
 }
 
@@ -184,6 +202,7 @@ pub const McpServerConfig = struct {
     auth: ?McpAuthConfig = null,
     allow_stored_credentials: bool = false,
     enabled: bool = true,
+    workspace_admission: ?WorkspaceAdmission = null,
     startup_timeout_ms: u32 = default_startup_timeout_ms,
     operation_timeout_ms: u32 = default_operation_timeout_ms,
     restart_limit: u8 = default_restart_limit,
@@ -253,8 +272,22 @@ test "MCP server configuration deinit owns present empty targets" {
 test "MCP configuration sources admit only their product scope" {
     try std.testing.expect(sourceAllowsScope(.profile, .profile));
     try std.testing.expect(sourceAllowsScope(.acp, .acp_session));
+    try std.testing.expect(sourceAllowsScope(.workspace, .profile));
+    try std.testing.expect(sourceAllowsScope(.workspace, .acp_session));
     try std.testing.expect(!sourceAllowsScope(.profile, .acp_session));
     try std.testing.expect(!sourceAllowsScope(.acp, .profile));
+}
+
+test "workspace admission is present exactly for workspace source" {
+    for ([_]ConfigSource{ .profile, .acp, .workspace }) |source| {
+        for ([_]?WorkspaceAdmission{ null, .pending, .approved, .rejected }) |admission| {
+            const expected = if (source == .workspace) admission != null else admission == null;
+            try std.testing.expectEqual(
+                expected,
+                sourceAllowsWorkspaceAdmission(source, admission),
+            );
+        }
+    }
 }
 
 pub fn freeOwnedStrings(alloc: Allocator, values: []const []const u8) void {

@@ -480,7 +480,7 @@ const test_entry_context_registry = context_contract.Registry{ .default_provider
     .append_transient_fn = appendNoopTransientContextForTest,
 } };
 
-fn noMcpRuntimeForTest(_: Allocator, _: @import("../mcp/elicitation.zig").Capabilities) !?*mcp_runtime.McpRuntime {
+fn noMcpRuntimeForTest(_: Allocator, _: []const u8, _: @import("../mcp/elicitation.zig").Capabilities) !?*mcp_runtime.McpRuntime {
     return null;
 }
 

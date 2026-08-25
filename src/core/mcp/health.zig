@@ -81,6 +81,7 @@ pub const ServerSnapshot = struct {
     negotiated_version: ?[]u8,
     source: mcp_contract.ConfigSource,
     scope: mcp_contract.ConfigScope,
+    workspace_admission: ?mcp_contract.WorkspaceAdmission = null,
     required: bool,
     transport: mcp_contract.McpTransport,
     protocol_version: ?[]u8,
@@ -164,6 +165,9 @@ pub fn render(alloc: Allocator, snapshot: Snapshot) ![]u8 {
                 @tagName(server.authentication),
             },
         );
+        if (server.workspace_admission) |admission| {
+            try out.writer.print("    admission={s}\n", .{@tagName(admission)});
+        }
         try out.writer.print(
             "    negotiated_name={s} negotiated_version={s} protocol={s}\n",
             .{

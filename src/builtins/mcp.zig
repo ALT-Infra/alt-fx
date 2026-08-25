@@ -6,7 +6,9 @@ const io_mod = @import("../core/shared/io.zig");
 const command_provider_contract = @import("../core/mcp/command_provider.zig");
 const mcp_contract = @import("../core/mcp/mcp_contract.zig");
 const mcp_auth = @import("../core/mcp/mcp_auth.zig");
+const project_config = @import("../core/mcp/project_config.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
+const config_runtime = @import("../core/config/config_runtime.zig");
 const elicitation = @import("../core/mcp/elicitation.zig");
 const streamable_http = @import("../core/mcp/streamable_http.zig");
 const profile_paths = @import("../core/shared/profile_paths.zig");
@@ -72,6 +74,42 @@ fn handleCommand(alloc: Allocator, rest: []const u8, command_request: CommandReq
             .reload = true,
             .report_reload = true,
         };
+    }
+
+    if (std.mem.startsWith(u8, trimmed, "trust ")) {
+        var tokens = std.mem.tokenizeAny(u8, trimmed[6..], " \t");
+        const operation = tokens.next() orelse
+            return lineLiteral(alloc, "Usage: /mcp trust approve|reject <server> | approve-all | reset", false);
+        if (std.mem.eql(u8, operation, "approve-all")) {
+            if (tokens.next() != null) return lineLiteral(alloc, "Usage: /mcp trust approve-all", false);
+            return .{
+                .display = .{ .line = try alloc.dupe(u8, "Approving all project MCP servers for this workspace.") },
+                .project_action = .approve_all,
+            };
+        }
+        if (std.mem.eql(u8, operation, "reset")) {
+            if (tokens.next() != null) return lineLiteral(alloc, "Usage: /mcp trust reset", false);
+            return .{
+                .display = .{ .line = try alloc.dupe(u8, "Resetting project MCP choices for this workspace.") },
+                .project_action = .reset,
+            };
+        }
+        const name = tokens.next() orelse
+            return lineLiteral(alloc, "Usage: /mcp trust approve|reject <server>", false);
+        if (tokens.next() != null) return lineLiteral(alloc, "Usage: /mcp trust approve|reject <server>", false);
+        if (std.mem.eql(u8, operation, "approve")) {
+            return .{
+                .display = .{ .line = try std.fmt.allocPrint(alloc, "Approving project MCP server '{s}'.", .{name}) },
+                .project_action = .{ .approve = name },
+            };
+        }
+        if (std.mem.eql(u8, operation, "reject")) {
+            return .{
+                .display = .{ .line = try std.fmt.allocPrint(alloc, "Rejecting project MCP server '{s}'.", .{name}) },
+                .project_action = .{ .reject = name },
+            };
+        }
+        return lineLiteral(alloc, "Usage: /mcp trust approve|reject <server> | approve-all | reset", false);
     }
 
     if (std.mem.startsWith(u8, trimmed, "auth ")) {
@@ -265,7 +303,7 @@ fn handleCommand(alloc: Allocator, rest: []const u8, command_request: CommandReq
 
     return lineLiteral(
         alloc,
-        "Usage: /mcp [list|resource|prompt|add|remove|path|reload|auth|logout]",
+        "Usage: /mcp [list|resource|prompt|add|remove|path|reload|auth|logout|trust]",
         false,
     );
 }
@@ -401,16 +439,90 @@ pub fn configPathFromHome(alloc: Allocator, home: []const u8) ![]u8 {
 
 pub fn loadRuntime(
     alloc: Allocator,
+    workspace_root: []const u8,
     elicitation_capabilities: elicitation.Capabilities,
 ) !?*mcp_runtime.McpRuntime {
-    const home = io_mod.getenv("HOME") orelse return null;
-    const config_path = try configPathFromHome(alloc, home);
-    defer alloc.free(config_path);
+    var profile: std.ArrayList(McpServerConfig) = .empty;
+    defer freeConfigs(alloc, &profile);
+    if (io_mod.getenv("HOME")) |home| {
+        const config_path = try configPathFromHome(alloc, home);
+        defer alloc.free(config_path);
+        profile = try loadConfigFromPath(alloc, config_path);
+    }
 
-    var configs = try loadConfigFromPath(alloc, config_path);
+    var choice_load = config_runtime.loadProjectMcpChoices(alloc, workspace_root) catch |err| blk: {
+        debug_trace.logf("mcp", "workspace MCP choices unavailable err={s}", .{@errorName(err)});
+        break :blk config_runtime.ProjectMcpChoiceLoad{};
+    };
+    defer choice_load.deinit(alloc);
+    for (choice_load.diagnostics.items) |diagnostic| {
+        debug_trace.logf(
+            "mcp",
+            "workspace MCP choice diagnostic cause={s} server={s}",
+            .{ @tagName(diagnostic.cause), diagnostic.server_name orelse "none" },
+        );
+    }
+
+    var workspace = try loadWorkspaceConfig(
+        alloc,
+        workspace_root,
+        .profile,
+        choice_load.choices,
+    );
+    defer workspace.deinit(alloc);
+    traceWorkspaceDiagnostics(workspace.diagnostics.items);
+
+    var configs = try project_config.mergeNative(alloc, &profile, &workspace.configs);
     defer freeConfigs(alloc, &configs);
-
     return runtimeFromConfigs(alloc, &configs, elicitation_capabilities);
+}
+
+pub fn loadWorkspaceConfig(
+    alloc: Allocator,
+    workspace_root: []const u8,
+    scope: mcp_contract.ConfigScope,
+    choices: project_config.ProjectMcpChoices,
+) !project_config.WorkspaceParseResult {
+    var dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), workspace_root, .{}) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return .{},
+        else => return err,
+    };
+    defer dir.close(io_mod.getIo());
+    var file = io_mod.openExistingRegularFile(dir, ".mcp.json", .read_only) catch |err| switch (err) {
+        error.FileNotFound => return .{},
+        else => {
+            var result: project_config.WorkspaceParseResult = .{};
+            try result.diagnostics.append(alloc, .{ .cause = .invalid_entry });
+            return result;
+        },
+    };
+    defer file.close(io_mod.getIo());
+    const stat = try file.stat(io_mod.getIo());
+    if (stat.size > 1024 * 1024) {
+        var result: project_config.WorkspaceParseResult = .{};
+        try result.diagnostics.append(alloc, .{ .cause = .invalid_entry });
+        return result;
+    }
+    const bytes = io_mod.readFileToEnd(alloc, &file, 1024 * 1024) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            var result: project_config.WorkspaceParseResult = .{};
+            try result.diagnostics.append(alloc, .{ .cause = .invalid_entry });
+            return result;
+        },
+    };
+    defer alloc.free(bytes);
+    return project_config.parseWorkspaceJson(alloc, bytes, scope, choices);
+}
+
+fn traceWorkspaceDiagnostics(diagnostics: []const project_config.WorkspaceDiagnostic) void {
+    for (diagnostics) |diagnostic| {
+        debug_trace.logf(
+            "mcp",
+            "workspace MCP config skipped cause={s} server={s}",
+            .{ @tagName(diagnostic.cause), diagnostic.server_name orelse "none" },
+        );
+    }
 }
 
 pub fn inspectProfileConfig(
@@ -543,36 +655,7 @@ fn removeServerFromPath(alloc: Allocator, path: []const u8, name: []const u8) !b
 }
 
 fn loadConfigFromJson(alloc: Allocator, json_text: []const u8) !std.ArrayList(McpServerConfig) {
-    var configs: std.ArrayList(McpServerConfig) = .empty;
-    errdefer freeConfigs(alloc, &configs);
-
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, json_text, .{}) catch |err| {
-        debug_trace.logf("mcp", "failed to parse config json: {s}", .{@errorName(err)});
-        if (err == error.OutOfMemory) return error.OutOfMemory;
-        return error.McpConfigInvalidJson;
-    };
-    defer parsed.deinit();
-
-    if (parsed.value != .object) {
-        return error.McpConfigRootMustBeObject;
-    }
-
-    const servers = parsed.value.object.get("mcp") orelse return configs;
-    if (servers != .object) {
-        return error.McpConfigServersMustBeObject;
-    }
-
-    var it = servers.object.iterator();
-    while (it.next()) |entry| {
-        const config = try parseServerConfig(alloc, entry.key_ptr.*, entry.value_ptr.*);
-        configs.append(alloc, config) catch |err| {
-            var mutable = config;
-            mutable.deinit(alloc);
-            return err;
-        };
-    }
-
-    return configs;
+    return project_config.parseProfileJson(alloc, json_text);
 }
 
 fn saveConfigsToPath(alloc: Allocator, path: []const u8, configs: []const McpServerConfig) !void {
@@ -1411,7 +1494,7 @@ test "built-in MCP runtime returns null when HOME is missing" {
     const home = try TestHome.install(alloc, null);
     defer home.deinit();
 
-    try std.testing.expect(try loadRuntime(alloc, .{}) == null);
+    try std.testing.expect(try loadRuntime(alloc, "/", .{}) == null);
 }
 
 test "MCP config diagnostic treats nonblocking profile states as clear" {
@@ -1470,7 +1553,7 @@ test "MCP config diagnostic preserves the startup parser error" {
         .clear => return error.TestUnexpectedResult,
         .failed => |err| try std.testing.expectEqual(error.McpConfigInvalidJson, err),
     }
-    try std.testing.expectError(error.McpConfigInvalidJson, loadRuntime(alloc, .{}));
+    try std.testing.expectError(error.McpConfigInvalidJson, loadRuntime(alloc, "/", .{}));
 }
 
 test "MCP config diagnostic propagates allocation failure" {
@@ -1513,7 +1596,7 @@ test "built-in MCP runtime loads disabled configured servers without spawning" {
     const home = try TestHome.install(alloc, home_path);
     defer home.deinit();
 
-    const runtime = try loadRuntime(alloc, .{}) orelse return error.TestUnexpectedResult;
+    const runtime = try loadRuntime(alloc, "/", .{}) orelse return error.TestUnexpectedResult;
     defer {
         runtime.deinit();
         alloc.destroy(runtime);
@@ -1539,7 +1622,7 @@ test "built-in MCP runtime loading leaves enabled servers disconnected" {
     const home = try TestHome.install(alloc, home_path);
     defer home.deinit();
 
-    const runtime = try loadRuntime(alloc, .{}) orelse return error.TestUnexpectedResult;
+    const runtime = try loadRuntime(alloc, "/", .{}) orelse return error.TestUnexpectedResult;
     defer {
         runtime.deinit();
         alloc.destroy(runtime);
@@ -1610,7 +1693,7 @@ test "built-in MCP runtime reserves active registry names" {
     const home = try TestHome.install(alloc, home_path);
     defer home.deinit();
 
-    const runtime = try loadRuntime(alloc, .{}) orelse return error.TestUnexpectedResult;
+    const runtime = try loadRuntime(alloc, "/", .{}) orelse return error.TestUnexpectedResult;
     defer {
         runtime.deinit();
         alloc.destroy(runtime);
@@ -1933,7 +2016,7 @@ test "built-in MCP command preserves usage and missing-home notices" {
     defer generic_usage.deinit(alloc);
     try expectLine(
         generic_usage,
-        "Usage: /mcp [list|resource|prompt|add|remove|path|reload|auth|logout]",
+        "Usage: /mcp [list|resource|prompt|add|remove|path|reload|auth|logout|trust]",
         false,
     );
 }

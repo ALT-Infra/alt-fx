@@ -122,11 +122,11 @@ pub fn prepare(
             config.deinit(alloc);
             return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
-                error.McpConfigScopeMismatch => unreachable,
+                error.McpConfigScopeMismatch, error.McpConfigAdmissionMismatch => unreachable,
             };
         };
     }
-    runtime.connectAll(builtin_tools.registry);
+    runtime.connectAllForAcp(builtin_tools.registry);
 
     for (runtime.servers.items) |server_state| {
         if (server_state.state == .ready) continue;

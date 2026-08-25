@@ -12,6 +12,8 @@ const session_store = @import("../core/session/session_store.zig");
 const js_host_session_store = @import("../core/session/js_host_session_store.zig");
 const session_runtime = @import("../core/session/session.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
+const project_config = @import("../core/mcp/project_config.zig");
+const config_runtime = @import("../core/config/config_runtime.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const provider_set = @import("../core/gateway/provider_set.zig");
 const host = @import("../core/hosts/host.zig");
@@ -141,6 +143,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
             .message = "MCP servers are unavailable in this runtime",
         });
     }
+    if (state.cfg.allow_acp_mcp) try appendProjectMcpConfigs(state, alloc, &mcp_configs);
     var mcp_preparation = try mcp_servers.prepare(
         alloc,
         &mcp_configs,
@@ -456,6 +459,31 @@ fn handleRestoreSession(
         }),
     };
     defer mcp_configs.deinit(alloc);
+    if (!state.cfg.allow_acp_mcp) {
+        if (mcp_configs.items.items.len > 0) {
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_params,
+                .message = "MCP servers are unavailable in this runtime",
+            });
+        }
+    } else {
+        try appendProjectMcpConfigs(state, alloc, &mcp_configs);
+    }
+    if (state.active_session) |*active| {
+        if (sameSessionId(active.session_id, session_id) and
+            active.mcp != null and
+            active.mcp.?.workspaceAuthorityReducedAgainstConfigs(
+                mcp_configs.items.items,
+                .acp_startup,
+            ))
+        {
+            const previous = detachActiveMcpForAuthorityReduction(state, active);
+            previous.retireAndWait();
+            previous.deinit();
+            alloc.destroy(previous);
+            server.enableSubagentHost(state);
+        }
+    }
     var mcp_preparation = try mcp_servers.prepare(
         alloc,
         &mcp_configs,
@@ -642,6 +670,98 @@ fn handleRestoreSession(
         alloc,
         msg,
         state.active_session.?.model,
+    );
+}
+
+fn detachActiveMcpForAuthorityReduction(
+    state: *server.ServerState,
+    active: *server.ActiveSessionState,
+) *mcp_runtime.McpRuntime {
+    server.cancelAndReapActivePrompt(state);
+    server.disableSubagentHost(state);
+    state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
+    const previous = active.mcp.?;
+    active.mcp = null;
+    state.subagent_authority_mutex.unlock(io_mod.getIo());
+    return previous;
+}
+
+fn appendProjectMcpConfigs(
+    state: *server.ServerState,
+    alloc: Allocator,
+    configs: *mcp_servers.OwnedServerConfigs,
+) !void {
+    var choices = if (state.cfg.home_override) |home|
+        config_runtime.loadProjectMcpChoicesFromHome(alloc, home, state.workspace_root) catch |err| blk: {
+            debug_trace.logf("mcp", "ACP workspace MCP choices unavailable err={s}", .{@errorName(err)});
+            break :blk config_runtime.ProjectMcpChoiceLoad{};
+        }
+    else
+        config_runtime.loadProjectMcpChoices(alloc, state.workspace_root) catch |err| blk: {
+            debug_trace.logf("mcp", "ACP workspace MCP choices unavailable err={s}", .{@errorName(err)});
+            break :blk config_runtime.ProjectMcpChoiceLoad{};
+        };
+    defer choices.deinit(alloc);
+
+    var workspace = try readProjectMcpConfig(
+        alloc,
+        state.workspace_root,
+        choices.choices,
+    );
+    defer workspace.deinit(alloc);
+    for (workspace.diagnostics.items) |diagnostic| {
+        debug_trace.logf(
+            "mcp",
+            "ACP workspace MCP config skipped cause={s} server={s}",
+            .{ @tagName(diagnostic.cause), diagnostic.server_name orelse "none" },
+        );
+    }
+    try project_config.appendWorkspaceAfterAcpPrimary(
+        alloc,
+        &configs.items,
+        &workspace.configs,
+    );
+}
+
+fn readProjectMcpConfig(
+    alloc: Allocator,
+    workspace_root: []const u8,
+    choices: project_config.ProjectMcpChoices,
+) !project_config.WorkspaceParseResult {
+    var dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), workspace_root, .{}) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return .{},
+        else => return err,
+    };
+    defer dir.close(io_mod.getIo());
+    var file = io_mod.openExistingRegularFile(dir, ".mcp.json", .read_only) catch |err| switch (err) {
+        error.FileNotFound => return .{},
+        else => {
+            var result: project_config.WorkspaceParseResult = .{};
+            try result.diagnostics.append(alloc, .{ .cause = .invalid_entry });
+            return result;
+        },
+    };
+    defer file.close(io_mod.getIo());
+    const stat = try file.stat(io_mod.getIo());
+    if (stat.size > 1024 * 1024) {
+        var result: project_config.WorkspaceParseResult = .{};
+        try result.diagnostics.append(alloc, .{ .cause = .invalid_entry });
+        return result;
+    }
+    const bytes = io_mod.readFileToEnd(alloc, &file, 1024 * 1024) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            var result: project_config.WorkspaceParseResult = .{};
+            try result.diagnostics.append(alloc, .{ .cause = .invalid_entry });
+            return result;
+        },
+    };
+    defer alloc.free(bytes);
+    return project_config.parseWorkspaceJson(
+        alloc,
+        bytes,
+        .acp_session,
+        choices,
     );
 }
 

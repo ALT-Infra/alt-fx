@@ -2115,6 +2115,72 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP session/new loads pending workspace MCP without persisting approval",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-project-mcp-");
+      const pidPath = join(root.root, "project-mcp.pid");
+      const wirePath = join(root.root, "project-mcp-wire.jsonl");
+      writeFileSync(
+        join(root.workspace, ".mcp.json"),
+        JSON.stringify({
+          mcpServers: {
+            fixture: {
+              command: process.execPath,
+              args: [MCP_STDIO_FIXTURE],
+              env: {
+                FX_MCP_RESULT_TEXT: "ACP_PROJECT_MCP_RESULT",
+                FX_MCP_PID_PATH: pidPath,
+                FX_MCP_WIRE_LOG: wirePath,
+              },
+            },
+          },
+        }),
+      );
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("select_project", "mcp_select_tool", {
+          name: MCP_TOOL_NAME,
+        }),
+        fakeGatewayToolCall("call_project", MCP_TOOL_NAME, { text: "acp" }),
+        finalText("ACP project MCP complete"),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request(
+          "session/new",
+          { cwd: root.workspace, mcpServers: [] },
+          2,
+        ) as any;
+        expect(created.error).toBeUndefined();
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "code" }, 3);
+        await runMcpToolPrompt(
+          client,
+          gateway,
+          "call_project",
+          "ACP_PROJECT_MCP_RESULT",
+        );
+        expect(existsSync(pidPath)).toBe(true);
+        const settingsPath = join(root.home, ".fx", "settings.json");
+        if (existsSync(settingsPath)) {
+          expect(readFileSync(settingsPath, "utf8"))
+            .not.toContain("enabledMcpjsonServers");
+        }
+      } finally {
+        await client?.close();
+        client = null;
+        gateway.stop();
+        if (existsSync(pidPath)) await expectMcpProcessExited(pidPath);
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "ACP routes legacy HTTP and SSE configs through new load resume and close",
     async () => {
       const root = createIsolatedRoot("fx-acp-mcp-legacy-remote-");

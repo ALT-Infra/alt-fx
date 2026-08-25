@@ -589,6 +589,16 @@ function createRoot(
   return { root, home, workspace, bin, trace, openLog, stderr };
 }
 
+function moveAuthFixtureToWorkspace(root: ReturnType<typeof createRoot>): void {
+  const profilePath = join(root.home, ".fx", "mcp.json");
+  const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+  writeFileSync(
+    join(root.workspace, ".mcp.json"),
+    JSON.stringify({ mcpServers: { fixture: profile.mcp.fixture } }),
+  );
+  writeFileSync(profilePath, JSON.stringify({ mcp: {} }));
+}
+
 function baseEnv(root: ReturnType<typeof createRoot>) {
   return {
     HOME: root.home,
@@ -1854,6 +1864,51 @@ describe("MCP remote authentication lifecycle", () => {
       expect(readFileSync(root.stderr, "utf8")).toBe("");
     },
     30_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "pending workspace authentication is blocked and logout deletes local credentials only",
+    async () => {
+      upstream = startModernMcpHttpFixture("json");
+      auth = startAuthFixture(upstream.url);
+      const root = createRoot(auth, true, "http", auth.url, false);
+      moveAuthFixtureToWorkspace(root);
+      const credentialPath = seedExpiredCredentials(
+        root,
+        auth,
+        Date.now() + 3_600_000,
+      );
+      gateway = startFakeGateway([], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        env: {
+          ...baseEnv(root),
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        },
+        width: 120,
+        height: 34,
+        stderrPath: root.stderr,
+      });
+      await tui.waitForComposer(15_000);
+      await tui.waitForText("Project MCP servers pending approval: fixture", 10_000);
+
+      await tui.sendText("/mcp auth fixture --open");
+      await tui.waitForText("McpWorkspaceApprovalRequired", 10_000);
+      expect(existsSync(root.openLog)).toBe(false);
+      expect(auth.authorizationRequests).toBe(0);
+      expect(existsSync(credentialPath)).toBe(true);
+
+      await tui.sendText("/mcp logout fixture");
+      await tui.waitForText("Logged out of MCP server 'fixture'", 10_000);
+      expect(existsSync(credentialPath)).toBe(false);
+      expect(auth.revocations).toBe(0);
+      expect(auth.requests).toHaveLength(0);
+    },
+    35_000,
   );
 
   test.skipIf(!tmuxAvailable())(

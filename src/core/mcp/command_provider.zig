@@ -1,4 +1,5 @@
 const std = @import("std");
+const project_config = @import("project_config.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -100,6 +101,7 @@ pub const Result = struct {
     display: Display,
     reload: bool = false,
     report_reload: bool = false,
+    project_action: ?project_config.ProjectMcpAction = null,
 
     pub fn deinit(self: Result, alloc: Allocator) void {
         switch (self.display) {

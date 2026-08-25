@@ -1175,6 +1175,53 @@ pub fn Handlers(comptime App: type) type {
             var reload_notice: ?[]u8 = null;
             defer if (reload_notice) |notice| app.alloc.free(notice);
             var reload_warning = false;
+            if (result.project_action) |action| {
+                if (comptime !@hasField(App, "workspace_root") or
+                    !@hasDecl(App, "beginMcpAuthorityReduction"))
+                {
+                    return error.McpProjectChoicesUnavailable;
+                } else {
+                    const reducing_requested = switch (action) {
+                        .reject, .reset => true,
+                        .approve, .approve_all => false,
+                    };
+                    var attempt = config_runtime.attemptProjectMcpMutation(
+                        app.alloc,
+                        app.workspace_root,
+                        action,
+                    );
+                    defer attempt.deinit(app.alloc);
+                    switch (attempt) {
+                        .outcome => |outcome| switch (outcome) {
+                            .unchanged => {},
+                            .committed => |committed| {
+                                if (committed.authority_reduced) {
+                                    try app.beginMcpAuthorityReduction(true);
+                                } else {
+                                    try app.beginMcpReload();
+                                }
+                            },
+                        },
+                        .failure => |failure| {
+                            if (failure.err == error.SettingsCommitIndeterminate and reducing_requested) {
+                                try app.beginMcpAuthorityReduction(false);
+                                reload_warning = true;
+                                reload_notice = try app.alloc.dupe(
+                                    u8,
+                                    "Project MCP choices may have been saved, so live MCP authority was retired. Run /mcp reload after checking settings.json.",
+                                );
+                            } else {
+                                reload_warning = true;
+                                reload_notice = try std.fmt.allocPrint(
+                                    app.alloc,
+                                    "Project MCP choices were not applied: {s}.",
+                                    .{@errorName(failure.err)},
+                                );
+                            }
+                        },
+                    }
+                }
+            }
             if (result.reload) {
                 app.beginMcpReload() catch |err| {
                     reload_warning = true;

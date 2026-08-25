@@ -572,6 +572,7 @@ const App = struct {
     metrics: Metrics = .{},
     fn loadNoMcpRuntime(
         _: Allocator,
+        _: []const u8,
         _: @import("core/mcp/elicitation.zig").Capabilities,
     ) !?*mcp_runtime_mod.McpRuntime {
         return null;
@@ -1408,11 +1409,27 @@ const App = struct {
     pub fn beginMcpReload(self: *App) !void {
         return self.mcp.beginReload(
             self.alloc,
+            self.workspace_root,
             .{ .form = true, .url = true },
             if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
             self.toolRegistry(),
             @intCast(@max(io_mod.milliTimestamp(), 0)),
         );
+    }
+
+    pub fn beginMcpAuthorityReduction(self: *App, rebuild: bool) !void {
+        return self.mcp.beginAuthorityReduction(
+            self.alloc,
+            self.workspace_root,
+            .{ .form = true, .url = true },
+            if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
+            self.toolRegistry(),
+            @intCast(@max(io_mod.milliTimestamp(), 0)),
+            rebuild,
+        ) catch |err| {
+            self.mcp.retireAuthoritySynchronously(self.alloc);
+            return err;
+        };
     }
 
     pub fn startMcpAuthentication(
@@ -1445,6 +1462,10 @@ const App = struct {
 
     pub fn startMcpDiscovery(self: *App) void {
         self.mcp.startDiscovery(self.toolRegistry());
+    }
+
+    pub fn pendingWorkspaceMcpNames(self: *App, alloc: Allocator) ![][]u8 {
+        return self.mcp.pendingWorkspaceNames(alloc);
     }
 
     fn effectiveToolSet(self: *const App) tool_set_contract.ToolSet {

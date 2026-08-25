@@ -160,12 +160,28 @@ The interactive agent can also install skills via the `install_skill` tool when 
 fx negotiates MCP `2026-07-28` over local stdio and stateless Streamable HTTP.
 Version-scoped adapters retain legacy stdio,
 `2025-11-25`/`2025-06-18`/`2025-03-26` Streamable HTTP, and deprecated
-`2024-11-05` HTTP+SSE. Native sessions load runnable MCP configuration only
-from the trusted profile:
+`2024-11-05` HTTP+SSE. Native sessions load trusted MCP configuration from the
+profile:
 
 * `~/.fx/mcp.json`
 
+They also read Claude-compatible workspace configuration from:
+
+* `<workspace>/.mcp.json`
+
 Project `.fx.json` does not define runnable MCP commands, URLs, env, or secrets.
+The profile file keeps fx's top-level `mcp` contract. The workspace file reads
+only top-level `mcpServers`, accepts `command` plus `args`, and is opened as a
+bounded no-follow regular file. Profile entries win native name collisions;
+ACP request entries win ACP name collisions without deduplicating the request
+array. Workspace entries are always optional and never load stored credentials.
+
+Interactive sessions keep pending and rejected workspace servers disconnected.
+Choices live only in profile `settings.json` under the canonical workspace key,
+using `enabledMcpjsonServers`, `disabledMcpjsonServers`, and
+`enableAllProjectMcpServers`. Repository files cannot persist their own
+approval. `fx ask` and ACP connect pending workspace servers without persisting
+approval; rejected servers remain disabled.
 
 The core feature surface is Tools, Resources and Resource Templates, Prompts,
 Completion, pagination, cache-aware discovery, subscriptions, progress,
@@ -206,6 +222,14 @@ The interactive surface supports:
 * `/mcp auth <name> --open`
 
 * `/mcp logout <name>`
+
+* `/mcp trust approve <name>`
+
+* `/mcp trust reject <name>`
+
+* `/mcp trust approve-all`
+
+* `/mcp trust reset`
 
 * `/mcp path`
 

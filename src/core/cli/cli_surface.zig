@@ -5176,7 +5176,7 @@ const test_surface_context_registry = context_contract.Registry{ .default_provid
     .append_transient_fn = appendNoopTransientContextForTest,
 } };
 
-fn noMcpRuntimeForTest(_: Allocator, _: @import("../mcp/elicitation.zig").Capabilities) !?*mcp_runtime.McpRuntime {
+fn noMcpRuntimeForTest(_: Allocator, _: []const u8, _: @import("../mcp/elicitation.zig").Capabilities) !?*mcp_runtime.McpRuntime {
     return null;
 }
 
@@ -5198,6 +5198,7 @@ fn failingMcpConfigInspectionForTest(
 
 fn countingMcpRuntimeForTest(
     _: Allocator,
+    _: []const u8,
     _: @import("../mcp/elicitation.zig").Capabilities,
 ) !?*mcp_runtime.McpRuntime {
     mcp_runtime_load_calls_for_test += 1;

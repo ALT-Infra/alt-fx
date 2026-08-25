@@ -224,6 +224,21 @@ function createRoot(
   };
 }
 
+function moveProfileFixtureToWorkspace(root: FixtureRoot): void {
+  const profilePath = join(root.home, ".fx", "mcp.json");
+  const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+  const fixture = profile.mcp.fixture;
+  if (Array.isArray(fixture.command)) {
+    fixture.args = fixture.command.slice(1);
+    fixture.command = fixture.command[0];
+  }
+  writeFileSync(
+    join(root.workspace, ".mcp.json"),
+    JSON.stringify({ mcpServers: { fixture } }),
+  );
+  writeFileSync(profilePath, JSON.stringify({ mcp: {} }));
+}
+
 function fixtureEnv(root: FixtureRoot, activeGateway: ReturnType<typeof startFakeGateway>) {
   return {
     HOME: root.home,
@@ -473,6 +488,88 @@ describe("modern MCP stdio compatibility", () => {
       projectEndpoint.stop(true);
     }
   }, 20_000);
+
+  test("fx ask loads pending workspace MCP without persisting approval", async () => {
+    const root = createRoot("workspace-ask", MODERN_FIXTURE);
+    moveProfileFixtureToWorkspace(root);
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("workspace_select", "mcp_select_tool", { name: TOOL_NAME }),
+      fakeGatewayToolCall("workspace_call", TOOL_NAME, { text: "workspace" }),
+      fakeGatewayFinalText("WORKSPACE_MCP_READY"),
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Use the workspace MCP."],
+      {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway),
+        timeoutMs: 20_000,
+      },
+    );
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("WORKSPACE_MCP_READY");
+    expect(result.stderr).toContain("loaded project MCP servers: fixture");
+    expect(readWire(root.wireLogPath).some((entry) =>
+      entry.message.method === "tools/call"
+    )).toBe(true);
+    const settings = readFileSync(join(root.home, ".fx", "settings.json"), "utf8");
+    expect(settings).not.toContain("enabledMcpjsonServers");
+    expect(settings).not.toContain("enableAllProjectMcpServers");
+    await expectFixtureProcessesExited(readWire(root.wireLogPath));
+  }, 25_000);
+
+  test.skipIf(process.platform === "win32" || !tmuxAvailable())(
+    "interactive workspace MCP stays inert until approved and retires after rejection",
+    async () => {
+      const root = createRoot("workspace-interactive", MODERN_FIXTURE, {
+        recordLaunchAttempts: true,
+      });
+      moveProfileFixtureToWorkspace(root);
+      gateway = startFakeGateway([
+        fakeGatewayFinalText("workspace gateway should remain unused"),
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 140,
+        height: 36,
+        env: fixtureEnv(root, gateway),
+      });
+
+      await tui.waitForComposer(15_000);
+      await tui.waitForText("Project MCP servers pending approval: fixture", 10_000);
+      expect(existsSync(root.launchLogPath)).toBe(false);
+      await tui.sendText("/mcp list");
+      let pane = await tui.waitForText("admission=pending", 10_000);
+      expect(pane).toContain("source=workspace");
+      expect(pane).toContain("state=disabled");
+
+      await tui.sendText("/mcp trust approve fixture");
+      await tui.waitForText("MCP configuration reloaded successfully", 15_000);
+      await tui.sendText("/mcp list");
+      pane = await tui.waitForText("admission=approved", 10_000);
+      expect(pane).toContain("state=ready");
+      expect(readFileSync(join(root.home, ".fx", "settings.json"), "utf8"))
+        .toContain("enabledMcpjsonServers");
+
+      await tui.sendText("/mcp trust reject fixture");
+      await tui.waitForText("MCP configuration reloaded successfully", 15_000);
+      await tui.sendText("/mcp list");
+      pane = await tui.waitForText("admission=rejected", 10_000);
+      expect(pane).toContain("state=disabled");
+      expect(readFileSync(join(root.home, ".fx", "settings.json"), "utf8"))
+        .toContain("disabledMcpjsonServers");
+
+      await tui.kill();
+      tui = null;
+      await expectFixtureProcessesExited(readWire(root.wireLogPath));
+    },
+    50_000,
+  );
 
   test("fresh and resumed native sessions reconstruct MCP from the current profile", async () => {
     const root = createRoot("resume-current-profile", MODERN_FIXTURE);
