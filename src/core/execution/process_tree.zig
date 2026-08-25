@@ -3,8 +3,58 @@ const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 
 const Allocator = std.mem.Allocator;
-pub const command_process_token_env_prefix = "FX_INTERNAL_COMMAND_PROCESS_TOKEN_";
-const max_darwin_process_args_bytes = 1024 * 1024;
+const max_darwin_process_fds: usize = std.c.OPEN_MAX;
+
+const DarwinPipeIdentity = struct {
+    handle: u64,
+    peer_handle: u64,
+
+    fn eql(self: DarwinPipeIdentity, other: DarwinPipeIdentity) bool {
+        return self.handle == other.handle and self.peer_handle == other.peer_handle;
+    }
+};
+
+/// Kernel-owned command membership that survives environment replacement,
+/// exec, process-group changes, and forks. The caller owns `deinit`.
+pub const DarwinProcessWitness = struct {
+    supervisor_fd: ?std.posix.fd_t,
+    child_fd: ?std.posix.fd_t,
+    identity: DarwinPipeIdentity,
+
+    pub fn init() !DarwinProcessWitness {
+        if (comptime builtin.os.tag != .macos) return error.ProcessTreeUnsupported;
+        var pipe: [2]std.posix.fd_t = undefined;
+        switch (std.posix.errno(std.posix.system.pipe(&pipe))) {
+            .SUCCESS => {},
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
+        errdefer closeFd(pipe[0]);
+        errdefer closeFd(pipe[1]);
+        try setCloseOnExec(pipe[0]);
+        try setCloseOnExec(pipe[1]);
+        return .{
+            .supervisor_fd = pipe[0],
+            .child_fd = pipe[1],
+            .identity = try captureDarwinPipeIdentity(std.c.getpid(), pipe[1]),
+        };
+    }
+
+    pub fn childFd(self: DarwinProcessWitness) std.posix.fd_t {
+        return self.child_fd orelse unreachable;
+    }
+
+    pub fn closeChildCopy(self: *DarwinProcessWitness) void {
+        const fd = self.child_fd orelse return;
+        closeFd(fd);
+        self.child_fd = null;
+    }
+
+    pub fn deinit(self: *DarwinProcessWitness) void {
+        if (self.child_fd) |fd| closeFd(fd);
+        if (self.supervisor_fd) |fd| closeFd(fd);
+        self.* = undefined;
+    }
+};
 
 const Identity = union(enum) {
     linux_start_ticks: u64,
@@ -70,8 +120,8 @@ pub const Tracker = struct {
     processes: std.ArrayList(TrackedProcess) = .empty,
     macos_child_buffer: []std.posix.pid_t = &.{},
     macos_pid_buffer: []std.posix.pid_t = &.{},
-    macos_args_buffer: []u8 = &.{},
-    darwin_process_marker: ?[]u8 = null,
+    macos_fd_buffer: []Darwin.ProcFdInfo = &.{},
+    darwin_process_witness: ?DarwinPipeIdentity = null,
     macos_root_started_at_us: ?u64 = null,
 
     pub fn init(alloc: Allocator) !Tracker {
@@ -108,25 +158,16 @@ pub const Tracker = struct {
         if (self.macos_pid_buffer.len > 0) {
             self.alloc.free(self.macos_pid_buffer);
         }
-        if (self.macos_args_buffer.len > 0) self.alloc.free(self.macos_args_buffer);
-        if (self.darwin_process_marker) |marker| self.alloc.free(marker);
+        if (self.macos_fd_buffer.len > 0) self.alloc.free(self.macos_fd_buffer);
         self.* = undefined;
     }
 
-    pub fn bindProcessEnvironment(
+    pub fn bindProcessWitness(
         self: *Tracker,
-        name: []const u8,
-        value: []const u8,
-    ) !void {
+        witness: *const DarwinProcessWitness,
+    ) void {
         if (comptime builtin.os.tag != .macos) return;
-        const marker = try self.alloc.alloc(
-            u8,
-            name.len + 1 + value.len,
-        );
-        @memcpy(marker[0..name.len], name);
-        marker[name.len] = '=';
-        @memcpy(marker[name.len + 1 ..], value);
-        self.darwin_process_marker = marker;
+        self.darwin_process_witness = witness.identity;
     }
 
     pub fn refresh(self: *Tracker, root_pid: std.posix.pid_t) !void {
@@ -439,7 +480,7 @@ pub const Tracker = struct {
         )) return false;
         const parent_unique_id = snapshot.parent_unique_id orelse return false;
         if (!self.containsMacOSUniqueId(parent_unique_id) and
-            !try self.processHasBoundToken(pid))
+            !try self.processHasBoundWitness(pid))
         {
             return false;
         }
@@ -459,30 +500,33 @@ pub const Tracker = struct {
         return true;
     }
 
-    fn processHasBoundToken(self: *Tracker, pid: std.posix.pid_t) !bool {
+    fn processHasBoundWitness(self: *Tracker, pid: std.posix.pid_t) !bool {
         if (comptime builtin.os.tag != .macos) return false;
-        const marker = self.darwin_process_marker orelse return false;
-        if (self.macos_args_buffer.len == 0) {
-            self.macos_args_buffer = try self.alloc.alloc(
-                u8,
-                max_darwin_process_args_bytes,
+        const expected = self.darwin_process_witness orelse return false;
+        if (self.macos_fd_buffer.len == 0) {
+            self.macos_fd_buffer = try self.alloc.alloc(
+                Darwin.ProcFdInfo,
+                max_darwin_process_fds,
             );
         }
-        var args_len = self.macos_args_buffer.len;
-        const mib = [_]c_int{ Darwin.ctl_kern, Darwin.kern_proc_args_2, pid };
-        const result = std.c.sysctl(
-            &mib,
-            @intCast(mib.len),
-            self.macos_args_buffer.ptr,
-            &args_len,
-            null,
+        const read_len = Darwin.proc_pidinfo(
+            pid,
+            Darwin.proc_pid_list_fds,
             0,
+            self.macos_fd_buffer.ptr,
+            @intCast(self.macos_fd_buffer.len * @sizeOf(Darwin.ProcFdInfo)),
         );
-        if (result != 0) return false;
-        return processEnvironmentContainsMarker(
-            self.macos_args_buffer[0..args_len],
-            marker,
+        if (read_len <= 0) return false;
+        const fd_count = @min(
+            @as(usize, @intCast(read_len)) / @sizeOf(Darwin.ProcFdInfo),
+            self.macos_fd_buffer.len,
         );
+        for (self.macos_fd_buffer[0..fd_count]) |fd| {
+            if (fd.proc_fd < 0 or fd.proc_fdtype != Darwin.prox_fd_type_pipe) continue;
+            const actual = captureDarwinPipeIdentity(pid, fd.proc_fd) catch continue;
+            if (expected.eql(actual)) return true;
+        }
+        return false;
     }
 
     fn containsMacOSUniqueId(self: *Tracker, unique_id: u64) bool {
@@ -503,46 +547,46 @@ fn identityHasMacOSUniqueId(identity: Identity, unique_id: u64) bool {
     };
 }
 
-fn processEnvironmentContainsMarker(
-    process_args: []const u8,
-    marker: []const u8,
-) bool {
-    if (marker.len == 0 or process_args.len < @sizeOf(c_int)) return false;
-    if (std.mem.find(u8, process_args, marker) == null) return false;
-    const argc = std.mem.readInt(
-        c_int,
-        process_args[0..@sizeOf(c_int)],
-        builtin.target.cpu.arch.endian(),
+fn setCloseOnExec(fd: std.posix.fd_t) !void {
+    while (true) switch (std.posix.errno(std.posix.system.fcntl(
+        fd,
+        std.posix.F.SETFD,
+        @as(usize, std.posix.FD_CLOEXEC),
+    ))) {
+        .SUCCESS => return,
+        .INTR => continue,
+        else => return error.FileControlFailed,
+    };
+}
+
+fn closeFd(fd: std.posix.fd_t) void {
+    switch (std.posix.errno(std.posix.system.close(fd))) {
+        .SUCCESS, .INTR => {},
+        else => {},
+    }
+}
+
+fn captureDarwinPipeIdentity(
+    pid: std.posix.pid_t,
+    fd: std.posix.fd_t,
+) !DarwinPipeIdentity {
+    if (comptime builtin.os.tag != .macos) return error.ProcessTreeUnsupported;
+    var info: Darwin.PipeFdInfo = undefined;
+    const read_len = Darwin.proc_pidfdinfo(
+        pid,
+        fd,
+        Darwin.proc_pid_fd_pipe_info,
+        &info,
+        @sizeOf(Darwin.PipeFdInfo),
     );
-    if (argc < 0) return false;
-
-    var cursor: usize = @sizeOf(c_int);
-    const executable_end = std.mem.findScalar(u8, process_args[cursor..], 0) orelse
-        return false;
-    cursor += executable_end + 1;
-    while (cursor < process_args.len and process_args[cursor] == 0) : (cursor += 1) {}
-
-    var remaining_args: usize = @intCast(argc);
-    while (remaining_args > 0) : (remaining_args -= 1) {
-        if (cursor >= process_args.len) return false;
-        const argument_end = std.mem.findScalar(u8, process_args[cursor..], 0) orelse
-            return false;
-        cursor += argument_end + 1;
+    if (read_len == 0) return error.ProcessNotFound;
+    if (read_len != @sizeOf(Darwin.PipeFdInfo)) {
+        return error.ProcessIdentityUnavailable;
     }
-
-    while (cursor < process_args.len) {
-        if (process_args[cursor] == 0) {
-            cursor += 1;
-            continue;
-        }
-        const field_end = std.mem.findScalar(u8, process_args[cursor..], 0) orelse
-            return false;
-        if (std.mem.eql(u8, process_args[cursor .. cursor + field_end], marker)) {
-            return true;
-        }
-        cursor += field_end + 1;
-    }
-    return false;
+    return .{
+        .handle = info.pipeinfo.pipe_handle,
+        .peer_handle = info.pipeinfo.pipe_peerhandle,
+    };
 }
 
 fn couldBelongByStart(root_started_at_us: ?u64, candidate_started_at_us: ?u64) bool {
@@ -885,8 +929,59 @@ const Darwin = struct {
     // Stable libproc process-identity flavor; the SDK omits this constant from
     // its public header, but XNU defines the record as API with a fixed size.
     const proc_pid_unique_identifier_info: c_int = 17;
-    const ctl_kern: c_int = 1;
-    const kern_proc_args_2: c_int = 49;
+    const proc_pid_list_fds: c_int = 1;
+    const proc_pid_fd_pipe_info: c_int = 6;
+    const prox_fd_type_pipe: u32 = 6;
+
+    const ProcFdInfo = extern struct {
+        proc_fd: i32,
+        proc_fdtype: u32,
+    };
+
+    const ProcFileInfo = extern struct {
+        fi_openflags: u32,
+        fi_status: u32,
+        fi_offset: i64,
+        fi_type: i32,
+        fi_guardflags: u32,
+    };
+
+    const VinfoStat = extern struct {
+        vst_dev: u32,
+        vst_mode: u16,
+        vst_nlink: u16,
+        vst_ino: u64,
+        vst_uid: u32,
+        vst_gid: u32,
+        vst_atime: i64,
+        vst_atimensec: i64,
+        vst_mtime: i64,
+        vst_mtimensec: i64,
+        vst_ctime: i64,
+        vst_ctimensec: i64,
+        vst_birthtime: i64,
+        vst_birthtimensec: i64,
+        vst_size: i64,
+        vst_blocks: i64,
+        vst_blksize: i32,
+        vst_flags: u32,
+        vst_gen: u32,
+        vst_rdev: u32,
+        vst_qspare: [2]i64,
+    };
+
+    const PipeInfo = extern struct {
+        pipe_stat: VinfoStat,
+        pipe_handle: u64,
+        pipe_peerhandle: u64,
+        pipe_status: i32,
+        rfu_1: i32,
+    };
+
+    const PipeFdInfo = extern struct {
+        pfi: ProcFileInfo,
+        pipeinfo: PipeInfo,
+    };
 
     const ProcUniqueIdentifierInfo = extern struct {
         p_uuid: [16]u8,
@@ -941,6 +1036,14 @@ const Darwin = struct {
         buffer: *anyopaque,
         buffersize: c_int,
     ) c_int;
+
+    extern "c" fn proc_pidfdinfo(
+        pid: c_int,
+        fd: c_int,
+        flavor: c_int,
+        buffer: *anyopaque,
+        buffersize: c_int,
+    ) c_int;
 };
 
 test "tracked identity distinguishes process instances" {
@@ -950,32 +1053,7 @@ test "tracked identity distinguishes process instances" {
     try std.testing.expect(!linux.eql(.{ .macos_unique_id = 42 }));
 }
 
-test "process marker admits only exact environment field" {
-    const marker = "FX_INTERNAL_COMMAND_PROCESS_TOKEN_abc123=1";
-    const outer_marker = "FX_INTERNAL_COMMAND_PROCESS_TOKEN_outer=1";
-    try std.testing.expect(processEnvironmentContainsMarker(
-        "\x02\x00\x00\x00/bin/zsh\x00\x00zsh\x00arg\x00" ++ outer_marker ++ "\x00" ++ marker ++ "\x00OTHER=value\x00",
-        marker,
-    ));
-    try std.testing.expect(processEnvironmentContainsMarker(
-        "\x02\x00\x00\x00/bin/zsh\x00\x00zsh\x00arg\x00" ++ outer_marker ++ "\x00" ++ marker ++ "\x00OTHER=value\x00",
-        outer_marker,
-    ));
-    try std.testing.expect(!processEnvironmentContainsMarker(
-        "\x03\x00\x00\x00/bin/zsh\x00\x00zsh\x00arg\x00" ++ marker ++ "\x00OTHER=value\x00",
-        marker,
-    ));
-    try std.testing.expect(!processEnvironmentContainsMarker(
-        "\x02\x00\x00\x00/bin/zsh\x00\x00zsh\x00arg\x00prefix" ++ marker ++ "\x00",
-        marker,
-    ));
-    try std.testing.expect(!processEnvironmentContainsMarker(
-        "\x02\x00\x00\x00/bin/zsh\x00\x00zsh\x00arg\x00" ++ marker ++ "suffix\x00",
-        marker,
-    ));
-}
-
-test "Darwin token scan excludes processes older than command root" {
+test "Darwin witness scan excludes processes older than command root" {
     try std.testing.expect(couldBelongByStart(null, null));
     try std.testing.expect(!couldBelongByStart(100, null));
     try std.testing.expect(!couldBelongByStart(100, 99));

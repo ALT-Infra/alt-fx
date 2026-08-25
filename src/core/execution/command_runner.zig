@@ -16,6 +16,7 @@ const artifact_digest = @import("../session/artifact_digest.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const shell_resolver = @import("../terminal/shell_resolver.zig");
+const darwin_process_spawn = @import("../shared/darwin_process_spawn.zig");
 
 const Allocator = std.mem.Allocator;
 pub const CommandOutputStream = command_contract.CommandOutputStream;
@@ -146,36 +147,34 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
     if (comptime builtin.os.tag == .linux) {
         _ = try std.posix.prctl(.SET_CHILD_SUBREAPER, .{@as(usize, 1)});
     }
-    var target_environment: ?std.process.Environ.Map = null;
-    defer if (target_environment) |*environment| environment.deinit();
-    var process_token_bytes: [foreground_session_failure_nonce_bytes]u8 = undefined;
-    var process_environment_name: ?[]const u8 = null;
-    if (comptime builtin.os.tag == .macos) {
-        zio.random(&process_token_bytes);
-        const process_token = std.fmt.bytesToHex(process_token_bytes, .lower);
-        process_environment_name = try std.fmt.allocPrint(
-            std.heap.page_allocator,
-            "{s}{s}",
-            .{ process_tree.command_process_token_env_prefix, &process_token },
-        );
-        target_environment = try io_mod.cloneEnvironMap(std.heap.page_allocator);
-        try target_environment.?.put(process_environment_name.?, "1");
-    }
-    defer if (process_environment_name) |name| std.heap.page_allocator.free(name);
-    var target = std.process.spawn(zio, .{
+    var process_witness: ?process_tree.DarwinProcessWitness =
+        if (comptime builtin.os.tag == .macos)
+            try .init()
+        else
+            null;
+    defer if (process_witness) |*witness| witness.deinit();
+    const spawn_options: std.process.SpawnOptions = .{
         .argv = args[2..],
-        .environ_map = if (target_environment) |*environment| environment else null,
         .stdin = .inherit,
         .stdout = .inherit,
         .stderr = .inherit,
         .start_suspended = builtin.os.tag == .macos,
-    }) catch |err| {
+    };
+    var target = (if (comptime builtin.os.tag == .macos)
+        darwin_process_spawn.spawn_inheriting_fd(
+            zio,
+            spawn_options,
+            process_witness.?.childFd(),
+        )
+    else
+        std.process.spawn(zio, spawn_options)) catch |err| {
         writeForegroundSessionReplaceFailure(failure_nonce, err);
         std.process.exit(foreground_session_replace_failure_exit_code);
     };
+    if (process_witness) |*witness| witness.closeChildCopy();
     const term = waitForForegroundTarget(
         &target,
-        process_environment_name,
+        if (process_witness) |*witness| witness else null,
         deadline_ms,
     ) catch |err| {
         target.kill(zio);
@@ -250,14 +249,14 @@ fn foregroundRequestAtDeadline(
 
 fn waitForForegroundTarget(
     target: *std.process.Child,
-    process_environment_name: ?[]const u8,
+    process_witness: ?*const process_tree.DarwinProcessWitness,
     deadline_ms: ?i64,
 ) !std.process.Child.Term {
     const target_pid = target.id orelse return error.ForegroundTargetMissing;
     var descendants = try process_tree.Tracker.init(std.heap.page_allocator);
     defer descendants.deinit();
-    if (process_environment_name) |name| {
-        try descendants.bindProcessEnvironment(name, "1");
+    if (process_witness) |witness| {
+        descendants.bindProcessWitness(witness);
     }
     if (comptime builtin.os.tag == .macos) {
         try descendants.refresh(target_pid);
@@ -3810,6 +3809,54 @@ test "timeout terminates double-forked descendant after setsid" {
         10,
     );
     try expectProcessGone(pid);
+}
+
+test "timeout terminates environment-sanitized double-fork descendants" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "env-clear-timeout.pids" });
+    defer alloc.free(pid_path);
+    const command = try std.fmt.allocPrint(
+        alloc,
+        "/usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/python3 -c 'import os,time\n" ++
+            "for index in range(16):\n" ++
+            " pid=os.fork()\n" ++
+            " if pid == 0:\n" ++
+            "  os.setsid()\n" ++
+            "  grandchild=os.fork()\n" ++
+            "  if grandchild > 0: os._exit(0)\n" ++
+            "  with open(\"{s}\",\"a\") as output: output.write(str(os.getpid())+\"\\n\")\n" ++
+            "  null=os.open(\"/dev/null\",os.O_RDWR)\n" ++
+            "  os.dup2(null,0); os.dup2(null,1); os.dup2(null,2)\n" ++
+            "  time.sleep(30)\n" ++
+            "while True: time.sleep(1)'",
+        .{pid_path},
+    );
+    defer alloc.free(command);
+
+    try std.testing.expectError(error.TimeoutExpired, executeCommand(.{
+        .max_command_output_bytes = 1024,
+        .timeout_ms = 2000,
+    }, alloc, command, workspace));
+
+    const pid_text = try readAbsoluteFile(alloc, pid_path, 4096);
+    defer alloc.free(pid_text);
+    var pids: std.ArrayList(std.posix.pid_t) = .empty;
+    defer pids.deinit(alloc);
+    var lines = std.mem.tokenizeAny(u8, pid_text, " \t\r\n");
+    while (lines.next()) |line| {
+        try pids.append(alloc, try std.fmt.parseInt(std.posix.pid_t, line, 10));
+    }
+    defer for (pids.items) |pid| {
+        std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+    };
+    try std.testing.expectEqual(@as(usize, 16), pids.items.len);
+    for (pids.items) |pid| try expectProcessGone(pid);
 }
 
 fn expectProcessGone(pid: std.posix.pid_t) !void {
