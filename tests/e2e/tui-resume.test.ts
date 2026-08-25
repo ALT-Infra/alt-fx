@@ -4153,7 +4153,7 @@ test.skipIf(!tmuxAvailable())(
       expect(scrollback).not.toContain(`● Failed ${command}`);
       expect(scrollback).toContain("Read nested/input.txt");
       expect(scrollback).toContain(`Ran ${command}`);
-      expect(scrollback).toContain(`Ran ${failureCommand}`);
+      expect(scrollback).toContain(`Exited 7 ${failureCommand}`);
       expect(scrollback).not.toContain("│ exit code 7");
     }
 
