@@ -42,12 +42,18 @@ pub fn build(b: *std.Build) void {
     const git_commit = readGitCommit(b);
     const app_version = readAppVersion(b);
     const update_channel = b.option(UpdateChannel, "update-channel", "Build update channel (stable or dev)") orelse .stable;
+    const orchestration_root = b.option(
+        []const u8,
+        "orchestration-root",
+        "Root Zig source file for an optional orchestration extension",
+    );
 
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "git_commit", git_commit);
     build_options.addOption([]const u8, "app_version", app_version);
     build_options.addOption([]const u8, "update_channel", @tagName(update_channel));
     build_options.addOption(WasmSurface, "wasm_surface", .none);
+    build_options.addOption(bool, "orchestration_enabled", orchestration_root != null);
 
     const exe = b.addExecutable(.{
         .name = "fx",
@@ -65,6 +71,23 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addImport("build_options", build_options.createModule());
+    var selected_orchestration_extension: ?*std.Build.Module = null;
+    if (orchestration_root) |root| {
+        const orchestration_host = b.createModule(.{
+            .root_source_file = b.path("src/core/orchestration/host_contract.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const orchestration_extension = b.createModule(.{
+            .root_source_file = .{ .cwd_relative = root },
+            .target = target,
+            .optimize = optimize,
+        });
+        orchestration_extension.addImport("fx_orchestration_host", orchestration_host);
+        exe.root_module.addImport("fx_orchestration_host", orchestration_host);
+        exe.root_module.addImport("orchestration_extension", orchestration_extension);
+        selected_orchestration_extension = orchestration_extension;
+    }
 
     b.installArtifact(exe);
 
@@ -89,6 +112,32 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
+
+    if (selected_orchestration_extension) |orchestration_extension| {
+        const orchestration_tests = b.addTest(.{ .root_module = orchestration_extension });
+        const run_orchestration_tests = b.addRunArtifact(orchestration_tests);
+        const orchestration_host_tests = b.addTest(.{
+            .root_module = exe.root_module,
+            .filters = &.{
+                "extension failure becomes a notice",
+                "active native subagent work refuses orchestration",
+                "unsettled native subagent recovery fails orchestration admission closed",
+                "queued prompt duplication keeps canonical input and secrets independently owned",
+                "canonical custody projects specialists without prompt skill or attachment escalation",
+                "canonical steering preserves ordered user input and authorizes instruction attachments",
+                "isolated service is independent of native subagent modules",
+                "orchestration run manager has no native subagent dependency",
+                "context-bearing surface restores exact history without repeating the same root turn",
+            },
+        });
+        const run_orchestration_host_tests = b.addRunArtifact(orchestration_host_tests);
+        const orchestration_test_step = b.step(
+            "test-orchestration-extension",
+            "Run the orchestration host and selected extension tests",
+        );
+        orchestration_test_step.dependOn(&run_orchestration_tests.step);
+        orchestration_test_step.dependOn(&run_orchestration_host_tests.step);
+    }
 
     if (wasm_surface != .none) {
         addWasmArtifact(b, wasm_surface, git_commit, app_version, update_channel);

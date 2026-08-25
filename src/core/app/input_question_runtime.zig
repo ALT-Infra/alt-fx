@@ -61,6 +61,24 @@ pub fn QuestionRuntime(comptime App: type) type {
         pub fn cancelQuestionPrompt(app: *App) !void {
             const route_recovery = isRouteRecoveryPrompt(app);
             const mcp_elicitation = isMcpElicitationPrompt(app);
+            const orchestration_question = isOrchestrationQuestion(app);
+            if (orchestration_question) {
+                if (!route_recovery and !mcp_elicitation) {
+                    try finalizeQuestionTranscript(app, true);
+                }
+                if (!try cancelOrchestrationQuestion(app)) {
+                    return error.OrchestrationQuestionUnavailable;
+                }
+                app.question_prompt.discard(app.alloc, "orchestration_cancelled");
+                app.input_runtime.input_limit_rejection =
+                    input_limit_rejection.clear();
+                const gesture_transition = gesture_state.disarmEscapeClear(
+                    app.input_runtime.gestures,
+                );
+                app.input_runtime.gestures = gesture_transition.next;
+                app.shell.render_requests.request(.modal);
+                return;
+            }
             interrupt.traceInterruptRequested(app, "input_question");
             if (!route_recovery) {
                 if (comptime @hasField(App, "queued_prompt_review")) {
@@ -93,7 +111,16 @@ pub fn QuestionRuntime(comptime App: type) type {
             if (!isRouteRecoveryPrompt(app) and !isMcpElicitationPrompt(app)) {
                 try finalizeQuestionTranscript(app, false);
             }
-            try app.worker.submitQuestionBatchAnswer(std.heap.c_allocator, labels.items);
+            if (isOrchestrationQuestion(app)) {
+                if (!try submitOrchestrationQuestionAnswer(app, labels.items)) {
+                    return error.OrchestrationQuestionUnavailable;
+                }
+            } else {
+                try app.worker.submitQuestionBatchAnswer(
+                    std.heap.c_allocator,
+                    labels.items,
+                );
+            }
             app.question_prompt.resetAfterSubmission(app.alloc);
             app.input_runtime.input_limit_rejection = input_limit_rejection.clear();
             app.shell.render_requests.request(.modal);
@@ -104,6 +131,9 @@ pub fn QuestionRuntime(comptime App: type) type {
         }
 
         fn isRouteRecoveryPrompt(app: *App) bool {
+            if (orchestrationQuestionSource(app)) |source| {
+                return source == .route_recovery;
+            }
             const Worker = @TypeOf(app.worker);
             if (comptime @hasDecl(Worker, "pendingQuestionBatchSource")) {
                 return app.worker.pendingQuestionBatchSource() == worker_runtime.QuestionPromptSource.route_recovery;
@@ -112,9 +142,49 @@ pub fn QuestionRuntime(comptime App: type) type {
         }
 
         fn isMcpElicitationPrompt(app: *App) bool {
+            if (orchestrationQuestionSource(app)) |source| {
+                return source == .mcp_elicitation;
+            }
             const Worker = @TypeOf(app.worker);
             if (comptime @hasDecl(Worker, "pendingQuestionBatchSource")) {
                 return app.worker.pendingQuestionBatchSource() == worker_runtime.QuestionPromptSource.mcp_elicitation;
+            }
+            return false;
+        }
+
+        fn isOrchestrationQuestion(app: *App) bool {
+            if (comptime @hasDecl(App, "isOrchestrationQuestion")) {
+                return app.isOrchestrationQuestion();
+            }
+            return false;
+        }
+
+        fn orchestrationQuestionSource(
+            app: *App,
+        ) ?worker_runtime.QuestionPromptSource {
+            if (!isOrchestrationQuestion(app)) return null;
+            if (comptime @hasDecl(App, "orchestrationQuestionSource")) {
+                return app.orchestrationQuestionSource();
+            }
+            return .agent_question;
+        }
+
+        fn submitOrchestrationQuestionAnswer(
+            app: *App,
+            answers: []const []const u8,
+        ) !bool {
+            if (comptime @hasDecl(App, "submitOrchestrationQuestionAnswer")) {
+                return app.submitOrchestrationQuestionAnswer(
+                    std.heap.c_allocator,
+                    answers,
+                );
+            }
+            return false;
+        }
+
+        fn cancelOrchestrationQuestion(app: *App) !bool {
+            if (comptime @hasDecl(App, "cancelOrchestrationQuestion")) {
+                return app.cancelOrchestrationQuestion(std.heap.c_allocator);
             }
             return false;
         }

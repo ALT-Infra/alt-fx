@@ -33,6 +33,7 @@ pub const Config = struct {
     advertised_tool_names: []const []const u8 = &.{},
     advertised_functions: []const model_tool_schema.FunctionSchema = &.{},
     initial_dynamic_tools: []const stream_provider.DynamicFunctionTool = &.{},
+    response_format: ?stream_provider.StructuredResponseFormat = null,
     provider_capabilities: provider_set.Bundle.Capabilities = .{
         .fx_search = true,
         .vision_fallback = true,

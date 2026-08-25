@@ -74,6 +74,22 @@ pub fn InterruptRuntime(comptime App: type) type {
                 return;
             }
             if (!app.stream.active) return;
+            if (comptime @hasDecl(App, "cancelActiveOrchestrationTurn")) {
+                if (try app.cancelActiveOrchestrationTurn()) {
+                    traceInterruptRequested(app, "input_orchestration_stream");
+                    app.pacer.clear(app.alloc);
+                    if (comptime @hasDecl(App, "playCancelSound")) {
+                        app.playCancelSound();
+                    }
+                    try app.writeDomainNotice(
+                        session_runtime.interrupted_turn_notice,
+                        true,
+                    );
+                    app.stream = .{};
+                    app.shell.render_requests.request(.footer);
+                    return;
+                }
+            }
             // Pending approval keeps the stream active until resolution.
             // Avoid duplicate cancellation notices once the worker is cancelled.
             if (app.worker.isCancelRequested()) return;

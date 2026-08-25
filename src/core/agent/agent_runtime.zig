@@ -45,6 +45,7 @@ pub const classifyProviderExecutedResultStatus = runtime_execution_memory.classi
 pub const normalizeAssistantTextForDisplay = runtime_assistant_stream.normalizeAssistantTextForDisplay;
 
 test {
+    _ = @import("isolated_run.zig");
     _ = @import("stream_provider.zig");
     _ = @import("runtime/context_compaction.zig");
     _ = @import("runtime/tests/gateway_flow.zig");

@@ -446,7 +446,16 @@ pub fn Runtime(comptime App: type) type {
                 request.view()
             else
                 null;
-            var owned_child_pending = if (worker_pending_request == null)
+            var orchestration_pending_owned: ?permission_request.OwnedPermissionRequest = null;
+            defer if (orchestration_pending_owned) |*request| request.deinit(app.alloc);
+            if (worker_pending_request == null) {
+                if (comptime @hasDecl(App, "snapshotOrchestrationApproval")) {
+                    orchestration_pending_owned = app.snapshotOrchestrationApproval(app.alloc) catch null;
+                }
+            }
+            const orchestration_pending_request: ?permission_request.PermissionRequest =
+                if (orchestration_pending_owned) |*request| request.view() else null;
+            var owned_child_pending = if (worker_pending_request == null and orchestration_pending_request == null)
                 if (app_session_runtime.Runtime(App).subagentHost(app)) |host|
                     host.pendingApprovalRequest(app.alloc) catch null
                 else
@@ -456,7 +465,9 @@ pub fn Runtime(comptime App: type) type {
             defer if (owned_child_pending) |*pending| pending.deinit(app.alloc);
             const child_pending_request: ?permission_request.PermissionRequest =
                 if (owned_child_pending) |*pending| pending.request.view() else null;
-            const pending_request = worker_pending_request orelse child_pending_request;
+            const pending_request = worker_pending_request orelse
+                orchestration_pending_request orelse
+                child_pending_request;
             const management_active = if (comptime @hasField(
                 @TypeOf(app.approval_prompt),
                 "rule_management",
@@ -469,12 +480,19 @@ pub fn Runtime(comptime App: type) type {
             else
                 app.approval_prompt.syncRequest(app.alloc, pending_request) catch false;
             const review_changed = if (comptime @hasDecl(@TypeOf(app.approval_prompt), "syncReview")) blk: {
-                const review = if (comptime @hasField(@TypeOf(snapshot), "pending_permission_review"))
+                const root_review = if (comptime @hasField(@TypeOf(snapshot), "pending_permission_review"))
                     if (snapshot.pending_permission_review) |pending|
                         if (pending_request) |request|
                             if (pending.request_id == request.id) pending.review else null
                         else
                             null
+                    else
+                        null
+                else
+                    null;
+                const review: ?*const diff_mod.FileReview = root_review orelse if (orchestration_pending_request) |request|
+                    if (comptime @hasDecl(App, "snapshotOrchestrationApprovalReview"))
+                        app.snapshotOrchestrationApprovalReview(request.id)
                     else
                         null
                 else
@@ -497,12 +515,46 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
 
+            // Native worker questions are opened by their ordered
+            // `question_requested` event below, after paced assistant text has
+            // drained. ALT runs are isolated from that worker event queue, so
+            // only their question needs polling here. Once a prompt is open,
+            // either source may keep it alive through its own snapshot.
             if (app.question_prompt.isActive()) {
-                if (app.worker.snapshotPendingQuestionBatch(app.alloc) catch return) |question_snapshot| {
-                    question_snapshot.deinit(app.alloc);
+                var question_snapshot = app.worker.snapshotPendingQuestionBatch(
+                    app.alloc,
+                ) catch return;
+                if (question_snapshot == null) {
+                    if (comptime @hasDecl(App, "snapshotOrchestrationQuestion")) {
+                        question_snapshot = app.snapshotOrchestrationQuestion(
+                            app.alloc,
+                        ) catch return;
+                    }
+                }
+                if (question_snapshot) |owned| {
+                    owned.deinit(app.alloc);
                 } else {
                     app.question_prompt.discard(app.alloc, "worker_cleared");
                     app.shell.render_requests.request(.modal);
+                }
+            } else if (pending_request == null) {
+                if (comptime @hasDecl(App, "snapshotOrchestrationQuestion")) {
+                    if (app.snapshotOrchestrationQuestion(app.alloc) catch return) |owned| {
+                        defer owned.deinit(app.alloc);
+                        app.question_prompt.syncFrom(app.alloc, owned.entries) catch return;
+                        if (app.question_prompt.isActive()) {
+                            app.shell.render_requests.request(.modal);
+                            if (comptime @hasDecl(App, "dispatchAttentionRequired")) {
+                                app.dispatchAttentionRequired(
+                                    snapshot.active_turn_id,
+                                    switch (owned.source) {
+                                        .agent_question, .mcp_elicitation => .question,
+                                        .route_recovery => .route_recovery,
+                                    },
+                                );
+                            }
+                        }
+                    }
                 }
             }
 
@@ -555,6 +607,9 @@ pub fn Runtime(comptime App: type) type {
             event_handlers: WorkerEventHandlers,
         ) !void {
             if (!try authorizeInteractiveAdmission(app)) return;
+            if (comptime @hasDecl(App, "drainOrchestrationAgentEvents")) {
+                try app.drainOrchestrationAgentEvents();
+            }
             try drainEvents(app, event_handlers);
             syncState(app, event_handlers.tool_lifecycle);
 

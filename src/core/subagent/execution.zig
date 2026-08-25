@@ -1,12 +1,8 @@
 const std = @import("std");
-const agent_runtime = @import("../agent/agent_runtime.zig");
 const managed_execution = @import("../execution/managed_execution.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const permission_prompter = @import("../permissions/permission_prompter.zig");
-const runtime_assistant_stream = @import("../agent/runtime/assistant_stream.zig");
-const runtime_config = @import("../agent/runtime/config.zig");
 const runtime_deps = @import("../agent/runtime/deps.zig");
-const runtime_lifecycle = @import("../agent/runtime/lifecycle.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const authority_mod = @import("authority.zig");
 const approval_registry_mod = @import("approval_registry.zig");
@@ -435,31 +431,3 @@ pub const TurnContext = struct {
         };
     }
 };
-
-pub const NormalAgentError = error{
-    OutOfMemory,
-    Cancelled,
-    AgentExecutionFailed,
-};
-
-pub fn runNormalAgentTurn(
-    agent: *agent_runtime.Agent,
-    deps: *const runtime_deps.AgentRuntimeDeps,
-    semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink,
-    lifecycle: runtime_lifecycle.LifecycleContext,
-    config: runtime_config.Config,
-    prompt: worker_runtime.QueuedPrompt,
-) NormalAgentError!void {
-    agent_runtime.processAgentPrompt(
-        agent,
-        deps,
-        semantic_presentation,
-        lifecycle,
-        config,
-        prompt,
-    ) catch |err| return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.Cancelled => error.Cancelled,
-        else => error.AgentExecutionFailed,
-    };
-}

@@ -5207,6 +5207,7 @@ fn processQueuedPromptLoop(
                     verified_images.items
                 else
                     null,
+                .response_format = config.response_format,
             };
             var prepared_request_body: ?[]const u8 = null;
             var request_cost_for_attempt: ?runtime_prompt_context.RequestCost = null;
@@ -5466,6 +5467,7 @@ fn processQueuedPromptLoop(
                 .budget = request_data.budget,
                 .verified_images = request_data.verified_images,
                 .prepared_request_body = prepared_request_body,
+                .response_format = config.response_format,
                 .trace_ctx = step_ctx,
                 .content_capture_limit = null,
                 .cooperative_pulse = deps.cooperative_transport_pulse,
