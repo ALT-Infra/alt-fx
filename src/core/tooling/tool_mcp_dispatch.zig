@@ -66,11 +66,12 @@ pub fn decodeSearch(
     const prepared = lexical_relevance.prepare(query) catch |err| switch (err) {
         error.QueryTooLong => unreachable,
         error.TooManyTokens => {
-            ctx.allocator.free(query);
-            return .{ .failure = try ctx.allocator.dupe(
+            const message = try ctx.allocator.dupe(
                 u8,
                 "mcp_search_tools query must not exceed 64 tokens.",
-            ) };
+            );
+            ctx.allocator.free(query);
+            return .{ .failure = message };
         },
     };
     const input = try ctx.allocator.create(SearchInput);
@@ -298,6 +299,20 @@ test "MCP search decoder releases every accepted-input allocation failure" {
                 .{ .allocator = alloc },
                 "{\"query\":\"linear public data\",\"limit\":8}",
             );
+            switch (decoded) {
+                .input => |input| input.deinit(alloc),
+                .failure => |message| alloc.free(message),
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "MCP search decoder releases every rejected-input allocation failure" {
+    const Case = struct {
+        fn run(alloc: Allocator) !void {
+            const args_json = "{\"query\":\"" ++ ("token " ** 64) ++ "token\"}";
+            const decoded = try decodeSearch(.{ .allocator = alloc }, args_json);
             switch (decoded) {
                 .input => |input| input.deinit(alloc),
                 .failure => |message| alloc.free(message),

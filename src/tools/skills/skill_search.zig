@@ -65,8 +65,12 @@ pub fn decode(
     const prepared = lexical_relevance.prepare(query) catch |err| switch (err) {
         error.QueryTooLong => unreachable,
         error.TooManyTokens => {
+            const result = try failure(
+                ctx.allocator,
+                "skill_search query must not exceed 64 tokens",
+            );
             ctx.allocator.free(query);
-            return failure(ctx.allocator, "skill_search query must not exceed 64 tokens");
+            return result;
         },
     };
     const input = try ctx.allocator.create(Input);
@@ -199,12 +203,15 @@ fn renderProjectedSearch(
 
     while (true) {
         const more_available = ranked.more_available or projection_omitted;
-        const raw = try renderRawSearch(
+        const raw = renderRawSearch(
             alloc,
             ranked.matches[0..retained_count],
             description_limit.effectiveBytes(),
             more_available,
-        );
+        ) catch |err| switch (err) {
+            error.WriteFailed => return error.OutOfMemory,
+            else => return err,
+        };
         defer alloc.free(raw);
 
         const projected = @constCast(try tool_result_limits.prepareModelOutput(
@@ -213,6 +220,7 @@ fn renderProjectedSearch(
             raw,
             max_bytes,
         ));
+        errdefer alloc.free(projected);
         const check = try checkProjection(
             alloc,
             projected,
@@ -454,6 +462,48 @@ test "skill search decoder releases every accepted-input allocation failure" {
                 .input => |input| input.deinit(alloc),
                 .failure => |message| alloc.free(message),
             }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "skill search decoder releases every rejected-input allocation failure" {
+    const Case = struct {
+        fn run(alloc: Allocator) !void {
+            const args_json = "{\"query\":\"" ++ ("token " ** 64) ++ "token\"}";
+            const decoded = try decode(.{ .allocator = alloc }, args_json);
+            switch (decoded) {
+                .input => |input| input.deinit(alloc),
+                .failure => |message| alloc.free(message),
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "skill search projection releases every allocation failure" {
+    const Case = struct {
+        fn run(alloc: Allocator) !void {
+            const skills = [_]skill_runtime.Skill{
+                .{ .name = "unsafe", .description = "unsafe", .path = "/skills/TOKEN=runtime-location-secret/SKILL.md", .source = .workspace_fx },
+                .{ .name = "oversized", .description = "x" ** 700, .path = "/skills/oversized/SKILL.md", .source = .workspace_fx },
+                .{ .name = "three", .description = "three", .path = "/skills/three/SKILL.md", .source = .workspace_fx },
+                .{ .name = "four", .description = "four", .path = "/skills/four/SKILL.md", .source = .workspace_fx },
+                .{ .name = "five", .description = "five", .path = "/skills/five/SKILL.md", .source = .workspace_fx },
+                .{ .name = "six", .description = "six", .path = "/skills/six/SKILL.md", .source = .workspace_fx },
+                .{ .name = "seven", .description = "seven", .path = "/skills/seven/SKILL.md", .source = .workspace_fx },
+                .{ .name = "eight", .description = "eight", .path = "/skills/eight/SKILL.md", .source = .workspace_fx },
+                .{ .name = "nine", .description = "nine", .path = "/skills/nine/SKILL.md", .source = .workspace_fx },
+            };
+            const query = try lexical_relevance.prepare("");
+            const output = try renderProjectedSearch(
+                alloc,
+                &query,
+                &skills,
+                (context_limits.Values{}).skill_description_bytes,
+                1024,
+            );
+            alloc.free(output);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
