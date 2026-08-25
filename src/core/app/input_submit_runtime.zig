@@ -125,6 +125,11 @@ pub fn SubmitRuntime(comptime App: type) type {
             installed,
         };
 
+        const PendingSnapshotCleanup = enum {
+            automatic,
+            transferred_to_composer_history,
+        };
+
         const AcceptedDraftProjection = struct {
             input: []const u8,
             pasted_blocks: std.ArrayList(paste_blocks.PastedBlock) = .empty,
@@ -269,11 +274,19 @@ pub fn SubmitRuntime(comptime App: type) type {
         }
 
         pub fn clearPendingSubmission(app: *App, reason: []const u8) void {
+            clearPendingSubmissionWithSnapshots(app, reason, .automatic);
+        }
+
+        fn clearPendingSubmissionWithSnapshots(
+            app: *App,
+            reason: []const u8,
+            snapshot_cleanup: PendingSnapshotCleanup,
+        ) void {
             if (comptime !@hasField(App, "submission")) return;
             var pending = app.submission.pending orelse return;
             app.submission.pending = null;
             if (pending.ownsTurnStartHold()) app.worker.releaseTurnStartHold();
-            if (pending.phase != .queued) {
+            if (snapshot_cleanup == .automatic and pending.phase != .queued) {
                 image_attachments.discardImageSnapshots(app.alloc, pending.draft.images);
             }
             debug_trace.eventf(
@@ -305,6 +318,10 @@ pub fn SubmitRuntime(comptime App: type) type {
 
         fn finishPendingSubmissionFailure(app: *App, err: anyerror) void {
             const turn_id = app.submission.pending.?.draft.turn_id;
+            const snapshot_cleanup: PendingSnapshotCleanup = if (transferPendingImageSnapshotsToComposerHistory(app))
+                .transferred_to_composer_history
+            else
+                .automatic;
             const body = std.fmt.allocPrint(
                 app.alloc,
                 "failed to submit prompt after presentation ({s})",
@@ -315,7 +332,11 @@ pub fn SubmitRuntime(comptime App: type) type {
                     "pending prompt failure notice allocation failed err={s}",
                     .{@errorName(notice_err)},
                 );
-                clearPendingSubmission(app, "finalization_failure");
+                clearPendingSubmissionWithSnapshots(
+                    app,
+                    "finalization_failure",
+                    snapshot_cleanup,
+                );
                 return;
             };
             defer app.alloc.free(body);
@@ -337,7 +358,22 @@ pub fn SubmitRuntime(comptime App: type) type {
                 "err={s}",
                 .{@errorName(err)},
             );
-            clearPendingSubmission(app, "finalization_failure");
+            clearPendingSubmissionWithSnapshots(
+                app,
+                "finalization_failure",
+                snapshot_cleanup,
+            );
+        }
+
+        fn transferPendingImageSnapshotsToComposerHistory(app: *App) bool {
+            if (comptime !@hasField(App, "input_runtime")) return false;
+            if (comptime !@hasField(@TypeOf(app.input_runtime), "composer_history")) {
+                return false;
+            }
+            const pending = app.submission.pending orelse return false;
+            return app.input_runtime.composer_history.claimLatestImageSnapshots(
+                pending.draft.images,
+            );
         }
 
         pub fn submitInput(app: *App, max_prompt_history: usize) !void {
