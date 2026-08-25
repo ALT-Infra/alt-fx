@@ -208,12 +208,11 @@ const PendingCardPaintContext = struct {
 };
 
 fn pendingCardLeadingAdvanceRows(
-    has_prior_turns: bool,
     cursor_row: u16,
     cursor_col: u16,
     content_bottom: u16,
 ) u16 {
-    if (has_prior_turns or cursor_col == 1 or cursor_row >= content_bottom) return 0;
+    if (cursor_col == 1 or cursor_row >= content_bottom) return 0;
     const canonical_rows = render_engine.transcript_blocks.blockSeparatorNewlineCount(
         .unknown_raw,
         .user_turn,
@@ -251,16 +250,11 @@ fn buildPendingCardProjection(
         };
     }
 
-    const has_prior_turns = if (comptime @hasField(App, "session"))
-        app.session.historyLen() > 0
-    else
-        false;
     const cursor_row = @min(
         @max(presentation_shell.cursor_row, 1),
         presentation_shell.layout.content_bottom,
     );
     const leading_advance_rows = pendingCardLeadingAdvanceRows(
-        has_prior_turns,
         cursor_row,
         presentation_shell.cursor_col,
         presentation_shell.layout.content_bottom,
@@ -3973,23 +3967,19 @@ test "pending prompt projection waits for a paintable terminal width" {
 test "pending prompt uses the canonical user turn boundary" {
     try std.testing.expectEqual(
         @as(u16, 2),
-        pendingCardLeadingAdvanceRows(false, 8, 47, 20),
+        pendingCardLeadingAdvanceRows(8, 47, 20),
     );
     try std.testing.expectEqual(
         @as(u16, 0),
-        pendingCardLeadingAdvanceRows(true, 8, 47, 20),
+        pendingCardLeadingAdvanceRows(8, 1, 20),
     );
     try std.testing.expectEqual(
         @as(u16, 0),
-        pendingCardLeadingAdvanceRows(false, 8, 1, 20),
-    );
-    try std.testing.expectEqual(
-        @as(u16, 0),
-        pendingCardLeadingAdvanceRows(false, 20, 47, 20),
+        pendingCardLeadingAdvanceRows(20, 47, 20),
     );
     try std.testing.expectEqual(
         @as(u16, 1),
-        pendingCardLeadingAdvanceRows(false, 19, 47, 20),
+        pendingCardLeadingAdvanceRows(19, 47, 20),
     );
 }
 

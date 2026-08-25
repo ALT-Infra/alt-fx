@@ -986,12 +986,7 @@ function assertFirstPostEnterOutputShowsSubmittedPrompt(
   submittedPrompt: string,
 ) {
   const frames = readTapeFrames(tapePath);
-  const enterIndex = frames.findIndex(
-    (frame) =>
-      frame.kind === 2 &&
-      frame.payload.equals(Buffer.from("\r")),
-  );
-  expect(enterIndex).toBeGreaterThanOrEqual(0);
+  const enterIndex = findEnterAfterSubmittedPrompt(frames, submittedPrompt);
 
   const firstOutput = frames
     .slice(enterIndex + 1)
@@ -1000,16 +995,30 @@ function assertFirstPostEnterOutputShowsSubmittedPrompt(
   expect(firstOutput!.payload.includes(Buffer.from(submittedPrompt))).toBe(true);
 }
 
+function findEnterAfterSubmittedPrompt(
+  frames: ReturnType<typeof readTapeFrames>,
+  submittedPrompt: string,
+): number {
+  const promptInputIndex = frames.findIndex((frame) =>
+    frame.kind === 2 && frame.payload.includes(Buffer.from(submittedPrompt))
+  );
+  expect(promptInputIndex).toBeGreaterThanOrEqual(0);
+  const enterIndex = frames.findIndex((frame, index) =>
+    index > promptInputIndex &&
+    frame.kind === 2 &&
+    frame.payload.equals(Buffer.from("\r"))
+  );
+  expect(enterIndex).toBeGreaterThan(promptInputIndex);
+  return enterIndex;
+}
+
 function assertSubmittedPromptRowStaysStableAfterEnter(
   tapePath: string,
   framesRoot: string,
   submittedPrompt: string,
 ) {
   const frames = readTapeFrames(tapePath);
-  const enterIndex = frames.findIndex(
-    (frame) => frame.kind === 2 && frame.payload.equals(Buffer.from("\r")),
-  );
-  expect(enterIndex).toBeGreaterThanOrEqual(0);
+  const enterIndex = findEnterAfterSubmittedPrompt(frames, submittedPrompt);
   const firstOutput = frames.slice(enterIndex + 1).find((frame) => frame.kind === 1);
   expect(firstOutput).toBeDefined();
   const gridDir = join(framesRoot, "frames");
@@ -2632,6 +2641,78 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(hold.cancelled).toBe(true);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(existsSync(tapePath)).toBe(true);
+      expect(session.isAlive()).toBe(true);
+      expect(session.isPaneAlive()).toBe(true);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "idle submitted prompt keeps its canonical row after a completed turn",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-idle-submit-multiturn-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const tapePath = join(root, "session.fxtape");
+      const framesRoot = join(root, "replay-frames");
+      const seedPrompt = "MULTI_TURN_SEED_PROMPT";
+      const seedReply = "MULTI_TURN_SEED_REPLY";
+      const submittedPrompt = "MULTI_TURN_ROW_SENTINEL";
+      const hold: HoldState = { started: false, cancelled: false };
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+
+      const queuedGateway = startFakeGateway([
+        fakeGatewayFinalText(seedReply),
+        () => heldGatewayResponse(hold),
+      ]);
+      gateway = queuedGateway;
+      session = await TmuxSession.create({
+        cwd: realpathSync(workspace),
+        width: 96,
+        height: 28,
+        stderrPath,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-idle-submit-multiturn-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+          FX_MODEL: MODEL,
+          FX_RECORD: tapePath,
+          FX_RECORD_INPUT: "1",
+        },
+      });
+
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText(seedPrompt);
+      await session.waitForText(seedReply, TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      await session.sendLiteral(submittedPrompt);
+      session.sendKeysImmediate(["Enter"]);
+      await waitForCondition(
+        () => queuedGateway.requests.length === 2 && hold.started,
+        "held multi-turn submitted prompt stream",
+      );
+      await session.waitForText("Thinking", TIMEOUT);
+      await Bun.sleep(250);
+      await session.sendKeys("C-c");
+      await session.waitForText("cancelled", TIMEOUT);
+
+      execFileSync(FX_BIN, ["replay", tapePath, "--frames-dir", framesRoot], {
+        encoding: "utf8",
+      });
+      assertFirstPostEnterOutputShowsSubmittedPrompt(tapePath, submittedPrompt);
+      assertSubmittedPromptRowStaysStableAfterEnter(
+        tapePath,
+        framesRoot,
+        submittedPrompt,
+      );
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(session.isAlive()).toBe(true);
       expect(session.isPaneAlive()).toBe(true);
     },
