@@ -179,7 +179,7 @@ const PendingCardProjection = struct {
     bytes: []u8,
     row_count: u16,
     paint_row_count: u16,
-    leading_blank_rows: u16,
+    leading_advance_rows: u16,
 
     fn deinit(self: *PendingCardProjection, alloc: std.mem.Allocator) void {
         alloc.free(self.bytes);
@@ -206,6 +206,19 @@ const PendingCardPaintContext = struct {
         );
     }
 };
+
+fn pendingCardLeadingAdvanceRows(
+    has_prior_turns: bool,
+    cursor_row: u16,
+    cursor_col: u16,
+    content_bottom: u16,
+) u16 {
+    if (has_prior_turns or cursor_col == 1 or cursor_row >= content_bottom) return 0;
+    return render_engine.transcript_blocks.blockSeparatorNewlineCount(
+        .unknown_raw,
+        .user_turn,
+    );
+}
 
 fn buildPendingCardProjection(
     comptime App: type,
@@ -245,12 +258,13 @@ fn buildPendingCardProjection(
         @max(presentation_shell.cursor_row, 1),
         presentation_shell.layout.content_bottom,
     );
-    const leading_blank_rows: u16 = @intFromBool(
-        !has_prior_turns and
-            presentation_shell.cursor_col != 1 and
-            cursor_row < presentation_shell.layout.content_bottom,
+    const leading_advance_rows = pendingCardLeadingAdvanceRows(
+        has_prior_turns,
+        cursor_row,
+        presentation_shell.cursor_col,
+        presentation_shell.layout.content_bottom,
     );
-    const available_rows = presentation_shell.layout.content_bottom - cursor_row + 1 -| leading_blank_rows;
+    const available_rows = presentation_shell.layout.content_bottom - cursor_row + 1 -| leading_advance_rows;
     const card = try user_message_card.buildUserPromptCardTailForTerminalPresentationInterruptible(
         app.alloc,
         pending.draft.prompt,
@@ -268,7 +282,7 @@ fn buildPendingCardProjection(
         @as(usize, std.math.maxInt(u16)),
     ));
     const paint_row_count = rendered_line_count;
-    const row_count = rendered_line_count +| leading_blank_rows;
+    const row_count = rendered_line_count +| leading_advance_rows;
     if (row_count == 0) {
         app.alloc.free(bytes);
         return error.EmptyPendingPromptCard;
@@ -277,7 +291,7 @@ fn buildPendingCardProjection(
         .bytes = bytes,
         .row_count = row_count,
         .paint_row_count = paint_row_count,
-        .leading_blank_rows = leading_blank_rows,
+        .leading_advance_rows = leading_advance_rows,
     };
 }
 
@@ -2247,7 +2261,7 @@ pub fn Runtime(comptime App: type) type {
                 .row = (if (prepared_transcript) |*prepared|
                     prepared.cursor.cursor_row
                 else
-                    presentation_shell.cursor_row) +| card.leading_blank_rows,
+                    presentation_shell.cursor_row) +| card.leading_advance_rows,
                 .max_rows = card.paint_row_count,
             } else null;
             if (pending_paint_ctx) |paint_ctx| switch (transcript_body) {
@@ -3953,6 +3967,25 @@ test "pending prompt projection waits for a paintable terminal width" {
     )).?;
     defer projection.deinit(alloc);
     try std.testing.expect(projection.paint_row_count > 0);
+}
+
+test "pending prompt uses the canonical user turn boundary" {
+    try std.testing.expectEqual(
+        @as(u16, 2),
+        pendingCardLeadingAdvanceRows(false, 8, 47, 20),
+    );
+    try std.testing.expectEqual(
+        @as(u16, 0),
+        pendingCardLeadingAdvanceRows(true, 8, 47, 20),
+    );
+    try std.testing.expectEqual(
+        @as(u16, 0),
+        pendingCardLeadingAdvanceRows(false, 8, 1, 20),
+    );
+    try std.testing.expectEqual(
+        @as(u16, 0),
+        pendingCardLeadingAdvanceRows(false, 20, 47, 20),
+    );
 }
 
 test "assistant tail writability changes remain traceable" {

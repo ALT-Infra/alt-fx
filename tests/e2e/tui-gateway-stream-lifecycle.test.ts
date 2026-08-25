@@ -1000,6 +1000,44 @@ function assertFirstPostEnterOutputShowsSubmittedPrompt(
   expect(firstOutput!.payload.includes(Buffer.from(submittedPrompt))).toBe(true);
 }
 
+function assertSubmittedPromptRowStaysStableAfterEnter(
+  tapePath: string,
+  framesRoot: string,
+  submittedPrompt: string,
+) {
+  const frames = readTapeFrames(tapePath);
+  const enterIndex = frames.findIndex(
+    (frame) => frame.kind === 2 && frame.payload.equals(Buffer.from("\r")),
+  );
+  expect(enterIndex).toBeGreaterThanOrEqual(0);
+  const firstOutput = frames.slice(enterIndex + 1).find((frame) => frame.kind === 1);
+  expect(firstOutput).toBeDefined();
+  const gridDir = join(framesRoot, "frames");
+  const frameNames = readdirSync(gridDir)
+    .filter((name) => name.endsWith(".grid.txt"))
+    .sort();
+  const firstGrid = readFileSync(
+    join(gridDir, `${String(firstOutput!.index).padStart(4, "0")}.grid.txt`),
+    "utf8",
+  );
+  const thinkingGrid = frameNames
+    .filter((name) => Number.parseInt(name, 10) > firstOutput!.index)
+    .map((name) => readFileSync(join(gridDir, name), "utf8"))
+    .find((grid) => grid.includes("Thinking"));
+  expect(thinkingGrid).toBeDefined();
+
+  const promptRow = (grid: string) => {
+    const row = grid.split(/\r?\n/).findIndex((line) =>
+      line.includes(submittedPrompt)
+    );
+    expect(row).toBeGreaterThanOrEqual(0);
+    return row;
+  };
+  expect(promptRow(thinkingGrid!)).toBe(
+    promptRow(firstGrid),
+  );
+}
+
 function hasBareRunningRow(value: string): boolean {
   return value.split(/\r?\n/).some((line) => line.trim() === "● Running");
 }
@@ -2576,6 +2614,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         encoding: "utf8",
       });
       assertFirstPostEnterOutputShowsSubmittedPrompt(tapePath, submittedPrompt);
+      assertSubmittedPromptRowStaysStableAfterEnter(
+        tapePath,
+        framesRoot,
+        submittedPrompt,
+      );
       assertThinkingFramesShowSubmittedPrompt(framesRoot, submittedPrompt);
       const trace = readFileSync(tracePath, "utf8");
       const frameCommitted = trace.indexOf("event=pending_prompt_frame_committed");
