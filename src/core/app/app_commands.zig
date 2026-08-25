@@ -374,6 +374,7 @@ pub fn Handlers(comptime App: type) type {
                 .submit_feedback = commandSubmitFeedback,
                 .create_trace = commandCreateTrace,
                 .compact_history = commandCompactHistory,
+                .steer = commandSteer,
                 .handle_settings = commandHandleSettings,
                 .handle_alias = commandHandleAlias,
                 .show_credits = commandShowCredits,
@@ -1644,6 +1645,13 @@ pub fn Handlers(comptime App: type) type {
         fn commandCreateTrace(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try handleTraceReport(app);
+        }
+
+        fn commandSteer(ctx: *anyopaque, prompt: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime @hasDecl(App, "steerPrompt")) {
+                _ = try App.steerPrompt(app, prompt);
+            }
         }
 
         fn commandCompactHistory(ctx: *anyopaque) !void {
