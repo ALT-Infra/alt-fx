@@ -4187,6 +4187,10 @@ const Session = struct {
         };
         if (!self.matchesSignalTarget(target)) return false;
 
+        const shell_group_delivery = if (failSignalStageForTest("shell_group"))
+            ProcessGroupDelivery.failed
+        else
+            self.signalVerifiedProcessGroup(target, signal);
         var descendants_delivery = descendants.signalOutsideProcessGroupChecked(
             signalValue(signal),
             target.pid,
@@ -4201,10 +4205,7 @@ const Session = struct {
         );
         return terminalSignalCompleted(
             descendants_delivery,
-            if (failSignalStageForTest("shell_group"))
-                .failed
-            else
-                self.signalVerifiedProcessGroup(target, signal),
+            shell_group_delivery,
         );
     }
 
