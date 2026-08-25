@@ -66,6 +66,7 @@ const foreground_target_cleanup_wait_ms: i64 = 250;
 const foreground_session_replace_failure_exit_code: u8 = 125;
 const foreground_session_failure_nonce_bytes: usize = 16;
 const foreground_session_failure_nonce_hex_bytes: usize = foreground_session_failure_nonce_bytes * 2;
+const foreground_session_control_bytes = foreground_session_failure_nonce_hex_bytes + 1;
 const foreground_session_replace_failure_prefix = "\x00FX_FOREGROUND_EXEC_FAILED:";
 const foreground_session_replace_failure_marker_bytes =
     foreground_session_replace_failure_prefix.len +
@@ -99,13 +100,13 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
     if (comptime !supports_foreground_session) {
         return error.OperationUnsupported;
     }
-    if (!isForegroundSessionInvocation(args) or args.len < 4) {
+    if (!isForegroundSessionInvocation(args) or args.len < 3) {
         return error.InvalidForegroundSessionInvocation;
     }
-    const deadline_ms = if (std.mem.eql(u8, args[2], "none"))
+    const deadline_ms = if (std.mem.eql(u8, args[1], "none"))
         null
     else
-        std.fmt.parseInt(i64, args[2], 10) catch
+        std.fmt.parseInt(i64, args[1], 10) catch
             return error.InvalidForegroundSessionInvocation;
     if (std.c.setsid() == -1) return error.ForegroundSessionSetupFailed;
 
@@ -115,15 +116,21 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
         &.{foreground_session_ready_byte},
     );
 
-    var release: [1]u8 = undefined;
-    const release_len = std.Io.File.stdin().readStreaming(
-        zio,
-        &.{&release},
-    ) catch |err| switch (err) {
-        error.EndOfStream => return error.InvalidForegroundSessionRelease,
-        else => |read_err| return read_err,
-    };
-    if (release_len != 1 or release[0] != foreground_session_release_byte) {
+    var control: [foreground_session_control_bytes]u8 = undefined;
+    var control_len: usize = 0;
+    while (control_len < control.len) {
+        const read_len = std.Io.File.stdin().readStreaming(
+            zio,
+            &.{control[control_len..]},
+        ) catch |err| switch (err) {
+            error.EndOfStream => return error.InvalidForegroundSessionRelease,
+            else => |read_err| return read_err,
+        };
+        if (read_len == 0) return error.InvalidForegroundSessionRelease;
+        control_len += read_len;
+    }
+    const failure_nonce = control[0..foreground_session_failure_nonce_hex_bytes];
+    if (control[control.len - 1] != foreground_session_release_byte) {
         return error.InvalidForegroundSessionRelease;
     }
 
@@ -156,14 +163,14 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
     }
     defer if (process_environment_name) |name| std.heap.page_allocator.free(name);
     var target = std.process.spawn(zio, .{
-        .argv = args[3..],
+        .argv = args[2..],
         .environ_map = if (target_environment) |*environment| environment else null,
         .stdin = .inherit,
         .stdout = .inherit,
         .stderr = .inherit,
         .start_suspended = builtin.os.tag == .macos,
     }) catch |err| {
-        writeForegroundSessionReplaceFailure(args[1], err);
+        writeForegroundSessionReplaceFailure(failure_nonce, err);
         std.process.exit(foreground_session_replace_failure_exit_code);
     };
     const term = waitForForegroundTarget(
@@ -172,7 +179,7 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
         deadline_ms,
     ) catch |err| {
         target.kill(zio);
-        writeForegroundSessionReplaceFailure(args[1], err);
+        writeForegroundSessionReplaceFailure(failure_nonce, err);
         std.process.exit(foreground_session_replace_failure_exit_code);
     };
     exitForegroundSessionSupervisor(term);
@@ -1055,7 +1062,6 @@ fn executeProcessWithDetachedSession(
     var helper_argv: std.ArrayList([]const u8) = .empty;
     try helper_argv.append(scratch, executable);
     try helper_argv.append(scratch, foreground_session_token);
-    try helper_argv.append(scratch, &nonce);
     const deadline_ms = ExecutionControl.init(cfg).deadlineMs();
     const deadline_text = if (deadline_ms) |value|
         try std.fmt.allocPrint(scratch, "{d}", .{value})
@@ -1094,10 +1100,18 @@ fn executeProcessWithDetachedSession(
     var script_write_error: ?std.Io.File.Writer.Error = null;
     script_write.writeStreamingAll(
         io_mod.getIo(),
-        &.{foreground_session_release_byte},
+        &nonce,
     ) catch |err| {
         script_write_error = err;
     };
+    if (script_write_error == null) {
+        script_write.writeStreamingAll(
+            io_mod.getIo(),
+            &.{foreground_session_release_byte},
+        ) catch |err| {
+            script_write_error = err;
+        };
+    }
     if (script_write_error == null) {
         script_write.writeStreamingAll(io_mod.getIo(), script) catch |err| {
             script_write_error = err;
@@ -2398,7 +2412,6 @@ fn spawnForegroundSessionBootstrapForTest(
     const argv = [_][]const u8{
         product_path,
         foreground_session_token,
-        "test-nonce",
         "none",
         "/bin/sh",
         "-c",
@@ -2412,6 +2425,8 @@ fn spawnForegroundSessionBootstrapForTest(
         .cwd = .{ .path = workspace },
     });
 }
+
+const foreground_session_test_nonce = "00000000000000000000000000000000";
 
 fn expectForegroundSessionReadyForTest(child: *std.process.Child) !void {
     const ready_read = child.stderr orelse return error.TestUnexpectedResult;
@@ -2446,7 +2461,10 @@ fn expectRejectedForegroundSessionReleaseForTest(release: ?u8) !void {
 
     var release_write = child.stdin orelse return error.TestUnexpectedResult;
     child.stdin = null;
-    if (release) |byte| try release_write.writeStreamingAll(io_mod.getIo(), &.{byte});
+    if (release) |byte| {
+        try release_write.writeStreamingAll(io_mod.getIo(), foreground_session_test_nonce);
+        try release_write.writeStreamingAll(io_mod.getIo(), &.{byte});
+    }
     release_write.close(io_mod.getIo());
 
     try expectChildExitCodeForTest(&child, 1);
@@ -2507,6 +2525,10 @@ test "foreground session bootstrap waits for release before executing target" {
     child.stdin = null;
     try release_write.writeStreamingAll(
         io_mod.getIo(),
+        foreground_session_test_nonce,
+    );
+    try release_write.writeStreamingAll(
+        io_mod.getIo(),
         &.{foreground_session_release_byte},
     );
     release_write.close(io_mod.getIo());
@@ -2563,12 +2585,19 @@ test "target replacement marker prefix remains ordinary stderr" {
     try std.testing.expect(std.mem.find(u8, result.output, stderr_text) != null);
 }
 
-test "target ownership token cannot forge replacement failure" {
-    if (builtin.os.tag != .macos) return error.SkipZigTest;
+test "target cannot recover replacement nonce from supervisor" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
 
-    const command =
-        "token=$(env | sed -n 's/^FX_INTERNAL_COMMAND_PROCESS_TOKEN_\\([0-9a-f]*\\)=1$/\\1/p'); " ++
-        "printf '\\000FX_FOREGROUND_EXEC_FAILED:%s:FileNotFound\\n' \"$token\" >&2; exit 125";
+    const token_probe = if (builtin.os.tag == .linux)
+        "tr '\\000' '\\n' < /proc/$PPID/cmdline | grep -E '^[0-9a-f]{32}$' | head -1"
+    else
+        "ps -ww -p $PPID -o command= | grep -Eo '[0-9a-f]{32}' | head -1";
+    const command = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "token=$({s}); printf '\\000FX_FOREGROUND_EXEC_FAILED:%s:FileNotFound\\n' \"$token\" >&2; exit 125",
+        .{token_probe},
+    );
+    defer std.testing.allocator.free(command);
     const result = try executeCommand(.{
         .max_command_output_bytes = 4096,
     }, std.testing.allocator, command, "/tmp");
