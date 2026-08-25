@@ -1,5 +1,6 @@
 const std = @import("std");
 const isolated_run = @import("../agent/isolated_run.zig");
+const run_failure = @import("../agent/run_failure.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const session_runtime = @import("../session/session.zig");
 const tool_projection = @import("../tooling/tool_projection.zig");
@@ -70,6 +71,8 @@ pub const Event = union(enum) {
         run_id: []u8,
         message: []u8,
         interrupted: bool,
+        kind: run_failure.Kind = .runtime,
+        http_status: ?u16 = null,
     },
 
     pub fn deinit(self: Event, alloc: Allocator) void {
@@ -167,11 +170,19 @@ const Run = struct {
         };
         defer result.deinit(self.manager.alloc);
         if (result.outcome != .completed) {
-            self.manager.pushFailed(
-                self.prepared.run_id,
-                "fx agent run did not complete.",
-                result.outcome == .interrupted,
-            ) catch {};
+            if (result.failure) |failure| {
+                self.manager.pushFailure(
+                    self.prepared.run_id,
+                    failure,
+                    result.outcome == .interrupted,
+                ) catch {};
+            } else {
+                self.manager.pushFailed(
+                    self.prepared.run_id,
+                    "fx agent run did not complete.",
+                    result.outcome == .interrupted,
+                ) catch {};
+            }
             return;
         }
         if (self.prepared.context_key) |key| {
@@ -557,14 +568,23 @@ pub const Manager = struct {
     }
 
     fn pushFailed(self: *Manager, run_id: []const u8, message: []const u8, interrupted: bool) !void {
+        return self.pushFailure(run_id, .{
+            .kind = if (interrupted) .interrupted else .runtime,
+            .message = message,
+        }, interrupted);
+    }
+
+    fn pushFailure(self: *Manager, run_id: []const u8, failure: run_failure.Snapshot, interrupted: bool) !void {
         const owned_id = try self.alloc.dupe(u8, run_id);
         errdefer self.alloc.free(owned_id);
-        const owned_message = try self.alloc.dupe(u8, message);
+        const owned_message = try self.alloc.dupe(u8, failure.message);
         errdefer self.alloc.free(owned_message);
         try self.pushEvent(.{ .failed = .{
             .run_id = owned_id,
             .message = owned_message,
             .interrupted = interrupted,
+            .kind = if (interrupted) .interrupted else failure.kind,
+            .http_status = failure.http_status,
         } });
     }
 
