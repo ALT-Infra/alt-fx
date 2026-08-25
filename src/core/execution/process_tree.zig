@@ -3,6 +3,8 @@ const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 
 const Allocator = std.mem.Allocator;
+pub const command_process_token_env = "FX_INTERNAL_COMMAND_PROCESS_TOKEN";
+const max_darwin_process_args_bytes = 1024 * 1024;
 
 const Identity = union(enum) {
     linux_start_ticks: u64,
@@ -67,6 +69,8 @@ pub const Tracker = struct {
     processes: std.ArrayList(TrackedProcess) = .empty,
     macos_child_buffer: []std.posix.pid_t = &.{},
     macos_pid_buffer: []std.posix.pid_t = &.{},
+    macos_args_buffer: []u8 = &.{},
+    darwin_process_marker: ?[]u8 = null,
 
     pub fn init(alloc: Allocator) !Tracker {
         var tracker = Tracker{ .alloc = alloc };
@@ -102,7 +106,24 @@ pub const Tracker = struct {
         if (self.macos_pid_buffer.len > 0) {
             self.alloc.free(self.macos_pid_buffer);
         }
+        if (self.macos_args_buffer.len > 0) self.alloc.free(self.macos_args_buffer);
+        if (self.darwin_process_marker) |marker| self.alloc.free(marker);
         self.* = undefined;
+    }
+
+    pub fn bindProcessToken(
+        self: *Tracker,
+        token: []const u8,
+    ) !void {
+        if (comptime builtin.os.tag != .macos) return;
+        const marker = try self.alloc.alloc(
+            u8,
+            command_process_token_env.len + 1 + token.len,
+        );
+        @memcpy(marker[0..command_process_token_env.len], command_process_token_env);
+        marker[command_process_token_env.len] = '=';
+        @memcpy(marker[command_process_token_env.len + 1 ..], token);
+        self.darwin_process_marker = marker;
     }
 
     pub fn refresh(self: *Tracker, root_pid: std.posix.pid_t) !void {
@@ -409,7 +430,11 @@ pub const Tracker = struct {
     fn trackLineageProcess(self: *Tracker, pid: std.posix.pid_t) !bool {
         const snapshot = captureSnapshot(self.alloc, pid) catch return false;
         const parent_unique_id = snapshot.parent_unique_id orelse return false;
-        if (!self.containsMacOSUniqueId(parent_unique_id)) return false;
+        if (!self.containsMacOSUniqueId(parent_unique_id) and
+            !try self.processHasBoundToken(pid))
+        {
+            return false;
+        }
         if (self.root) |root| {
             if (root.pid == pid and root.identity.eql(snapshot.identity)) return false;
         }
@@ -424,6 +449,29 @@ pub const Tracker = struct {
             .identity = snapshot.identity,
         });
         return true;
+    }
+
+    fn processHasBoundToken(self: *Tracker, pid: std.posix.pid_t) !bool {
+        if (comptime builtin.os.tag != .macos) return false;
+        const marker = self.darwin_process_marker orelse return false;
+        if (self.macos_args_buffer.len == 0) {
+            self.macos_args_buffer = try self.alloc.alloc(
+                u8,
+                max_darwin_process_args_bytes,
+            );
+        }
+        var args_len = self.macos_args_buffer.len;
+        const mib = [_]c_int{ Darwin.ctl_kern, Darwin.kern_proc_args_2, pid };
+        const result = std.c.sysctl(
+            &mib,
+            @intCast(mib.len),
+            self.macos_args_buffer.ptr,
+            &args_len,
+            null,
+            0,
+        );
+        if (result != 0) return false;
+        return containsProcessMarker(self.macos_args_buffer[0..args_len], marker);
     }
 
     fn containsMacOSUniqueId(self: *Tracker, unique_id: u64) bool {
@@ -442,6 +490,20 @@ fn identityHasMacOSUniqueId(identity: Identity, unique_id: u64) bool {
         .macos_unique_id => |actual| actual == unique_id,
         else => false,
     };
+}
+
+fn containsProcessMarker(process_args: []const u8, marker: []const u8) bool {
+    if (marker.len == 0 or process_args.len <= marker.len) return false;
+    var offset: usize = 0;
+    while (std.mem.find(u8, process_args[offset..], marker)) |relative| {
+        const start = offset + relative;
+        const end = start + marker.len;
+        const begins_field = start == 0 or process_args[start - 1] == 0;
+        const ends_field = end < process_args.len and process_args[end] == 0;
+        if (begins_field and ends_field) return true;
+        offset = start + 1;
+    }
+    return false;
 }
 
 fn shouldTraverseParent(expected: Identity, actual: Identity) bool {
@@ -767,6 +829,8 @@ const Darwin = struct {
     // Stable libproc process-identity flavor; the SDK omits this constant from
     // its public header, but XNU defines the record as API with a fixed size.
     const proc_pid_unique_identifier_info: c_int = 17;
+    const ctl_kern: c_int = 1;
+    const kern_proc_args_2: c_int = 49;
 
     const ProcUniqueIdentifierInfo = extern struct {
         p_uuid: [16]u8,
@@ -828,4 +892,20 @@ test "tracked identity distinguishes process instances" {
     try std.testing.expect(linux.eql(.{ .linux_start_ticks = 42 }));
     try std.testing.expect(!linux.eql(.{ .linux_start_ticks = 43 }));
     try std.testing.expect(!linux.eql(.{ .macos_unique_id = 42 }));
+}
+
+test "process marker requires exact nul-delimited field" {
+    const marker = "FX_INTERNAL_COMMAND_PROCESS_TOKEN=abc123";
+    try std.testing.expect(containsProcessMarker(
+        "\x02\x00\x00\x00/bin/zsh\x00arg\x00" ++ marker ++ "\x00OTHER=value\x00",
+        marker,
+    ));
+    try std.testing.expect(!containsProcessMarker(
+        "\x02\x00\x00\x00/bin/zsh\x00prefix" ++ marker ++ "\x00",
+        marker,
+    ));
+    try std.testing.expect(!containsProcessMarker(
+        "\x02\x00\x00\x00/bin/zsh\x00" ++ marker ++ "suffix\x00",
+        marker,
+    ));
 }

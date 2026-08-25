@@ -70,7 +70,14 @@ const foreground_session_replace_failure_prefix = "\x00FX_FOREGROUND_EXEC_FAILED
 const foreground_session_replace_failure_marker_bytes =
     foreground_session_replace_failure_prefix.len +
     foreground_session_failure_nonce_hex_bytes + 1;
-var foreground_session_termination_requested: std.c.sig_atomic_t = 0;
+const foreground_session_force_signal = std.posix.SIG.USR1;
+const ForegroundSessionTerminationRequest = enum(std.c.sig_atomic_t) {
+    none,
+    graceful,
+    force,
+};
+var foreground_session_termination_request: std.c.sig_atomic_t =
+    @intFromEnum(ForegroundSessionTerminationRequest.none);
 const foreground_session_replace_error_name_bytes = blk: {
     var max_len: usize = 0;
     for (std.meta.fields(std.process.ReplaceError)) |field| {
@@ -92,9 +99,14 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
     if (comptime !supports_foreground_session) {
         return error.OperationUnsupported;
     }
-    if (!isForegroundSessionInvocation(args) or args.len < 3) {
+    if (!isForegroundSessionInvocation(args) or args.len < 4) {
         return error.InvalidForegroundSessionInvocation;
     }
+    const deadline_ms = if (std.mem.eql(u8, args[2], "none"))
+        null
+    else
+        std.fmt.parseInt(i64, args[2], 10) catch
+            return error.InvalidForegroundSessionInvocation;
     if (std.c.setsid() == -1) return error.ForegroundSessionSetupFailed;
 
     const zio = io_mod.getIo();
@@ -115,20 +127,24 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
         return error.InvalidForegroundSessionRelease;
     }
 
-    // The group receives TERM together. Keep the supervisor alive while the
-    // target uses the cooperative shutdown window.
-    @as(*volatile std.c.sig_atomic_t, &foreground_session_termination_requested).* = 0;
+    @as(*volatile std.c.sig_atomic_t, &foreground_session_termination_request).* =
+        @intFromEnum(ForegroundSessionTerminationRequest.none);
     const supervisor_action: std.posix.Sigaction = .{
         .handler = .{ .handler = recordForegroundSessionTermination },
         .mask = std.posix.sigemptyset(),
         .flags = 0,
     };
     std.posix.sigaction(std.posix.SIG.TERM, &supervisor_action, null);
+    std.posix.sigaction(foreground_session_force_signal, &supervisor_action, null);
     if (comptime builtin.os.tag == .linux) {
         _ = try std.posix.prctl(.SET_CHILD_SUBREAPER, .{@as(usize, 1)});
     }
+    var target_environment = try io_mod.cloneEnvironMap(std.heap.page_allocator);
+    defer target_environment.deinit();
+    try target_environment.put(process_tree.command_process_token_env, args[1]);
     var target = std.process.spawn(zio, .{
-        .argv = args[2..],
+        .argv = args[3..],
+        .environ_map = &target_environment,
         .stdin = .inherit,
         .stdout = .inherit,
         .stderr = .inherit,
@@ -137,7 +153,7 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
         writeForegroundSessionReplaceFailure(args[1], err);
         std.process.exit(foreground_session_replace_failure_exit_code);
     };
-    const term = waitForForegroundTarget(&target) catch |err| {
+    const term = waitForForegroundTarget(&target, args[1], deadline_ms) catch |err| {
         target.kill(zio);
         writeForegroundSessionReplaceFailure(args[1], err);
         std.process.exit(foreground_session_replace_failure_exit_code);
@@ -145,20 +161,63 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
     exitForegroundSessionSupervisor(term);
 }
 
-fn recordForegroundSessionTermination(_: std.posix.SIG) callconv(.c) void {
-    @as(*volatile std.c.sig_atomic_t, &foreground_session_termination_requested).* = 1;
+fn recordForegroundSessionTermination(signal: std.posix.SIG) callconv(.c) void {
+    const request = @as(*volatile std.c.sig_atomic_t, &foreground_session_termination_request);
+    if (signal == foreground_session_force_signal) {
+        request.* = @intFromEnum(ForegroundSessionTerminationRequest.force);
+    } else if (request.* == @intFromEnum(ForegroundSessionTerminationRequest.none)) {
+        request.* = @intFromEnum(ForegroundSessionTerminationRequest.graceful);
+    }
 }
 
-fn foregroundSessionTerminationRequested() bool {
-    return @as(*volatile std.c.sig_atomic_t, &foreground_session_termination_requested).* != 0;
+fn foregroundSessionTerminationRequest() ForegroundSessionTerminationRequest {
+    return @enumFromInt(
+        @as(*volatile std.c.sig_atomic_t, &foreground_session_termination_request).*,
+    );
+}
+
+const ForegroundTerminationAction = enum {
+    none,
+    begin_graceful,
+    force,
+};
+
+fn decideForegroundTerminationAction(
+    request: ForegroundSessionTerminationRequest,
+    termination_started_ms: ?i64,
+    forced: bool,
+    now_ms: i64,
+) ForegroundTerminationAction {
+    if (forced or request == .none) return .none;
+    if (request == .force) return .force;
+    const started_ms = termination_started_ms orelse return .begin_graceful;
+    if (now_ms >= started_ms and
+        now_ms - started_ms >= foreground_target_termination_grace_ms)
+    {
+        return .force;
+    }
+    return .none;
+}
+
+fn foregroundRequestAtDeadline(
+    observed: ForegroundSessionTerminationRequest,
+    deadline_ms: ?i64,
+    now_ms: i64,
+) ForegroundSessionTerminationRequest {
+    if (observed != .none) return observed;
+    const deadline = deadline_ms orelse return .none;
+    return if (now_ms >= deadline) .force else .none;
 }
 
 fn waitForForegroundTarget(
     target: *std.process.Child,
+    process_token: []const u8,
+    deadline_ms: ?i64,
 ) !std.process.Child.Term {
     const target_pid = target.id orelse return error.ForegroundTargetMissing;
     var descendants = try process_tree.Tracker.init(std.heap.page_allocator);
     defer descendants.deinit();
+    try descendants.bindProcessToken(process_token);
     if (comptime builtin.os.tag == .macos) {
         try descendants.refresh(target_pid);
         try std.posix.kill(target_pid, std.posix.SIG.CONT);
@@ -167,34 +226,34 @@ fn waitForForegroundTarget(
     var forced = false;
 
     while (true) {
-        try refreshForegroundTargetTree(&descendants, target_pid);
         const now_ms = io_mod.milliTimestamp();
-        if (foregroundSessionTerminationRequested()) {
-            if (termination_started_ms == null) {
-                beginForegroundTargetTermination(
-                    &descendants,
-                    now_ms,
-                    &termination_started_ms,
-                );
-            } else if (!forced and
-                now_ms - termination_started_ms.? >= foreground_target_termination_grace_ms)
-            {
-                forced = true;
-                forceKillForegroundTargetDescendants(&descendants);
-            }
+        const request = foregroundRequestAtDeadline(
+            foregroundSessionTerminationRequest(),
+            deadline_ms,
+            now_ms,
+        );
+        if (request == .force) {
+            @as(*volatile std.c.sig_atomic_t, &foreground_session_termination_request).* =
+                @intFromEnum(ForegroundSessionTerminationRequest.force);
         }
+        try refreshForegroundTargetTree(&descendants, target_pid);
+        advanceForegroundTargetTermination(
+            &descendants,
+            request,
+            now_ms,
+            &termination_started_ms,
+            &forced,
+        );
 
         if (try pollProcessLeader(target)) |term| {
             try refreshForegroundTargetTree(&descendants, target_pid);
-            if (termination_started_ms == null and
-                foregroundSessionTerminationRequested())
-            {
-                beginForegroundTargetTermination(
-                    &descendants,
-                    io_mod.milliTimestamp(),
-                    &termination_started_ms,
-                );
-            }
+            advanceForegroundTargetTermination(
+                &descendants,
+                foregroundSessionTerminationRequest(),
+                io_mod.milliTimestamp(),
+                &termination_started_ms,
+                &forced,
+            );
             if (termination_started_ms) |started_ms| {
                 try waitForForegroundTargetDescendants(
                     &descendants,
@@ -255,27 +314,44 @@ fn refreshForegroundTargetTree(
         try descendants.refreshAdditionalRoot(std.c.getpid());
     }
     if (comptime builtin.os.tag == .macos) {
-        if (foregroundSessionTerminationRequested()) {
+        if (foregroundSessionTerminationRequest() != .none) {
             try descendants.refreshLineageProcesses();
         }
     }
 }
 
-fn beginForegroundTargetTermination(
+fn advanceForegroundTargetTermination(
     descendants: *process_tree.Tracker,
+    request: ForegroundSessionTerminationRequest,
     now_ms: i64,
     termination_started_ms: *?i64,
+    forced: *bool,
 ) void {
-    termination_started_ms.* = now_ms;
-    const count = descendants.signalOutsideProcessGroup(
-        std.posix.SIG.TERM,
-        std.c.getpid(),
-    );
-    debug_trace.logf(
-        "core",
-        "captured command termination reached tracked descendants count={d}",
-        .{count},
-    );
+    switch (decideForegroundTerminationAction(
+        request,
+        termination_started_ms.*,
+        forced.*,
+        now_ms,
+    )) {
+        .none => {},
+        .begin_graceful => {
+            termination_started_ms.* = now_ms;
+            const count = descendants.signalOutsideProcessGroup(
+                std.posix.SIG.TERM,
+                std.c.getpid(),
+            );
+            debug_trace.logf(
+                "core",
+                "captured command termination reached tracked descendants count={d}",
+                .{count},
+            );
+        },
+        .force => {
+            if (termination_started_ms.* == null) termination_started_ms.* = now_ms;
+            forced.* = true;
+            forceKillForegroundTargetDescendants(descendants);
+        },
+    }
 }
 
 fn waitForForegroundTargetDescendants(
@@ -452,6 +528,13 @@ const ExecutionControl = struct {
             const elapsed_ms: u64 = if (now_ms > self.started_ms) @intCast(now_ms - self.started_ms) else 0;
             if (elapsed_ms >= timeout_ms) return error.TimeoutExpired;
         }
+    }
+
+    fn deadlineMs(self: ExecutionControl) ?i64 {
+        const timeout_ms = self.timeout_ms orelse return null;
+        const timeout_i64 = std.math.cast(i64, timeout_ms) orelse return std.math.maxInt(i64);
+        const sum = @addWithOverflow(self.started_ms, timeout_i64);
+        return if (sum[1] == 0) sum[0] else std.math.maxInt(i64);
     }
 };
 
@@ -868,6 +951,7 @@ fn executeProcessWithInput(
         cfg,
         null,
         process_group_id,
+        .process_group,
         &leader_term,
     );
     const term = try waitForCollectedProcess(
@@ -938,6 +1022,12 @@ fn executeProcessWithDetachedSession(
     try helper_argv.append(scratch, executable);
     try helper_argv.append(scratch, foreground_session_token);
     try helper_argv.append(scratch, &nonce);
+    const deadline_ms = ExecutionControl.init(cfg).deadlineMs();
+    const deadline_text = if (deadline_ms) |value|
+        try std.fmt.allocPrint(scratch, "{d}", .{value})
+    else
+        "none";
+    try helper_argv.append(scratch, deadline_text);
     try helper_argv.appendSlice(scratch, argv);
 
     const started_ms = io_mod.milliTimestamp();
@@ -992,6 +1082,7 @@ fn executeProcessWithDetachedSession(
         cfg,
         &launch_failure_probe,
         process_group_id,
+        .foreground_supervisor,
         &leader_term,
     );
     const term = try waitForCollectedProcess(
@@ -1143,6 +1234,7 @@ fn executeProcessWithScriptUnisolated(
         cfg,
         null,
         process_group_id,
+        .process_group,
         &leader_term,
     );
     const term = try waitForCollectedProcess(
@@ -1582,12 +1674,47 @@ fn writePreviewEnvelope(alloc: Allocator, writer: *std.Io.Writer, label: []const
 }
 
 const TerminationSource = enum {
-    // Cancellation and timeout share a signal path, so retain the initiating
-    // source until after the child is reaped.
     natural,
     cancelled,
     timed_out,
 };
+
+const TerminationProtocol = enum {
+    process_group,
+    foreground_supervisor,
+};
+
+const TerminationIntent = enum {
+    cooperative,
+    force,
+};
+
+const TerminationSignalPlan = struct {
+    scope: enum { process_group, supervisor },
+    signal: std.posix.SIG,
+};
+
+fn terminationSignalPlan(
+    protocol: TerminationProtocol,
+    intent: TerminationIntent,
+) TerminationSignalPlan {
+    return switch (protocol) {
+        .process_group => .{
+            .scope = .process_group,
+            .signal = if (intent == .force) std.posix.SIG.KILL else std.posix.SIG.TERM,
+        },
+        .foreground_supervisor => switch (intent) {
+            .cooperative => .{
+                .scope = .process_group,
+                .signal = std.posix.SIG.TERM,
+            },
+            .force => .{
+                .scope = .supervisor,
+                .signal = foreground_session_force_signal,
+            },
+        },
+    };
+}
 
 const OutputChunkEmitter = struct {
     stdout_pending: std.ArrayList(u8) = .empty,
@@ -1792,6 +1919,7 @@ fn collectOutput(
     source: *TerminationSource,
     launch_failure_probe: ?*ForegroundLaunchFailureProbe,
     process_group_id: ?std.posix.pid_t,
+    termination_protocol: TerminationProtocol,
     leader_term: *?std.process.Child.Term,
 ) !TerminationSource {
     const zio = io_mod.getIo();
@@ -1815,6 +1943,7 @@ fn collectOutput(
         try updateTerminationSignal(
             child,
             process_group_id,
+            termination_protocol,
             cfg,
             started_ms,
             source,
@@ -1904,6 +2033,7 @@ fn collectOutputForProcess(
     cfg: Config,
     launch_failure_probe: ?*ForegroundLaunchFailureProbe,
     process_group_id: ?std.posix.pid_t,
+    termination_protocol: TerminationProtocol,
     leader_term: *?std.process.Child.Term,
 ) !TerminationSource {
     var source: TerminationSource = .natural;
@@ -1915,6 +2045,7 @@ fn collectOutputForProcess(
         &source,
         launch_failure_probe,
         process_group_id,
+        termination_protocol,
         leader_term,
     ) catch |err|
         return mapTerminationError(source, cfg.cancel_flag, "output collection", err);
@@ -1995,6 +2126,7 @@ fn mapTerminationError(
 fn updateTerminationSignal(
     child: *std.process.Child,
     process_group_id: ?std.posix.pid_t,
+    termination_protocol: TerminationProtocol,
     cfg: Config,
     started_ms: i64,
     source: *TerminationSource,
@@ -2005,7 +2137,7 @@ fn updateTerminationSignal(
     if (signal_started_ms.* == null) {
         if (cancelRequested(cfg.cancel_flag)) {
             source.* = .cancelled;
-            try signalChild(child, process_group_id, false);
+            try signalChild(child, process_group_id, termination_protocol, .cooperative);
             debug_trace.logf("core", "command termination requested source=cancelled", .{});
             signal_started_ms.* = now_ms;
         }
@@ -2013,7 +2145,7 @@ fn updateTerminationSignal(
             if (cfg.timeout_ms) |timeout_ms| {
                 if (now_ms - started_ms >= @as(i64, @intCast(timeout_ms))) {
                     source.* = .timed_out;
-                    try signalChild(child, process_group_id, true);
+                    try signalChild(child, process_group_id, termination_protocol, .force);
                     force_kill_sent.* = true;
                     debug_trace.logf("core", "command termination requested source=timeout", .{});
                     signal_started_ms.* = now_ms;
@@ -2024,7 +2156,7 @@ fn updateTerminationSignal(
 
     if (signal_started_ms.*) |sent_ms| {
         if (!force_kill_sent.* and now_ms - sent_ms >= 800) {
-            try signalChild(child, process_group_id, true);
+            try signalChild(child, process_group_id, termination_protocol, .force);
             debug_trace.logf("core", "command force-killed after termination grace expired", .{});
             force_kill_sent.* = true;
         }
@@ -2047,27 +2179,36 @@ fn emitOutputChunk(
 fn signalChild(
     child: *std.process.Child,
     process_group_id: ?std.posix.pid_t,
-    force: bool,
+    protocol: TerminationProtocol,
+    intent: TerminationIntent,
 ) !void {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
         child.kill(io_mod.getIo());
         return;
     }
 
-    if (process_group_id) |pid| return signalProcessGroup(pid, force);
     const pid = child.id orelse return;
-    return signalProcessGroup(pid, force);
+    const target_pid = process_group_id orelse pid;
+    const plan = terminationSignalPlan(protocol, intent);
+    return switch (plan.scope) {
+        .process_group => signalProcessGroup(target_pid, plan.signal),
+        .supervisor => signalProcess(target_pid, plan.signal),
+    };
 }
 
-fn signalProcessGroup(pid: std.posix.pid_t, force: bool) !void {
-    std.posix.kill(-pid, if (force) std.posix.SIG.KILL else std.posix.SIG.TERM) catch |err| switch (err) {
+fn signalProcess(pid: std.posix.pid_t, signal: std.posix.SIG) !void {
+    std.posix.kill(pid, signal) catch |err| switch (err) {
         error.ProcessNotFound => {},
         else => return err,
     };
 }
 
+fn signalProcessGroup(pid: std.posix.pid_t, signal: std.posix.SIG) !void {
+    return signalProcess(-pid, signal);
+}
+
 fn terminateRemainingProcessGroup(pid: std.posix.pid_t) void {
-    signalProcessGroup(pid, true) catch |err| {
+    signalProcessGroup(pid, std.posix.SIG.KILL) catch |err| {
         debug_trace.logf(
             "core",
             "remaining captured process group cleanup failed err={s}",
@@ -2206,6 +2347,7 @@ fn spawnForegroundSessionBootstrapForTest(
         product_path,
         foreground_session_token,
         "test-nonce",
+        "none",
         "/bin/sh",
         "-c",
         target_script,
@@ -3297,6 +3439,7 @@ test "artifact write failure after cancellation remains a bare error" {
         cfg,
         null,
         process_group_id,
+        .process_group,
         &leader_term,
     ));
     try std.testing.expect(ready_seen.load(.seq_cst));
@@ -3307,6 +3450,60 @@ test "timeout source is distinct from cancellation" {
         .max_command_output_bytes = 1024,
         .timeout_ms = 120,
     }, std.testing.allocator, "sleep 5", "/tmp"));
+}
+
+test "foreground force cleanup preserves the supervisor" {
+    const timeout = terminationSignalPlan(.foreground_supervisor, .force);
+    try std.testing.expect(timeout.scope == .supervisor);
+    try std.testing.expectEqual(foreground_session_force_signal, timeout.signal);
+
+    const cancellation = terminationSignalPlan(.foreground_supervisor, .cooperative);
+    try std.testing.expect(cancellation.scope == .process_group);
+    try std.testing.expectEqual(std.posix.SIG.TERM, cancellation.signal);
+
+    const ordinary = terminationSignalPlan(.process_group, .force);
+    try std.testing.expect(ordinary.scope == .process_group);
+    try std.testing.expectEqual(std.posix.SIG.KILL, ordinary.signal);
+}
+
+test "foreground force request dominates graceful termination" {
+    try std.testing.expectEqual(
+        ForegroundTerminationAction.none,
+        decideForegroundTerminationAction(.none, null, false, 1000),
+    );
+    try std.testing.expectEqual(
+        ForegroundTerminationAction.begin_graceful,
+        decideForegroundTerminationAction(.graceful, null, false, 1000),
+    );
+    try std.testing.expectEqual(
+        ForegroundTerminationAction.none,
+        decideForegroundTerminationAction(.graceful, 1000, false, 1699),
+    );
+    try std.testing.expectEqual(
+        ForegroundTerminationAction.force,
+        decideForegroundTerminationAction(.graceful, 1000, false, 1700),
+    );
+    try std.testing.expectEqual(
+        ForegroundTerminationAction.force,
+        decideForegroundTerminationAction(.force, 1000, false, 1001),
+    );
+    try std.testing.expectEqual(
+        ForegroundTerminationAction.none,
+        decideForegroundTerminationAction(.force, 1000, true, 2000),
+    );
+
+    try std.testing.expectEqual(
+        ForegroundSessionTerminationRequest.none,
+        foregroundRequestAtDeadline(.none, 1700, 1699),
+    );
+    try std.testing.expectEqual(
+        ForegroundSessionTerminationRequest.force,
+        foregroundRequestAtDeadline(.none, 1700, 1700),
+    );
+    try std.testing.expectEqual(
+        ForegroundSessionTerminationRequest.graceful,
+        foregroundRequestAtDeadline(.graceful, 1700, 2000),
+    );
 }
 
 test "timeout prevents captured user shell from evaluating trailing statements" {
@@ -3401,6 +3598,90 @@ test "timeout terminates foreground process group descendants" {
         }
         io_mod.sleep(10 * std.time.ns_per_ms);
     }
+}
+
+test "timeout terminates redirected descendant after setsid" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "escaped-timeout.pid" });
+    defer alloc.free(pid_path);
+    const command = try std.fmt.allocPrint(
+        alloc,
+        "python3 -c 'import os,time\n" ++
+            "pid=os.fork()\n" ++
+            "if pid == 0:\n" ++
+            " os.setsid()\n" ++
+            " null=os.open(\"/dev/null\",os.O_RDWR)\n" ++
+            " os.dup2(null,0); os.dup2(null,1); os.dup2(null,2)\n" ++
+            " open(\"{s}\",\"w\").write(str(os.getpid()))\n" ++
+            " time.sleep(30)\n" ++
+            "else:\n" ++
+            " while True: time.sleep(1)'",
+        .{pid_path},
+    );
+    defer alloc.free(command);
+
+    try std.testing.expectError(error.TimeoutExpired, executeCommand(.{
+        .max_command_output_bytes = 1024,
+        .timeout_ms = 500,
+    }, alloc, command, workspace));
+
+    const pid_text = try readAbsoluteFile(alloc, pid_path, 64);
+    defer alloc.free(pid_text);
+    const pid = try std.fmt.parseInt(
+        std.posix.pid_t,
+        std.mem.trim(u8, pid_text, " \t\r\n"),
+        10,
+    );
+    try expectProcessGone(pid);
+}
+
+test "timeout terminates double-forked descendant after setsid" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "double-fork-timeout.pid" });
+    defer alloc.free(pid_path);
+    const command = try std.fmt.allocPrint(
+        alloc,
+        "python3 -c 'import os,time\n" ++
+            "pid=os.fork()\n" ++
+            "if pid == 0:\n" ++
+            " os.setsid()\n" ++
+            " grandchild=os.fork()\n" ++
+            " if grandchild > 0: os._exit(0)\n" ++
+            " null=os.open(\"/dev/null\",os.O_RDWR)\n" ++
+            " os.dup2(null,0); os.dup2(null,1); os.dup2(null,2)\n" ++
+            " open(\"{s}\",\"w\").write(str(os.getpid()))\n" ++
+            " time.sleep(30)\n" ++
+            "else:\n" ++
+            " while True: time.sleep(1)'",
+        .{pid_path},
+    );
+    defer alloc.free(command);
+
+    try std.testing.expectError(error.TimeoutExpired, executeCommand(.{
+        .max_command_output_bytes = 1024,
+        .timeout_ms = 500,
+    }, alloc, command, workspace));
+
+    const pid_text = try readAbsoluteFile(alloc, pid_path, 64);
+    defer alloc.free(pid_text);
+    const pid = try std.fmt.parseInt(
+        std.posix.pid_t,
+        std.mem.trim(u8, pid_text, " \t\r\n"),
+        10,
+    );
+    try expectProcessGone(pid);
 }
 
 fn expectProcessGone(pid: std.posix.pid_t) !void {
