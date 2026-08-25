@@ -1714,9 +1714,59 @@ test "ACP host-disabled new load and resume skip project MCP effects" {
         try std.testing.expect(state.active_session.?.mcp == null);
     }
 
+    const local_request = try std.fmt.allocPrint(
+        arena,
+        "{{\"name\":\"request-local\",\"command\":\"/bin/sh\",\"args\":[\"-c\",\"printf launched > {s}\"],\"env\":[]}}",
+        .{marker_path},
+    );
+    const remote_request =
+        "{\"type\":\"http\",\"name\":\"request-remote\",\"url\":\"http://127.0.0.1:1/mcp\",\"headers\":[]}";
+    inline for (.{
+        .{ .method = "session/new", .handler = handleNewSession, .server = local_request },
+        .{ .method = "session/load", .handler = handleLoadSession, .server = remote_request },
+        .{ .method = "session/resume", .handler = handleResumeSession, .server = local_request },
+    }, 0..) |request, index| {
+        const params = if (std.mem.eql(u8, request.method, "session/new"))
+            try std.fmt.allocPrint(
+                arena,
+                "{{\"mcpServers\":[{s}]}}",
+                .{request.server},
+            )
+        else
+            try std.fmt.allocPrint(
+                arena,
+                "{{\"sessionId\":\"{s}\",\"mcpServers\":[{s}]}}",
+                .{ session_id, request.server },
+            );
+        var msg = jsonrpc.Message{
+            .id = .{ .integer = @intCast(index + 10) },
+            .method = request.method,
+            .params_raw = params,
+        };
+        try request.handler(&state, arena, &msg);
+        try std.testing.expect(state.active_session.?.mcp == null);
+        try std.testing.expectEqualStrings(
+            session_id,
+            state.active_session.?.session_id,
+        );
+    }
+
     try std.testing.expectError(
         error.FileNotFound,
         tmp.dir.openFile(io_mod.getIo(), "workspace/project-mcp-launched", .{}),
+    );
+    try capture.sync(io_mod.getIo());
+    var captured_file = try tmp.dir.openFile(
+        io_mod.getIo(),
+        "acp-host-disabled.jsonl",
+        .{},
+    );
+    defer captured_file.close(io_mod.getIo());
+    const captured = try io_mod.readFileToEnd(alloc, &captured_file, 64 * 1024);
+    defer alloc.free(captured);
+    try std.testing.expectEqual(
+        @as(usize, 3),
+        std.mem.count(u8, captured, "MCP servers are unavailable in this runtime"),
     );
 }
 
