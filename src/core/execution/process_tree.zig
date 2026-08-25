@@ -33,6 +33,7 @@ const ProcessSnapshot = struct {
     identity: Identity,
     parent_pid: std.posix.pid_t,
     parent_unique_id: ?u64 = null,
+    started_at_us: ?u64 = null,
 };
 
 pub const DeliverySummary = struct {
@@ -71,6 +72,7 @@ pub const Tracker = struct {
     macos_pid_buffer: []std.posix.pid_t = &.{},
     macos_args_buffer: []u8 = &.{},
     darwin_process_marker: ?[]u8 = null,
+    macos_root_started_at_us: ?u64 = null,
 
     pub fn init(alloc: Allocator) !Tracker {
         var tracker = Tracker{ .alloc = alloc };
@@ -142,6 +144,7 @@ pub const Tracker = struct {
                     .pid = root_pid,
                     .identity = snapshot.identity,
                 };
+                self.macos_root_started_at_us = snapshot.started_at_us;
                 traverse_root = true;
             }
         }
@@ -430,6 +433,10 @@ pub const Tracker = struct {
 
     fn trackLineageProcess(self: *Tracker, pid: std.posix.pid_t) !bool {
         const snapshot = captureSnapshot(self.alloc, pid) catch return false;
+        if (!couldBelongByStart(
+            self.macos_root_started_at_us,
+            snapshot.started_at_us,
+        )) return false;
         const parent_unique_id = snapshot.parent_unique_id orelse return false;
         if (!self.containsMacOSUniqueId(parent_unique_id) and
             !try self.processHasBoundToken(pid))
@@ -501,6 +508,7 @@ fn processEnvironmentContainsMarker(
     marker: []const u8,
 ) bool {
     if (marker.len == 0 or process_args.len < @sizeOf(c_int)) return false;
+    if (std.mem.find(u8, process_args, marker) == null) return false;
     const argc = std.mem.readInt(
         c_int,
         process_args[0..@sizeOf(c_int)],
@@ -535,6 +543,19 @@ fn processEnvironmentContainsMarker(
         cursor += field_end + 1;
     }
     return false;
+}
+
+fn couldBelongByStart(root_started_at_us: ?u64, candidate_started_at_us: ?u64) bool {
+    const root = root_started_at_us orelse return true;
+    const candidate = candidate_started_at_us orelse return false;
+    return candidate >= root;
+}
+
+fn darwinStartTimeUs(seconds: u64, microseconds: u64) u64 {
+    const scaled = @mulWithOverflow(seconds, @as(u64, std.time.us_per_s));
+    if (scaled[1] != 0) return std.math.maxInt(u64);
+    const total = @addWithOverflow(scaled[0], microseconds);
+    return if (total[1] == 0) total[0] else std.math.maxInt(u64);
 }
 
 fn shouldTraverseParent(expected: Identity, actual: Identity) bool {
@@ -853,6 +874,10 @@ fn captureMacOSSnapshot(pid: std.posix.pid_t) !ProcessSnapshot {
         .identity = .{ .macos_unique_id = unique.p_uniqueid },
         .parent_pid = @intCast(info.pbi_ppid),
         .parent_unique_id = unique.p_puniqueid,
+        .started_at_us = darwinStartTimeUs(
+            info.pbi_start_tvsec,
+            info.pbi_start_tvusec,
+        ),
     };
 }
 
@@ -948,4 +973,17 @@ test "process marker admits only exact environment field" {
         "\x02\x00\x00\x00/bin/zsh\x00\x00zsh\x00arg\x00" ++ marker ++ "suffix\x00",
         marker,
     ));
+}
+
+test "Darwin token scan excludes processes older than command root" {
+    try std.testing.expect(couldBelongByStart(null, null));
+    try std.testing.expect(!couldBelongByStart(100, null));
+    try std.testing.expect(!couldBelongByStart(100, 99));
+    try std.testing.expect(couldBelongByStart(100, 100));
+    try std.testing.expect(couldBelongByStart(100, 101));
+    try std.testing.expectEqual(@as(u64, 2_000_003), darwinStartTimeUs(2, 3));
+    try std.testing.expectEqual(
+        std.math.maxInt(u64),
+        darwinStartTimeUs(std.math.maxInt(u64), 1),
+    );
 }
