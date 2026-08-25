@@ -1658,6 +1658,7 @@ fn commandProcessPresentation(
         .foreground => |value| value,
         .background => return null,
     };
+    if (foreground.timed_out) return .timed_out;
     if (foreground.signal) |signal| return .{ .signal = signal };
     if (foreground.exit_code) |exit_code| {
         if (exit_code != 0) return .{ .exit_code = exit_code };

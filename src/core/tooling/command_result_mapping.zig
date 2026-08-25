@@ -97,6 +97,9 @@ pub const Foreground = struct {
                 .timed_out = true,
                 .duration_ms = if (started_ms) |started| elapsedMs(started, io_mod.milliTimestamp()) else null,
             } }).toJson(arena),
+            .tool_result_memory = .{
+                .command_process_presentation = .timed_out,
+            },
         };
     }
 
@@ -112,6 +115,9 @@ pub const Foreground = struct {
                 .details = &details,
                 .suggestion = "Do not retry unchanged. Inspect available command evidence, free storage if needed, or explain that complete output capture failed.",
             }),
+            .tool_result_memory = .{
+                .command_process_presentation = .output_capture_failed,
+            },
         };
     }
 };
@@ -398,6 +404,10 @@ test "command result mapping preserves timeout JSON" {
         timeout.model_output,
     );
     try expectContains(timeout.command_result_json.?, "\"timed_out\":true");
+    try std.testing.expectEqual(
+        types.CommandProcessPresentation.timed_out,
+        timeout.tool_result_memory.?.command_process_presentation.?,
+    );
 }
 
 test "foreground output capture failure is structured and recoverable" {
@@ -407,6 +417,10 @@ test "foreground output capture failure is structured and recoverable" {
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
     try expectContains(result.model_output, "\"output_capture_failed\":true");
     try expectContains(result.model_output, "Command output could not be retained");
+    try std.testing.expectEqual(
+        types.CommandProcessPresentation.output_capture_failed,
+        result.tool_result_memory.?.command_process_presentation.?,
+    );
 }
 
 test "command result mapping projects background reuse output and JSON" {
