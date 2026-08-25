@@ -1,6 +1,11 @@
 const std = @import("std");
 const model_provider = @import("../config/model_provider.zig");
 
+pub const CatalogScope = enum {
+    provider_native,
+    unified,
+};
+
 pub const Entry = struct {
     id: model_provider.ProviderId,
     slug: []const u8,
@@ -9,6 +14,7 @@ pub const Entry = struct {
     route_name: []const u8,
     description: []const u8,
     subscription: bool,
+    catalog_scope: CatalogScope,
 };
 
 pub const entries = [_]Entry{
@@ -20,6 +26,7 @@ pub const entries = [_]Entry{
         .route_name = "Vercel AI Gateway",
         .description = "Vercel account or AI Gateway billing",
         .subscription = false,
+        .catalog_scope = .unified,
     },
     .{
         .id = .codex,
@@ -28,6 +35,7 @@ pub const entries = [_]Entry{
         .route_name = "Codex subscription",
         .description = "ChatGPT Plus, Pro, Business, Enterprise, or Edu subscription",
         .subscription = true,
+        .catalog_scope = .provider_native,
     },
     .{
         .id = .grok,
@@ -36,6 +44,7 @@ pub const entries = [_]Entry{
         .route_name = "Grok subscription",
         .description = "SuperGrok or X Premium subscription",
         .subscription = true,
+        .catalog_scope = .provider_native,
     },
     .{
         .id = .opencode,
@@ -44,6 +53,7 @@ pub const entries = [_]Entry{
         .route_name = "OpenCode",
         .description = "Zen or Go API key from opencode.ai",
         .subscription = false,
+        .catalog_scope = .unified,
     },
 };
 
@@ -77,4 +87,8 @@ test "auth provider catalog uses the model provider identity and explicit aliase
     try std.testing.expect(find(.codex).subscription);
     try std.testing.expect(find(.grok).subscription);
     try std.testing.expect(!find(.opencode).subscription);
+    try std.testing.expectEqual(CatalogScope.unified, find(.gateway).catalog_scope);
+    try std.testing.expectEqual(CatalogScope.unified, find(.opencode).catalog_scope);
+    try std.testing.expectEqual(CatalogScope.provider_native, find(.codex).catalog_scope);
+    try std.testing.expectEqual(CatalogScope.provider_native, find(.grok).catalog_scope);
 }

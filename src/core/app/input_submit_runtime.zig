@@ -479,6 +479,12 @@ pub fn SubmitRuntime(comptime App: type) type {
                 try submitSlashCommand(app, left_trimmed, null, max_prompt_history);
                 return;
             }
+            if (comptime @hasDecl(App, "isExtensionSlashCommand")) {
+                if (App.isExtensionSlashCommand(app, resolved_slash_submission)) {
+                    try submitSlashCommand(app, left_trimmed, null, max_prompt_history);
+                    return;
+                }
+            }
             if (shouldRouteUnknownSlashCommand(app, resolved_slash_submission)) {
                 try submitSlashCommand(app, left_trimmed, null, max_prompt_history);
                 return;

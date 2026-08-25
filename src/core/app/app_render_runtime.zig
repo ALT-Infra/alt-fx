@@ -2594,10 +2594,20 @@ pub fn Runtime(comptime App: type) type {
                     .{@errorName(leave_err)},
                 );
             };
-            switch (app.worker.submitPermissionResponse(
-                request_id,
-                permission_request.OwnedPermissionResponse.init(app.alloc, .deny, null),
-            )) {
+            const response = permission_request.OwnedPermissionResponse.init(
+                app.alloc,
+                .deny,
+                null,
+            );
+            const submission = if (comptime @hasDecl(App, "isOrchestrationApproval") and
+                @hasDecl(App, "submitOrchestrationPermissionResponse"))
+                if (app.isOrchestrationApproval(request_id))
+                    app.submitOrchestrationPermissionResponse(request_id, response)
+                else
+                    app.worker.submitPermissionResponse(request_id, response)
+            else
+                app.worker.submitPermissionResponse(request_id, response);
+            switch (submission) {
                 .accepted => {
                     app.approval_prompt.clearWithReason(app.alloc, "screen_failure");
                     app.approval_screen.clear();

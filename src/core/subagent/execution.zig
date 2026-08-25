@@ -6,10 +6,7 @@ const permission_prompter = @import("../permissions/permission_prompter.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
-const runtime_assistant_stream = @import("../agent/runtime/assistant_stream.zig");
-const runtime_config = @import("../agent/runtime/config.zig");
 const runtime_deps = @import("../agent/runtime/deps.zig");
-const runtime_lifecycle = @import("../agent/runtime/lifecycle.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
@@ -964,34 +961,6 @@ pub const TurnContext = struct {
         };
     }
 };
-
-/// The production adapter uses the same orchestrator as interactive, ask, and
-/// ACP execution. Host-specific dependency assembly stays outside the manager.
-pub const NormalAgentError = error{
-    OutOfMemory,
-    Cancelled,
-    AgentExecutionFailed,
-};
-
-pub fn runNormalAgentTurn(
-    deps: *const runtime_deps.AgentRuntimeDeps,
-    semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink,
-    lifecycle: runtime_lifecycle.LifecycleContext,
-    config: runtime_config.Config,
-    prompt: worker_runtime.QueuedPrompt,
-) NormalAgentError!void {
-    agent_runtime.processQueuedPrompt(
-        deps,
-        semantic_presentation,
-        lifecycle,
-        config,
-        prompt,
-    ) catch |err| return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.Cancelled => error.Cancelled,
-        else => error.AgentExecutionFailed,
-    };
-}
 
 pub const StartResult = enum {
     started,

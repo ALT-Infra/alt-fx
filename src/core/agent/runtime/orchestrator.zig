@@ -3580,6 +3580,7 @@ fn processQueuedPromptLoop(
                     verified_images.items
                 else
                     null,
+                .response_format = config.response_format,
                 .trace_ctx = step_ctx,
                 .content_capture_limit = null,
                 .cooperative_pulse = deps.cooperative_transport_pulse,

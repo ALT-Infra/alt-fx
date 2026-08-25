@@ -198,7 +198,16 @@ pub fn ApprovalRuntime(comptime App: type) type {
                 try submitRuleManagementChoice(app, decision);
                 return;
             }
-            if (try submitSubagentPermissionChoice(app, decision)) return;
+            const request_id = app.approval_prompt.request.?.id;
+            const orchestration_approval = if (comptime @hasDecl(
+                App,
+                "isOrchestrationApproval",
+            ))
+                app.isOrchestrationApproval(request_id)
+            else
+                false;
+            if (!orchestration_approval and
+                try submitSubagentPermissionChoice(app, decision)) return;
             var affirmative_claimed = false;
             if (decision != .deny and
                 app.approval_prompt.request.?.file != null)
@@ -247,14 +256,16 @@ pub fn ApprovalRuntime(comptime App: type) type {
             defer if (affirmative_claimed) {
                 releaseApprovalAffirmative(app);
             };
-            const request_id = app.approval_prompt.request.?.id;
             var response = try app.approval_prompt.decision.materializeResponse(
                 app.alloc,
                 decision,
             );
             var response_submitted = false;
             errdefer if (!response_submitted) response.deinit();
-            const result = app.worker.submitPermissionResponse(request_id, response);
+            const result = if (orchestration_approval)
+                app.submitOrchestrationPermissionResponse(request_id, response)
+            else
+                app.worker.submitPermissionResponse(request_id, response);
             response_submitted = true;
             switch (result) {
                 .accepted => {
@@ -406,6 +417,20 @@ pub fn ApprovalRuntime(comptime App: type) type {
         }
 
         pub fn cancelApprovalOperation(app: *App) !void {
+            if (comptime @hasDecl(App, "isOrchestrationApproval") and
+                @hasDecl(App, "cancelOrchestrationApproval"))
+            {
+                if (app.approval_prompt.request) |request| {
+                    if (app.isOrchestrationApproval(request.id)) {
+                        clearApprovalPrompt(app, "orchestration_approval_cancelled");
+                        _ = app.cancelOrchestrationApproval(request.id);
+                        app.input_runtime.input_limit_rejection =
+                            input_limit_rejection.clear();
+                        requestActiveSurfaceFrame(app);
+                        return;
+                    }
+                }
+            }
             if (comptime @hasField(App, "subagents")) {
                 if (comptime @hasDecl(@TypeOf(app.subagents), "mainApprovalBinding")) {
                     if (app.approval_prompt.request) |request| {
