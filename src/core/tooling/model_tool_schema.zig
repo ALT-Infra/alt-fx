@@ -4,6 +4,7 @@ pub const description_max_bytes: usize = 1024;
 pub const truncation_marker = "... [truncated]";
 
 pub const JsonType = enum {
+    null,
     string,
     integer,
     boolean,
@@ -335,6 +336,34 @@ test "nullable properties preserve concrete constraints and add one null branch"
     try std.testing.expectEqualStrings("object", config_alternatives[0].object.get("type").?.string);
     try std.testing.expectEqual(false, config_alternatives[0].object.get("additionalProperties").?.bool);
     try std.testing.expectEqualStrings("null", config_alternatives[1].object.get("type").?.string);
+}
+
+test "exact null properties serialize without a concrete alternative" {
+    const alloc = std.testing.allocator;
+    const schema = FunctionSchema{
+        .name = "exact_null",
+        .description = "exact null",
+        .input_schema = .{
+            .properties = &.{.{
+                .name = "value",
+                .json_type = .null,
+                .description = "Must be null.",
+            }},
+            .required = &.{"value"},
+            .additional_properties = false,
+        },
+    };
+
+    const json = try builtinFunctionSchemaJsonAlloc(alloc, schema);
+    defer alloc.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+
+    const value = parsed.value.object.get("inputSchema").?.object
+        .get("properties").?.object.get("value").?.object;
+    try std.testing.expectEqualStrings("null", value.get("type").?.string);
+    try std.testing.expect(value.get("anyOf") == null);
+    try std.testing.expectEqualStrings("Must be null.", value.get("description").?.string);
 }
 
 test "nested object schema serializes exact property bounds" {

@@ -552,6 +552,13 @@ pub fn call(
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const input = &erased.as(OwnedInput).value;
     if (input.action == .exec) return callExec(ctx, input);
+    return callDurable(ctx, input);
+}
+
+fn callDurable(
+    ctx: tool_dispatch.DispatchContext,
+    input: *const Input,
+) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const runtime = ctx.terminal_client orelse return structuredFailure(
         ctx.allocator,
         durableAction(input.action).?,
@@ -658,6 +665,43 @@ pub fn call(
         }
         io_mod.sleep(2 * std.time.ns_per_ms);
     }
+}
+
+pub fn release_agent_write_lease(
+    ctx: tool_dispatch.DispatchContext,
+    session_id: []const u8,
+) !void {
+    const input = Input{
+        .action = .write,
+        .session_id = session_id,
+        .lease = .release,
+    };
+    const result = try callDurable(ctx, &input);
+    defer result.deinit(ctx.allocator);
+    const body = switch (result) {
+        .success => |value| value,
+        .failure => |value| value,
+    };
+    var parsed = std.json.parseFromSlice(
+        contracts.Result,
+        ctx.allocator,
+        body,
+        .{},
+    ) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidTerminalLeaseCleanupResult,
+    };
+    defer parsed.deinit();
+    return switch (parsed.value) {
+        .success => |success| switch (success) {
+            .write => {},
+            else => error.InvalidTerminalLeaseCleanupResult,
+        },
+        .failure => |failure| switch (failure.code) {
+            .session_not_found, .lease_conflict => {},
+            else => error.TerminalLeaseCleanupFailed,
+        },
+    };
 }
 
 fn callExec(

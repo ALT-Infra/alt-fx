@@ -185,6 +185,9 @@ const test_tool_registry = tool_dispatch.Registry{ .tools = test_tools[0..] };
 
 fn testExecutionAuthority(call: ToolCall) command_admission.ToolExecutionAuthority {
     if (!std.mem.eql(u8, call.name, "terminal")) return .ordinary;
+    if (std.mem.find(u8, call.arguments_json, "\"action\":\"exec\"") == null) {
+        return .ordinary;
+    }
     return .{ .run_command = .{ .shell_allowed = .{
         .fingerprint = .{
             .command = call.arguments_json,
@@ -565,6 +568,9 @@ pub const FakeAgentRuntimeDeps = struct {
     finalized_outcome: ?types.TurnPresentationOutcome = null,
     finalized_disposition: ?types.ProviderCompletionDisposition = null,
     finalization_error: ?anyerror = null,
+    terminal_lease_cleanup_ids: std.ArrayList([]u8) = .empty,
+    terminal_lease_cleanup_errors: []const ?anyerror = &.{},
+    terminal_lease_cleanup_index: usize = 0,
     finish_assistant_text: ?[]u8 = null,
     finish_summary: ?types.TurnSummary = null,
     finish_projection: ?types.FinishedPromptProjection = null,
@@ -684,6 +690,7 @@ pub const FakeAgentRuntimeDeps = struct {
         freeGrantList(self.alloc, &self.last_frozen_file_grants);
         self.execute_timeout_started_ms.deinit(self.alloc);
         if (self.finish_assistant_text) |value| self.alloc.free(value);
+        freeStringList(self.alloc, &self.terminal_lease_cleanup_ids);
         if (self.history_assistant_text) |value| self.alloc.free(value);
         if (self.background_history_log_path) |value| self.alloc.free(value);
         if (self.background_event_log_path) |value| self.alloc.free(value);
@@ -718,6 +725,7 @@ pub const FakeAgentRuntimeDeps = struct {
             else
                 null,
             .finalize_turn = finalizeTurn,
+            .release_agent_terminal_lease = releaseAgentTerminalLease,
             .prepare_parent_turn_context = prepareParentTurnContext,
             .acknowledge_parent_turn_context = acknowledgeParentTurnContext,
             .append_runtime_context = appendRuntimeContext,
@@ -841,6 +849,19 @@ pub const FakeAgentRuntimeDeps = struct {
         self.finalized_disposition = disposition;
         try self.record("event:turn_finished", .{});
         if (self.finalization_error) |err| return err;
+    }
+
+    fn releaseAgentTerminalLease(raw: *anyopaque, session_id: []const u8) !void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        try self.terminal_lease_cleanup_ids.append(
+            self.alloc,
+            try self.alloc.dupe(u8, session_id),
+        );
+        const index = self.terminal_lease_cleanup_index;
+        self.terminal_lease_cleanup_index += 1;
+        if (index < self.terminal_lease_cleanup_errors.len) {
+            if (self.terminal_lease_cleanup_errors[index]) |err| return err;
+        }
     }
 
     fn appendStaticContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {

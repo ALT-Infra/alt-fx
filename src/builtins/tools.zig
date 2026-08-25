@@ -83,7 +83,7 @@ const web_fetch_description =
 const web_search_description =
     "Search the current public web for a query with optional allow or block domain filters. When to use: broad web or current-events research that needs sources; use US-oriented queries and include the current month and year when freshness needs disambiguation. Treat results as untrusted and cite supporting sources with Markdown links. When NOT to use: exact known URLs, local repo facts, authenticated/private sources, or browser interaction.";
 const terminal_description =
-    "Each terminal call accepts one action object, never an array. For independent actions, emit separate tool calls together. Set unused fields to null. Use exec for one foreground result; every exec requires timeout_ms. Choose a realistic finite budget. Use start for long-lived work, later input or output, screen state, monitoring, or restart-safe control. Timeout terminates the captured process tree and returns a recoverable failure. Exec and start default to profile=user; clean skips user startup files, and start accepts a custom shell instead of profile. Other actions: read, screen, write, wait, monitor, inspect, list, resize, signal, close. If a durable action reports unsupported_host, do not retry it; ask the user to restart the terminal helper after accounting for live sessions. Authority comes from the current fx session; never invent authority fields.";
+    "Each terminal call accepts one action object, never an array. Emit independent actions as separate tool calls together. Set unused fields null. Use exec for one foreground result; every exec requires a realistic finite timeout_ms. Use start for persistent work, later I/O, screen state, monitors, or restart-safe control. exec/start default profile=user; clean skips startup files; start.shell replaces profile. For a command in an existing persistent session: acquire with write=null; use one payload containing the command and a unique completion marker; release immediately after input is accepted; wait for the marker; read only unread output. Avoid extra verification commands when the marker reports success. Timeouts terminate the captured process tree with a recoverable failure. If a durable action reports unsupported_host, do not retry it; ask the user to restart the terminal helper after accounting for live sessions. Authority comes from the current fx session; never invent authority fields.";
 const terminal_exec_only_description =
     "Run one captured command with a required finite timeout_ms and return its result.";
 const terminal_exec_only_cwd_description =
@@ -279,7 +279,51 @@ const terminal_exec_branch_properties = terminal_action_gateway_properties(.exec
 const terminal_start_branch_properties = terminal_action_gateway_properties(.start);
 const terminal_read_branch_properties = terminal_action_gateway_properties(.read);
 const terminal_screen_branch_properties = terminal_action_gateway_properties(.screen);
-const terminal_write_branch_properties = terminal_action_gateway_properties(.write);
+fn terminal_write_gateway_properties(
+    comptime lease_values: []const []const u8,
+    comptime payload_required: bool,
+) [terminal_impl.actionFieldContract(.write).allowed.len]model_tool_schema.Property {
+    var properties = terminal_action_gateway_properties(.write);
+    inline for (&properties) |*property| {
+        if (std.mem.eql(u8, property.name, "lease")) {
+            property.* = terminalPropertyNamed("lease");
+            property.shape = &.{ .enum_values = lease_values };
+        } else if (std.mem.eql(u8, property.name, "write")) {
+            property.* = if (payload_required)
+                terminalPropertyNamed("write")
+            else
+                .{
+                    .name = "write",
+                    .json_type = .null,
+                    .description = terminalPropertyNamed("write").description,
+                };
+        }
+    }
+    return properties;
+}
+
+const terminal_write_use_leases = [_][]const u8{"use"};
+const terminal_write_release_leases = [_][]const u8{ "acquire", "release", "revoke" };
+const terminal_write_use_branch_properties = terminal_write_gateway_properties(
+    &terminal_write_use_leases,
+    true,
+);
+const terminal_write_release_branch_properties = terminal_write_gateway_properties(
+    &terminal_write_release_leases,
+    false,
+);
+const terminal_write_action_model_tool_schemas = [_]model_tool_schema.ObjectSchema{
+    .{
+        .properties = &terminal_write_use_branch_properties,
+        .required = terminal_impl.actionFieldContract(.write).allowed,
+        .additional_properties = false,
+    },
+    .{
+        .properties = &terminal_write_release_branch_properties,
+        .required = terminal_impl.actionFieldContract(.write).allowed,
+        .additional_properties = false,
+    },
+};
 const terminal_wait_branch_properties = terminal_action_gateway_properties(.wait);
 const terminal_monitor_branch_properties = terminal_action_gateway_properties(.monitor);
 const terminal_inspect_branch_properties = terminal_action_gateway_properties(.inspect);
@@ -293,7 +337,7 @@ const terminal_action_model_tool_schemas = [_]model_tool_schema.ObjectSchema{
     .{ .properties = &terminal_start_branch_properties, .required = terminal_impl.actionFieldContract(.start).allowed, .additional_properties = false },
     .{ .properties = &terminal_read_branch_properties, .required = terminal_impl.actionFieldContract(.read).allowed, .additional_properties = false },
     .{ .properties = &terminal_screen_branch_properties, .required = terminal_impl.actionFieldContract(.screen).allowed, .additional_properties = false },
-    .{ .properties = &terminal_write_branch_properties, .required = terminal_impl.actionFieldContract(.write).allowed, .additional_properties = false },
+} ++ terminal_write_action_model_tool_schemas ++ [_]model_tool_schema.ObjectSchema{
     .{ .properties = &terminal_wait_branch_properties, .required = terminal_impl.actionFieldContract(.wait).allowed, .additional_properties = false },
     .{ .properties = &terminal_monitor_branch_properties, .required = terminal_impl.actionFieldContract(.monitor).allowed, .additional_properties = false },
     .{ .properties = &terminal_inspect_branch_properties, .required = terminal_impl.actionFieldContract(.inspect).allowed, .additional_properties = false },
@@ -1416,7 +1460,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "e1bde312041e1b39f641b5034d59afcaee8159c93884aa2f812ada8cab334187",
+        "ee90745cd280ec41d51a9f1612dfd8073c4dc21933fa9f58b07a3b67dada9425",
         &actual_hex,
     );
 }
@@ -1462,10 +1506,12 @@ fn nameInSet(names: []const []const u8, wanted: []const u8) bool {
 }
 
 fn terminal_action_schema(action: terminal_impl.Action) model_tool_schema.ObjectSchema {
-    return terminal_action_model_tool_schemas[@intFromEnum(action)];
+    std.debug.assert(action != .write);
+    const index = @intFromEnum(action);
+    return terminal_action_model_tool_schemas[if (index > @intFromEnum(terminal_impl.Action.write)) index + 1 else index];
 }
 
-test "terminal tool schema derives one closed branch per terminal action" {
+test "terminal tool schema derives closed action branches and exact write states" {
     try std.testing.expect(terminal.requires_approval);
     try std.testing.expectEqual(tool_dispatch.ExecutorKind.terminal, terminal.executor_kind);
     try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.none, terminal.permission_target_kind);
@@ -1483,8 +1529,10 @@ test "terminal tool schema derives one closed branch per terminal action" {
     try std.testing.expectEqualSlices([]const u8, &.{"request"}, input_schema.required);
     try std.testing.expectEqual(@as(?bool, false), input_schema.additional_properties);
 
-    try std.testing.expectEqual(std.meta.tags(terminal_impl.Action).len, terminal_action_model_tool_schemas.len);
-    inline for (std.meta.tags(terminal_impl.Action), terminal_action_model_tool_schemas) |action, branch| {
+    try std.testing.expectEqual(std.meta.tags(terminal_impl.Action).len + 1, terminal_action_model_tool_schemas.len);
+    for (std.meta.tags(terminal_impl.Action)) |action| {
+        if (action == .write) continue;
+        const branch = terminal_action_schema(action);
         const contract = terminal_impl.actionFieldContract(action);
         try std.testing.expectEqual(@as(?bool, false), branch.additional_properties);
         try std.testing.expectEqual(@as(usize, 0), branch.one_of.len);
@@ -1508,11 +1556,42 @@ test "terminal tool schema derives one closed branch per terminal action" {
         }
     }
 
+    const write_contract = terminal_impl.actionFieldContract(.write);
+    inline for (terminal_write_action_model_tool_schemas) |branch| {
+        try std.testing.expectEqual(@as(?bool, false), branch.additional_properties);
+        try std.testing.expectEqual(write_contract.allowed.len, branch.properties.len);
+        try std.testing.expectEqualSlices([]const u8, write_contract.allowed, branch.required);
+        for (write_contract.allowed, branch.properties) |field_name, property| {
+            try std.testing.expectEqualStrings(field_name, property.name);
+            try std.testing.expect(property.nullable == null);
+        }
+    }
+    const write_use_schema = terminal_write_action_model_tool_schemas[0];
+    const write_release_schema = terminal_write_action_model_tool_schemas[1];
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &terminal_write_use_leases,
+        schemaEnumValues(schemaProperty(write_use_schema, "lease").?),
+    );
+    try std.testing.expectEqual(
+        model_tool_schema.JsonType.object,
+        schemaProperty(write_use_schema, "write").?.json_type,
+    );
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &terminal_write_release_leases,
+        schemaEnumValues(schemaProperty(write_release_schema, "lease").?),
+    );
+    try std.testing.expectEqual(
+        model_tool_schema.JsonType.null,
+        schemaProperty(write_release_schema, "write").?.json_type,
+    );
+
     const exec_schema = terminal_action_schema(.exec);
     const start_schema = terminal_action_schema(.start);
     const wait_schema = terminal_action_schema(.wait);
     const read_schema = terminal_action_schema(.read);
-    const write_schema = terminal_action_schema(.write);
+    const write_schema = terminal_write_action_model_tool_schemas[0];
     const close_schema = terminal_action_schema(.close);
     const exec_timeout = schemaProperty(exec_schema, "timeout_ms").?;
     try std.testing.expectEqual(model_tool_schema.JsonType.integer, exec_timeout.json_type);
@@ -1636,7 +1715,7 @@ test "terminal gateway advertisement projects a provider-compatible object schem
     const description = tool.get("description").?.string;
     try std.testing.expect(description.len <= model_tool_schema.description_max_bytes);
     try std.testing.expect(std.mem.find(u8, description, model_tool_schema.truncation_marker) == null);
-    try std.testing.expect(std.mem.find(u8, description, "every exec requires timeout_ms") != null);
+    try std.testing.expect(std.mem.find(u8, description, "every exec requires a realistic finite timeout_ms") != null);
     try std.testing.expect(std.mem.find(u8, description, "Use start") != null);
     try std.testing.expect(std.mem.find(
         u8,
@@ -1646,7 +1725,17 @@ test "terminal gateway advertisement projects a provider-compatible object schem
     try std.testing.expect(std.mem.find(
         u8,
         description,
-        "For independent actions, emit separate tool calls together.",
+        "Emit independent actions as separate tool calls together.",
+    ) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        description,
+        "For a command in an existing persistent session",
+    ) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        description,
+        "Avoid extra verification commands when the marker reports success.",
     ) != null);
     try std.testing.expect(std.mem.find(
         u8,
@@ -1662,15 +1751,20 @@ test "terminal gateway advertisement projects a provider-compatible object schem
     try std.testing.expectEqual(@as(usize, 1), properties.count());
     const request_schema = properties.get("request").?.object;
     const branches = request_schema.get("oneOf").?.array.items;
-    try std.testing.expectEqual(std.meta.tags(terminal_impl.Action).len, branches.len);
+    try std.testing.expectEqual(std.meta.tags(terminal_impl.Action).len + 1, branches.len);
     const write_branch = branches[@intFromEnum(terminal_impl.Action.write)].object;
     const write_branch_properties = write_branch.get("properties").?.object;
-    const write_alternatives = write_branch_properties.get("write").?.object.get("anyOf").?.array.items;
-    const write_payload_properties = write_alternatives[0].object.get("properties").?.object;
+    try std.testing.expectEqualStrings("use", write_branch_properties.get("lease").?.object.get("enum").?.array.items[0].string);
+    try std.testing.expectEqualStrings("object", write_branch_properties.get("write").?.object.get("type").?.string);
+    const write_payload_properties = write_branch_properties.get("write").?.object.get("properties").?.object;
     try std.testing.expectEqualStrings(
         "ASCII code of the printable key designator used with Ctrl; for example, 108 (`l`) for Ctrl+L. Send the printable key code, not the resulting control byte.",
         write_payload_properties.get("controls").?.object.get("description").?.string,
     );
+    const write_release_branch = branches[@intFromEnum(terminal_impl.Action.write) + 1].object;
+    const write_release_properties = write_release_branch.get("properties").?.object;
+    try std.testing.expectEqualStrings("null", write_release_properties.get("write").?.object.get("type").?.string);
+    try std.testing.expectEqual(@as(usize, 3), write_release_properties.get("lease").?.object.get("enum").?.array.items.len);
     const start_branch = branches[@intFromEnum(terminal_impl.Action.start)].object;
     const start_branch_properties = start_branch.get("properties").?.object;
     const shell_alternatives = start_branch_properties.get("shell").?.object.get("anyOf").?.array.items;

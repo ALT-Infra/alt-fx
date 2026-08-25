@@ -912,12 +912,7 @@ const SupportedRegistry = struct {
             .start => |value| self.start(value, cancelled),
             .read => |value| self.read(value),
             .screen => |value| self.screen(value),
-            .write => |value| self.withSession(
-                .write,
-                value.session_id,
-                writeAction,
-                .{ value, cancelled },
-            ),
+            .write => |value| self.write(value, cancelled),
             .wait => |value| self.wait(value, cancelled),
             .monitor => |value| self.monitor(value, cancelled),
             .inspect => |value| self.inspect(value),
@@ -1222,13 +1217,69 @@ const SupportedRegistry = struct {
         });
     }
 
+    fn write(
+        self: *SupportedRegistry,
+        request: contracts.WriteRequest,
+        cancelled: *const std.atomic.Value(bool),
+    ) Allocator.Error!contracts.OwnedResult {
+        if (self.find(request.session_id)) |reference| {
+            defer self.releaseReference(reference.index, reference.session);
+            return writeAction(reference.session, request, cancelled) catch |err| {
+                return self.actionError(.write, request.session_id, err);
+            };
+        }
+        if (request.lease != .release) {
+            return self.failure(.write, .session_not_found, request.session_id);
+        }
+        if (cancelled.load(.acquire)) {
+            return self.failure(.write, .cancelled, request.session_id);
+        }
+        const durable = self.profile.open_terminal(request.session_id) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return self.failure(.write, .session_not_found, request.session_id);
+        };
+        defer self.profile.release_terminal(durable);
+        const authorization = durable.release_write_lease(
+            request.authority.?,
+            io_mod.milliTimestamp(),
+        ) catch |err| return self.actionError(.write, request.session_id, err);
+        return contracts.OwnedResult.init(
+            self.alloc,
+            .{ .success = .{ .write = .{
+                .session = projectedFacts(durable.facts(), authorization),
+                .accepted_bytes = 0,
+            } } },
+        ) catch return error.OutOfMemory;
+    }
+
     fn wait(
         self: *SupportedRegistry,
         request: contracts.WaitRequest,
         cancelled: *const std.atomic.Value(bool),
     ) Allocator.Error!contracts.OwnedResult {
-        const reference = self.find(request.session_id) orelse
-            return self.failure(.wait, .session_not_found, request.session_id);
+        const reference = self.find(request.session_id) orelse {
+            if (request.return_when != .exit) {
+                return self.failure(.wait, .session_not_found, request.session_id);
+            }
+            const durable = self.profile.open_terminal(request.session_id) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                return self.failure(.wait, .session_not_found, request.session_id);
+            };
+            defer self.profile.release_terminal(durable);
+            const authorization = durable.authorize(
+                request.authority.?,
+                .wait,
+            ) catch |err| return self.actionError(.wait, request.session_id, err);
+            const outcome = durable.termination_outcome() orelse
+                return self.failure(.wait, .session_not_found, request.session_id);
+            return contracts.OwnedResult.init(
+                self.alloc,
+                .{ .success = .{ .wait = .{
+                    .session = projectedFacts(durable.facts(), authorization),
+                    .outcome = outcome,
+                } } },
+            ) catch return error.OutOfMemory;
+        };
         defer self.releaseReference(reference.index, reference.session);
         const authorization = reference.session.durable.begin_wait(
             request.authority.?,
@@ -1270,20 +1321,20 @@ const SupportedRegistry = struct {
         const reference = self.find(request.session_id) orelse
             return self.failure(.monitor, .session_not_found, request.session_id);
         defer self.releaseReference(reference.index, reference.session);
-        switch (request.operation) {
-            .add => |definition| _ = reference.session.durable.authorize_monitor_definition(
+        const authorization = switch (request.operation) {
+            .add => |definition| reference.session.durable.authorize_monitor_definition(
                 request.authority.?,
                 definition,
             ) catch |err| return self.actionError(.monitor, request.session_id, err),
-            .update => |value| _ = reference.session.durable.authorize_monitor_definition(
+            .update => |value| reference.session.durable.authorize_monitor_definition(
                 request.authority.?,
                 value.definition,
             ) catch |err| return self.actionError(.monitor, request.session_id, err),
-            .pause, .@"resume", .remove => _ = reference.session.durable.authorize(
+            .pause, .@"resume", .remove => reference.session.durable.authorize(
                 request.authority.?,
                 .monitor,
             ) catch |err| return self.actionError(.monitor, request.session_id, err),
-        }
+        };
         const owner = reference.session.monitor_owner orelse
             return self.failure(.monitor, .monitor_unavailable, request.session_id);
         const monitor_sequence = owner.applyOperation(
@@ -1297,7 +1348,10 @@ const SupportedRegistry = struct {
                 return self.failure(.monitor, .invalid_request, request.session_id)
         else
             null;
-        const facts = reference.session.durable.facts();
+        const facts = projectedFacts(
+            reference.session.durable.facts(),
+            authorization,
+        );
         return contracts.OwnedResult.init(
             self.alloc,
             .{ .success = .{ .monitor = .{

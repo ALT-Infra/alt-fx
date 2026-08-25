@@ -26,6 +26,7 @@ const tooling_tool_admission = @import("../../tooling/tool_admission.zig");
 const hooks = @import("../../hooks/hooks.zig");
 const command_contract = @import("../../execution/command_contract.zig");
 const command_environment = @import("../../execution/command_environment.zig");
+const terminal_contracts = @import("../../terminal/contracts.zig");
 const context_contract = @import("../../workspace/context_contract.zig");
 const tool_preparation = @import("../tool_preparation.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
@@ -196,6 +197,101 @@ fn normalized_terminal_request_arguments(
     defer out.deinit();
     std.json.Stringify.value(request, .{}, &out.writer) catch return error.OutOfMemory;
     return try out.toOwnedSlice();
+}
+
+const AgentTerminalLeaseTransition = union(enum) {
+    track: []const u8,
+    remove: []const u8,
+};
+
+fn agent_terminal_lease_transition(
+    alloc: Allocator,
+    registry: tool_dispatch.Registry,
+    call: ToolCall,
+) !?AgentTerminalLeaseTransition {
+    const tool = registry.lookup(call.name) orelse return null;
+    if (tool.executor_kind != .terminal) return null;
+    const parsed = std.json.parseFromSliceLeaky(
+        std.json.Value,
+        alloc,
+        call.arguments_json,
+        .{},
+    ) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidTerminalLeaseTrackingInput,
+    };
+    if (parsed != .object) return error.InvalidTerminalLeaseTrackingInput;
+    const action = parsed.object.get("action") orelse return error.InvalidTerminalLeaseTrackingInput;
+    if (action != .string) return error.InvalidTerminalLeaseTrackingInput;
+    if (!std.mem.eql(u8, action.string, "write")) return null;
+    const session_id = parsed.object.get("session_id") orelse
+        return error.InvalidTerminalLeaseTrackingInput;
+    const lease_value = parsed.object.get("lease") orelse
+        return error.InvalidTerminalLeaseTrackingInput;
+    if (session_id != .string or lease_value != .string) {
+        return error.InvalidTerminalLeaseTrackingInput;
+    }
+    const lease = std.meta.stringToEnum(
+        terminal_contracts.WriteLeaseIntent,
+        lease_value.string,
+    ) orelse return error.InvalidTerminalLeaseTrackingInput;
+    return switch (lease) {
+        .acquire, .use => .{ .track = session_id.string },
+        .release, .revoke => .{ .remove = session_id.string },
+    };
+}
+
+test "agent terminal lease transitions derive from normalized validated write intent" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const terminal_tool = tool_dispatch.Tool{
+        .name = "terminal",
+        .description = "terminal",
+        .model_schema = .{ .name = "terminal", .description = "terminal" },
+        .executor_kind = .terminal,
+        .decode = undefined,
+        .call = undefined,
+        .reads_only_fn = undefined,
+        .irreversible_fn = undefined,
+    };
+    const registry = tool_dispatch.Registry{ .tools = &.{terminal_tool} };
+    const cases = [_]struct {
+        lease: []const u8,
+        track: bool,
+    }{
+        .{ .lease = "acquire", .track = true },
+        .{ .lease = "use", .track = true },
+        .{ .lease = "release", .track = false },
+        .{ .lease = "revoke", .track = false },
+    };
+    for (cases) |case| {
+        const arguments_json = try std.fmt.allocPrint(
+            arena,
+            "{{\"action\":\"write\",\"session_id\":\"terminal-one\",\"lease\":\"{s}\",\"write\":null}}",
+            .{case.lease},
+        );
+        const transition = (try agent_terminal_lease_transition(
+            arena,
+            registry,
+            .{ .id = "call", .name = "terminal", .arguments_json = arguments_json },
+        )).?;
+        switch (transition) {
+            .track => |session_id| {
+                try std.testing.expect(case.track);
+                try std.testing.expectEqualStrings("terminal-one", session_id);
+            },
+            .remove => |session_id| {
+                try std.testing.expect(!case.track);
+                try std.testing.expectEqualStrings("terminal-one", session_id);
+            },
+        }
+    }
+    try std.testing.expect((try agent_terminal_lease_transition(
+        arena,
+        registry,
+        .{ .id = "list", .name = "terminal", .arguments_json = "{\"action\":\"list\"}" },
+    )) == null);
 }
 
 fn normalize_terminal_request_tool_calls(
@@ -2211,6 +2307,7 @@ pub fn processQueuedPrompt(
         effective_job.turn_id,
         lifecycle,
     );
+    defer finalization.deinit();
 
     processQueuedPromptInner(deps, semantic_presentation, lifecycle, config, effective_job, &finalization) catch |err| {
         if (finalization.state == .open) {
@@ -6586,6 +6683,16 @@ fn processQueuedPromptLoop(
             else
                 null;
 
+            const terminal_lease_transition = try agent_terminal_lease_transition(
+                arena,
+                deps.tool_registry,
+                execution_call,
+            );
+            if (terminal_lease_transition) |transition| switch (transition) {
+                .track => |session_id| try finalization.track_agent_terminal_lease(session_id),
+                .remove => {},
+            };
+
             debug_trace.eventf("tool", "before_tool_execution", step_ctx, "call_id={s} name={s}", .{ tool_call.id, tool_call.name });
             debug_trace.eventf("tool", "execution_start", step_ctx, "call_id={s} name={s}", .{ tool_call.id, tool_call.name });
             if (deps.tool_activity_recorder) |recorder| {
@@ -6715,6 +6822,13 @@ fn processQueuedPromptLoop(
                 replay_handed_off = true;
                 finish_trace.finish("interrupted");
                 return;
+            }
+
+            if (execution.status == .success) {
+                if (terminal_lease_transition) |transition| switch (transition) {
+                    .track => {},
+                    .remove => |session_id| finalization.remove_agent_terminal_lease(session_id),
+                };
             }
 
             if (deps.tool_activity_recorder) |recorder| {

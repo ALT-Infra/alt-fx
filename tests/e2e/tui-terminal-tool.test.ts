@@ -1402,7 +1402,7 @@ test.skipIf(!tmuxAvailable())(
     expect(Object.keys(properties)).toEqual(["request"]);
     expect(terminalSchema!.required).toEqual(["request"]);
     const branches = properties.request!.oneOf ?? [];
-    expect(branches).toHaveLength(12);
+    expect(branches).toHaveLength(13);
     const branchByAction = new Map(branches.map((branch) => [
       branch.properties?.action?.enum?.[0],
       branch,
@@ -1415,6 +1415,16 @@ test.skipIf(!tmuxAvailable())(
       expect(branch.type).toBe("object");
       expect(branch.additionalProperties).toBe(false);
     }
+    const writeBranches = branches.filter(
+      (branch) => branch.properties?.action?.enum?.[0] === "write",
+    );
+    expect(writeBranches).toHaveLength(2);
+    expect(writeBranches[0]!.properties?.lease?.enum).toEqual(["use"]);
+    expect(writeBranches[0]!.properties?.write?.type).toBe("object");
+    expect(writeBranches[1]!.properties?.lease?.enum).toEqual([
+      "acquire", "release", "revoke",
+    ]);
+    expect(writeBranches[1]!.properties?.write?.type).toBe("null");
     const startProperties = branchByAction.get("start")!.properties!;
     expect(startProperties.wait_ceiling_ms!.anyOf![0]!.type).toBe("integer");
     expect(startProperties.shell!.anyOf![0]!.type).toBe("object");
@@ -2095,6 +2105,110 @@ test.skipIf(!tmuxAvailable())(
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
   TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "TUI terminal agent lease ends with its turn before the process exits",
+  async () => {
+    const fixture = createFixture("fx-tui-terminal-turn-lease-");
+    let terminalSessionId = "";
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("turn_lease_start", "terminal", {
+        action: "start",
+        cwd: fixture.workspace,
+        command:
+          "printf 'TURN_LEASE_READY\\n'; IFS= read -r line; eval \"$line\"",
+        shell: {
+          kind: "executable",
+          path: TERMINAL_FIXTURE_SHELL,
+          clean_start: true,
+        },
+        backend: "native",
+        return_when: { kind: "match", pattern: "TURN_LEASE_READY" },
+        wait_ceiling_ms: 20_000,
+        dimensions: { rows: 24, columns: 80 },
+      }),
+      (body) => {
+        const result = JSON.parse(toolResultText(body, "turn_lease_start")) as {
+          success: { start: { session: { session_id: string } } };
+        };
+        terminalSessionId = result.success.start.session.session_id;
+        return fakeGatewayToolCall("turn_lease_acquire", "terminal", {
+          action: "write",
+          session_id: terminalSessionId,
+          lease: "acquire",
+        });
+      },
+      (body) => {
+        expect(toolResultText(body, "turn_lease_acquire"))
+          .toContain('"write_lease":"agent"');
+        return fakeGatewayToolCall("turn_lease_use", "terminal", {
+          action: "write",
+          session_id: terminalSessionId,
+          lease: "use",
+          write: {
+            kind: "text",
+            text: "printf 'TURN_LEASE_MARKER\\n'; sleep 5; exit 0\n",
+          },
+        });
+      },
+      (body) => {
+        expect(toolResultText(body, "turn_lease_use"))
+          .toContain('"accepted_bytes":');
+        return fakeGatewayFinalText("TURN_LEASE_A_DONE");
+      },
+      () => fakeGatewayToolCall("turn_lease_read", "terminal", {
+        action: "read",
+        session_id: terminalSessionId,
+        cursor_segment: 1,
+        cursor_offset: 0,
+      }),
+      (body) => {
+        const read = toolResultText(body, "turn_lease_read");
+        expect(read).toContain('"lifecycle":"running"');
+        expect(read).toContain('"write_lease":"none"');
+        expect(read).toContain("TURN_LEASE_MARKER");
+        return fakeGatewayToolCall("turn_lease_wait", "terminal", {
+          action: "wait",
+          session_id: terminalSessionId,
+          return_when: { kind: "exit" },
+          wait_ceiling_ms: 20_000,
+        });
+      },
+      (body) => {
+        const waited = toolResultText(body, "turn_lease_wait");
+        expect(waited).toContain('"outcome":{"exited":0}');
+        return fakeGatewayToolCall("turn_lease_close", "terminal", {
+          action: "close",
+          session_id: terminalSessionId,
+          close_policy: "force",
+        });
+      },
+      (body) => {
+        expect(toolResultText(body, "turn_lease_close"))
+          .toContain('"lifecycle":"closed"');
+        return fakeGatewayFinalText("TURN_LEASE_B_DONE");
+      },
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway);
+
+    await active.sendText("Start the terminal lease fixture and send its command.");
+    await active.waitForText("TURN_LEASE_A_DONE", TIMEOUT);
+    await active.sendText("Read the running session, wait for exit, and close it.");
+    await active.waitForText("TURN_LEASE_B_DONE", TIMEOUT);
+
+    expect(gateway.requests).toHaveLength(8);
+    expect(terminalRecords(fixture.home)).toEqual([
+      expect.objectContaining({
+        session_id: terminalSessionId,
+        lifecycle: "closed",
+        attention: expect.objectContaining({ write_lease: "none" }),
+      }),
+    ]);
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  45_000,
 );
 
 test.skipIf(!tmuxAvailable())(

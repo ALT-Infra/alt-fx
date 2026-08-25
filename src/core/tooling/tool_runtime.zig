@@ -61,6 +61,7 @@ const tool_mcp_registry = @import("tool_mcp_registry.zig");
 const tool_mcp_runtime = @import("tool_mcp_runtime.zig");
 const tool_mcp_feature_dispatch = @import("tool_mcp_feature_dispatch.zig");
 const tool_presentation = @import("tool_presentation.zig");
+const terminal_impl = @import("../../tools/terminal/terminal.zig");
 const web_fetch_runtime = @import("web_fetch_runtime.zig");
 const web_search_contract = @import("web_search_contract.zig");
 const web_fetch_artifacts = @import("../session/web_fetch_artifacts.zig");
@@ -914,6 +915,15 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         else
             ctx.permission_rules,
     };
+}
+
+pub fn release_agent_terminal_lease(ctx: Context, session_id: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(ctx.session_allocator);
+    defer arena_state.deinit();
+    return terminal_impl.release_agent_write_lease(
+        typedDispatchContext(ctx, arena_state.allocator()),
+        session_id,
+    );
 }
 
 fn requestQuestionBatchWithWorker(
