@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 
 const Allocator = std.mem.Allocator;
-pub const command_process_token_env = "FX_INTERNAL_COMMAND_PROCESS_TOKEN";
+pub const command_process_token_env_prefix = "FX_INTERNAL_COMMAND_PROCESS_TOKEN_";
 const max_darwin_process_args_bytes = 1024 * 1024;
 
 const Identity = union(enum) {
@@ -111,18 +111,19 @@ pub const Tracker = struct {
         self.* = undefined;
     }
 
-    pub fn bindProcessToken(
+    pub fn bindProcessEnvironment(
         self: *Tracker,
-        token: []const u8,
+        name: []const u8,
+        value: []const u8,
     ) !void {
         if (comptime builtin.os.tag != .macos) return;
         const marker = try self.alloc.alloc(
             u8,
-            command_process_token_env.len + 1 + token.len,
+            name.len + 1 + value.len,
         );
-        @memcpy(marker[0..command_process_token_env.len], command_process_token_env);
-        marker[command_process_token_env.len] = '=';
-        @memcpy(marker[command_process_token_env.len + 1 ..], token);
+        @memcpy(marker[0..name.len], name);
+        marker[name.len] = '=';
+        @memcpy(marker[name.len + 1 ..], value);
         self.darwin_process_marker = marker;
     }
 
@@ -471,7 +472,10 @@ pub const Tracker = struct {
             0,
         );
         if (result != 0) return false;
-        return containsProcessMarker(self.macos_args_buffer[0..args_len], marker);
+        return processEnvironmentContainsMarker(
+            self.macos_args_buffer[0..args_len],
+            marker,
+        );
     }
 
     fn containsMacOSUniqueId(self: *Tracker, unique_id: u64) bool {
@@ -492,16 +496,43 @@ fn identityHasMacOSUniqueId(identity: Identity, unique_id: u64) bool {
     };
 }
 
-fn containsProcessMarker(process_args: []const u8, marker: []const u8) bool {
-    if (marker.len == 0 or process_args.len <= marker.len) return false;
-    var offset: usize = 0;
-    while (std.mem.find(u8, process_args[offset..], marker)) |relative| {
-        const start = offset + relative;
-        const end = start + marker.len;
-        const begins_field = start == 0 or process_args[start - 1] == 0;
-        const ends_field = end < process_args.len and process_args[end] == 0;
-        if (begins_field and ends_field) return true;
-        offset = start + 1;
+fn processEnvironmentContainsMarker(
+    process_args: []const u8,
+    marker: []const u8,
+) bool {
+    if (marker.len == 0 or process_args.len < @sizeOf(c_int)) return false;
+    const argc = std.mem.readInt(
+        c_int,
+        process_args[0..@sizeOf(c_int)],
+        builtin.target.cpu.arch.endian(),
+    );
+    if (argc < 0) return false;
+
+    var cursor: usize = @sizeOf(c_int);
+    const executable_end = std.mem.findScalar(u8, process_args[cursor..], 0) orelse
+        return false;
+    cursor += executable_end + 1;
+    while (cursor < process_args.len and process_args[cursor] == 0) : (cursor += 1) {}
+
+    var remaining_args: usize = @intCast(argc);
+    while (remaining_args > 0) : (remaining_args -= 1) {
+        if (cursor >= process_args.len) return false;
+        const argument_end = std.mem.findScalar(u8, process_args[cursor..], 0) orelse
+            return false;
+        cursor += argument_end + 1;
+    }
+
+    while (cursor < process_args.len) {
+        if (process_args[cursor] == 0) {
+            cursor += 1;
+            continue;
+        }
+        const field_end = std.mem.findScalar(u8, process_args[cursor..], 0) orelse
+            return false;
+        if (std.mem.eql(u8, process_args[cursor .. cursor + field_end], marker)) {
+            return true;
+        }
+        cursor += field_end + 1;
     }
     return false;
 }
@@ -894,18 +925,27 @@ test "tracked identity distinguishes process instances" {
     try std.testing.expect(!linux.eql(.{ .macos_unique_id = 42 }));
 }
 
-test "process marker requires exact nul-delimited field" {
-    const marker = "FX_INTERNAL_COMMAND_PROCESS_TOKEN=abc123";
-    try std.testing.expect(containsProcessMarker(
-        "\x02\x00\x00\x00/bin/zsh\x00arg\x00" ++ marker ++ "\x00OTHER=value\x00",
+test "process marker admits only exact environment field" {
+    const marker = "FX_INTERNAL_COMMAND_PROCESS_TOKEN_abc123=1";
+    const outer_marker = "FX_INTERNAL_COMMAND_PROCESS_TOKEN_outer=1";
+    try std.testing.expect(processEnvironmentContainsMarker(
+        "\x02\x00\x00\x00/bin/zsh\x00\x00zsh\x00arg\x00" ++ outer_marker ++ "\x00" ++ marker ++ "\x00OTHER=value\x00",
         marker,
     ));
-    try std.testing.expect(!containsProcessMarker(
-        "\x02\x00\x00\x00/bin/zsh\x00prefix" ++ marker ++ "\x00",
+    try std.testing.expect(processEnvironmentContainsMarker(
+        "\x02\x00\x00\x00/bin/zsh\x00\x00zsh\x00arg\x00" ++ outer_marker ++ "\x00" ++ marker ++ "\x00OTHER=value\x00",
+        outer_marker,
+    ));
+    try std.testing.expect(!processEnvironmentContainsMarker(
+        "\x03\x00\x00\x00/bin/zsh\x00\x00zsh\x00arg\x00" ++ marker ++ "\x00OTHER=value\x00",
         marker,
     ));
-    try std.testing.expect(!containsProcessMarker(
-        "\x02\x00\x00\x00/bin/zsh\x00" ++ marker ++ "suffix\x00",
+    try std.testing.expect(!processEnvironmentContainsMarker(
+        "\x02\x00\x00\x00/bin/zsh\x00\x00zsh\x00arg\x00prefix" ++ marker ++ "\x00",
+        marker,
+    ));
+    try std.testing.expect(!processEnvironmentContainsMarker(
+        "\x02\x00\x00\x00/bin/zsh\x00\x00zsh\x00arg\x00" ++ marker ++ "suffix\x00",
         marker,
     ));
 }

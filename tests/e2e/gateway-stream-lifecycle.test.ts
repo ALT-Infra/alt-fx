@@ -2967,7 +2967,7 @@ describe("gateway stream lifecycle", () => {
           return fakeGatewayToolCall(timeoutCallId, "terminal", {
             action: "exec",
             command,
-            timeout_ms: 500,
+            timeout_ms: 2_000,
           });
         case 1: {
           const timedOut = toolResultOutput(body, timeoutCallId);
