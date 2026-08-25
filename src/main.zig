@@ -1359,7 +1359,7 @@ const App = struct {
                 review,
             );
 
-        _ = try self.worker.admitPrompt(std.heap.c_allocator, .{
+        try self.worker.admitPrompt(std.heap.c_allocator, .{
             .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else 0,
             .prompt = prompt_copy,
             .images = images_copy,

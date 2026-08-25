@@ -32,10 +32,6 @@ pub fn SubmitRuntime(comptime App: type) type {
 
         pub const Intent = enum { queue, steer };
 
-        pub fn submitInput(app: *App, max_prompt_history: usize) !void {
-            try submitWithIntent(app, max_prompt_history, .queue);
-        }
-
         pub fn submitSteering(app: *App, max_prompt_history: usize) !void {
             try submitWithIntent(app, max_prompt_history, .steer);
         }
@@ -72,20 +68,6 @@ pub fn SubmitRuntime(comptime App: type) type {
                 if (comptime @hasDecl(App, "submitDirectTerminal")) {
                     try App.submitDirectTerminal(app, command);
                     return;
-                }
-            }
-
-            if (intent == .queue) {
-                if (steerCommandPayload(expanded.text)) |payload| {
-                    if (!try preflightPrompt(app)) return;
-                    if (comptime @hasDecl(App, "steerPrompt")) {
-                        if (!try App.steerPrompt(app, payload)) return;
-                        recordAcceptedInput(app, payload);
-                        app.input_runtime.inputResetState().clearCurrent(app.alloc);
-                        paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
-                        app.shell.render_requests.request(.footer);
-                        return;
-                    }
                 }
             }
 
@@ -279,15 +261,6 @@ pub fn SubmitRuntime(comptime App: type) type {
             if (acceptedPromptNeedsImmediateFooter(app)) {
                 app.shell.render_requests.request(.footer);
             }
-        }
-
-        fn steerCommandPayload(text: []const u8) ?[]const u8 {
-            const trimmed = std.mem.trim(u8, text, " \t\r\n");
-            if (!std.mem.startsWith(u8, trimmed, "/steer")) return null;
-            if (trimmed.len == "/steer".len) return null;
-            if (!std.ascii.isWhitespace(trimmed["/steer".len])) return null;
-            const payload = std.mem.trim(u8, trimmed["/steer".len..], " \t\r\n");
-            return if (payload.len > 0) payload else null;
         }
 
         fn acceptedPromptNeedsImmediateFooter(app: *const App) bool {

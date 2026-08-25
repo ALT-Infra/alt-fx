@@ -1498,7 +1498,7 @@ pub fn Runtime(comptime App: type) type {
                         return;
                     }
                     debug_trace.logf("input", "submit requested stream_active={s} queued={d} input_bytes={d}", .{ if (app.stream.active) "true" else "false", app.worker.queuedPromptCount(), app.input_runtime.edit_state.input.items.len });
-                    try submit_rt.submitInput(app, max_prompt_history);
+                    try submit_rt.submit(app, max_prompt_history);
                 },
                 else => {
                     if (composer_shortcut) |action| {
@@ -2089,7 +2089,7 @@ pub fn Runtime(comptime App: type) type {
                 app.shell.render_requests.request(.footer);
                 return true;
             }
-            try submit_rt.submitInput(app, max_prompt_history);
+            try submit_rt.submit(app, max_prompt_history);
             return true;
         }
 
@@ -13151,20 +13151,8 @@ test "ctrl+enter submits steering while ordinary submit keeps queue semantics" {
     try std.testing.expect(app.last_prompt == null);
 
     try app.input_runtime.edit_state.input.appendSlice(alloc, "queue next");
-    try input_submit_runtime.SubmitRuntime(FakeSubmitApp).submitInput(&app, 100);
+    try input_submit_runtime.SubmitRuntime(FakeSubmitApp).submit(&app, 100);
     try std.testing.expectEqualStrings("queue next", app.last_prompt.?);
-}
-
-test "slash steer uses the explicit steering path" {
-    const alloc = std.testing.allocator;
-    var app = FakeSubmitApp{ .alloc = alloc };
-    defer app.deinit();
-    app.stream.active = true;
-
-    try app.input_runtime.edit_state.input.appendSlice(alloc, "/steer focus on tests");
-    try input_submit_runtime.SubmitRuntime(FakeSubmitApp).submitInput(&app, 100);
-    try std.testing.expectEqualStrings("focus on tests", app.last_steering.?);
-    try std.testing.expect(app.last_prompt == null);
 }
 
 test "app_input_runtime small paste opens skills menu for matching dollar token" {

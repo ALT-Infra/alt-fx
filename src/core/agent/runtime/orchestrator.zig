@@ -2818,11 +2818,7 @@ fn processQueuedPromptLoop(
             for (guidance) |text| {
                 try within_turn_suffix.append(arena, .{
                     .role = .user,
-                    .content = try std.fmt.allocPrint(
-                        arena,
-                        "<user_steering>\n{s}\n</user_steering>",
-                        .{text},
-                    ),
+                    .content = try runtime_execution_memory.steeringMessage(arena, text),
                 });
             }
         }
@@ -7071,11 +7067,7 @@ fn processQueuedPromptLoop(
                         for (guidance) |text| {
                             try within_turn_suffix.append(arena, .{
                                 .role = .user,
-                                .content = try std.fmt.allocPrint(
-                                    arena,
-                                    "<user_steering>\n{s}\n</user_steering>",
-                                    .{text},
-                                ),
+                                .content = try runtime_execution_memory.steeringMessage(arena, text),
                             });
                         }
                         try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });

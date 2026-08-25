@@ -24,6 +24,13 @@ const ToolCall = types.ToolCall;
 const Config = runtime_config.Config;
 const ToolExecutionStatus = runtime_tool_contracts.ToolExecutionStatus;
 
+const steering_open = "<user_steering>\n";
+const steering_close = "\n</user_steering>";
+
+pub fn steeringMessage(alloc: Allocator, text: []const u8) ![]u8 {
+    return std.fmt.allocPrint(alloc, steering_open ++ "{s}" ++ steering_close, .{text});
+}
+
 pub fn persistedStatusForCurrentFxLocalResult(
     status: ToolExecutionStatus,
     output: []const u8,
@@ -63,10 +70,8 @@ pub fn buildExecutionMemory(alloc: Allocator, within_turn_suffix: []const ChatMe
 }
 
 fn steeringText(content: []const u8) ?[]const u8 {
-    const open = "<user_steering>\n";
-    const close = "\n</user_steering>";
-    if (!std.mem.startsWith(u8, content, open) or !std.mem.endsWith(u8, content, close)) return null;
-    return content[open.len .. content.len - close.len];
+    if (!std.mem.startsWith(u8, content, steering_open) or !std.mem.endsWith(u8, content, steering_close)) return null;
+    return content[steering_open.len .. content.len - steering_close.len];
 }
 
 pub fn buildInterruptedExecutionMemory(
