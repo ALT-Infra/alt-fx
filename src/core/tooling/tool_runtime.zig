@@ -6480,7 +6480,13 @@ test "run_command timeout returns model-visible failure" {
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
     try expectContains(result.model_output, "timeout=true\n");
     try expectContains(result.model_output, "timeout_ms=1000\n");
-    try expectContains(result.model_output, "command timed out and was terminated\n");
+    try expectContains(
+        result.model_output,
+        "cleanup_scope=process_group_and_tracked_descendants\n",
+    );
+    try expectContains(result.model_output, "cleanup_guarantee=best_effort\n");
+    try expectContains(result.model_output, "fully detached descendants may remain\n");
+    try expectNotContains(result.model_output, "command timed out and was terminated");
     try expectNotContains(result.model_output, "PRE-TIMEOUT-OUT");
     try expectNotContains(result.model_output, "PRE-TIMEOUT-ERR");
     const structured = result.command_result_json orelse return error.TestExpectedEqual;

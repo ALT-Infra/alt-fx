@@ -84,10 +84,18 @@ pub const Foreground = struct {
         timeout_ms: ?usize,
         started_ms: ?i64,
     ) !ToolExecutionResult {
+        const cleanup =
+            "cleanup_scope=process_group_and_tracked_descendants\n" ++
+            "cleanup_guarantee=best_effort\n" ++
+            "message=command timed out; cleanup was attempted for the process group and tracked descendants, but fully detached descendants may remain\n";
         const output = if (timeout_ms) |ms|
-            try std.fmt.allocPrint(arena, "timeout=true\ntimeout_ms={d}\ncommand timed out and was terminated\n", .{ms})
+            try std.fmt.allocPrint(
+                arena,
+                "timeout=true\ntimeout_ms={d}\n" ++ cleanup,
+                .{ms},
+            )
         else
-            try arena.dupe(u8, "timeout=true\ncommand timed out and was terminated\n");
+            try arena.dupe(u8, "timeout=true\n" ++ cleanup);
         return .{
             .status = .failure,
             .model_output = output,
@@ -400,7 +408,11 @@ test "command result mapping preserves timeout JSON" {
     defer alloc.free(timeout.model_output);
     defer alloc.free(timeout.command_result_json.?);
     try std.testing.expectEqualStrings(
-        "timeout=true\ntimeout_ms=5\ncommand timed out and was terminated\n",
+        "timeout=true\n" ++
+            "timeout_ms=5\n" ++
+            "cleanup_scope=process_group_and_tracked_descendants\n" ++
+            "cleanup_guarantee=best_effort\n" ++
+            "message=command timed out; cleanup was attempted for the process group and tracked descendants, but fully detached descendants may remain\n",
         timeout.model_output,
     );
     try expectContains(timeout.command_result_json.?, "\"timed_out\":true");

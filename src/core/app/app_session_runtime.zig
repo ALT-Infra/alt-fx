@@ -6861,7 +6861,11 @@ test "historical command timeout preserves its typed outcome" {
         .name = "run_command",
         .arguments_json = "{\"command\":\"sleep 5\"}",
     }};
-    const output = "timeout=true\ntimeout_ms=25\ncommand timed out and was terminated\n";
+    const output =
+        "timeout=true\n" ++
+        "timeout_ms=25\n" ++
+        "cleanup_scope=process_group_and_tracked_descendants\n" ++
+        "cleanup_guarantee=best_effort\n";
     var results = [_]types.PersistedToolResult{.{
         .tool_call_id = @constCast("call_timeout"),
         .tool_name = @constCast("run_command"),
