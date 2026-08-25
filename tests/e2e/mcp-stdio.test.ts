@@ -520,6 +520,47 @@ describe("modern MCP stdio compatibility", () => {
     await expectFixtureProcessesExited(readWire(root.wireLogPath));
   }, 25_000);
 
+  test("headless project MCP traces encode hostile server names on recovery", async () => {
+    const root = createRoot("workspace-trace-name", MODERN_FIXTURE, {
+      mode: "crash_always",
+      restartLimit: 1,
+    });
+    moveProfileFixtureToWorkspace(root);
+    const hostileName = "bad\n\x1b]0;owned\x07";
+    const projectPath = join(root.workspace, ".mcp.json");
+    const project = JSON.parse(readFileSync(projectPath, "utf8"));
+    project.mcpServers[hostileName] = project.mcpServers.fixture;
+    delete project.mcpServers.fixture;
+    writeFileSync(projectPath, JSON.stringify(project));
+    const toolName = `mcp_${hostileName.replace(/[^A-Za-z0-9_-]/g, "_")}_echo`;
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("trace_select", "mcp_select_tool", { name: toolName }),
+      fakeGatewayToolCall("trace_call", toolName, { text: "trace" }),
+      fakeGatewayFinalText("HOSTILE_TRACE_NAME_SAFE"),
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Exercise the project MCP."],
+      {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway),
+        timeoutMs: 25_000,
+      },
+    );
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("HOSTILE_TRACE_NAME_SAFE");
+    const trace = readFileSync(root.traceLogPath, "utf8");
+    expect(trace).toContain("server=bad\\x0a\\x1b]0;owned\\x07");
+    expect(trace).not.toContain("\x1b");
+    for (const line of trace.split("\n").filter(Boolean)) {
+      expect([...Buffer.from(line)].every((byte) => byte >= 0x20 && byte <= 0x7e))
+        .toBe(true);
+    }
+    await expectFixtureProcessesExited(readWire(root.wireLogPath));
+  }, 30_000);
+
   test("fx ask skips workspace MCP when profile choices are unreadable", async () => {
     const root = createRoot("workspace-choice-failure", MODERN_FIXTURE, {
       recordLaunchAttempts: true,

@@ -1636,6 +1636,90 @@ fn initAcpSessionTestState(
     };
 }
 
+test "ACP host-disabled new load and resume skip project MCP effects" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_path);
+    const workspace_path = try io_mod.dirRealpathAlloc(
+        alloc,
+        tmp.dir,
+        "workspace",
+    );
+    defer alloc.free(workspace_path);
+    const marker_path = try std.fs.path.join(
+        alloc,
+        &.{ workspace_path, "project-mcp-launched" },
+    );
+    defer alloc.free(marker_path);
+    const project_json = try std.fmt.allocPrint(
+        alloc,
+        "{{\"mcpServers\":{{\"fixture\":{{\"command\":\"/bin/sh\",\"args\":[\"-c\",\"printf launched > {s}\"]}},\"remote\":{{\"type\":\"http\",\"url\":\"http://127.0.0.1:1/mcp\",\"startup_timeout_ms\":5000}}}}}}",
+        .{marker_path},
+    );
+    defer alloc.free(project_json);
+    try tmp.dir.writeFile(io_mod.getIo(), .{
+        .sub_path = "workspace/.mcp.json",
+        .data = project_json,
+    });
+    try tmp.dir.writeFile(io_mod.getIo(), .{
+        .sub_path = "home/.fx/settings.json",
+        .data = "{}",
+    });
+    const test_home = try AcpSessionTestHome.install(alloc, home_path);
+    defer test_home.deinit();
+
+    var capture = try tmp.dir.createFile(
+        io_mod.getIo(),
+        "acp-host-disabled.jsonl",
+        .{ .read = true },
+    );
+    defer capture.close(io_mod.getIo());
+    var state = try initAcpSessionTestState(arena, workspace_path, capture);
+    defer state.deinit();
+    state.cfg.allow_acp_mcp = false;
+
+    var new_msg = jsonrpc.Message{
+        .id = .{ .integer = 1 },
+        .method = "session/new",
+        .params_raw = "{\"mcpServers\":[]}",
+    };
+    try handleNewSession(&state, arena, &new_msg);
+    try std.testing.expect(state.active_session.?.mcp == null);
+    const session_id = try alloc.dupe(u8, state.active_session.?.session_id);
+    defer alloc.free(session_id);
+
+    inline for (.{
+        .{ .method = "session/load", .handler = handleLoadSession },
+        .{ .method = "session/resume", .handler = handleResumeSession },
+    }, 0..) |restore, index| {
+        const params = try std.fmt.allocPrint(
+            arena,
+            "{{\"sessionId\":\"{s}\",\"mcpServers\":[]}}",
+            .{session_id},
+        );
+        var msg = jsonrpc.Message{
+            .id = .{ .integer = @intCast(index + 2) },
+            .method = restore.method,
+            .params_raw = params,
+        };
+        try restore.handler(&state, arena, &msg);
+        try std.testing.expect(state.active_session.?.mcp == null);
+    }
+
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.openFile(io_mod.getIo(), "workspace/project-mcp-launched", .{}),
+    );
+}
+
 test "ACP new and loaded sessions provide a writable subagent host" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

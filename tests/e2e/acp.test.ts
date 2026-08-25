@@ -2185,6 +2185,60 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP keeps duplicate primary server names and excludes a workspace collision",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-project-mcp-collision-");
+      const firstPid = join(root.root, "primary-first.pid");
+      const secondPid = join(root.root, "primary-second.pid");
+      const projectPid = join(root.root, "project-collision.pid");
+      writeFileSync(
+        join(root.workspace, ".mcp.json"),
+        JSON.stringify({
+          mcpServers: {
+            fixture: {
+              command: process.execPath,
+              args: [MCP_STDIO_FIXTURE],
+              env: { FX_MCP_PID_PATH: projectPid },
+            },
+          },
+        }),
+      );
+      const gateway = startFakeGateway([]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request(
+          "session/new",
+          {
+            cwd: root.workspace,
+            mcpServers: [
+              acpStdioServer("PRIMARY_FIRST", firstPid),
+              acpStdioServer("PRIMARY_SECOND", secondPid),
+            ],
+          },
+          2,
+        ) as any;
+        expect(created.error).toBeUndefined();
+        await client.readLine();
+        await waitForPath(firstPid, 5_000);
+        await waitForPath(secondPid, 5_000);
+        expect(existsSync(projectPid)).toBe(false);
+      } finally {
+        await client?.close();
+        client = null;
+        gateway.stop();
+        if (existsSync(firstPid)) await expectMcpProcessExited(firstPid);
+        if (existsSync(secondPid)) await expectMcpProcessExited(secondPid);
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "ACP session/new keeps rejected and unavailable workspace MCP optional",
     async () => {
       const root = createIsolatedRoot("fx-acp-project-mcp-optional-");
@@ -2396,6 +2450,119 @@ describe("acp: model-independent", () => {
         await client?.close();
         client = null;
         gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP project authority reduction reaps subagent-owned stalled MCP work",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-project-mcp-subagent-reduce-");
+      const pidPath = join(root.root, "subagent-project-mcp.pid");
+      const wirePath = join(root.root, "subagent-project-mcp-wire.jsonl");
+      writeFileSync(
+        join(root.workspace, ".mcp.json"),
+        JSON.stringify({
+          mcpServers: {
+            fixture: {
+              command: process.execPath,
+              args: [MCP_STDIO_FIXTURE],
+              env: {
+                FX_MCP_PID_PATH: pidPath,
+                FX_MCP_WIRE_LOG: wirePath,
+                FX_MCP_MODE: "stall_operation",
+              },
+            },
+          },
+        }),
+      );
+      const parentPrompt = "Create a child that exercises project MCP.";
+      const childPrompt = "Call the project MCP and wait for its result.";
+      const createId = "project_reduce_child_create";
+      const selectId = "project_reduce_child_select";
+      const callId = "project_reduce_child_call";
+      let childId = "";
+      const gateway = startDynamicFakeGateway((body) => {
+        if (
+          body.includes(`"toolCallId":"${selectId}"`) &&
+          body.includes('"type":"tool-result"')
+        ) {
+          return fakeGatewayToolCall(callId, MCP_TOOL_NAME, { text: "stall" });
+        }
+        if (
+          body.includes(`"toolCallId":"${createId}"`) &&
+          body.includes('"type":"tool-result"')
+        ) {
+          const created = JSON.parse(acpToolResultText(body, createId)) as {
+            child_id: string;
+          };
+          childId = created.child_id;
+          return finalText("ACP project MCP subagent started");
+        }
+        if (acpPromptText(body).includes(childPrompt)) {
+          return fakeGatewayToolCall(selectId, "mcp_select_tool", {
+            name: MCP_TOOL_NAME,
+          });
+        }
+        expect(acpPromptText(body)).toContain(parentPrompt);
+        return fakeGatewayToolCall(createId, "subagent", {
+          command: { create: {
+            name: "project-mcp-reduction-child",
+            mode: "persistent",
+            prompt: childPrompt,
+          } },
+        });
+      });
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request(
+          "session/new",
+          { cwd: root.workspace, mcpServers: [] },
+          2,
+        ) as any;
+        expect(created.error).toBeUndefined();
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "code" }, 3);
+
+        sendPrompt(client, 4, parentPrompt);
+        await waitForCondition(
+          "subagent-owned stalled project MCP call",
+          () => childId.length > 0 && existsSync(wirePath) &&
+            readFileSync(wirePath, "utf8").includes("tools/call"),
+          TIMEOUT,
+        );
+        expect(acpSubagentState(root, childId)).toBe("running");
+
+        writeFileSync(
+          join(root.home, ".fx", "settings.json"),
+          JSON.stringify({
+            workspaces: {
+              [root.workspace]: { disabledMcpjsonServers: ["fixture"] },
+            },
+          }),
+        );
+        client.send({
+          jsonrpc: "2.0",
+          id: 5,
+          method: "session/new",
+          params: { cwd: root.workspace, mcpServers: [] },
+        });
+        const replacement = await readResponse(client, 5, TIMEOUT);
+        expect(replacement.error).toBeUndefined();
+        expect(replacement.result.sessionId).toBeTruthy();
+        await expectMcpProcessExited(pidPath);
+        expect(acpSubagentState(root, childId)).not.toBe("running");
+      } finally {
+        await client?.close();
+        client = null;
+        gateway.stop();
+        if (existsSync(pidPath)) await expectMcpProcessExited(pidPath);
         rmSync(root.root, { recursive: true, force: true });
       }
     },

@@ -102,6 +102,24 @@ const ExplicitModelSelectionParse = union(enum) {
     selection: ExplicitModelSelection,
 };
 
+const ProjectMcpPromptInputState = struct {
+    active: bool,
+    question_active: bool,
+    approval_active: bool,
+    subagent_active: bool,
+    menu_active: bool,
+    authentication_active: bool,
+};
+
+fn projectMcpPromptMayOwnInput(state: ProjectMcpPromptInputState) bool {
+    return state.active and
+        !state.question_active and
+        !state.approval_active and
+        !state.subagent_active and
+        !state.menu_active and
+        !state.authentication_active;
+}
+
 fn shortcutMayMutateQueuedDraft(action: input_action.ShortcutAction) bool {
     return switch (action) {
         .move,
@@ -857,21 +875,28 @@ pub fn Runtime(comptime App: type) type {
 
         fn projectMcpPromptOwnsInput(app: *App) bool {
             if (comptime !@hasDecl(App, "projectMcpPromptActive")) return false;
-            if (!app.projectMcpPromptActive()) return false;
-            if (app.question_prompt.isActive() or app.approval_prompt.isActive()) return false;
+            var subagent_active = false;
             if (comptime runtime_profile.allows(App, .subagents)) {
-                if (app.subagents.isViewActive()) return false;
+                subagent_active = app.subagents.isViewActive();
             }
-            if (activeCompactCommandMenu(app) != null or
+            const menu_active = activeCompactCommandMenu(app) != null or
                 settingsMenuActive(app) or
                 skillsMenuActive(app) or
                 modelMenuActive(app) or
                 sessionMenuActive(app) or
-                helpMenuActive(app)) return false;
+                helpMenuActive(app);
+            var authentication_active = false;
             if (comptime runtime_profile.allows(App, .native_auth)) {
-                if (app.auth.apiKeyEntryActive()) return false;
+                authentication_active = app.auth.apiKeyEntryActive();
             }
-            return true;
+            return projectMcpPromptMayOwnInput(.{
+                .active = app.projectMcpPromptActive(),
+                .question_active = app.question_prompt.isActive(),
+                .approval_active = app.approval_prompt.isActive(),
+                .subagent_active = subagent_active,
+                .menu_active = menu_active,
+                .authentication_active = authentication_active,
+            });
         }
 
         fn routeProjectMcpPromptByte(app: *App, byte: u8) !bool {
@@ -3144,6 +3169,36 @@ test "all destructive composer shortcuts can delete an empty queued draft" {
     try std.testing.expect(!shortcutDeletesQueuedDraft(.cut_selection));
     try std.testing.expect(!shortcutDeletesQueuedDraft(.{ .move = .{ .kind = .character_left } }));
     try std.testing.expect(!shortcutDeletesQueuedDraft(.insert_newline));
+}
+
+test "project MCP prompt waits for every existing modal owner" {
+    const base = ProjectMcpPromptInputState{
+        .active = true,
+        .question_active = false,
+        .approval_active = false,
+        .subagent_active = false,
+        .menu_active = false,
+        .authentication_active = false,
+    };
+    try std.testing.expect(projectMcpPromptMayOwnInput(base));
+    var blocked = base;
+    blocked.question_active = true;
+    try std.testing.expect(!projectMcpPromptMayOwnInput(blocked));
+    blocked = base;
+    blocked.approval_active = true;
+    try std.testing.expect(!projectMcpPromptMayOwnInput(blocked));
+    blocked = base;
+    blocked.subagent_active = true;
+    try std.testing.expect(!projectMcpPromptMayOwnInput(blocked));
+    blocked = base;
+    blocked.menu_active = true;
+    try std.testing.expect(!projectMcpPromptMayOwnInput(blocked));
+    blocked = base;
+    blocked.authentication_active = true;
+    try std.testing.expect(!projectMcpPromptMayOwnInput(blocked));
+    var inactive = base;
+    inactive.active = false;
+    try std.testing.expect(!projectMcpPromptMayOwnInput(inactive));
 }
 
 const RoutingFakeApp = struct {

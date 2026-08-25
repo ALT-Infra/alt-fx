@@ -718,6 +718,29 @@ pub const State = struct {
         captured_at_ms: u64,
         rebuild: bool,
     ) !void {
+        return self.beginAuthorityReductionWithSpawner(
+            alloc,
+            workspace_root,
+            elicitation_capabilities,
+            loader,
+            registry,
+            captured_at_ms,
+            rebuild,
+            spawnPendingReload,
+        );
+    }
+
+    fn beginAuthorityReductionWithSpawner(
+        self: *State,
+        alloc: Allocator,
+        workspace_root: []const u8,
+        elicitation_capabilities: elicitation.Capabilities,
+        loader: mcp_runtime.LoadRuntimeFn,
+        registry: tool_dispatch.Registry,
+        captured_at_ms: u64,
+        rebuild: bool,
+        spawn_reload: SpawnPendingReloadFn,
+    ) !void {
         const pending = try alloc.create(PendingReload);
         const owned_workspace_root = alloc.dupe(u8, workspace_root) catch |err| {
             alloc.destroy(pending);
@@ -751,7 +774,7 @@ pub const State = struct {
         if (comptime builtin.single_threaded) {
             pending.run();
         } else {
-            pending.thread = std.Thread.spawn(.{}, PendingReload.run, .{pending}) catch {
+            pending.thread = spawn_reload(pending) catch {
                 pending.run();
                 return;
             };
@@ -1338,6 +1361,135 @@ test "reload thread start failure frees the task and copied workspace root once"
         ),
     );
     try std.testing.expect(state.pending_reload == null);
+}
+
+test "authority reduction quiesces superseded tasks before detached runtime retirement" {
+    if (comptime builtin.single_threaded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+    const runtime = try alloc.create(mcp_runtime.McpRuntime);
+    runtime.* = mcp_runtime.McpRuntime.init(alloc);
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "workspace"),
+        .source = .workspace,
+        .scope = .profile,
+        .command = try alloc.dupe(u8, "unused"),
+        .workspace_admission = .approved,
+    });
+    state.installInitial(runtime);
+
+    var active_lease = state.acquire() orelse return error.TestUnexpectedResult;
+    var active_lease_owned = true;
+    defer if (active_lease_owned) active_lease.deinit();
+
+    test_reload_mode = .delayed_empty;
+    defer test_reload_mode = .empty;
+    try state.beginReload(
+        alloc,
+        "/workspace",
+        .{},
+        loadTestReloadRuntime,
+        previewTestWorkspaceAuthority,
+        .{},
+        50,
+    );
+
+    const authentication = try alloc.create(PendingAuthentication);
+    authentication.* = .{
+        .alloc = alloc,
+        .server_name = try alloc.dupe(u8, "workspace"),
+        .lease = state.acquire() orelse return error.TestUnexpectedResult,
+        .opener = host.unavailable_url_opener,
+        .done = .init(true),
+        .result = error.Cancelled,
+    };
+    state.lock.lockUncancelable(io_mod.getIo());
+    state.pending_authentication = authentication;
+    state.lock.unlock(io_mod.getIo());
+
+    try state.beginAuthorityReduction(
+        alloc,
+        "/workspace",
+        .{},
+        loadTestReloadRuntime,
+        .{},
+        60,
+        false,
+    );
+    try std.testing.expect(state.acquire() == null);
+
+    const retirement_deadline = io_mod.milliTimestamp() + 2_000;
+    while (!runtime.retiring.load(.acquire) and
+        io_mod.milliTimestamp() < retirement_deadline)
+    {
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    try std.testing.expect(runtime.retiring.load(.acquire));
+    try std.testing.expect(state.takeReloadCompletion() == null);
+
+    active_lease.deinit();
+    active_lease_owned = false;
+    var completion: ?ReloadCompletion = null;
+    const completion_deadline = io_mod.milliTimestamp() + 2_000;
+    while (completion == null and io_mod.milliTimestamp() < completion_deadline) {
+        io_mod.sleep(std.time.ns_per_ms);
+        completion = state.takeReloadCompletion();
+    }
+    var loaded = completion orelse return error.TestUnexpectedResult;
+    defer loaded.deinit(alloc);
+    switch (loaded) {
+        .outcome => |outcome| switch (outcome) {
+            .published => |published| try std.testing.expect(
+                published.generation == null,
+            ),
+            .retained_required_failure => return error.TestUnexpectedResult,
+        },
+        .failed => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(state.acquire() == null);
+}
+
+test "authority reduction thread start failure falls back synchronously" {
+    if (comptime builtin.single_threaded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+    const runtime = try alloc.create(mcp_runtime.McpRuntime);
+    runtime.* = mcp_runtime.McpRuntime.init(alloc);
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "workspace"),
+        .source = .workspace,
+        .scope = .profile,
+        .command = try alloc.dupe(u8, "unused"),
+        .workspace_admission = .approved,
+    });
+    state.installInitial(runtime);
+
+    test_reload_mode = .empty;
+    try state.beginAuthorityReductionWithSpawner(
+        alloc,
+        "/workspace",
+        .{},
+        loadTestReloadRuntime,
+        .{},
+        70,
+        false,
+        failPendingReloadSpawn,
+    );
+    try std.testing.expect(state.acquire() == null);
+    var completion = state.takeReloadCompletion() orelse
+        return error.TestUnexpectedResult;
+    defer completion.deinit(alloc);
+    switch (completion) {
+        .outcome => |outcome| switch (outcome) {
+            .published => |published| try std.testing.expect(
+                published.generation == null,
+            ),
+            .retained_required_failure => return error.TestUnexpectedResult,
+        },
+        .failed => return error.TestUnexpectedResult,
+    }
 }
 
 test "authentication admission is busy while reload is pending" {

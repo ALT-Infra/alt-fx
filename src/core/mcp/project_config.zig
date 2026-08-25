@@ -54,6 +54,11 @@ const ParsePolicy = struct {
     workspace_admission: ?mcp_contract.WorkspaceAdmission = null,
 };
 
+const ParsedTimeouts = struct {
+    startup_ms: u32,
+    operation_ms: u32,
+};
+
 pub const WorkspaceDiagnosticCause = enum {
     invalid_json,
     root_must_be_object,
@@ -402,27 +407,13 @@ fn parseServerEntry(
         false;
     const required = if (policy.force_optional) false else configured_required;
 
-    const startup_timeout_ms = parseUnsignedPolicy(
-        object,
-        "startup_timeout_ms",
-        mcp_contract.default_startup_timeout_ms,
-        1,
-        std.math.maxInt(u32),
-    ) catch return error.McpConfigInvalidStartupTimeout;
-    const operation_timeout_ms = parseUnsignedPolicy(
-        object,
-        "operation_timeout_ms",
-        mcp_contract.default_operation_timeout_ms,
-        1,
-        std.math.maxInt(u32),
-    ) catch return error.McpConfigInvalidOperationTimeout;
-    const env = try parseSelectedEnvironment(alloc, object);
-    errdefer freeEnvVars(alloc, env);
-
     if (transport != .stdio) {
         const url_value = object.get("url") orelse return error.McpConfigMissingUrl;
         if (url_value != .string) return error.McpConfigInvalidUrl;
         streamable_http.validateEndpoint(url_value.string) catch return error.McpConfigInvalidUrl;
+        const timeouts = try parseTimeouts(object);
+        const env = try parseSelectedEnvironment(alloc, object);
+        errdefer freeEnvVars(alloc, env);
         const headers = try parseRemoteHeaders(alloc, object);
         errdefer freeHttpHeaders(alloc, headers);
         const header_env = try parseRemoteHeaderEnv(alloc, object);
@@ -453,11 +444,12 @@ fn parseServerEntry(
             .allow_stored_credentials = policy.allow_stored_credentials,
             .enabled = enabled,
             .workspace_admission = policy.workspace_admission,
-            .startup_timeout_ms = @intCast(startup_timeout_ms),
-            .operation_timeout_ms = @intCast(operation_timeout_ms),
+            .startup_timeout_ms = timeouts.startup_ms,
+            .operation_timeout_ms = timeouts.operation_ms,
         };
     }
 
+    const timeouts = try parseTimeouts(object);
     const restart_limit = parseUnsignedPolicy(
         object,
         "restart_limit",
@@ -470,6 +462,8 @@ fn parseServerEntry(
         else => return error.McpConfigInvalidCommand,
     };
     errdefer freeParsedCommandSpec(alloc, command);
+    const env = try parseSelectedEnvironment(alloc, object);
+    errdefer freeEnvVars(alloc, env);
     return .{
         .name = try alloc.dupe(u8, name),
         .source = policy.source,
@@ -481,9 +475,33 @@ fn parseServerEntry(
         .env = env,
         .enabled = enabled,
         .workspace_admission = policy.workspace_admission,
-        .startup_timeout_ms = @intCast(startup_timeout_ms),
-        .operation_timeout_ms = @intCast(operation_timeout_ms),
+        .startup_timeout_ms = timeouts.startup_ms,
+        .operation_timeout_ms = timeouts.operation_ms,
         .restart_limit = @intCast(restart_limit),
+    };
+}
+
+fn parseTimeouts(object: std.json.ObjectMap) error{
+    McpConfigInvalidStartupTimeout,
+    McpConfigInvalidOperationTimeout,
+}!ParsedTimeouts {
+    const startup_ms = parseUnsignedPolicy(
+        object,
+        "startup_timeout_ms",
+        mcp_contract.default_startup_timeout_ms,
+        1,
+        std.math.maxInt(u32),
+    ) catch return error.McpConfigInvalidStartupTimeout;
+    const operation_ms = parseUnsignedPolicy(
+        object,
+        "operation_timeout_ms",
+        mcp_contract.default_operation_timeout_ms,
+        1,
+        std.math.maxInt(u32),
+    ) catch return error.McpConfigInvalidOperationTimeout;
+    return .{
+        .startup_ms = @intCast(startup_ms),
+        .operation_ms = @intCast(operation_ms),
     };
 }
 
@@ -781,6 +799,37 @@ fn freeHttpHeaderEnvList(alloc: Allocator, headers: *std.ArrayList(McpHttpHeader
         alloc.free(header.env);
     }
     headers.deinit(alloc);
+}
+
+test "profile parser preserves validation precedence for multiply invalid entries" {
+    const cases = .{
+        .{
+            .json = "{\"mcp\":{\"bad\":{\"type\":\"http\",\"startup_timeout_ms\":0,\"env\":3}}}",
+            .expected = error.McpConfigMissingUrl,
+        },
+        .{
+            .json = "{\"mcp\":{\"bad\":{\"type\":\"http\",\"url\":\"https://example.test/mcp\",\"startup_timeout_ms\":0,\"env\":3}}}",
+            .expected = error.McpConfigInvalidStartupTimeout,
+        },
+        .{
+            .json = "{\"mcp\":{\"bad\":{\"startup_timeout_ms\":0,\"restart_limit\":999,\"command\":3,\"env\":3}}}",
+            .expected = error.McpConfigInvalidStartupTimeout,
+        },
+        .{
+            .json = "{\"mcp\":{\"bad\":{\"restart_limit\":999,\"command\":3,\"env\":3}}}",
+            .expected = error.McpConfigInvalidRestartLimit,
+        },
+        .{
+            .json = "{\"mcp\":{\"bad\":{\"command\":3,\"env\":3}}}",
+            .expected = error.McpConfigInvalidCommand,
+        },
+    };
+    inline for (cases) |case| {
+        try std.testing.expectError(
+            case.expected,
+            parseProfileJson(std.testing.allocator, case.json),
+        );
+    }
 }
 
 test "workspace parsing stamps optional credential-isolated configs" {
