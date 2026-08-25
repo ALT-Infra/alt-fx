@@ -116,14 +116,12 @@ pub fn SubmitRuntime(comptime App: type) type {
 
         const PromptAdmission = enum {
             rejected,
-            deferred,
             pending,
             enqueued,
         };
 
         const PendingInstall = enum {
             unavailable,
-            deferred,
             installed,
         };
 
@@ -259,6 +257,10 @@ pub fn SubmitRuntime(comptime App: type) type {
                     );
                     return false;
                 }
+                image_attachments.discardImageSnapshots(
+                    app.alloc,
+                    app.submission.pending.?.draft.images,
+                );
             }
             clearPendingSubmission(app, "ctrl_c_pending_submission");
             app.shell.render_requests.request(.transcript);
@@ -271,6 +273,9 @@ pub fn SubmitRuntime(comptime App: type) type {
             var pending = app.submission.pending orelse return;
             app.submission.pending = null;
             if (pending.ownsTurnStartHold()) app.worker.releaseTurnStartHold();
+            if (pending.phase != .queued) {
+                image_attachments.discardImageSnapshots(app.alloc, pending.draft.images);
+            }
             debug_trace.eventf(
                 "input",
                 "pending_prompt_cleared",
@@ -419,7 +424,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                 if (app.pending_images.items.len > 0) {
                     if (!try preflightPrompt(app)) return;
                     const admission = try enqueuePromptForSubmit(app, "", &.{}, null);
-                    if (admission == .rejected or admission == .deferred) return;
+                    if (admission == .rejected) return;
                     releasePendingImages(app);
                     app.input_runtime.inputResetState().clearCurrent(app.alloc);
                     if (acceptedPromptNeedsImmediateFooter(app)) {
@@ -550,7 +555,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                     display_skill_tokens,
                     &accepted_draft,
                 );
-            if (admission == .rejected or admission == .deferred) return;
+            if (admission == .rejected) return;
             commitStableExtractedImageIds(app, extracted.images);
             commitRemappedImageIds(app, visual_text.next_image_id);
             if (visual_text.text.len > 0) {
@@ -765,7 +770,6 @@ pub fn SubmitRuntime(comptime App: type) type {
         ) !PromptAdmission {
             switch (try installPendingSubmission(app, prompt, skill_tokens)) {
                 .installed => return .pending,
-                .deferred => return .deferred,
                 .unavailable => {},
             }
             const resume_review = if (comptime @hasField(App, "queued_prompt_review"))
@@ -842,7 +846,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             {
                 if (app.shell.fullTranscriptActive()) return .unavailable;
             }
-            if (app.submission.pending != null) return .deferred;
+            std.debug.assert(app.submission.pending == null);
             if (!app.worker.tryHoldTurnStart()) return .unavailable;
             errdefer app.worker.releaseTurnStartHold();
 
@@ -887,7 +891,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                 skill_tokens,
                 accepted_draft,
             );
-            if (admission == .rejected or admission == .deferred) {
+            if (admission == .rejected) {
                 staged_images.* = app.pending_images;
                 app.pending_images = original_images;
                 return admission;
@@ -2025,6 +2029,42 @@ fn pendingLifecycleFake(alloc: std.mem.Allocator, turn_id: u64) !PendingLifecycl
     };
 }
 
+fn pendingLifecycleFakeWithSnapshot(
+    alloc: std.mem.Allocator,
+    turn_id: u64,
+    snapshot_path: []const u8,
+) !PendingLifecycleFake {
+    return .{
+        .alloc = alloc,
+        .submission = .{ .pending = PendingSubmission.init(try buildQueuedPromptDraft(
+            alloc,
+            turn_id,
+            "visible image prompt",
+            &.{.{
+                .id = 1,
+                .path = @constCast("/tmp/original.png"),
+                .media_type = @constCast("image/png"),
+                .snapshot_path = @constCast(snapshot_path),
+            }},
+            &.{},
+        )) },
+    };
+}
+
+fn writePendingSnapshotFixture(tmp: *std.testing.TmpDir, name: []const u8) ![]u8 {
+    var file = try tmp.dir.createFile(std.testing.io, name, .{});
+    defer file.close(std.testing.io);
+    try file.writeStreamingAll(std.testing.io, "snapshot");
+    return io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, name);
+}
+
+fn expectPendingSnapshotMissing(path: []const u8) !void {
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.openFileAbsolute(std.testing.io, path, .{}),
+    );
+}
+
 test "post-commit adoption failure keeps one retryable owner and hold" {
     const Runtime = SubmitRuntime(PendingLifecycleFake);
     var app = try pendingLifecycleFake(std.testing.allocator, 501);
@@ -2128,4 +2168,50 @@ test "Ctrl+C requests cancellation after the pending turn leaves the queue" {
     try Runtime.acceptPresentedPrompt(&app, 805);
     try std.testing.expect(app.submission.pending == null);
     try std.testing.expectEqual(@as(usize, 1), app.worker.release_count);
+}
+
+test "pending terminal cleanup deletes snapshots until a worker claims the turn" {
+    const alloc = std.testing.allocator;
+    const Runtime = SubmitRuntime(PendingLifecycleFake);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const awaiting_path = try writePendingSnapshotFixture(&tmp, "awaiting.bin");
+    defer alloc.free(awaiting_path);
+    var awaiting = try pendingLifecycleFakeWithSnapshot(alloc, 901, awaiting_path);
+    defer awaiting.deinit();
+    try std.testing.expect(Runtime.cancelPendingSubmission(&awaiting));
+    try expectPendingSnapshotMissing(awaiting_path);
+
+    const failed_path = try writePendingSnapshotFixture(&tmp, "failed.bin");
+    defer alloc.free(failed_path);
+    var failed = try pendingLifecycleFakeWithSnapshot(alloc, 902, failed_path);
+    defer failed.deinit();
+    failed.finalization_error = true;
+    Runtime.noteCommittedFrame(&failed);
+    Runtime.collectPendingSubmissionFacts(&failed);
+    try std.testing.expect(failed.submission.pending == null);
+    try expectPendingSnapshotMissing(failed_path);
+
+    const queued_path = try writePendingSnapshotFixture(&tmp, "queued.bin");
+    defer alloc.free(queued_path);
+    var queued = try pendingLifecycleFakeWithSnapshot(alloc, 903, queued_path);
+    defer queued.deinit();
+    Runtime.noteCommittedFrame(&queued);
+    Runtime.collectPendingSubmissionFacts(&queued);
+    try std.testing.expect(Runtime.cancelPendingSubmission(&queued));
+    try expectPendingSnapshotMissing(queued_path);
+
+    const claimed_path = try writePendingSnapshotFixture(&tmp, "claimed.bin");
+    defer alloc.free(claimed_path);
+    var claimed = try pendingLifecycleFakeWithSnapshot(alloc, 904, claimed_path);
+    defer claimed.deinit();
+    Runtime.noteCommittedFrame(&claimed);
+    Runtime.collectPendingSubmissionFacts(&claimed);
+    claimed.worker.queued_turn_id = null;
+    claimed.worker.active_turn_id = 904;
+    try std.testing.expect(Runtime.cancelPendingSubmission(&claimed));
+    try Runtime.acceptPresentedPrompt(&claimed, 904);
+    var retained = try std.Io.Dir.openFileAbsolute(std.testing.io, claimed_path, .{});
+    retained.close(std.testing.io);
 }
