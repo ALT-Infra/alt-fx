@@ -214,10 +214,11 @@ fn pendingCardLeadingAdvanceRows(
     content_bottom: u16,
 ) u16 {
     if (has_prior_turns or cursor_col == 1 or cursor_row >= content_bottom) return 0;
-    return render_engine.transcript_blocks.blockSeparatorNewlineCount(
+    const canonical_rows = render_engine.transcript_blocks.blockSeparatorNewlineCount(
         .unknown_raw,
         .user_turn,
     );
+    return @min(canonical_rows, content_bottom - cursor_row);
 }
 
 fn buildPendingCardProjection(
@@ -3985,6 +3986,10 @@ test "pending prompt uses the canonical user turn boundary" {
     try std.testing.expectEqual(
         @as(u16, 0),
         pendingCardLeadingAdvanceRows(false, 20, 47, 20),
+    );
+    try std.testing.expectEqual(
+        @as(u16, 1),
+        pendingCardLeadingAdvanceRows(false, 19, 47, 20),
     );
 }
 
