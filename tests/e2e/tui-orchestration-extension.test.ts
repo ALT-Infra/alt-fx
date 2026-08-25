@@ -409,6 +409,9 @@ describe.skipIf(SKIP)("tui: orchestration extension host", () => {
       });
       try {
         await session.waitForComposer(10_000);
+        expect(existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "").not.toContain(
+          "event=activation_accepted",
+        );
 
         await session.sendText("/alt");
         await session.waitForText("ALT mode enabled.", 5_000);

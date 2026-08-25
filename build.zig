@@ -20,6 +20,12 @@ const NapiSurface = enum {
     core,
 };
 
+const OrchestrationMode = enum {
+    alt,
+    none,
+    custom,
+};
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -42,11 +48,30 @@ pub fn build(b: *std.Build) void {
     const git_commit = readGitCommit(b);
     const app_version = readAppVersion(b);
     const update_channel = b.option(UpdateChannel, "update-channel", "Build update channel (stable or dev)") orelse .stable;
-    const orchestration_root = b.option(
+    const orchestration_root_override = b.option(
         []const u8,
         "orchestration-root",
-        "Root Zig source file for an optional orchestration extension",
+        "Root Zig source file used with -Dorchestration=custom",
     );
+    const orchestration_mode: OrchestrationMode = b.option(
+        OrchestrationMode,
+        "orchestration",
+        "Bundled orchestration implementation: alt (default), none, or custom",
+    ) orelse if (orchestration_root_override != null) .custom else .alt;
+    var orchestration_configuration_failure: ?*std.Build.Step = null;
+    const orchestration_root: ?std.Build.LazyPath = switch (orchestration_mode) {
+        .alt => b.path("alt/extension.zig"),
+        .none => null,
+        .custom => if (orchestration_root_override) |root|
+            .{ .cwd_relative = root }
+        else blk: {
+            const failure = b.addFail(
+                "-Dorchestration=custom requires -Dorchestration-root=/absolute/path/to/extension.zig",
+            );
+            orchestration_configuration_failure = &failure.step;
+            break :blk null;
+        },
+    };
 
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "git_commit", git_commit);
@@ -79,7 +104,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         const orchestration_extension = b.createModule(.{
-            .root_source_file = .{ .cwd_relative = root },
+            .root_source_file = root,
             .target = target,
             .optimize = optimize,
         });
@@ -90,6 +115,9 @@ pub fn build(b: *std.Build) void {
     }
 
     b.installArtifact(exe);
+    if (orchestration_configuration_failure) |failure| {
+        b.getInstallStep().dependOn(failure);
+    }
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -113,6 +141,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
 
+    var orchestration_test_step: ?*std.Build.Step = null;
     if (selected_orchestration_extension) |orchestration_extension| {
         const orchestration_tests = b.addTest(.{ .root_module = orchestration_extension });
         const run_orchestration_tests = b.addRunArtifact(orchestration_tests);
@@ -127,16 +156,45 @@ pub fn build(b: *std.Build) void {
                 "canonical steering preserves ordered user input and authorizes instruction attachments",
                 "isolated service is independent of native subagent modules",
                 "orchestration run manager has no native subagent dependency",
-                "context-bearing surface restores exact history without repeating the same root turn",
             },
         });
         const run_orchestration_host_tests = b.addRunArtifact(orchestration_host_tests);
-        const orchestration_test_step = b.step(
+        const selected_extension_test_step = b.step(
             "test-orchestration-extension",
             "Run the orchestration host and selected extension tests",
         );
-        orchestration_test_step.dependOn(&run_orchestration_tests.step);
-        orchestration_test_step.dependOn(&run_orchestration_host_tests.step);
+        selected_extension_test_step.dependOn(&run_orchestration_tests.step);
+        selected_extension_test_step.dependOn(&run_orchestration_host_tests.step);
+        orchestration_test_step = selected_extension_test_step;
+    }
+
+    const crucible_host_step = b.step(
+        "crucible-host",
+        "Build ALT-enabled fx and exercise the extension through a real PTY",
+    );
+    if (orchestration_mode == .alt) {
+        const bun_exe = b.option(
+            []const u8,
+            "bun",
+            "Path to the Bun executable used by Crucible",
+        ) orelse "bun";
+        const run_host_scenario = b.addSystemCommand(&.{
+            bun_exe,
+            "test",
+            "--max-concurrency",
+            "1",
+            "./tui-orchestration-extension.test.ts",
+        });
+        run_host_scenario.setCwd(b.path("tests/e2e"));
+        run_host_scenario.setEnvironmentVariable("FX_ORCHESTRATION_E2E", "1");
+        run_host_scenario.step.dependOn(b.getInstallStep());
+        if (orchestration_test_step) |step| run_host_scenario.step.dependOn(step);
+        crucible_host_step.dependOn(&run_host_scenario.step);
+    } else {
+        const failure = b.addFail(
+            "crucible-host exercises bundled ALT and requires -Dorchestration=alt",
+        );
+        crucible_host_step.dependOn(&failure.step);
     }
 
     if (wasm_surface != .none) {
