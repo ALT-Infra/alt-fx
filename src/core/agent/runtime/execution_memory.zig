@@ -37,10 +37,36 @@ pub fn classifyProviderExecutedResultStatus(output: []const u8) types.PersistedT
 }
 
 pub fn buildExecutionMemory(alloc: Allocator, within_turn_suffix: []const ChatMessage) !types.ExecutionMemory {
-    return execution_memory_helpers.buildNormalChatExecutionMemory(
+    var execution = try execution_memory_helpers.buildNormalChatExecutionMemory(
         alloc,
         within_turn_suffix,
     );
+    errdefer types.freeExecutionMemory(alloc, execution);
+
+    var steering: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (steering.items) |text| alloc.free(text);
+        steering.deinit(alloc);
+    }
+    for (within_turn_suffix) |message| {
+        if (message.role != .user) continue;
+        const content = message.content orelse continue;
+        const text = steeringText(content) orelse continue;
+        const copy = try alloc.dupe(u8, text);
+        steering.append(alloc, copy) catch |err| {
+            alloc.free(copy);
+            return err;
+        };
+    }
+    execution.steering = try steering.toOwnedSlice(alloc);
+    return execution;
+}
+
+fn steeringText(content: []const u8) ?[]const u8 {
+    const open = "<user_steering>\n";
+    const close = "\n</user_steering>";
+    if (!std.mem.startsWith(u8, content, open) or !std.mem.endsWith(u8, content, close)) return null;
+    return content[open.len .. content.len - close.len];
 }
 
 pub fn buildInterruptedExecutionMemory(
@@ -992,6 +1018,23 @@ test "large result storage redacts secret-bearing output before preview and disk
     defer alloc.free(stored);
     try std.testing.expect(std.mem.find(u8, stored, "super-secret-value") == null);
     try std.testing.expect(std.mem.find(u8, stored, "api_key=[redacted]") != null);
+}
+
+test "execution memory persists consumed steering without protocol wrappers" {
+    const alloc = std.testing.allocator;
+    const messages = [_]ChatMessage{
+        .{ .role = .user, .content = "ordinary user context" },
+        .{ .role = .user, .content = "<user_steering>\nfocus on rendering\n</user_steering>" },
+        .{ .role = .assistant, .content = "continuing" },
+        .{ .role = .user, .content = "<user_steering>\nrun the focused test\n</user_steering>" },
+    };
+
+    const execution = try buildExecutionMemory(alloc, &messages);
+    defer types.freeExecutionMemory(alloc, execution);
+
+    try std.testing.expectEqual(@as(usize, 2), execution.steering.len);
+    try std.testing.expectEqualStrings("focus on rendering", execution.steering[0]);
+    try std.testing.expectEqualStrings("run the focused test", execution.steering[1]);
 }
 
 test "transcript does not mark native web_search as provider resource placeholder" {

@@ -171,10 +171,10 @@ pub fn Runtime(comptime App: type) type {
             const index = state.selected_index orelse return error.QueueReviewSelectionMissing;
             if (index >= state.entries.len) return error.QueueReviewSelectionMissing;
 
-            const turn_id = state.entries[index].draft.turn_id;
+            const prompt_id = state.entries[index].draft.prompt_id;
             if (!app.worker.deleteQueuedPromptDraft(
                 app.alloc,
-                turn_id,
+                prompt_id,
                 app.input_runtime.kill_ring.images.items,
             )) {
                 return error.QueuedPromptNoLongerAvailable;
@@ -187,7 +187,7 @@ pub fn Runtime(comptime App: type) type {
                 state.entries = &.{};
                 removed.deinit(app.alloc);
                 app.shell.render_requests.finishSubmittedPromptTransition();
-                debug_trace.eventf("input", "queue_review_draft_deleted", .{ .turn_id = turn_id }, "remaining=0", .{});
+                debug_trace.eventf("input", "queue_review_draft_deleted", .{ .turn_id = prompt_id }, "remaining=0", .{});
                 app.input_runtime.inputResetState().clearCurrent(app.alloc);
                 paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
                 releasePendingImages(app);
@@ -205,7 +205,7 @@ pub fn Runtime(comptime App: type) type {
             app.alloc.free(state.entries);
             state.entries = next;
             removed.deinit(app.alloc);
-            debug_trace.eventf("input", "queue_review_draft_deleted", .{ .turn_id = turn_id }, "remaining={d}", .{remaining_len});
+            debug_trace.eventf("input", "queue_review_draft_deleted", .{ .turn_id = prompt_id }, "remaining={d}", .{remaining_len});
 
             state.selected_index = @min(index, remaining_len - 1);
             state.visible = false;
@@ -508,7 +508,9 @@ pub fn Runtime(comptime App: type) type {
                     },
                 );
                 commits[filled] = .{
+                    .prompt_id = entry.draft.prompt_id,
                     .turn_id = entry.draft.turn_id,
+                    .kind = entry.draft.kind,
                     .prompt = prompt_copy,
                     .images = images_copy,
                     .skill_display_spans = spans_copy,

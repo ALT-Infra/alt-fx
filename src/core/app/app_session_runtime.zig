@@ -3756,6 +3756,7 @@ pub fn Runtime(comptime App: type) type {
                     }
                 }
             }
+            try writePermissionFeedback(sink, execution.steering);
         }
 
         fn writePermissionFeedback(sink: anytype, feedback: []const []const u8) !void {
