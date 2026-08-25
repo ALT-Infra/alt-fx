@@ -2,6 +2,41 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("core/shared/io.zig");
+const orchestration_host = if (build_options.orchestration_enabled)
+    @import("fx_orchestration_host")
+else
+    struct {};
+const orchestration_extension = if (build_options.orchestration_enabled)
+    @import("orchestration_extension")
+else
+    struct {};
+const orchestration_app_runtime = if (build_options.orchestration_enabled)
+    @import("core/orchestration/app_runtime.zig")
+else
+    struct {};
+const orchestration_run_manager = if (build_options.orchestration_enabled)
+    @import("core/orchestration/run_manager.zig")
+else
+    struct {};
+
+comptime {
+    if (build_options.orchestration_enabled) {
+        orchestration_host.validateExtension(orchestration_extension);
+    }
+}
+
+const OrchestrationState = if (build_options.orchestration_enabled)
+    orchestration_app_runtime.State(orchestration_host)
+else
+    struct {};
+const OrchestrationTraceRecord = if (build_options.orchestration_enabled)
+    orchestration_host.TraceRecord
+else
+    struct {};
+const OrchestrationAgentRunRequest = if (build_options.orchestration_enabled)
+    orchestration_host.AgentRunRequest
+else
+    struct {};
 
 pub const version = "0.0.5";
 
@@ -46,6 +81,7 @@ const model_provider = @import("core/config/model_provider.zig");
 const js_host_prompt_history = @import("core/session/js_host_prompt_history.zig");
 const model_capabilities = @import("core/config/model_capabilities.zig");
 const prompt_policy = @import("core/config/prompt_policy.zig");
+const permission_request = @import("core/permissions/permission_request.zig");
 const builtin_commands = @import("builtins/commands.zig");
 const command_specs = @import("core/slash_commands/command_specs.zig");
 const builtin_context = @import("builtins/context.zig");
@@ -77,6 +113,7 @@ const mcp_access_policy = @import("core/mcp/access_policy.zig");
 const app_mcp_runtime = @import("core/app/app_mcp_runtime.zig");
 const skill_commands = @import("core/skills/skill_commands.zig");
 const skill_runtime = @import("core/skills/skill_runtime.zig");
+const skill_invocation = @import("core/skills/skill_invocation.zig");
 const cli_surface = @import("core/cli/cli_surface.zig");
 const hooks = @import("core/hooks/hooks.zig");
 const github_publish = @import("core/github/github_publish.zig");
@@ -84,6 +121,7 @@ const subagent_domain = @import("core/subagent/domain.zig");
 const subagent_execution = @import("core/subagent/execution.zig");
 const types = @import("core/shared/types.zig");
 const image_attachments = @import("core/images/image_attachments.zig");
+const output_diff = @import("core/output/diff.zig");
 const permissions = @import("core/permissions/permissions.zig");
 const command_runner = @import("core/execution/command_runner.zig");
 const command_admission = @import("core/permissions/command_admission.zig");
@@ -205,6 +243,59 @@ const ignored_list_entries = [_][]const u8{
     "build",
     "coverage",
 };
+
+fn orchestrationModelId(
+    alloc: Allocator,
+    provider: model_provider.ProviderId,
+    route_raw: []const u8,
+    name_raw: []const u8,
+) ![]u8 {
+    const route = std.mem.trim(u8, route_raw, " \t\r\n");
+    const name = std.mem.trim(u8, name_raw, " \t\r\n");
+    if (!validOrchestrationModelComponent(route) or
+        !validOrchestrationModelComponent(name))
+    {
+        return error.InvalidOrchestrationModelIdentity;
+    }
+    return switch (provider) {
+        .opencode => if (std.ascii.eqlIgnoreCase(route, "zen"))
+            alloc.dupe(u8, name)
+        else if (std.ascii.eqlIgnoreCase(route, "go"))
+            std.fmt.allocPrint(alloc, "go/{s}", .{name})
+        else
+            error.InvalidOpenCodeRoute,
+        .gateway => std.fmt.allocPrint(alloc, "{s}/{s}", .{ route, name }),
+        .codex, .grok => error.OrchestrationProviderNotUnified,
+    };
+}
+
+fn validOrchestrationModelComponent(value: []const u8) bool {
+    if (value.len == 0 or value.len > 256) return false;
+    for (value) |byte| {
+        if (byte <= 0x20 or byte == 0x7f) return false;
+    }
+    return true;
+}
+
+fn orchestrationPromptOverlay(
+    alloc: Allocator,
+    base: ?[]const u8,
+    role_prompt: []const u8,
+    supplemental_context: []const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    var wrote = false;
+    for ([_][]const u8{ base orelse "", role_prompt, supplemental_context }) |section| {
+        const trimmed = std.mem.trim(u8, section, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        if (wrote) try writer.writeAll("\n\n");
+        try writer.writeAll(trimmed);
+        wrote = true;
+    }
+    return out.toOwnedSlice();
+}
 
 fn dupeUniqueSkillBindingsFromTokens(
     alloc: Allocator,
@@ -513,6 +604,7 @@ const App = struct {
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
     notifications: builtin_hooks.notifications.State = .{},
     herdr: builtin_hooks.Client = .{},
+    orchestration: OrchestrationState = .{},
 
     session: SessionRuntime = SessionRuntime.initWithProviders(
         max_history_turns,
@@ -838,6 +930,9 @@ const App = struct {
         self.pending_images.deinit(self.alloc);
         self.input_runtime.deinit(self.alloc);
         self.terminal_input_runtime.deinit(self.alloc);
+        if (comptime build_options.orchestration_enabled) {
+            orchestration_app_runtime.deinit(orchestration_host, self.alloc, &self.orchestration);
+        }
         self.shell.deinit(self.alloc);
         self.pacer.deinit(self.alloc);
         self.provider_selection.deinit();
@@ -921,6 +1016,9 @@ const App = struct {
     }
 
     pub fn ensurePromptCredential(self: *App) !bool {
+        if (comptime build_options.orchestration_enabled) {
+            if (self.orchestration.active) return true;
+        }
         return AuthAppRuntime.admitPromptCredential(self);
     }
 
@@ -996,7 +1094,585 @@ const App = struct {
     }
 
     pub fn handleCommand(self: *App, cmd: []const u8) !void {
+        if (comptime build_options.orchestration_enabled) {
+            if (try orchestration_app_runtime.handleCommand(
+                orchestration_host,
+                orchestration_extension,
+                self,
+                cmd,
+            )) return;
+        }
         try app_commands.Handlers(App).route(self, cmd);
+    }
+
+    pub fn isExtensionSlashCommand(_: *const App, input: []const u8) bool {
+        if (comptime !build_options.orchestration_enabled) return false;
+        return orchestration_app_runtime.isCommand(orchestration_extension, input);
+    }
+
+    pub fn orchestrationConversationId(self: *App) []const u8 {
+        if (comptime !build_options.orchestration_enabled) return "";
+        return SessionAppRuntime.activeSessionId(self) orelse "";
+    }
+
+    /// Native fx subagents and extension orchestration are deliberately
+    /// separate execution environments. Keeping this decision on App gives
+    /// every native-subagent admission surface one live source of truth.
+    pub fn nativeSubagentsAvailable(self: *const App) bool {
+        if (comptime !build_options.orchestration_enabled) return true;
+        return !self.orchestration.active;
+    }
+
+    /// Enabling orchestration must never hide or strand native child work.
+    /// Idle and terminal child records remain persisted and become visible
+    /// again after the extension mode is left.
+    pub fn nativeSubagentWorkActive(self: *App) !bool {
+        if (comptime !build_options.orchestration_enabled) return false;
+        const host_runtime = SessionAppRuntime.subagentHost(self) orelse return false;
+        switch (host_runtime.recoveryState()) {
+            .pending, .scheduled, .running, .deferred => return error.NativeSubagentRecoveryUnsettled,
+            .complete => {},
+        }
+
+        var cursor: ?[]u8 = null;
+        defer if (cursor) |owned| self.alloc.free(owned);
+        while (true) {
+            var result = try host_runtime.manager.snapshot(self.alloc, .{
+                .root_id = host_runtime.root_id,
+                .cursor = cursor,
+                .limit = subagent_domain.max_page_limit,
+            });
+            defer result.deinit(self.alloc);
+
+            var next_cursor: ?[]u8 = null;
+            switch (result) {
+                .failure => return error.NativeSubagentSnapshotUnavailable,
+                .snapshot => |snapshot| {
+                    for (snapshot.nodes) |node| {
+                        if (host_runtime.owner.externalBusy(node.child_id)) return true;
+                        switch (node.state) {
+                            .queued, .running, .awaiting_approval => return true,
+                            .idle,
+                            .interrupted,
+                            .completed,
+                            .failed,
+                            .cancelled,
+                            .archived,
+                            => {},
+                        }
+                    }
+                    if (snapshot.next_cursor) |next| {
+                        next_cursor = try self.alloc.dupe(u8, next);
+                    }
+                },
+            }
+
+            if (cursor) |owned| self.alloc.free(owned);
+            cursor = next_cursor;
+            if (cursor == null) return false;
+        }
+    }
+
+    pub fn orchestrationModeEntered(self: *App) void {
+        if (comptime !build_options.orchestration_enabled) return;
+        // The command is only admitted from the root composer, so the native
+        // manager cannot be the active alternate-screen owner here. Clear only
+        // its disposable projection; durable child records remain untouched.
+        self.subagents.clearProjection(self.alloc);
+    }
+
+    pub fn orchestrationModeLeft(self: *App) void {
+        if (comptime !build_options.orchestration_enabled) return;
+        self.refreshSubagentManagerProjectionNow() catch |err| debug_trace.logf(
+            "orchestration",
+            "native subagent projection restore deferred error={s}",
+            .{@errorName(err)},
+        );
+    }
+
+    pub fn startOrchestrationAgentRun(
+        self: *App,
+        request: OrchestrationAgentRunRequest,
+    ) !void {
+        if (comptime !build_options.orchestration_enabled) return;
+        if (!self.orchestration.active) return error.OrchestrationModeInactive;
+        if (self.orchestration.active_source_turn_id != request.authority.source_turn_id) {
+            return error.OrchestrationAuthorityMismatch;
+        }
+        if (!std.mem.eql(
+            u64,
+            self.orchestration.instruction_source_turn_ids.items,
+            request.authority.instruction_source_turn_ids,
+        )) {
+            return error.OrchestrationInstructionAuthorityMismatch;
+        }
+        switch (request.scope) {
+            .specialist => if (request.context_key != null) {
+                return error.StatefulOrchestrationSpecialist;
+            },
+            .leader, .peer => if (request.context_key == null or request.context_key.?.len == 0) {
+                return error.MissingOrchestrationContextKey;
+            },
+        }
+        if (request.context_key != null and request.visible_input == .projected) {
+            return error.ContextBearingProjectedInput;
+        }
+        const provider = provider_catalog.parse(request.model.provider_id) orelse
+            return error.UnknownOrchestrationProvider;
+        if (provider_catalog.find(provider).catalog_scope != .unified) {
+            return error.OrchestrationProviderNotUnified;
+        }
+
+        var prompt = switch (request.visible_input) {
+            .canonical_turn => try self.orchestration.canonical_turns.cloneCanonical(
+                self.alloc,
+                request.authority.source_turn_id,
+                request.authority.instruction_source_turn_ids,
+            ),
+            .projected => |projected| try self.orchestration.canonical_turns.cloneProjected(
+                self.alloc,
+                request.authority.source_turn_id,
+                request.authority.instruction_source_turn_ids,
+                projected.content,
+                projected.attachment_references,
+            ),
+        };
+        var owns_prompt = true;
+        errdefer if (owns_prompt) worker_runtime.freeQueuedPrompt(self.alloc, prompt);
+        const supplemental_context = switch (request.visible_input) {
+            .canonical_turn => |canonical| canonical.supplemental_context,
+            .projected => "",
+        };
+        const continued_context = if (request.context_key) |key|
+            try self.orchestration.runs.attachContextSurface(
+                self.alloc,
+                key,
+                request.authority.source_turn_id,
+                request.authority.instruction_source_turn_ids,
+                supplemental_context,
+                &prompt,
+            )
+        else
+            false;
+
+        // Canonical projections deliberately discard the root worker's turn
+        // identity. Rebind this isolated worker to fx's opaque custody ID so
+        // its permission, question, cancellation, and activity snapshots have
+        // a stable nonzero lifecycle key without reviving root-worker state.
+        prompt.turn_id = request.authority.source_turn_id;
+
+        try self.routeOrchestrationCredential(&prompt, provider);
+        const exact_model = try orchestrationModelId(
+            self.alloc,
+            provider,
+            request.model.route,
+            request.model.name,
+        );
+        self.alloc.free(prompt.model);
+        prompt.model = exact_model;
+        prompt.provider = provider;
+        prompt.agent_settings.effort = .auto;
+        if (request.model.reasoning_effort) |raw_effort| {
+            prompt.agent_settings.effort = ReasoningEffort.parse(raw_effort) orelse
+                return error.InvalidOrchestrationReasoningEffort;
+        }
+
+        var projection = try self.snapshotModelToolProjection(
+            self.alloc,
+            prompt.permission_mode,
+        );
+        var owns_projection = true;
+        errdefer if (owns_projection) projection.deinit(self.alloc);
+        debug_trace.eventf(
+            "orchestration",
+            "agent_run_host_admitted",
+            .{},
+            "run={s} provider={s} model={s} tool_count={d} write_file={s} native_subagent={s} structured_outcome={s}",
+            .{
+                request.run_id,
+                request.model.provider_id,
+                prompt.model,
+                projection.advertised_names.len,
+                if (tool_projection.containsName(projection.advertised_names, "write_file")) "advertised" else "absent",
+                if (tool_projection.containsName(projection.advertised_names, "subagent")) "advertised" else "absent",
+                if (request.response_schema_json != null) "enabled" else "disabled",
+            },
+        );
+        var permission_rules = try types.dupePermissionRuleSet(
+            self.alloc,
+            self.permission_engine.rules,
+        );
+        var owns_permission_rules = true;
+        errdefer if (owns_permission_rules) permission_rules.deinit(self.alloc);
+
+        var tool_context = AgentAppRuntime.toolContext(
+            self,
+            &ignored_list_entries,
+            max_list_entries,
+            max_read_file_bytes,
+            max_read_file_lines,
+            max_read_file_line_len,
+            max_command_output_bytes,
+            builtin_gateway.retry_count,
+            builtin_gateway.defaultChatUrl(),
+        );
+        const bundle = self.providerSet().select(provider);
+        tool_context.agent_stream_provider = bundle.agent_stream_or_unavailable();
+        tool_context.provider = provider;
+        tool_context.provider_capabilities = bundle.capabilities;
+        tool_context.model = prompt.model;
+        tool_context.api_key = prompt.api_key;
+        tool_context.gateway_team = prompt.gateway_team;
+        tool_context.credential_source = prompt.credential_source;
+        tool_context.account_id = prompt.account_id;
+        tool_context.permission_mode = prompt.permission_mode;
+        tool_context.permission_grants = prompt.grants;
+        tool_context.permission_rules = permission_rules;
+        tool_context.subagent_host = null;
+        tool_context.subagent_caller_id = null;
+        if (!bundle.capabilities.fx_search) {
+            tool_context.web_search_backend = null;
+            tool_context.web_search_runtime_ready = false;
+        }
+        if (request.visible_input == .projected) {
+            tool_context.context_enabled = false;
+        }
+
+        const policy_snapshot = self.promptPolicy();
+        var strings_transferred = false;
+        const system_prompt = try self.alloc.dupe(u8, policy_snapshot.system_prompt);
+        errdefer if (!strings_transferred) self.alloc.free(system_prompt);
+        const model_prompt_overlay = try orchestrationPromptOverlay(
+            self.alloc,
+            policy_snapshot.modelPromptOverlay(prompt.model),
+            request.system_prompt,
+            if (continued_context) "" else supplemental_context,
+        );
+        errdefer if (!strings_transferred) self.alloc.free(model_prompt_overlay);
+
+        var skills_prompt_section: []u8 = &.{};
+        var explicit_skills_prompt_section: []u8 = &.{};
+        if (request.visible_input == .canonical_turn) {
+            var bounded = try self.skills.buildBoundedSystemPromptSection(
+                self.alloc,
+                self.context_limits,
+            );
+            defer bounded.deinit(self.alloc);
+            skills_prompt_section = try self.alloc.dupe(u8, bounded.text);
+            errdefer if (!strings_transferred) self.alloc.free(skills_prompt_section);
+
+            const explicit_bindings = try self.alloc.alloc(
+                skill_invocation.ExplicitBinding,
+                prompt.skill_bindings.len,
+            );
+            defer self.alloc.free(explicit_bindings);
+            for (prompt.skill_bindings, 0..) |binding, index| {
+                explicit_bindings[index] = .{
+                    .name = binding.name,
+                    .path = binding.path,
+                };
+            }
+            var explicit = try skill_invocation.buildExplicitPromptSection(
+                self.alloc,
+                .{
+                    .skills = self.skills.items,
+                    .diagnostics = self.skills.diagnostics,
+                },
+                prompt.prompt,
+                explicit_bindings,
+                self.context_limits,
+            );
+            defer explicit.deinit(self.alloc);
+            explicit_skills_prompt_section = try self.alloc.dupe(
+                u8,
+                explicit.text,
+            );
+            errdefer if (!strings_transferred) self.alloc.free(explicit_skills_prompt_section);
+        }
+
+        const run_id = try self.alloc.dupe(u8, request.run_id);
+        errdefer if (!strings_transferred) self.alloc.free(run_id);
+        const context_key = if (request.context_key) |key|
+            try self.alloc.dupe(u8, key)
+        else
+            null;
+        errdefer if (!strings_transferred) {
+            if (context_key) |key| self.alloc.free(key);
+        };
+        const instruction_source_turn_ids = try self.alloc.dupe(
+            u64,
+            request.authority.instruction_source_turn_ids,
+        );
+        errdefer if (!strings_transferred) self.alloc.free(instruction_source_turn_ids);
+        const response_schema_json = if (request.response_schema_json) |schema|
+            try self.alloc.dupe(u8, schema)
+        else
+            null;
+        errdefer if (!strings_transferred) {
+            if (response_schema_json) |schema| self.alloc.free(schema);
+        };
+        const lifecycle_session_id = try self.alloc.dupe(u8, request.run_id);
+        errdefer if (!strings_transferred) self.alloc.free(lifecycle_session_id);
+
+        var owned_prepared = orchestration_run_manager.Prepared{
+            .run_id = run_id,
+            .context_key = context_key,
+            .source_turn_id = request.authority.source_turn_id,
+            .instruction_source_turn_ids = instruction_source_turn_ids,
+            .prompt = prompt,
+            .tool_context = tool_context,
+            .tool_projection = projection,
+            .permission_rules = permission_rules,
+            .system_prompt = system_prompt,
+            .model_prompt_overlay = model_prompt_overlay,
+            .skills_prompt_section = skills_prompt_section,
+            .explicit_skills_prompt_section = explicit_skills_prompt_section,
+            .response_schema_json = response_schema_json,
+            .lifecycle_session_id = lifecycle_session_id,
+        };
+        var owns_prepared = true;
+        errdefer if (owns_prepared) owned_prepared.deinit(self.alloc);
+        owns_prompt = false;
+        owns_projection = false;
+        owns_permission_rules = false;
+        strings_transferred = true;
+        try self.orchestration.runs.start(owned_prepared);
+        owns_prepared = false;
+    }
+
+    fn routeOrchestrationCredential(
+        self: *App,
+        prompt: *worker_runtime.QueuedPrompt,
+        provider: model_provider.ProviderId,
+    ) !void {
+        if (model_provider.authorizesCredential(provider, prompt.credential_source)) return;
+        const resolution = try credentials.resolveForProvider(
+            self.alloc,
+            self.auth.oauthTransport(),
+            self.auth.secretStore(),
+            .refresh_if_needed,
+            provider,
+            prompt.credential_source,
+        );
+        var credential = resolution.credential orelse return error.OrchestrationCredentialMissing;
+        defer credential.deinit(self.alloc);
+        const token = try self.alloc.dupe(u8, credential.token);
+        errdefer secret.zeroAndFree(self.alloc, token);
+        const gateway_team = if (credential.gatewayTeam()) |team|
+            try self.alloc.dupe(u8, team)
+        else
+            null;
+        errdefer if (gateway_team) |team| self.alloc.free(team);
+        const account_id = if (credential.accountId()) |id|
+            try self.alloc.dupe(u8, id)
+        else
+            null;
+
+        secret.zeroAndFree(self.alloc, prompt.api_key);
+        if (prompt.gateway_team) |team| self.alloc.free(team);
+        if (prompt.account_id) |id| self.alloc.free(id);
+        prompt.api_key = token;
+        prompt.gateway_team = gateway_team;
+        prompt.account_id = account_id;
+        prompt.credential_source = credential.source;
+    }
+
+    pub fn snapshotOrchestrationApproval(
+        self: *App,
+        alloc: std.mem.Allocator,
+    ) !?permission_request.OwnedPermissionRequest {
+        if (comptime !build_options.orchestration_enabled) return null;
+        if (!self.orchestration.active) return null;
+        return self.orchestration.runs.snapshotPendingApproval(alloc);
+    }
+
+    pub fn isOrchestrationApproval(self: *App, request_id: u64) bool {
+        if (comptime !build_options.orchestration_enabled) return false;
+        return self.orchestration.runs.approvalBound(request_id);
+    }
+
+    pub fn snapshotOrchestrationApprovalReview(
+        self: *App,
+        request_id: u64,
+    ) ?*const output_diff.FileReview {
+        if (comptime !build_options.orchestration_enabled) return null;
+        return self.orchestration.runs.approvalReview(request_id);
+    }
+
+    /// Consumes `response`, matching WorkerRuntime's ownership contract.
+    pub fn submitOrchestrationPermissionResponse(
+        self: *App,
+        request_id: u64,
+        response: permission_request.OwnedPermissionResponse,
+    ) worker_runtime.PermissionSubmissionResult {
+        if (comptime !build_options.orchestration_enabled) {
+            var owned = response;
+            owned.deinit();
+            return .no_pending;
+        }
+        return self.orchestration.runs.submitPermissionResponse(
+            request_id,
+            response,
+        );
+    }
+
+    pub fn cancelOrchestrationApproval(self: *App, request_id: u64) bool {
+        if (comptime !build_options.orchestration_enabled) return false;
+        return self.orchestration.runs.cancelApproval(request_id);
+    }
+
+    pub fn snapshotOrchestrationQuestion(
+        self: *App,
+        alloc: std.mem.Allocator,
+    ) !?worker_runtime.PendingQuestionBatchSnapshot {
+        if (comptime !build_options.orchestration_enabled) return null;
+        if (!self.orchestration.active) return null;
+        return self.orchestration.runs.snapshotPendingQuestion(alloc);
+    }
+
+    pub fn isOrchestrationQuestion(self: *App) bool {
+        if (comptime !build_options.orchestration_enabled) return false;
+        return self.orchestration.runs.questionBound();
+    }
+
+    pub fn orchestrationQuestionSource(
+        self: *App,
+    ) ?worker_runtime.QuestionPromptSource {
+        if (comptime !build_options.orchestration_enabled) return null;
+        return self.orchestration.runs.questionSource();
+    }
+
+    pub fn submitOrchestrationQuestionAnswer(
+        self: *App,
+        alloc: std.mem.Allocator,
+        answers: ?[]const []const u8,
+    ) !bool {
+        if (comptime !build_options.orchestration_enabled) return false;
+        return self.orchestration.runs.submitQuestionAnswer(alloc, answers);
+    }
+
+    pub fn cancelOrchestrationQuestion(
+        self: *App,
+        alloc: std.mem.Allocator,
+    ) !bool {
+        if (comptime !build_options.orchestration_enabled) return false;
+        return self.orchestration.runs.cancelQuestion(alloc);
+    }
+
+    pub fn cancelOrchestrationAgentRun(self: *App, run_id: []const u8) !void {
+        if (comptime !build_options.orchestration_enabled) return;
+        if (!self.orchestration.runs.cancelRun(run_id)) {
+            return error.UnknownOrchestrationRun;
+        }
+    }
+
+    pub fn cancelActiveOrchestrationTurn(self: *App) !bool {
+        if (comptime !build_options.orchestration_enabled) return false;
+        if (!self.orchestration.active) return false;
+        return orchestration_app_runtime.cancelActiveTurn(
+            orchestration_host,
+            orchestration_extension,
+            self,
+        );
+    }
+
+    pub fn drainOrchestrationAgentEvents(self: *App) !void {
+        if (comptime !build_options.orchestration_enabled) return;
+        try orchestration_app_runtime.drainRunEvents(
+            orchestration_host,
+            orchestration_extension,
+            self,
+        );
+    }
+
+    pub fn publishOrchestrationAnswer(
+        self: *App,
+        _: []const u8,
+        text: []const u8,
+    ) !void {
+        if (comptime !build_options.orchestration_enabled) return;
+        const source_turn_id = self.orchestration.active_source_turn_id orelse
+            return error.OrchestrationSourceTurnUnavailable;
+        const user = try self.orchestration.canonical_turns.cloneCombinedUserTurn(
+            self.alloc,
+            source_turn_id,
+            self.orchestration.instruction_source_turn_ids.items,
+        );
+        defer types.freeUserTurn(self.alloc, user);
+        defer orchestration_app_runtime.releaseCanonicalCustody(
+            orchestration_host,
+            self.alloc,
+            &self.orchestration,
+        );
+        try self.worker.pushEvent(std.heap.c_allocator, .{
+            .assistant_presentation = .{ .text = @constCast(text) },
+        });
+        try self.worker.pushEvent(std.heap.c_allocator, .{
+            .finish_prompt = .{ .turn = .{ .assistant = .{
+                .user = .{
+                    .text = user.text,
+                    .images = user.images,
+                },
+                .assistant = @constCast(text),
+            } } },
+        });
+    }
+
+    pub fn failOrchestrationTurn(self: *App) !void {
+        if (comptime !build_options.orchestration_enabled) return;
+        const source_turn_id = self.orchestration.active_source_turn_id orelse
+            return error.OrchestrationSourceTurnUnavailable;
+        const user = try self.orchestration.canonical_turns.cloneCombinedUserTurn(
+            self.alloc,
+            source_turn_id,
+            self.orchestration.instruction_source_turn_ids.items,
+        );
+        defer types.freeUserTurn(self.alloc, user);
+        defer orchestration_app_runtime.releaseCanonicalCustody(
+            orchestration_host,
+            self.alloc,
+            &self.orchestration,
+        );
+        try self.worker.pushEvent(std.heap.c_allocator, .{
+            .finish_prompt = .{ .turn = .{ .interrupted = .{
+                .user = .{
+                    .text = user.text,
+                    .images = user.images,
+                },
+                .terminal_reason = .failed,
+            } } },
+        });
+    }
+
+    pub fn traceOrchestrationFailure(_: *App, extension_id: []const u8, err: anyerror) void {
+        if (comptime !build_options.orchestration_enabled) return;
+        debug_trace.logf(
+            "orchestration",
+            "extension dispatch failed id={s} error={s}",
+            .{ extension_id, @errorName(err) },
+        );
+    }
+
+    pub fn traceOrchestrationRecord(
+        _: *App,
+        extension_id: []const u8,
+        record: OrchestrationTraceRecord,
+    ) void {
+        if (comptime !build_options.orchestration_enabled) return;
+        debug_trace.eventf(
+            "orchestration",
+            record.event,
+            .{},
+            "extension={s} session={s} run={s} caused_by={s} agent={s} detail={s}",
+            .{
+                extension_id,
+                record.session_id,
+                record.run_id,
+                record.caused_by_run_id,
+                record.agent_id,
+                debug_trace.preview(record.detail, 160),
+            },
+        );
     }
 
     pub fn clearPendingImages(self: *App) void {
@@ -1262,22 +1938,41 @@ const App = struct {
     ) !bool {
         try self.reloadSkills();
 
+        const orchestration_turn = if (comptime build_options.orchestration_enabled)
+            self.orchestration.active and recovery_checkpoint == null
+        else
+            false;
         const prompt_copy = try std.heap.c_allocator.dupe(u8, prompt);
         errdefer std.heap.c_allocator.free(prompt_copy);
 
         const model_copy = try std.heap.c_allocator.dupe(u8, self.provider_selection.selection().model);
         errdefer std.heap.c_allocator.free(model_copy);
 
-        const gateway_credential = self.auth.gatewayCredential() orelse return error.MissingApiKey;
-        const api_key_copy = try std.heap.c_allocator.dupe(u8, gateway_credential.api_key);
+        // An ALT canonical turn is provider-neutral custody. Its Team selects
+        // and resolves a credential only when each fx-owned run is admitted.
+        // Requiring the root composer provider here would make ALT depend on a
+        // provider that the Team may never use.
+        const gateway_credential: ?auth_runtime.GatewayCredential = if (orchestration_turn)
+            null
+        else
+            self.auth.gatewayCredential() orelse return error.MissingApiKey;
+        const api_key_copy = if (gateway_credential) |credential|
+            try std.heap.c_allocator.dupe(u8, credential.api_key)
+        else
+            try std.heap.c_allocator.alloc(u8, 0);
         errdefer secret.zeroAndFree(std.heap.c_allocator, api_key_copy);
 
-        const gateway_team_copy = if (gateway_credential.gateway_team) |team|
-            try std.heap.c_allocator.dupe(u8, team)
+        const gateway_team_copy = if (gateway_credential) |credential|
+            if (credential.gateway_team) |team|
+                try std.heap.c_allocator.dupe(u8, team)
+            else
+                null
         else
             null;
         errdefer if (gateway_team_copy) |team| std.heap.c_allocator.free(team);
-        const account_id_copy = if (self.auth.accountId()) |account_id|
+        const account_id_copy = if (orchestration_turn)
+            null
+        else if (self.auth.accountId()) |account_id|
             try std.heap.c_allocator.dupe(u8, account_id)
         else
             null;
@@ -1292,7 +1987,10 @@ const App = struct {
         );
         errdefer types.freeImageAttachmentSlice(std.heap.c_allocator, authorized_image_catalog);
 
-        const history_copy = try self.session.snapshotContextHistory(std.heap.c_allocator);
+        const history_copy = if (orchestration_turn)
+            try self.session.snapshotHistory(std.heap.c_allocator)
+        else
+            try self.session.snapshotContextHistory(std.heap.c_allocator);
         errdefer types.freeHistoryTurnSlice(std.heap.c_allocator, history_copy);
         const root_user_intent_context = try auto_classifier_context.buildCanonicalRootUserContext(
             std.heap.c_allocator,
@@ -1345,7 +2043,7 @@ const App = struct {
                 review,
             );
 
-        try self.worker.enqueuePrompt(std.heap.c_allocator, .{
+        const owned_prompt = worker_runtime.QueuedPrompt{
             .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else 0,
             .prompt = prompt_copy,
             .images = images_copy,
@@ -1354,7 +2052,10 @@ const App = struct {
             .provider = self.provider_selection.selection().provider,
             .api_key = api_key_copy,
             .gateway_team = gateway_team_copy,
-            .credential_source = gateway_credential.source,
+            .credential_source = if (gateway_credential) |credential|
+                credential.source
+            else
+                null,
             .account_id = account_id_copy,
             .permission_mode = self.permission_engine.mode,
             .history = history_copy,
@@ -1366,7 +2067,59 @@ const App = struct {
             .context_snapshot = context_snapshot_copy,
             .recovery_checkpoint = recovery_checkpoint_copy,
             .recovery_source_already_presented = recovery_checkpoint != null,
-        });
+        };
+        var owns_prompt = true;
+        errdefer if (owns_prompt) worker_runtime.freeQueuedPrompt(
+            std.heap.c_allocator,
+            owned_prompt,
+        );
+        if (comptime build_options.orchestration_enabled) {
+            if (orchestration_turn) {
+                const steering = self.orchestration.active_source_turn_id != null;
+                const captured = try orchestration_app_runtime.captureCanonicalTurn(
+                    orchestration_host,
+                    &self.orchestration,
+                    std.heap.c_allocator,
+                    owned_prompt,
+                );
+                owns_prompt = false;
+                const accepted = if (steering)
+                    orchestration_app_runtime.dispatchCanonicalInstruction(
+                        orchestration_host,
+                        orchestration_extension,
+                        self,
+                        captured,
+                        prompt,
+                    )
+                else
+                    orchestration_app_runtime.dispatchCanonicalTurn(
+                        orchestration_host,
+                        orchestration_extension,
+                        self,
+                        captured,
+                        prompt,
+                    );
+                if (accepted) {
+                    self.worker.pushEvent(std.heap.c_allocator, .{
+                        .begin_prompt_with_skill_bindings = .{
+                            .prompt = .{
+                                .text = prompt_copy,
+                                .images = images_copy,
+                            },
+                            .skill_bindings = skill_bindings,
+                            .skill_display_spans = skill_display_spans,
+                        },
+                    }) catch |err| debug_trace.logf(
+                        "orchestration",
+                        "canonical {s} presentation deferred error={s}",
+                        .{ if (steering) "instruction" else "user", @errorName(err) },
+                    );
+                }
+                return accepted;
+            }
+        }
+        try self.worker.enqueuePrompt(std.heap.c_allocator, owned_prompt);
+        owns_prompt = false;
         HerdrAppRuntime.reportWorking(self);
         return true;
     }
@@ -1562,7 +2315,8 @@ const App = struct {
         return app_mcp_runtime.buildModelToolProjection(&self.mcp, alloc, self.toolAdvertisementSet(), .{
             .permission_mode = permission_mode,
             .permission_rules = permission_rules,
-            .subagent_available = self.session_persistence.subagent_host != null,
+            .subagent_available = self.session_persistence.subagent_host != null and
+                self.nativeSubagentsAvailable(),
         });
     }
 
@@ -1707,16 +2461,32 @@ const App = struct {
     }
 
     pub fn writeSubagentSnapshot(self: *App) !void {
+        if (!self.nativeSubagentsAvailable()) {
+            try self.writeDomainNotice(.{
+                .topic = "ALT",
+                .tone = .warning,
+                .body = "Native fx subagents are unavailable while ALT mode is active. Use /alt off to return to native fx.",
+            }, true);
+            return;
+        }
         try RenderAppRuntime.toggleSubagentView(self);
     }
 
     pub fn refreshSubagentManagerProjection(self: *App) !void {
         if (comptime !host_profile.subagents) return;
+        if (!self.nativeSubagentsAvailable()) {
+            self.subagents.clearProjection(self.alloc);
+            return;
+        }
         try RenderAppRuntime.refreshSubagentManager(self, false);
     }
 
     pub fn refreshSubagentManagerProjectionNow(self: *App) !void {
         if (comptime !host_profile.subagents) return;
+        if (!self.nativeSubagentsAvailable()) {
+            self.subagents.clearProjection(self.alloc);
+            return;
+        }
         try RenderAppRuntime.refreshSubagentManagerAfterSessionInstall(self);
     }
 

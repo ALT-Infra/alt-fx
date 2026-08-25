@@ -1,5 +1,6 @@
 const std = @import("std");
 const agent_runtime = @import("../agent/agent_runtime.zig");
+const agent_run_service = @import("../agent/run_service.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
@@ -210,10 +211,9 @@ pub fn run(
         .recovery_source_already_presented = recovery_checkpoint != null,
     };
     const deps = runtimeDeps(&context);
-    execution.runNormalAgentTurn(
-        &deps,
-        null,
-        .{
+    agent_run_service.run(.{
+        .deps = &deps,
+        .lifecycle = .{
             .view = config.lifecycle_view,
             .scope = .{
                 .kind = .subagent,
@@ -222,7 +222,7 @@ pub fn run(
             },
             .outcome_allocator = turn.alloc,
         },
-        .{
+        .config = .{
             .system_prompt = config.system_prompt,
             .model_prompt_overlay = config.model_prompt_overlay,
             .skills_prompt_section = config.skills_prompt_section,
@@ -248,8 +248,8 @@ pub fn run(
             .session_child_capability = turn.childCapability() catch null,
             .context_limits = config.tool_context.context_limits,
         },
-        prompt,
-    ) catch |err| {
+        .prompt = prompt,
+    }) catch |err| {
         const mapped: execution.ServiceError = switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             error.Cancelled => error.Cancelled,

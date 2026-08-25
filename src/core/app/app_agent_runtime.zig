@@ -101,6 +101,13 @@ pub fn Runtime(comptime App: type) type {
             return child_context;
         }
 
+        fn nativeSubagentsAvailable(app: *const App) bool {
+            if (comptime @hasDecl(App, "nativeSubagentsAvailable")) {
+                return app.nativeSubagentsAvailable();
+            }
+            return true;
+        }
+
         pub fn toolContext(
             app: *App,
             ignored_list_entries: []const []const u8,
@@ -238,7 +245,10 @@ pub fn Runtime(comptime App: type) type {
                 .first_call_tool_choice = agent_settings.first_call_tool_choice,
                 .tool_registry = if (comptime @hasDecl(App, "toolRegistry")) app.toolRegistry() else .{},
                 .subagent_host = if (comptime @hasField(App, "session_persistence"))
-                    app_session_runtime.Runtime(App).subagentHost(app)
+                    if (nativeSubagentsAvailable(app))
+                        app_session_runtime.Runtime(App).subagentHost(app)
+                    else
+                        null
                 else
                     null,
                 .subagent_caller_id = if (comptime @hasField(App, "session_persistence"))

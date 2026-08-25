@@ -1051,6 +1051,36 @@ pub const WorkerRuntime = struct {
         return job;
     }
 
+    /// Admit a host-owned turn that does not pass through this worker's prompt
+    /// queue. Isolated orchestration runs still need the ordinary processing
+    /// lifecycle so permission and question snapshots remain visible and
+    /// cancellation retains the same invariants as a queued root turn.
+    pub fn beginIsolatedProcessing(self: *WorkerRuntime, turn_id: u64) !void {
+        if (turn_id == 0) return error.InvalidTurnId;
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (self.worker_stop_requested) return error.WorkerStopped;
+        if (self.worker_processing or
+            self.pending_permission_waiting or
+            self.pending_question_shared != null)
+        {
+            return error.WorkerBusy;
+        }
+        self.worker_cancel_requested.store(false, .seq_cst);
+        self.worker_recovery_pause_requested.store(false, .seq_cst);
+        self.worker_connectivity_wait_active.store(false, .seq_cst);
+        self.recovery_continuation_ready = false;
+        self.worker_processing = true;
+        self.active_turn_id = turn_id;
+        debug_trace.eventf(
+            "worker",
+            "isolated_worker_begin",
+            .{ .turn_id = turn_id },
+            "cancel_reset=true",
+            .{},
+        );
+    }
+
     pub fn finishProcessing(self: *WorkerRuntime) void {
         debug_trace.logf("worker", "finish processing queued={d}", .{self.queuedPromptCount()});
         self.worker_mutex.lockUncancelable(io_mod.getIo());
@@ -1103,6 +1133,21 @@ pub const WorkerRuntime = struct {
             else
                 null,
         };
+    }
+
+    /// Borrow the immutable review associated with the exact permission wait.
+    /// The pointer remains valid while that request is awaiting a decision.
+    pub fn pendingPermissionReview(
+        self: *WorkerRuntime,
+        expected_request_id: u64,
+    ) ?*const diff_mod.FileReview {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (!self.permissionRequestAwaitingDecisionLocked()) return null;
+        if (self.pending_permission_request_shared.?.id != expected_request_id) {
+            return null;
+        }
+        return self.pending_permission_review;
     }
 
     pub fn activeTurnId(self: *WorkerRuntime) u64 {
@@ -1955,6 +2000,121 @@ pub fn freeQueuedPrompt(alloc: std.mem.Allocator, prompt: QueuedPrompt) void {
     }
 }
 
+/// Produces an independently owned prompt snapshot for a second fx agent run.
+/// Secrets remain fx-owned and are zeroed by freeQueuedPrompt. Snapshot-file
+/// handles are reference counted so cloning metadata never duplicates or
+/// transfers the underlying temporary files.
+pub fn dupeQueuedPrompt(
+    alloc: std.mem.Allocator,
+    source: QueuedPrompt,
+) !QueuedPrompt {
+    const prompt = try alloc.dupe(u8, source.prompt);
+    errdefer alloc.free(prompt);
+    const images = try types.dupeImageAttachmentSlice(alloc, source.images);
+    errdefer types.freeImageAttachmentSlice(alloc, images);
+    const authorized_image_catalog = try types.dupeImageAttachmentSlice(
+        alloc,
+        source.authorized_image_catalog,
+    );
+    errdefer types.freeImageAttachmentSlice(alloc, authorized_image_catalog);
+    const model = try alloc.dupe(u8, source.model);
+    errdefer alloc.free(model);
+    const api_key = try alloc.dupe(u8, source.api_key);
+    errdefer secret.zeroAndFree(alloc, api_key);
+    const gateway_team = if (source.gateway_team) |team|
+        try alloc.dupe(u8, team)
+    else
+        null;
+    errdefer if (gateway_team) |team| alloc.free(team);
+    const account_id = if (source.account_id) |id|
+        try alloc.dupe(u8, id)
+    else
+        null;
+    errdefer if (account_id) |id| alloc.free(id);
+
+    const history = try alloc.alloc(types.HistoryTurn, source.history.len);
+    var history_count: usize = 0;
+    errdefer {
+        for (history[0..history_count]) |turn| types.freeHistoryTurn(alloc, turn);
+        alloc.free(history);
+    }
+    while (history_count < source.history.len) : (history_count += 1) {
+        history[history_count] = try types.dupeHistoryTurn(
+            alloc,
+            source.history[history_count],
+        );
+    }
+
+    const root_user_intent_context = if (source.root_user_intent_context.len > 0)
+        try alloc.dupe(u8, source.root_user_intent_context)
+    else
+        @constCast(&.{});
+    errdefer if (root_user_intent_context.len > 0) {
+        alloc.free(root_user_intent_context);
+    };
+    const grants = try types.dupePermissionGrantSlice(alloc, source.grants);
+    errdefer types.freePermissionGrantSlice(alloc, grants);
+    const skill_bindings = try dupeSkillBindings(alloc, source.skill_bindings);
+    errdefer freeSkillBindings(alloc, skill_bindings);
+    const skill_display_spans = try dupeSkillDisplaySpans(
+        alloc,
+        source.skill_display_spans,
+    );
+    errdefer freeSkillDisplaySpans(alloc, skill_display_spans);
+    const review_draft = if (source.review_draft) |review|
+        try dupeQueueReviewDraft(alloc, review)
+    else
+        null;
+    errdefer if (review_draft) |review| freeQueueReviewDraft(alloc, review);
+    var context_snapshot = try source.context_snapshot.dupe(alloc);
+    errdefer context_snapshot.deinit(alloc);
+
+    const snapshot_file_ownerships = try alloc.dupe(
+        types.SnapshotFileOwnership,
+        source.snapshot_file_ownerships,
+    );
+    var retained_ownership_count: usize = 0;
+    errdefer {
+        for (snapshot_file_ownerships[0..retained_ownership_count]) |ownership| {
+            ownership.release();
+        }
+        alloc.free(snapshot_file_ownerships);
+    }
+    while (retained_ownership_count < snapshot_file_ownerships.len) : (retained_ownership_count += 1) {
+        snapshot_file_ownerships[retained_ownership_count].retain();
+    }
+
+    const recovery_checkpoint = if (source.recovery_checkpoint) |checkpoint|
+        try checkpoint.dupe(alloc)
+    else
+        null;
+
+    return .{
+        .turn_id = source.turn_id,
+        .prompt = prompt,
+        .images = images,
+        .authorized_image_catalog = authorized_image_catalog,
+        .model = model,
+        .provider = source.provider,
+        .api_key = api_key,
+        .gateway_team = gateway_team,
+        .credential_source = source.credential_source,
+        .account_id = account_id,
+        .permission_mode = source.permission_mode,
+        .history = history,
+        .root_user_intent_context = root_user_intent_context,
+        .grants = grants,
+        .skill_bindings = skill_bindings,
+        .skill_display_spans = skill_display_spans,
+        .review_draft = review_draft,
+        .context_snapshot = context_snapshot,
+        .agent_settings = source.agent_settings,
+        .snapshot_file_ownerships = snapshot_file_ownerships,
+        .recovery_checkpoint = recovery_checkpoint,
+        .recovery_source_already_presented = source.recovery_source_already_presented,
+    };
+}
+
 fn discardQueuedPrompt(
     alloc: std.mem.Allocator,
     prompt: QueuedPrompt,
@@ -2765,6 +2925,42 @@ fn makePrompt(alloc: std.mem.Allocator, text: []const u8, model: []const u8) !Qu
         .history = try alloc.alloc(types.HistoryTurn, 0),
         .grants = try alloc.alloc(types.PermissionGrant, 0),
     };
+}
+
+test "queued prompt duplication keeps canonical input and secrets independently owned" {
+    const alloc = std.testing.allocator;
+    var source = try makePromptWithGrant(
+        alloc,
+        "canonical user turn",
+        "go/kimi-k3",
+        "read_file",
+        "/workspace/a.zig",
+    );
+    defer freeQueuedPrompt(alloc, source);
+    source.root_user_intent_context = try alloc.dupe(u8, "root authority");
+
+    var copy = try dupeQueuedPrompt(alloc, source);
+    defer freeQueuedPrompt(alloc, copy);
+
+    try std.testing.expectEqualStrings(source.prompt, copy.prompt);
+    try std.testing.expectEqualStrings(source.model, copy.model);
+    try std.testing.expectEqualStrings(source.api_key, copy.api_key);
+    try std.testing.expectEqualStrings(
+        source.root_user_intent_context,
+        copy.root_user_intent_context,
+    );
+    try std.testing.expectEqualStrings(
+        source.grants[0].target_path,
+        copy.grants[0].target_path,
+    );
+    try std.testing.expect(source.prompt.ptr != copy.prompt.ptr);
+    try std.testing.expect(source.model.ptr != copy.model.ptr);
+    try std.testing.expect(source.api_key.ptr != copy.api_key.ptr);
+    try std.testing.expect(source.grants[0].target_path.ptr != copy.grants[0].target_path.ptr);
+
+    copy.prompt[0] = 'C';
+    try std.testing.expectEqualStrings("canonical user turn", source.prompt);
+    try std.testing.expectEqualStrings("Canonical user turn", copy.prompt);
 }
 
 fn makeGrant(alloc: std.mem.Allocator, tool_name: []const u8, target_path: []const u8) !types.PermissionGrant {
@@ -3800,6 +3996,37 @@ test "paused queue admission blocks the next prompt until review resumes" {
     const job = state.job.?;
     defer freeQueuedPrompt(alloc, job);
     try std.testing.expectEqualStrings("blocked queued prompt", job.prompt);
+}
+
+test "isolated processing lifecycle exposes ordinary permission snapshots" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+
+    try std.testing.expectError(error.InvalidTurnId, runtime.beginIsolatedProcessing(0));
+    try runtime.beginIsolatedProcessing(44);
+    try std.testing.expectError(error.WorkerBusy, runtime.beginIsolatedProcessing(45));
+    runtime.pending_permission_waiting = true;
+    runtime.pending_permission_request_shared =
+        try permission_request.OwnedPermissionRequest.dupe(
+            alloc,
+            .{ .id = 7, .label = "isolated write" },
+        );
+
+    var active = try runtime.snapshotState(alloc);
+    defer active.deinit(alloc);
+    try std.testing.expect(active.processing);
+    try std.testing.expectEqual(@as(u64, 44), active.active_turn_id);
+    try std.testing.expectEqualStrings(
+        "isolated write",
+        active.pending_permission_request.?.label,
+    );
+
+    runtime.finishProcessing();
+    var finished = try runtime.snapshotState(alloc);
+    defer finished.deinit(alloc);
+    try std.testing.expect(!finished.processing);
+    try std.testing.expect(finished.pending_permission_request == null);
 }
 
 test "explicit cancellation pauses queued admission for post-cancel review" {
