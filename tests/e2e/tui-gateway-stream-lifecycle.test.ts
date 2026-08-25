@@ -8365,10 +8365,10 @@ describe.skipIf(!tmuxAvailable())("transcript scrollback release", () => {
         ]);
         releaseFinish();
         await session.waitForPane(hasEmptyComposer, SB_TIMEOUT);
-        const scrollback = await waitForScrollback(
-          session,
-          (value) => countOccurrences(value, "ANCHOR_PHASE_TWO_24") === 1,
-          "completed phase-two scrollback append",
+        const scrollback = await session.waitForStableScrollback(
+          (value) =>
+            countOccurrences(value, "ANCHOR_PHASE_TWO_24") === 1 &&
+            TURN_SUMMARY_WITH_TOKENS.test(value),
           SB_TIMEOUT,
         );
         const orderedMarkers = [
