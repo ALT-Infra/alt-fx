@@ -293,18 +293,25 @@ pub fn SubmitRuntime(comptime App: type) type {
             const history_owns_snapshots =
                 transferPendingImageSnapshotsToComposerHistory(app);
             if (pending.phase == .queued) {
-                if (history_owns_snapshots) {
-                    if (comptime @hasDecl(@TypeOf(app.worker), "preservePromptSnapshots")) {
-                        _ = app.worker.preservePromptSnapshots(
-                            pending.draft.turn_id,
-                            pending.draft.images,
-                        );
-                    }
+                const retained_images = if (history_owns_snapshots)
+                    pending.draft.images
+                else
+                    &.{};
+                if (comptime @hasDecl(
+                    @TypeOf(app.worker),
+                    "clearQueuedPromptsForSessionTransition",
+                )) {
+                    app.worker.clearQueuedPromptsForSessionTransition(
+                        std.heap.c_allocator,
+                        pending.draft.turn_id,
+                        retained_images,
+                    );
+                } else {
+                    app.worker.clearQueuedPrompts(
+                        std.heap.c_allocator,
+                        retained_images,
+                    );
                 }
-                app.worker.clearQueuedPrompts(
-                    std.heap.c_allocator,
-                    if (history_owns_snapshots) pending.draft.images else &.{},
-                );
                 clearPendingSubmissionWithSnapshots(
                     app,
                     "session_transition",

@@ -564,6 +564,7 @@ pub const WorkerRuntime = struct {
     active_agent_turn_settings: ?AgentTurnSettings = null,
     active_context_snapshot: ?*const context_contract.GatheredContextSnapshot = null,
     active_prompt_snapshot_ownership: ?*ActivePromptSnapshotOwnership = null,
+    preserve_prompt_snapshot_turn_id: ?u64 = null,
 
     pub fn deinit(self: *WorkerRuntime, alloc: std.mem.Allocator) void {
         if (self.pending_permission_response) |response| {
@@ -1194,6 +1195,31 @@ pub const WorkerRuntime = struct {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
 
+        self.clearQueuedPromptsLocked(alloc, retained_images);
+    }
+
+    /// Clears the queue while atomically transferring deletion responsibility
+    /// for a matching active or finished turn to the supplied retained images.
+    pub fn clearQueuedPromptsForSessionTransition(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        turn_id: u64,
+        retained_images: []const types.ImageAttachment,
+    ) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+
+        if (retained_images.len > 0) {
+            _ = self.preservePromptSnapshotsLocked(turn_id, retained_images);
+        }
+        self.clearQueuedPromptsLocked(alloc, retained_images);
+    }
+
+    fn clearQueuedPromptsLocked(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        retained_images: []const types.ImageAttachment,
+    ) void {
         const dropped = self.queued_prompt_count;
         if (dropped > 0) {
             debug_trace.logf("worker", "clear queued prompts dropped={d}", .{dropped});
@@ -1382,6 +1408,10 @@ pub const WorkerRuntime = struct {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
         std.debug.assert(self.active_prompt_snapshot_ownership == null);
+        if (self.preserve_prompt_snapshot_turn_id == self.active_turn_id) {
+            _ = ownership.preserve();
+            self.preserve_prompt_snapshot_turn_id = null;
+        }
         self.active_prompt_snapshot_ownership = ownership;
     }
 
@@ -1406,21 +1436,20 @@ pub const WorkerRuntime = struct {
         ownership.deinit();
     }
 
-    /// Relinquishes deletion for the matching active or finished prompt. The
-    /// caller must already have established another owner for these files.
-    pub fn preservePromptSnapshots(
+    fn preservePromptSnapshotsLocked(
         self: *WorkerRuntime,
         turn_id: u64,
         images: []const types.ImageAttachment,
     ) bool {
         if (turn_id == 0 or images.len == 0) return false;
-        self.worker_mutex.lockUncancelable(io_mod.getIo());
-        defer self.worker_mutex.unlock(io_mod.getIo());
 
         var preserved = false;
         if (self.active_turn_id == turn_id) {
             if (self.active_prompt_snapshot_ownership) |ownership| {
                 preserved = ownership.preserve();
+            } else {
+                self.preserve_prompt_snapshot_turn_id = turn_id;
+                preserved = true;
             }
         }
         for (self.worker_events.items) |*event| {
@@ -2097,10 +2126,19 @@ test "active prompt snapshot ownership discards every pre-transfer boundary" {
 
 test "session transfer preserves active and finished prompt snapshots" {
     const alloc = std.testing.allocator;
-    for ([_]bool{ false, true }) |finished_before_transfer| {
+    const phases = [_]enum { take_before_begin, active, finished }{
+        .take_before_begin,
+        .active,
+        .finished,
+    };
+    for (phases) |phase| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
-        const name = if (finished_before_transfer) "finished.bin" else "active.bin";
+        const name = switch (phase) {
+            .take_before_begin => "take-before-begin.bin",
+            .active => "active.bin",
+            .finished => "finished.bin",
+        };
         {
             var file = try tmp.dir.createFile(std.testing.io, name, .{});
             defer file.close(std.testing.io);
@@ -2120,8 +2158,8 @@ test "session transfer preserves active and finished prompt snapshots" {
         defer runtime.deinit(alloc);
         runtime.active_turn_id = 41;
         var active = ActivePromptSnapshotOwnership.init(&images);
-        runtime.beginActivePromptSnapshots(&active);
-        if (finished_before_transfer) {
+        if (phase != .take_before_begin) runtime.beginActivePromptSnapshots(&active);
+        if (phase == .finished) {
             const ownership = (try runtime.handoffActivePromptSnapshots(alloc)) orelse
                 return error.TestExpectedSnapshotOwnership;
             try runtime.pushEvent(alloc, .{ .finish_prompt = .{
@@ -2136,8 +2174,9 @@ test "session transfer preserves active and finished prompt snapshots" {
             runtime.active_turn_id = 0;
         }
 
-        try std.testing.expect(runtime.preservePromptSnapshots(41, &images));
-        if (!finished_before_transfer) runtime.endActivePromptSnapshots(&active);
+        runtime.clearQueuedPromptsForSessionTransition(alloc, 41, &images);
+        if (phase == .take_before_begin) runtime.beginActivePromptSnapshots(&active);
+        if (phase != .finished) runtime.endActivePromptSnapshots(&active);
         runtime.discardEvents(alloc);
         try std.Io.Dir.accessAbsolute(std.testing.io, path, .{});
         try std.Io.Dir.deleteFileAbsolute(std.testing.io, path);

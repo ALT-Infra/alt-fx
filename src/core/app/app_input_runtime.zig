@@ -10826,12 +10826,13 @@ const FakeSubmitApp = struct {
             self.queued_images_alloc = null;
         }
 
-        pub fn preservePromptSnapshots(
-            _: *@This(),
+        pub fn clearQueuedPromptsForSessionTransition(
+            self: *@This(),
+            alloc: std.mem.Allocator,
             _: u64,
-            _: []const types.ImageAttachment,
-        ) bool {
-            return false;
+            retained_images: []const types.ImageAttachment,
+        ) void {
+            self.clearQueuedPrompts(alloc, retained_images);
         }
 
         pub fn activeTurnId(_: *const @This()) u64 {
