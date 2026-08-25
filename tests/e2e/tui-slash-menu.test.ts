@@ -2314,7 +2314,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   );
 
   test(
-    "inline completions stay in the composer while leading triggers open their menus",
+    "skill and completion menus stay inline with the composer",
     async () => {
       const fixture = createSkillsMenuFixture();
       const tapePath = join(fixture.home, "dollar-inline.fxtape");
@@ -2332,6 +2332,10 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         stderrPath: fixture.stderrPath,
       });
       await session.waitForComposer(10_000);
+      const alternateCount = (sequence: string) =>
+        countOccurrences(readFileSync(tapePath).toString("latin1"), sequence);
+      const entersBeforeSkills = alternateCount("\x1b[?1049h");
+      const leavesBeforeSkills = alternateCount("\x1b[?1049l");
 
       await session.sendKeys("-l '/sk'");
       await session.waitForText("browse and manage skills", 5_000);
@@ -2341,8 +2345,10 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("Enter");
       grid = await waitForSkillsMenu(session, 4);
       const pane = grid.join("\n");
-      expect(pane).not.toContain("𝒇x");
-      expect(pane).not.toContain("Run /help for commands");
+      expect(pane).toContain("𝒇x");
+      expect(pane).toContain("Run /help for commands");
+      expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeSkills);
+      expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
       expect(pane).toContain("[All]");
       expect(pane).toContain("Fx");
       expect(pane).toContain("Workspace");
@@ -2381,8 +2387,6 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         5_000,
       );
 
-      const alternateCount = (sequence: string) =>
-        countOccurrences(readFileSync(tapePath).toString("latin1"), sequence);
       const entersBeforeDollar = alternateCount("\x1b[?1049h");
       const leavesBeforeDollar = alternateCount("\x1b[?1049l");
 
@@ -2558,6 +2562,8 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("C-[");
       await session.waitForPane((current) => !current.includes("↑↓ Navigate"), 5_000);
+      expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeSkills);
+      expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
       await session.sendKeys("C-u");
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
