@@ -153,7 +153,6 @@ const SurfaceFrameShell = struct {
 const RenderReconciliation = union(enum) {
     inline_render: InlineRenderReconciliation,
     file_approval_screen,
-    skills_screen,
     models_screen,
     resume_screen,
     help_screen,
@@ -1528,7 +1527,6 @@ pub fn Runtime(comptime App: type) type {
                 if (modelMenuActive(app)) return .models_screen;
                 if (sessionMenuActive(app)) return .resume_screen;
                 if (helpMenuActive(app)) return .help_screen;
-                if (skillsCatalogMenuActive(app)) return .skills_screen;
             }
 
             if (app.terminal.catalogMenuScreenActive()) {
@@ -1654,7 +1652,6 @@ pub fn Runtime(comptime App: type) type {
             else switch (try reconcileBeforeFrameRender(app, render_input.queuedBannerRows(footer_ctx))) {
                 .inline_render => |inline_render| inline_render,
                 .file_approval_screen => return renderApprovalScreen(app),
-                .skills_screen => return renderSkillsScreen(app, footer_ctx),
                 .models_screen => return renderModelsScreen(app, footer_ctx),
                 .resume_screen => return renderResumeScreen(app, footer_ctx),
                 .help_screen => return renderHelpScreen(app, footer_ctx),
@@ -2283,42 +2280,6 @@ pub fn Runtime(comptime App: type) type {
             };
         }
 
-        fn renderSkillsScreen(app: *App, ctx: render_input.RenderContext) !FrameAttemptResult {
-            if (comptime !@hasField(App, "terminal") or !@hasField(App, "skills")) {
-                return error.MissingSkillsScreenRuntime;
-            }
-
-            const clear_display = !app.terminal.catalogMenuScreenActive();
-            try app_lifecycle.enterCatalogMenuScreen(&app.terminal, &app.shell, &app.metrics);
-            if (app.shell.shadow_vt) |grid| {
-                if (grid.cols != app.shell.layout.cols or grid.rows != app.shell.layout.rows) {
-                    try grid.resize(app.shell.layout.cols, app.shell.layout.rows);
-                }
-            }
-
-            var screen = try skills_screen.paint(app.alloc, .{
-                .rows = app.shell.layout.rows,
-                .cols = app.shell.layout.cols,
-                .skills = render_input.skillsMenuProjection(&app.skills),
-                .composer = .{
-                    .input = ctx.input.edit_state.input.items,
-                    .cursor = ctx.input.edit_state.cursor,
-                    .images = ctx.pending_images,
-                    .pasted_blocks = ctx.input.entities.pasted_blocks.items,
-                    .image_tokens = ctx.input.entities.image_tokens.items,
-                    .skill_tokens = ctx.input.entities.skill_tokens.items,
-                },
-                .ctrl_c_pending = ctx.ctrl_c_pending,
-                .clear_display = clear_display,
-            });
-            defer screen.deinit(app.alloc);
-            try app_lifecycle.writeLifecycleTerminalBytes(&app.shell, &app.metrics, screen.bytes);
-            return .{
-                .shadow_state = .committed,
-                .animation_visible = false,
-            };
-        }
-
         fn renderModelsScreen(app: *App, ctx: render_input.RenderContext) !FrameAttemptResult {
             if (comptime !@hasField(App, "terminal") or !@hasField(App, "model_cache")) {
                 return error.MissingModelsScreenRuntime;
@@ -2658,13 +2619,6 @@ pub fn Runtime(comptime App: type) type {
             return false;
         }
 
-        fn skillsCatalogMenuActive(app: *const App) bool {
-            if (comptime @hasField(App, "skills")) {
-                return app.skills.menu.active and !app.skills.menu.origin.isMention();
-            }
-            return false;
-        }
-
         fn modelMenuActive(app: *const App) bool {
             if (comptime @hasField(App, "model_cache")) return app.model_cache.menu.active;
             return false;
@@ -2688,7 +2642,6 @@ pub fn Runtime(comptime App: type) type {
         fn catalogMenuActive(app: *const App) bool {
             return settingsMenuActive(app) or
                 helpMenuActive(app) or
-                skillsCatalogMenuActive(app) or
                 modelMenuActive(app) or
                 sessionMenuActive(app);
         }
@@ -5205,7 +5158,7 @@ test "core.app_render_runtime first requested startup frame commits through the 
     try std.testing.expectEqual(first_len, try file.length(io_mod.getIo()));
 }
 
-test "core.app_render_runtime mention skills stay inline while command skills retain the catalog screen" {
+test "core.app_render_runtime main skill menu origins share the inline footer" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5324,8 +5277,9 @@ test "core.app_render_runtime mention skills stay inline while command skills re
     app.skills.openMenu();
     app.shell.render_requests.request(.footer);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
-    try std.testing.expect(app.terminal.catalogMenuScreenActive());
-    try std.testing.expect(!(try coordinatorGridContains(app.shell.shadow_vt.?.*, "transcript stays visible")));
+    try std.testing.expect(!app.terminal.catalogMenuScreenActive());
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "pure-core"));
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "transcript stays visible"));
 
     app.skills.closeMenu();
     app.shell.render_requests.request(.footer);
@@ -5335,8 +5289,8 @@ test "core.app_render_runtime mention skills stay inline while command skills re
     var read_offset: u64 = 0;
     const terminal_bytes = try readCoordinatorFrameBytes(alloc, file, &read_offset);
     defer alloc.free(terminal_bytes);
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, terminal_bytes, "\x1b[?1049h"));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, terminal_bytes, "\x1b[?1049l"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, terminal_bytes, "\x1b[?1049h"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, terminal_bytes, "\x1b[?1049l"));
 }
 
 test "core.app_render_runtime width-changed queued editor keeps mention navigation and render aligned" {

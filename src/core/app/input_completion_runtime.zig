@@ -498,31 +498,14 @@ pub fn CompletionRuntime(comptime App: type) type {
 
         fn skillsMenuVisibleRows(app: *App) !u16 {
             const projection = render_input.skillsMenuProjection(&app.skills);
-            if (app.skills.menu.origin.isMention()) {
-                const budget = try footerRowBudget(app);
-                return skills_menu_presentation.inlineVisibleNavigationRowsForBudget(
-                    projection,
-                    picker_presentation.inlinePickerRowBudget(
-                        app.shell.layout.rows,
-                        budget.input_extra,
-                        budget.banner_rows,
-                    ),
-                );
-            }
-            const scan = ui_input.scanInputCursorVertical(
-                &app.input_runtime,
-                .down,
-                app.shell.layout.cols,
-                app.pending_images.items,
-            );
-            const layout = catalog_screen_layout.screenLayout(
-                app.shell.layout.rows,
-                scan.total_rows,
-                scan.cursor_row,
-            );
-            return skills_menu_presentation.visibleNavigationRowsForBudget(
+            const budget = try footerRowBudget(app);
+            return skills_menu_presentation.inlineVisibleNavigationRowsForBudget(
                 projection,
-                layout.menu_row_budget,
+                picker_presentation.inlinePickerRowBudget(
+                    app.shell.layout.rows,
+                    budget.input_extra,
+                    budget.banner_rows,
+                ),
             );
         }
 
@@ -1562,7 +1545,7 @@ test "model picker effort completion labels survive capability resolution" {
     try std.testing.expectEqualStrings("high", values[2].displayLabel());
 }
 
-test "mention skills navigation measures a width-changed queued editor before frame commit" {
+test "command skills navigation measures a width-changed queued editor before frame commit" {
     const alloc = std.testing.allocator;
     const rt = CompletionRuntime(SkillsNavigationTestApp);
     const skills = [_]skill_runtime.Skill{
@@ -1577,7 +1560,7 @@ test "mention skills navigation measures a width-changed queued editor before fr
     var app = SkillsNavigationTestApp{ .alloc = alloc };
     defer app.deinit();
     app.skills.items = @constCast(&skills);
-    app.skills.openMenuWithQuery(.dollar, .{ .start = 0, .end = 1 }, "");
+    app.skills.openMenu();
     try app.input_runtime.textReplacementState().replace(alloc, "x" ** 60);
 
     const entries = try alloc.alloc(input_queue_runtime.ReviewEntry, 2);
