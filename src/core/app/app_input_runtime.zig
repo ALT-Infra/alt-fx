@@ -887,7 +887,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
             if (try routeUpgradeShortcut(app, byte)) return;
-            if (routePickerControlByte(app, byte)) return;
+            if (try routePickerControlByte(app, byte)) return;
 
             if (isComposerEditingByte(byte, raw.composer_shortcut) and
                 !activeCatalogMenuOwnsByte(app, byte) and
@@ -1127,10 +1127,10 @@ pub fn Runtime(comptime App: type) type {
             return .done;
         }
 
-        fn routePickerControlByte(app: *App, byte: u8) bool {
+        fn routePickerControlByte(app: *App, byte: u8) !bool {
             if (!composerPickerSurfaceVisible(app)) return false;
             const delta = pickerControlDelta(byte) orelse return false;
-            if (!routeVisiblePickerMove(app, delta)) return false;
+            if (!try routeVisiblePickerMove(app, delta)) return false;
             app.input_runtime.vertical_navigation.reset();
             app.shell.render_requests.request(.footer);
             return true;
@@ -1692,25 +1692,9 @@ pub fn Runtime(comptime App: type) type {
             return app.auth.popPickerStage(app.alloc);
         }
 
-        fn dismissSkillsMenuForComposerEdit(app: *App) bool {
-            if (comptime !@hasField(App, "skills")) return false;
-            if (!app.skills.menu.active) return false;
-            if (isMentionSkillsMenuOrigin(app.skills.menu.origin) or commandSkillsMenuActive(app)) return false;
-            app.skills.closeMenu();
-            return true;
-        }
-
-        fn isMentionSkillsMenuOrigin(origin: skill_runtime.SkillMenuOrigin) bool {
-            return origin == .dollar or origin == .paste;
-        }
-
-        fn isCommandSkillsMenuOrigin(origin: skill_runtime.SkillMenuOrigin) bool {
-            return origin == .command or origin == .slash;
-        }
-
         fn commandSkillsMenuActive(app: *App) bool {
             if (comptime !@hasField(App, "skills")) return false;
-            return app.skills.menu.active and isCommandSkillsMenuOrigin(app.skills.menu.origin);
+            return app.skills.menu.active and !app.skills.menu.origin.isMention();
         }
 
         fn skillsMenuActive(app: *App) bool {
@@ -1754,7 +1738,7 @@ pub fn Runtime(comptime App: type) type {
         fn dismissMentionSkillsMenuForSpace(app: *App) void {
             if (comptime !@hasField(App, "skills")) return;
             if (!app.skills.menu.active) return;
-            if (!isMentionSkillsMenuOrigin(app.skills.menu.origin)) return;
+            if (!app.skills.menu.origin.isMention()) return;
             app.skills.closeMenu();
             app.shell.render_requests.request(.footer);
         }
@@ -1805,9 +1789,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn dismissActiveMenusForComposerEdit(app: *App) bool {
-            var dismissed = dismissAuthPickerForComposerEdit(app);
-            dismissed = dismissSkillsMenuForComposerEdit(app) or dismissed;
-            return dismissed;
+            return dismissAuthPickerForComposerEdit(app);
         }
 
         fn dismissActiveMenusThenRedraw(app: *App) void {
@@ -1824,14 +1806,14 @@ pub fn Runtime(comptime App: type) type {
             const origin = app.skills.menu.origin;
             syncSkillsMenu(app);
             const skill = app.skills.selectedMenuSkill() orelse {
-                if (isMentionSkillsMenuOrigin(origin)) {
+                if (origin.isMention()) {
                     app.skills.closeMenu();
                     app.shell.render_requests.request(.footer);
                     return false;
                 }
                 return true;
             };
-            const target = if (isCommandSkillsMenuOrigin(origin))
+            const target = if (!origin.isMention())
                 skill_runtime.SkillMenuTarget{ .start = 0, .end = app.input_runtime.edit_state.input.items.len }
             else
                 app.skills.menu.target orelse skill_runtime.SkillMenuTarget{
@@ -2244,7 +2226,7 @@ pub fn Runtime(comptime App: type) type {
         fn syncSkillsMenu(app: *App) void {
             if (comptime !@hasField(App, "skills")) return;
             if (!app.skills.menu.active) return;
-            if (isCommandSkillsMenuOrigin(app.skills.menu.origin)) {
+            if (!app.skills.menu.origin.isMention()) {
                 app.skills.menu.setQuery(app.input_runtime.edit_state.input.items);
                 app.skills.menu.clamp(app.skills.items);
                 return;
@@ -2500,7 +2482,7 @@ pub fn Runtime(comptime App: type) type {
         fn cancelSkillsMenu(app: *App) bool {
             if (comptime !@hasField(App, "skills")) return false;
             if (!app.skills.menu.active) return false;
-            const clear_query = isCommandSkillsMenuOrigin(app.skills.menu.origin);
+            const clear_query = !app.skills.menu.origin.isMention();
             app.skills.closeMenu();
             if (clear_query) {
                 app.input_runtime.inputResetState().clearCurrent(app.alloc);
@@ -4168,7 +4150,7 @@ test "app_input_runtime skills menu navigation remains interactive while streami
     try std.testing.expectEqual(@as(usize, 1), app.skills.menu.selected_index);
 }
 
-test "app_input_runtime skills menu navigation uses the dedicated composer window" {
+test "app_input_runtime command skills navigation uses the inline composer window" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -4194,7 +4176,7 @@ test "app_input_runtime skills menu navigation uses the dedicated composer windo
     try Runtime(RoutingFakeApp).routeModifiedHistory(&app, .down, 1);
 
     try std.testing.expectEqual(@as(usize, 1), app.skills.menu.selected_index);
-    try std.testing.expectEqual(@as(usize, 0), app.skills.menu.window_start);
+    try std.testing.expectEqual(@as(usize, 1), app.skills.menu.window_start);
 }
 
 test "app_input_runtime Escape closes an idle skills menu before empty-composer handling" {
