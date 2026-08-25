@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 
 var wrapped_vtable: std.Io.VTable = undefined;
 var wrapped_original_vtable: ?*const std.Io.VTable = null;
-const explicit_inherited_fd_target: std.posix.fd_t = 255;
+const preferred_inherited_fd_target: std.posix.fd_t = 64;
 
 pub fn wrap(original: std.Io) std.Io {
     if (wrapped_original_vtable) |original_vtable| {
@@ -87,7 +87,7 @@ fn process_spawn_inheriting_fd(
         try add_inherit_or_dup(&actions, pipe[1], progress_fileno);
     }
     if (inherited_fd) |fd| {
-        try add_inherit_or_dup(&actions, fd, explicit_inherited_fd_target);
+        try add_inherit_or_dup(&actions, fd, inherited_fd_target(fd));
     }
 
     var attributes: std.c.posix_spawnattr_t = undefined;
@@ -257,6 +257,13 @@ fn add_inherit_or_dup(
             std.c.posix_spawn_file_actions_adddup2(actions, source, target),
         );
     }
+}
+
+fn inherited_fd_target(source: std.posix.fd_t) std.posix.fd_t {
+    return if (source == preferred_inherited_fd_target)
+        preferred_inherited_fd_target + 1
+    else
+        preferred_inherited_fd_target;
 }
 
 extern "c" fn posix_spawnattr_setpgroup(
@@ -459,17 +466,29 @@ test "Darwin spawn resolves argv through parent PATH and replaces the child envi
 
 test "Darwin explicit inherited descriptor avoids low user descriptors" {
     const io = try darwin_io();
+    for ([_]std.posix.fd_t{
+        0,
+        3,
+        preferred_inherited_fd_target,
+        preferred_inherited_fd_target + 1,
+        255,
+    }) |source_fd| {
+        const selected_fd = inherited_fd_target(source_fd);
+        try std.testing.expect(selected_fd >= preferred_inherited_fd_target);
+        try std.testing.expect(selected_fd != source_fd);
+    }
     const pipe = try create_pipe(false);
     defer close_pipe(pipe);
-    try std.testing.expect(pipe[1] != explicit_inherited_fd_target);
-    try std.testing.expect(explicit_inherited_fd_target >= 64);
+    const target_fd = inherited_fd_target(pipe[1]);
+    try std.testing.expect(pipe[1] != target_fd);
+    try std.testing.expect(target_fd >= preferred_inherited_fd_target);
     var source_buffer: [32]u8 = undefined;
     const source = try std.fmt.bufPrint(&source_buffer, "{d}", .{pipe[1]});
     var target_buffer: [32]u8 = undefined;
     const target = try std.fmt.bufPrint(
         &target_buffer,
         "{d}",
-        .{explicit_inherited_fd_target},
+        .{target_fd},
     );
     var child = try spawn_inheriting_fd(io, .{
         .argv = &.{
@@ -480,6 +499,40 @@ test "Darwin explicit inherited descriptor avoids low user descriptors" {
             source,
             target,
         },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }, pipe[1]);
+    try wait_exited(&child, io, 0);
+}
+
+test "Darwin inherited descriptor survives Bash script execution" {
+    const io = try darwin_io();
+    const pipe = try create_pipe(false);
+    defer close_pipe(pipe);
+    const target_fd = inherited_fd_target(pipe[1]);
+    try std.testing.expect(pipe[1] != target_fd);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var script = try tmp.dir.createFile(io, "inherit-fd.sh", .{});
+        defer script.close(io);
+        try script.writeStreamingAll(
+            io,
+            "#!/bin/bash\n" ++
+                "/bin/sh -c 'test -p /dev/fd/$1' sh \"$1\"\n",
+        );
+    }
+    var fd_buffer: [32]u8 = undefined;
+    const fd_text = try std.fmt.bufPrint(
+        &fd_buffer,
+        "{d}",
+        .{target_fd},
+    );
+    var child = try spawn_inheriting_fd(io, .{
+        .argv = &.{ "/bin/bash", "inherit-fd.sh", fd_text },
+        .cwd = .{ .dir = tmp.dir },
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
