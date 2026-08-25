@@ -1,3 +1,5 @@
+# alt-fx
+
 ```
  ⠀⠀⠀⠀⠀⠀⣠⣾⣿⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀
  ⠀⠀⠀⠀⠀⢰⣿⡿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
@@ -11,18 +13,29 @@
  ⣿⣿⣿⠟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
 ```
 
-fx is a coding agent harness and CLI written in Zig, optimized for research and embeddability as part of larger systems.
+alt-fx is a fork of [vercel-labs/fx](https://github.com/vercel-labs/fx) with ALT's recursive multi-model Team orchestration bundled as a first-class, replaceable extension.
 
-It focuses on minimalism and performance across the board, from system prompt design to its tools, feature set, and 7.8 MiB binary.
+fx remains the harness. Its terminal UI, model clients, credentials, permission engine, tools, filesystem access, process execution, and persistence infrastructure remain native. ALT owns only Team definitions, leadership, consultations, specialist projections, bounded orchestration context, and the rules by which results return.
+
+ALT is compiled into normal alt-fx builds, but **ALT mode is not active when the application starts**. alt-fx opens in native fx. Use `/alt` when you want Team orchestration and `/alt off` to return to the native environment.
+
+The underlying harness remains optimized for research and embeddability as part of larger systems.
+
+It focuses on minimalism and performance across the board, from system prompt design to its tools, feature set, and compact native binary.
 
 For end users, its CLI output style and form factor aim to be closer to a Unix shell than a heavy "IDE in the terminal" TUI.
 
 It's open source (Apache-2.0), model-agnostic, and suitable for both local and cloud inference.
 
-## Install
+## Build and run
+
+Building alt-fx requires [Zig 0.16.0+](https://ziglang.org/download/):
 
 ```bash
-curl -fsSL https://fx.sh/setup.sh | bash
+git clone https://github.com/ALT-Infra/alt-fx.git
+cd alt-fx
+zig build -Doptimize=ReleaseSafe
+./zig-out/bin/fx
 ```
 
 ## Run fx
@@ -80,6 +93,46 @@ The current directory becomes the primary workspace. Enter a prompt, or run `/he
 
 Tool calls are expanded by default. Enable `Collapse tool calls` in `/settings`, or set `"collapse_tool_calls": true` in `~/.fx/settings.json`, to show one summary per tool-call group in the main transcript. Individual calls remain available in the full transcript with Ctrl+O.
 
+## ALT mode
+
+Enter the bundled orchestration environment explicitly:
+
+```text
+/alt
+```
+
+Leave it without leaving fx:
+
+```text
+/alt off
+```
+
+Every user turn in ALT mode enters through the Team's configured primary peer. Exactly one peer holds leadership at a time and may answer, hand leadership to an authorized peer, or coordinate Team work.
+
+```mermaid
+flowchart TD
+    U[User turn] --> P[Configured primary]
+    P -->|handoff| L[Another leader]
+    P -->|consult| C1[Peer consultant]
+    C1 -->|consult| C2[Peer consultant]
+    C2 -->|delegate| S[Stateless specialist]
+    S --> C2 --> C1 --> P
+    P --> A[Answer]
+    L --> A
+```
+
+The runtime enforces these boundaries:
+
+- A consultation never transfers leadership or answers the user.
+- A consultant may call its own authorized peers and specialists.
+- Nested results return only to the immediate caller and unwind one frame at a time.
+- Context-bearing peer surfaces are serialized while unrelated child work may run concurrently.
+- Specialist batches may express dependency ordering with `depends_on`.
+- Specialists are clean-slate leaf calls with bounded projections, selected attachments, and fx's real tools—but no conversation or Team state.
+- Every new user turn starts at the configured primary, regardless of who answered the previous turn.
+
+The bundled Engineering Team currently uses OpenCode Go models. Native Codex, Grok, and fx subagents are unavailable inside ALT mode; `/alt off` restores the complete native fx environment.
+
 The status line hides the workspace path and Git branch by default. Enable the `Status line workspace` option in `/settings`, run `/statusline workspace`, or set it in `~/.fx/settings.json`:
 
 ```json
@@ -133,7 +186,7 @@ The WebAssembly SDK is experimental. See the [WebAssembly SDK](sdk/README.md) an
 
 ## Extend fx
 
-Add reusable instructions with [skills](https://fx.sh/docs/capabilities/skills), connect external tools through [MCP](https://fx.sh/docs/capabilities/mcp), or delegate independent work to [subagents](https://fx.sh/docs/capabilities/subagents). Run `fx mcp add NAME COMMAND [ARGS...]` for a local server or `fx mcp add --transport http NAME URL` for Streamable HTTP without opening the interactive shell; the equivalent `/mcp add` forms remain available inside fx. A workspace may also provide Claude-compatible `.mcp.json` with a top-level `mcpServers` object. Pending project servers stay disconnected on every surface until they are approved with `/mcp trust approve <server>` or `fx mcp trust approve <server>`. Interactive fx presents the trust prompt after startup. `fx ask` reports skipped pending servers on stderr, and ACP leaves them unavailable. Repository files cannot persist approval or expose environment-expanded values before approval. `/mcp trust reject <server>` rejects one and `/mcp trust reset` clears the workspace choices. Profile entries win same-name collisions. Profile `~/.fx/mcp.json` accepts `mcpServers` as an alias for `mcp`, while writes always use `mcp` and ambiguous server-like keys produce a visible warning. Project instruction files may link within their scope, and read-only workspace or compatibility skill directories and their primary `SKILL.md` files may link within their owning workspace or home; managed skills, secondary resources, and escaping links remain no-follow. Skills installed via symlinks that resolve outside home or workspace (e.g. Nix store paths) are loaded when their resolved target is inside a directory listed in the `FX_SKILL_SYMLINK_AUTHORITIES` environment variable (colon-separated absolute paths). `fx status` and `fx doctor` report invalid or suspicious trusted MCP profiles without starting their servers.
+Add reusable instructions with [skills](https://fx.sh/docs/capabilities/skills), connect external tools through [MCP](https://fx.sh/docs/capabilities/mcp), or delegate independent work to [subagents](https://fx.sh/docs/capabilities/subagents) in native fx. Run `fx mcp add NAME COMMAND [ARGS...]` for a local server or `fx mcp add --transport http NAME URL` for Streamable HTTP without opening the interactive shell; the equivalent `/mcp add` forms remain available inside fx. A workspace may also provide Claude-compatible `.mcp.json` with a top-level `mcpServers` object. Pending project servers stay disconnected on every surface until they are approved with `/mcp trust approve <server>` or `fx mcp trust approve <server>`. Interactive fx presents the trust prompt after startup. `fx ask` reports skipped pending servers on stderr, and ACP leaves them unavailable. Repository files cannot persist approval or expose environment-expanded values before approval. `/mcp trust reject <server>` rejects one and `/mcp trust reset` clears the workspace choices. Profile entries win same-name collisions. Profile `~/.fx/mcp.json` accepts `mcpServers` as an alias for `mcp`, while writes always use `mcp` and ambiguous server-like keys produce a visible warning. Project instruction files may link within their scope, and read-only workspace or compatibility skill directories and their primary `SKILL.md` files may link within their owning workspace or home; managed skills, secondary resources, and escaping links remain no-follow. Skills installed via symlinks that resolve outside home or workspace (e.g. Nix store paths) are loaded when their resolved target is inside a directory listed in the `FX_SKILL_SYMLINK_AUTHORITIES` environment variable (colon-separated absolute paths). `fx status` and `fx doctor` report invalid or suspicious trusted MCP profiles without starting their servers.
 
 Use `fx mcp list`, `fx mcp path`, and `fx mcp remove NAME` for noninteractive profile management. `fx mcp trust approve|reject NAME`, `fx mcp trust approve-all`, and `fx mcp trust reset` manage workspace-scoped project trust. `fx mcp auth NAME` and `fx mcp logout NAME` run the existing remote credential lifecycle without opening the TUI or contacting the Gateway.
 
@@ -143,18 +196,40 @@ MCP servers have a 30-second startup timeout by default; set `startup_timeout_ms
 
 Read the [fx documentation](https://fx.sh/docs).
 
-## Build from source
+## Build modes
 
-Building fx requires [Zig 0.16.0+](https://ziglang.org/download/):
+The normal build selects the bundled ALT implementation but does not activate its mode at startup:
 
 ```bash
-git clone https://github.com/vercel-labs/fx.git
-cd fx
 zig build -Doptimize=ReleaseSafe
-./zig-out/bin/fx
 ```
 
-Run the test suite with `zig build test`. See [CONTRIBUTING.md](CONTRIBUTING.md) for development and contribution guidelines.
+Build the harness without ALT or any orchestration extension:
+
+```bash
+zig build -Doptimize=ReleaseSafe -Dorchestration=none
+```
+
+Build against another implementation of the generic host contract:
+
+```bash
+zig build \
+  -Doptimize=ReleaseSafe \
+  -Dorchestration=custom \
+  -Dorchestration-root=/absolute/path/to/extension.zig
+```
+
+Passing `-Dorchestration-root` by itself is retained as shorthand for the custom mode.
+
+Run the full Zig suite with `zig build test`. Run the paired ALT host suite with `zig build test-orchestration-extension -Dtarget=x86_64-linux-musl`. Crucible also builds the product and drives its real TUI through a PTY with deterministic provider fixtures:
+
+```bash
+zig build crucible-host \
+  -Dtarget=x86_64-linux-musl \
+  -Dbun=/absolute/path/to/bun
+```
+
+The bundled implementation lives under `alt/`; the ALT-agnostic host contract and lifecycle infrastructure remain under `src/core/orchestration/`. See [CONTRIBUTING.md](CONTRIBUTING.md) for development and contribution guidelines.
 
 ## License
 
