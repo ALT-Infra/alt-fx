@@ -104,6 +104,20 @@ fn terminal_action_is(object: std.json.ObjectMap, action_name: []const u8) bool 
     return action == .string and std.mem.eql(u8, action.string, action_name);
 }
 
+fn terminal_lease_is_absent(value: std.json.Value) bool {
+    return switch (value) {
+        .null => true,
+        .string => |text| tool_args.isNullPlaceholderText(text),
+        else => false,
+    };
+}
+
+fn elide_terminal_null_lease(object: *std.json.ObjectMap) void {
+    const lease = object.get("lease") orelse return;
+    if (!terminal_lease_is_absent(lease)) return;
+    _ = object.orderedRemove("lease");
+}
+
 const TerminalModelPayloadMapping = struct {
     kind: []const u8,
     model_field: []const u8,
@@ -135,9 +149,9 @@ fn project_terminal_model_write(
     arena: Allocator,
     object: *std.json.ObjectMap,
 ) Allocator.Error!bool {
-    if (!terminal_action_is(object.*, "write") or object.get("lease") != null or
-        object.get("input") != null)
-    {
+    if (!terminal_action_is(object.*, "write")) return false;
+    elide_terminal_null_lease(object);
+    if (object.get("lease") != null or object.get("input") != null) {
         return false;
     }
     const write = object.get("write") orelse return false;
@@ -157,9 +171,9 @@ fn normalize_terminal_model_input(
     arena: Allocator,
     object: *std.json.ObjectMap,
 ) Allocator.Error!bool {
-    if (!terminal_action_is(object.*, "write") or object.get("write") != null or
-        object.get("lease") != null)
-    {
+    if (!terminal_action_is(object.*, "write")) return false;
+    elide_terminal_null_lease(object);
+    if (object.get("write") != null or object.get("lease") != null) {
         return false;
     }
     const input = object.get("input") orelse return false;
@@ -323,11 +337,7 @@ fn agent_terminal_lease_transition(
         return error.InvalidTerminalLeaseTrackingInput;
     }
     const lease_value = parsed.object.get("lease");
-    const lease_absent = lease_value == null or switch (lease_value.?) {
-        .null => true,
-        .string => |text| tool_args.isNullPlaceholderText(text),
-        else => false,
-    };
+    const lease_absent = lease_value == null or terminal_lease_is_absent(lease_value.?);
     if (lease_absent) {
         const write = parsed.object.get("write") orelse
             return error.InvalidTerminalLeaseTrackingInput;
@@ -572,6 +582,8 @@ test "terminal request projection wraps eligible flat objects without changing s
         .{ .id = "unknown-action", .input = "{\"action\":\"unknown\"}", .expected = "{\"request\":{\"action\":\"unknown\"}}" },
         .{ .id = "valid-action", .input = "{\"action\":\"list\"}", .expected = "{\"request\":{\"action\":\"list\"}}" },
         .{ .id = "atomic-keys", .input = "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"write\":{\"kind\":\"keys\",\"keys\":[\"enter\"]}}", .expected = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"input\":{\"keys\":[\"enter\"]}}}" },
+        .{ .id = "null-lease", .input = "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"lease\":null,\"write\":{\"kind\":\"keys\",\"keys\":[\"enter\"]}}", .expected = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"input\":{\"keys\":[\"enter\"]}}}" },
+        .{ .id = "textual-null-lease", .input = "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"lease\":\"null\",\"write\":{\"kind\":\"keys\",\"keys\":[\"enter\"]}}", .expected = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"input\":{\"keys\":[\"enter\"]}}}" },
         .{ .id = "explicit-lease", .input = "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"lease\":\"use\",\"write\":{\"kind\":\"keys\",\"keys\":[\"enter\"]}}", .expected = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"lease\":\"use\",\"write\":{\"kind\":\"keys\",\"keys\":[\"enter\"]}}}" },
         .{ .id = "null-request", .input = "{\"request\":null}", .expected = "{\"request\":{\"request\":null}}" },
         .{ .id = "request-sibling", .input = "{\"request\":{\"action\":\"list\"},\"sibling\":true}", .expected = "{\"request\":{\"request\":{\"action\":\"list\"},\"sibling\":true}}" },
@@ -728,6 +740,31 @@ test "terminal request normalization unwraps only exact eligible native calls" {
         "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"write\":{\"kind\":\"keys\",\"keys\":[\"enter\"]}}",
         inferred_write[0].arguments_json,
     );
+
+    const semantic_null_write_calls = [_]ToolCall{
+        .{
+            .id = "null-lease-write",
+            .name = "terminal",
+            .arguments_json = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"lease\":null,\"input\":{\"keys\":[\"enter\"]}}}",
+        },
+        .{
+            .id = "textual-null-lease-write",
+            .name = "terminal",
+            .arguments_json = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"lease\":\"null\",\"input\":{\"keys\":[\"enter\"]}}}",
+        },
+    };
+    const semantic_null_writes = try normalize_terminal_request_tool_calls(
+        arena,
+        native_registry,
+        true,
+        &semantic_null_write_calls,
+    );
+    for (semantic_null_writes) |call| {
+        try std.testing.expectEqualStrings(
+            "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"write\":{\"kind\":\"keys\",\"keys\":[\"enter\"]}}",
+            call.arguments_json,
+        );
+    }
 
     const invalid_input_calls = [_]ToolCall{.{
         .id = "invalid-input",
