@@ -655,7 +655,7 @@ pub noinline fn composePickerOptionRow(
     // selection by brightness alone, like the question panel; the other
     // pickers keep the filled row.
     const selected_style = switch (kind) {
-        .model_stage => ui_render.selected_completion_style,
+        .model_stage, .models => ui_render.selected_completion_style,
         .file, .slash, .skills, .help, .settings, .sessions, .auth => ui_render.approval_button_inactive_style,
     };
     try row.appendSlice(alloc, if (selected) selected_style else ui_render.dim_style);
@@ -718,6 +718,7 @@ pub fn composePickerStatusRow(
             .effort => "no matching effort",
             .fast => "no matching mode",
         },
+        .models => "no models available",
         .file => if (loading)
             "indexing files..."
         else if (failed)
@@ -1208,10 +1209,10 @@ const picker_test_slash_specs = [_]command_specs.SlashSpec{
     .{ .kind = .help, .command = "/help", .help_entry = "/help", .completion_description = "show available slash commands", .presentation_category = .general },
     .{ .kind = .clear_screen, .command = "/clear", .help_entry = "/clear", .completion_description = "clear the terminal transcript", .presentation_category = .general },
     .{ .kind = .model, .command = "/model", .help_entry = "/model <id-or-query>", .completion_description = "choose what model and reasoning effort to use", .presentation_category = .model, .has_args = true },
-    .{ .kind = .models, .command = "/models", .help_entry = "/models", .completion_description = "browse available models", .presentation_category = .model },
     .{ .kind = .mcp, .command = "/mcp", .help_entry = "/mcp [list|resource|prompt|add|remove]", .completion_description = "manage MCP servers, resources, and prompts", .presentation_category = .extensions, .has_args = true },
     .{ .kind = .permissions, .command = "/permissions", .help_entry = "/permissions [ask|auto|remember|revoke|yolo|reset]", .completion_description = "choose permission behavior", .presentation_category = .security, .has_args = true },
     .{ .kind = .credits, .command = "/credits", .aliases = &.{"/balance"}, .help_entry = "/credits (/balance)", .completion_description = "show gateway credits balance", .presentation_category = .account },
+    .{ .kind = .settings, .command = "/settings", .help_entry = "/settings", .completion_description = "configure fx", .presentation_category = .general },
 };
 const picker_test_slash_registry = command_specs.SlashRegistry{ .commands = picker_test_slash_specs[0..] };
 
@@ -1300,7 +1301,7 @@ test "slash menu rows prioritize marker label description and category by width"
     const model_offset = std.mem.find(u8, wide.items, "Model") orelse return error.TestExpectedMetadata;
     const model_column = display_width.visibleWidthIgnoringAnsi(wide.items[0..model_offset]);
 
-    var extensions = try composeSlashMenuOptionRow(std.testing.allocator, picker_test_slash_registry, "/m", &.{}, 2, false, column_widths, 100, true);
+    var extensions = try composeSlashMenuOptionRow(std.testing.allocator, picker_test_slash_registry, "/m", &.{}, 1, false, column_widths, 100, true);
     defer extensions.deinit(std.testing.allocator);
     const extensions_offset = std.mem.find(u8, extensions.items, "Extensions") orelse return error.TestExpectedMetadata;
     try std.testing.expectEqual(model_column, display_width.visibleWidthIgnoringAnsi(extensions.items[0..extensions_offset]));

@@ -1379,6 +1379,8 @@ pub fn Runtime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                     } else if (cycleModelMenuProvider(app, 1) or cycleSkillsMenuSource(app, 1)) {
                         app.shell.render_requests.request(.footer);
+                    } else if (!app.stream.active and picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state)) {
+                        try completion_rt.openCurrentModelPicker(app);
                     } else if (completion_rt.hasFileQuery(app)) {
                         if ((try completion_rt.autocompleteFilePickerSelection(app, max_input_len)) == .limit_exceeded) {
                             try input_limit_feedback.report(App, app, .composer, 1);
@@ -1453,7 +1455,7 @@ pub fn Runtime(comptime App: type) type {
                     if (try submitAuthPickerSelection(app)) return;
                     if (try submitModelMenuSelection(app)) return;
                     if (try submitSkillsMenuSelection(app, max_input_len)) return;
-                    if (try submitSlashSkillSelection(app)) return;
+                    if (try submitSlashPickerSelection(app)) return;
                     if (comptime runtime_profile.allows(App, .durable_sessions)) {
                         if (try submitSessionPickerSelection(app)) return;
                     }
@@ -1465,7 +1467,7 @@ pub fn Runtime(comptime App: type) type {
                         return;
                     }
                     if (picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state)) {
-                        try completion_rt.openCurrentModelPicker(app);
+                        try openModelBrowseCatalog(app);
                         return;
                     }
                     if (completion_rt.hasModelQuery(app)) {
@@ -1781,6 +1783,16 @@ pub fn Runtime(comptime App: type) type {
                 paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
             }
             return true;
+        }
+
+        fn openModelBrowseCatalog(app: *App) !void {
+            if (comptime !@hasField(App, "model_cache")) return;
+            if (comptime @hasDecl(App, "ensureModelCache")) app.ensureModelCache();
+            if (comptime @hasField(App, "skills")) app.skills.closeMenu();
+            try app.model_cache.openMenu();
+            app.input_runtime.inputResetState().clearCurrent(app.alloc);
+            paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
+            app.shell.render_requests.request(.footer);
         }
 
         fn toggleSessionPickerScopeIfActive(app: *App) !bool {
@@ -2113,7 +2125,7 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
-        fn submitSlashSkillSelection(app: *App) !bool {
+        fn submitSlashPickerSelection(app: *App) !bool {
             if (comptime !@hasField(App, "skills")) return false;
             if (nonSlashPickerOwnsEnter(app)) return false;
             const items = app.input_runtime.edit_state.input.items;
@@ -2125,6 +2137,23 @@ pub fn Runtime(comptime App: type) type {
             const count = completion_rt.visibleSlashCompletionCount(app);
             if (count == 0) return false;
             const idx = app.input_runtime.picker.slash_completion_index % count;
+            if (!picker_presentation.mixedSlashCompletionIsSkill(
+                app.slashRegistry(),
+                prefix,
+                app.skills.items,
+                idx,
+            )) {
+                const selected = picker_presentation.nthMixedSlashCompletionText(
+                    app.slashRegistry(),
+                    prefix,
+                    app.skills.items,
+                    idx,
+                ) orelse return false;
+                const spec = app.slashRegistry().matchExact(selected) orelse return false;
+                if (spec.command.kind != .model) return false;
+                try openModelBrowseCatalog(app);
+                return true;
+            }
             return try bindSelectedSlashSkill(app, idx);
         }
 
@@ -2636,7 +2665,6 @@ const routing_test_slash_specs = [_]command_specs.SlashSpec{
     .{ .kind = .image, .command = "/image", .aliases = &.{"/img"}, .help_entry = "/image <path> (/img)", .completion_description = "attach an image by path", .presentation_category = .media, .has_args = true, .accepts_payload = true },
     .{ .kind = .images, .command = "/images", .help_entry = "/images [clear]", .completion_description = "manage pending image attachments", .presentation_category = .media, .has_args = true, .accepts_payload = true },
     .{ .kind = .model, .command = "/model", .help_entry = "/model <id-or-query>", .completion_description = "choose a model", .presentation_category = .model, .has_args = true, .accepts_payload = true, .requires_prompt_credential = true },
-    .{ .kind = .models, .command = "/models", .help_entry = "/models", .completion_description = "browse available models", .presentation_category = .model },
     .{ .kind = .skills, .command = "/skills", .help_entry = "/skills", .completion_description = "browse and manage skills", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
     .{ .kind = .workspace, .command = "/workspace", .help_entry = "/workspace [list|add PATH|remove PATH|clear]", .completion_description = "manage additional workspace directories", .presentation_category = .workspace, .has_args = true, .accepts_payload = true },
 };
@@ -5789,7 +5817,7 @@ test "active stream Enter explains an incomplete hidden model choice" {
     try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
 }
 
-test "app_input_runtime model picker Enter ignores hidden slash skill matches" {
+test "app_input_runtime staged model picker Enter ignores hidden slash skill matches" {
     const alloc = std.testing.allocator;
     const skills = [_]skill_runtime.Skill{.{
         .name = "model-helper",
@@ -5805,7 +5833,7 @@ test "app_input_runtime model picker Enter ignores hidden slash skill matches" {
     app.model_completion_values = &completions;
     try app.input_runtime.textReplacementState().replace(alloc, "/model");
 
-    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+    try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
     try std.testing.expectEqualStrings("/model ", app.input_runtime.edit_state.input.items);
 
     try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
@@ -5819,7 +5847,47 @@ test "app_input_runtime model picker Enter ignores hidden slash skill matches" {
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "Invalid /model selection") == null);
 }
 
-test "app_input_runtime bare model opens on current scrolled selection before staging effort" {
+test "app_input_runtime Tab on bare model opens the staged picker" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.model_completion_values = &.{"openai/gpt-5"};
+    try app.input_runtime.textReplacementState().replace(alloc, "/model");
+
+    try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
+
+    try std.testing.expectEqualStrings("/model ", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) != null);
+    try std.testing.expect(!app.model_cache.menu.active);
+}
+
+test "app_input_runtime Enter on bare model opens the browse catalog" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try app.input_runtime.textReplacementState().replace(alloc, "/model");
+
+    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+
+    try std.testing.expect(app.model_cache.menu.active);
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) == null);
+}
+
+test "app_input_runtime Enter on selected model slash completion opens browse on first try" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try app.input_runtime.textReplacementState().replace(alloc, "/mode");
+
+    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+
+    try std.testing.expect(app.model_cache.menu.active);
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
+}
+
+test "app_input_runtime bare model Tab opens on current scrolled selection before staging effort" {
     const alloc = std.testing.allocator;
     const current_model = "anthropic/claude-opus-4.8";
     const completions = [_][]const u8{
@@ -5843,7 +5911,7 @@ test "app_input_runtime bare model opens on current scrolled selection before st
     app.fast_mode = false;
     try app.input_runtime.textReplacementState().replace(alloc, "/model");
 
-    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+    try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
 
     try std.testing.expectEqualStrings("/model ", app.input_runtime.edit_state.input.items);
     var projected: [32][]const u8 = undefined;
@@ -5874,7 +5942,7 @@ test "app_input_runtime bare model opens on current scrolled selection before st
     try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
 }
 
-test "app_input_runtime bare model keeps current selection across catalog readiness" {
+test "app_input_runtime bare model Tab keeps current selection across catalog readiness" {
     const alloc = std.testing.allocator;
     const current_model = "anthropic/claude-opus-4.8";
     const completions = [_][]const u8{
@@ -5892,7 +5960,7 @@ test "app_input_runtime bare model keeps current selection across catalog readin
     try app.selected_model.appendSlice(alloc, current_model);
     try app.input_runtime.textReplacementState().replace(alloc, "/model");
 
-    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+    try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
     app.model_cache_loading = false;
     try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
 
@@ -5900,7 +5968,7 @@ test "app_input_runtime bare model keeps current selection across catalog readin
     try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
 }
 
-test "app_input_runtime bare model keeps current selection beyond completion window" {
+test "app_input_runtime bare model Tab keeps current selection beyond completion window" {
     const alloc = std.testing.allocator;
     const current_model = "anthropic/claude-opus-4.8";
     var completions = [_][]const u8{"anthropic/claude-opus-4.8-preview"} ** 33;
@@ -5915,7 +5983,7 @@ test "app_input_runtime bare model keeps current selection beyond completion win
     try app.selected_model.appendSlice(alloc, current_model);
     try app.input_runtime.textReplacementState().replace(alloc, "/model");
 
-    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+    try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
     try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
 
     try std.testing.expectEqualStrings(current_model, app.input_runtime.picker.model_picker_pending_model.items);
@@ -5935,9 +6003,10 @@ test "app_input_runtime stream model-shaped keys stay model-owned" {
         input: []const u8,
         byte: u8,
         expect_input: []const u8,
+        expect_catalog: bool = false,
     }{
         .{ .input = "/model ", .byte = '\r', .expect_input = "/model " },
-        .{ .input = "/model", .byte = '\r', .expect_input = "/model " },
+        .{ .input = "/model", .byte = '\r', .expect_input = "", .expect_catalog = true },
         .{ .input = "/model", .byte = '\t', .expect_input = "/model" },
         .{ .input = "/model ", .byte = '\t', .expect_input = "/model " },
     };
@@ -5959,6 +6028,7 @@ test "app_input_runtime stream model-shaped keys stay model-owned" {
         try std.testing.expectEqual(@as(usize, 0), app.input_runtime.entities.skill_tokens.items.len);
         try std.testing.expectEqualStrings("anthropic/claude-opus-4.7", app.selected_model.items);
         try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
+        try std.testing.expectEqual(case.expect_catalog, app.model_cache.menu.active);
     }
 }
 
@@ -12556,7 +12626,7 @@ test "app_input_runtime preflight rejection removes captured inline snapshot" {
     try std.testing.expectEqual(@as(usize, 0), try countTestSnapshotFiles(snapshot_dir));
 }
 
-test "app_input_runtime gates model selection but not model discovery" {
+test "app_input_runtime gates direct model selection but not bare model browse" {
     const alloc = std.testing.allocator;
     const cases = [_]struct {
         input: []const u8,
@@ -12564,7 +12634,7 @@ test "app_input_runtime gates model selection but not model discovery" {
         command: ?[]const u8,
         remaining_input: []const u8,
     }{
-        .{ .input = "/models", .preflight_count = 0, .command = "/models", .remaining_input = "" },
+        .{ .input = "/model", .preflight_count = 0, .command = "/model", .remaining_input = "" },
         .{ .input = "/model claude", .preflight_count = 1, .command = null, .remaining_input = "/model claude" },
     };
 

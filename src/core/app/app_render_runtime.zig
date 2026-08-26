@@ -41,7 +41,6 @@ const ui_input = @import("../../ui/input/runtime.zig");
 const input_visual_layout = @import("../../ui/input/visual_layout.zig");
 const registered_entities = @import("../input/registered_entities.zig");
 const approval_screen = @import("../../ui/approval_screen.zig");
-const models_screen = @import("../../ui/models_screen.zig");
 const skills_screen = @import("../../ui/skills_screen.zig");
 const full_transcript_screen = @import("../../ui/full_transcript_screen.zig");
 const render_engine = @import("../../ui/render_engine.zig");
@@ -152,7 +151,6 @@ const SurfaceFrameShell = struct {
 const RenderReconciliation = union(enum) {
     inline_render: InlineRenderReconciliation,
     file_approval_screen,
-    models_screen,
     frame_result: FrameAttemptResult,
 };
 
@@ -1708,7 +1706,6 @@ pub fn Runtime(comptime App: type) type {
                 )) {
                     try requestNormalViewportRecovery(app);
                 }
-                if (modelMenuActive(app) and !settingsMenuActive(app)) return .models_screen;
             }
 
             if (app.terminal.catalogMenuScreenActive()) {
@@ -1823,9 +1820,6 @@ pub fn Runtime(comptime App: type) type {
                 )
             else
                 main_footer_ctx;
-            if (child_view != null and modelMenuActive(app)) {
-                return renderChildModelsScreen(app, footer_ctx);
-            }
             if (child_view != null and skillsMenuActive(app)) {
                 return renderChildSkillsScreen(app, footer_ctx);
             }
@@ -1834,7 +1828,6 @@ pub fn Runtime(comptime App: type) type {
             else switch (try reconcileBeforeFrameRender(app, render_input.queuedBannerRows(footer_ctx))) {
                 .inline_render => |inline_render| inline_render,
                 .file_approval_screen => return renderApprovalScreen(app),
-                .models_screen => return renderModelsScreen(app, footer_ctx),
                 .frame_result => |result| return result,
             };
             const presentation_commits_transcript =
@@ -2508,78 +2501,6 @@ pub fn Runtime(comptime App: type) type {
             if (screen.needs_full_file_projection) {
                 app.shell.render_requests.request(.modal);
             }
-            return .{
-                .shadow_state = .committed,
-                .animation_visible = false,
-            };
-        }
-
-        fn renderModelsScreen(app: *App, ctx: render_input.RenderContext) !FrameAttemptResult {
-            if (comptime !@hasField(App, "terminal") or !@hasField(App, "model_cache")) {
-                return error.MissingModelsScreenRuntime;
-            }
-
-            const clear_display = !app.terminal.catalogMenuScreenActive();
-            try app_lifecycle.enterCatalogMenuScreen(&app.terminal, &app.shell, &app.metrics);
-            if (app.shell.shadow_vt) |grid| {
-                if (grid.cols != app.shell.layout.cols or grid.rows != app.shell.layout.rows) {
-                    try grid.resize(app.shell.layout.cols, app.shell.layout.rows);
-                }
-            }
-
-            var screen = try models_screen.paint(app.alloc, .{
-                .rows = app.shell.layout.rows,
-                .cols = app.shell.layout.cols,
-                .models = ctx.model_menu,
-                .composer = .{
-                    .input = ctx.input.edit_state.input.items,
-                    .cursor = ctx.input.edit_state.cursor,
-                    .images = ctx.pending_images,
-                    .pasted_blocks = ctx.input.entities.pasted_blocks.items,
-                    .image_tokens = ctx.input.entities.image_tokens.items,
-                    .skill_tokens = ctx.input.entities.skill_tokens.items,
-                },
-                .ctrl_c_pending = ctx.ctrl_c_pending,
-                .clear_display = clear_display,
-            });
-            defer screen.deinit(app.alloc);
-            try app_lifecycle.writeLifecycleTerminalBytes(&app.shell, &app.metrics, screen.bytes);
-            return .{
-                .shadow_state = .committed,
-                .animation_visible = false,
-            };
-        }
-
-        fn renderChildModelsScreen(
-            app: *App,
-            ctx: render_input.RenderContext,
-        ) !FrameAttemptResult {
-            if (comptime !@hasField(App, "terminal") or !@hasField(App, "model_cache")) {
-                return error.MissingModelsScreenRuntime;
-            }
-            if (app.shell.shadow_vt) |grid| {
-                if (grid.cols != app.shell.layout.cols or grid.rows != app.shell.layout.rows) {
-                    try grid.resize(app.shell.layout.cols, app.shell.layout.rows);
-                }
-            }
-
-            var screen = try models_screen.paint(app.alloc, .{
-                .rows = app.shell.layout.rows,
-                .cols = app.shell.layout.cols,
-                .models = ctx.model_menu,
-                .composer = .{
-                    .input = ctx.input.edit_state.input.items,
-                    .cursor = ctx.input.edit_state.cursor,
-                    .images = &.{},
-                    .pasted_blocks = ctx.input.entities.pasted_blocks.items,
-                    .image_tokens = ctx.input.entities.image_tokens.items,
-                    .skill_tokens = ctx.input.entities.skill_tokens.items,
-                },
-                .ctrl_c_pending = ctx.ctrl_c_pending,
-                .clear_display = true,
-            });
-            defer screen.deinit(app.alloc);
-            try app_lifecycle.writeLifecycleTerminalBytes(&app.shell, &app.metrics, screen.bytes);
             return .{
                 .shadow_state = .committed,
                 .animation_visible = false,
@@ -5713,11 +5634,21 @@ test "core.app_render_runtime inline menus survive the VT size and resize matrix
     app.session_persistence.session_picker.summaries.items = summaries[0..];
     app.session_persistence.session_picker.load_state = .ready;
     app.session_persistence.session_picker.has_more = true;
+    for (0..25) |index| {
+        const id = if (index == 24) "provider/selected-model" else "provider/model";
+        try app.model_cache.menu.items.append(alloc, .{
+            .id = try alloc.dupe(u8, id),
+            .provider = "provider",
+            .capabilities = .{},
+        });
+    }
+    app.model_cache.menu.load_state = .ready;
+    app.model_cache.menu.selected_index = 24;
     try app.shell.initBacking(alloc);
     try app.shell.enableShadowVt(alloc);
     try app.shell.writeTranscript(alloc, &app.metrics, "inline menu matrix transcript\n", true);
 
-    const MenuKind = enum { slash, skills, settings, help, sessions };
+    const MenuKind = enum { slash, skills, settings, help, sessions, models };
     const menu_cases = [_]struct {
         kind: MenuKind,
         visible_text: []const u8,
@@ -5727,6 +5658,7 @@ test "core.app_render_runtime inline menus survive the VT size and resize matrix
         .{ .kind = .settings, .visible_text = "Status line context" },
         .{ .kind = .help, .visible_text = "/help" },
         .{ .kind = .sessions, .visible_text = "Responsive" },
+        .{ .kind = .models, .visible_text = "selected-model" },
     };
     const geometries = [_]struct { cols: u16, rows: u16 }{
         .{ .cols = 40, .rows = 6 },
@@ -5743,6 +5675,7 @@ test "core.app_render_runtime inline menus survive the VT size and resize matrix
         app.input_runtime.settings_menu.close();
         app.input_runtime.help_menu.close();
         app.session_persistence.session_picker.active = false;
+        app.model_cache.menu.active = false;
         try app.input_runtime.textReplacementState().replace(alloc, "");
         switch (menu_case.kind) {
             .slash => try app.input_runtime.textReplacementState().replace(alloc, "/"),
@@ -5750,6 +5683,7 @@ test "core.app_render_runtime inline menus survive the VT size and resize matrix
             .settings => app.input_runtime.settings_menu.open(),
             .help => app.input_runtime.help_menu.open(),
             .sessions => app.session_persistence.session_picker.active = true,
+            .models => app.model_cache.menu.active = true,
         }
 
         for (geometries) |geometry| {
@@ -5781,6 +5715,7 @@ test "core.app_render_runtime inline menus survive the VT size and resize matrix
     app.input_runtime.settings_menu.close();
     app.input_runtime.help_menu.close();
     app.session_persistence.session_picker.active = false;
+    app.model_cache.menu.active = false;
     try app.input_runtime.textReplacementState().replace(alloc, "");
     app.shell.render_requests.request(.footer);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
@@ -5920,7 +5855,7 @@ test "core.app_render_runtime active setup hub stays on the inline transcript su
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "test-model"));
 }
 
-test "core.app_render_runtime model catalog survives modal preemption and restores the transcript on close" {
+test "core.app_render_runtime inline model catalog survives modal preemption and close" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5955,10 +5890,10 @@ test "core.app_render_runtime model catalog survives modal preemption and restor
     app.shell.render_requests.request(.footer);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
 
-    try std.testing.expect(app.terminal.catalogMenuScreenActive());
+    try std.testing.expect(!app.terminal.catalogMenuScreenActive());
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Models 0"));
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Loading models"));
-    try std.testing.expect(!(try coordinatorGridContains(app.shell.shadow_vt.?.*, "model catalog transcript stays behind")));
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "model catalog transcript stays behind"));
 
     try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
         .id = 84,
@@ -5972,7 +5907,7 @@ test "core.app_render_runtime model catalog survives modal preemption and restor
     app.approval_prompt.clear(alloc);
     app.shell.render_requests.request(.modal);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
-    try std.testing.expect(app.terminal.catalogMenuScreenActive());
+    try std.testing.expect(!app.terminal.catalogMenuScreenActive());
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Loading models"));
 
     app.model_cache.closeMenu();
@@ -5980,6 +5915,12 @@ test "core.app_render_runtime model catalog survives modal preemption and restor
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "model catalog transcript stays behind"));
+
+    var read_offset: u64 = 0;
+    const terminal_bytes = try readCoordinatorFrameBytes(alloc, file, &read_offset);
+    defer alloc.free(terminal_bytes);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, terminal_bytes, "\x1b[?1049h"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, terminal_bytes, "\x1b[?1049l"));
 }
 
 test "core.app_render_runtime file approval returns to the preserved inline skills menu" {
