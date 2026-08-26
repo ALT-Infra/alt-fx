@@ -2228,10 +2228,17 @@ pub fn Runtime(comptime App: type) type {
         fn closeModelMenu(app: *App, clear_query: bool) bool {
             if (comptime !@hasField(App, "model_cache")) return false;
             if (!app.model_cache.menu.active) return false;
+            const orchestration_picker = if (comptime @hasDecl(App, "orchestrationDefinitionModelSelectionActive"))
+                app.orchestrationDefinitionModelSelectionActive()
+            else
+                false;
             app.model_cache.closeMenu();
             if (clear_query) {
                 app.input_runtime.inputResetState().clearCurrent(app.alloc);
                 paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
+            }
+            if (orchestration_picker and comptime @hasDecl(App, "finishOrchestrationDefinitionModelPicker")) {
+                app.finishOrchestrationDefinitionModelPicker();
             }
             return true;
         }
@@ -2600,9 +2607,24 @@ pub fn Runtime(comptime App: type) type {
             };
             defer app.alloc.free(selected);
 
+            const orchestration_picker = if (comptime @hasDecl(App, "orchestrationDefinitionModelSelectionActive"))
+                app.orchestrationDefinitionModelSelectionActive()
+            else
+                false;
             app.model_cache.closeMenu();
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
+            if (comptime @hasDecl(App, "orchestrationDefinitionModelSelectionActive") and
+                @hasDecl(App, "applyOrchestrationDefinitionModelSelection"))
+            {
+                if (orchestration_picker) {
+                    app.applyOrchestrationDefinitionModelSelection(selected);
+                    if (comptime @hasDecl(App, "finishOrchestrationDefinitionModelPicker")) {
+                        app.finishOrchestrationDefinitionModelPicker();
+                    }
+                    return true;
+                }
+            }
             try completion_rt.beginExactModelSelection(app, selected);
             return true;
         }

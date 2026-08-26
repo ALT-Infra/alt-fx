@@ -11,14 +11,14 @@ const RoleRef = union(enum) {
     peer: usize,
     specialist: usize,
 };
-const TextField = enum { team_name, team_id, role_id, model, definition };
+const TextField = enum { team_name, role_id, definition };
 const Screen = union(enum) {
     overview,
     provider,
     members: RoleKind,
     role: RoleRef,
-    relationships,
-    relationship_targets: RoleRef,
+    specialist_access,
+    specialist_targets: RoleRef,
     text: struct { field: TextField, role: ?RoleRef, previous: PreviousScreen },
     delete_role: RoleRef,
 };
@@ -35,7 +35,6 @@ pub const Editor = struct {
     title_buffer: [256]u8 = undefined,
     error_buffer: [256]u8 = undefined,
     error_len: usize = 0,
-    identity_locked: bool = false,
 
     pub fn init(alloc: Allocator, source: []const u8) !Editor {
         var arena = std.heap.ArenaAllocator.init(alloc);
@@ -47,11 +46,9 @@ pub const Editor = struct {
             .{},
         );
         if (value != .object) return error.InvalidTeamDocument;
-        return .{ .arena = arena, .root = value };
-    }
-
-    pub fn lockIdentity(self: *Editor) void {
-        self.identity_locked = true;
+        var editor = Editor{ .arena = arena, .root = value };
+        editor.removeLegacyPeerFields();
+        return editor;
     }
 
     pub fn deinit(self: *Editor) void {
@@ -66,8 +63,8 @@ pub const Editor = struct {
             .provider => "Model provider",
             .members => |kind| if (kind == .peer) "Peers" else "Specialists",
             .role => |role| self.roleTitle(role),
-            .relationships => "Relationships",
-            .relationship_targets => |role| self.relationshipTitle(role),
+            .specialist_access => "Specialist access",
+            .specialist_targets => |role| self.specialistAccessTitle(role),
             .text => |field| textFieldTitle(field.field),
             .delete_role => "Remove role?",
         };
@@ -77,8 +74,8 @@ pub const Editor = struct {
             .provider => self.projectProvider(),
             .members => |kind| self.projectMembers(kind),
             .role => |role| self.projectRole(role),
-            .relationships => self.projectRelationships(),
-            .relationship_targets => |role| self.projectRelationshipTargets(role),
+            .specialist_access => self.projectSpecialistAccess(),
+            .specialist_targets => |role| self.projectSpecialistTargets(role),
             .text => |field| self.projectText(field.field),
             .delete_role => |role| self.projectDelete(role),
         }
@@ -93,7 +90,7 @@ pub const Editor = struct {
             .accepts_text = accepts_text,
             .hint = if (accepts_text)
                 "Enter Apply  ·  Esc Cancel"
-            else if (self.screen == .relationship_targets)
+            else if (self.screen == .specialist_targets)
                 "↑↓ Navigate  ·  Enter Toggle  ·  Esc Done"
             else
                 "↑↓ Navigate  ·  Enter Select  ·  Esc Back",
@@ -118,8 +115,8 @@ pub const Editor = struct {
             .provider => self.submitProvider(),
             .members => |kind| self.submitMembers(kind),
             .role => |role| self.submitRole(role),
-            .relationships => self.submitRelationships(),
-            .relationship_targets => |role| self.submitRelationshipTarget(role),
+            .specialist_access => self.submitSpecialistAccess(),
+            .specialist_targets => |role| self.submitSpecialistTarget(role),
             .text => |field| self.submitText(field, input),
             .delete_role => |role| self.submitDeleteRole(role),
         };
@@ -129,13 +126,13 @@ pub const Editor = struct {
         self.clearError();
         switch (self.screen) {
             .overview => return .exit,
-            .provider, .members, .relationships => self.screen = .overview,
+            .provider, .members, .specialist_access => self.screen = .overview,
             .role => |role| self.screen = switch (role) {
                 .primary => .overview,
                 .peer => .{ .members = .peer },
                 .specialist => .{ .members = .specialist },
             },
-            .relationship_targets => self.screen = .relationships,
+            .specialist_targets => self.screen = .specialist_access,
             .text => |field| self.screen = previousScreen(field.previous),
             .delete_role => |role| self.screen = .{ .role = role },
         }
@@ -146,16 +143,12 @@ pub const Editor = struct {
     fn submitOverview(self: *Editor, alloc: Allocator) !host.DefinitionEditorOutcome {
         switch (self.selected) {
             0 => return self.beginText(.team_name, null, .overview, self.teamString("name")),
-            1 => if (self.identity_locked) {
-                self.setError("A revision keeps its Team ID. Create a new Team to use another ID.");
-                return .redraw;
-            } else return self.beginText(.team_id, null, .overview, self.teamString("id")),
-            2 => self.screen = .provider,
-            3 => self.screen = .{ .role = .primary },
-            4 => self.screen = .{ .members = .peer },
-            5 => self.screen = .{ .members = .specialist },
-            6 => self.screen = .relationships,
-            7 => {
+            1 => self.screen = .provider,
+            2 => self.screen = .{ .role = .primary },
+            3 => self.screen = .{ .members = .peer },
+            4 => self.screen = .{ .members = .specialist },
+            5 => self.screen = .specialist_access,
+            6 => {
                 const source = self.serialize(alloc) catch |err| {
                     self.setErrorName("Team could not be saved", err);
                     return .redraw;
@@ -179,7 +172,7 @@ pub const Editor = struct {
         const provider = if (self.selected == 0) "opencode" else "vercel";
         try self.setTeamString("provider_id", provider);
         self.screen = .overview;
-        self.selected = 2;
+        self.selected = 1;
         return .{ .replace_input = "" };
     }
 
@@ -200,23 +193,36 @@ pub const Editor = struct {
             return .{ .replace_input = "" };
         }
         self.screen = .overview;
-        self.selected = if (kind == .peer) 4 else 5;
+        self.selected = if (kind == .peer) 3 else 4;
         return .{ .replace_input = "" };
     }
 
     fn submitRole(self: *Editor, role: RoleRef) !host.DefinitionEditorOutcome {
+        if (role == .specialist) {
+            switch (self.selected) {
+                0 => return self.beginText(.role_id, role, .{ .role = role }, self.roleString(role, "id")),
+                1 => return .{ .choose_model = self.teamString("provider_id") },
+                2 => return self.beginText(.definition, role, .{ .role = role }, self.roleString(role, "definition")),
+                3 => {
+                    self.screen = .{ .delete_role = role };
+                    self.selected = 1;
+                },
+                else => {},
+            }
+            return .{ .replace_input = "" };
+        }
         switch (self.selected) {
             0 => return self.beginText(.role_id, role, .{ .role = role }, self.roleString(role, "id")),
-            1 => return self.beginText(.model, role, .{ .role = role }, self.modelDisplay(role)),
+            1 => return .{ .choose_model = self.teamString("provider_id") },
             2 => return self.beginText(.definition, role, .{ .role = role }, self.roleString(role, "definition")),
             3 => {
-                self.screen = .{ .relationship_targets = role };
+                self.screen = .{ .specialist_targets = role };
                 self.selected = 0;
             },
             4 => {
                 if (role == .primary) {
                     self.screen = .overview;
-                    self.selected = 3;
+                    self.selected = 2;
                 } else {
                     self.screen = .{ .delete_role = role };
                     self.selected = 1;
@@ -227,50 +233,30 @@ pub const Editor = struct {
         return .{ .replace_input = "" };
     }
 
-    fn submitRelationships(self: *Editor) host.DefinitionEditorOutcome {
+    fn submitSpecialistAccess(self: *Editor) host.DefinitionEditorOutcome {
         const agent_count = 1 + self.roleArray(.peer).items.len;
         if (self.selected < agent_count) {
-            self.screen = .{ .relationship_targets = if (self.selected == 0)
+            self.screen = .{ .specialist_targets = if (self.selected == 0)
                 .primary
             else
                 .{ .peer = self.selected - 1 } };
             self.selected = 0;
         } else {
             self.screen = .overview;
-            self.selected = 6;
+            self.selected = 5;
         }
         return .{ .replace_input = "" };
     }
 
-    fn submitRelationshipTarget(self: *Editor, role: RoleRef) !host.DefinitionEditorOutcome {
-        const peer_count = self.roleArray(.peer).items.len;
-        var row: usize = 0;
-        if (role != .primary) {
-            if (row == self.selected) {
-                try self.togglePeerEdge(role, .primary);
-                return .redraw;
-            }
-            row += 1;
-        }
-        var peer_index: usize = 0;
-        while (peer_index < peer_count) : (peer_index += 1) {
-            const target: RoleRef = .{ .peer = peer_index };
-            if (sameRole(role, target)) continue;
-            if (row == self.selected) {
-                try self.togglePeerEdge(role, target);
-                return .redraw;
-            }
-            row += 1;
-        }
+    fn submitSpecialistTarget(self: *Editor, role: RoleRef) !host.DefinitionEditorOutcome {
         const specialists = self.roleArray(.specialist).items;
         for (specialists, 0..) |_, specialist_index| {
-            if (row == self.selected) {
+            if (specialist_index == self.selected) {
                 try self.toggleSpecialist(role, specialist_index);
                 return .redraw;
             }
-            row += 1;
         }
-        self.screen = .relationships;
+        self.screen = .specialist_access;
         self.selected = 0;
         return .{ .replace_input = "" };
     }
@@ -287,13 +273,6 @@ pub const Editor = struct {
         }
         switch (field.field) {
             .team_name => try self.setTeamString("name", input),
-            .team_id => {
-                if (!validIdentifier(input)) {
-                    self.setError("Team IDs use lowercase letters, digits, and single hyphens.");
-                    return .redraw;
-                }
-                try self.setTeamString("id", input);
-            },
             .role_id => {
                 if (!validIdentifier(input)) {
                     self.setError("Role IDs use lowercase letters, digits, and single hyphens.");
@@ -305,25 +284,12 @@ pub const Editor = struct {
                 }
                 try self.renameRole(field.role.?, input);
             },
-            .model => self.setRoleModel(field.role.?, input) catch |err| {
-                self.setError(switch (err) {
-                    error.InvalidModelId => if (std.mem.eql(u8, self.teamString("provider_id"), "opencode"))
-                        "Use model or go/model for OpenCode."
-                    else
-                        "Gateway models use provider/model IDs.",
-                    error.DuplicateCatalogModel => "Every Team role must use a distinct model.",
-                    else => "That model could not be applied.",
-                });
-                return .redraw;
-            },
             .definition => try self.setRoleString(field.role.?, "definition", input),
         }
         self.screen = previousScreen(field.previous);
         self.selected = switch (field.field) {
             .team_name => 0,
-            .team_id => 1,
             .role_id => 0,
-            .model => 1,
             .definition => 2,
         };
         return .{ .replace_input = "" };
@@ -341,19 +307,18 @@ pub const Editor = struct {
             self.selected = 0;
         } else {
             self.screen = .{ .role = role };
-            self.selected = 4;
+            self.selected = if (role == .specialist) 3 else 4;
         }
         return .{ .replace_input = "" };
     }
 
     fn projectOverview(self: *Editor) void {
         self.addRow("Name", self.teamString("name"), false, false);
-        self.addRow(if (self.identity_locked) "ID · fixed" else "ID", self.teamString("id"), false, false);
         self.addRow("Provider", providerLabel(self.teamString("provider_id")), false, false);
         self.addRow("Primary", self.roleString(.primary, "id"), false, false);
         self.addCountRow("Peers", self.roleArray(.peer).items.len);
         self.addCountRow("Specialists", self.roleArray(.specialist).items.len);
-        self.addRow("Relationships", "peer access and specialist authority", false, false);
+        self.addRow("Specialist access", "assign specialists to primary and peers", false, false);
         self.addRow("Save & start", "new ALT conversation", false, false);
     }
 
@@ -376,11 +341,15 @@ pub const Editor = struct {
         self.addRow("ID", self.roleString(role, "id"), false, false);
         self.addRow("Model", self.modelDisplay(role), false, false);
         self.addRow("Instructions", self.roleString(role, "definition"), false, false);
-        self.addRow("Relationships", "consultation and specialist access", false, false);
-        self.addRow(if (role == .primary) "Back" else "Remove role", "", false, role != .primary);
+        if (role == .specialist) {
+            self.addRow("Remove role", "", false, true);
+        } else {
+            self.addRow("Specialists", "assign callable specialists", false, false);
+            self.addRow(if (role == .primary) "Back" else "Remove role", "", false, role != .primary);
+        }
     }
 
-    fn projectRelationships(self: *Editor) void {
+    fn projectSpecialistAccess(self: *Editor) void {
         self.addRow(self.roleString(.primary, "id"), "primary", false, false);
         for (self.roleArray(.peer).items, 0..) |_, index| {
             const role: RoleRef = .{ .peer = index };
@@ -389,25 +358,7 @@ pub const Editor = struct {
         self.addRow("Done", "", false, false);
     }
 
-    fn projectRelationshipTargets(self: *Editor, role: RoleRef) void {
-        if (role != .primary) {
-            self.addRow(
-                self.roleString(.primary, "id"),
-                "primary",
-                self.hasPeerEdge(role, .primary),
-                false,
-            );
-        }
-        for (self.roleArray(.peer).items, 0..) |_, index| {
-            const target: RoleRef = .{ .peer = index };
-            if (sameRole(role, target)) continue;
-            self.addRow(
-                self.roleString(target, "id"),
-                "peer",
-                self.hasPeerEdge(role, target),
-                false,
-            );
-        }
+    fn projectSpecialistTargets(self: *Editor, role: RoleRef) void {
         for (self.roleArray(.specialist).items, 0..) |_, index| {
             const target: RoleRef = .{ .specialist = index };
             self.addRow(
@@ -422,12 +373,8 @@ pub const Editor = struct {
 
     fn projectText(self: *Editor, field: TextField) void {
         const detail = switch (field) {
-            .model => if (std.mem.eql(u8, self.teamString("provider_id"), "opencode"))
-                "Use an fx model ID such as kimi-k3 or go/kimi-k3."
-            else
-                "Use a Gateway model ID such as anthropic/claude-sonnet-4.",
             .definition => "Describe this role's expertise, judgment, and responsibilities.",
-            .team_id, .role_id => "Lowercase letters, digits, and single hyphens.",
+            .role_id => "Lowercase letters, digits, and single hyphens.",
             .team_name => "A concise display name for this Team.",
         };
         self.addRow(detail, "", false, false);
@@ -444,8 +391,8 @@ pub const Editor = struct {
             .provider => "ALT accepts only unified multi-model providers.",
             .members => "Every role must use a distinct catalog model.",
             .role => "Model and instructions are pinned in this Team revision.",
-            .relationships => "Choose each context-bearing agent to configure its access.",
-            .relationship_targets => "Checked peers are consultable; checked specialists are callable.",
+            .specialist_access => "Every peer can consult every other peer; specialist access is assigned here.",
+            .specialist_targets => "Checked specialists are callable by this primary or peer.",
             .text => "",
             .delete_role => "References and the role's model are removed together.",
         };
@@ -524,6 +471,7 @@ pub const Editor = struct {
         const route_value = model.get("route") orelse return "Choose model";
         const name_value = model.get("name") orelse return "Choose model";
         if (route_value != .string or name_value != .string) return "Choose model";
+        if (route_value.string.len == 0 or name_value.string.len == 0) return "Choose model";
         const slot = self.row_count % self.detail_buffers.len;
         if (std.mem.eql(u8, self.teamString("provider_id"), "opencode") and
             std.mem.eql(u8, route_value.string, "zen"))
@@ -576,6 +524,28 @@ pub const Editor = struct {
         try current.put(self.arena.allocator(), "name", .{ .string = try self.arena.allocator().dupe(u8, name) });
     }
 
+    pub fn applySelectedModel(self: *Editor, input: []const u8) void {
+        const role = switch (self.screen) {
+            .role => |value| value,
+            else => return,
+        };
+        self.clearError();
+        self.setRoleModel(role, input) catch |err| {
+            self.setError(switch (err) {
+                error.DuplicateCatalogModel => "Every Team role must use a distinct model.",
+                else => "That catalog model could not be applied.",
+            });
+        };
+        self.selected = 1;
+    }
+
+    pub fn expectsModelSelection(self: *const Editor) bool {
+        return switch (self.screen) {
+            .role => self.selected == 1,
+            else => false,
+        };
+    }
+
     fn roleIdInUse(self: *Editor, role: RoleRef, id: []const u8) bool {
         if (!sameRole(role, .primary) and std.mem.eql(u8, self.roleString(.primary, "id"), id)) return true;
         for (self.roleArray(.peer).items, 0..) |_, index| {
@@ -592,12 +562,12 @@ pub const Editor = struct {
     fn renameRole(self: *Editor, role: RoleRef, new_id: []const u8) !void {
         const old_id = self.roleString(role, "id");
         const owned = try self.arena.allocator().dupe(u8, new_id);
-        for ([_][]const u8{ "peers", "specialists" }) |key| {
-            if (self.rootObject().getPtr("primary").?.object.getPtr(key)) |value| {
+        if (self.rootObject().getPtr("primary").?.object.getPtr("specialists")) |value| {
+            replaceArrayString(&value.array, old_id, owned);
+        }
+        for (self.roleArray(.peer).items) |*peer| {
+            if (peer.object.getPtr("specialists")) |value| {
                 replaceArrayString(&value.array, old_id, owned);
-            }
-            for (self.roleArray(.peer).items) |*peer| {
-                if (peer.object.getPtr(key)) |value| replaceArrayString(&value.array, old_id, owned);
             }
         }
         try self.roleObject(role).put(self.arena.allocator(), "id", .{ .string = owned });
@@ -619,12 +589,11 @@ pub const Editor = struct {
         try object.put(self.arena.allocator(), "model_id", .{ .string = model_id });
         try object.put(self.arena.allocator(), "definition", .{ .string = try self.arena.allocator().dupe(u8, "Describe this role.") });
         if (kind == .peer) {
-            try object.put(self.arena.allocator(), "peers", .{ .array = std.json.Array.init(self.arena.allocator()) });
             try object.put(self.arena.allocator(), "specialists", .{ .array = std.json.Array.init(self.arena.allocator()) });
         }
         try self.roleArray(kind).append(.{ .object = object });
         const role: RoleRef = if (kind == .peer) .{ .peer = index } else .{ .specialist = index };
-        if (kind == .peer) try self.setPeerEdge(.primary, role, true) else try self.setSpecialist(.primary, index, true);
+        if (kind == .specialist) try self.setSpecialist(.primary, index, true);
         return role;
     }
 
@@ -648,35 +617,16 @@ pub const Editor = struct {
     }
 
     fn removeReferences(self: *Editor, id: []const u8) void {
-        for ([_][]const u8{ "peers", "specialists" }) |key| {
-            if (self.rootObject().getPtr("primary").?.object.getPtr(key)) |value| removeArrayString(&value.array, id);
-            for (self.roleArray(.peer).items) |*peer| {
-                if (peer.object.getPtr(key)) |value| removeArrayString(&value.array, id);
-            }
+        if (self.rootObject().getPtr("primary").?.object.getPtr("specialists")) |value| {
+            removeArrayString(&value.array, id);
+        }
+        for (self.roleArray(.peer).items) |*peer| {
+            if (peer.object.getPtr("specialists")) |value| removeArrayString(&value.array, id);
         }
     }
 
-    fn hasPeerEdge(self: *Editor, left: RoleRef, right: RoleRef) bool {
-        return arrayContains(self.agentArray(left, "peers"), self.roleString(right, "id")) or
-            arrayContains(self.agentArray(right, "peers"), self.roleString(left, "id"));
-    }
-
-    fn togglePeerEdge(self: *Editor, left: RoleRef, right: RoleRef) !void {
-        try self.setPeerEdge(left, right, !self.hasPeerEdge(left, right));
-    }
-
-    fn setPeerEdge(self: *Editor, left: RoleRef, right: RoleRef, enabled: bool) !void {
-        const left_id = self.roleString(left, "id");
-        const right_id = self.roleString(right, "id");
-        removeArrayString(self.agentArray(left, "peers"), right_id);
-        removeArrayString(self.agentArray(right, "peers"), left_id);
-        if (enabled) try self.agentArray(left, "peers").append(.{
-            .string = try self.arena.allocator().dupe(u8, right_id),
-        });
-    }
-
     fn hasSpecialist(self: *Editor, role: RoleRef, index: usize) bool {
-        return arrayContains(self.agentArray(role, "specialists"), self.roleString(.{ .specialist = index }, "id"));
+        return arrayContains(self.specialistArray(role), self.roleString(.{ .specialist = index }, "id"));
     }
 
     fn toggleSpecialist(self: *Editor, role: RoleRef, index: usize) !void {
@@ -685,20 +635,27 @@ pub const Editor = struct {
 
     fn setSpecialist(self: *Editor, role: RoleRef, index: usize, enabled: bool) !void {
         const id = self.roleString(.{ .specialist = index }, "id");
-        const values = self.agentArray(role, "specialists");
+        const values = self.specialistArray(role);
         removeArrayString(values, id);
         if (enabled) try values.append(.{
             .string = try self.arena.allocator().dupe(u8, id),
         });
     }
 
-    fn agentArray(self: *Editor, role: RoleRef, key: []const u8) *std.json.Array {
+    fn specialistArray(self: *Editor, role: RoleRef) *std.json.Array {
         const object = self.roleObject(role);
-        if (object.getPtr(key)) |value| return &value.array;
-        object.put(self.arena.allocator(), key, .{
+        if (object.getPtr("specialists")) |value| return &value.array;
+        object.put(self.arena.allocator(), "specialists", .{
             .array = std.json.Array.init(self.arena.allocator()),
         }) catch unreachable;
-        return &object.getPtr(key).?.array;
+        return &object.getPtr("specialists").?.array;
+    }
+
+    fn removeLegacyPeerFields(self: *Editor) void {
+        _ = self.rootObject().getPtr("primary").?.object.orderedRemove("peers");
+        for (self.roleArray(.peer).items) |*peer| {
+            _ = peer.object.orderedRemove("peers");
+        }
     }
 
     fn serialize(self: *Editor, alloc: Allocator) ![]u8 {
@@ -741,12 +698,12 @@ pub const Editor = struct {
         ) catch "Role";
     }
 
-    fn relationshipTitle(self: *Editor, role: RoleRef) []const u8 {
+    fn specialistAccessTitle(self: *Editor, role: RoleRef) []const u8 {
         return std.fmt.bufPrint(
             &self.title_buffer,
-            "Relationships · {s}",
+            "Specialists · {s}",
             .{self.roleString(role, "id")},
-        ) catch "Relationships";
+        ) catch "Specialists";
     }
 
     fn setError(self: *Editor, message: []const u8) void {
@@ -772,9 +729,7 @@ pub const Editor = struct {
 fn textFieldTitle(field: TextField) []const u8 {
     return switch (field) {
         .team_name => "Team name",
-        .team_id => "Team ID",
         .role_id => "Role ID",
-        .model => "Model",
         .definition => "Role instructions",
     };
 }
@@ -811,14 +766,13 @@ fn validIdentifier(value: []const u8) bool {
 fn teamValidationMessage(err: anyerror) []const u8 {
     return switch (err) {
         error.MissingCollaborator => "Add at least one peer or specialist before starting ALT.",
-        error.UnreachablePeer => "Connect every peer to the primary through Relationships.",
         error.UnreachableSpecialist => "Give at least one primary or peer access to every specialist.",
         error.DuplicateCatalogModel, error.DuplicateModelOwner => "Every Team role must use a distinct model.",
         error.EmptyModel => "Choose a model for every Team role.",
         error.InvalidIdentifier => "Team and role IDs use lowercase letters, digits, and single hyphens.",
         error.DuplicateAssignment => "Every primary, peer, and specialist needs a distinct ID.",
         error.UnsupportedProvider => "Choose OpenCode or Vercel AI Gateway.",
-        else => "This Team is incomplete. Review every role, model, and relationship.",
+        else => "This Team is incomplete. Review every role, model, and specialist assignment.",
     };
 }
 
@@ -876,8 +830,12 @@ test "guided Team editor revises without exposing JSON" {
     const projection = editor.projection();
     try std.testing.expectEqualStrings("Team", projection.title);
     try std.testing.expectEqualStrings("Name", projection.rows[0].label);
+    for (projection.rows) |row| {
+        try std.testing.expect(!std.mem.eql(u8, row.label, "ID"));
+        try std.testing.expect(!std.mem.eql(u8, row.label, "Relationships"));
+    }
     try std.testing.expect(std.mem.find(u8, projection.rows[0].label, "{") == null);
-    editor.selected = 7;
+    editor.selected = 6;
     const outcome = try editor.submit(alloc, "");
     switch (outcome) {
         .save => |saved| {
@@ -885,7 +843,32 @@ test "guided Team editor revises without exposing JSON" {
             var parsed = try team_document.Document.parse(alloc, saved);
             defer parsed.deinit();
             try std.testing.expect(parsed.value.peers.len + parsed.value.specialists.len > 0);
+            const saved_value = try std.json.parseFromSlice(std.json.Value, alloc, saved, .{});
+            defer saved_value.deinit();
+            try std.testing.expect(saved_value.value.object.get("primary").?.object.get("peers") == null);
+            try std.testing.expect(saved_value.value.object.get("peers").?.array.items[0].object.get("peers") == null);
         },
         else => return error.ExpectedSavedTeam,
     }
+}
+
+test "role model selection delegates to the native catalog" {
+    const alloc = std.testing.allocator;
+    const source =
+        "{\"schema\":2,\"id\":\"generated-team\",\"revision\":1,\"name\":\"Generated\",\"provider_id\":\"opencode\",\"models\":[" ++
+        "{\"id\":\"primary-model\",\"route\":\"\",\"name\":\"\"},{\"id\":\"peer-model\",\"route\":\"\",\"name\":\"\"}]," ++
+        "\"primary\":{\"id\":\"primary\",\"model_id\":\"primary-model\",\"definition\":\"Own.\"}," ++
+        "\"peers\":[{\"id\":\"peer\",\"model_id\":\"peer-model\",\"definition\":\"Help.\"}],\"specialists\":[]}";
+    var editor = try Editor.init(alloc, source);
+    defer editor.deinit();
+    editor.selected = 2;
+    _ = try editor.submit(alloc, "");
+    editor.selected = 1;
+    const outcome = try editor.submit(alloc, "");
+    switch (outcome) {
+        .choose_model => |provider| try std.testing.expectEqualStrings("opencode", provider),
+        else => return error.ExpectedNativeModelPicker,
+    }
+    editor.applySelectedModel("go/deepseek-v4-pro");
+    try std.testing.expectEqualStrings("go/deepseek-v4-pro", editor.modelDisplay(.primary));
 }

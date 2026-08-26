@@ -11,7 +11,6 @@ pub const Agent = struct {
     id: []const u8,
     model_id: []const u8,
     definition: []const u8,
-    peers: []const []const u8 = &.{},
     specialists: []const []const u8 = &.{},
 };
 
@@ -82,17 +81,12 @@ pub const Team = struct {
         try self.validateReachableCollaboration();
     }
 
-    /// ALT is deliberately not a single-model mode. Every declared agent must
-    /// be reachable from the primary through the peer graph, every specialist
-    /// must be callable by at least one reachable agent, and at least one such
-    /// collaborator must exist.
+    /// ALT is deliberately not a single-model mode. Peers form one complete
+    /// collaboration graph. Every specialist must be assigned to at least one
+    /// context-bearing agent, and at least one collaborator must exist.
     fn validateReachableCollaboration(self: Team) ValidationError!void {
         if (self.peers.len == 0 and self.specialists.len == 0) {
             return error.MissingCollaborator;
-        }
-
-        for (self.peers) |candidate| {
-            if (!self.agentReachable(candidate.id)) return error.UnreachablePeer;
         }
 
         for (self.specialists) |candidate| {
@@ -107,33 +101,6 @@ pub const Team = struct {
             }
             if (!callable) return error.UnreachableSpecialist;
         }
-    }
-
-    fn agentReachable(self: Team, target_id: []const u8) bool {
-        if (equal(target_id, self.primary.id)) return true;
-
-        // A bounded fixed-point walk avoids allocating during validation. A
-        // peer is reachable when there is a path from the primary through the
-        // undirected peer declarations. `visitedBefore` recomputes the earlier
-        // frontier deterministically from the Team document.
-        var depth: usize = 0;
-        while (depth <= self.peers.len) : (depth += 1) {
-            if (self.reachableWithin(target_id, depth)) return true;
-        }
-        return false;
-    }
-
-    fn reachableWithin(self: Team, target_id: []const u8, depth: usize) bool {
-        if (equal(target_id, self.primary.id)) return true;
-        if (depth == 0) return false;
-        const target = self.agent(target_id) orelse return false;
-        if (self.arePeers(self.primary.id, target.id)) return true;
-        for (self.peers) |candidate| {
-            if (equal(candidate.id, target.id)) continue;
-            if (self.arePeers(candidate.id, target.id) and
-                self.reachableWithin(candidate.id, depth - 1)) return true;
-        }
-        return false;
     }
 
     fn validateExclusiveModelOwnership(self: Team) ValidationError!void {
@@ -187,12 +154,6 @@ pub const Team = struct {
     fn validateAgent(self: Team, assignment: Agent) ValidationError!void {
         if (!validIdentifier(assignment.id)) return error.InvalidIdentifier;
         if (self.model(assignment.model_id) == null) return error.UnknownModel;
-        for (assignment.peers, 0..) |peer_id, index| {
-            if (equal(peer_id, assignment.id)) return error.SelfPeer;
-            const peer = self.agent(peer_id) orelse return error.UnknownPeer;
-            if (contains(assignment.peers[0..index], peer_id)) return error.DuplicatePeer;
-            if (contains(peer.peers, assignment.id)) return error.DuplicatePeerEdge;
-        }
         for (assignment.specialists, 0..) |specialist_id, index| {
             if (self.specialist(specialist_id) == null) return error.UnknownSpecialist;
             if (contains(assignment.specialists[0..index], specialist_id)) return error.DuplicateSpecialist;
@@ -222,9 +183,8 @@ pub const Team = struct {
     }
 
     pub fn arePeers(self: Team, left_id: []const u8, right_id: []const u8) bool {
-        const left = self.agent(left_id) orelse return false;
-        const right = self.agent(right_id) orelse return false;
-        return contains(left.peers, right.id) or contains(right.peers, left.id);
+        if (equal(left_id, right_id)) return false;
+        return self.agent(left_id) != null and self.agent(right_id) != null;
     }
 
     pub fn canUseSpecialist(self: Team, caller_id: []const u8, specialist_id: []const u8) bool {
@@ -248,14 +208,9 @@ pub const ValidationError = error{
     EmptyAssignment,
     DuplicateAssignment,
     UnknownModel,
-    SelfPeer,
-    UnknownPeer,
-    DuplicatePeer,
-    DuplicatePeerEdge,
     UnknownSpecialist,
     DuplicateSpecialist,
     MissingCollaborator,
-    UnreachablePeer,
     UnreachableSpecialist,
 };
 
@@ -304,7 +259,6 @@ const fixture_models = [_]Model{
     .{ .id = "research", .route = "free", .name = "research-model" },
     .{ .id = "vision", .route = "free", .name = "vision-model" },
 };
-const fixture_primary_peers = [_][]const u8{"researcher"};
 const fixture_primary_specialists = [_][]const u8{"vision-reader"};
 const fixture_peers = [_]Agent{.{
     .id = "researcher",
@@ -330,7 +284,6 @@ pub fn fixture() Team {
             .id = "coder",
             .model_id = "coding",
             .definition = "Own implementation end to end.",
-            .peers = &fixture_primary_peers,
             .specialists = &fixture_primary_specialists,
         },
         .peers = &fixture_peers,
@@ -338,7 +291,7 @@ pub fn fixture() Team {
     };
 }
 
-test "team preserves undirected peers and directed specialist authority" {
+test "all Team peers are mutually consultable and specialist authority is directed" {
     const value = fixture();
     try value.validate();
     try std.testing.expect(value.arePeers("coder", "researcher"));
@@ -364,28 +317,20 @@ test "Team identifiers are lowercase kebab-case" {
     try std.testing.expectError(error.InvalidIdentifier, value.validate());
 }
 
-test "an undirected peer edge has one durable declaration" {
-    const reverse = [_][]const u8{"coder"};
-    var peers = [_]Agent{fixture().peers[0]};
-    peers[0].peers = &reverse;
-    var value = fixture();
-    value.peers = &peers;
-    try std.testing.expectError(error.DuplicatePeerEdge, value.validate());
-}
-
 test "ALT refuses a primary-only Team" {
     var value = fixture();
-    value.primary.peers = &.{};
     value.primary.specialists = &.{};
     value.peers = &.{};
     value.specialists = &.{};
     try std.testing.expectError(error.MissingCollaborator, value.validate());
 }
 
-test "every peer must be reachable from the primary" {
+test "declared peers require no configurable edges" {
     var value = fixture();
-    value.primary.peers = &.{};
-    try std.testing.expectError(error.UnreachablePeer, value.validate());
+    value.primary.specialists = &.{};
+    value.specialists = &.{};
+    try value.validate();
+    try std.testing.expect(value.arePeers("coder", "researcher"));
 }
 
 test "every specialist must be callable by a reachable agent" {

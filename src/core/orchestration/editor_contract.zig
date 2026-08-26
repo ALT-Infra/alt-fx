@@ -19,6 +19,7 @@ pub const Projection = struct {
 pub const Outcome = union(enum) {
     redraw,
     replace_input: []const u8,
+    choose_model: []const u8,
     save: []u8,
     exit,
 };

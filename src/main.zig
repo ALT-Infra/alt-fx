@@ -1229,6 +1229,7 @@ const App = struct {
 
     pub fn moveOrchestrationDefinitionManager(self: *App, delta: i32) bool {
         if (comptime !build_options.orchestration_enabled) return false;
+        if (self.model_cache.menu.active) return false;
         return OrchestrationDefinitionAppRuntime.moveManager(self, delta);
     }
 
@@ -1244,7 +1245,101 @@ const App = struct {
 
     pub fn submitOrchestrationDefinitionManager(self: *App) !bool {
         if (comptime !build_options.orchestration_enabled) return false;
+        if (self.model_cache.menu.active) return false;
         return OrchestrationDefinitionAppRuntime.submitManager(self);
+    }
+
+    pub fn openOrchestrationDefinitionModelPicker(
+        self: *App,
+        provider_id: []const u8,
+    ) !bool {
+        if (comptime !build_options.orchestration_enabled) return false;
+        const provider = provider_catalog.parse(provider_id) orelse
+            return error.UnknownOrchestrationProvider;
+        if (provider_catalog.find(provider).catalog_scope != .unified) {
+            return error.OrchestrationProviderNotUnified;
+        }
+        if (provider_runtime.provider(self) == provider) {
+            self.ensureModelCache();
+        } else {
+            try self.flushBeforeBlockingExternalWork();
+            const resolution = credentials.resolveForProvider(
+                self.alloc,
+                self.auth.oauthTransport(),
+                self.auth.secretStore(),
+                .refresh_if_needed,
+                provider,
+                null,
+            ) catch {
+                try self.writeDomainNotice(.{
+                    .topic = "model",
+                    .tone = .@"error",
+                    .body = "Could not load credentials for that Team provider.",
+                }, true);
+                return false;
+            };
+            var credential = resolution.credential orelse {
+                self.auth.openPickerForProvider(self.alloc, provider);
+                self.shell.render_requests.request(.footer);
+                return false;
+            };
+            defer credential.deinit(self.alloc);
+            const access = credentials.catalogAccessForCredentialAndAccount(
+                credential.source,
+                credential.token,
+                credential.gatewayTeam(),
+                credential.accountId(),
+            );
+            const fetched = self.fetchProviderCatalog(provider, access) catch {
+                try self.writeDomainNotice(.{
+                    .topic = "model",
+                    .tone = .@"error",
+                    .body = "Could not load that Team provider's model catalog.",
+                }, true);
+                return false;
+            };
+            var catalog = switch (fetched) {
+                .catalog => |value| value,
+                .failure => {
+                    try self.writeDomainNotice(.{
+                        .topic = "model",
+                        .tone = .@"error",
+                        .body = "That Team provider's model catalog could not be validated.",
+                    }, true);
+                    return false;
+                },
+            };
+            defer model_catalog.freeModelCatalog(self.alloc, &catalog);
+            self.model_cache.adoptOwnedCatalog(access, &catalog);
+        }
+        try self.model_cache.openMenu();
+        self.input_runtime.inputResetState().clearCurrent(self.alloc);
+        self.shell.render_requests.request(.footer);
+        return true;
+    }
+
+    pub fn orchestrationDefinitionModelSelectionActive(self: *const App) bool {
+        if (comptime !build_options.orchestration_enabled) return false;
+        if (!self.orchestration_definition_manager.active or
+            self.orchestration_definition_manager.stage != .editor) return false;
+        const editor = self.orchestration_definition_editor orelse return false;
+        return editor.expectsModelSelection();
+    }
+
+    pub fn applyOrchestrationDefinitionModelSelection(
+        self: *App,
+        model_id: []const u8,
+    ) void {
+        if (comptime !build_options.orchestration_enabled) return;
+        if (self.orchestration_definition_editor) |*editor| {
+            editor.applySelectedModel(model_id);
+            self.shell.render_requests.request(.footer);
+        }
+    }
+
+    pub fn finishOrchestrationDefinitionModelPicker(self: *App) void {
+        if (comptime !build_options.orchestration_enabled) return;
+        self.model_cache.reset();
     }
 
     pub fn orchestrationConversationId(self: *App) []const u8 {
