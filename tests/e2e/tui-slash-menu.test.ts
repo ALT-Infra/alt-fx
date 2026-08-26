@@ -1002,7 +1002,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       ).toBe(71);
       expect(closedComposerRow).toBe(73);
       await session.sendLiteralText("/");
-      await session.waitForText("Commands 37", 5_000);
+      await session.waitForText("Commands 36", 5_000);
       const afterSlash = await capture("after-slash");
       expect(visibleTranscriptTailRow(afterSlash)).toBe(62);
       expect(composerRow(afterSlash)).toBe(64);
@@ -1185,17 +1185,10 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       const modelRow = initialGrid.find((line) =>
         line.includes("/model") && line.includes("choose what model and reasoning effort to use")
       );
-      const modelsRow = initialGrid.find((line) =>
-        line.includes("/models") && line.includes("browse available models")
-      );
       expect(modelRow).toBeDefined();
-      expect(modelsRow).toBeDefined();
       expect(modelRow!.trimStart().startsWith("/model")).toBe(true);
-      expect(modelRow!.indexOf("choose")).toBe(modelsRow!.indexOf("browse"));
       const metadataColumn = modelRow!.lastIndexOf("Model");
-      expect(modelsRow!.lastIndexOf("Model")).toBe(metadataColumn);
 
-      await session.sendKeys("Down");
       await session.sendKeys("Down");
       await session.waitForText(
         "manage local and remote MCP servers, resources, and prompts",
@@ -1511,7 +1504,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
 
       await session.sendText("/help");
-      let grid = await waitForHelpMenu(session, 37);
+      let grid = await waitForHelpMenu(session, 36);
       let pane = grid.join("\n");
       expect(pane).toContain("𝒇x");
       expect(pane).toContain("Run /help for commands");
@@ -1527,7 +1520,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       grid = await waitForHelpMenu(session, 5);
       expect(grid.join("\n")).toContain("[General]");
       await session.sendKeys("BTab");
-      grid = await waitForHelpMenu(session, 37);
+      grid = await waitForHelpMenu(session, 36);
       expect(grid.join("\n")).toContain("[All]");
 
       await session.sendLiteralText("clipboard");
@@ -1538,11 +1531,11 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).not.toContain("/clear");
 
       await session.sendKeys("C-u");
-      await waitForHelpMenu(session, 37);
+      await waitForHelpMenu(session, 36);
       await session.sendKeys("Down");
       await session.sendKeys("Enter");
       pane = await session.waitForPane(
-        (current) => hasEmptyComposer(current) && !current.includes("Commands 37"),
+        (current) => hasEmptyComposer(current) && !current.includes("Commands 36"),
         5_000,
       );
       expect(composerContains(pane, "/clear")).toBe(false);
@@ -1551,7 +1544,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("C-u");
       await session.sendText("/help");
-      await waitForHelpMenu(session, 37);
+      await waitForHelpMenu(session, 36);
       await session.sendLiteralText("additional directories");
       await waitForHelpMenu(session, 1);
       await session.sendKeys("Enter");
@@ -1568,7 +1561,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("C-u");
       await session.sendText("/help");
-      await waitForHelpMenu(session, 37);
+      await waitForHelpMenu(session, 36);
       await session.sendLiteralText("no command can match this query");
       await session.waitForText("No commands found.", 5_000);
       await session.sendKeys("Escape");
@@ -2582,7 +2575,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
 
       await session.sendText("/help");
-      grid = await waitForHelpMenu(session, 37);
+      grid = await waitForHelpMenu(session, 36);
       expect(grid.join("\n")).toContain("Run /help for commands");
       expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeSkills);
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
@@ -2696,7 +2689,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   );
 
   test(
-    "models command opens a searchable provider catalog and selects through the existing model flow",
+    "model Enter opens an inline provider catalog and selects through the existing model flow",
     async () => {
       const fixture = createModelsMenuFixture();
       const currentModel = "anthropic/claude-opus-4.8";
@@ -2757,13 +2750,68 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
       expect(await session.paneTitle()).toBe(`fx · workspace · ${currentModel}`);
 
-      await session.sendText("/models");
+      const alternateCount = (sequence: string) =>
+        countOccurrences(readFileSync(fixture.tapePath).toString("latin1"), sequence);
+      const entersBeforeModelMenu = alternateCount("\x1b[?1049h");
+      const leavesBeforeModelMenu = alternateCount("\x1b[?1049l");
+
+      await session.sendLiteralText("/mode");
+      await session.sendKeys("Enter");
+      await waitForModelsMenu(session, 4);
+      expect(await session.captureFullScrollback()).not.toContain(`● Model: ${currentModel}`);
+      await session.sendKeys("Escape");
+      await session.waitForPane(
+        (current) => hasEmptyComposer(current) && !current.includes("Tab Provider"),
+        5_000,
+      );
+
+      await session.sendLiteralText("/model");
+      await session.sendKeys("Tab");
+      const stagedPane = await session.waitForPane(
+        (current) =>
+          composerContains(current, "/model") &&
+          current.includes(currentModel) &&
+          !current.includes("Tab Provider"),
+        5_000,
+      );
+      expect(stagedPane).not.toContain("Models 4");
+      expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeModelMenu);
+      expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeModelMenu);
+      await session.sendKeys("Escape");
+      await session.sendKeys("C-u");
+      await session.waitForPane(hasEmptyComposer, 5_000);
+
+      await session.sendText("/model");
       let grid = await waitForModelsMenu(session, 4);
       let pane = grid.join("\n");
-      expect(pane).not.toContain("𝒇x");
+      expect(pane).toContain("𝒇x");
+      expect(pane).toContain("Run /help for commands");
+      expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeModelMenu);
+      expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeModelMenu);
       expect(pane).toContain("[All]");
+      expect(pane).toContain("Anthropic");
+      expect(pane).toContain("OpenAI");
+      expect(pane).toContain("Others");
+      expect(pane).not.toContain("xAI");
+      expect(pane).not.toContain("Z.AI");
       expect(pane).toContain(currentModel);
       expect(pane).toContain("1M context · 32K output · Fast");
+      expect(pane).toContain("Note: Gateway catalog is authenticated with an API key");
+      const headerRow = grid.findIndex((line) => line.includes("Models 4"));
+      const firstModelRow = grid.findIndex((line) => line.includes("openai/gpt-5.4"));
+      const lastModelRow = grid.findIndex((line) => line.includes(selectedModel));
+      const statusRow = grid.findIndex((line) =>
+        line.includes("Note: Gateway catalog is authenticated with an API key")
+      );
+      const currentRow = grid[firstModelRow + 1]!;
+      const openaiRow = grid[firstModelRow]!;
+      const currentFactsColumn = currentRow.indexOf("1M context");
+      const openaiFactsColumn = openaiRow.indexOf("400K context");
+      const currentNameEnd = currentRow.indexOf(currentModel) + currentModel.length;
+      expect(firstModelRow).toBe(headerRow + 2);
+      expect(statusRow).toBe(lastModelRow + 2);
+      expect(currentFactsColumn - currentNameEnd).toBe(2);
+      expect(openaiFactsColumn).toBe(currentFactsColumn);
       expect(pane).not.toContain("Authenticated model catalog loaded.");
       expect(pane).not.toContain("Current");
       expect(pane).not.toContain("Reasoning");
@@ -2793,7 +2841,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         5_000,
       );
 
-      await session.sendText("/models");
+      await session.sendText("/model");
       await waitForModelsMenu(session, 4);
       await session.sendKeys("Down");
       await session.sendKeys("Enter");
@@ -2805,7 +2853,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("C-u");
       await session.waitForPane(hasEmptyComposer, 5_000);
 
-      await session.sendText("/models");
+      await session.sendText("/model");
       await waitForModelsMenu(session, 4);
       await session.sendKeys("Down");
       await session.sendKeys("Down");
@@ -2832,7 +2880,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   );
 
   test(
-    "models command keeps shared-prefix ids distinguishable at narrow widths",
+    "model inline catalog keeps shared-prefix ids distinguishable at narrow widths",
     async () => {
       const fixture = createModelsMenuFixture();
       const modelIds = [
@@ -2868,7 +2916,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       });
       await session.waitForComposer(10_000);
 
-      await session.sendText("/models");
+      await session.sendText("/model");
       const pane = (await waitForModelsMenu(session, modelIds.length)).join("\n");
       for (const suffix of ["alpha", "beta", "gamma", "delta"]) {
         expect(pane).toContain(`ing-${suffix}`);
@@ -3421,7 +3469,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
 
       await session.sendLiteralText("/");
-      await session.waitForText("Commands 37", 5_000);
+      await session.waitForText("Commands 36", 5_000);
 
       for (let i = 0; i < 5; i += 1) {
         await session.sendKeys("Down");
@@ -3493,7 +3541,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       const grid = await session.capturePaneGrid();
       const pane = grid.join("\n");
-      expect(pane).toContain("Commands 2");
+      expect(pane).toContain("Commands 1");
       expect(pane).toContain("/model");
       expect(pane).toContain("…");
       expect(pane).not.toMatch(/\sModel\s*$/m);

@@ -33,7 +33,6 @@ const help_menu_presentation = @import("../../ui/footer/help_menu_presentation.z
 const settings_menu_presentation = @import("../../ui/footer/settings_menu_presentation.zig");
 const surface_frame = @import("../../ui/footer/surface_frame.zig");
 const footer_paint_plan = @import("../../ui/footer/paint_plan.zig");
-const catalog_screen_layout = @import("../../ui/catalog_screen_layout.zig");
 
 const ModelPickerStage = picker_state.ModelPickerStage;
 
@@ -367,7 +366,7 @@ pub fn CompletionRuntime(comptime App: type) type {
         fn routeNonSlashPickerMove(app: *App, delta: i32) !bool {
             if (try routeSettingsMenuMove(app, delta)) return true;
             if (try routeHelpMenuMove(app, delta)) return true;
-            if (routeModelMenuMove(app, delta)) return true;
+            if (try routeModelMenuMove(app, delta)) return true;
             if (routeAuthPickerMove(app, delta)) return true;
             if (try routeSkillsMenuMove(app, delta)) return true;
             if (comptime runtime_profile.allows(App, .durable_sessions)) {
@@ -441,29 +440,17 @@ pub fn CompletionRuntime(comptime App: type) type {
             );
         }
 
-        fn routeModelMenuMove(app: *App, delta: i32) bool {
+        fn routeModelMenuMove(app: *App, delta: i32) !bool {
             if (comptime !@hasField(App, "model_cache")) return false;
             if (!app.model_cache.menu.active) return false;
-            _ = app.model_cache.menu.moveVisibleItems(delta, modelMenuVisibleItems(app));
+            _ = app.model_cache.menu.moveVisibleItems(
+                delta,
+                model_menu_presentation.visibleNavigationItemsForBudget(
+                    render_input.modelMenuProjection(&app.model_cache),
+                    try inlineMenuRowBudget(app, model_menu_presentation.max_inline_rows),
+                ),
+            );
             return true;
-        }
-
-        fn modelMenuVisibleItems(app: *App) u16 {
-            const scan = ui_input.scanInputCursorVertical(
-                &app.input_runtime,
-                .down,
-                app.shell.layout.cols,
-                app.pending_images.items,
-            );
-            const layout = catalog_screen_layout.screenLayout(
-                app.shell.layout.rows,
-                scan.total_rows,
-                scan.cursor_row,
-            );
-            return model_menu_presentation.visibleNavigationItemsForBudget(
-                render_input.modelMenuProjection(&app.model_cache),
-                layout.menu_row_budget,
-            );
         }
 
         fn routeSessionPickerMove(app: *App, delta: i32) !bool {
@@ -1388,11 +1375,6 @@ const inline_completion_test_slash_specs = [_]command_specs.SlashSpec{
         .kind = .help,
         .command = "/help",
         .help_entry = "/help",
-    },
-    .{
-        .kind = .models,
-        .command = "/models",
-        .help_entry = "/models",
     },
     .{
         .kind = .resume_session,

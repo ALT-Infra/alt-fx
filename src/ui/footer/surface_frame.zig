@@ -15,6 +15,7 @@ const compact_command_menu_presentation = @import("compact_command_menu_presenta
 const input_presentation = @import("input_presentation.zig");
 const interaction_state = @import("interaction_state.zig");
 const picker_presentation = @import("picker_presentation.zig");
+const model_menu_presentation = @import("model_menu_presentation.zig");
 const skills_menu_presentation = @import("skills_menu_presentation.zig");
 const help_menu_presentation = @import("help_menu_presentation.zig");
 const settings_menu_presentation = @import("settings_menu_presentation.zig");
@@ -379,7 +380,8 @@ fn buildFooterSurfaceProjection(
     const show_settings_menu = !viewer_active and !show_auth_picker and !modal_active and ctx.settings_menu.active;
     const show_help_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !modal_active and ctx.help_menu.active;
     const show_session_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_help_menu and !modal_active and ctx.session_menu.active;
-    const show_inline_catalog = show_settings_menu or show_help_menu or show_session_menu;
+    const show_models_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_help_menu and !show_session_menu and !modal_active and ctx.model_menu.active;
+    const show_inline_catalog = show_settings_menu or show_help_menu or show_session_menu or show_models_menu;
     const show_skills_query = !viewer_active and !show_auth_picker and !show_inline_catalog and !modal_active and ctx.skills_menu.active;
     const stream_suppresses_file_query = ctx.stream.active and !ctx.queued_editor_active;
     const show_model_query = !viewer_active and !show_auth_picker and !show_inline_catalog and !show_skills_query and !modal_active and !ctx.stream.active and ctx.model_query_active;
@@ -439,6 +441,8 @@ fn buildFooterSurfaceProjection(
         .help
     else if (show_session_menu)
         .sessions
+    else if (show_models_menu)
+        .models
     else if (show_slash_query)
         .slash
     else if (show_auth_picker)
@@ -497,6 +501,12 @@ fn buildFooterSurfaceProjection(
         banner_rows,
         settings_menu_presentation.max_inline_rows,
     );
+    const models_picker_row_budget = picker_presentation.inlinePickerRowBudgetCapped(
+        shell.layout.rows,
+        geometry.input_extra,
+        banner_rows,
+        model_menu_presentation.max_inline_rows,
+    );
     const picker_rows: u16 = if (sizing_request) |request|
         if (request.file) |request_file|
             approval_ui.fileApprovalPickerRows(request_file)
@@ -535,6 +545,12 @@ fn buildFooterSurfaceProjection(
             ctx.session_menu,
             shell.layout.cols,
             expanded_picker_row_budget,
+        )
+    else if (show_models_menu)
+        model_menu_presentation.menuRowCount(
+            ctx.model_menu,
+            shell.layout.cols,
+            models_picker_row_budget,
         )
     else if (show_skills_query)
         skills_menu_presentation.inlineMenuRowCount(

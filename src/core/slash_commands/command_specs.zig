@@ -51,7 +51,6 @@ pub const SlashKind = enum {
     image,
     images,
     model,
-    models,
     permissions,
     allowlist,
     stats,
@@ -181,7 +180,7 @@ pub fn childChatSlashRegistry(
     var count: usize = 0;
     for (registry.commands) |spec| {
         switch (spec.kind) {
-            .quit, .models, .skills => {
+            .quit, .model, .skills => {
                 std.debug.assert(count < storage.len);
                 storage[count] = spec;
                 count += 1;
@@ -1746,20 +1745,17 @@ test "slash completion matches prefix and aliases" {
 
 test "slash completion ranks exact prefix and substring command matches" {
     const specs = [_]SlashSpec{
-        .{ .kind = .models, .command = "/models", .help_entry = "/models", .completion_description = "browse models", .presentation_category = .model },
         .{ .kind = .rename_session, .command = "/rename", .help_entry = "/rename <title>", .completion_description = "rename session", .presentation_category = .session },
         .{ .kind = .model, .command = "/model", .help_entry = "/model <id>", .completion_description = "choose model", .presentation_category = .model },
     };
     const registry = SlashRegistry{ .commands = specs[0..] };
 
-    try std.testing.expectEqual(@as(usize, 2), slashCompletionCount(registry, "/model"));
+    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(registry, "/model"));
     try std.testing.expectEqualStrings("/model", nthSlashCompletion(registry, "/model", 0).?);
     try std.testing.expectEqualStrings("choose model", nthSlashCompletionDescription(registry, "/model", 0).?);
-    try std.testing.expectEqualStrings("/models", nthSlashCompletion(registry, "/model", 1).?);
 
-    try std.testing.expectEqual(@as(usize, 2), slashCompletionCount(registry, "/mo"));
-    try std.testing.expectEqualStrings("/models", nthSlashCompletion(registry, "/mo", 0).?);
-    try std.testing.expectEqualStrings("/model", nthSlashCompletion(registry, "/mo", 1).?);
+    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(registry, "/mo"));
+    try std.testing.expectEqualStrings("/model", nthSlashCompletion(registry, "/mo", 0).?);
 
     try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(registry, "/name"));
     try std.testing.expectEqualStrings("/rename", nthSlashCompletion(registry, "/name", 0).?);
@@ -1794,7 +1790,7 @@ test "slash completion categories follow canonical entries" {
 test "help catalog groups visible commands and searches all command metadata" {
     const registry = testSlashRegistry();
 
-    try std.testing.expectEqual(@as(usize, 37), helpCatalogCount(registry, ""));
+    try std.testing.expectEqual(@as(usize, 36), helpCatalogCount(registry, ""));
     try std.testing.expectEqualStrings("/help", helpCatalogSpecAt(registry, "", 0).?.command);
     try std.testing.expectEqual(@as(usize, 5), helpCatalogCategoryCount(registry, "", .general));
     try std.testing.expectEqual(@as(usize, 3), helpCatalogCount(registry, "appearance"));
@@ -1872,9 +1868,16 @@ test "child chat slash registry exposes only locally handled commands" {
 
     try std.testing.expectEqual(@as(usize, 3), child.commands.len);
     try std.testing.expect(matchesSlashExact(child, "/quit", .quit));
-    try std.testing.expect(matchesSlashExact(child, "/models", .models));
+    try std.testing.expect(matchesSlashExact(child, "/model", .model));
+    try std.testing.expect(child.matchExact("/models") == null);
     try std.testing.expect(matchesSlashExact(child, "/skills", .skills));
     try std.testing.expect(child.matchExact("/help") == null);
+}
+
+test "interactive model command has no plural spelling" {
+    const registry = testSlashRegistry();
+    try std.testing.expect(registry.matchExact("/model") != null);
+    try std.testing.expect(registry.matchExact("/models") == null);
 }
 
 test "default slash registry resolves primary commands and aliases" {
@@ -2105,10 +2108,9 @@ test "slash completion labels strip argument prefixes" {
 }
 
 test "slash completion descriptions follow completion matches" {
-    try std.testing.expectEqual(@as(usize, 2), slashCompletionCount(testSlashRegistry(), "/mo"));
+    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(testSlashRegistry(), "/mo"));
     try std.testing.expectEqualStrings("/model", nthSlashCompletion(testSlashRegistry(), "/mo", 0).?);
     try std.testing.expectEqualStrings("choose what model and reasoning effort to use", nthSlashCompletionDescription(testSlashRegistry(), "/mo", 0).?);
-    try std.testing.expectEqualStrings("/models", nthSlashCompletion(testSlashRegistry(), "/mo", 1).?);
     try std.testing.expectEqualStrings("start a fresh session and keep background processes", nthSlashCompletionDescription(testSlashRegistry(), "/cl", 0).?);
     try std.testing.expectEqualStrings("undo the latest tracked file operation", nthSlashCompletionDescription(testSlashRegistry(), "/un", 0).?);
     try std.testing.expectEqualStrings("open the fx feedback form", nthSlashCompletionDescription(testSlashRegistry(), "/fee", 0).?);
