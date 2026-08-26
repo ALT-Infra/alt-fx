@@ -717,31 +717,36 @@ async function completeDisplayedGrokLogin(
   activeSession: TmuxSession,
   fixture: ReturnType<typeof startFakeGrokOAuth>,
 ) {
-  await activeSession.resizeWindow(500, 20);
-  const pane = await activeSession.waitForPane(
-    (value) => value.includes(`${fixture.baseUrl}/oauth2/authorize?`),
-    TIMEOUT,
+  await completeDisplayedSubscriptionLogin(
+    activeSession,
+    "Authorize with Grok",
+    `${fixture.baseUrl}/oauth2/authorize?`,
   );
-  const authorizationUrl = pane
-    .split(/\s+/)
-    .find((value) => value.startsWith(`${fixture.baseUrl}/oauth2/authorize?`));
-  if (!authorizationUrl) throw new Error("Grok authorization URL was not rendered");
-  const response = await fetch(authorizationUrl, { redirect: "follow" });
-  expect(response.status).toBe(200);
-  await activeSession.resizeWindow(100, 30);
 }
 
 async function completeDisplayedCodexLogin(
   activeSession: TmuxSession,
   fixture: ReturnType<typeof startFakeChatGptOAuth>,
 ) {
-  await activeSession.waitForText("Authorize with Codex", TIMEOUT);
+  await completeDisplayedSubscriptionLogin(
+    activeSession,
+    "Authorize with Codex",
+    `${fixture.baseUrl}/oauth/authorize?`,
+  );
+}
+
+async function completeDisplayedSubscriptionLogin(
+  activeSession: TmuxSession,
+  label: string,
+  authorizationUrlPrefix: string,
+) {
+  await activeSession.waitForText(label, TIMEOUT);
   const escapes = await activeSession.capturePaneEscapes();
-  const urlStart = escapes.indexOf(`${fixture.baseUrl}/oauth/authorize?`);
+  const urlStart = escapes.indexOf(authorizationUrlPrefix);
   const linkStart = escapes.lastIndexOf("\x1b]8;", urlStart);
   const urlEnd = escapes.indexOf("\x1b\\", urlStart);
   if (urlStart < 0 || linkStart < 0 || urlEnd < 0) {
-    throw new Error("Codex authorization hyperlink was not rendered");
+    throw new Error(`${label} hyperlink was not rendered`);
   }
   const authorizationUrl = escapes.slice(urlStart, urlEnd);
   const response = await fetch(authorizationUrl, { redirect: "follow" });
@@ -1154,6 +1159,9 @@ tmuxTest(
         pane.includes("Enter reopens browser · Esc cancels"),
       TIMEOUT,
     );
+    expect(signInScreen).toMatch(/^Sign in with Codex\s+Waiting for authorization…$/m);
+    expect(signInScreen).toMatch(/^  Open\s+Authorize with Codex$/m);
+    expect(signInScreen).toMatch(/^Enter reopens browser · Esc cancels$/m);
     expect(signInScreen).not.toContain("Code   ");
     expect(signInScreen).not.toContain(`${chatgptOauth.baseUrl}/oauth/authorize?`);
     const signInEscapes = await session.capturePaneEscapes();
@@ -2537,6 +2545,17 @@ tmuxTest(
       await session.sendKeys("Down");
       await session.sendKeys("Down");
       await session.sendKeys("Enter");
+      const collapsed = await session.waitForPane(
+        (pane) =>
+          pane.includes("Authorize with Grok") &&
+          pane.includes("Browser didn't return? Press Tab to enter a code") &&
+          pane.includes("Enter reopens browser · Tab enters code · Esc cancels"),
+        TIMEOUT,
+      );
+      expect(collapsed).toMatch(/^Sign in with Grok\s+Waiting for authorization…$/m);
+      expect(collapsed).toMatch(/^  Open\s+Authorize with Grok$/m);
+      expect(collapsed).not.toContain("Paste or type the code");
+      expect(collapsed).not.toContain(`${grok.baseUrl}/oauth2/authorize?`);
       await completeDisplayedGrokLogin(session, grok);
       await session.waitForText("Switched to Grok subscription with grok-4.20.", TIMEOUT);
       await session.sendText("Answer from Grok.");
@@ -2580,7 +2599,7 @@ tmuxTest(
 );
 
 tmuxTest(
-  "interactive Grok login accepts a bracketed-paste authorization code",
+  "interactive Grok login auto-expands for a bracketed-paste authorization code",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-grok-tui-code-"));
     stderrPath = join(home, "stderr.log");
@@ -2599,17 +2618,27 @@ tmuxTest(
       await session.sendKeys("Down");
       await session.sendKeys("Down");
       await session.sendKeys("Enter");
-      await session.waitForText("Paste the code shown by xAI", TIMEOUT);
+      await session.waitForText("Browser didn't return? Press Tab to enter a code", TIMEOUT);
+      await session.pasteText("grok-code");
+      await session.waitForPane(
+        (pane) => pane.includes("•••••••••") && pane.includes("Enter submits"),
+        TIMEOUT,
+      );
+      const expanded = await session.capturePane();
+      expect(expanded).toMatch(/^  Open\s+Authorize with Grok\n\s*\n  Paste the code shown by xAI$/m);
       await session.resizeWindow(80, 5);
       const compactEntry = await session.waitForPane(
         (pane) =>
-          pane.includes("Paste or type the code") &&
+          pane.includes("•••••••••") &&
           pane.includes("Enter submits") &&
           pane.includes("Esc cancels"),
         TIMEOUT,
       );
       expect(compactEntry).not.toContain("Paste the code shown by xAI");
-      await session.pasteText("grok-code");
+      await session.sendKeys("Tab");
+      const collapsedWithDraft = await session.waitForText("Tab enters code", TIMEOUT);
+      expect(collapsedWithDraft).not.toContain("•••••••••");
+      await session.sendKeys("Tab");
       await session.waitForPane(
         (pane) => pane.includes("•••••••••") && pane.includes("Enter submits"),
         TIMEOUT,
