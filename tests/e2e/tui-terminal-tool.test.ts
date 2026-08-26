@@ -21,6 +21,7 @@ import {
   fakeGatewayFinalText,
   fakeGatewaySse,
   fakeGatewayToolCall,
+  heldFakeGatewayFinalText,
   startFakeGateway,
   terminalFixtureShell,
   TmuxSession,
@@ -2315,6 +2316,99 @@ test.skipIf(!tmuxAvailable())(
       }),
     ]);
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  45_000,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "TUI terminal agent lease releases after an interrupted turn",
+  async () => {
+    const fixture = createFixture("fx-tui-terminal-interrupted-lease-");
+    const held = heldFakeGatewayFinalText();
+    let terminalSessionId = "";
+    try {
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("interrupted_lease_start", "terminal", {
+          action: "start",
+          cwd: fixture.workspace,
+          command: "printf 'INTERRUPTED_LEASE_READY\\n'; while :; do sleep 1; done",
+          shell: {
+            kind: "executable",
+            path: TERMINAL_FIXTURE_SHELL,
+            clean_start: true,
+          },
+          backend: "native",
+          return_when: { kind: "match", pattern: "INTERRUPTED_LEASE_READY" },
+          wait_ceiling_ms: 20_000,
+          dimensions: { rows: 24, columns: 80 },
+        }),
+        (body) => {
+          const result = JSON.parse(
+            toolResultText(body, "interrupted_lease_start"),
+          ) as {
+            success: { start: { session: { session_id: string } } };
+          };
+          terminalSessionId = result.success.start.session.session_id;
+          return fakeGatewayToolCall(
+            "interrupted_lease_acquire",
+            "terminal",
+            {
+              action: "write",
+              session_id: terminalSessionId,
+              lease: "acquire",
+            },
+          );
+        },
+        held.response,
+        () => fakeGatewayToolCall("interrupted_lease_read", "terminal", {
+          action: "read",
+          session_id: terminalSessionId,
+          cursor_segment: 1,
+          cursor_offset: 0,
+        }),
+        (body) => {
+          const read = toolResultText(body, "interrupted_lease_read");
+          expect(read).toContain('"write_lease":"none"');
+          return fakeGatewayToolCall("interrupted_lease_close", "terminal", {
+            action: "close",
+            session_id: terminalSessionId,
+            close_policy: "force",
+          });
+        },
+        (body) => {
+          expect(toolResultText(body, "interrupted_lease_close"))
+            .toContain('"lifecycle":"closed"');
+          return fakeGatewayFinalText("INTERRUPTED_LEASE_DONE");
+        },
+      ]);
+      gateways.push(gateway);
+      const active = await launch(fixture, gateway);
+
+      await active.sendText("Acquire terminal control and wait for instructions.");
+      await active.waitForText("Acquired control of", TIMEOUT);
+      const providerDeadline = Date.now() + TIMEOUT;
+      while (gateway.requests.length < 3 && Date.now() < providerDeadline) {
+        await Bun.sleep(25);
+      }
+      expect(gateway.requests).toHaveLength(3);
+      await active.sendKeys("Escape");
+      await active.waitForText("cancelled", TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+
+      await active.sendText("Read the session lease and close it.");
+      await active.waitForText("INTERRUPTED_LEASE_DONE", TIMEOUT);
+      expect(gateway.requests).toHaveLength(6);
+      expect(terminalRecords(fixture.home)).toEqual([
+        expect.objectContaining({
+          session_id: terminalSessionId,
+          lifecycle: "closed",
+          attention: expect.objectContaining({ write_lease: "none" }),
+        }),
+      ]);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+    } finally {
+      held.dispose();
+    }
   },
   45_000,
 );
