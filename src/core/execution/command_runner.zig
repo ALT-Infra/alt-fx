@@ -53,6 +53,7 @@ const command_artifact_log_suffix = ".log";
 const command_artifact_stdout_suffix = ".stdout.log";
 const command_artifact_stderr_suffix = ".stderr.log";
 const pending_output_flush_bytes: usize = 4096;
+const command_output_poll_ms: i64 = 100;
 const supports_foreground_session = builtin.link_libc and
     std.process.can_spawn and
     std.process.can_replace and
@@ -64,6 +65,7 @@ const foreground_session_release_byte: u8 = 0x06;
 const foreground_session_setup_timeout_ms: i64 = 5000;
 const foreground_target_termination_grace_ms: i64 = 700;
 const foreground_target_cleanup_wait_ms: i64 = 250;
+const foreground_supervisor_handoff_ms: i64 = command_output_poll_ms * 2;
 const foreground_session_replace_failure_exit_code: u8 = 125;
 const foreground_session_failure_nonce_bytes: usize = 16;
 const foreground_session_failure_nonce_hex_bytes: usize = foreground_session_failure_nonce_bytes * 2;
@@ -578,6 +580,11 @@ const ExecutionControl = struct {
     }
 };
 
+fn foreground_supervisor_fallback_deadline_ms(deadline_ms: ?i64) ?i64 {
+    const deadline = deadline_ms orelse return null;
+    return deadline +| foreground_supervisor_handoff_ms;
+}
+
 fn cancelRequested(cancel_flag: ?*std.atomic.Value(bool)) bool {
     return if (cancel_flag) |flag| flag.load(.seq_cst) else false;
 }
@@ -1062,7 +1069,8 @@ fn executeProcessWithDetachedSession(
     try helper_argv.append(scratch, executable);
     try helper_argv.append(scratch, foreground_session_token);
     const deadline_ms = ExecutionControl.init(cfg).deadlineMs();
-    const deadline_text = if (deadline_ms) |value|
+    const supervisor_deadline_ms = foreground_supervisor_fallback_deadline_ms(deadline_ms);
+    const deadline_text = if (supervisor_deadline_ms) |value|
         try std.fmt.allocPrint(scratch, "{d}", .{value})
     else
         "none";
@@ -2132,7 +2140,7 @@ fn collectOutput(
             continue;
         }
 
-        const keep_reading = if (multi_reader.fill(4096, .{ .duration = .{ .raw = .{ .nanoseconds = 100_000_000 }, .clock = .awake } }))
+        const keep_reading = if (multi_reader.fill(4096, .{ .duration = .{ .raw = .{ .nanoseconds = command_output_poll_ms * std.time.ns_per_ms }, .clock = .awake } }))
             true
         else |err| switch (err) {
             error.EndOfStream => false,
@@ -4149,6 +4157,21 @@ test "execution control reuses configured timeout start time" {
     try std.testing.expectEqual(started_ms, control.started_ms);
 }
 
+test "foreground supervisor fallback leaves the parent two termination polls" {
+    try std.testing.expectEqual(
+        @as(?i64, null),
+        foreground_supervisor_fallback_deadline_ms(null),
+    );
+    try std.testing.expectEqual(
+        @as(?i64, 1200),
+        foreground_supervisor_fallback_deadline_ms(1000),
+    );
+    try std.testing.expectEqual(
+        @as(?i64, std.math.maxInt(i64)),
+        foreground_supervisor_fallback_deadline_ms(std.math.maxInt(i64) - 100),
+    );
+}
+
 test "cancel and timeout tie chooses cancellation" {
     var cancel = std.atomic.Value(bool).init(true);
     try std.testing.expectError(error.CancelledBeforeExecution, executeCommand(.{
@@ -4156,4 +4179,81 @@ test "cancel and timeout tie chooses cancellation" {
         .cancel_flag = &cancel,
         .timeout_ms = 1,
     }, std.testing.allocator, "sleep 5", "/tmp"));
+}
+
+test "runtime cancellation observed at the timeout deadline stays graceful" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    for (0..10) |_| {
+        const alloc = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+        defer alloc.free(workspace);
+        const term_path = try std.fs.path.join(alloc, &.{ workspace, "tie.term" });
+        defer alloc.free(term_path);
+        const quoted_term = try shellQuote(alloc, term_path);
+        defer alloc.free(quoted_term);
+        const command = try std.fmt.allocPrint(
+            alloc,
+            "trap 'printf TERM > {s}; sleep 3; exit 130' TERM; printf 'TIE-READY\n'; while :; do sleep 1; done",
+            .{quoted_term},
+        );
+        defer alloc.free(command);
+
+        const timeout_ms: usize = 2000;
+        const started_ms = io_mod.milliTimestamp();
+        var cancel = std.atomic.Value(bool).init(false);
+        const CancelNearDeadline = struct {
+            fn run(flag: *std.atomic.Value(bool), request_at_ms: i64) void {
+                while (io_mod.milliTimestamp() < request_at_ms) {
+                    io_mod.sleep(std.time.ns_per_ms);
+                }
+                flag.store(true, .seq_cst);
+            }
+        };
+        const request_at_ms = started_ms + @as(i64, @intCast(timeout_ms)) - 25;
+        const thread = try std.Thread.spawn(
+            .{},
+            CancelNearDeadline.run,
+            .{ &cancel, request_at_ms },
+        );
+        defer thread.join();
+        var result: ?CommandExecutionResult = null;
+        var cancelled = false;
+        if (executeCommand(.{
+            .max_command_output_bytes = 4096,
+            .cancel_flag = &cancel,
+            .timeout_ms = timeout_ms,
+            .timeout_started_ms = started_ms,
+        }, alloc, command, workspace)) |value| {
+            result = value;
+            cancelled = value.cancelled;
+        } else |err| switch (err) {
+            error.Cancelled => cancelled = true,
+            else => {
+                try std.testing.expectEqual(error.Cancelled, err);
+                cancelled = true;
+            },
+        }
+        defer if (result) |value| alloc.free(value.output);
+
+        try std.testing.expect(cancelled);
+        try std.testing.expect(io_mod.milliTimestamp() - started_ms >= @as(i64, @intCast(timeout_ms)));
+        try std.testing.expect(absoluteFileExists(term_path));
+        const term_text = try readAbsoluteFile(alloc, term_path, 64);
+        defer alloc.free(term_text);
+        try std.testing.expectEqualStrings("TERM", term_text);
+    }
+}
+
+test "accepted short timeout matrix returns timeout errors" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    for ([_]usize{ 1, 2, 5, 10, 25, 50 }) |timeout_ms| {
+        try std.testing.expectError(error.TimeoutExpired, executeCommand(.{
+            .max_command_output_bytes = 1024,
+            .timeout_ms = timeout_ms,
+        }, std.testing.allocator, "sleep 30", "/tmp"));
+    }
 }
