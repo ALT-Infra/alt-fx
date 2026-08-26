@@ -5,6 +5,20 @@ const app_session_runtime = @import("../app/app_session_runtime.zig");
 const orchestration_app_runtime = @import("app_runtime.zig");
 const revision_store = @import("revision_store.zig");
 
+fn generateDefinitionId(
+    allocator: std.mem.Allocator,
+    definition_kind: []const u8,
+) ![]u8 {
+    var random_bytes: [12]u8 = undefined;
+    io_mod.getIo().random(&random_bytes);
+    const random_hex = std.fmt.bytesToHex(random_bytes, .lower);
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}-{s}",
+        .{ definition_kind, random_hex },
+    );
+}
+
 /// Owns the interactive definition-library and session-binding workflow. The
 /// composition root exposes narrow callbacks while this runtime keeps Team
 /// management out of `main.zig` and independent of ALT's document schema.
@@ -83,6 +97,7 @@ pub fn Runtime(
                             app.alloc,
                             text,
                         ) catch {},
+                        .choose_model => {},
                         .redraw => {},
                         .save => |source| app.alloc.free(source),
                     }
@@ -275,7 +290,10 @@ pub fn Runtime(
         }
 
         fn beginNewDefinition(app: *App) !void {
-            const template = try Extension.newDefinitionTemplate(app.alloc);
+            const descriptor = Extension.descriptor();
+            const definition_id = try generateDefinitionId(app.alloc, descriptor.definition_kind);
+            defer app.alloc.free(definition_id);
+            const template = try Extension.newDefinitionTemplate(app.alloc, definition_id);
             defer app.alloc.free(template);
             app.orchestration_definition_manager.enterCreateEditor(app.alloc);
             if (app.orchestration_definition_editor) |*editor| editor.deinit();
@@ -305,7 +323,6 @@ pub fn Runtime(
             try app.orchestration_definition_manager.enterReviseEditor(app.alloc);
             if (app.orchestration_definition_editor) |*editor| editor.deinit();
             app.orchestration_definition_editor = try Editor.init(app.alloc, revised);
-            app.orchestration_definition_editor.?.lockIdentity();
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
         }
 
@@ -346,6 +363,13 @@ pub fn Runtime(
                     app.alloc,
                     text,
                 ),
+                .choose_model => |provider_id| {
+                    if (comptime @hasDecl(App, "openOrchestrationDefinitionModelPicker")) {
+                        _ = try app.openOrchestrationDefinitionModelPicker(provider_id);
+                    } else {
+                        return error.OrchestrationModelPickerUnavailable;
+                    }
+                },
                 .exit => {
                     editor.deinit();
                     app.orchestration_definition_editor = null;
@@ -460,4 +484,15 @@ pub fn Runtime(
             }, true);
         }
     };
+}
+
+test "definition identities are opaque random host values" {
+    const alloc = std.testing.allocator;
+    const first = try generateDefinitionId(alloc, "team");
+    defer alloc.free(first);
+    const second = try generateDefinitionId(alloc, "team");
+    defer alloc.free(second);
+    try std.testing.expect(std.mem.startsWith(u8, first, "team-"));
+    try std.testing.expectEqual(@as(usize, "team-".len + 24), first.len);
+    try std.testing.expect(!std.mem.eql(u8, first, second));
 }

@@ -1,7 +1,7 @@
 const std = @import("std");
 const editor_contract = @import("editor_contract.zig");
 
-pub const api_version: u16 = 11;
+pub const api_version: u16 = 12;
 pub const AgentRunFailureKind = enum {
     interrupted,
     authentication,

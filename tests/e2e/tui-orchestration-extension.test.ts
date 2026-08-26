@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
@@ -47,7 +48,6 @@ const ENGINEERING_TEAM = {
     id: "engineering",
     model_id: "engineering",
     definition: "Own the task, use evidence, and publish the final answer.",
-    peers: ["coding"],
     specialists: ["visual-inspector"],
   },
   peers: [{
@@ -188,6 +188,16 @@ function startOpenCodeTeamUxServer() {
     port: 0,
     async fetch(request) {
       const url = new URL(request.url);
+      if (url.pathname === "/zen/models") {
+        return Response.json({ data: [
+          { id: "deepseek-v4-flash", object: "model" },
+        ] });
+      }
+      if (url.pathname === "/go/models") {
+        return Response.json({ data: [
+          { id: "deepseek-v4-pro", object: "model" },
+        ] });
+      }
       if (url.pathname !== "/chat") return new Response("not found", { status: 404 });
       await request.text();
       requestCount += 1;
@@ -211,6 +221,8 @@ function startOpenCodeTeamUxServer() {
   });
   return {
     chatUrl: `http://127.0.0.1:${server.port}/chat`,
+    zenModelsUrl: `http://127.0.0.1:${server.port}/zen/models`,
+    goModelsUrl: `http://127.0.0.1:${server.port}/go/models`,
     stop() {
       server.stop(true);
     },
@@ -509,6 +521,8 @@ describe.skipIf(SKIP)("tui: orchestration extension host", () => {
             FX_AUTO_UPGRADE: "0",
             FX_DISABLE_KEYCHAIN: "1",
             FX_E2E_OPENCODE_CHAT_URL: provider.chatUrl,
+            FX_E2E_OPENCODE_ZEN_MODELS_URL: provider.zenModelsUrl,
+            FX_E2E_OPENCODE_GO_MODELS_URL: provider.goModelsUrl,
             FX_SKIP_ONBOARDING: "1",
             OPENCODE_API_KEY: undefined,
           },
@@ -522,7 +536,51 @@ describe.skipIf(SKIP)("tui: orchestration extension host", () => {
           "Configure a primary plus at least one peer or specialist.",
           5_000,
         );
-        for (let index = 0; index < 7; index += 1) await session.sendKeys("Down");
+
+        await session.sendKeys("Down");
+        await session.sendKeys("Down");
+        await session.sendKeys("Enter");
+        await session.waitForText("Primary · primary", 5_000);
+        await session.sendKeys("Down");
+        await session.sendKeys("Enter");
+        await session.waitForText("Models", 5_000);
+        await session.sendLiteral("deepseek-v4-flash");
+        await session.waitForText("deepseek-v4-flash", 5_000);
+        await session.sendKeys("Enter");
+        await session.waitForText("Model  deepseek-v4-flash", 5_000);
+        await session.sendKeys("Escape");
+        await session.waitForPane(
+          (pane) => pane.includes("› Name") && pane.includes("Save & start"),
+          5_000,
+        );
+
+        for (const label of ["Provider", "Primary", "Peers"]) {
+          await session.sendKeys("Down");
+          await session.waitForPane((pane) => pane.includes(`› ${label}`), 5_000);
+        }
+        await session.sendKeys("Enter");
+        await session.waitForPane((pane) => pane.includes("› peer") && pane.includes("+ Add peer"), 5_000);
+        await session.sendKeys("Enter");
+        await session.waitForText("Peer · peer", 5_000);
+        await session.sendKeys("Down");
+        await session.sendKeys("Enter");
+        await session.waitForText("Models", 5_000);
+        await session.sendLiteral("go/deepseek-v4-pro");
+        await session.waitForText("go/deepseek-v4-pro", 5_000);
+        await session.sendKeys("Enter");
+        await session.waitForText("Model  go/deepseek-v4-pro", 5_000);
+        await session.sendKeys("Escape");
+        await session.waitForText("Peers", 5_000);
+        await session.sendKeys("Escape");
+        await session.waitForPane(
+          (pane) => pane.includes("› Name") && pane.includes("Save & start"),
+          5_000,
+        );
+        expect(existsSync(join(fxHome, "settings.json"))).toBe(false);
+        for (const label of ["Provider", "Primary", "Peers", "Specialists", "Specialist access", "Save & start"]) {
+          await session.sendKeys("Down");
+          await session.waitForPane((pane) => pane.includes(`› ${label}`), 5_000);
+        }
         await session.sendKeys("Enter");
         await session.waitForText("ALT mode enabled.", 5_000);
         await session.waitForComposer(5_000);
@@ -530,18 +588,27 @@ describe.skipIf(SKIP)("tui: orchestration extension host", () => {
         await session.waitForText(TEAM_UX_FIRST_MARKER, 10_000);
         await session.waitForComposer(5_000);
 
-        const manifestPath = join(
+        const teamsRoot = join(
           home,
           ".fx",
           "extensions",
           "alt",
           "teams",
-          "my-team",
+        );
+        const teamIds = readdirSync(teamsRoot, { withFileTypes: true })
+          .filter((entry) => entry.isDirectory())
+          .map((entry) => entry.name);
+        expect(teamIds).toHaveLength(1);
+        const teamId = teamIds[0]!;
+        expect(teamId).toMatch(/^team-[0-9a-f]{24}$/);
+        const manifestPath = join(
+          teamsRoot,
+          teamId,
           "manifest.json",
         );
         const initialManifest = JSON.parse(readFileSync(manifestPath, "utf8"));
         expect(initialManifest).toMatchObject({
-          id: "my-team",
+          id: teamId,
           name: "My Team",
           latest_revision: 1,
           deleted: false,
@@ -552,7 +619,7 @@ describe.skipIf(SKIP)("tui: orchestration extension host", () => {
           "extensions",
           "alt",
           "teams",
-          "my-team",
+          teamId,
           `1-${initialManifest.latest_digest}.json`,
         ))).toBe(true);
 
@@ -566,13 +633,19 @@ describe.skipIf(SKIP)("tui: orchestration extension host", () => {
         await session.waitForText("Edit as a new revision", 5_000);
         await session.sendKeys("Down");
         await session.sendKeys("Enter");
-        await session.waitForText("ID · fixed", 5_000);
+        await session.waitForText("Configure a primary plus at least one peer or specialist.", 5_000);
 
         await session.sendKeys("Enter");
         await session.sendKeys("C-u");
         await session.sendText("Revised Team");
-        await session.waitForText("Name  Revised Team", 5_000);
-        for (let index = 0; index < 7; index += 1) await session.sendKeys("Down");
+        await session.waitForPane(
+          (pane) => pane.includes("› Name  Revised Team") && pane.includes("Save & start"),
+          5_000,
+        );
+        for (const label of ["Provider", "Primary", "Peers", "Specialists", "Specialist access", "Save & start"]) {
+          await session.sendKeys("Down");
+          await session.waitForPane((pane) => pane.includes(`› ${label}`), 5_000);
+        }
         await session.sendKeys("Enter");
         await session.waitForText("ALT mode enabled.", 5_000);
         await session.waitForComposer(5_000);
@@ -582,7 +655,7 @@ describe.skipIf(SKIP)("tui: orchestration extension host", () => {
 
         const revisedManifest = JSON.parse(readFileSync(manifestPath, "utf8"));
         expect(revisedManifest).toMatchObject({
-          id: "my-team",
+          id: teamId,
           name: "Revised Team",
           latest_revision: 2,
           deleted: false,
@@ -593,7 +666,7 @@ describe.skipIf(SKIP)("tui: orchestration extension host", () => {
           "extensions",
           "alt",
           "teams",
-          "my-team",
+          teamId,
           `2-${revisedManifest.latest_digest}.json`,
         ))).toBe(true);
 

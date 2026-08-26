@@ -112,9 +112,9 @@ Open Team management directly, or begin a new Team in the guided builder:
 /alt new
 ```
 
-The builder configures the Team name and ID, unified provider, primary, peers, specialists, per-role model and instructions, consultable peer edges, and callable specialist authority. OpenCode model IDs use `model` for Zen or `go/model` for Go; Gateway model IDs use `provider/model`.
+The builder configures the Team name, unified provider, primary, peers, specialists, per-role model and instructions, and callable specialist authority. Team IDs are opaque and generated automatically. Role models are chosen through fx's native live model catalog instead of typed from memory. Every primary and peer can consult every other peer; specialist access is assigned independently to each primary or peer, so a specialist may be exclusive to one of them.
 
-The Team library can start the latest revision in a new conversation, edit it as the next immutable revision in another new conversation, or remove it from the active library. Editing keeps the Team ID fixed. Removed Teams remain available through sessions that already pin one of their revisions. A Team must contain a primary and at least one reachable peer or callable specialist; alt-fx does not offer a single-agent ALT preset.
+The Team library can start the latest revision in a new conversation, edit it as the next immutable revision in another new conversation, or remove it from the active library. Editing preserves the hidden Team identity. Removed Teams remain available through sessions that already pin one of their revisions. A Team must contain a primary and at least one peer or callable specialist; alt-fx does not offer a single-agent ALT preset.
 
 Return to native fx without leaving the application:
 
@@ -139,7 +139,7 @@ flowchart TD
 The runtime enforces these boundaries:
 
 - A consultation never transfers leadership or answers the user.
-- A consultant may call its own authorized peers and specialists.
+- A consultant may call any other Team peer and the specialists assigned to it.
 - Nested results return only to the immediate caller and unwind one frame at a time.
 - Context-bearing peer surfaces are serialized while unrelated child work may run concurrently.
 - Specialist batches may express dependency ordering with `depends_on`.

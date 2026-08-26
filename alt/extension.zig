@@ -57,34 +57,33 @@ pub fn inspectDefinition(
     };
 }
 
-pub fn newDefinitionTemplate(allocator: std.mem.Allocator) ![]u8 {
-    return allocator.dupe(u8,
-        \\{
+pub fn newDefinitionTemplate(allocator: std.mem.Allocator, definition_id: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator,
+        \\{{
         \\  "schema": 2,
-        \\  "id": "my-team",
+        \\  "id": "{s}",
         \\  "revision": 1,
         \\  "name": "My Team",
         \\  "provider_id": "opencode",
         \\  "models": [
-        \\    { "id": "primary-model", "route": "zen", "name": "kimi-k3" },
-        \\    { "id": "peer-model", "route": "go", "name": "kimi-k3" }
+        \\    {{ "id": "primary-model", "route": "", "name": "" }},
+        \\    {{ "id": "peer-model", "route": "", "name": "" }}
         \\  ],
-        \\  "primary": {
+        \\  "primary": {{
         \\    "id": "primary",
         \\    "model_id": "primary-model",
-        \\    "definition": "Own the user's request and its final answer.",
-        \\    "peers": ["peer"]
-        \\  },
+        \\    "definition": "Own the user's request and its final answer."
+        \\  }},
         \\  "peers": [
-        \\    {
+        \\    {{
         \\      "id": "peer",
         \\      "model_id": "peer-model",
         \\      "definition": "Contribute an independent perspective when consulted."
-        \\    }
+        \\    }}
         \\  ],
         \\  "specialists": []
-        \\}
-    );
+        \\}}
+    , .{definition_id});
 }
 
 pub fn nextDefinitionRevision(
@@ -181,18 +180,27 @@ test "adapter admits only a unified catalog provider" {
     try std.testing.expect(capture.entered);
 }
 
-test "Team editor template starts valid and revisions remain valid" {
+test "Team editor template receives an opaque identity and revisions remain valid" {
     const alloc = std.testing.allocator;
-    const template = try newDefinitionTemplate(alloc);
+    const template = try newDefinitionTemplate(alloc, "team-0123456789abcdef01234567");
     defer alloc.free(template);
-    var initial = try team_document.Document.parse(alloc, template);
-    defer initial.deinit();
-    try std.testing.expectEqual(@as(u32, 1), initial.value.revision);
+    const initial_value = try std.json.parseFromSlice(std.json.Value, alloc, template, .{});
+    defer initial_value.deinit();
+    try std.testing.expectEqualStrings(
+        "team-0123456789abcdef01234567",
+        initial_value.value.object.get("id").?.string,
+    );
 
-    const revised = try nextDefinitionRevision(alloc, template);
+    const valid =
+        "{\"schema\":2,\"id\":\"team-0123456789abcdef01234567\",\"revision\":1,\"name\":\"My Team\",\"provider_id\":\"opencode\",\"models\":[" ++
+        "{\"id\":\"primary-model\",\"route\":\"zen\",\"name\":\"kimi-k3\"}," ++
+        "{\"id\":\"peer-model\",\"route\":\"go\",\"name\":\"kimi-k3\"}]," ++
+        "\"primary\":{\"id\":\"primary\",\"model_id\":\"primary-model\",\"definition\":\"Own.\"}," ++
+        "\"peers\":[{\"id\":\"peer\",\"model_id\":\"peer-model\",\"definition\":\"Contribute.\"}],\"specialists\":[]}";
+    const revised = try nextDefinitionRevision(alloc, valid);
     defer alloc.free(revised);
     var next = try team_document.Document.parse(alloc, revised);
     defer next.deinit();
     try std.testing.expectEqual(@as(u32, 2), next.value.revision);
-    try std.testing.expectEqualStrings(initial.value.id, next.value.id);
+    try std.testing.expectEqualStrings("team-0123456789abcdef01234567", next.value.id);
 }

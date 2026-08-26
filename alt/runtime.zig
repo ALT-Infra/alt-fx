@@ -2535,15 +2535,12 @@ test "nested consultations unwind one caller at a time while child work remains 
         .{ .id = "gamma-model", .route = "go", .name = "gamma" },
         .{ .id = "lens-model", .route = "go", .name = "lens" },
     };
-    const alpha_peers = [_][]const u8{"beta"};
-    const beta_peers = [_][]const u8{"gamma"};
     const shared_specialists = [_][]const u8{"lens"};
     const peers = [_]team_mod.Agent{
         .{
             .id = "beta",
             .model_id = "beta-model",
             .definition = "Synthesize implementation evidence.",
-            .peers = &beta_peers,
             .specialists = &shared_specialists,
         },
         .{
@@ -2569,7 +2566,6 @@ test "nested consultations unwind one caller at a time while child work remains 
             .id = "alpha",
             .model_id = "alpha-model",
             .definition = "Own the final answer.",
-            .peers = &alpha_peers,
         },
         .peers = &peers,
         .specialists = &specialists,
