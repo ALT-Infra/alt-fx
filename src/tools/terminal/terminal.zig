@@ -5,6 +5,7 @@ const identity = @import("../../core/terminal/identity.zig");
 const operation = @import("../../core/terminal/operation.zig");
 const store = @import("../../core/terminal/store.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
+const types = @import("../../core/shared/types.zig");
 const sort_utils = @import("../../core/shared/sort_utils.zig");
 const command_environment = @import("../../core/execution/command_environment.zig");
 const io_mod = @import("../../core/shared/io.zig");
@@ -690,14 +691,14 @@ fn callDurable(
     input: *const Input,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const runtime = ctx.terminal_client orelse return structuredFailure(
-        ctx.allocator,
+        ctx,
         durableAction(input.action).?,
         null,
         .unsupported_host,
         false,
     );
     const owner = ctx.session_child_capability orelse return structuredFailure(
-        ctx.allocator,
+        ctx,
         durableAction(input.action).?,
         null,
         .authority_denied,
@@ -705,7 +706,7 @@ fn callDurable(
     );
     const durable_session_id = ctx.terminal_owner_session_id orelse
         return structuredFailure(
-            ctx.allocator,
+            ctx,
             durableAction(input.action).?,
             null,
             .authority_denied,
@@ -716,7 +717,7 @@ fn callDurable(
     const arena = arena_state.allocator();
     var profile_user_buffer: [64]u8 = undefined;
     const profile_user = identity.profileUser(&profile_user_buffer) orelse return structuredFailure(
-        ctx.allocator,
+        ctx,
         durableAction(input.action).?,
         input.session_id,
         .unsupported_host,
@@ -739,12 +740,12 @@ fn callDurable(
         if (err == error.TerminalSessionNotFound and
             input.action == .list and input.session_id == null)
         {
-            return stringifyResult(ctx.allocator, .{ .success = .{
+            return projectResult(ctx, .{ .success = .{
                 .list = .{ .sessions = &.{} },
             } });
         }
         return structuredFailure(
-            ctx.allocator,
+            ctx,
             durableAction(input.action).?,
             input.session_id,
             mapErrorCode(err),
@@ -765,7 +766,7 @@ fn callDurable(
             .{ @tagName(input.action), @errorName(err) },
         );
         return structuredFailure(
-            ctx.allocator,
+            ctx,
             durableAction(input.action).?,
             request.sessionId(),
             mapErrorCode(err),
@@ -779,7 +780,7 @@ fn callDurable(
             var completion = completion_value;
             defer completion.deinit();
             return resultFromCompletion(
-                ctx.allocator,
+                ctx,
                 durableAction(input.action).?,
                 request.sessionId(),
                 completion,
@@ -1352,16 +1353,16 @@ fn repeatedProbeAuthority(
 }
 
 fn resultFromCompletion(
-    alloc: Allocator,
+    ctx: tool_dispatch.DispatchContext,
     action: contracts.Action,
     session_id: ?[]const u8,
     completion: client.Completion,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     if (completion.frame) |*frame| {
         return switch (frame.message().payload) {
-            .response => |response| stringifyResult(alloc, response),
+            .response => |response| projectResult(ctx, response),
             else => structuredFailure(
-                alloc,
+                ctx,
                 action,
                 session_id,
                 .protocol_incompatible,
@@ -1370,7 +1371,7 @@ fn resultFromCompletion(
         };
     }
     return structuredFailure(
-        alloc,
+        ctx,
         action,
         session_id,
         switch (completion.kind) {
@@ -1403,6 +1404,20 @@ fn stringifyResult(
     };
 }
 
+fn projectResult(
+    ctx: tool_dispatch.DispatchContext,
+    result: contracts.Result,
+) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+    const projected = terminalActionPresentation(result);
+    const tool_result = try stringifyResult(ctx.allocator, result);
+    if (projected) |presentation_value| {
+        tool_dispatch.reportToolResultMemory(ctx, .{
+            .terminal_action_presentation = presentation_value,
+        });
+    }
+    return tool_result;
+}
+
 pub fn mapAuthorizedResult(
     alloc: Allocator,
     result: tool_dispatch.DispatchResult,
@@ -1423,30 +1438,78 @@ pub fn mapAuthorizedResult(
         .failure => |failure| failure.code,
     };
     var mapped = result;
-    mapped.status_detail = switch (code) {
-        .path_outside_workspace => try alloc.dupe(u8, "path is outside the workspace"),
-        .authority_retired => try alloc.dupe(
-            u8,
-            "saved terminal authority is from an older fx version; start a new terminal",
-        ),
-        else => return result,
-    };
+    mapped.status_detail = try alloc.dupe(
+        u8,
+        terminalFailurePresentation(code).detail(),
+    );
     return mapped;
 }
 
 fn structuredFailure(
-    alloc: Allocator,
+    ctx: tool_dispatch.DispatchContext,
     action: contracts.Action,
     session_id: ?[]const u8,
     code: contracts.StructuredErrorCode,
     retryable: bool,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    return stringifyResult(alloc, .{ .failure = .{
+    return projectResult(ctx, .{ .failure = .{
         .action = action,
         .code = code,
         .session_id = session_id,
         .retryable = retryable,
     } });
+}
+
+fn terminalActionPresentation(
+    result: contracts.Result,
+) ?types.TerminalActionPresentation {
+    return switch (result) {
+        .success => |success| switch (success) {
+            .start => |value| .{ .returned = terminalReturnPresentation(value.outcome) },
+            .wait => |value| .{ .returned = terminalReturnPresentation(value.outcome) },
+            .read, .screen, .write, .monitor, .inspect, .list, .resize, .signal, .close => null,
+        },
+        .failure => |failure| .{ .failed = terminalFailurePresentation(failure.code) },
+    };
+}
+
+fn terminalReturnPresentation(
+    outcome: contracts.ReturnOutcome,
+) types.TerminalReturnPresentation {
+    return switch (outcome) {
+        .started => .started,
+        .condition_met => .condition_met,
+        .safety_ceiling => .safety_ceiling,
+        .cancelled => .cancelled,
+        .exited => |code| .{ .exited = code },
+        .signal => |signal| .{ .signal = signal },
+    };
+}
+
+fn terminalFailurePresentation(
+    code: contracts.StructuredErrorCode,
+) types.TerminalFailurePresentation {
+    return switch (code) {
+        .invalid_request => .invalid_request,
+        .path_outside_workspace => .path_outside_workspace,
+        .unsupported_host => .unsupported_host,
+        .shell_unavailable => .shell_unavailable,
+        .pty_unavailable => .pty_unavailable,
+        .startup_failed => .startup_failed,
+        .process_identity_unavailable => .process_identity_unavailable,
+        .session_lost => .session_lost,
+        .session_not_found => .session_not_found,
+        .invalid_lifecycle => .invalid_lifecycle,
+        .authority_denied => .authority_denied,
+        .authority_retired => .authority_retired,
+        .lease_conflict => .lease_conflict,
+        .cursor_gap => .cursor_gap,
+        .screen_unavailable => .screen_unavailable,
+        .monitor_unavailable => .monitor_unavailable,
+        .protocol_incompatible => .protocol_incompatible,
+        .capacity_exceeded => .capacity_exceeded,
+        .cancelled => .cancelled,
+    };
 }
 
 fn mapErrorCode(err: anyerror) contracts.StructuredErrorCode {
@@ -2466,7 +2529,17 @@ test "terminal result mapper adds detail for actionable failures" {
         .{
             .status = .failure,
             .body = "{\"failure\":{\"action\":\"start\",\"code\":\"invalid_request\",\"session_id\":null,\"retryable\":false}}",
-            .expected_detail = null,
+            .expected_detail = "invalid request",
+        },
+        .{
+            .status = .failure,
+            .body = "{\"failure\":{\"action\":\"wait\",\"code\":\"session_not_found\",\"session_id\":\"terminal-missing\",\"retryable\":false}}",
+            .expected_detail = "terminal session not found",
+        },
+        .{
+            .status = .failure,
+            .body = "{\"failure\":{\"action\":\"start\",\"code\":\"capacity_exceeded\",\"session_id\":null,\"retryable\":true}}",
+            .expected_detail = "terminal capacity exceeded",
         },
         .{
             .status = .failure,
@@ -2490,7 +2563,10 @@ test "terminal result mapper adds detail for actionable failures" {
         defer mapped.deinit(alloc);
         try std.testing.expectEqualStrings(case.body, mapped.body);
         if (case.expected_detail) |expected| {
-            try std.testing.expectEqualStrings(expected, mapped.status_detail.?);
+            try std.testing.expectEqualStrings(
+                expected,
+                mapped.status_detail orelse return error.TestExpectedDetail,
+            );
         } else {
             try std.testing.expect(mapped.status_detail == null);
         }
@@ -2568,7 +2644,7 @@ test "terminal completion maps only complete signal capability misses to unsuppo
 
     for (cases) |case| {
         const result = try resultFromCompletion(
-            alloc,
+            .{ .allocator = alloc },
             .start,
             null,
             case.completion,

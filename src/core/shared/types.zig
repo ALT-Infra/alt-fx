@@ -734,6 +734,7 @@ pub const PersistedToolResult = struct {
     committed_file_presentation: ?CommittedFilePresentation = null,
     command_output_replay: ?CommandOutputReplay = null,
     command_process_presentation: ?CommandProcessPresentation = null,
+    terminal_action_presentation: ?TerminalActionPresentation = null,
 };
 
 pub const CommandOutputReplayDescriptor = struct {
@@ -754,6 +755,83 @@ pub const CancelledCommandPresentation = struct {
 pub const CommandProcessPresentation = union(enum) {
     exit_code: i64,
     signal: u32,
+    timed_out,
+    output_capture_failed,
+};
+
+pub const TerminalReturnPresentation = union(enum) {
+    started,
+    condition_met,
+    safety_ceiling,
+    cancelled,
+    exited: i32,
+    signal: u32,
+};
+
+pub const TerminalFailurePresentation = enum {
+    invalid_request,
+    path_outside_workspace,
+    unsupported_host,
+    shell_unavailable,
+    pty_unavailable,
+    startup_failed,
+    process_identity_unavailable,
+    session_lost,
+    session_not_found,
+    invalid_lifecycle,
+    authority_denied,
+    authority_retired,
+    lease_conflict,
+    cursor_gap,
+    screen_unavailable,
+    monitor_unavailable,
+    protocol_incompatible,
+    capacity_exceeded,
+    cancelled,
+
+    pub fn detail(self: TerminalFailurePresentation) []const u8 {
+        return switch (self) {
+            .invalid_request => "invalid request",
+            .path_outside_workspace => "path is outside the workspace",
+            .unsupported_host => "terminal host is unavailable",
+            .shell_unavailable => "terminal shell is unavailable",
+            .pty_unavailable => "terminal PTY is unavailable",
+            .startup_failed => "terminal startup failed",
+            .process_identity_unavailable => "terminal process identity is unavailable",
+            .session_lost => "terminal session was lost",
+            .session_not_found => "terminal session not found",
+            .invalid_lifecycle => "terminal session is in an invalid lifecycle state",
+            .authority_denied => "terminal authority denied",
+            .authority_retired => "saved terminal authority is from an older fx version; start a new terminal",
+            .lease_conflict => "terminal control lease conflict",
+            .cursor_gap => "terminal output cursor gap",
+            .screen_unavailable => "terminal screen is unavailable",
+            .monitor_unavailable => "terminal monitor is unavailable",
+            .protocol_incompatible => "terminal protocol is incompatible",
+            .capacity_exceeded => "terminal capacity exceeded",
+            .cancelled => "terminal action was cancelled",
+        };
+    }
+};
+
+pub const TerminalActionPresentation = union(enum) {
+    returned: TerminalReturnPresentation,
+    failed: TerminalFailurePresentation,
+
+    pub fn outcomeKind(self: TerminalActionPresentation) ToolOutcomeKind {
+        return switch (self) {
+            .returned => |returned| switch (returned) {
+                .started, .condition_met, .safety_ceiling => .completed,
+                .cancelled => .cancelled,
+                .exited => |code| if (code == 0) .completed else .failed,
+                .signal => .failed,
+            },
+            .failed => |failed| if (failed == .cancelled)
+                .cancelled
+            else
+                .failed,
+        };
+    }
 };
 
 pub const deferred_tool_result_output = "Not executed";
@@ -813,6 +891,7 @@ pub const ToolResultMemory = struct {
     committed_file_presentation: ?CommittedFilePresentation = null,
     command_output_replay: ?CommandOutputReplay = null,
     command_process_presentation: ?CommandProcessPresentation = null,
+    terminal_action_presentation: ?TerminalActionPresentation = null,
 };
 
 pub const ToolExecutionStep = struct {
@@ -2139,6 +2218,7 @@ fn dupePersistedToolResult(alloc: std.mem.Allocator, result: PersistedToolResult
         .committed_file_presentation = committed_file_presentation,
         .command_output_replay = command_output_replay,
         .command_process_presentation = result.command_process_presentation,
+        .terminal_action_presentation = result.terminal_action_presentation,
     };
 }
 
