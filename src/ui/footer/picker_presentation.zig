@@ -440,26 +440,30 @@ fn composeSignInPickerRow(
     if (subscription_source and row_index == 0) {
         try row.appendSlice(alloc, ui_render.dim_style);
         const value_col = detailValueColumn(width);
+        const status = switch (snapshot.state) {
+            .idle => "Preparing sign-in…",
+            .polling => "Waiting for authorization…",
+            .succeeded => "Authorization complete",
+            .failed => "Sign-in failed",
+            .cancelled => "Sign-in cancelled",
+        };
+        const status_col = @max(
+            value_col,
+            @as(usize, width) -| display_width.visibleWidth(status),
+        );
         try row_text.appendSingleLineEllipsized(
             alloc,
             &row,
             if (source == .chatgpt_subscription) "Sign in with Codex" else "Sign in with Grok",
             value_col,
         );
-        if (value_col < width) {
-            try row_text.appendSpacesToColumn(alloc, &row, value_col);
-            const status = switch (snapshot.state) {
-                .idle => "Preparing sign-in…",
-                .polling => "Waiting for authorization…",
-                .succeeded => "Authorization complete",
-                .failed => "Sign-in failed",
-                .cancelled => "Sign-in cancelled",
-            };
+        if (status_col < width) {
+            try row_text.appendSpacesToColumn(alloc, &row, status_col);
             try row_text.appendSingleLineEllipsized(
                 alloc,
                 &row,
                 status,
-                @as(usize, width) - value_col,
+                @as(usize, width) - status_col,
             );
         }
         try row.appendSlice(alloc, ui_render.reset_style);
@@ -2284,7 +2288,7 @@ test "Codex sign-in projects the compact aligned footer through the VT emulator"
     defer row.deinit(alloc);
     try grid.rowTextTrimmed(1, &row);
     try std.testing.expectEqualStrings(
-        "Sign in with Codex                                   Waiting for authorization…",
+        "Sign in with Codex                                    Waiting for authorization…",
         row.items,
     );
     row.clearRetainingCapacity();
@@ -2327,7 +2331,7 @@ test "Grok sign-in starts with the collapsed browser flow in the VT emulator" {
     var row: std.ArrayList(u8) = .empty;
     defer row.deinit(alloc);
     const expected_rows = [_][]const u8{
-        "Sign in with Grok                                    Waiting for authorization…",
+        "Sign in with Grok                                     Waiting for authorization…",
         "",
         "  Open   Authorize with Grok",
         "  Browser didn't return? Press Tab to enter a code",
@@ -2370,7 +2374,7 @@ test "Grok manual fallback projects the approved expanded layout through the VT 
     var row: std.ArrayList(u8) = .empty;
     defer row.deinit(alloc);
     const expected_rows = [_][]const u8{
-        "Sign in with Grok                                    Waiting for authorization…",
+        "Sign in with Grok                                     Waiting for authorization…",
         "",
         "  Open   Authorize with Grok",
         "",
