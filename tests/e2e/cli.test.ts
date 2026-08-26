@@ -4022,7 +4022,7 @@ describe("cli: ask success", () => {
       expect(jsonResult.code).toBe(1);
       expect(jsonResult.stderr).toBe("");
       expect(jsonResult.stdout).toBe(
-        '{"output":"","exit_code":1,"model":"","session_id":"","steps":0,"tool_calls":[],"error":"PromptResourceLimitExceeded"}\n',
+        '{"output":"","final_output":"","exit_code":1,"model":"","session_id":"","steps":0,"tool_calls":[],"error":"PromptResourceLimitExceeded"}\n',
       );
     },
     120_000,

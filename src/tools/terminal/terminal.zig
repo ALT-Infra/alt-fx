@@ -348,6 +348,7 @@ fn actionFieldCorrection(
 const OwnedInput = struct {
     arena_state: std.heap.ArenaAllocator.State,
     value: Input,
+    lease_explicit: bool,
 
     fn deinit(self: *OwnedInput, alloc: Allocator) void {
         self.arena_state.promote(alloc).deinit();
@@ -397,6 +398,7 @@ pub fn decode(
             "terminal arguments must match the advertised action schema",
         ) };
     };
+    const lease_explicit = raw.object.get("lease") != null;
     if (action == .exec) {
         if (raw.object.get("timeout_ms")) |timeout_value| {
             if (timeout_value != .integer) {
@@ -442,6 +444,7 @@ pub fn decode(
     owned.* = .{
         .arena_state = arena_state.state,
         .value = input,
+        .lease_explicit = lease_explicit,
     };
     arena_state.state = .init;
     return .{ .input = .{
@@ -550,9 +553,136 @@ pub fn call(
     ctx: tool_dispatch.DispatchContext,
     erased: tool_dispatch.ToolInput,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    const input = &erased.as(OwnedInput).value;
+    const owned = erased.as(OwnedInput);
+    const input = &owned.value;
     if (input.action == .exec) return callExec(ctx, input);
+    if (input.action == .write and input.write != null and !owned.lease_explicit) {
+        return call_atomic_write(ctx, input);
+    }
     return callDurable(ctx, input);
+}
+
+fn call_atomic_write(
+    ctx: tool_dispatch.DispatchContext,
+    input: *const Input,
+) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+    var acquire = input.*;
+    acquire.lease = .acquire;
+    acquire.write = null;
+    var acquired = try callDurable(ctx, &acquire);
+    switch (acquired) {
+        .failure => return acquired,
+        .success => {},
+    }
+    defer acquired.deinit(ctx.allocator);
+
+    var use = input.*;
+    use.lease = .use;
+    var used = callDurable(ctx, &use) catch |err| {
+        release_atomic_write_after_failure(ctx, input);
+        return err;
+    };
+    switch (used) {
+        .failure => {
+            release_atomic_write_after_failure(ctx, input);
+            return used;
+        },
+        .success => {},
+    }
+    defer used.deinit(ctx.allocator);
+
+    var released = try release_atomic_write(ctx, input);
+    switch (released) {
+        .failure => return released,
+        .success => {},
+    }
+    defer released.deinit(ctx.allocator);
+
+    return merge_atomic_write_results(ctx.allocator, used, released);
+}
+
+fn release_atomic_write(
+    ctx: tool_dispatch.DispatchContext,
+    input: *const Input,
+) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+    var release = input.*;
+    release.lease = .release;
+    release.write = null;
+    var cleanup_ctx = ctx;
+    cleanup_ctx.cancel_flag = null;
+    return callDurable(cleanup_ctx, &release);
+}
+
+fn release_atomic_write_after_failure(
+    ctx: tool_dispatch.DispatchContext,
+    input: *const Input,
+) void {
+    var released = release_atomic_write(ctx, input) catch |err| {
+        debug_trace.logf(
+            "terminal",
+            "atomic write cleanup failed session_id={s} err={s}",
+            .{ input.session_id orelse "", @errorName(err) },
+        );
+        return;
+    };
+    defer released.deinit(ctx.allocator);
+    switch (released) {
+        .success => {},
+        .failure => debug_trace.logf(
+            "terminal",
+            "atomic write cleanup was rejected session_id={s}",
+            .{input.session_id orelse ""},
+        ),
+    }
+}
+
+fn merge_atomic_write_results(
+    alloc: Allocator,
+    used: tool_dispatch.ToolResult,
+    released: tool_dispatch.ToolResult,
+) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+    const used_body = switch (used) {
+        .success => |value| value,
+        .failure => return error.InvalidToolArguments,
+    };
+    var parsed_used = try std.json.parseFromSlice(
+        contracts.Result,
+        alloc,
+        used_body,
+        .{},
+    );
+    defer parsed_used.deinit();
+    const accepted_bytes = switch (parsed_used.value) {
+        .success => |success| switch (success) {
+            .write => |write| write.accepted_bytes,
+            else => return error.InvalidToolArguments,
+        },
+        .failure => return error.InvalidToolArguments,
+    };
+
+    const released_body = switch (released) {
+        .success => |value| value,
+        .failure => return error.InvalidToolArguments,
+    };
+    var parsed_released = try std.json.parseFromSlice(
+        contracts.Result,
+        alloc,
+        released_body,
+        .{},
+    );
+    defer parsed_released.deinit();
+    return switch (parsed_released.value) {
+        .success => |success| switch (success) {
+            .write => |write| stringifyResult(alloc, .{ .success = .{
+                .write = .{
+                    .session = write.session,
+                    .accepted_bytes = accepted_bytes,
+                },
+            } }),
+            else => error.InvalidToolArguments,
+        },
+        .failure => error.InvalidToolArguments,
+    };
 }
 
 fn callDurable(
@@ -1486,6 +1616,43 @@ test "terminal decoder accepts every public action and owns its input" {
     }
 }
 
+test "terminal atomic write selection preserves explicit legacy lease calls" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        arguments_json: []const u8,
+        lease_explicit: bool,
+    }{
+        .{
+            .arguments_json = "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"write\":{\"kind\":\"text\",\"text\":\"input\"}}",
+            .lease_explicit = false,
+        },
+        .{
+            .arguments_json = "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"lease\":\"use\",\"write\":{\"kind\":\"text\",\"text\":\"input\"}}",
+            .lease_explicit = true,
+        },
+        .{
+            .arguments_json = "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"lease\":\"acquire\"}",
+            .lease_explicit = true,
+        },
+    };
+    for (cases) |case| {
+        const decoded = try decode(.{ .allocator = alloc }, case.arguments_json);
+        switch (decoded) {
+            .failure => |message| {
+                defer alloc.free(message);
+                return error.TestUnexpectedResult;
+            },
+            .input => |input| {
+                defer input.deinit(alloc);
+                try std.testing.expectEqual(
+                    case.lease_explicit,
+                    input.as(OwnedInput).lease_explicit,
+                );
+            },
+        }
+    }
+}
+
 test "terminal decoder keeps complex decode within allocation budget" {
     var counted = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const alloc = counted.allocator();
@@ -2319,6 +2486,52 @@ test "terminal result mapper adds detail for actionable failures" {
         } else {
             try std.testing.expect(mapped.status_detail == null);
         }
+    }
+}
+
+test "terminal atomic write result combines use bytes with released session facts" {
+    const alloc = std.testing.allocator;
+    const base_facts = contracts.SessionFacts{
+        .session_id = "terminal-a",
+        .lifecycle = .running,
+        .attention = .{ .write_lease = .agent },
+        .backend = .native,
+        .output_cursor = .{ .segment = 1, .offset = 0 },
+        .screen_recovery = .{ .unavailable = .missing },
+    };
+    var used = try stringifyResult(alloc, .{ .success = .{ .write = .{
+        .session = base_facts,
+        .accepted_bytes = 19,
+    } } });
+    defer used.deinit(alloc);
+    var released_facts = base_facts;
+    released_facts.attention.write_lease = .none;
+    var released = try stringifyResult(alloc, .{ .success = .{ .write = .{
+        .session = released_facts,
+        .accepted_bytes = 0,
+    } } });
+    defer released.deinit(alloc);
+
+    var merged = try merge_atomic_write_results(alloc, used, released);
+    defer merged.deinit(alloc);
+    const body = switch (merged) {
+        .success => |value| value,
+        .failure => return error.TestUnexpectedResult,
+    };
+    var parsed = try std.json.parseFromSlice(contracts.Result, alloc, body, .{});
+    defer parsed.deinit();
+    switch (parsed.value) {
+        .success => |success| switch (success) {
+            .write => |write| {
+                try std.testing.expectEqual(@as(u32, 19), write.accepted_bytes);
+                try std.testing.expectEqual(
+                    contracts.WriteLease.none,
+                    write.session.attention.write_lease,
+                );
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        .failure => return error.TestUnexpectedResult,
     }
 }
 

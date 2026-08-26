@@ -1408,7 +1408,7 @@ test.skipIf(!tmuxAvailable())(
       branch,
     ]));
     expect([...branchByAction.keys()]).toEqual([
-      "exec", "start", "read", "screen", "write", "wait",
+      "start", "exec", "read", "screen", "write", "wait",
       "monitor", "inspect", "list", "resize", "signal", "close",
     ]);
     for (const branch of branches) {
@@ -1418,14 +1418,33 @@ test.skipIf(!tmuxAvailable())(
     const writeBranches = branches.filter(
       (branch) => branch.properties?.action?.enum?.[0] === "write",
     );
-    expect(writeBranches).toHaveLength(2);
-    expect(writeBranches[0]!.properties?.lease?.enum).toEqual(["use"]);
-    expect(writeBranches[0]!.properties?.write?.type).toBe("object");
-    expect(writeBranches[1]!.properties?.lease?.enum).toEqual([
-      "acquire", "release", "revoke",
+    expect(writeBranches).toHaveLength(1);
+    expect(writeBranches[0]!.required).toEqual([
+      "action", "session_id", "input",
     ]);
-    expect(writeBranches[1]!.properties?.write?.type).toBe("null");
-    const startProperties = branchByAction.get("start")!.properties!;
+    expect(writeBranches[0]!.properties?.lease).toBeUndefined();
+    expect(writeBranches[0]!.properties?.write).toBeUndefined();
+    const writeInputs = writeBranches[0]!.properties?.input?.oneOf ?? [];
+    expect(writeInputs).toHaveLength(4);
+    expect(writeInputs.map((input) => input.required?.[0])).toEqual([
+      "text", "keys", "controls", "paste",
+    ]);
+    for (const input of writeInputs) {
+      expect(input.type).toBe("object");
+      expect(input.additionalProperties).toBe(false);
+      expect(input.properties?.kind).toBeUndefined();
+    }
+    const startBranches = branches.filter(
+      (branch) => branch.properties?.action?.enum?.[0] === "start",
+    );
+    expect(startBranches).toHaveLength(2);
+    const shellStart = startBranches[0]!.properties!;
+    const profileStart = startBranches[1]!.properties!;
+    expect(shellStart.shell).toBeDefined();
+    expect(shellStart.profile).toBeUndefined();
+    expect(profileStart.profile).toBeDefined();
+    expect(profileStart.shell).toBeUndefined();
+    const startProperties = shellStart;
     expect(startProperties.wait_ceiling_ms!.anyOf![0]!.type).toBe("integer");
     expect(startProperties.shell!.anyOf![0]!.type).toBe("object");
     expect(startProperties.initial_monitors!.anyOf![0]!.type).toBe("array");
@@ -1970,6 +1989,109 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
+  "TUI terminal model write acquires and releases control atomically",
+  async () => {
+    const fixture = createFixture("fx-tui-terminal-atomic-write-");
+    const payload = "ATOMIC_WRITE_INPUT";
+    let terminalSessionId = "";
+    let atomicTextResult = "";
+    let atomicKeyResult = "";
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("atomic_write_start", "terminal", {
+        action: "start",
+        cwd: fixture.workspace,
+        command:
+          "printf 'ATOMIC_WRITE_READY\\n'; " +
+          "while IFS= read -r line; do " +
+          "printf 'ATOMIC_WRITE_ECHO:%s\\n' \"$line\"; done",
+        shell: {
+          kind: "executable",
+          path: TERMINAL_FIXTURE_SHELL,
+          clean_start: true,
+        },
+        backend: "native",
+        return_when: { kind: "match", pattern: "ATOMIC_WRITE_READY" },
+        wait_ceiling_ms: 20_000,
+        dimensions: { rows: 24, columns: 80 },
+      }),
+      (body) => {
+        const result = JSON.parse(toolResultText(body, "atomic_write_start")) as {
+          success: { start: { session: { session_id: string } } };
+        };
+        terminalSessionId = result.success.start.session.session_id;
+        return fakeGatewayToolCall("atomic_write_send", "terminal", {
+          request: {
+            action: "write",
+            session_id: terminalSessionId,
+            input: { text: payload },
+          },
+        });
+      },
+      (body) => {
+        atomicTextResult = toolResultText(body, "atomic_write_send");
+        if (!atomicTextResult.includes('"accepted_bytes":18')) {
+          return fakeGatewayFinalText("TUI terminal atomic write complete");
+        }
+        return fakeGatewayToolCall("atomic_write_enter", "terminal", {
+          request: {
+            action: "write",
+            session_id: terminalSessionId,
+            input: { keys: ["enter"] },
+          },
+        });
+      },
+      (body) => {
+        atomicKeyResult = toolResultText(body, "atomic_write_enter");
+        if (!atomicKeyResult.includes('"accepted_bytes":1')) {
+          return fakeGatewayFinalText("TUI terminal atomic write complete");
+        }
+        return fakeGatewayToolCall("atomic_write_wait", "terminal", {
+          action: "wait",
+          session_id: terminalSessionId,
+          return_when: {
+            kind: "match",
+            pattern: "ATOMIC_WRITE_ECHO:ATOMIC_WRITE_INPUT",
+          },
+          wait_ceiling_ms: 20_000,
+        });
+      },
+      (body) => {
+        expect(toolResultText(body, "atomic_write_wait"))
+          .toContain('"outcome":{"condition_met":{}}');
+        return fakeGatewayToolCall("atomic_write_close", "terminal", {
+          action: "close",
+          session_id: terminalSessionId,
+          close_policy: "force",
+        });
+      },
+      (body) => {
+        expect(toolResultText(body, "atomic_write_close"))
+          .toContain('"lifecycle":"closed"');
+        return fakeGatewayFinalText("TUI terminal atomic write complete");
+      },
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway);
+
+    await active.sendText("Write to a persistent terminal and confirm its output.");
+    const pane = await active.waitForText(
+      "TUI terminal atomic write complete",
+      TIMEOUT,
+    );
+    expect(atomicTextResult).toContain('"accepted_bytes":18');
+    expect(atomicTextResult).toContain('"write_lease":"none"');
+    expect(atomicKeyResult).toContain('"accepted_bytes":1');
+    expect(atomicKeyResult).toContain('"write_lease":"none"');
+    expect(pane).toContain("Sent input to");
+    expect(pane).toContain("Finished waiting for");
+    expect(pane).toContain("Killed printf 'ATOMIC_WRITE_READY");
+    expect(gateway.requests).toHaveLength(6);
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
   "TUI terminal write lease payload contract rejects combined acquire and delivers after valid acquisition",
   async () => {
     const fixture = createFixture("fx-tui-terminal-lease-payload-");
@@ -2018,20 +2140,6 @@ test.skipIf(!tmuxAvailable())(
         expect(
           toolResultText(body, "tui_terminal_lease_invalid_acquire"),
         ).toContain("InvalidWritePayload");
-        return fakeGatewayToolCall(
-          "tui_terminal_lease_premature_use",
-          "terminal",
-          {
-            action: "write",
-            session_id: terminalSessionId,
-            lease: "use",
-            write: { kind: "text", text: payload },
-          },
-        );
-      },
-      (body) => {
-        expect(toolResultText(body, "tui_terminal_lease_premature_use"))
-          .toContain('"code":"lease_conflict"');
         return fakeGatewayToolCall("tui_terminal_lease_read_before", "terminal", {
           action: "read",
           session_id: terminalSessionId,
@@ -2101,7 +2209,7 @@ test.skipIf(!tmuxAvailable())(
     expect(pane).toContain("Sent input to");
     expect(pane).toContain("Finished waiting for");
     expect(pane).toContain("Killed printf 'TUI_PUBLIC_LEASE_PAYLOAD_READY");
-    expect(gateway.requests).toHaveLength(9);
+    expect(gateway.requests).toHaveLength(8);
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
   TIMEOUT,
