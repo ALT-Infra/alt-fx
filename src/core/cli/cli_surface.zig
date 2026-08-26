@@ -46,6 +46,7 @@ const mcp_contract = @import("../mcp/mcp_contract.zig");
 const mcp_command_provider = @import("../mcp/command_provider.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const profile_paths = @import("../shared/profile_paths.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
@@ -201,6 +202,8 @@ pub const Config = struct {
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
     add_mcp_profile_server: mcp_command_provider.AddProfileServerFn =
         mcp_command_provider.addProfileServerUnavailable,
+    remove_mcp_profile_server: mcp_command_provider.RemoveProfileServerFn =
+        mcp_command_provider.removeProfileServerUnavailable,
     acp_runner: acp_runner.Runner,
 };
 
@@ -1140,48 +1143,7 @@ fn runNonInteractiveWithDeps(
             return .handled_success;
         },
         .mcp => |rest| {
-            if (rest.len == 0 or !std.mem.eql(u8, rest[0], "add")) {
-                try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
-                return .handled_failure;
-            }
-            var tokens: std.ArrayList([]const u8) = .empty;
-            defer tokens.deinit(alloc);
-            try tokens.ensureTotalCapacity(alloc, rest.len - 1);
-            for (rest[1..]) |token| tokens.appendAssumeCapacity(token);
-            const intent = mcp_command_provider.parseAddIntent(tokens.items) catch |err| {
-                if (err == error.McpAddUsage) {
-                    try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
-                } else {
-                    try writeMcpAddFailure(alloc, deps, err);
-                }
-                return .handled_failure;
-            };
-            var result = cfg.add_mcp_profile_server(alloc, intent) catch |err| {
-                try writeMcpAddFailure(alloc, deps, err);
-                return .handled_failure;
-            };
-            defer result.deinit(alloc);
-            if (result.warning) |warning| {
-                try writeMcpProfileWarning(alloc, deps, warning);
-            }
-            const name = switch (intent) {
-                .local => |local| local.name,
-                .http => |http| http.name,
-            };
-            var encoded_path = try text_utils.encodeTerminalSafe(
-                alloc,
-                result.profile_path,
-                512,
-            );
-            defer encoded_path.deinit(alloc);
-            var out: std.Io.Writer.Allocating = .init(alloc);
-            defer out.deinit();
-            try out.writer.print(
-                "Saved MCP server '{s}' to {s}.\n",
-                .{ name, encoded_path.bytes },
-            );
-            try writeStdout(deps, out.written());
-            return .handled_success;
+            return runTopLevelMcp(alloc, rest, cfg, deps);
         },
         .models => |rest| {
             const opts = parseLocalSurfaceArgs(rest) catch |err| {
@@ -2136,10 +2098,309 @@ fn writeTopLevelUsage(command_catalog: CommandCatalog, deps: RunDeps, kind: TopL
     try writeStderr(deps, "\n");
 }
 
-fn writeMcpAddFailure(alloc: Allocator, deps: RunDeps, err: anyerror) !void {
+const McpCommandRuntime = struct {
+    startup: app_lifecycle.StartupState,
+    runtime: ?*mcp_runtime.McpRuntime,
+
+    fn deinit(self: *McpCommandRuntime, alloc: Allocator) void {
+        if (self.runtime) |runtime| {
+            runtime.deinit();
+            alloc.destroy(runtime);
+        }
+        self.startup.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+fn loadMcpCommandRuntime(
+    alloc: Allocator,
+    cfg: Config,
+    deps: RunDeps,
+) !McpCommandRuntime {
+    var startup = try deps.load_startup_state_without_credentials(
+        alloc,
+        cfg.default_model,
+        cfg.default_agent_step_limit,
+    );
+    errdefer startup.deinit(alloc);
+    const runtime = try cfg.load_mcp_runtime(
+        alloc,
+        startup.workspace_root,
+        .{ .form = true, .url = true },
+    );
+    return .{ .startup = startup, .runtime = runtime };
+}
+
+fn runTopLevelMcp(
+    alloc: Allocator,
+    rest: []const [:0]const u8,
+    cfg: Config,
+    deps: RunDeps,
+) !RunResult {
+    if (rest.len == 0) {
+        try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
+        return .handled_failure;
+    }
+    const operation = rest[0];
+    if (std.mem.eql(u8, operation, "add")) {
+        var tokens: std.ArrayList([]const u8) = .empty;
+        defer tokens.deinit(alloc);
+        try tokens.ensureTotalCapacity(alloc, rest.len - 1);
+        for (rest[1..]) |token| tokens.appendAssumeCapacity(token);
+        const intent = mcp_command_provider.parseAddIntent(tokens.items) catch |err| {
+            if (err == error.McpAddUsage) {
+                try writeMcpAddUsage(deps);
+            } else {
+                try writeMcpOperationFailure(alloc, deps, "add", err);
+            }
+            return .handled_failure;
+        };
+        var result = cfg.add_mcp_profile_server(alloc, intent) catch |err| {
+            try writeMcpOperationFailure(alloc, deps, "add", err);
+            return .handled_failure;
+        };
+        defer result.deinit(alloc);
+        if (result.warning) |warning| try writeMcpProfileWarning(alloc, deps, warning);
+        const name = switch (intent) {
+            .local => |local| local.name,
+            .http => |http| http.name,
+        };
+        try writeMcpProfileMutationSuccess(
+            alloc,
+            deps,
+            "Saved",
+            "to",
+            name,
+            result.profile_path,
+        );
+        return .handled_success;
+    }
+    if (std.mem.eql(u8, operation, "path")) {
+        if (rest.len != 1) {
+            try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
+            return .handled_failure;
+        }
+        const home = deps.getenv(deps.env_ctx, "HOME") orelse {
+            try writeMcpOperationFailure(alloc, deps, "path", error.HomeNotSet);
+            return .handled_failure;
+        };
+        const path = try profile_paths.mcpConfigPath(alloc, home);
+        defer alloc.free(path);
+        var encoded_path = try text_utils.encodeTerminalSafe(alloc, path, 512);
+        defer encoded_path.deinit(alloc);
+        try writeStdout(deps, encoded_path.bytes);
+        try writeStdout(deps, "\n");
+        return .handled_success;
+    }
+    if (std.mem.eql(u8, operation, "remove")) {
+        if (rest.len != 2 or rest[1].len == 0) {
+            try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
+            return .handled_failure;
+        }
+        var result = cfg.remove_mcp_profile_server(alloc, rest[1]) catch |err| {
+            try writeMcpOperationFailure(alloc, deps, "remove", err);
+            return .handled_failure;
+        };
+        defer result.deinit(alloc);
+        if (result.warning) |warning| try writeMcpProfileWarning(alloc, deps, warning);
+        if (!result.removed) {
+            var encoded_name = try text_utils.encodeTerminalSafe(alloc, rest[1], 160);
+            defer encoded_name.deinit(alloc);
+            var out: std.Io.Writer.Allocating = .init(alloc);
+            defer out.deinit();
+            try out.writer.print(
+                "MCP server '{s}' was not found in the profile.\n",
+                .{encoded_name.bytes},
+            );
+            try writeStderr(deps, out.written());
+            return .handled_failure;
+        }
+        try writeMcpProfileMutationSuccess(
+            alloc,
+            deps,
+            "Removed",
+            "from",
+            rest[1],
+            result.profile_path,
+        );
+        return .handled_success;
+    }
+    if (std.mem.eql(u8, operation, "list")) {
+        if (rest.len != 1) {
+            try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
+            return .handled_failure;
+        }
+        var loaded = loadMcpCommandRuntime(alloc, cfg, deps) catch |err| {
+            try writeMcpOperationFailure(alloc, deps, "list", err);
+            return .handled_failure;
+        };
+        defer loaded.deinit(alloc);
+        try writeConfigDiagnostics(alloc, deps, loaded.startup.config_diagnostics);
+        const listing = if (loaded.runtime) |runtime|
+            try runtime.listServersAndTools(alloc)
+        else
+            try alloc.dupe(u8, "No MCP servers configured.\n");
+        defer alloc.free(listing);
+        try writeStdout(deps, listing);
+        return .handled_success;
+    }
+    if (std.mem.eql(u8, operation, "auth")) {
+        if (rest.len != 2 or rest[1].len == 0) {
+            try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
+            return .handled_failure;
+        }
+        var loaded = loadMcpCommandRuntime(alloc, cfg, deps) catch |err| {
+            try writeMcpOperationFailure(alloc, deps, "auth", err);
+            return .handled_failure;
+        };
+        defer loaded.deinit(alloc);
+        try writeConfigDiagnostics(alloc, deps, loaded.startup.config_diagnostics);
+        const runtime = loaded.runtime orelse {
+            try writeMcpOperationFailure(alloc, deps, "auth", error.McpServerNotFound);
+            return .handled_failure;
+        };
+        var opener = cfg.url_opener;
+        var result = runtime.authenticateServer(
+            rest[1],
+            &opener,
+            openTopLevelMcpUrl,
+        ) catch |err| {
+            try writeMcpOperationFailure(alloc, deps, "auth", err);
+            return .handled_failure;
+        };
+        defer result.deinit();
+        switch (result) {
+            .authenticated => |authenticated| {
+                var encoded_name = try text_utils.encodeTerminalSafe(alloc, rest[1], 160);
+                defer encoded_name.deinit(alloc);
+                var out: std.Io.Writer.Allocating = .init(alloc);
+                defer out.deinit();
+                try out.writer.print("Authenticated MCP server '{s}'.", .{encoded_name.bytes});
+                if (authenticated.repaired_entries > 0) {
+                    try out.writer.print(
+                        " Removed {d} unreadable MCP credential {s}.",
+                        .{
+                            authenticated.repaired_entries,
+                            if (authenticated.repaired_entries == 1) "entry" else "entries",
+                        },
+                    );
+                }
+                try out.writer.writeByte('\n');
+                try writeStdout(deps, out.written());
+                return .handled_success;
+            },
+            .issuer_mismatch => {
+                try writeMcpOperationFailure(
+                    alloc,
+                    deps,
+                    "auth",
+                    error.McpAuthorizationIssuerMismatch,
+                );
+                return .handled_failure;
+            },
+        }
+    }
+    if (std.mem.eql(u8, operation, "logout")) {
+        if (rest.len != 2 or rest[1].len == 0) {
+            try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
+            return .handled_failure;
+        }
+        var loaded = loadMcpCommandRuntime(alloc, cfg, deps) catch |err| {
+            try writeMcpOperationFailure(alloc, deps, "logout", err);
+            return .handled_failure;
+        };
+        defer loaded.deinit(alloc);
+        try writeConfigDiagnostics(alloc, deps, loaded.startup.config_diagnostics);
+        const runtime = loaded.runtime orelse {
+            try writeMcpOperationFailure(alloc, deps, "logout", error.McpServerNotFound);
+            return .handled_failure;
+        };
+        const result = runtime.logoutServer(rest[1]) catch |err| {
+            try writeMcpOperationFailure(alloc, deps, "logout", err);
+            return .handled_failure;
+        };
+        var encoded_name = try text_utils.encodeTerminalSafe(alloc, rest[1], 160);
+        defer encoded_name.deinit(alloc);
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        if (!result.removed) {
+            try out.writer.print(
+                "No stored MCP credentials found for '{s}'.\n",
+                .{encoded_name.bytes},
+            );
+        } else if (result.local_only) {
+            try out.writer.print(
+                "Logged out of MCP server '{s}' locally.\n",
+                .{encoded_name.bytes},
+            );
+        } else if (result.revocation_failed) {
+            try out.writer.print(
+                "Logged out of MCP server '{s}' locally; remote revocation failed.\n",
+                .{encoded_name.bytes},
+            );
+        } else {
+            try out.writer.print(
+                "Logged out of MCP server '{s}'.\n",
+                .{encoded_name.bytes},
+            );
+        }
+        try writeStdout(deps, out.written());
+        return .handled_success;
+    }
+
+    try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
+    return .handled_failure;
+}
+
+fn openTopLevelMcpUrl(
+    raw: ?*anyopaque,
+    alloc: Allocator,
+    url: []const u8,
+) anyerror!bool {
+    const opener: *const host.UrlOpener = @ptrCast(@alignCast(raw.?));
+    return opener.open(alloc, url);
+}
+
+fn writeMcpProfileMutationSuccess(
+    alloc: Allocator,
+    deps: RunDeps,
+    action: []const u8,
+    preposition: []const u8,
+    name: []const u8,
+    path: []const u8,
+) !void {
+    var encoded_name = try text_utils.encodeTerminalSafe(alloc, name, 160);
+    defer encoded_name.deinit(alloc);
+    var encoded_path = try text_utils.encodeTerminalSafe(alloc, path, 512);
+    defer encoded_path.deinit(alloc);
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try out.writer.print("fx mcp add failed: {s}.\n", .{@errorName(err)});
+    try out.writer.print(
+        "{s} MCP server '{s}' {s} {s}.\n",
+        .{ action, encoded_name.bytes, preposition, encoded_path.bytes },
+    );
+    try writeStdout(deps, out.written());
+}
+
+fn writeMcpAddUsage(deps: RunDeps) !void {
+    return writeStderr(
+        deps,
+        "usage: fx mcp add NAME COMMAND [ARGS...] | fx mcp add --transport http NAME URL\n",
+    );
+}
+
+fn writeMcpOperationFailure(
+    alloc: Allocator,
+    deps: RunDeps,
+    operation: []const u8,
+    err: anyerror,
+) !void {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.print(
+        "fx mcp {s} failed: {s}.\n",
+        .{ operation, @errorName(err) },
+    );
     try writeStderr(deps, out.written());
 }
 
@@ -4277,6 +4538,59 @@ test "top-level MCP add mutates through the focused provider without startup" {
     try std.testing.expectEqualStrings("", capture.stderr.written());
 }
 
+test "top-level MCP list loads configuration without discovery and remove uses its provider" {
+    const alloc = std.testing.allocator;
+    {
+        var capture = CaptureOutput.init(alloc);
+        defer capture.deinit();
+        var cfg = testConfig();
+        cfg.load_mcp_runtime = configuredMcpRuntimeForTest;
+        var deps = capture.deps();
+        deps.load_startup_state_without_credentials = stubLoadStartupStateWithoutCredentials;
+
+        const result = try runIfRequestedWithDeps(
+            alloc,
+            &.{ @constCast("mcp"), @constCast("list") },
+            cfg,
+            deps,
+        );
+        try std.testing.expectEqual(RunResult.handled_success, result);
+        try std.testing.expect(std.mem.find(
+            u8,
+            capture.stdout.written(),
+            "fixture source=profile scope=profile",
+        ) != null);
+        try std.testing.expect(std.mem.find(
+            u8,
+            capture.stdout.written(),
+            "state=disconnected",
+        ) != null);
+        try std.testing.expectEqualStrings("", capture.stderr.written());
+    }
+
+    {
+        var capture = CaptureOutput.init(alloc);
+        defer capture.deinit();
+        var cfg = testConfig();
+        cfg.remove_mcp_profile_server = captureMcpProfileRemoveForTest;
+        mcp_profile_remove_calls_for_test = 0;
+
+        const result = try runIfRequestedWithDeps(
+            alloc,
+            &.{ @constCast("mcp"), @constCast("remove"), @constCast("fixture") },
+            cfg,
+            capture.deps(),
+        );
+        try std.testing.expectEqual(RunResult.handled_success, result);
+        try std.testing.expectEqual(@as(usize, 1), mcp_profile_remove_calls_for_test);
+        try std.testing.expectEqualStrings(
+            "Removed MCP server 'fixture' from /tmp/test-home/.fx/mcp.json.\n",
+            capture.stdout.written(),
+        );
+        try std.testing.expectEqualStrings("", capture.stderr.written());
+    }
+}
+
 test "workspace launch modifiers preserve supported command help" {
     var capture = CaptureOutput.init(std.testing.allocator);
     defer capture.deinit();
@@ -5325,6 +5639,7 @@ fn clearMcpConfigInspectionForTest(
 var mcp_config_inspection_calls_for_test: usize = 0;
 var mcp_runtime_load_calls_for_test: usize = 0;
 var mcp_profile_add_calls_for_test: usize = 0;
+var mcp_profile_remove_calls_for_test: usize = 0;
 
 fn captureMcpProfileAddForTest(
     alloc: Allocator,
@@ -5342,6 +5657,35 @@ fn captureMcpProfileAddForTest(
     return .{
         .profile_path = try alloc.dupe(u8, "/tmp/test-home/.fx/mcp.json"),
     };
+}
+
+fn captureMcpProfileRemoveForTest(
+    alloc: Allocator,
+    name: []const u8,
+) anyerror!mcp_command_provider.ProfileRemoveResult {
+    mcp_profile_remove_calls_for_test += 1;
+    try std.testing.expectEqualStrings("fixture", name);
+    return .{
+        .profile_path = try alloc.dupe(u8, "/tmp/test-home/.fx/mcp.json"),
+        .removed = true,
+    };
+}
+
+fn configuredMcpRuntimeForTest(
+    alloc: Allocator,
+    workspace_root: []const u8,
+    _: @import("../mcp/elicitation.zig").Capabilities,
+) !?*mcp_runtime.McpRuntime {
+    try std.testing.expectEqualStrings("/tmp/fx", workspace_root);
+    const runtime = try alloc.create(mcp_runtime.McpRuntime);
+    errdefer alloc.destroy(runtime);
+    runtime.* = mcp_runtime.McpRuntime.init(alloc);
+    errdefer runtime.deinit();
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "fixture"),
+        .command = try alloc.dupe(u8, "node"),
+    });
+    return runtime;
 }
 
 fn failingMcpConfigInspectionForTest(
@@ -5428,6 +5772,19 @@ fn stubLoadStartupState(
         .source = .ai_gateway_api_key,
     };
     state.credential.?.team_id = try alloc.dupe(u8, "team_123");
+    return state;
+}
+
+fn stubLoadStartupStateWithoutCredentials(
+    alloc: Allocator,
+    _: []const u8,
+    default_agent_step_limit: usize,
+) !app_lifecycle.StartupState {
+    var state = app_lifecycle.StartupState{
+        .agent_step_limit = default_agent_step_limit,
+    };
+    errdefer state.deinit(alloc);
+    state.workspace_root = try alloc.dupe(u8, "/tmp/fx");
     return state;
 }
 

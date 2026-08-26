@@ -242,16 +242,28 @@ The interactive surface supports:
 
 * `/mcp path`
 
-The noninteractive profile mutation surface supports:
+The noninteractive MCP surface supports:
 
 * `fx mcp add <name> <command> [args...]`
 
 * `fx mcp add --transport http <name> <url>`
 
+* `fx mcp auth <name>`
+
+* `fx mcp list`
+
+* `fx mcp logout <name>`
+
+* `fx mcp path`
+
+* `fx mcp remove <name>`
+
 The local form saves a stdio command. The HTTP form saves a remote Streamable
-HTTP endpoint. Slash forms evaluate a replacement MCP runtime immediately.
-Top-level forms exit after the locked profile update without constructing the
-TUI or MCP runtime.
+HTTP endpoint. List reads effective profile and workspace configuration without
+connecting servers. Path prints the profile configuration path. Remove uses the
+same locked canonical profile writer as add. Auth and logout run the existing
+remote credential lifecycle. None of these commands constructs the TUI or
+contacts the Gateway.
 
 Remote authentication supports configured bearer tokens and OAuth credential
 discovery, persistence, refresh, scope challenges, and logout. Credential and

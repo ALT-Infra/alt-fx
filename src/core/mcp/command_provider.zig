@@ -45,6 +45,29 @@ pub fn addProfileServerUnavailable(
     return error.McpProfileMutationUnavailable;
 }
 
+pub const ProfileRemoveResult = struct {
+    profile_path: []u8,
+    removed: bool,
+    warning: ?mcp_contract.ProfileConfigWarning = null,
+
+    pub fn deinit(self: *ProfileRemoveResult, alloc: Allocator) void {
+        alloc.free(self.profile_path);
+        self.* = undefined;
+    }
+};
+
+pub const RemoveProfileServerFn = *const fn (
+    alloc: Allocator,
+    name: []const u8,
+) anyerror!ProfileRemoveResult;
+
+pub fn removeProfileServerUnavailable(
+    _: Allocator,
+    _: []const u8,
+) anyerror!ProfileRemoveResult {
+    return error.McpProfileMutationUnavailable;
+}
+
 pub fn parseAddIntent(tokens: []const []const u8) AddIntentError!AddIntent {
     if (tokens.len == 0) return error.McpAddUsage;
     if (std.mem.eql(u8, tokens[0], "--transport")) {

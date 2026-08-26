@@ -5449,6 +5449,9 @@ pub const McpRuntime = struct {
         };
         if (cancellation.cancelled()) return error.Cancelled;
         const server = try self.authenticationServer(name);
+        try loadStoredCredentials(self.alloc, server, .{
+            .lifecycle_cancel_flag = &self.retiring,
+        });
         server.connection_lock.lockSharedUncancelable(io_mod.getIo());
         var connection_locked = true;
         defer if (connection_locked) server.connection_lock.unlockShared(io_mod.getIo());
@@ -5666,6 +5669,16 @@ pub const McpRuntime = struct {
                 .local_only = true,
             };
         }
+        loadStoredCredentials(self.alloc, server, .{
+            .lifecycle_cancel_flag = &self.retiring,
+        }) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            debug_trace.logf(
+                "mcp",
+                "stored credential load skipped during logout server={s} err={s}",
+                .{ server.config.name, @errorName(err) },
+            );
+        };
         server.auth_lock.lockUncancelable(io_mod.getIo());
         if (server.auth_logout_in_progress.load(.acquire)) {
             server.auth_lock.unlock(io_mod.getIo());

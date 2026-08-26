@@ -130,10 +130,17 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .mcp,
         .token = "mcp",
-        .usage = "mcp add NAME COMMAND [ARGS...] | mcp add --transport http NAME URL",
-        .summary = "Add an MCP server to the profile",
+        .usage = "mcp <add|auth|list|logout|path|remove> ...",
+        .summary = "Manage MCP servers without opening the interactive shell",
         .details = &.{
-            "Adds or replaces one server in ~/.fx/mcp.json without starting the interactive shell.",
+            "Commands:",
+            "  fx mcp add NAME COMMAND [ARGS...]",
+            "  fx mcp add --transport http NAME URL",
+            "  fx mcp auth NAME",
+            "  fx mcp list",
+            "  fx mcp logout NAME",
+            "  fx mcp path",
+            "  fx mcp remove NAME",
         },
     },
     .{
@@ -312,7 +319,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
     .{ .entries = &.{
         .{ .kind = .status, .usage = "status" },
         .{ .kind = .doctor, .usage = "doctor" },
-        .{ .kind = .mcp, .usage = "mcp add ..." },
+        .{ .kind = .mcp, .usage = "mcp <add|auth|list|logout|path|remove> ..." },
         .{ .kind = .models, .usage = "models" },
         .{ .kind = .permissions, .usage = "permissions" },
         .{ .kind = .workspace, .usage = "workspace" },

@@ -794,6 +794,46 @@ async function preserveAuthTuiFailure(
 }
 
 describe("MCP remote authentication lifecycle", () => {
+  test("top-level MCP auth and logout complete without TUI or Gateway", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const env = {
+      ...baseEnv(root),
+      AI_GATEWAY_API_KEY: undefined,
+    };
+
+    const authenticated = await runFx(["mcp", "auth", "fixture"], {
+      cwd: root.workspace,
+      env,
+      timeoutMs: 20_000,
+    });
+    expect(authenticated.code).toBe(0);
+    expect(authenticated.stderr).toBe("");
+    expect(authenticated.stdout).toContain("Authenticated MCP server 'fixture'");
+    expect(auth.authorizationRequests).toBe(1);
+    expect(auth.tokenExchanges).toBe(1);
+    expect(existsSync(root.openLog)).toBe(true);
+    const credentialPath = join(
+      root.home,
+      ".fx",
+      "mcp-credentials",
+      "credentials.json",
+    );
+    expect(existsSync(credentialPath)).toBe(true);
+
+    const loggedOut = await runFx(["mcp", "logout", "fixture"], {
+      cwd: root.workspace,
+      env,
+      timeoutMs: 20_000,
+    });
+    expect(loggedOut.code).toBe(0);
+    expect(loggedOut.stderr).toBe("");
+    expect(loggedOut.stdout).toContain("Logged out of MCP server 'fixture'");
+    expect(existsSync(credentialPath)).toBe(false);
+    expect(auth.revocations).toBe(2);
+  }, 30_000);
+
   test.skipIf(!tmuxAvailable())(
     "no-scope OAuth credentials survive reload and preserve an unrelated server",
     async () => {
@@ -1919,6 +1959,45 @@ describe("MCP remote authentication lifecycle", () => {
     },
     35_000,
   );
+
+  test("top-level pending workspace auth is blocked and logout stays local", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth, true, "http", auth.url, false);
+    moveAuthFixtureToWorkspace(root);
+    const credentialPath = seedExpiredCredentials(
+      root,
+      auth,
+      Date.now() + 3_600_000,
+    );
+    const env = {
+      ...baseEnv(root),
+      AI_GATEWAY_API_KEY: undefined,
+    };
+
+    const authentication = await runFx(["mcp", "auth", "fixture"], {
+      cwd: root.workspace,
+      env,
+      timeoutMs: 20_000,
+    });
+    expect(authentication.code).not.toBe(0);
+    expect(authentication.stderr).toContain("McpWorkspaceApprovalRequired");
+    expect(existsSync(root.openLog)).toBe(false);
+    expect(auth.authorizationRequests).toBe(0);
+    expect(existsSync(credentialPath)).toBe(true);
+    const requestsBeforeLogout = auth.requests.length;
+
+    const logout = await runFx(["mcp", "logout", "fixture"], {
+      cwd: root.workspace,
+      env,
+      timeoutMs: 20_000,
+    });
+    expect(logout.code).toBe(0);
+    expect(logout.stdout).toContain("Logged out of MCP server 'fixture' locally");
+    expect(existsSync(credentialPath)).toBe(false);
+    expect(auth.revocations).toBe(0);
+    expect(auth.requests).toHaveLength(requestsBeforeLogout);
+  }, 30_000);
 
   test.skipIf(!tmuxAvailable())(
     "fresh TUI login persists, ask refreshes after restart, and logout revokes",

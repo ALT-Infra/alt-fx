@@ -516,6 +516,21 @@ pub fn addProfileServer(
     return .{ .profile_path = config_path, .warning = warning };
 }
 
+pub fn removeProfileServer(
+    alloc: Allocator,
+    name: []const u8,
+) !command_provider_contract.ProfileRemoveResult {
+    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    const config_path = try configPathFromHome(alloc, home);
+    errdefer alloc.free(config_path);
+    const result = try removeProfileServerFromPath(alloc, config_path, name);
+    return .{
+        .profile_path = config_path,
+        .removed = result.removed,
+        .warning = result.warning,
+    };
+}
+
 pub fn loadRuntime(
     alloc: Allocator,
     workspace_root: []const u8,
@@ -804,23 +819,37 @@ fn addOrReplaceServer(
     return warning;
 }
 
-fn removeServerFromPath(alloc: Allocator, path: []const u8, name: []const u8) !bool {
+const ProfileRemoveFromPathResult = struct {
+    removed: bool,
+    warning: ?project_config.ProfileDiagnostic = null,
+};
+
+fn removeProfileServerFromPath(
+    alloc: Allocator,
+    path: []const u8,
+    name: []const u8,
+) !ProfileRemoveFromPathResult {
     var lock = try acquireProfileMutationLock(path);
     defer lock.release();
     var document = try loadProfileDocumentFromPath(alloc, path);
     defer document.deinit(alloc);
     if (!document.mutation_allowed) return error.McpConfigAmbiguousServerKey;
     const configs = &document.configs;
+    const warning = document.diagnostic;
 
     for (configs.items, 0..) |config, i| {
         if (!std.mem.eql(u8, config.name, name)) continue;
         var removed = configs.orderedRemove(i);
         removed.deinit(alloc);
         try saveConfigsToPath(alloc, path, configs.items);
-        return true;
+        return .{ .removed = true, .warning = warning };
     }
 
-    return false;
+    return .{ .removed = false, .warning = warning };
+}
+
+fn removeServerFromPath(alloc: Allocator, path: []const u8, name: []const u8) !bool {
+    return (try removeProfileServerFromPath(alloc, path, name)).removed;
 }
 
 fn loadConfigFromJson(alloc: Allocator, json_text: []const u8) !std.ArrayList(McpServerConfig) {

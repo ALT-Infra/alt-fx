@@ -67,6 +67,8 @@ pub const Config = struct {
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
     add_mcp_profile_server: mcp_command_provider.AddProfileServerFn =
         mcp_command_provider.addProfileServerUnavailable,
+    remove_mcp_profile_server: mcp_command_provider.RemoveProfileServerFn =
+        mcp_command_provider.removeProfileServerUnavailable,
     acp_runner: acp_runner.Runner,
 };
 
@@ -409,6 +411,7 @@ fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
         .inspect_mcp_profile_config = cfg.inspect_mcp_profile_config,
         .load_mcp_runtime = cfg.load_mcp_runtime,
         .add_mcp_profile_server = cfg.add_mcp_profile_server,
+        .remove_mcp_profile_server = cfg.remove_mcp_profile_server,
         .acp_runner = cfg.acp_runner,
     };
 }

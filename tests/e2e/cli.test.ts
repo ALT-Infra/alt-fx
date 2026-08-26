@@ -4965,6 +4965,90 @@ describe("cli: workspace access", () => {
 });
 
 describe("cli: MCP profile add", () => {
+  test("lists paths and removes profile servers without launching MCP transport", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-manage-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const profileMarker = join(root, "profile-launched");
+    const workspaceMarker = join(root, "workspace-launched");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace, { recursive: true });
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({}));
+    writeFileSync(
+      join(home, ".fx", "mcp.json"),
+      JSON.stringify({
+        mcp: {
+          shared: {
+            command: ["/bin/sh", "-c", `touch ${profileMarker}`],
+          },
+        },
+      }),
+    );
+    writeFileSync(
+      join(workspace, ".mcp.json"),
+      JSON.stringify({
+        mcpServers: {
+          shared: {
+            command: "/bin/sh",
+            args: ["-c", `touch ${workspaceMarker}`],
+          },
+          "workspace-only": {
+            command: "/bin/sh",
+            args: ["-c", `touch ${workspaceMarker}`],
+          },
+          broken: {
+            command: "${MISSING_LIST_COMMAND}",
+          },
+        },
+      }),
+    );
+    const env = { HOME: home, ...NO_GATEWAY_AUTH };
+    try {
+      const path = await runFx(["mcp", "path"], { cwd: workspace, env });
+      expect(path.code).toBe(0);
+      expect(path.stderr).toBe("");
+      expect(path.stdout.trim()).toBe(join(home, ".fx", "mcp.json"));
+
+      const before = await runFx(["mcp", "list"], { cwd: workspace, env });
+      expect(before.code).toBe(0);
+      expect(before.stderr).toBe("");
+      expect(before.stdout).toMatch(/shared source=profile scope=profile/);
+      expect(before.stdout).toMatch(
+        /workspace-only source=workspace scope=workspace/,
+      );
+      expect(before.stdout).not.toMatch(/shared source=workspace scope=workspace/);
+      expect(before.stdout).toContain(".mcp.json server 'broken'");
+      expect(before.stdout).toContain("MISSING_LIST_COMMAND");
+      expect(existsSync(profileMarker)).toBe(false);
+      expect(existsSync(workspaceMarker)).toBe(false);
+
+      const removed = await runFx(["mcp", "remove", "shared"], {
+        cwd: workspace,
+        env,
+      });
+      expect(removed.code).toBe(0);
+      expect(removed.stderr).toBe("");
+      expect(removed.stdout).toContain("Removed MCP server 'shared'");
+      expect(JSON.parse(readFileSync(join(home, ".fx", "mcp.json"), "utf8")))
+        .toEqual({ mcp: {} });
+
+      const after = await runFx(["mcp", "list"], { cwd: workspace, env });
+      expect(after.code).toBe(0);
+      expect(after.stdout).toMatch(/shared source=workspace scope=workspace/);
+      expect(existsSync(profileMarker)).toBe(false);
+      expect(existsSync(workspaceMarker)).toBe(false);
+
+      const missing = await runFx(["mcp", "remove", "missing"], {
+        cwd: workspace,
+        env,
+      });
+      expect(missing.code).not.toBe(0);
+      expect(missing.stderr).toContain("MCP server 'missing' was not found");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("adds local and HTTP servers without launching either server", async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-add-")));
     const home = join(root, "home");
@@ -4975,7 +5059,14 @@ describe("cli: MCP profile add", () => {
         env: { HOME: home, ...NO_GATEWAY_AUTH },
       });
       expect(help.code).toBe(0);
-      expect(help.stdout).toContain("fx mcp add NAME COMMAND [ARGS...]");
+      for (const command of [
+        "fx mcp add NAME COMMAND [ARGS...]",
+        "fx mcp auth NAME",
+        "fx mcp list",
+        "fx mcp logout NAME",
+        "fx mcp path",
+        "fx mcp remove NAME",
+      ]) expect(help.stdout).toContain(command);
 
       const local = await runFx(
         ["mcp", "add", "local", "/bin/sh", "-c", `touch ${marker}`],
