@@ -986,18 +986,65 @@ function assertFirstPostEnterOutputShowsSubmittedPrompt(
   submittedPrompt: string,
 ) {
   const frames = readTapeFrames(tapePath);
-  const enterIndex = frames.findIndex(
-    (frame) =>
-      frame.kind === 2 &&
-      frame.payload.equals(Buffer.from("\r")),
-  );
-  expect(enterIndex).toBeGreaterThanOrEqual(0);
+  const enterIndex = findEnterAfterSubmittedPrompt(frames, submittedPrompt);
 
   const firstOutput = frames
     .slice(enterIndex + 1)
     .find((frame) => frame.kind === 1);
   expect(firstOutput).toBeDefined();
   expect(firstOutput!.payload.includes(Buffer.from(submittedPrompt))).toBe(true);
+}
+
+function findEnterAfterSubmittedPrompt(
+  frames: ReturnType<typeof readTapeFrames>,
+  submittedPrompt: string,
+): number {
+  const promptInputIndex = frames.findIndex((frame) =>
+    frame.kind === 2 && frame.payload.includes(Buffer.from(submittedPrompt))
+  );
+  expect(promptInputIndex).toBeGreaterThanOrEqual(0);
+  const enterIndex = frames.findIndex((frame, index) =>
+    index > promptInputIndex &&
+    frame.kind === 2 &&
+    frame.payload.equals(Buffer.from("\r"))
+  );
+  expect(enterIndex).toBeGreaterThan(promptInputIndex);
+  return enterIndex;
+}
+
+function assertSubmittedPromptRowStaysStableAfterEnter(
+  tapePath: string,
+  framesRoot: string,
+  submittedPrompt: string,
+) {
+  const frames = readTapeFrames(tapePath);
+  const enterIndex = findEnterAfterSubmittedPrompt(frames, submittedPrompt);
+  const firstOutput = frames.slice(enterIndex + 1).find((frame) => frame.kind === 1);
+  expect(firstOutput).toBeDefined();
+  const gridDir = join(framesRoot, "frames");
+  const frameNames = readdirSync(gridDir)
+    .filter((name) => name.endsWith(".grid.txt"))
+    .sort();
+  const firstGrid = readFileSync(
+    join(gridDir, `${String(firstOutput!.index).padStart(4, "0")}.grid.txt`),
+    "utf8",
+  );
+  const thinkingGrid = frameNames
+    .filter((name) => Number.parseInt(name, 10) > firstOutput!.index)
+    .map((name) => readFileSync(join(gridDir, name), "utf8"))
+    .find((grid) => grid.includes("Thinking"));
+  expect(thinkingGrid).toBeDefined();
+
+  const promptRow = (grid: string) => {
+    const row = grid.split(/\r?\n/).findIndex((line) =>
+      line.includes(submittedPrompt)
+    );
+    expect(row).toBeGreaterThanOrEqual(0);
+    return row;
+  };
+  expect(promptRow(thinkingGrid!)).toBe(
+    promptRow(firstGrid),
+  );
 }
 
 function hasBareRunningRow(value: string): boolean {
@@ -2518,8 +2565,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const workspacePath = join(root, "workspace");
       const stderrPath = join(root, "stderr.log");
       const tapePath = join(root, "session.fxtape");
+      const tracePath = join(root, "fx-trace.log");
       const framesRoot = join(root, "replay-frames");
       const submittedPrompt = "IDLE_SUBMIT_ORDER_SENTINEL";
+      const newerDraft = "RAPID_SECOND_DRAFT_SENTINEL";
       const hold: HoldState = { started: false, cancelled: false };
       mkdirSync(join(home, ".fx"), { recursive: true });
       mkdirSync(workspacePath, { recursive: true });
@@ -2551,14 +2600,103 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_MODEL: MODEL,
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "input,worker",
         },
       });
 
       await session.waitForComposer(TIMEOUT);
-      await session.sendText(submittedPrompt);
+      await session.sendLiteral(submittedPrompt);
+      session.sendKeysImmediate(["Enter"]);
+      session.sendLiteralImmediate(newerDraft);
+      session.sendKeysImmediate(["Enter"]);
       await waitForCondition(
         () => heldGateway.requests.length === 1 && hold.started,
         "held idle submitted prompt stream",
+      );
+      await session.waitForText("Thinking", TIMEOUT);
+      await Bun.sleep(250);
+      await session.sendKeys("C-c");
+      const cancelledPane = await session.waitForText("cancelled", TIMEOUT);
+
+      execFileSync(FX_BIN, ["replay", tapePath, "--frames-dir", framesRoot], {
+        encoding: "utf8",
+      });
+      assertFirstPostEnterOutputShowsSubmittedPrompt(tapePath, submittedPrompt);
+      assertSubmittedPromptRowStaysStableAfterEnter(
+        tapePath,
+        framesRoot,
+        submittedPrompt,
+      );
+      assertThinkingFramesShowSubmittedPrompt(framesRoot, submittedPrompt);
+      const trace = readFileSync(tracePath, "utf8");
+      const frameCommitted = trace.indexOf("event=pending_prompt_frame_committed");
+      const promptQueued = trace.indexOf("event=prompt_enqueue");
+      const workerBegin = trace.indexOf("event=worker_begin");
+      expect(frameCommitted).toBeGreaterThanOrEqual(0);
+      expect(promptQueued).toBeGreaterThan(frameCommitted);
+      expect(workerBegin).toBeGreaterThan(promptQueued);
+      expect(composerContains(cancelledPane, newerDraft)).toBe(true);
+
+      expect(hold.cancelled).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(existsSync(tapePath)).toBe(true);
+      expect(session.isAlive()).toBe(true);
+      expect(session.isPaneAlive()).toBe(true);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "idle submitted prompt keeps its canonical row after a completed turn",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-idle-submit-multiturn-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const tapePath = join(root, "session.fxtape");
+      const framesRoot = join(root, "replay-frames");
+      const seedPrompt = "MULTI_TURN_SEED_PROMPT";
+      const seedReply = "MULTI_TURN_SEED_REPLY";
+      const submittedPrompt = "MULTI_TURN_ROW_SENTINEL";
+      const hold: HoldState = { started: false, cancelled: false };
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+
+      const queuedGateway = startFakeGateway([
+        fakeGatewayFinalText(seedReply),
+        () => heldGatewayResponse(hold),
+      ]);
+      gateway = queuedGateway;
+      session = await TmuxSession.create({
+        cwd: realpathSync(workspace),
+        width: 96,
+        height: 28,
+        stderrPath,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-idle-submit-multiturn-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+          FX_MODEL: MODEL,
+          FX_RECORD: tapePath,
+          FX_RECORD_INPUT: "1",
+        },
+      });
+
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText(seedPrompt);
+      await session.waitForText(seedReply, TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      await session.sendLiteral(submittedPrompt);
+      session.sendKeysImmediate(["Enter"]);
+      await waitForCondition(
+        () => queuedGateway.requests.length === 2 && hold.started,
+        "held multi-turn submitted prompt stream",
       );
       await session.waitForText("Thinking", TIMEOUT);
       await Bun.sleep(250);
@@ -2569,11 +2707,12 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         encoding: "utf8",
       });
       assertFirstPostEnterOutputShowsSubmittedPrompt(tapePath, submittedPrompt);
-      assertThinkingFramesShowSubmittedPrompt(framesRoot, submittedPrompt);
-
-      expect(hold.cancelled).toBe(true);
+      assertSubmittedPromptRowStaysStableAfterEnter(
+        tapePath,
+        framesRoot,
+        submittedPrompt,
+      );
       expect(readFileSync(stderrPath, "utf8")).toBe("");
-      expect(existsSync(tapePath)).toBe(true);
       expect(session.isAlive()).toBe(true);
       expect(session.isPaneAlive()).toBe(true);
     },
@@ -8226,9 +8365,12 @@ describe.skipIf(!tmuxAvailable())("transcript scrollback release", () => {
         ]);
         releaseFinish();
         await session.waitForPane(hasEmptyComposer, SB_TIMEOUT);
-        await Bun.sleep(250);
-
-        const scrollback = await session.captureFullScrollback();
+        const scrollback = await session.waitForStableScrollback(
+          (value) =>
+            countOccurrences(value, "ANCHOR_PHASE_TWO_24") === 1 &&
+            TURN_SUMMARY_WITH_TOKENS.test(value),
+          SB_TIMEOUT,
+        );
         const orderedMarkers = [
           "BLOCK_HEADING",
           "BLOCK_PROSE",
