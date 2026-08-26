@@ -549,7 +549,12 @@ pub fn Runtime(comptime App: type) type {
             if (!app.approval_prompt.isActive() and
                 !app.question_prompt.isActive())
             {
-                _ = advanceVisibleAnimation(app, event_handlers.tool_lifecycle, now_ms);
+                _ = advanceVisibleAnimation(
+                    app,
+                    event_handlers.tool_lifecycle,
+                    now_ms,
+                    std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake),
+                );
             }
         }
 
@@ -557,6 +562,7 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             presenter: activity_runtime.LifecyclePresenter,
             now_ms: i64,
+            now_awake: std.Io.Clock.Timestamp,
         ) bool {
             if (comptime @hasDecl(@TypeOf(app.subagents), "childPresentationView") and
                 @hasDecl(@TypeOf(app.subagents), "childConversationRuntime") and
@@ -566,11 +572,17 @@ pub fn Runtime(comptime App: type) type {
                     const view = app.subagents.childPresentationView() orelse return false;
                     const child_shell = app.subagents.childConversationRuntime() orelse return false;
                     const requests = app.subagents.activeRenderRequests();
+                    const status_changed = child_shell.worker_status_state().refresh_route_recovery(now_awake);
+                    if (status_changed) requests.request(.footer);
                     const status_expired = child_shell.worker_status_state().expire_transient(now_ms);
                     if (status_expired) requests.request(.footer);
-                    if (!view.chat.busy() or !child_shell.shimmer_active) return status_expired;
+                    if (!view.chat.busy() or !child_shell.shimmer_active) {
+                        return status_changed or status_expired;
+                    }
                     const previous_deadline = requests.animation_next_deadline_ms;
-                    if (!requests.requestAnimationDue(now_ms)) return status_expired;
+                    if (!requests.requestAnimationDue(now_ms)) {
+                        return status_changed or status_expired;
+                    }
                     debug_trace.logf(
                         "frame_schedule",
                         "child_animation_due previous_ms={d} now_ms={d} interval_ms={d}",
@@ -579,7 +591,11 @@ pub fn Runtime(comptime App: type) type {
                     return true;
                 }
             }
-            if (!app.stream.active and !app.pacer.hasCompletedAssistantPresentationTail()) return false;
+            const status_changed = app.shell.worker_status_state().refresh_route_recovery(now_awake);
+            if (status_changed) app.shell.render_requests.request(.footer);
+            if (!app.stream.active and !app.pacer.hasCompletedAssistantPresentationTail()) {
+                return status_changed;
+            }
             const native_history_active = if (comptime @hasDecl(
                 @TypeOf(app.shell),
                 "nativeHistoryActive",
@@ -592,13 +608,13 @@ pub fn Runtime(comptime App: type) type {
                 !app.shell.shimmer_active or
                 native_history_active)
             {
-                return false;
+                return status_changed;
             }
 
             var label_buf: [256]u8 = undefined;
-            _ = activityShimmerLabel(app, presenter, &label_buf) orelse return false;
+            _ = activityShimmerLabel(app, presenter, &label_buf) orelse return status_changed;
             const previous_deadline = app.shell.render_requests.animation_next_deadline_ms;
-            if (!app.shell.render_requests.requestAnimationDue(now_ms)) return false;
+            if (!app.shell.render_requests.requestAnimationDue(now_ms)) return status_changed;
             debug_trace.logf(
                 "frame_schedule",
                 "animation_due previous_ms={d} now_ms={d} interval_ms={d}",
@@ -1898,6 +1914,13 @@ fn tickNoop(app: *FakeApp) !void {
     try Runtime(FakeApp).tick(app, noopTaskCompletion, NoopBridge.handlers(app));
 }
 
+fn test_awake_timestamp(milliseconds: i64) std.Io.Clock.Timestamp {
+    return .{
+        .clock = .awake,
+        .raw = .fromNanoseconds(@as(i96, milliseconds) * std.time.ns_per_ms),
+    };
+}
+
 fn queueLifecycle(app: *FakeApp, event: types.ToolLifecycleEvent) !void {
     try app.worker.pushEvent(std.heap.c_allocator, .{ .tool_lifecycle = event });
 }
@@ -2133,15 +2156,15 @@ test "core.app_worker_runtime advances visible animation exactly at its deadline
     app.shell.render_requests.animation_next_deadline_ms = 1_050;
     const before = app.shell.render_requests.visibleAnimationPhase();
 
-    try std.testing.expect(!Runtime(FakeApp).advanceVisibleAnimation(&app, NoopBridge.lifecyclePresenter(&app), 1_049));
+    try std.testing.expect(!Runtime(FakeApp).advanceVisibleAnimation(&app, NoopBridge.lifecyclePresenter(&app), 1_049, test_awake_timestamp(1_049)));
     try std.testing.expectEqual(before, app.shell.render_requests.visibleAnimationPhase());
     try std.testing.expect(!app.shell.render_requests.hasReason(.animation));
 
-    try std.testing.expect(Runtime(FakeApp).advanceVisibleAnimation(&app, NoopBridge.lifecyclePresenter(&app), 1_050));
+    try std.testing.expect(Runtime(FakeApp).advanceVisibleAnimation(&app, NoopBridge.lifecyclePresenter(&app), 1_050, test_awake_timestamp(1_050)));
     try std.testing.expectEqual(before, app.shell.render_requests.visibleAnimationPhase());
     try std.testing.expect(app.shell.render_requests.hasReason(.animation));
 
-    try std.testing.expect(!Runtime(FakeApp).advanceVisibleAnimation(&app, NoopBridge.lifecyclePresenter(&app), 1_050));
+    try std.testing.expect(!Runtime(FakeApp).advanceVisibleAnimation(&app, NoopBridge.lifecyclePresenter(&app), 1_050, test_awake_timestamp(1_050)));
     try std.testing.expectEqual(before, app.shell.render_requests.visibleAnimationPhase());
 }
 
@@ -2162,8 +2185,65 @@ test "core.app_worker_runtime pauses visible animation after native history star
         &app,
         NoopBridge.lifecyclePresenter(&app),
         1,
+        test_awake_timestamp(1),
     ));
     try std.testing.expect(!app.shell.render_requests.hasReason(.animation));
+}
+
+test "core.app_worker_runtime refreshes root and selected child retry countdowns" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+
+    app.stream.active = true;
+    app.shell.shimmer_active = true;
+    app.shell.worker_status_state().set_route_recovery(.{
+        .kind = .auto_retry,
+        .failed_attempt = 1,
+        .attempt_limit = 3,
+        .delay_seconds = 4,
+        .retry_deadline = test_awake_timestamp(4_000),
+    }, 0);
+
+    try std.testing.expect(Runtime(FakeApp).advanceVisibleAnimation(
+        &app,
+        NoopBridge.lifecyclePresenter(&app),
+        0,
+        test_awake_timestamp(3_000),
+    ));
+    switch (app.shell.activityProjection()) {
+        .turn_thinking => |projection| try std.testing.expectEqualStrings(
+            "⚠ Provider unavailable · retrying request in 1s · attempt 1/3",
+            projection.label,
+        ),
+        .none, .tool_slot => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+
+    app.subagents.view_active = true;
+    app.subagents.child_busy = true;
+    app.subagents.child_shell.shimmer_active = true;
+    app.subagents.child_shell.worker_status_state().set_route_recovery(.{
+        .kind = .auto_retry,
+        .failed_attempt = 2,
+        .attempt_limit = 3,
+        .delay_seconds = 4,
+        .retry_deadline = test_awake_timestamp(8_000),
+    }, 0);
+
+    try std.testing.expect(Runtime(FakeApp).advanceVisibleAnimation(
+        &app,
+        NoopBridge.lifecyclePresenter(&app),
+        0,
+        test_awake_timestamp(7_000),
+    ));
+    switch (app.subagents.child_shell.activityProjection()) {
+        .turn_thinking => |projection| try std.testing.expectEqualStrings(
+            "⚠ Provider unavailable · retrying request in 1s · attempt 2/3",
+            projection.label,
+        ),
+        .none, .tool_slot => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(app.subagents.child_render_requests.hasReason(.footer));
 }
 
 test "core.app_worker_runtime expires selected child worker status while idle" {
@@ -2176,7 +2256,7 @@ test "core.app_worker_runtime expires selected child worker status while idle" {
         .attempt_limit = 3,
     }, 1_000);
 
-    _ = Runtime(FakeApp).advanceVisibleAnimation(&app, NoopBridge.lifecyclePresenter(&app), 2_500);
+    _ = Runtime(FakeApp).advanceVisibleAnimation(&app, NoopBridge.lifecyclePresenter(&app), 2_500, test_awake_timestamp(2_500));
 
     try std.testing.expect(app.subagents.child_shell.activityProjection() == .none);
     try std.testing.expect(app.subagents.child_render_requests.hasReason(.footer));
@@ -2310,6 +2390,39 @@ test "core.app_worker_runtime clears route recovery activity on clear event but 
     try tickNoop(&app);
     switch (app.shell.activityProjection()) {
         .turn_thinking => |thinking| try std.testing.expectEqualStrings("⚠ Provider unavailable · recovery paused after 3/3 attempts", thinking.label),
+        .none, .tool_slot => return error.TestUnexpectedResult,
+    }
+}
+
+test "core.app_worker_runtime replaces a due retry with its consumed terminal attempt" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
+        .kind = .auto_retry,
+        .failed_attempt = 1,
+        .attempt_limit = 2,
+        .delay_seconds = 4,
+        .retry_deadline = test_awake_timestamp(4_000),
+    } });
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .route_recovery_status = .{
+        .kind = .terminal_provider_error,
+        .failed_attempt = 1,
+        .attempt_limit = 2,
+        .diagnostic = types.ModelFailureDiagnostic.init("TestProviderSerializationFailed"),
+    } });
+    try app.worker.pushEvent(std.heap.c_allocator, .{ .error_text = .{
+        .topic = "system",
+        .tone = .@"error",
+        .body = "request failed",
+    } });
+    try tickNoop(&app);
+
+    switch (app.shell.activityProjection()) {
+        .turn_thinking => |thinking| try std.testing.expectEqualStrings(
+            "⚠ Provider unavailable · TestProviderSerializationFailed · recovery paused after 1/2 attempts",
+            thinking.label,
+        ),
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
 }
