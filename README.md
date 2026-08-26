@@ -17,7 +17,9 @@ alt-fx is a fork of [vercel-labs/fx](https://github.com/vercel-labs/fx) with ALT
 
 fx remains the harness. Its terminal UI, model clients, credentials, permission engine, tools, filesystem access, process execution, and persistence infrastructure remain native. ALT owns only Team definitions, leadership, consultations, specialist projections, bounded orchestration context, and the rules by which results return.
 
-ALT is compiled into normal alt-fx builds, but **ALT mode is not active when the application starts**. alt-fx opens in native fx. Use `/alt` when you want Team orchestration and `/alt off` to return to the native environment.
+**Development status:** the ALT orchestration runtime and its fx host integration are wired in and exercised, but ALT is not yet usable as an end-user feature. The product does not yet provide the Team creation, selection, revision, and ALT-session workflows needed to use that runtime. `/alt` currently exposes the bundled development Team so the integration can be verified while those workflows are built.
+
+ALT is compiled into normal alt-fx builds, but **ALT mode is not active when the application starts**. alt-fx opens in native fx. `/alt` and `/alt off` are currently development-facing entry and exit commands.
 
 The underlying harness remains optimized for research and embeddability as part of larger systems.
 
@@ -93,9 +95,9 @@ The current directory becomes the primary workspace. Enter a prompt, or run `/he
 
 Tool calls are expanded by default. Enable `Collapse tool calls` in `/settings`, or set `"collapse_tool_calls": true` in `~/.fx/settings.json`, to show one summary per tool-call group in the main transcript. Individual calls remain available in the full transcript with Ctrl+O.
 
-## ALT mode
+## ALT development interface
 
-Enter the bundled orchestration environment explicitly:
+Enter the temporary bundled Engineering Team explicitly:
 
 ```text
 /alt
@@ -131,7 +133,7 @@ The runtime enforces these boundaries:
 - Specialists are clean-slate leaf calls with bounded projections, selected attachments, and fx's real tools—but no conversation or Team state.
 - Every new user turn starts at the configured primary, regardless of who answered the previous turn.
 
-The bundled Engineering Team currently uses OpenCode Go models. Native Codex, Grok, and fx subagents are unavailable inside ALT mode; `/alt off` restores the complete native fx environment.
+This compiled Team is an integration fixture, not the intended Team-management surface. It currently uses OpenCode Go models. Native Codex, Grok, and fx subagents are unavailable inside ALT mode; `/alt off` restores the complete native fx environment.
 
 The status line hides the workspace path and Git branch by default. Enable the `Status line workspace` option in `/settings`, run `/statusline workspace`, or set it in `~/.fx/settings.json`:
 

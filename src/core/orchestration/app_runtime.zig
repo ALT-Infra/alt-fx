@@ -34,6 +34,16 @@ pub fn handleCommand(
     input: []const u8,
 ) !bool {
     const payload = commandPayload(Extension, input) orelse return false;
+    try handlePayload(Host, Extension, app, payload);
+    return true;
+}
+
+pub fn handlePayload(
+    comptime Host: type,
+    comptime Extension: type,
+    app: anytype,
+    payload: []const u8,
+) !void {
     const entering = payload.len == 0 or std.ascii.eqlIgnoreCase(payload, "on");
     if (entering) {
         const App = @TypeOf(app.*);
@@ -45,7 +55,7 @@ pub fn handleCommand(
                     .tone = .@"error",
                     .body = "ALT mode was not enabled because fx could not prove that native subagent work is idle. Retry after native subagent recovery settles.",
                 }, true);
-                return true;
+                return;
             };
             if (native_work_active) {
                 const descriptor = Extension.descriptor();
@@ -54,14 +64,14 @@ pub fn handleCommand(
                     .tone = .warning,
                     .body = "ALT mode was not enabled because native fx subagent work is active. Settle or cancel that work first.",
                 }, true);
-                return true;
+                return;
             }
         }
     }
     const engine = app.orchestration.engine orelse blk: {
         const created = Extension.create(app.alloc) catch |err| {
             try writeFailure(Extension, app, err);
-            return true;
+            return;
         };
         app.orchestration.engine = created;
         break :blk created;
@@ -90,12 +100,12 @@ pub fn handleCommand(
             .workspace_path = app.workspace_root,
             .providers = provider_storage[0..provider_count],
         } }, sink) catch |err| try writeFailure(Extension, app, err);
-        return true;
+        return;
     }
     if (std.ascii.eqlIgnoreCase(payload, "off")) {
         _ = try cancelActiveTurn(Host, Extension, app);
         engine.dispatch(.leave, sink) catch |err| try writeFailure(Extension, app, err);
-        return true;
+        return;
     }
 
     const descriptor = Extension.descriptor();
@@ -104,7 +114,6 @@ pub fn handleCommand(
         .tone = .@"error",
         .body = descriptor.usage,
     }, true);
-    return true;
 }
 
 pub fn captureCanonicalTurn(

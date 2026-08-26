@@ -9,8 +9,8 @@ pub fn descriptor() host.ExtensionDescriptor {
         .id = "alt",
         .display_name = "ALT",
         .slash_command = "/alt",
-        .summary = "Enter the ALT multi-model orchestration environment",
-        .usage = "Use /alt or /alt off.",
+        .summary = "enter or leave ALT Team orchestration",
+        .usage = "/alt [on|off]",
     };
 }
 

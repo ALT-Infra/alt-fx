@@ -384,6 +384,7 @@ pub fn Handlers(comptime App: type) type {
                 .handle_notifications = commandHandleNotifications,
                 .handle_workspace = commandHandleWorkspace,
                 .show_version = commandShowVersion,
+                .handle_extension = commandHandleExtension,
                 .unknown = commandUnknown,
             };
         }
@@ -1992,6 +1993,15 @@ pub fn Handlers(comptime App: type) type {
                 .tone = .neutral,
                 .body = App.app_version,
             }, true);
+        }
+
+        fn commandHandleExtension(ctx: *anyopaque, payload: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime @hasDecl(App, "handleExtensionSlashCommand")) {
+                try app.handleExtensionSlashCommand(payload);
+                return;
+            }
+            return error.ExtensionSlashCommandUnavailable;
         }
 
         fn commandUnknown(ctx: *anyopaque, _: []const u8) !void {

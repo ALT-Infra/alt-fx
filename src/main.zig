@@ -86,6 +86,36 @@ const prompt_policy = @import("core/config/prompt_policy.zig");
 const permission_request = @import("core/permissions/permission_request.zig");
 const builtin_commands = @import("builtins/commands.zig");
 const command_specs = @import("core/slash_commands/command_specs.zig");
+const orchestration_slash_specs = if (build_options.orchestration_enabled) blk: {
+    const descriptor = orchestration_extension.descriptor();
+    break :blk [_]command_specs.SlashSpec{.{
+        .kind = .extension,
+        .command = descriptor.slash_command,
+        .help_entry = descriptor.usage,
+        .completion_description = descriptor.summary,
+        .presentation_category = .agents,
+        .has_args = true,
+        .accepts_payload = true,
+    }};
+} else [_]command_specs.SlashSpec{};
+const app_slash_specs = builtin_commands.slash_specs ++ orchestration_slash_specs;
+const app_slash_registry = command_specs.SlashRegistry{ .commands = app_slash_specs[0..] };
+
+comptime {
+    if (build_options.orchestration_enabled) {
+        const extension_command = orchestration_extension.descriptor().slash_command;
+        for (builtin_commands.slash_specs) |spec| {
+            if (std.mem.eql(u8, extension_command, spec.command)) {
+                @compileError("orchestration extension command collides with a native slash command");
+            }
+            for (spec.aliases) |alias| {
+                if (std.mem.eql(u8, extension_command, alias)) {
+                    @compileError("orchestration extension command collides with a native slash-command alias");
+                }
+            }
+        }
+    }
+}
 const builtin_context = @import("builtins/context.zig");
 const builtin_gateway = @import("builtins/gateway.zig");
 const builtin_providers = @import("builtins/providers.zig");
@@ -515,7 +545,7 @@ const App = struct {
     }
 
     pub fn slashRegistry(_: *const Self) command_specs.SlashRegistry {
-        return builtin_commands.slash_registry;
+        return app_slash_registry;
     }
 
     pub fn mcpCommandProvider(_: *const Self) mcp_command_provider.Provider {
@@ -1125,20 +1155,19 @@ const App = struct {
     }
 
     pub fn handleCommand(self: *App, cmd: []const u8) !void {
-        if (comptime build_options.orchestration_enabled) {
-            if (try orchestration_app_runtime.handleCommand(
-                orchestration_host,
-                orchestration_extension,
-                self,
-                cmd,
-            )) return;
-        }
         try app_commands.Handlers(App).route(self, cmd);
     }
 
-    pub fn isExtensionSlashCommand(_: *const App, input: []const u8) bool {
-        if (comptime !build_options.orchestration_enabled) return false;
-        return orchestration_app_runtime.isCommand(orchestration_extension, input);
+    pub fn handleExtensionSlashCommand(self: *App, payload: []const u8) !void {
+        if (comptime !build_options.orchestration_enabled) {
+            return error.OrchestrationExtensionUnavailable;
+        }
+        try orchestration_app_runtime.handlePayload(
+            orchestration_host,
+            orchestration_extension,
+            self,
+            payload,
+        );
     }
 
     pub fn orchestrationConversationId(self: *App) []const u8 {
@@ -4616,6 +4645,26 @@ test "/version command writes version to transcript" {
     try std.testing.expectEqualStrings("version", notice.topic);
     try std.testing.expectEqual(types.NoticeTone.neutral, notice.tone);
     try std.testing.expect(std.mem.find(u8, notice.body, version) != null);
+}
+
+test "compiled orchestration contributes to the native slash-command surface" {
+    if (comptime build_options.orchestration_enabled) {
+        const descriptor = orchestration_extension.descriptor();
+        const spec = app_slash_registry.lookup(descriptor.slash_command) orelse
+            return error.TestExpectedOrchestrationSlashCommand;
+        try std.testing.expectEqual(command_specs.SlashKind.extension, spec.kind);
+        try std.testing.expectEqualStrings(descriptor.usage, spec.help_entry.?);
+        try std.testing.expectEqualStrings(descriptor.summary, spec.completion_description.?);
+        try std.testing.expectEqual(command_specs.SlashPresentationCategory.agents, spec.presentation_category.?);
+        try std.testing.expect(spec.accepts_payload);
+
+        const help = try command_specs.renderSlashHelp(std.testing.allocator, app_slash_registry);
+        defer std.testing.allocator.free(help);
+        try std.testing.expect(std.mem.find(u8, help, descriptor.usage) != null);
+        try std.testing.expect(command_specs.slashCompletionCount(app_slash_registry, "/al") > 0);
+    } else {
+        try std.testing.expect(app_slash_registry.lookup("/alt") == null);
+    }
 }
 
 test "background process registry ignores stale watcher urls" {
