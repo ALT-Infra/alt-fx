@@ -2598,12 +2598,12 @@ describe.skipIf(SKIP)("tui: resize", () => {
       label: "help",
       width: 72,
       height: 16,
-      surfaceMarker: "Commands ",
+      surfaceMarker: "Enter Open",
       editedInput: "x",
       async openSurface(active) {
         await active.resizeWindow(60, 12, 500);
         await active.sendText("/help");
-        await active.waitForText("Commands ", TIMEOUT);
+        await active.waitForText("Enter Open", TIMEOUT);
       },
     },
     {
