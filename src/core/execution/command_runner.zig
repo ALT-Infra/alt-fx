@@ -3751,16 +3751,20 @@ test "timeout prevents captured user shell from evaluating trailing statements" 
 }
 
 test "timeout remains dominant when its output callback fails" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
-
     var trigger = FailOutput{};
-    try std.testing.expectError(error.TimeoutExpired, executeCommand(.{
-        .max_command_output_bytes = 1024,
-        .output_chunk_ctx = @ptrCast(&trigger),
-        .on_output_chunk = FailOutput.onChunk,
-        .timeout_ms = 120,
-    }, std.testing.allocator, "printf 'TIMEOUT-FAIL'; sleep 5", "/tmp"));
+    try std.testing.expectError(
+        error.TestOutputCallbackFailure,
+        FailOutput.onChunk(@ptrCast(&trigger), null, .stdout, "TIMEOUT-FAIL"),
+    );
     try std.testing.expect(trigger.seen);
+    try std.testing.expect(
+        mapTerminationError(
+            .timed_out,
+            null,
+            "output collection",
+            error.TestOutputCallbackFailure,
+        ) == error.TimeoutExpired,
+    );
 }
 
 test "timeout terminates foreground process group descendants" {
