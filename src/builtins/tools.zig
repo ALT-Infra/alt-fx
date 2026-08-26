@@ -312,16 +312,16 @@ const terminal_screen_branch_properties = terminal_action_gateway_properties(.sc
 const terminal_atomic_write_description =
     "Input for this session. Supply exactly one of text, keys, controls, or paste. Fx acquires and releases agent control around the write.";
 const terminal_model_text_input_properties = [_]model_tool_schema.Property{
-    .{ .name = "text", .json_type = .string, .description = "Literal text written to the session." },
+    .{ .name = "text", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = terminal_contracts.max_write_bytes }, .description = "Literal text written to the session." },
 };
 const terminal_model_keys_input_properties = [_]model_tool_schema.Property{
-    terminal_write_schema.properties[2],
+    .{ .name = "keys", .json_type = .array, .bounds = &.{ .min_items = 1, .max_items = terminal_contracts.max_write_items }, .shape = terminal_write_schema.properties[2].shape },
 };
 const terminal_model_controls_input_properties = [_]model_tool_schema.Property{
-    terminal_write_schema.properties[3],
+    .{ .name = "controls", .json_type = .array, .bounds = &.{ .min_items = 1, .max_items = terminal_contracts.max_write_items }, .shape = terminal_write_schema.properties[3].shape, .description = terminal_write_schema.properties[3].description },
 };
 const terminal_model_paste_input_properties = [_]model_tool_schema.Property{
-    .{ .name = "paste", .json_type = .string, .description = "Literal text pasted into the session." },
+    .{ .name = "paste", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = terminal_contracts.max_write_bytes }, .description = "Literal text pasted into the session." },
 };
 const terminal_model_input_schemas = [_]model_tool_schema.ObjectSchema{
     .{ .properties = &terminal_model_text_input_properties, .required = &.{"text"}, .additional_properties = false },
@@ -1560,7 +1560,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "dcd56db16b733d17bb913e090b09db281b77892a1f29894ba7c9217f9ac6e66b",
+        "2add25290daca1adba81c3e6e04d66e1170317b99ba2a94c67063144d9afa070",
         &actual_hex,
     );
 }
@@ -1699,6 +1699,22 @@ test "terminal tool schema derives closed action branches and exact write states
         try std.testing.expectEqual(@as(usize, 1), alternative.properties.len);
         try std.testing.expectEqualStrings(field_name, alternative.properties[0].name);
         try std.testing.expect(schemaProperty(alternative, "kind") == null);
+        const bounds = alternative.properties[0].bounds.?;
+        if (std.mem.eql(u8, field_name, "text") or
+            std.mem.eql(u8, field_name, "paste"))
+        {
+            try std.testing.expectEqual(@as(?u32, 1), bounds.min_length);
+            try std.testing.expectEqual(
+                @as(?u32, terminal_contracts.max_write_bytes),
+                bounds.max_length,
+            );
+        } else {
+            try std.testing.expectEqual(@as(?u32, 1), bounds.min_items);
+            try std.testing.expectEqual(
+                @as(?u32, terminal_contracts.max_write_items),
+                bounds.max_items,
+            );
+        }
     }
 
     const exec_schema = terminal_action_schema(.exec);

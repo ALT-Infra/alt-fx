@@ -23,6 +23,7 @@ const model_tool_schema = @import("../../tooling/model_tool_schema.zig");
 const command_result_mapping = @import("../../tooling/command_result_mapping.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
 const tooling_tool_admission = @import("../../tooling/tool_admission.zig");
+const tool_args = @import("../../tooling/tool_args.zig");
 const hooks = @import("../../hooks/hooks.zig");
 const command_contract = @import("../../execution/command_contract.zig");
 const command_environment = @import("../../execution/command_environment.zig");
@@ -321,16 +322,23 @@ fn agent_terminal_lease_transition(
     if (session_id != .string) {
         return error.InvalidTerminalLeaseTrackingInput;
     }
-    const lease_value = parsed.object.get("lease") orelse {
+    const lease_value = parsed.object.get("lease");
+    const lease_absent = lease_value == null or switch (lease_value.?) {
+        .null => true,
+        .string => |text| tool_args.isNullPlaceholderText(text),
+        else => false,
+    };
+    if (lease_absent) {
         const write = parsed.object.get("write") orelse
             return error.InvalidTerminalLeaseTrackingInput;
         if (write == .null) return error.InvalidTerminalLeaseTrackingInput;
         return .{ .atomic = session_id.string };
-    };
-    if (lease_value != .string) return error.InvalidTerminalLeaseTrackingInput;
+    }
+    const concrete_lease = lease_value.?;
+    if (concrete_lease != .string) return error.InvalidTerminalLeaseTrackingInput;
     const lease = std.meta.stringToEnum(
         terminal_contracts.WriteLeaseIntent,
-        lease_value.string,
+        concrete_lease.string,
     ) orelse return error.InvalidTerminalLeaseTrackingInput;
     return switch (lease) {
         .acquire, .use => .{ .track = session_id.string },
@@ -385,21 +393,28 @@ test "agent terminal lease transitions derive from normalized validated write in
             .atomic => unreachable,
         }
     }
-    const atomic = (try agent_terminal_lease_transition(
-        arena,
-        registry,
-        .{
-            .id = "atomic",
-            .name = "terminal",
-            .arguments_json = "{\"action\":\"write\",\"session_id\":\"terminal-one\",\"write\":{\"kind\":\"text\",\"text\":\"input\"}}",
-        },
-    )).?;
-    switch (atomic) {
-        .atomic => |session_id| try std.testing.expectEqualStrings(
-            "terminal-one",
-            session_id,
-        ),
-        .track, .remove => unreachable,
+    const atomic_arguments = [_][]const u8{
+        "{\"action\":\"write\",\"session_id\":\"terminal-one\",\"write\":{\"kind\":\"text\",\"text\":\"input\"}}",
+        "{\"action\":\"write\",\"session_id\":\"terminal-one\",\"lease\":null,\"write\":{\"kind\":\"text\",\"text\":\"input\"}}",
+        "{\"action\":\"write\",\"session_id\":\"terminal-one\",\"lease\":\"null\",\"write\":{\"kind\":\"text\",\"text\":\"input\"}}",
+    };
+    for (atomic_arguments) |arguments_json| {
+        const atomic = (try agent_terminal_lease_transition(
+            arena,
+            registry,
+            .{
+                .id = "atomic",
+                .name = "terminal",
+                .arguments_json = arguments_json,
+            },
+        )).?;
+        switch (atomic) {
+            .atomic => |session_id| try std.testing.expectEqualStrings(
+                "terminal-one",
+                session_id,
+            ),
+            .track, .remove => unreachable,
+        }
     }
     try std.testing.expect((try agent_terminal_lease_transition(
         arena,

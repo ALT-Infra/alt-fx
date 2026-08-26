@@ -398,7 +398,6 @@ pub fn decode(
             "terminal arguments must match the advertised action schema",
         ) };
     };
-    const lease_explicit = raw.object.get("lease") != null;
     if (action == .exec) {
         if (raw.object.get("timeout_ms")) |timeout_value| {
             if (timeout_value != .integer) {
@@ -410,6 +409,7 @@ pub fn decode(
         }
     }
     elideKnownNullFields(&raw.object);
+    const lease_explicit = raw.object.get("lease") != null;
     var correction_scratch: ActionFieldCorrectionScratch = .{};
     defer correction_scratch.deinit(ctx.allocator);
     if (try actionFieldCorrection(ctx.allocator, action, raw.object, &correction_scratch)) |correction| {
@@ -1633,6 +1633,14 @@ test "terminal atomic write selection preserves explicit legacy lease calls" {
         .{
             .arguments_json = "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"lease\":\"acquire\"}",
             .lease_explicit = true,
+        },
+        .{
+            .arguments_json = "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"lease\":null,\"write\":{\"kind\":\"text\",\"text\":\"input\"}}",
+            .lease_explicit = false,
+        },
+        .{
+            .arguments_json = "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"lease\":\"null\",\"write\":{\"kind\":\"text\",\"text\":\"input\"}}",
+            .lease_explicit = false,
         },
     };
     for (cases) |case| {

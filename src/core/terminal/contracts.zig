@@ -507,7 +507,7 @@ pub const WriteLeaseIntent = enum {
     revoke,
 };
 
-pub fn write_payload_required(lease: WriteLeaseIntent) bool {
+fn write_payload_required(lease: WriteLeaseIntent) bool {
     return lease == .use;
 }
 

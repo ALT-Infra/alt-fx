@@ -7429,6 +7429,90 @@ test "shutdownSessionsOnly signals live sessions and leaves them allocated" {
     try std.testing.expectEqual(contracts.Lifecycle.running, session.lifecycle);
 }
 
+test "durable release and exit wait survive resident session removal" {
+    if (!isSupported()) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    const persistence = testPersistence("/workspace");
+    const authority = contracts.AuthorityClaim{
+        .principal = persistence.grant.principal,
+        .actor = persistence.grant.actor,
+        .generation = persistence.grant.generation,
+        .proof = persistence.proof,
+    };
+    var durable = try terminal_store.DurableSession.create(&fixture.profile, .{
+        .session_id = "terminal-durable-fallback",
+        .host_identity = "test-host",
+        .shell = "/bin/zsh",
+        .cwd = "/workspace",
+        .command = null,
+        .backend = .native,
+        .dimensions = .{ .rows = 24, .columns = 80 },
+        .persistence = persistence,
+        .initial_monitors = &.{},
+        .now_ms = 1,
+    });
+    var durable_owned = true;
+    defer if (durable_owned) durable.deinit();
+    try durable.persist_termination(.{ .exited = 17 }, 2);
+    _ = try durable.acquire_write_lease(authority, 3);
+    durable.deinit();
+    durable_owned = false;
+
+    var probe: WorkProbe = .{};
+    var registry = SupportedRegistry{
+        .alloc = alloc,
+        .tracker = .{ .context = &probe, .update_fn = WorkProbe.update },
+        .profile = &fixture.profile,
+        .host_identity = "test-host",
+        .durable_root = "/workspace",
+        .transport_root = "/workspace",
+    };
+    var cancelled = std.atomic.Value(bool).init(false);
+    var released = try registry.write(.{
+        .session_id = "terminal-durable-fallback",
+        .lease = .release,
+        .authority = authority,
+    }, &cancelled);
+    defer released.deinit(alloc);
+    switch (released.view()) {
+        .success => |success| switch (success) {
+            .write => |write| {
+                try std.testing.expectEqual(@as(u32, 0), write.accepted_bytes);
+                try std.testing.expectEqual(
+                    contracts.WriteLease.none,
+                    write.session.attention.write_lease,
+                );
+                try std.testing.expectEqual(
+                    contracts.Lifecycle.exited,
+                    write.session.lifecycle,
+                );
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        .failure => return error.TestUnexpectedResult,
+    }
+
+    var waited = try registry.wait(.{
+        .session_id = "terminal-durable-fallback",
+        .return_when = .exit,
+        .safety_ceiling_ms = 1_000,
+        .authority = authority,
+    }, &cancelled);
+    defer waited.deinit(alloc);
+    switch (waited.view()) {
+        .success => |success| switch (success) {
+            .wait => |wait| try std.testing.expectEqual(
+                contracts.ReturnOutcome{ .exited = 17 },
+                wait.outcome,
+            ),
+            else => return error.TestUnexpectedResult,
+        },
+        .failure => return error.TestUnexpectedResult,
+    }
+}
+
 test "a referenced slot is never recycled out from under its holder" {
     if (!isSupported()) return error.SkipZigTest;
     const alloc = std.testing.allocator;

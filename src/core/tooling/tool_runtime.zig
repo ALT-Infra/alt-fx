@@ -917,11 +917,20 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
     };
 }
 
+fn terminal_lease_cleanup_dispatch_context(
+    ctx: Context,
+    arena: Allocator,
+) tool_dispatch.DispatchContext {
+    var dispatch = typedDispatchContext(ctx, arena);
+    dispatch.cancel_flag = null;
+    return dispatch;
+}
+
 pub fn release_agent_terminal_lease(ctx: Context, session_id: []const u8) !void {
     var arena_state = std.heap.ArenaAllocator.init(ctx.session_allocator);
     defer arena_state.deinit();
     return terminal_impl.release_agent_write_lease(
-        typedDispatchContext(ctx, arena_state.allocator()),
+        terminal_lease_cleanup_dispatch_context(ctx, arena_state.allocator()),
         session_id,
     );
 }
@@ -3760,6 +3769,20 @@ test "tool runtime explicit cancellation source overrides worker fallback" {
     defer arena_state.deinit();
 
     try std.testing.expect(typedDispatchContext(rt.context(), arena_state.allocator()).cancel_flag.? == &cancel_flag);
+}
+
+test "agent terminal lease cleanup ignores preexisting turn cancellation" {
+    var cancel_flag = std.atomic.Value(bool).init(true);
+    var rt = TestRuntime{ .cancel_flag = &cancel_flag };
+    defer rt.deinit(std.testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const cleanup = terminal_lease_cleanup_dispatch_context(
+        rt.context(),
+        arena_state.allocator(),
+    );
+    try std.testing.expect(cleanup.cancel_flag == null);
 }
 
 test "read-only local runtime tools are registered in built-in registry" {
