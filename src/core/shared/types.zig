@@ -305,6 +305,7 @@ pub const RouteRecoveryStatus = struct {
     action: ?ModelRecoveryAction = null,
     required_action: ModelRecoveryRequiredAction = .none,
     delay_seconds: u64 = 0,
+    retry_deadline: ?std.Io.Clock.Timestamp = null,
     diagnostic: ?ModelFailureDiagnostic = null,
 
     pub fn tone(self: RouteRecoveryStatus) RouteRecoveryStatusTone {
@@ -880,9 +881,12 @@ pub const ChatMessage = struct {
 pub const Usage = struct {
     input_tokens: ?u64 = null,
     output_tokens: ?u64 = null,
+    cache_read_tokens: ?u64 = null,
+    cache_write_tokens: ?u64 = null,
+    reasoning_tokens: ?u64 = null,
 };
 
-/// Exact usage metadata returned by a completed Gateway stream. `model` is
+/// Exact usage metadata returned by a completed provider stream. `model` is
 /// owned by the completion carrying this value.
 pub const ProviderBilling = struct {
     created_at_ms: i64,
@@ -1481,6 +1485,8 @@ pub const FinishedPromptProjection = enum {
 };
 
 pub const SnapshotFileOwnership = struct {
+    /// Shared lifetime for snapshot files after worker completion. Copies must
+    /// retain/release; accepted history transfers deletion responsibility.
     ctx: *anyopaque,
     retain_fn: *const fn (*anyopaque) void,
     release_fn: *const fn (*anyopaque) void,

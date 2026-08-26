@@ -49,7 +49,7 @@ pub const top_level_specs = [_]TopLevelSpec{
         .details = &.{
             "The prompt may be passed as arguments or piped on stdin when no prompt args are given.",
             "TTY stdout uses the Minimal transcript presentation; redirected stdout emits raw assistant Markdown.",
-            "Operational progress and diagnostics are written to stderr. JSON output keeps raw Markdown in `output`.",
+            "Operational progress and diagnostics are written to stderr. JSON `output` keeps accumulated assistant Markdown; `final_output` contains only the completed final response, or an empty string when absent.",
             "With --prompt-permissions, JSON and quiet requests may prompt on stderr only when stdin is a TTY.",
         },
     },

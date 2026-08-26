@@ -272,6 +272,7 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .context_registry = context.config.context_registry,
         .context_enabled = context.config.context_enabled,
         .finalize_turn = finalizeTurn,
+        .release_agent_terminal_lease = releaseAgentTerminalLease,
         .live_tool_authority = context.turn.liveToolAuthorityProvider(),
         .current_mcp_generation = currentMcpGeneration,
         .tool_activity_recorder = context.turn.toolActivityRecorder(),
@@ -317,6 +318,11 @@ fn currentMcpGeneration(raw: *anyopaque) ?u64 {
         return null;
     const mcp_ctx = context.config.tool_context.mcp_ctx orelse return null;
     return callback(mcp_ctx);
+}
+
+fn releaseAgentTerminalLease(raw: *anyopaque, session_id: []const u8) !void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    return tool_runtime.release_agent_terminal_lease(context.toolContext(), session_id);
 }
 
 fn refreshGatewayCredential(

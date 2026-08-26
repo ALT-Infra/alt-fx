@@ -61,6 +61,7 @@ const tool_mcp_registry = @import("tool_mcp_registry.zig");
 const tool_mcp_runtime = @import("tool_mcp_runtime.zig");
 const tool_mcp_feature_dispatch = @import("tool_mcp_feature_dispatch.zig");
 const tool_presentation = @import("tool_presentation.zig");
+const terminal_impl = @import("../../tools/terminal/terminal.zig");
 const web_fetch_runtime = @import("web_fetch_runtime.zig");
 const web_search_contract = @import("web_search_contract.zig");
 const web_fetch_artifacts = @import("../session/web_fetch_artifacts.zig");
@@ -916,6 +917,24 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         else
             ctx.permission_rules,
     };
+}
+
+fn terminal_lease_cleanup_dispatch_context(
+    ctx: Context,
+    arena: Allocator,
+) tool_dispatch.DispatchContext {
+    var dispatch = typedDispatchContext(ctx, arena);
+    dispatch.cancel_flag = null;
+    return dispatch;
+}
+
+pub fn release_agent_terminal_lease(ctx: Context, session_id: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(ctx.session_allocator);
+    defer arena_state.deinit();
+    return terminal_impl.release_agent_write_lease(
+        terminal_lease_cleanup_dispatch_context(ctx, arena_state.allocator()),
+        session_id,
+    );
 }
 
 fn requestQuestionBatchWithWorker(
@@ -3753,6 +3772,20 @@ test "tool runtime explicit cancellation source overrides worker fallback" {
     defer arena_state.deinit();
 
     try std.testing.expect(typedDispatchContext(rt.context(), arena_state.allocator()).cancel_flag.? == &cancel_flag);
+}
+
+test "agent terminal lease cleanup ignores preexisting turn cancellation" {
+    var cancel_flag = std.atomic.Value(bool).init(true);
+    var rt = TestRuntime{ .cancel_flag = &cancel_flag };
+    defer rt.deinit(std.testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const cleanup = terminal_lease_cleanup_dispatch_context(
+        rt.context(),
+        arena_state.allocator(),
+    );
+    try std.testing.expect(cleanup.cancel_flag == null);
 }
 
 test "read-only local runtime tools are registered in built-in registry" {
@@ -7447,8 +7480,8 @@ const McpFixture = struct {
         return error.McpFixtureFailure;
     }
 
-    fn search(_: *anyopaque, arena: Allocator, query: []const u8, _: usize, _: types.PermissionRuleSet, _: context_limits.Values) anyerror!tool_mcp_runtime.SearchResult {
-        return .{ .model_output = try std.fmt.allocPrint(arena, "{{\"query\":\"{s}\",\"tools\":[{{\"name\":\"mcp_fs_read\",\"server\":\"fs\",\"description\":\"Read\",\"input_schema\":{{\"type\":\"object\"}},\"tags\":[\"fs\",\"read\"]}}],\"count\":1}}", .{query}) };
+    fn search(_: *anyopaque, arena: Allocator, query: *const tool_mcp_runtime.PreparedQuery, _: usize, _: types.PermissionRuleSet, _: context_limits.Values) anyerror!tool_mcp_runtime.SearchResult {
+        return .{ .model_output = try std.fmt.allocPrint(arena, "{{\"query\":\"{s}\",\"tools\":[{{\"name\":\"mcp_fs_read\",\"server\":\"fs\",\"description\":\"Read\",\"input_schema\":{{\"type\":\"object\"}},\"tags\":[\"fs\",\"read\"]}}],\"count\":1}}", .{query.raw}) };
     }
 
     fn schema(_: *anyopaque, arena: Allocator, name: []const u8, _: types.PermissionRuleSet, _: context_limits.Values, _: tool_mcp_runtime.Access) anyerror!?tool_mcp_runtime.ToolSchemaResult {
@@ -7456,7 +7489,7 @@ const McpFixture = struct {
         return .{ .selected = .{ .model_output = try arena.dupe(u8, "{\"type\":\"function\",\"name\":\"mcp_fs_read\",\"description\":\"Read <context_limit action='literal' />\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"context_limit_rejection\":{\"type\":\"string\"}}}}") } };
     }
 
-    fn searchRecordingRules(raw_ctx: *anyopaque, arena: Allocator, query: []const u8, _: usize, permission_rules: types.PermissionRuleSet, limits: context_limits.Values, _: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.SearchResult {
+    fn searchRecordingRules(raw_ctx: *anyopaque, arena: Allocator, query: *const tool_mcp_runtime.PreparedQuery, _: usize, permission_rules: types.PermissionRuleSet, limits: context_limits.Values, _: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.SearchResult {
         const ctx: *PermissionContext = @ptrCast(@alignCast(raw_ctx));
         ctx.search_rule_count = permission_rules.rules.len;
         return search(raw_ctx, arena, query, 0, permission_rules, limits);
