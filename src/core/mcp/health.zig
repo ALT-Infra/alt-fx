@@ -109,13 +109,25 @@ pub const ServerSnapshot = struct {
     }
 };
 
+pub const ConfigurationIssue = struct {
+    message: []u8,
+
+    pub fn deinit(self: *ConfigurationIssue, alloc: Allocator) void {
+        alloc.free(self.message);
+        self.* = undefined;
+    }
+};
+
 pub const Snapshot = struct {
     captured_at_ms: u64,
     servers: []ServerSnapshot,
+    configuration_issues: []ConfigurationIssue = &.{},
 
     pub fn deinit(self: *Snapshot, alloc: Allocator) void {
         for (self.servers) |*server| server.deinit(alloc);
         alloc.free(self.servers);
+        for (self.configuration_issues) |*issue| issue.deinit(alloc);
+        alloc.free(self.configuration_issues);
         self.* = undefined;
     }
 };
@@ -145,15 +157,17 @@ pub fn publishCandidateForDecision(decision: StartupDecision) bool {
 }
 
 pub fn render(alloc: Allocator, snapshot: Snapshot) ![]u8 {
-    if (snapshot.servers.len == 0) {
+    if (snapshot.servers.len == 0 and snapshot.configuration_issues.len == 0) {
         return alloc.dupe(u8, "No MCP servers configured.\n");
     }
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try out.writer.print("MCP health ({d} {s}):\n", .{
-        snapshot.servers.len,
-        if (snapshot.servers.len == 1) "server" else "servers",
-    });
+    if (snapshot.servers.len > 0) {
+        try out.writer.print("MCP health ({d} {s}):\n", .{
+            snapshot.servers.len,
+            if (snapshot.servers.len == 1) "server" else "servers",
+        });
+    }
     for (snapshot.servers) |server| {
         try out.writer.print(
             "  {s} source={s} scope={s} policy={s} transport={s} state={s} auth={s}\n",
@@ -199,14 +213,30 @@ pub fn render(alloc: Allocator, snapshot: Snapshot) ![]u8 {
         try out.writer.writeByte('\n');
         if (server.failure) |failure| try out.writer.print("    failure={s}\n", .{failure});
     }
+    if (snapshot.configuration_issues.len > 0) {
+        try out.writer.writeAll("Project MCP configuration errors:\n");
+        for (snapshot.configuration_issues) |issue| {
+            try out.writer.print("  {s}\n", .{issue.message});
+        }
+    }
     return out.toOwnedSlice();
 }
 
 pub fn renderSummary(alloc: Allocator, snapshot: Snapshot) ![]u8 {
-    if (snapshot.servers.len == 0) {
+    if (snapshot.servers.len == 0 and snapshot.configuration_issues.len == 0) {
         return alloc.dupe(
             u8,
             "MCP: no servers configured. Use /mcp add <name> <command> [args...].",
+        );
+    }
+    if (snapshot.servers.len == 0) {
+        return std.fmt.allocPrint(
+            alloc,
+            "MCP: {d} project .mcp.json {s}. Use /mcp list for details.",
+            .{
+                snapshot.configuration_issues.len,
+                if (snapshot.configuration_issues.len == 1) "error" else "errors",
+            },
         );
     }
     var ready: usize = 0;
@@ -267,6 +297,12 @@ pub fn renderSummary(alloc: Allocator, snapshot: Snapshot) ![]u8 {
             try out.writer.print(", +{d} more", .{pending_count - rendered_count});
         }
         try out.writer.writeByte('.');
+    }
+    if (snapshot.configuration_issues.len > 0) {
+        try out.writer.print(
+            " Project .mcp.json errors: {d}.",
+            .{snapshot.configuration_issues.len},
+        );
     }
     try out.writer.writeAll(" Use /mcp list for details.");
     return out.toOwnedSlice();

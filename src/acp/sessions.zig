@@ -719,13 +719,19 @@ fn appendProjectMcpConfigs(
     defer workspace.deinit(alloc);
     for (workspace.diagnostics.items) |diagnostic| {
         var name_buf: [256]u8 = undefined;
+        var variable_buf: [160]u8 = undefined;
         debug_trace.logf(
             "mcp",
-            "ACP workspace MCP config skipped cause={s} server={s}",
+            "ACP workspace MCP config skipped cause={s} server={s} field={s} variable={s}",
             .{
                 @tagName(diagnostic.cause),
                 if (diagnostic.server_name) |name|
                     debug_trace.terminalPreview(name_buf[0..], name)
+                else
+                    "none",
+                if (diagnostic.environment_field) |field| @tagName(field) else "none",
+                if (diagnostic.environment_variable) |name|
+                    debug_trace.terminalPreview(variable_buf[0..], name)
                 else
                     "none",
             },
@@ -772,11 +778,17 @@ fn readProjectMcpConfig(
         },
     };
     defer alloc.free(bytes);
-    return project_config.parseWorkspaceJson(
+    var environment = io_mod.cloneEnvironMap(alloc) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => std.process.Environ.Map.init(alloc),
+    };
+    defer environment.deinit();
+    return project_config.parseWorkspaceJsonWithEnvironment(
         alloc,
         bytes,
         .workspace,
         choices,
+        &environment,
     );
 }
 
@@ -1634,6 +1646,40 @@ fn initAcpSessionTestState(
         .agent_step_limit = 8,
         .max_tool_result_bytes = 64 * 1024,
     };
+}
+
+test "ACP project MCP loading expands workspace environment templates" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try tmp.dir.writeFile(io_mod.getIo(), .{
+        .sub_path = "workspace/.mcp.json",
+        .data =
+        \\{"mcpServers":{"expanded":{"command":"${ACP_MCP_COMMAND}","args":["${ACP_MCP_ARG:-fallback}"],"env":{"TOKEN":"${ACP_MCP_TOKEN}"}}}}
+        ,
+    });
+    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_path);
+    const workspace_path = try io_mod.dirRealpathAlloc(
+        alloc,
+        tmp.dir,
+        "workspace",
+    );
+    defer alloc.free(workspace_path);
+    const test_home = try AcpSessionTestHome.install(alloc, home_path);
+    defer test_home.deinit();
+    try test_home.map.put("ACP_MCP_COMMAND", "node");
+    try test_home.map.put("ACP_MCP_TOKEN", "secret-value");
+
+    var result = try readProjectMcpConfig(alloc, workspace_path, .{});
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), result.configs.items.len);
+    const config = result.configs.items[0];
+    try std.testing.expectEqualStrings("node", config.command.?);
+    try std.testing.expectEqualStrings("fallback", config.args[0]);
+    try std.testing.expectEqualStrings("secret-value", config.env[0].value);
 }
 
 test "ACP host-disabled new load and resume skip project MCP effects" {

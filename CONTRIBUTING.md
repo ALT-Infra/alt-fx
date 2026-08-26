@@ -178,6 +178,9 @@ top-level `mcpServers`, accepts `command` plus `args`, and is opened as a
 bounded no-follow regular file. Profile entries win native name collisions;
 ACP request entries win ACP name collisions without deduplicating the request
 array. Workspace entries are always optional and never load stored credentials.
+Workspace `command`, `args`, `env`, and HTTP header values expand `${VAR}` and
+`${VAR:-default}` from the fx process environment. Missing required variables
+leave that server unloaded and appear in `/mcp list` without exposing values.
 
 Interactive sessions connect pending workspace servers for protocol and
 catalog discovery, then request project trust on the first tool use. Pending

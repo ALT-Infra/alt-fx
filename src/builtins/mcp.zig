@@ -561,7 +561,22 @@ pub fn loadRuntime(
 
     var configs = try project_config.mergeNative(alloc, &profile, &workspace.configs);
     defer freeConfigs(alloc, &configs);
-    return runtimeFromConfigs(alloc, &configs, elicitation_capabilities);
+    var runtime = try runtimeFromConfigs(alloc, &configs, elicitation_capabilities);
+    if (runtime == null and workspace.diagnostics.items.len > 0) {
+        runtime = try alloc.create(mcp_runtime.McpRuntime);
+        runtime.?.* = mcp_runtime.McpRuntime.initWithElicitation(
+            alloc,
+            elicitation_capabilities,
+        );
+    }
+    if (runtime) |value| {
+        value.takeWorkspaceDiagnostics(&workspace.diagnostics) catch |err| {
+            value.deinit();
+            alloc.destroy(value);
+            return err;
+        };
+    }
+    return runtime;
 }
 
 pub fn previewNativeWorkspaceAuthority(
@@ -619,19 +634,36 @@ fn loadWorkspaceConfig(
         },
     };
     defer alloc.free(bytes);
-    return project_config.parseWorkspaceJson(alloc, bytes, scope, choices);
+    var environment = io_mod.cloneEnvironMap(alloc) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => std.process.Environ.Map.init(alloc),
+    };
+    defer environment.deinit();
+    return project_config.parseWorkspaceJsonWithEnvironment(
+        alloc,
+        bytes,
+        scope,
+        choices,
+        &environment,
+    );
 }
 
 fn traceWorkspaceDiagnostics(diagnostics: []const project_config.WorkspaceDiagnostic) void {
     for (diagnostics) |diagnostic| {
         var name_buf: [256]u8 = undefined;
+        var variable_buf: [160]u8 = undefined;
         debug_trace.logf(
             "mcp",
-            "workspace MCP config skipped cause={s} server={s}",
+            "workspace MCP config skipped cause={s} server={s} field={s} variable={s}",
             .{
                 @tagName(diagnostic.cause),
                 if (diagnostic.server_name) |name|
                     debug_trace.terminalPreview(name_buf[0..], name)
+                else
+                    "none",
+                if (diagnostic.environment_field) |field| @tagName(field) else "none",
+                if (diagnostic.environment_variable) |name|
+                    debug_trace.terminalPreview(variable_buf[0..], name)
                 else
                     "none",
             },
@@ -1260,6 +1292,69 @@ test "MCP config diagnostic preserves parser allocation failure" {
         error.OutOfMemory,
         loadConfigFromJson(failing.allocator(), "{\"mcp\":{}}"),
     );
+}
+
+test "workspace MCP loading expands command args environment and HTTP headers" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTempFile(&tmp, "workspace/.mcp.json",
+        \\{"mcpServers":{"local":{"command":"${MCP_COMMAND}","args":["--token=${MCP_TOKEN}","${MCP_OPTIONAL:-fallback}"],"env":{"TOKEN":"${MCP_TOKEN}"}},"remote":{"type":"http","url":"https://example.test/mcp","headers":{"X-MCP-Token":"Bearer ${MCP_TOKEN}"}}}}
+    );
+    const workspace_root = try tmpDirPath(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+
+    const environment = try TestHome.install(alloc, "/tmp");
+    defer environment.deinit();
+    try environment.map.put("MCP_COMMAND", "node");
+    try environment.map.put("MCP_TOKEN", "secret-value");
+
+    var result = try loadWorkspaceConfig(
+        alloc,
+        workspace_root,
+        .workspace,
+        .{},
+    );
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), result.configs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), result.diagnostics.items.len);
+    const local = result.configs.items[0];
+    try std.testing.expectEqualStrings("node", local.command.?);
+    try std.testing.expectEqualStrings("--token=secret-value", local.args[0]);
+    try std.testing.expectEqualStrings("fallback", local.args[1]);
+    try std.testing.expectEqualStrings("secret-value", local.env[0].value);
+    const remote = result.configs.items[1];
+    try std.testing.expectEqualStrings("Bearer secret-value", remote.headers[0].value);
+}
+
+test "workspace MCP missing environment variable is actionable and secret free" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTempFile(&tmp, "workspace/.mcp.json",
+        \\{"mcpServers":{"secure":{"type":"http","url":"https://example.test/mcp","headers":{"X-MCP-Token":"secret-prefix-${MCP_REQUIRED_TOKEN}"}}}}
+    );
+    const workspace_root = try tmpDirPath(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+
+    const environment = try TestHome.install(alloc, "/tmp");
+    defer environment.deinit();
+
+    const runtime = try loadRuntime(alloc, workspace_root, .{}) orelse
+        return error.TestUnexpectedResult;
+    defer {
+        runtime.deinit();
+        alloc.destroy(runtime);
+    }
+    const listing = try runtime.listServersAndTools(alloc);
+    defer alloc.free(listing);
+
+    try std.testing.expect(std.mem.find(u8, listing, ".mcp.json") != null);
+    try std.testing.expect(std.mem.find(u8, listing, "secure") != null);
+    try std.testing.expect(std.mem.find(u8, listing, "MCP_REQUIRED_TOKEN") != null);
+    try std.testing.expect(std.mem.find(u8, listing, "http_header") != null);
+    try std.testing.expect(std.mem.find(u8, listing, "secret-prefix") == null);
 }
 
 test "built-in MCP runtime loads disabled configured servers without spawning" {

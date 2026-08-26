@@ -264,6 +264,9 @@ describe("modern MCP Streamable HTTP", () => {
       await tui.sendText("/mcp list");
       const health = await tui.waitForText("MCP health (1 server):", 10_000);
       expect(health).toMatch(/prisma[\s\S]{0,240}transport=http state=ready/);
+      expect(health).toContain(
+        "negotiated_name=modern-http-fixture negotiated_version=unavailable protocol=2026-07-28",
+      );
 
       const profile = JSON.parse(
         readFileSync(join(root.home, ".fx", "mcp.json"), "utf8"),
@@ -1321,6 +1324,52 @@ describe("modern MCP Streamable HTTP", () => {
     expect(result.stderr).not.toContain("environment-bearer-secret");
     expect(readFileSync(join(root.home, ".fx", "mcp.json"), "utf8")).not
       .toContain("environment-bearer-secret");
+  }, 30_000);
+
+  test("workspace MCP expands static HTTP headers without changing profile syntax", async () => {
+    fixture = startModernMcpHttpFixture("json");
+    const root = createRoot("workspace-expanded-headers", fixture);
+    writeFileSync(
+      join(root.home, ".fx", "mcp.json"),
+      JSON.stringify({ mcp: {} }),
+    );
+    writeFileSync(
+      join(root.workspace, ".mcp.json"),
+      JSON.stringify({
+        mcpServers: {
+          fixture: {
+            type: "http",
+            url: fixture.url,
+            headers: {
+              Authorization: "Bearer ${WORKSPACE_HTTP_TOKEN}",
+              "X-Workspace": "${WORKSPACE_HTTP_NAME:-project-default}",
+            },
+          },
+        },
+      }),
+    );
+    gateway = startToolGateway("Workspace-expanded HTTP MCP complete.");
+
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Call the workspace HTTP fixture."],
+      {
+        cwd: root.workspace,
+        env: {
+          ...fixtureEnv(root, gateway),
+          WORKSPACE_HTTP_TOKEN: "workspace-http-secret",
+        },
+        timeoutMs: 20_000,
+      },
+    );
+
+    expect(result.code).toBe(0);
+    expect(fixture.requests).toHaveLength(3);
+    for (const request of fixture.requests) {
+      expect(request.headers.authorization).toBe("Bearer workspace-http-secret");
+      expect(request.headers["x-workspace"]).toBe("project-default");
+    }
+    expect(result.stdout).not.toContain("workspace-http-secret");
+    expect(result.stderr).not.toContain("workspace-http-secret");
   }, 30_000);
 
   test("modern HTTP excludes tools with invalid header projection schemas", async () => {

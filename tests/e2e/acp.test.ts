@@ -2125,12 +2125,12 @@ describe("acp: model-independent", () => {
         JSON.stringify({
           mcpServers: {
             fixture: {
-              command: process.execPath,
-              args: [MCP_STDIO_FIXTURE],
+              command: "${ACP_PROJECT_COMMAND}",
+              args: ["${ACP_PROJECT_FIXTURE}"],
               env: {
-                FX_MCP_RESULT_TEXT: "ACP_PROJECT_MCP_RESULT",
-                FX_MCP_PID_PATH: pidPath,
-                FX_MCP_WIRE_LOG: wirePath,
+                FX_MCP_RESULT_TEXT: "${ACP_PROJECT_RESULT:-ACP_PROJECT_MCP_RESULT}",
+                FX_MCP_PID_PATH: "${ACP_PROJECT_PID}",
+                FX_MCP_WIRE_LOG: "${ACP_PROJECT_WIRE}",
               },
             },
           },
@@ -2146,7 +2146,13 @@ describe("acp: model-independent", () => {
       try {
         client = await AcpClient.create({
           cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            ACP_PROJECT_COMMAND: process.execPath,
+            ACP_PROJECT_FIXTURE: MCP_STDIO_FIXTURE,
+            ACP_PROJECT_PID: pidPath,
+            ACP_PROJECT_WIRE: wirePath,
+          },
         });
         await client.request("initialize", { protocolVersion: 1 }, 1);
         const created = await client.request(

@@ -9,6 +9,7 @@ const mcp_auth = @import("mcp_auth.zig");
 const mcp_contract = @import("mcp_contract.zig");
 const startup_admission = @import("startup_admission.zig");
 const streamable_http = @import("streamable_http.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const McpAuthConfig = mcp_contract.McpAuthConfig;
@@ -51,6 +52,7 @@ const ParsePolicy = struct {
     scope: mcp_contract.ConfigScope,
     force_optional: bool = false,
     allow_stored_credentials: bool = false,
+    allow_authorization_header: bool = false,
     workspace_admission: ?mcp_contract.WorkspaceAdmission = null,
 };
 
@@ -64,18 +66,68 @@ pub const WorkspaceDiagnosticCause = enum {
     root_must_be_object,
     servers_must_be_object,
     invalid_entry,
+    missing_environment_variable,
     approved_rejected_overlap,
+};
+
+pub const WorkspaceEnvironmentField = enum {
+    command,
+    argument,
+    environment,
+    http_header,
 };
 
 pub const WorkspaceDiagnostic = struct {
     server_name: ?[]u8 = null,
+    environment_variable: ?[]u8 = null,
+    environment_field: ?WorkspaceEnvironmentField = null,
     cause: WorkspaceDiagnosticCause,
 
     pub fn deinit(self: *WorkspaceDiagnostic, alloc: Allocator) void {
         if (self.server_name) |name| alloc.free(name);
+        if (self.environment_variable) |name| alloc.free(name);
         self.* = undefined;
     }
 };
+
+pub fn renderWorkspaceDiagnostic(
+    alloc: Allocator,
+    diagnostic: WorkspaceDiagnostic,
+) ![]u8 {
+    var encoded_server = try text_utils.encodeTerminalSafe(
+        alloc,
+        diagnostic.server_name orelse "unknown",
+        160,
+    );
+    defer encoded_server.deinit(alloc);
+    if (diagnostic.cause == .missing_environment_variable) {
+        var encoded_variable = try text_utils.encodeTerminalSafe(
+            alloc,
+            diagnostic.environment_variable orelse "unknown",
+            max_environment_name_bytes,
+        );
+        defer encoded_variable.deinit(alloc);
+        const field = if (diagnostic.environment_field) |value|
+            @tagName(value)
+        else
+            "value";
+        return std.fmt.allocPrint(
+            alloc,
+            ".mcp.json server '{s}' field {s} requires environment variable '{s}'; set it or use ${{{s}:-default}}.",
+            .{
+                encoded_server.bytes,
+                field,
+                encoded_variable.bytes,
+                encoded_variable.bytes,
+            },
+        );
+    }
+    return std.fmt.allocPrint(
+        alloc,
+        ".mcp.json server '{s}' was skipped: {s}.",
+        .{ encoded_server.bytes, @tagName(diagnostic.cause) },
+    );
+}
 
 pub const WorkspaceParseResult = struct {
     configs: std.ArrayList(McpServerConfig) = .empty,
@@ -297,6 +349,26 @@ pub fn parseWorkspaceJson(
     scope: mcp_contract.ConfigScope,
     choices: ProjectMcpChoices,
 ) Allocator.Error!WorkspaceParseResult {
+    return parseWorkspaceJsonInternal(alloc, json_text, scope, choices, null);
+}
+
+pub fn parseWorkspaceJsonWithEnvironment(
+    alloc: Allocator,
+    json_text: []const u8,
+    scope: mcp_contract.ConfigScope,
+    choices: ProjectMcpChoices,
+    environment: *const std.process.Environ.Map,
+) Allocator.Error!WorkspaceParseResult {
+    return parseWorkspaceJsonInternal(alloc, json_text, scope, choices, environment);
+}
+
+fn parseWorkspaceJsonInternal(
+    alloc: Allocator,
+    json_text: []const u8,
+    scope: mcp_contract.ConfigScope,
+    choices: ProjectMcpChoices,
+    environment: ?*const std.process.Environ.Map,
+) Allocator.Error!WorkspaceParseResult {
     var result: WorkspaceParseResult = .{};
     errdefer result.deinit(alloc);
 
@@ -326,6 +398,7 @@ pub fn parseWorkspaceJson(
             .scope = scope,
             .force_optional = true,
             .allow_stored_credentials = false,
+            .allow_authorization_header = true,
             .workspace_admission = admission,
         }) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -339,6 +412,37 @@ pub fn parseWorkspaceJson(
                 continue;
             },
         };
+        if (environment) |values| {
+            var mutable = config;
+            if (try expandWorkspaceConfig(alloc, &mutable, values)) |failure| {
+                defer mutable.deinit(alloc);
+                const server_name = try alloc.dupe(u8, entry.key_ptr.*);
+                errdefer alloc.free(server_name);
+                switch (failure) {
+                    .missing => |missing| {
+                        errdefer alloc.free(missing.variable_name);
+                        try result.diagnostics.append(alloc, .{
+                            .server_name = server_name,
+                            .environment_variable = missing.variable_name,
+                            .environment_field = missing.field,
+                            .cause = .missing_environment_variable,
+                        });
+                    },
+                    .invalid => {
+                        try result.diagnostics.append(alloc, .{
+                            .server_name = server_name,
+                            .cause = .invalid_entry,
+                        });
+                    },
+                }
+                continue;
+            }
+            result.configs.append(alloc, mutable) catch |err| {
+                mutable.deinit(alloc);
+                return err;
+            };
+            continue;
+        }
         result.configs.append(alloc, config) catch |err| {
             var mutable = config;
             mutable.deinit(alloc);
@@ -346,6 +450,148 @@ pub fn parseWorkspaceJson(
         };
     }
     return result;
+}
+
+const max_environment_name_bytes: usize = 128;
+const max_expanded_workspace_value_bytes: usize = 1024 * 1024;
+
+const WorkspaceTemplateExpansion = union(enum) {
+    expanded: []u8,
+    missing: []u8,
+    invalid,
+
+    pub fn deinit(self: *WorkspaceTemplateExpansion, alloc: Allocator) void {
+        switch (self.*) {
+            .expanded, .missing => |value| alloc.free(value),
+            .invalid => {},
+        }
+        self.* = undefined;
+    }
+};
+
+fn expandWorkspaceTemplate(
+    alloc: Allocator,
+    input: []const u8,
+    environment: *const std.process.Environ.Map,
+) Allocator.Error!WorkspaceTemplateExpansion {
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(alloc);
+
+    var cursor: usize = 0;
+    while (cursor < input.len) {
+        const relative_start = std.mem.find(u8, input[cursor..], "${") orelse {
+            if (!try appendExpandedBytes(alloc, &output, input[cursor..])) return .invalid;
+            return .{ .expanded = try output.toOwnedSlice(alloc) };
+        };
+        const start = cursor + relative_start;
+        if (!try appendExpandedBytes(alloc, &output, input[cursor..start])) return .invalid;
+        const expression_start = start + 2;
+        const relative_end = std.mem.findScalar(u8, input[expression_start..], '}') orelse
+            return .invalid;
+        const end = expression_start + relative_end;
+        const expression = input[expression_start..end];
+        const default_marker = std.mem.find(u8, expression, ":-");
+        const variable_name = if (default_marker) |index| expression[0..index] else expression;
+        const default_value = if (default_marker) |index| expression[index + 2 ..] else null;
+        if (variable_name.len > max_environment_name_bytes or !isValidEnvName(variable_name)) {
+            return .invalid;
+        }
+        const replacement = environment.get(variable_name) orelse default_value orelse {
+            return .{ .missing = try alloc.dupe(u8, variable_name) };
+        };
+        if (!try appendExpandedBytes(alloc, &output, replacement)) return .invalid;
+        cursor = end + 1;
+    }
+    return .{ .expanded = try output.toOwnedSlice(alloc) };
+}
+
+fn appendExpandedBytes(
+    alloc: Allocator,
+    output: *std.ArrayList(u8),
+    bytes: []const u8,
+) Allocator.Error!bool {
+    if (bytes.len > max_expanded_workspace_value_bytes - output.items.len) return false;
+    try output.appendSlice(alloc, bytes);
+    return true;
+}
+
+const WorkspaceExpansionFailure = union(enum) {
+    missing: struct {
+        field: WorkspaceEnvironmentField,
+        variable_name: []u8,
+    },
+    invalid,
+};
+
+fn expandWorkspaceConfig(
+    alloc: Allocator,
+    config: *McpServerConfig,
+    environment: *const std.process.Environ.Map,
+) Allocator.Error!?WorkspaceExpansionFailure {
+    if (config.command) |*command| {
+        if (try expandOwnedConstWorkspaceValue(alloc, command, environment, .command)) |failure| {
+            return failure;
+        }
+    }
+    for (@constCast(config.args)) |*argument| {
+        if (try expandOwnedConstWorkspaceValue(alloc, argument, environment, .argument)) |failure| {
+            return failure;
+        }
+    }
+    for (config.env) |*entry| {
+        if (try expandOwnedMutableWorkspaceValue(alloc, &entry.value, environment, .environment)) |failure| {
+            return failure;
+        }
+    }
+    for (config.headers) |*header| {
+        if (try expandOwnedMutableWorkspaceValue(alloc, &header.value, environment, .http_header)) |failure| {
+            return failure;
+        }
+    }
+    streamable_http.validateStaticHeaders(config.headers) catch return .invalid;
+    return null;
+}
+
+fn expandOwnedConstWorkspaceValue(
+    alloc: Allocator,
+    value: *[]const u8,
+    environment: *const std.process.Environ.Map,
+    field: WorkspaceEnvironmentField,
+) Allocator.Error!?WorkspaceExpansionFailure {
+    var expansion = try expandWorkspaceTemplate(alloc, value.*, environment);
+    switch (expansion) {
+        .expanded => |expanded| {
+            alloc.free(value.*);
+            value.* = expanded;
+            expansion = undefined;
+            return null;
+        },
+        .missing => |variable_name| {
+            expansion = undefined;
+            return .{ .missing = .{
+                .field = field,
+                .variable_name = variable_name,
+            } };
+        },
+        .invalid => return .invalid,
+    }
+}
+
+fn expandOwnedMutableWorkspaceValue(
+    alloc: Allocator,
+    value: *[]u8,
+    environment: *const std.process.Environ.Map,
+    field: WorkspaceEnvironmentField,
+) Allocator.Error!?WorkspaceExpansionFailure {
+    var borrowed: []const u8 = value.*;
+    const failure = try expandOwnedConstWorkspaceValue(
+        alloc,
+        &borrowed,
+        environment,
+        field,
+    );
+    value.* = @constCast(borrowed);
+    return failure;
 }
 
 pub fn parseChoices(
@@ -587,7 +833,11 @@ fn parseServerEntry(
         const timeouts = try parseTimeouts(object);
         const env = try parseSelectedEnvironment(alloc, object);
         errdefer freeEnvVars(alloc, env);
-        const headers = try parseRemoteHeaders(alloc, object);
+        const headers = try parseRemoteHeaders(
+            alloc,
+            object,
+            policy.allow_authorization_header,
+        );
         errdefer freeHttpHeaders(alloc, headers);
         const header_env = try parseRemoteHeaderEnv(alloc, object);
         errdefer freeHttpHeaderEnv(alloc, header_env);
@@ -678,7 +928,11 @@ fn parseTimeouts(object: std.json.ObjectMap) error{
     };
 }
 
-fn parseRemoteHeaders(alloc: Allocator, object: std.json.ObjectMap) ![]McpHttpHeader {
+fn parseRemoteHeaders(
+    alloc: Allocator,
+    object: std.json.ObjectMap,
+    allow_authorization: bool,
+) ![]McpHttpHeader {
     const value = object.get("headers") orelse return @constCast(&.{});
     if (value != .object) return error.McpConfigInvalidHeaders;
     var headers: std.ArrayList(McpHttpHeader) = .empty;
@@ -686,7 +940,9 @@ fn parseRemoteHeaders(alloc: Allocator, object: std.json.ObjectMap) ![]McpHttpHe
     try headers.ensureTotalCapacity(alloc, value.object.count());
     var it = value.object.iterator();
     while (it.next()) |entry| {
-        if (entry.value_ptr.* != .string or std.ascii.eqlIgnoreCase(entry.key_ptr.*, "authorization")) {
+        if (entry.value_ptr.* != .string or
+            (!allow_authorization and std.ascii.eqlIgnoreCase(entry.key_ptr.*, "authorization")))
+        {
             return error.McpConfigInvalidHeaders;
         }
         const owned_name = try alloc.dupe(u8, entry.key_ptr.*);
@@ -1083,6 +1339,100 @@ test "workspace parsing stamps optional credential-isolated configs" {
         try std.testing.expect(!config.allow_stored_credentials);
         try std.testing.expectEqual(mcp_contract.WorkspaceAdmission.pending, config.workspace_admission.?);
     }
+}
+
+test "workspace template expansion is explicit bounded and deterministic" {
+    const alloc = std.testing.allocator;
+    var environment = std.process.Environ.Map.init(alloc);
+    defer environment.deinit();
+    try environment.put("SET", "value");
+    try environment.put("EMPTY", "");
+
+    const cases = [_]struct {
+        input: []const u8,
+        expected: []const u8,
+    }{
+        .{ .input = "plain", .expected = "plain" },
+        .{ .input = "before-${SET}-after", .expected = "before-value-after" },
+        .{ .input = "${MISSING:-fallback}", .expected = "fallback" },
+        .{ .input = "${EMPTY:-fallback}", .expected = "" },
+        .{ .input = "${SET}/${SET}", .expected = "value/value" },
+    };
+    for (cases) |case| {
+        var expansion = try expandWorkspaceTemplate(alloc, case.input, &environment);
+        defer expansion.deinit(alloc);
+        switch (expansion) {
+            .expanded => |value| try std.testing.expectEqualStrings(case.expected, value),
+            .missing, .invalid => return error.TestUnexpectedResult,
+        }
+    }
+
+    var missing = try expandWorkspaceTemplate(alloc, "Bearer ${REQUIRED}", &environment);
+    defer missing.deinit(alloc);
+    switch (missing) {
+        .missing => |name| try std.testing.expectEqualStrings("REQUIRED", name),
+        .expanded, .invalid => return error.TestUnexpectedResult,
+    }
+
+    var malformed = try expandWorkspaceTemplate(alloc, "${NOT-CLOSED", &environment);
+    defer malformed.deinit(alloc);
+    try std.testing.expect(malformed == .invalid);
+}
+
+test "workspace environment diagnostics isolate entries and profile values stay literal" {
+    const alloc = std.testing.allocator;
+    var environment = std.process.Environ.Map.init(alloc);
+    defer environment.deinit();
+    try environment.put("COMMAND", "node");
+
+    var workspace = try parseWorkspaceJsonWithEnvironment(
+        alloc,
+        "{\"mcpServers\":{\"good\":{\"command\":\"${COMMAND}\"},\"bad\":{\"command\":\"${REQUIRED}\"}}}",
+        .workspace,
+        .{},
+        &environment,
+    );
+    defer workspace.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), workspace.configs.items.len);
+    try std.testing.expectEqualStrings("node", workspace.configs.items[0].command.?);
+    try std.testing.expectEqual(@as(usize, 1), workspace.diagnostics.items.len);
+    const diagnostic = workspace.diagnostics.items[0];
+    try std.testing.expectEqual(WorkspaceDiagnosticCause.missing_environment_variable, diagnostic.cause);
+    try std.testing.expectEqual(WorkspaceEnvironmentField.command, diagnostic.environment_field.?);
+    try std.testing.expectEqualStrings("REQUIRED", diagnostic.environment_variable.?);
+
+    var profile = try parseProfileDocument(
+        alloc,
+        "{\"mcp\":{\"literal\":{\"command\":\"${COMMAND}\"}}}",
+    );
+    defer profile.deinit(alloc);
+    try std.testing.expectEqualStrings("${COMMAND}", profile.configs.items[0].command.?);
+}
+
+test "workspace Authorization header expansion does not broaden profile headers" {
+    const alloc = std.testing.allocator;
+    var environment = std.process.Environ.Map.init(alloc);
+    defer environment.deinit();
+    try environment.put("TOKEN", "secret");
+
+    var workspace = try parseWorkspaceJsonWithEnvironment(
+        alloc,
+        "{\"mcpServers\":{\"remote\":{\"type\":\"http\",\"url\":\"https://example.test/mcp\",\"headers\":{\"Authorization\":\"Bearer ${TOKEN}\"}}}}",
+        .workspace,
+        .{},
+        &environment,
+    );
+    defer workspace.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), workspace.configs.items.len);
+    try std.testing.expectEqualStrings("Bearer secret", workspace.configs.items[0].headers[0].value);
+
+    try std.testing.expectError(
+        error.McpConfigInvalidHeaders,
+        parseProfileJson(
+            alloc,
+            "{\"mcp\":{\"remote\":{\"type\":\"http\",\"url\":\"https://example.test/mcp\",\"headers\":{\"Authorization\":\"Bearer ${TOKEN}\"}}}}",
+        ),
+    );
 }
 
 test "workspace parsing isolates invalid entries" {

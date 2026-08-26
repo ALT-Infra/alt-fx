@@ -492,6 +492,18 @@ describe("modern MCP stdio compatibility", () => {
   test("fx ask loads pending workspace MCP without persisting approval", async () => {
     const root = createRoot("workspace-ask", MODERN_FIXTURE);
     moveProfileFixtureToWorkspace(root);
+    const projectPath = join(root.workspace, ".mcp.json");
+    const project = JSON.parse(readFileSync(projectPath, "utf8"));
+    project.mcpServers.fixture.command = "${WORKSPACE_MCP_COMMAND}";
+    project.mcpServers.fixture.args = ["${WORKSPACE_MCP_FIXTURE}"];
+    project.mcpServers.fixture.env = {
+      FX_MCP_RESULT_TEXT: "${WORKSPACE_MCP_RESULT:-MODERN_MCP_TOOL_RESULT}",
+      FX_MCP_WIRE_LOG: "${WORKSPACE_MCP_WIRE_LOG}",
+      FX_MCP_PID_PATH: "${WORKSPACE_MCP_PID_PATH}",
+      FX_MCP_MODE: "${WORKSPACE_MCP_MODE:-normal}",
+    };
+    delete project.mcpServers.fixture.environment;
+    writeFileSync(projectPath, JSON.stringify(project));
     gateway = startFakeGateway([
       fakeGatewayToolCall("workspace_select", "mcp_select_tool", { name: TOOL_NAME }),
       fakeGatewayToolCall("workspace_call", TOOL_NAME, { text: "workspace" }),
@@ -504,7 +516,13 @@ describe("modern MCP stdio compatibility", () => {
       ["ask", "--json", "--auto", "--no-save", "Use the workspace MCP."],
       {
         cwd: root.workspace,
-        env: fixtureEnv(root, gateway),
+        env: {
+          ...fixtureEnv(root, gateway),
+          WORKSPACE_MCP_COMMAND: process.execPath,
+          WORKSPACE_MCP_FIXTURE: MODERN_FIXTURE,
+          WORKSPACE_MCP_WIRE_LOG: root.wireLogPath,
+          WORKSPACE_MCP_PID_PATH: join(root.root, "mcp.pid"),
+        },
         timeoutMs: 20_000,
       },
     );
@@ -519,6 +537,39 @@ describe("modern MCP stdio compatibility", () => {
     expect(settings).not.toContain("enableAllProjectMcpServers");
     await expectFixtureProcessesExited(readWire(root.wireLogPath));
   }, 25_000);
+
+  test.skipIf(process.platform === "win32" || !tmuxAvailable())(
+    "/mcp list reports a missing workspace variable without exposing config values",
+    async () => {
+      const root = createRoot("workspace-missing-environment", MODERN_FIXTURE);
+      moveProfileFixtureToWorkspace(root);
+      const projectPath = join(root.workspace, ".mcp.json");
+      const project = JSON.parse(readFileSync(projectPath, "utf8"));
+      project.mcpServers.fixture.command = "secret-prefix-${MISSING_WORKSPACE_COMMAND}";
+      writeFileSync(projectPath, JSON.stringify(project));
+      gateway = startFakeGateway([], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 160,
+        height: 36,
+        env: fixtureEnv(root, gateway),
+      });
+
+      await tui.waitForComposer(15_000);
+      await tui.sendText("/mcp list");
+      const pane = await tui.waitForText("MISSING_WORKSPACE_COMMAND", 10_000);
+      expect(pane).toContain("Project MCP configuration errors:");
+      expect(pane).toContain(".mcp.json server 'fixture'");
+      expect(pane).toContain("field command");
+      expect(pane).not.toContain("secret-prefix");
+      expect(pane).not.toContain(MODERN_FIXTURE);
+      expect(existsSync(root.wireLogPath)).toBe(false);
+    },
+    30_000,
+  );
 
   test("top-level mcp add persists stdio and a later ask calls it", async () => {
     const root = createRoot("top-level-add", MODERN_FIXTURE);
@@ -4322,7 +4373,8 @@ describe("modern MCP stdio compatibility", () => {
         "transport=stdio",
         "state=ready",
         "auth=none",
-        "negotiated_name=unavailable",
+        "negotiated_name=modern-stdio-fixture",
+        "negotiated_version=unavailable",
         "protocol=2026-07-28",
         "tools=1 resources=unknown templates=unknown prompts=unknown",
         "cache=fresh",

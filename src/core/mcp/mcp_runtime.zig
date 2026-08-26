@@ -3820,6 +3820,7 @@ pub const McpRuntime = struct {
     generation: u64,
     legacy_url_runtime_generation: u64 = 0,
     servers: std.ArrayList(McpServer) = .empty,
+    workspace_diagnostics: std.ArrayList(project_config.WorkspaceDiagnostic) = .empty,
     catalog_mutex: std.Io.RwLock = .init,
     recovery_mutex: std.Io.Mutex = .init,
     catalog_update_mutex: std.Io.Mutex = .init,
@@ -3886,6 +3887,10 @@ pub const McpRuntime = struct {
             server.subscription_lifecycle_lock.unlock(io_mod.getIo());
         }
         self.servers.deinit(self.alloc);
+        for (self.workspace_diagnostics.items) |*diagnostic| {
+            diagnostic.deinit(self.alloc);
+        }
+        self.workspace_diagnostics.deinit(self.alloc);
         std.debug.assert(self.legacy_url_waiters.items.len == 0);
         self.legacy_url_waiters.deinit(self.alloc);
         for (self.early_legacy_url_completions.items) |*completion| {
@@ -4945,6 +4950,18 @@ pub const McpRuntime = struct {
         return names.toOwnedSlice(alloc);
     }
 
+    pub fn takeWorkspaceDiagnostics(
+        self: *McpRuntime,
+        diagnostics: *std.ArrayList(project_config.WorkspaceDiagnostic),
+    ) !void {
+        try self.workspace_diagnostics.ensureUnusedCapacity(
+            self.alloc,
+            diagnostics.items.len,
+        );
+        self.workspace_diagnostics.appendSliceAssumeCapacity(diagnostics.items);
+        diagnostics.clearRetainingCapacity();
+    }
+
     pub fn waitForDiscovery(
         self: *McpRuntime,
         cancel_flag: ?*std.atomic.Value(bool),
@@ -5000,7 +5017,29 @@ pub const McpRuntime = struct {
             server.connection_lock.unlockShared(io_mod.getIo());
             initialized += 1;
         }
-        return .{ .captured_at_ms = captured_at_ms, .servers = items };
+        const configuration_issues = try alloc.alloc(
+            health.ConfigurationIssue,
+            self.workspace_diagnostics.items.len,
+        );
+        var issues_initialized: usize = 0;
+        errdefer {
+            for (configuration_issues[0..issues_initialized]) |*issue| issue.deinit(alloc);
+            alloc.free(configuration_issues);
+        }
+        for (self.workspace_diagnostics.items, 0..) |diagnostic, index| {
+            configuration_issues[index] = .{
+                .message = try project_config.renderWorkspaceDiagnostic(
+                    alloc,
+                    diagnostic,
+                ),
+            };
+            issues_initialized += 1;
+        }
+        return .{
+            .captured_at_ms = captured_at_ms,
+            .servers = items,
+            .configuration_issues = configuration_issues,
+        };
     }
 
     /// Returns an owned model-safe catalog snapshot. The caller releases it with `deinit`.
@@ -10459,23 +10498,36 @@ fn parseAndStoreServerIdentity(
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, response, .{}) catch
         return error.McpInvalidJson;
     defer parsed.deinit();
-    try mcp_contract.validateJsonRpcResponseEnvelope(parsed.value);
-    const result = parsed.value.object.get("result") orelse return error.McpInvalidResult;
-    if (result != .object) return error.McpInvalidResult;
-    const info = result.object.get("serverInfo") orelse return;
-    if (info != .object) return error.McpInvalidResult;
-    const name_value = info.object.get("name") orelse return;
-    const version_value = info.object.get("version") orelse return;
-    if (name_value != .string or version_value != .string) {
-        return error.McpInvalidResult;
-    }
-    const name = try alloc.dupe(u8, name_value.string);
-    errdefer alloc.free(name);
-    const version = try alloc.dupe(u8, version_value.string);
+    const identity = try parseServerIdentity(parsed.value);
+    const name = if (identity.name) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (name) |value| alloc.free(value);
+    const version = if (identity.version) |value| try alloc.dupe(u8, value) else null;
     if (server.negotiated_server_name) |old| alloc.free(old);
     if (server.negotiated_server_version) |old| alloc.free(old);
     server.negotiated_server_name = name;
     server.negotiated_server_version = version;
+}
+
+const ParsedServerIdentity = struct {
+    name: ?[]const u8 = null,
+    version: ?[]const u8 = null,
+};
+
+fn parseServerIdentity(value: std.json.Value) !ParsedServerIdentity {
+    try mcp_contract.validateJsonRpcResponseEnvelope(value);
+    const result = value.object.get("result") orelse return error.McpInvalidResult;
+    if (result != .object) return error.McpInvalidResult;
+    const info = result.object.get("serverInfo") orelse return .{};
+    if (info != .object) return error.McpInvalidResult;
+    const name = if (info.object.get("name")) |field| blk: {
+        if (field != .string) return error.McpInvalidResult;
+        break :blk field.string;
+    } else null;
+    const version = if (info.object.get("version")) |field| blk: {
+        if (field != .string) return error.McpInvalidResult;
+        break :blk field.string;
+    } else null;
+    return .{ .name = name, .version = version };
 }
 
 fn parseToolsListChangedCapability(value: std.json.Value) !bool {
@@ -16388,7 +16440,7 @@ test "connectServer discovers and calls a modern NDJSON tool" {
         \\      exit 2
         \\      ;;
         \\    *'"method":"server/discover"'*'"io.modelcontextprotocol/protocolVersion":"2026-07-28"'*'"io.modelcontextprotocol/clientCapabilities":{}'*)
-        \\      printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"instructions":"Use echo."}}'
+        \\      printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"serverInfo":{"name":"modern-identity"},"instructions":"Use echo."}}'
         \\      ;;
         \\    *'"method":"tools/list"'*'"io.modelcontextprotocol/protocolVersion":"2026-07-28"'*)
         \\      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","ttlMs":60000,"tools":[{"name":"echo","description":"Echo text","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}}]}}'
@@ -16412,6 +16464,15 @@ test "connectServer discovers and calls a modern NDJSON tool" {
     try std.testing.expectEqual(ServerState.ready, server.state);
     try std.testing.expectEqual(StdioProtocol.modern, server.stdio_protocol);
     try std.testing.expectEqualStrings("Use echo.", server.instructions.?);
+    try std.testing.expectEqualStrings("modern-identity", server.negotiated_server_name.?);
+    try std.testing.expectEqual(@as(?[]u8, null), server.negotiated_server_version);
+    const listing = try runtime.listServersAndTools(alloc);
+    defer alloc.free(listing);
+    try std.testing.expect(std.mem.find(
+        u8,
+        listing,
+        "negotiated_name=modern-identity negotiated_version=unavailable protocol=2026-07-28",
+    ) != null);
 
     const result = (try runtime.callToolByName(
         alloc,
@@ -16423,6 +16484,58 @@ test "connectServer discovers and calls a modern NDJSON tool" {
     try std.testing.expect(std.mem.find(u8, result.model_output, "modern echo") != null);
 
     server.disconnect();
+}
+
+test "server identity projection preserves independently optional modern fields" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        json: []const u8,
+        name: ?[]const u8,
+        version: ?[]const u8,
+    }{
+        .{
+            .json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"serverInfo\":{\"name\":\"name-only\"}}}",
+            .name = "name-only",
+            .version = null,
+        },
+        .{
+            .json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"serverInfo\":{\"version\":\"1.2.3\"}}}",
+            .name = null,
+            .version = "1.2.3",
+        },
+        .{
+            .json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}",
+            .name = null,
+            .version = null,
+        },
+    };
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, case.json, .{});
+        defer parsed.deinit();
+        const identity = try parseServerIdentity(parsed.value);
+        if (case.name) |expected| {
+            try std.testing.expectEqualStrings(expected, identity.name.?);
+        } else {
+            try std.testing.expect(identity.name == null);
+        }
+        if (case.version) |expected| {
+            try std.testing.expectEqualStrings(expected, identity.version.?);
+        } else {
+            try std.testing.expect(identity.version == null);
+        }
+    }
+
+    var invalid = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"serverInfo\":{\"name\":1}}}",
+        .{},
+    );
+    defer invalid.deinit();
+    try std.testing.expectError(
+        error.McpInvalidResult,
+        parseServerIdentity(invalid.value),
+    );
 }
 
 test "modern MCP calls delegate unsupported schema assertions to the server" {
