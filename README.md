@@ -6,7 +6,7 @@
  ⠀⠀⠀⣠⣶⣿⣿⣷⣶⡶⣶⣶⣆⠀⠀⠀⣴⣶⣶⠆
  ⠀⠀⠀⠉⢹⣿⣿⠉⠉⠀⠘⢿⣿⣧⣀⣾⣿⡿⠃⠀             Tiny, open, embeddable, native coding agent.
  ⠀⠀⠀⠀⣼⣿⡏⠀⠀⠀⠀⠀⠻⣿⣿⣿⠟⠀⠀⠀
- ⠀⠀⠀⢀⣿⣿⠃⠀⠀⠀⠀⢠⣦⠘⢿⣿⣷⡀⠀⠀             curl -fsSL https://fx.sh/setup.sh | bash
+ ⠀⠀⠀⢀⣿⣿⠃⠀⠀⠀⠀⢠⣦⠘⢿⣿⣷⡀⠀⠀             zig build -Doptimize=ReleaseSafe
  ⠀⠀⠀⣸⣿⡟⠀⠀⠀⠀⣰⣿⣿⠗⠀⠻⣿⣿⣄⠀
  ⠀⠀⠀⣿⣿⠇⠀⠀⠀⠾⠿⠿⠋⠀⠀⠀⠘⠿⠿⠦             ⚠ Status: Experimental. Use at your own risk.
   ⠀⣸⣿⡿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
@@ -17,9 +17,9 @@ alt-fx is a fork of [vercel-labs/fx](https://github.com/vercel-labs/fx) with ALT
 
 fx remains the harness. Its terminal UI, model clients, credentials, permission engine, tools, filesystem access, process execution, and persistence infrastructure remain native. ALT owns only Team definitions, leadership, consultations, specialist projections, bounded orchestration context, and the rules by which results return.
 
-**Development status:** the ALT orchestration runtime and its fx host integration are wired in and exercised, but ALT is not yet usable as an end-user feature. The product does not yet provide the Team creation, selection, revision, and ALT-session workflows needed to use that runtime. `/alt` currently exposes the bundled development Team so the integration can be verified while those workflows are built.
+**Development status:** ALT is experimental but usable through a native guided Team library. It creates, selects, revises, starts, and deletes immutable Teams without exposing their stored JSON documents. Every ALT session is pinned to the exact Team revision that created it and remains resumable after later revisions or deletion.
 
-ALT is compiled into normal alt-fx builds, but **ALT mode is not active when the application starts**. alt-fx opens in native fx. `/alt` and `/alt off` are currently development-facing entry and exit commands.
+ALT is compiled into normal alt-fx builds, but **ALT mode is not active when the application starts**. alt-fx opens in native fx. `/alt` resumes the latest ALT session when one exists and opens the Team library on a fresh installation, `/resume` identifies ALT sessions by their pinned Team revision, and `/alt off` returns to a native fx session.
 
 The underlying harness remains optimized for research and embeddability as part of larger systems.
 
@@ -39,6 +39,8 @@ cd alt-fx
 zig build -Doptimize=ReleaseSafe
 ./zig-out/bin/fx
 ```
+
+ALT-Infra intentionally publishes no alt-fx release tags or prebuilt releases. Clone the repository and build the current source.
 
 ## Run fx
 
@@ -95,15 +97,26 @@ The current directory becomes the primary workspace. Enter a prompt, or run `/he
 
 Tool calls are expanded by default. Enable `Collapse tool calls` in `/settings`, or set `"collapse_tool_calls": true` in `~/.fx/settings.json`, to show one summary per tool-call group in the main transcript. Individual calls remain available in the full transcript with Ctrl+O.
 
-## ALT development interface
+## ALT sessions
 
-Enter the temporary bundled Engineering Team explicitly:
+Resume the latest ALT session, or open the Team library when none exists:
 
 ```text
 /alt
 ```
 
-Leave it without leaving fx:
+Open Team management directly, or begin a new Team in the guided builder:
+
+```text
+/alt teams
+/alt new
+```
+
+The builder configures the Team name and ID, unified provider, primary, peers, specialists, per-role model and instructions, consultable peer edges, and callable specialist authority. OpenCode model IDs use `model` for Zen or `go/model` for Go; Gateway model IDs use `provider/model`.
+
+The Team library can start the latest revision in a new conversation, edit it as the next immutable revision in another new conversation, or remove it from the active library. Editing keeps the Team ID fixed. Removed Teams remain available through sessions that already pin one of their revisions. A Team must contain a primary and at least one reachable peer or callable specialist; alt-fx does not offer a single-agent ALT preset.
+
+Return to native fx without leaving the application:
 
 ```text
 /alt off
@@ -133,7 +146,7 @@ The runtime enforces these boundaries:
 - Specialists are clean-slate leaf calls with bounded projections, selected attachments, and fx's real tools—but no conversation or Team state.
 - Every new user turn starts at the configured primary, regardless of who answered the previous turn.
 
-This compiled Team is an integration fixture, not the intended Team-management surface. It currently uses OpenCode Go models. Native Codex, Grok, and fx subagents are unavailable inside ALT mode; `/alt off` restores the complete native fx environment.
+Team revisions are immutable. Creating a Team starts revision 1 in a new fx conversation; editing it will create the next revision and start another conversation. Existing sessions retain their exact Team revision even after that Team is edited or removed from the active library. Native Codex, Grok, and fx subagents are unavailable inside ALT mode; `/alt off` restores the complete native fx environment.
 
 The status line hides the workspace path and Git branch by default. Enable the `Status line workspace` option in `/settings`, run `/statusline workspace`, or set it in `~/.fx/settings.json`:
 
