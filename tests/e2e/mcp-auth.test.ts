@@ -808,6 +808,15 @@ describe("MCP remote authentication lifecycle", () => {
       env,
       timeoutMs: 20_000,
     });
+    if (authenticated.code !== 0) {
+      throw new Error(JSON.stringify({
+        authenticated,
+        authorizationRequests: auth.authorizationRequests,
+        tokenExchanges: auth.tokenExchanges,
+        authRequests: auth.requests,
+        trace: existsSync(root.trace) ? readFileSync(root.trace, "utf8") : "",
+      }, null, 2));
+    }
     expect(authenticated.code).toBe(0);
     expect(authenticated.stderr).toBe("");
     expect(authenticated.stdout).toContain("Authenticated MCP server 'fixture'");
