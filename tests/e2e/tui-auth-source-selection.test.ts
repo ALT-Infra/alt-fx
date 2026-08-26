@@ -17,6 +17,7 @@ import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
+  fakeGatewaySse,
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -58,6 +59,52 @@ function grokModalityModel(id: string, vision: boolean) {
     id,
     input_modalities: vision ? ["text", "image"] : ["text"],
     output_modalities: ["text"],
+  };
+}
+
+function startFakeDirectUsageProvider(
+  provider: "codex" | "grok",
+  model: string,
+  responseId: string,
+  inputTokens: number,
+  outputTokens: number,
+) {
+  let responses = 0;
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request) {
+      const path = new URL(request.url).pathname;
+      if (path === "/models") {
+        return provider === "codex"
+          ? Response.json({ models: [{
+            slug: model,
+            visibility: "list",
+            supported_in_api: true,
+            supported_reasoning_levels: [{ effort: "high" }],
+            additional_speed_tiers: [],
+            input_modalities: ["text"],
+            context_window: 272000,
+          }] })
+          : Response.json({ data: [grokSubscriptionModel(model, 500_000)] });
+      }
+      if (path === "/modalities") {
+        return Response.json({ models: [grokModalityModel(model, false)] });
+      }
+      responses += 1;
+      return new Response(
+        `data: ${JSON.stringify({ type: "response.output_text.delta", delta: `${provider.toUpperCase()}_USAGE_OK` })}\n\n` +
+          `data: ${JSON.stringify({ type: "response.completed", response: { id: responseId, status: "completed", usage: { input_tokens: inputTokens, output_tokens: outputTokens } } })}\n\n`,
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    },
+  });
+  return {
+    get responses() { return responses; },
+    responsesUrl: `http://127.0.0.1:${server.port}/responses`,
+    modelsUrl: `http://127.0.0.1:${server.port}/models`,
+    modalitiesUrl: `http://127.0.0.1:${server.port}/modalities`,
+    stop() { server.stop(true); },
   };
 }
 
@@ -122,6 +169,10 @@ function readSingleUsageSnapshot(testHome: string): {
   billing: string;
   next_sequence: number;
   settled_through_sequence: number;
+  input_tokens: number;
+  output_tokens: number;
+  request_count: number | null;
+  models: Array<{ model: string; request_count: number | null }>;
   pending: unknown[];
 } {
   const sessionsDir = join(testHome, ".fx", "sessions");
@@ -135,6 +186,10 @@ function readSingleUsageSnapshot(testHome: string): {
       billing: string;
       next_sequence: number;
       settled_through_sequence: number;
+      input_tokens: number;
+      output_tokens: number;
+      request_count: number | null;
+      models: Array<{ model: string; request_count: number | null }>;
       pending: unknown[];
     };
   }).snapshot;
@@ -2965,6 +3020,127 @@ test(
 );
 
 test(
+  "saved provider switching publishes Gateway, Codex, and Grok usage to one profile ledger",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-provider-usage-ledger-"));
+    const workspace = join(home, "workspace");
+    mkdirSync(workspace, { recursive: true });
+    gateway = startFakeGateway([
+      fakeGatewaySse([
+        {
+          type: "response-metadata",
+          modelId: FAKE_GATEWAY_MODEL,
+          timestamp: new Date().toISOString(),
+        },
+        {
+          type: "text-start",
+          id: "gateway_answer",
+          providerMetadata: {
+            gateway: { generationId: "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV" },
+          },
+        },
+        { type: "text-delta", id: "gateway_answer", delta: "GATEWAY_USAGE_OK" },
+        { type: "text-end", id: "gateway_answer" },
+        {
+          type: "finish",
+          finishReason: { unified: "stop", raw: "stop" },
+          usage: {
+            inputTokens: { total: 13 },
+            outputTokens: { total: 4 },
+          },
+          providerMetadata: {
+            gateway: {
+              generationId: "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+              cost: "0.01",
+              routing: { canonicalSlug: FAKE_GATEWAY_MODEL },
+            },
+          },
+        },
+      ]),
+    ]);
+    const codex = startFakeDirectUsageProvider(
+      "codex",
+      "gpt-5.6-sol",
+      "response-codex-profile",
+      17,
+      7,
+    );
+    const grok = startFakeDirectUsageProvider(
+      "grok",
+      "grok-4.20",
+      "response-grok-profile",
+      19,
+      5,
+    );
+    try {
+      writeSeededChatGptLogin(home, chatgptAccessToken("acct_usage"));
+      writeSeededGrokLogin(home, "grok-usage-token", "acct_usage");
+      const env = {
+        HOME: home,
+        AI_GATEWAY_API_KEY: "gateway-usage-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_AUTO_UPGRADE: "0",
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+        FX_E2E_XAI_GROK_RESPONSES_URL: grok.responsesUrl,
+        FX_E2E_XAI_GROK_MODELS_URL: grok.modelsUrl,
+        FX_E2E_XAI_GROK_MODALITIES_URL: grok.modalitiesUrl,
+      };
+      const settingsPath = join(home, ".fx", "settings.json");
+      const routes = [
+        { settings: { provider: "gateway", model: FAKE_GATEWAY_MODEL }, text: "GATEWAY_USAGE_OK" },
+        { settings: { provider: "codex", codex_model: "gpt-5.6-sol" }, text: "CODEX_USAGE_OK" },
+        { settings: { provider: "grok", grok_model: "grok-4.20" }, text: "GROK_USAGE_OK" },
+      ];
+      for (const route of routes) {
+        writeFileSync(settingsPath, JSON.stringify(route.settings) + "\n", { mode: 0o600 });
+        const result = await runFx(
+          ["ask", "--json", `Return ${route.text}.`],
+          { cwd: workspace, env, timeoutMs: TIMEOUT },
+        );
+        expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+        expect(result.stdout).toContain(route.text);
+      }
+
+      const usage = await runFx(
+        ["usage", "--json", "--period", "24h"],
+        { cwd: workspace, env: { HOME: home }, timeoutMs: TIMEOUT },
+      );
+      expect(usage.code, usage.stderr).toBe(0);
+      const report = JSON.parse(usage.stdout) as {
+        completeness: string;
+        totals: { input_tokens: number; output_tokens: number; request_count: number };
+        models: Array<{ model: string; totals: { request_count: number } }>;
+      };
+      expect(report.completeness).toBe("complete");
+      expect(report.totals).toMatchObject({
+        input_tokens: 49,
+        output_tokens: 16,
+        request_count: 3,
+      });
+      expect(Object.fromEntries(
+        report.models.map((model) => [model.model, model.totals.request_count]),
+      )).toEqual({
+        [FAKE_GATEWAY_MODEL]: 1,
+        "codex/gpt-5.6-sol": 1,
+        "grok/grok-4.20": 1,
+      });
+      expect(gateway.requests).toHaveLength(1);
+      expect(codex.responses).toBe(1);
+      expect(grok.responses).toBe(1);
+    } finally {
+      codex.stop();
+      grok.stop();
+    }
+  },
+  60_000,
+);
+
+test(
   "Codex automatic review uses gpt-5.4-mini while Gateway review stays untouched",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-codex-auto-review-"));
@@ -3007,8 +3183,15 @@ test(
       expect(readSingleUsageSnapshot(home)).toMatchObject({
         billing: "complete",
         api_duration_complete: true,
-        next_sequence: 1,
-        settled_through_sequence: 0,
+        next_sequence: 4,
+        settled_through_sequence: 3,
+        input_tokens: 20,
+        output_tokens: 8,
+        request_count: 3,
+        models: [
+          { model: "codex/gpt-5.6-sol", request_count: 2 },
+          { model: "codex/gpt-5.4-mini", request_count: 1 },
+        ],
         pending: [],
       });
     } finally {
@@ -3071,8 +3254,12 @@ test(
       expect(readSingleUsageSnapshot(home)).toMatchObject({
         billing: "complete",
         api_duration_complete: true,
-        next_sequence: 1,
-        settled_through_sequence: 0,
+        next_sequence: 4,
+        settled_through_sequence: 3,
+        input_tokens: 20,
+        output_tokens: 8,
+        request_count: 3,
+        models: [{ model: "grok/grok-4.20", request_count: 3 }],
         pending: [],
       });
     } finally {
