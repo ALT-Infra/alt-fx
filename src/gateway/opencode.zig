@@ -472,7 +472,7 @@ fn streamCompletionCore(
     );
     return .{ .completed = .{
         .completion = completion,
-        .usage = .{ .immediate = null },
+        .usage = .{ .unavailable = .possibly_billed },
         .ownership = .owned,
     } };
 }
