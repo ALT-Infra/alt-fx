@@ -1909,6 +1909,27 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
+        pub fn resumeSessionById(app: *App, session_id: []const u8) !void {
+            const log_options = session_log.Options{
+                .session_lock_deadline_ms = 0,
+                .commit_lock_deadline_ms = 0,
+            };
+            var loaded = try loadResumeTargetForWrite(
+                app,
+                .{ .id = session_id },
+                log_options,
+            );
+            var loaded_owned = true;
+            errdefer if (loaded_owned) loaded.deinit(app.alloc);
+
+            try app.prepareLiveSessionResume(log_options);
+            loaded_owned = false;
+            try installResumedSession(app, &loaded, .session);
+            requestSubagentBackgroundRecovery(app);
+            startResumedSessionReconciliation(app);
+            try app.finishLiveSessionResume();
+        }
+
         fn loadResumeTargetForWrite(
             app: *App,
             target: session_store.ResumeTarget,
@@ -1951,6 +1972,20 @@ pub fn Runtime(comptime App: type) type {
             try hydrateResumedSession(app, active.state, display.title, notice);
             active.resume_view_stale = true;
             enableSessionStores(app);
+            if (comptime @hasDecl(App, "restoreOrchestrationForSession")) {
+                app.restoreOrchestrationForSession(active.active_id) catch |err| {
+                    debug_trace.logf(
+                        "orchestration",
+                        "session mode restore failed id={s} err={s}",
+                        .{ active.active_id, @errorName(err) },
+                    );
+                    try app.writeDomainNotice(.{
+                        .topic = "orchestration",
+                        .tone = .@"error",
+                        .body = "This session resumed, but its orchestration mode could not be restored. Native fx remains available.",
+                    }, true);
+                };
+            }
         }
 
         fn hydrateResumedSession(

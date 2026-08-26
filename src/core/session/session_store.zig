@@ -21,6 +21,7 @@ const session_log = @import("session_log.zig");
 const session_projection = @import("session_projection.zig");
 const session_display_metadata = @import("session_display_metadata.zig");
 const session_usage = @import("session_usage.zig");
+const orchestration_binding = @import("../orchestration/session_binding.zig");
 const Allocator = std.mem.Allocator;
 
 const authority_module = @import("session_authority.zig");
@@ -302,6 +303,19 @@ const ResumableSessionScope = enum {
     current_workspace,
 };
 pub const StateSummary = store_types.StateSummary;
+pub const OrchestrationBinding = orchestration_binding.Binding;
+pub const OwnedOrchestrationBinding = orchestration_binding.OwnedBinding;
+pub const BoundOrchestrationSession = struct {
+    id: []u8,
+    updated_at_ms: i64,
+    binding: OwnedOrchestrationBinding,
+
+    pub fn deinit(self: *BoundOrchestrationSession, alloc: Allocator) void {
+        alloc.free(self.id);
+        self.binding.deinit(alloc);
+        self.* = undefined;
+    }
+};
 pub const StorageFormat = store_types.StorageFormat;
 const automatic_legacy_max_bytes = store_types.automatic_legacy_max_bytes;
 const max_session_bytes = store_types.max_session_bytes;
@@ -3262,6 +3276,72 @@ pub const Store = struct {
         return .{ .dir = dir };
     }
 
+    pub fn writeOrchestrationBinding(
+        self: Store,
+        alloc: Allocator,
+        session_id: []const u8,
+        binding: OrchestrationBinding,
+    ) !void {
+        var session_dir = try self.openSessionDir(session_id);
+        defer session_dir.close();
+        try orchestration_binding.write(alloc, &session_dir, binding);
+    }
+
+    pub fn readOrchestrationBinding(
+        self: Store,
+        alloc: Allocator,
+        session_id: []const u8,
+    ) !?OwnedOrchestrationBinding {
+        var session_dir = try self.openSessionDir(session_id);
+        defer session_dir.close();
+        return orchestration_binding.read(alloc, &session_dir);
+    }
+
+    pub fn latestOrchestrationSession(
+        self: Store,
+        alloc: Allocator,
+        extension_id: []const u8,
+    ) !?BoundOrchestrationSession {
+        var summaries = try self.listForWorkspace(alloc);
+        defer summary_codec.freeSummaries(alloc, &summaries);
+        for (summaries.items) |summary| {
+            var binding = (try self.readOrchestrationBinding(
+                alloc,
+                summary.id,
+            )) orelse continue;
+            if (!std.mem.eql(u8, binding.extension_id, extension_id)) {
+                binding.deinit(alloc);
+                continue;
+            }
+            return .{
+                .id = try alloc.dupe(u8, summary.id),
+                .updated_at_ms = summary.updated_at_ms,
+                .binding = binding,
+            };
+        }
+        return null;
+    }
+
+    pub fn latestNativeSession(
+        self: Store,
+        alloc: Allocator,
+        excluded_id: ?[]const u8,
+    ) !?[]u8 {
+        var summaries = try self.listForWorkspace(alloc);
+        defer summary_codec.freeSummaries(alloc, &summaries);
+        for (summaries.items) |summary| {
+            if (excluded_id) |id| {
+                if (std.mem.eql(u8, summary.id, id)) continue;
+            }
+            var binding = (try self.readOrchestrationBinding(
+                alloc,
+                summary.id,
+            )) orelse return try alloc.dupe(u8, summary.id);
+            binding.deinit(alloc);
+        }
+        return null;
+    }
+
     fn loadLegacyReadOnlyDetail(
         self: Store,
         alloc: Allocator,
@@ -5232,6 +5312,43 @@ fn initTempStore(alloc: Allocator, tmp: *std.testing.TmpDir) !TempStore {
     var store = try Store.initFromHome(alloc, home, workspace);
     errdefer store.deinit(alloc);
     return .{ .home = home, .workspace = workspace, .store = store };
+}
+
+test "session mode lookup distinguishes latest ALT and native conversations" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    try writeSummaryFixture(alloc, ctx.store, "native", ctx.workspace, 30, 1);
+    try writeSummaryFixture(alloc, ctx.store, "alt-old", ctx.workspace, 20, 1);
+    try writeSummaryFixture(alloc, ctx.store, "alt-new", ctx.workspace, 40, 1);
+    const descriptor = OrchestrationBinding{
+        .extension_id = "alt",
+        .extension_name = "ALT",
+        .definition_kind = "team",
+        .definition_id = "engineering",
+        .definition_revision = 2,
+        .definition_digest = [_]u8{'a'} ** 64,
+        .display_name = "Engineering",
+    };
+    try ctx.store.writeOrchestrationBinding(alloc, "alt-old", descriptor);
+    var newest = descriptor;
+    newest.definition_revision = 3;
+    newest.definition_digest = [_]u8{'b'} ** 64;
+    try ctx.store.writeOrchestrationBinding(alloc, "alt-new", newest);
+
+    var latest_alt = (try ctx.store.latestOrchestrationSession(alloc, "alt")) orelse
+        return error.TestExpectedSession;
+    defer latest_alt.deinit(alloc);
+    try std.testing.expectEqualStrings("alt-new", latest_alt.id);
+    try std.testing.expectEqual(@as(u32, 3), latest_alt.binding.definition_revision);
+
+    const latest_native = (try ctx.store.latestNativeSession(alloc, "alt-new")) orelse
+        return error.TestExpectedSession;
+    defer alloc.free(latest_native);
+    try std.testing.expectEqualStrings("native", latest_native);
 }
 
 fn testDurableState(

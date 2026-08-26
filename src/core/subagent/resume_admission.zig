@@ -246,10 +246,20 @@ fn listActionablePageInternal(
             };
             if (managed) continue;
             var cloned = try session_summary_codec.cloneSessionSummary(alloc, summary);
-            result.summaries.append(alloc, cloned) catch |err| {
-                cloned.deinit(alloc);
-                return err;
+            errdefer cloned.deinit(alloc);
+            if (cloned.orchestration) |*binding| binding.deinit(alloc);
+            cloned.orchestration = null;
+            cloned.orchestration = store.readOrchestrationBinding(
+                alloc,
+                summary.id,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => invalid: {
+                    cloned.orchestration_binding_invalid = true;
+                    break :invalid null;
+                },
             };
+            try result.summaries.append(alloc, cloned);
         }
         if (!page.has_more) break;
     }

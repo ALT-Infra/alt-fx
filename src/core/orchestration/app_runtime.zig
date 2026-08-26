@@ -7,6 +7,10 @@ const run_manager = @import("run_manager.zig");
 pub fn State(comptime Host: type) type {
     return struct {
         engine: ?Host.Engine = null,
+        /// Exact immutable extension document selected for this fx session.
+        /// Null means this native fx session has no orchestration definition.
+        definition_source: ?[]u8 = null,
+        definition_metadata: ?Host.DefinitionMetadata = null,
         active: bool = false,
         canonical_turns: canonical_turn_store.Store = .{},
         active_source_turn_id: ?u64 = null,
@@ -17,10 +21,34 @@ pub fn State(comptime Host: type) type {
 
 pub fn deinit(comptime Host: type, allocator: std.mem.Allocator, state: *State(Host)) void {
     if (state.engine) |engine| engine.deinit(allocator);
+    if (state.definition_source) |source| allocator.free(source);
+    if (state.definition_metadata) |*metadata| metadata.deinit(allocator);
     state.runs.deinit();
     state.canonical_turns.deinit(allocator);
     state.instruction_source_turn_ids.deinit(allocator);
     state.* = .{};
+}
+
+pub fn installDefinition(
+    comptime Host: type,
+    comptime Extension: type,
+    allocator: std.mem.Allocator,
+    state: *State(Host),
+    source: []const u8,
+) !void {
+    if (state.active or state.active_source_turn_id != null) {
+        return error.OrchestrationSessionActive;
+    }
+    var metadata = try Extension.inspectDefinition(allocator, source);
+    errdefer metadata.deinit(allocator);
+    const owned_source = try allocator.dupe(u8, source);
+    errdefer allocator.free(owned_source);
+    if (state.engine) |engine| engine.deinit(allocator);
+    if (state.definition_source) |prior| allocator.free(prior);
+    if (state.definition_metadata) |*prior| prior.deinit(allocator);
+    state.engine = null;
+    state.definition_source = owned_source;
+    state.definition_metadata = metadata;
 }
 
 pub fn isCommand(comptime Extension: type, input: []const u8) bool {
@@ -69,7 +97,18 @@ pub fn handlePayload(
         }
     }
     const engine = app.orchestration.engine orelse blk: {
-        const created = Extension.create(app.alloc) catch |err| {
+        const definition_source = app.orchestration.definition_source orelse {
+            const descriptor = Extension.descriptor();
+            try app.writeDomainNotice(.{
+                .topic = descriptor.id,
+                .tone = .@"error",
+                .body = "No orchestration definition is selected for this session.",
+            }, true);
+            return;
+        };
+        const created = Extension.create(app.alloc, .{
+            .definition_source = definition_source,
+        }) catch |err| {
             try writeFailure(Extension, app, err);
             return;
         };
@@ -596,10 +635,21 @@ test "extension failure becomes a notice instead of escaping the host event loop
                 .slash_command = "/failing",
                 .summary = "Exercise host failure isolation",
                 .usage = "Use /failing or /failing off.",
+                .definition_kind = "fixture",
+                .definition_collection = "fixtures",
             };
         }
 
-        fn create(allocator: std.mem.Allocator) !Host.Engine {
+        fn inspectDefinition(allocator: std.mem.Allocator, _: []const u8) !Host.DefinitionMetadata {
+            return .{
+                .id = try allocator.dupe(u8, "fixture"),
+                .revision = 1,
+                .digest = [_]u8{'0'} ** 64,
+                .name = try allocator.dupe(u8, "Fixture"),
+            };
+        }
+
+        fn create(allocator: std.mem.Allocator, _: Host.CreateOptions) !Host.Engine {
             const state = try allocator.create(EngineState);
             state.* = .{};
             return .{ .context = state, .vtable = &vtable };
@@ -652,6 +702,7 @@ test "extension failure becomes a notice instead of escaping the host event loop
 
     var app = FakeApp{ .alloc = std.testing.allocator };
     defer deinit(Host, app.alloc, &app.orchestration);
+    app.orchestration.definition_source = try app.alloc.dupe(u8, "fixture");
     try std.testing.expect(try handleCommand(Host, Extension, &app, "/failing"));
     try std.testing.expectEqual(@as(usize, 1), app.notice_count);
     try std.testing.expectEqualStrings(
@@ -673,10 +724,21 @@ test "active native subagent work refuses orchestration before extension creatio
                 .slash_command = "/test",
                 .summary = "Exercise native-subagent isolation",
                 .usage = "Use /test or /test off.",
+                .definition_kind = "fixture",
+                .definition_collection = "fixtures",
             };
         }
 
-        fn create(_: std.mem.Allocator) !Host.Engine {
+        fn inspectDefinition(allocator: std.mem.Allocator, _: []const u8) !Host.DefinitionMetadata {
+            return .{
+                .id = try allocator.dupe(u8, "fixture"),
+                .revision = 1,
+                .digest = [_]u8{'0'} ** 64,
+                .name = try allocator.dupe(u8, "Fixture"),
+            };
+        }
+
+        fn create(_: std.mem.Allocator, _: Host.CreateOptions) !Host.Engine {
             create_count += 1;
             return error.UnexpectedExtensionCreation;
         }
@@ -754,10 +816,21 @@ test "unsettled native subagent recovery fails orchestration admission closed" {
                 .slash_command = "/test",
                 .summary = "Exercise native-subagent isolation",
                 .usage = "Use /test or /test off.",
+                .definition_kind = "fixture",
+                .definition_collection = "fixtures",
             };
         }
 
-        fn create(_: std.mem.Allocator) !Host.Engine {
+        fn inspectDefinition(allocator: std.mem.Allocator, _: []const u8) !Host.DefinitionMetadata {
+            return .{
+                .id = try allocator.dupe(u8, "fixture"),
+                .revision = 1,
+                .digest = [_]u8{'0'} ** 64,
+                .name = try allocator.dupe(u8, "Fixture"),
+            };
+        }
+
+        fn create(_: std.mem.Allocator, _: Host.CreateOptions) !Host.Engine {
             create_count += 1;
             return error.UnexpectedExtensionCreation;
         }

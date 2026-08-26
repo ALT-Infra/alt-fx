@@ -10,6 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 import { TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
 const ENABLED = process.env.FX_ORCHESTRATION_E2E === "1";
@@ -25,9 +26,71 @@ const TEAM_FAILURE_MARKER = "CRUCIBLE_ALT_TEAM_FAILURE_RECOVERED_9C44";
 const NESTED_SPECIALIST_RAW = "CRUCIBLE_NESTED_SPECIALIST_RAW_73E1";
 const NESTED_PEER_SYNTHESIS = "CRUCIBLE_NESTED_PEER_SYNTHESIS_A902";
 const NESTED_ANSWER_MARKER = "CRUCIBLE_NESTED_UNWIND_DONE_6F3B";
+const TEAM_UX_FIRST_MARKER = "CRUCIBLE_TEAM_UX_REVISION_ONE_8C31";
+const TEAM_UX_SECOND_MARKER = "CRUCIBLE_TEAM_UX_REVISION_TWO_4D09";
 
 let session: TmuxSession | null = null;
 const tempDirs: string[] = [];
+
+const ENGINEERING_TEAM = {
+  schema: 2,
+  id: "engineering",
+  revision: 1,
+  name: "Engineering",
+  provider_id: "opencode",
+  models: [
+    { id: "engineering", route: "go", name: "kimi-k3" },
+    { id: "coding", route: "go", name: "deepseek-v4-flash" },
+    { id: "multimodal", route: "go", name: "mimo-v2.5" },
+  ],
+  primary: {
+    id: "engineering",
+    model_id: "engineering",
+    definition: "Own the task, use evidence, and publish the final answer.",
+    peers: ["coding"],
+    specialists: ["visual-inspector"],
+  },
+  peers: [{
+    id: "coding",
+    model_id: "coding",
+    definition: "Contribute code-centered work and consult specialists when useful.",
+    specialists: ["visual-inspector"],
+  }],
+  specialists: [{
+    id: "visual-inspector",
+    model_id: "multimodal",
+    definition: "Inspect only the caller's bounded projection and selected attachments.",
+  }],
+};
+
+function seedAltEngineeringTeam(home: string) {
+  const source = `${JSON.stringify(ENGINEERING_TEAM, null, 2)}\n`;
+  const digest = createHash("sha256").update(source).digest("hex");
+  const identity = join(home, ".fx", "extensions", "alt", "teams", "engineering");
+  mkdirSync(identity, { recursive: true, mode: 0o700 });
+  writeFileSync(join(identity, `1-${digest}.json`), source, { mode: 0o600 });
+  writeFileSync(join(identity, "manifest.json"), JSON.stringify({
+    schema: 1,
+    id: "engineering",
+    name: "Engineering",
+    latest_revision: 1,
+    latest_digest: digest,
+    created_at_ms: 1,
+    updated_at_ms: 1,
+    deleted: false,
+  }), { mode: 0o600 });
+}
+
+async function enterSeededAlt(active: TmuxSession) {
+  await active.sendText("/alt");
+  await active.waitForText("ALT Teams 1", 5_000);
+  await active.sendKeys("Down");
+  await active.sendKeys("Enter");
+  await active.waitForText("Start a new conversation", 5_000);
+  await active.sendKeys("Enter");
+  await active.waitForText("ALT mode enabled.", 5_000);
+  await active.waitForComposer(5_000);
+}
 
 async function waitForFileText(
   path: string,
@@ -113,6 +176,42 @@ function startHeldOpenCodeSteeringServer() {
     stop() {
       if (heldTimer) clearInterval(heldTimer);
       heldTimer = null;
+      server.stop(true);
+    },
+  };
+}
+
+function startOpenCodeTeamUxServer() {
+  let requestCount = 0;
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      const url = new URL(request.url);
+      if (url.pathname !== "/chat") return new Response("not found", { status: 404 });
+      await request.text();
+      requestCount += 1;
+      const terminal = JSON.stringify({
+        kind: "answer",
+        answer: requestCount === 1 ? TEAM_UX_FIRST_MARKER : TEAM_UX_SECOND_MARKER,
+      });
+      return new Response(
+        `data: ${JSON.stringify({
+          id: "alt-team-ux",
+          choices: [{ delta: { content: terminal }, finish_reason: null }],
+        })}\n\n` +
+          `data: ${JSON.stringify({
+            choices: [{ delta: {}, finish_reason: "stop" }],
+            usage: { prompt_tokens: 8, completion_tokens: 3 },
+          })}\n\n` +
+          "data: [DONE]\n\n",
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    },
+  });
+  return {
+    chatUrl: `http://127.0.0.1:${server.port}/chat`,
+    stop() {
       server.stop(true);
     },
   };
@@ -382,6 +481,187 @@ afterEach(async () => {
 
 describe.skipIf(SKIP)("tui: orchestration extension host", () => {
   test(
+    "native Team UX creates revises deletes and resumes immutable ALT sessions",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-orchestration-team-ux-"));
+      const home = join(root, "home");
+      const fxHome = join(home, ".fx");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(fxHome, { recursive: true, mode: 0o700 });
+      mkdirSync(workspace);
+      const authPath = join(fxHome, "opencode-auth.json");
+      writeFileSync(
+        authPath,
+        `${JSON.stringify({ schema_version: 1, api_key: "opencode-team-ux-fixture" })}\n`,
+        { mode: 0o600 },
+      );
+      chmodSync(authPath, 0o600);
+      tempDirs.push(root);
+      const provider = startOpenCodeTeamUxServer();
+
+      try {
+        session = await TmuxSession.create({
+          cwd: workspace,
+          stderrPath,
+          env: {
+            HOME: home,
+            FX_AUTO_UPGRADE: "0",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_E2E_OPENCODE_CHAT_URL: provider.chatUrl,
+            FX_SKIP_ONBOARDING: "1",
+            OPENCODE_API_KEY: undefined,
+          },
+        });
+        await session.waitForComposer(10_000);
+
+        await session.sendText("/alt");
+        await session.waitForText("ALT Teams 0", 5_000);
+        await session.sendKeys("Enter");
+        await session.waitForText(
+          "Configure a primary plus at least one peer or specialist.",
+          5_000,
+        );
+        for (let index = 0; index < 7; index += 1) await session.sendKeys("Down");
+        await session.sendKeys("Enter");
+        await session.waitForText("ALT mode enabled.", 5_000);
+        await session.waitForComposer(5_000);
+        await session.sendText("Persist a conversation on Team revision one.");
+        await session.waitForText(TEAM_UX_FIRST_MARKER, 10_000);
+        await session.waitForComposer(5_000);
+
+        const manifestPath = join(
+          home,
+          ".fx",
+          "extensions",
+          "alt",
+          "teams",
+          "my-team",
+          "manifest.json",
+        );
+        const initialManifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+        expect(initialManifest).toMatchObject({
+          id: "my-team",
+          name: "My Team",
+          latest_revision: 1,
+          deleted: false,
+        });
+        expect(existsSync(join(
+          home,
+          ".fx",
+          "extensions",
+          "alt",
+          "teams",
+          "my-team",
+          `1-${initialManifest.latest_digest}.json`,
+        ))).toBe(true);
+
+        await session.sendText("/alt off");
+        await session.waitForText("ALT mode disabled.", 5_000);
+        await session.waitForComposer(5_000);
+        await session.sendText("/alt teams");
+        await session.waitForText("ALT Teams 1", 5_000);
+        await session.sendKeys("Down");
+        await session.sendKeys("Enter");
+        await session.waitForText("Edit as a new revision", 5_000);
+        await session.sendKeys("Down");
+        await session.sendKeys("Enter");
+        await session.waitForText("ID · fixed", 5_000);
+
+        await session.sendKeys("Enter");
+        await session.sendKeys("C-u");
+        await session.sendText("Revised Team");
+        await session.waitForText("Name  Revised Team", 5_000);
+        for (let index = 0; index < 7; index += 1) await session.sendKeys("Down");
+        await session.sendKeys("Enter");
+        await session.waitForText("ALT mode enabled.", 5_000);
+        await session.waitForComposer(5_000);
+        await session.sendText("Persist a conversation on Team revision two.");
+        await session.waitForText(TEAM_UX_SECOND_MARKER, 10_000);
+        await session.waitForComposer(5_000);
+
+        const revisedManifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+        expect(revisedManifest).toMatchObject({
+          id: "my-team",
+          name: "Revised Team",
+          latest_revision: 2,
+          deleted: false,
+        });
+        expect(existsSync(join(
+          home,
+          ".fx",
+          "extensions",
+          "alt",
+          "teams",
+          "my-team",
+          `2-${revisedManifest.latest_digest}.json`,
+        ))).toBe(true);
+
+        await session.sendText("/alt off");
+        await session.waitForText("ALT mode disabled.", 5_000);
+        await session.waitForComposer(5_000);
+        await session.sendText("/resume");
+        await session.waitForText("ALT · Revised Team r2", 5_000);
+        await session.waitForText("ALT · My Team r1", 5_000);
+        await session.sendKeys("Escape");
+        await session.waitForPane((pane) => !pane.includes("Sessions 2"), 5_000);
+        await session.waitForComposer(5_000);
+
+        await session.sendText("/alt teams");
+        await session.waitForText("ALT Teams 1", 5_000);
+        await session.sendKeys("Down");
+        await session.sendKeys("Enter");
+        await session.sendKeys("Down");
+        await session.sendKeys("Down");
+        await session.sendKeys("Enter");
+        await session.waitForText("Delete Team?", 5_000);
+        await session.sendKeys("Up");
+        await session.sendKeys("Enter");
+        await session.waitForText("ALT Teams 0", 5_000);
+        expect(JSON.parse(readFileSync(manifestPath, "utf8"))).toMatchObject({
+          latest_revision: 2,
+          deleted: true,
+        });
+
+        await session.sendKeys("Escape");
+        await session.waitForPane((pane) => !pane.includes("ALT Teams 0"), 5_000);
+        await session.waitForComposer(5_000);
+        await session.sendText("/alt");
+        await session.waitForText("ALT mode enabled.", 5_000);
+        await session.waitForComposer(5_000);
+        expect(session.paneStatus()).toEqual({ dead: false, status: null });
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(5_000)).toBe(true);
+        session = null;
+      } catch (error) {
+        if (session) {
+          writeFileSync(
+            join(root, "failure-scrollback.txt"),
+            await session.captureFullScrollback(),
+          );
+          writeFileSync(
+            join(root, "failure-scrollback.ansi.txt"),
+            await session.captureFullScrollbackEscapes(),
+          );
+        }
+        writeFileSync(
+          join(root, "failure-summary.txt"),
+          `${String(error)}\n\nstderr:\n${existsSync(stderrPath) ? readFileSync(stderrPath, "utf8") : "<missing>"}`,
+        );
+        const cleanupIndex = tempDirs.indexOf(root);
+        if (cleanupIndex >= 0) tempDirs.splice(cleanupIndex, 1);
+        console.error(`retained Team UX failure artifacts at ${root}`);
+        throw error;
+      } finally {
+        provider.stop();
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "enter leave and refusal paths preserve a live native fx session",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-orchestration-extension-"));
@@ -391,6 +671,7 @@ describe.skipIf(SKIP)("tui: orchestration extension host", () => {
       const tracePath = join(root, "causal.trace.log");
       mkdirSync(home);
       mkdirSync(workspace);
+      seedAltEngineeringTeam(home);
       tempDirs.push(root);
 
       session = await TmuxSession.create({
@@ -417,13 +698,12 @@ describe.skipIf(SKIP)("tui: orchestration extension host", () => {
         await session.waitForPane(
           (pane) =>
             pane.includes("/alt") &&
-            pane.includes("enter or leave ALT Team orchestration"),
+            pane.includes("resume ALT or manage Teams"),
           5_000,
         );
         await session.sendKeys("C-u");
         await session.waitForComposer(5_000);
-        await session.sendText("/alt");
-        await session.waitForText("ALT mode enabled.", 5_000);
+        await enterSeededAlt(session);
         await session.waitForComposer(5_000);
         await session.sendKeys("C-x");
         await session.waitForText(
@@ -437,7 +717,7 @@ describe.skipIf(SKIP)("tui: orchestration extension host", () => {
           ["/alt", "ALT mode is already enabled."],
           ["/alt off", "ALT mode disabled."],
           ["/alt off", "ALT mode is already disabled."],
-          ["/alt nonsense", "/alt [on|off]"],
+          ["/alt nonsense", "/alt [off|teams|new]"],
         ] as const) {
           await session.sendText(command);
           await session.waitForText(expected, 5_000);
@@ -450,7 +730,6 @@ describe.skipIf(SKIP)("tui: orchestration extension host", () => {
           "event=activation_accepted",
           "event=activation_idempotent",
           "event=deactivation_completed",
-          "event=deactivation_idempotent",
         ];
         let previousIndex = -1;
         for (const event of expectedEvents) {
@@ -505,6 +784,7 @@ describe.skipIf(SKIP)("tui: orchestration extension host", () => {
       const tracePath = join(root, "causal.trace.log");
       mkdirSync(fxHome, { recursive: true, mode: 0o700 });
       mkdirSync(workspace);
+      seedAltEngineeringTeam(home);
       const authPath = join(fxHome, "opencode-auth.json");
       writeFileSync(
         authPath,
@@ -534,9 +814,7 @@ describe.skipIf(SKIP)("tui: orchestration extension host", () => {
           },
         });
         await session.waitForComposer(10_000);
-        await session.sendText("/alt");
-        await session.waitForText("ALT mode enabled.", 5_000);
-        await session.waitForComposer(5_000);
+        await enterSeededAlt(session);
         await session.sendText("ROOT ALT REQUEST THAT MUST REMAIN CANONICAL");
         await waitForFileText(tracePath, "event=agent_run_started", 10_000);
 
@@ -637,6 +915,7 @@ describe.skipIf(SKIP)("tui: orchestration extension host", () => {
       const tracePath = join(root, "causal.trace.log");
       mkdirSync(fxHome, { recursive: true, mode: 0o700 });
       mkdirSync(workspace);
+      seedAltEngineeringTeam(home);
       const authPath = join(fxHome, "opencode-auth.json");
       writeFileSync(
         authPath,
@@ -663,9 +942,7 @@ describe.skipIf(SKIP)("tui: orchestration extension host", () => {
           },
         });
         await session.waitForComposer(10_000);
-        await session.sendText("/alt");
-        await session.waitForText("ALT mode enabled.", 5_000);
-        await session.waitForComposer(5_000);
+        await enterSeededAlt(session);
         await session.sendText("Exercise semantic protocol correction.");
         const trace = await waitForFileText(tracePath, "event=answer_published", 15_000);
         await session.waitForText(CORRECTION_MARKER, 10_000);
@@ -728,6 +1005,7 @@ describe.skipIf(SKIP)("tui: orchestration extension host", () => {
       const tracePath = join(root, "causal.trace.log");
       mkdirSync(fxHome, { recursive: true, mode: 0o700 });
       mkdirSync(workspace);
+      seedAltEngineeringTeam(home);
       writeFileSync(join(workspace, "continuity-sentinel.txt"), `${CONTINUITY_FILE_SENTINEL}\n`);
       const authPath = join(fxHome, "opencode-auth.json");
       writeFileSync(
@@ -756,9 +1034,7 @@ describe.skipIf(SKIP)("tui: orchestration extension host", () => {
           },
         });
         await session.waitForComposer(10_000);
-        await session.sendText("/alt");
-        await session.waitForText("ALT mode enabled.", 5_000);
-        await session.waitForComposer(5_000);
+        await enterSeededAlt(session);
         await session.sendText(exactRoot);
         await waitForFileText(tracePath, "event=answer_published", 20_000);
         await session.waitForText(CONTINUITY_MARKER, 10_000);
@@ -820,6 +1096,7 @@ describe.skipIf(SKIP)("tui: orchestration extension host", () => {
       const tracePath = join(root, "causal.trace.log");
       mkdirSync(fxHome, { recursive: true, mode: 0o700 });
       mkdirSync(workspace);
+      seedAltEngineeringTeam(home);
       const authPath = join(fxHome, "opencode-auth.json");
       writeFileSync(
         authPath,
@@ -846,9 +1123,7 @@ describe.skipIf(SKIP)("tui: orchestration extension host", () => {
           },
         });
         await session.waitForComposer(10_000);
-        await session.sendText("/alt");
-        await session.waitForText("ALT mode enabled.", 5_000);
-        await session.waitForComposer(5_000);
+        await enterSeededAlt(session);
         await session.sendText("Exercise Team failure recovery.");
         const trace = await waitForFileText(tracePath, "event=answer_published", 15_000);
         await session.waitForText(TEAM_FAILURE_MARKER, 10_000);
@@ -911,6 +1186,7 @@ describe.skipIf(SKIP)("tui: orchestration extension host", () => {
       const tracePath = join(root, "causal.trace.log");
       mkdirSync(fxHome, { recursive: true, mode: 0o700 });
       mkdirSync(workspace);
+      seedAltEngineeringTeam(home);
       writeFileSync(
         join(workspace, "nested-specialist-sentinel.txt"),
         `${NESTED_SPECIALIST_RAW}\n`,
@@ -942,9 +1218,7 @@ describe.skipIf(SKIP)("tui: orchestration extension host", () => {
           },
         });
         await session.waitForComposer(10_000);
-        await session.sendText("/alt");
-        await session.waitForText("ALT mode enabled.", 5_000);
-        await session.waitForComposer(5_000);
+        await enterSeededAlt(session);
         await session.sendText(exactRoot);
         const trace = await waitForFileText(tracePath, "event=answer_published", 20_000);
         await session.waitForText(NESTED_ANSWER_MARKER, 10_000);

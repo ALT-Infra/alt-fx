@@ -363,6 +363,10 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         fn routeNonSlashPickerMove(app: *App, delta: i32) !bool {
+            if (comptime @hasDecl(App, "moveOrchestrationDefinitionManager")) {
+                if (app.moveOrchestrationDefinitionManager(delta)) return true;
+            }
+
             if (try routeSettingsMenuMove(app, delta)) return true;
             if (try routeHelpMenuMove(app, delta)) return true;
             if (try routeModelMenuMove(app, delta)) return true;

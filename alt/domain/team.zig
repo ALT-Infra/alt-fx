@@ -36,6 +36,9 @@ pub const Team = struct {
     pub fn validate(self: Team) ValidationError!void {
         if (self.schema != 2) return error.UnsupportedSchema;
         if (empty(self.id) or empty(self.name) or empty(self.provider_id)) return error.EmptyIdentity;
+        if (!equal(self.provider_id, "opencode") and !equal(self.provider_id, "vercel")) {
+            return error.UnsupportedProvider;
+        }
         for (self.digest) |byte| {
             if (!std.ascii.isHex(byte) or std.ascii.isUpper(byte)) {
                 return error.InvalidDigest;
@@ -76,6 +79,61 @@ pub const Team = struct {
             if (self.model(specialist_entry.model_id) == null) return error.UnknownModel;
         }
         try self.validateExclusiveModelOwnership();
+        try self.validateReachableCollaboration();
+    }
+
+    /// ALT is deliberately not a single-model mode. Every declared agent must
+    /// be reachable from the primary through the peer graph, every specialist
+    /// must be callable by at least one reachable agent, and at least one such
+    /// collaborator must exist.
+    fn validateReachableCollaboration(self: Team) ValidationError!void {
+        if (self.peers.len == 0 and self.specialists.len == 0) {
+            return error.MissingCollaborator;
+        }
+
+        for (self.peers) |candidate| {
+            if (!self.agentReachable(candidate.id)) return error.UnreachablePeer;
+        }
+
+        for (self.specialists) |candidate| {
+            var callable = contains(self.primary.specialists, candidate.id);
+            if (!callable) {
+                for (self.peers) |peer| {
+                    if (contains(peer.specialists, candidate.id)) {
+                        callable = true;
+                        break;
+                    }
+                }
+            }
+            if (!callable) return error.UnreachableSpecialist;
+        }
+    }
+
+    fn agentReachable(self: Team, target_id: []const u8) bool {
+        if (equal(target_id, self.primary.id)) return true;
+
+        // A bounded fixed-point walk avoids allocating during validation. A
+        // peer is reachable when there is a path from the primary through the
+        // undirected peer declarations. `visitedBefore` recomputes the earlier
+        // frontier deterministically from the Team document.
+        var depth: usize = 0;
+        while (depth <= self.peers.len) : (depth += 1) {
+            if (self.reachableWithin(target_id, depth)) return true;
+        }
+        return false;
+    }
+
+    fn reachableWithin(self: Team, target_id: []const u8, depth: usize) bool {
+        if (equal(target_id, self.primary.id)) return true;
+        if (depth == 0) return false;
+        const target = self.agent(target_id) orelse return false;
+        if (self.arePeers(self.primary.id, target.id)) return true;
+        for (self.peers) |candidate| {
+            if (equal(candidate.id, target.id)) continue;
+            if (self.arePeers(candidate.id, target.id) and
+                self.reachableWithin(candidate.id, depth - 1)) return true;
+        }
+        return false;
     }
 
     fn validateExclusiveModelOwnership(self: Team) ValidationError!void {
@@ -181,6 +239,7 @@ pub const ValidationError = error{
     EmptyIdentity,
     InvalidIdentifier,
     InvalidRevision,
+    UnsupportedProvider,
     EmptyModels,
     EmptyModel,
     DuplicateModel,
@@ -195,6 +254,9 @@ pub const ValidationError = error{
     DuplicatePeerEdge,
     UnknownSpecialist,
     DuplicateSpecialist,
+    MissingCollaborator,
+    UnreachablePeer,
+    UnreachableSpecialist,
 };
 
 fn empty(value: []const u8) bool {
@@ -309,4 +371,35 @@ test "an undirected peer edge has one durable declaration" {
     var value = fixture();
     value.peers = &peers;
     try std.testing.expectError(error.DuplicatePeerEdge, value.validate());
+}
+
+test "ALT refuses a primary-only Team" {
+    var value = fixture();
+    value.primary.peers = &.{};
+    value.primary.specialists = &.{};
+    value.peers = &.{};
+    value.specialists = &.{};
+    try std.testing.expectError(error.MissingCollaborator, value.validate());
+}
+
+test "every peer must be reachable from the primary" {
+    var value = fixture();
+    value.primary.peers = &.{};
+    try std.testing.expectError(error.UnreachablePeer, value.validate());
+}
+
+test "every specialist must be callable by a reachable agent" {
+    var value = fixture();
+    value.primary.specialists = &.{};
+    try std.testing.expectError(error.UnreachableSpecialist, value.validate());
+}
+
+test "a specialist callable by a connected peer is usable Team work" {
+    const peer_specialists = [_][]const u8{"vision-reader"};
+    var peers = [_]Agent{fixture().peers[0]};
+    peers[0].specialists = &peer_specialists;
+    var value = fixture();
+    value.primary.specialists = &.{};
+    value.peers = &peers;
+    try value.validate();
 }

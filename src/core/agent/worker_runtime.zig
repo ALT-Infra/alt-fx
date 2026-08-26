@@ -776,6 +776,22 @@ pub const WorkerRuntime = struct {
         return self.worker_cancel_requested.load(.seq_cst);
     }
 
+    /// Clears the cancellation latch after a live-session transition when the
+    /// next turn is owned by an external host rather than this worker's prompt
+    /// queue. Ordinary queued turns clear the same latch in
+    /// `takeNextPromptLocked`; isolated orchestration has no such dequeue.
+    pub fn resetIdleCancellation(self: *WorkerRuntime) !void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (self.worker_processing or self.queued_prompt_count != 0) {
+            return error.WorkerBusy;
+        }
+        self.worker_cancel_requested.store(false, .seq_cst);
+        self.worker_recovery_pause_requested.store(false, .seq_cst);
+        self.worker_connectivity_wait_active.store(false, .seq_cst);
+        self.recovery_continuation_ready = false;
+    }
+
     pub fn isConnectivityWaitActive(self: *const WorkerRuntime) bool {
         return self.worker_connectivity_wait_active.load(.seq_cst);
     }
@@ -4406,6 +4422,21 @@ test "takeEventBatch snapshots cancellation with detached events" {
     try std.testing.expect(batch.events.items[0] == .assistant_presentation);
     try std.testing.expect(batch.events.items[0].assistant_presentation == .text);
     try std.testing.expectEqual(@as(usize, 0), runtime.worker_events.items.len);
+}
+
+test "resetIdleCancellation admits external host events after a session transition" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+
+    runtime.requestCancel();
+    try std.testing.expect(runtime.isCancelRequested());
+    try runtime.resetIdleCancellation();
+    try std.testing.expect(!runtime.isCancelRequested());
+
+    try runtime.beginIsolatedProcessing(7);
+    defer runtime.finishProcessing();
+    try std.testing.expectError(error.WorkerBusy, runtime.resetIdleCancellation());
 }
 
 test "state snapshot reports completion queued after event batch detach" {

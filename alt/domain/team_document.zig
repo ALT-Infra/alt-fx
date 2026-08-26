@@ -52,25 +52,6 @@ pub const Document = struct {
     }
 };
 
-pub fn engineering(allocator: std.mem.Allocator) !Document {
-    return Document.parse(allocator, @embedFile("../teams/engineering.json"));
-}
-
-test "embedded engineering Team is a validated immutable revision" {
-    var document = try engineering(std.testing.allocator);
-    defer document.deinit();
-
-    try std.testing.expectEqual(@as(u16, 2), document.value.schema);
-    try std.testing.expectEqualStrings("engineering", document.value.id);
-    try std.testing.expectEqual(@as(u32, 6), document.value.revision);
-    try std.testing.expectEqualStrings("opencode", document.value.provider_id);
-    try std.testing.expect(document.value.arePeers("engineering", "coding"));
-    try std.testing.expect(document.value.canUseSpecialist(
-        "coding",
-        "visual-inspector",
-    ));
-}
-
 test "Team parser rejects unknown configuration fields" {
     try std.testing.expectError(
         error.UnknownField,

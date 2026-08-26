@@ -1,4 +1,12 @@
 const std = @import("std");
+const build_options = @import("build_options");
+const FallbackDefinitionEditorRow = struct {
+    label: []const u8,
+    detail: []const u8 = "",
+    selected: bool = false,
+    marked: bool = false,
+    destructive: bool = false,
+};
 const question_prompt = @import("../../core/agent/question_prompt.zig");
 const approval_prompt = @import("../../core/permissions/approval_prompt.zig");
 const auth_runtime = @import("../../core/auth/auth_runtime.zig");
@@ -8,6 +16,22 @@ const app_mcp_runtime = @import("../../core/app/app_mcp_runtime.zig");
 const mcp_health = @import("../../core/mcp/health.zig");
 const mcp_menu_state = @import("../../core/mcp/menu_state.zig");
 const mcp_runtime = @import("../../core/mcp/mcp_runtime.zig");
+const definition_manager = @import("../../core/orchestration/definition_manager.zig");
+const orchestration_host = if (build_options.orchestration_enabled)
+    @import("fx_orchestration_host")
+else
+    struct {
+        pub const DefinitionEditorRow = FallbackDefinitionEditorRow;
+        pub const DefinitionEditorProjection = struct {
+            active: bool = false,
+            title: []const u8 = "",
+            subtitle: []const u8 = "",
+            rows: []const FallbackDefinitionEditorRow = &.{},
+            error_message: []const u8 = "",
+            accepts_text: bool = false,
+            hint: []const u8 = "",
+        };
+    };
 const picker_state = @import("../../core/input/picker_state.zig");
 const session_catalog = @import("../../core/session/session_catalog.zig");
 const session_store = @import("../../core/session/session_store.zig");
@@ -242,6 +266,21 @@ pub const SessionMenuProjection = struct {
     }
 };
 
+pub const DefinitionManagerProjection = struct {
+    active: bool = false,
+    stage: definition_manager.Stage = .library,
+    state: ?*const definition_manager.State = null,
+    definition_kind: []const u8 = "definition",
+    extension_name: []const u8 = "Extension",
+    editor: orchestration_host.DefinitionEditorProjection = .{},
+
+    pub fn navigationItemCount(self: DefinitionManagerProjection) usize {
+        const manager = self.state orelse return 0;
+        return manager.navigationItemCount();
+    }
+};
+pub const DefinitionEditorRow = orchestration_host.DefinitionEditorRow;
+
 pub const HelpMenuProjection = struct {
     active: bool = false,
     category: ?command_specs.SlashPresentationCategory = null,
@@ -463,6 +502,7 @@ pub const RenderContext = struct {
     settings_menu: SettingsMenuProjection = .{},
     model_menu: ModelMenuProjection = .{},
     session_menu: SessionMenuProjection = .{},
+    definition_manager: DefinitionManagerProjection = .{},
     statusline_menu: StatuslineMenuProjection = .{},
     usage_menu: UsageMenuProjection = .{},
     workspace_menu: WorkspaceMenuProjection = .{},
