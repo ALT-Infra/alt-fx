@@ -423,21 +423,26 @@ fn parseGlobalLaunchArgs(
 /// Startup uses this same surface to select the full runtime configuration
 /// before the allocating parser runs.
 pub fn commandAfterGlobalLaunchArgs(args: []const [:0]const u8) ?[]const u8 {
+    const remaining = argsAfterGlobalLaunchArgs(args);
+    return if (remaining.len > 0) remaining[0] else null;
+}
+
+pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u8 {
     var index: usize = 0;
     while (index < args.len) {
         const arg = args[index];
         if (std.mem.eql(u8, arg, "--context-limit") or std.mem.eql(u8, arg, "--add-dir")) {
             index += 1;
-            if (index >= args.len) return null;
+            if (index >= args.len) return &.{};
         } else if (!std.mem.startsWith(u8, arg, "--context-limit=") and
             !std.mem.startsWith(u8, arg, "--add-dir=") and
             !std.mem.eql(u8, arg, "--no-additional-dirs"))
         {
-            return arg;
+            return args[index..];
         }
         index += 1;
     }
-    return null;
+    return &.{};
 }
 
 pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Command {

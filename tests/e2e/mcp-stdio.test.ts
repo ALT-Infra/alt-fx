@@ -538,6 +538,38 @@ describe("modern MCP stdio compatibility", () => {
     await expectFixtureProcessesExited(readWire(root.wireLogPath));
   }, 25_000);
 
+  test("fx ask reports rejected workspace MCP entries on stderr", async () => {
+    const root = createRoot("workspace-invalid-entry", MODERN_FIXTURE);
+    moveProfileFixtureToWorkspace(root);
+    const projectPath = join(root.workspace, ".mcp.json");
+    const project = JSON.parse(readFileSync(projectPath, "utf8"));
+    project.mcpServers.broken = {
+      type: "http",
+      url: "not a url",
+    };
+    writeFileSync(projectPath, JSON.stringify(project));
+    gateway = startFakeGateway([fakeGatewayFinalText("WORKSPACE_PARSE_CONTINUED")], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Confirm the workspace is available."],
+      {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway),
+        timeoutMs: 20_000,
+      },
+    );
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("WORKSPACE_PARSE_CONTINUED");
+    expect(result.stdout).not.toContain("broken");
+    expect(result.stderr).toContain("loaded project MCP servers: fixture");
+    expect(result.stderr).toContain(
+      ".mcp.json server 'broken' was skipped: invalid_entry.",
+    );
+    await expectFixtureProcessesExited(readWire(root.wireLogPath));
+  }, 25_000);
+
   test.skipIf(process.platform === "win32" || !tmuxAvailable())(
     "/mcp list reports a missing workspace variable without exposing config values",
     async () => {

@@ -269,7 +269,8 @@ Remote authentication supports configured bearer tokens and OAuth credential
 discovery, persistence, refresh, scope challenges, and logout. Credential and
 private-cache identity changes invalidate prior private state. macOS persists
 OAuth credentials in Keychain and migrates the private profile credential file
-only after verified publication. Other platforms use the `0600` credential file
+only after verified publication. If the user account has no default Keychain,
+macOS falls back to the same `0600` credential file used on other platforms
 under the `0700` profile directory. `FX_DISABLE_KEYCHAIN=1` selects that portable
 backend explicitly for deterministic tests and local troubleshooting.
 

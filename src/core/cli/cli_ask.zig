@@ -1637,6 +1637,16 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         ctx.mcp_elicitation_capabilities,
     );
     if (ctx.mcp) |mcp| {
+        var health_snapshot = try mcp.snapshotHealth(
+            alloc,
+            @intCast(@max(io_mod.milliTimestamp(), 0)),
+        );
+        defer health_snapshot.deinit(alloc);
+        for (health_snapshot.configuration_issues) |issue| {
+            try ctx.writeStderr("fx ask: ");
+            try ctx.writeStderr(issue.message);
+            try ctx.writeStderr("\n");
+        }
         const project_names = try mcp.pendingWorkspaceNamesForPhase(alloc, .ask_startup);
         defer mcp_contract.freeOwnedStrings(alloc, project_names);
         if (project_names.len > 0) {

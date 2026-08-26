@@ -364,7 +364,11 @@ export function startModernMcpHttpFixture(
         result: {
           resultType: "complete",
           supportedVersions: [MODERN_MCP_VERSION],
-          serverInfo: { name: "modern-http-fixture" },
+          _meta: {
+            "io.modelcontextprotocol/serverInfo": {
+              name: "modern-http-fixture",
+            },
+          },
           capabilities: {
             tools: mode === "cache_subscription" ||
                 mode === "cache_server_cancel" ||

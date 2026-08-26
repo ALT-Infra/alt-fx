@@ -10595,7 +10595,15 @@ fn parseServerIdentity(value: std.json.Value) !ParsedServerIdentity {
     try mcp_contract.validateJsonRpcResponseEnvelope(value);
     const result = value.object.get("result") orelse return error.McpInvalidResult;
     if (result != .object) return error.McpInvalidResult;
-    const info = result.object.get("serverInfo") orelse return .{};
+    const info = blk: {
+        if (result.object.get("_meta")) |meta| {
+            if (meta != .object) return error.McpInvalidResult;
+            if (meta.object.get("io.modelcontextprotocol/serverInfo")) |modern| {
+                break :blk modern;
+            }
+        }
+        break :blk result.object.get("serverInfo") orelse return .{};
+    };
     if (info != .object) return error.McpInvalidResult;
     const name = if (info.object.get("name")) |field| blk: {
         if (field != .string) return error.McpInvalidResult;
@@ -16472,7 +16480,7 @@ test "connectServer discovers and calls a modern NDJSON tool" {
         \\      exit 2
         \\      ;;
         \\    *'"method":"server/discover"'*'"io.modelcontextprotocol/protocolVersion":"2026-07-28"'*'"io.modelcontextprotocol/clientCapabilities":{}'*)
-        \\      printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"serverInfo":{"name":"modern-identity"},"instructions":"Use echo."}}'
+        \\      printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"instructions":"Use echo.","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"modern-identity"}}}}'
         \\      ;;
         \\    *'"method":"tools/list"'*'"io.modelcontextprotocol/protocolVersion":"2026-07-28"'*)
         \\      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","ttlMs":60000,"tools":[{"name":"echo","description":"Echo text","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}}]}}'
@@ -16525,6 +16533,11 @@ test "server identity projection preserves independently optional modern fields"
         name: ?[]const u8,
         version: ?[]const u8,
     }{
+        .{
+            .json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"_meta\":{\"io.modelcontextprotocol/serverInfo\":{\"name\":\"modern-meta\",\"version\":\"2.0.0\"}}}}",
+            .name = "modern-meta",
+            .version = "2.0.0",
+        },
         .{
             .json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"serverInfo\":{\"name\":\"name-only\"}}}",
             .name = "name-only",

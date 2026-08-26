@@ -843,6 +843,48 @@ describe("MCP remote authentication lifecycle", () => {
     expect(auth.revocations).toBe(2);
   }, 30_000);
 
+  test.skipIf(process.platform !== "darwin")(
+    "MCP auth falls back to the private profile store when HOME has no Keychain",
+    async () => {
+      upstream = startModernMcpHttpFixture("json");
+      auth = startAuthFixture(upstream.url);
+      const root = createRoot(auth);
+      const env = {
+        ...baseEnv(root),
+        AI_GATEWAY_API_KEY: undefined,
+        FX_DISABLE_KEYCHAIN: undefined,
+      };
+
+      const authenticated = await runFx(["mcp", "auth", "fixture"], {
+        cwd: root.workspace,
+        env,
+        timeoutMs: 20_000,
+      });
+      expect(authenticated.code).toBe(0);
+      expect(authenticated.stderr).toBe("");
+      expect(auth.authorizationRequests).toBe(1);
+      expect(auth.tokenExchanges).toBe(1);
+      const credentialPath = join(
+        root.home,
+        ".fx",
+        "mcp-credentials",
+        "credentials.json",
+      );
+      expect(existsSync(credentialPath)).toBe(true);
+      expect(statSync(credentialPath).mode & 0o777).toBe(0o600);
+
+      const loggedOut = await runFx(["mcp", "logout", "fixture"], {
+        cwd: root.workspace,
+        env,
+        timeoutMs: 20_000,
+      });
+      expect(loggedOut.code).toBe(0);
+      expect(loggedOut.stderr).toBe("");
+      expect(existsSync(credentialPath)).toBe(false);
+    },
+    30_000,
+  );
+
   test.skipIf(!tmuxAvailable())(
     "no-scope OAuth credentials survive reload and preserve an unrelated server",
     async () => {

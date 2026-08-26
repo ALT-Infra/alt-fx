@@ -3281,7 +3281,14 @@ fn needsFullEntryConfig(args: []const [:0]const u8) bool {
 
 fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
     if (needsFullEntryConfig(args)) return true;
-    const command = cli_surface.commandAfterGlobalLaunchArgs(args) orelse return false;
+    const effective_args = cli_surface.argsAfterGlobalLaunchArgs(args);
+    if (effective_args.len == 0) return false;
+    const command = effective_args[0];
+    if (std.mem.eql(u8, command, "mcp")) {
+        if (effective_args.len < 2) return false;
+        return std.mem.eql(u8, effective_args[1], "auth") or
+            std.mem.eql(u8, effective_args[1], "logout");
+    }
     return std.mem.eql(u8, command, "login") or
         std.mem.eql(u8, command, "logout") or
         std.mem.eql(u8, command, "teams") or
@@ -3311,6 +3318,22 @@ test "credential-reading commands use early threaded io without full entry confi
         const args = &.{command};
         try std.testing.expect(!needsFullEntryConfig(args));
         try std.testing.expect(needsEarlyThreadedIo(args));
+    }
+}
+
+test "MCP auth and logout use early threaded io" {
+    for ([_][:0]const u8{ "auth", "logout" }) |operation| {
+        try std.testing.expect(needsEarlyThreadedIo(&.{
+            @as([:0]const u8, "mcp"),
+            operation,
+            @as([:0]const u8, "fixture"),
+        }));
+    }
+    for ([_][:0]const u8{ "add", "list", "path", "remove" }) |operation| {
+        try std.testing.expect(!needsEarlyThreadedIo(&.{
+            @as([:0]const u8, "mcp"),
+            operation,
+        }));
     }
 }
 

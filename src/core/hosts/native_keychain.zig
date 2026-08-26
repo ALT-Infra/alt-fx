@@ -40,6 +40,29 @@ pub fn isDisabled() bool {
     return std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true");
 }
 
+pub fn userDefaultKeychainAvailable(alloc: std.mem.Allocator) Error!bool {
+    if (!isAvailable()) return false;
+    const result = std.process.run(alloc, io_mod.getIo(), .{
+        .argv = &.{ "/usr/bin/security", "default-keychain", "-d", "user" },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    }) catch |err| {
+        debug_trace.logf("keychain", "availability failed step=spawn err={s}", .{@errorName(err)});
+        return error.KeychainReadFailed;
+    };
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+    if (result.term == .exited and result.term.exited == 0) return true;
+    if (std.mem.find(u8, result.stderr, "default keychain could not be found") != null or
+        std.mem.find(u8, result.stderr, "A default keychain could not be found") != null)
+    {
+        debug_trace.logf("keychain", "availability unavailable reason=no_default_keychain", .{});
+        return false;
+    }
+    debug_trace.logf("keychain", "availability failed step=default term={t}", .{result.term});
+    return error.KeychainReadFailed;
+}
+
 /// Returns a slice borrowing `buf`. `USER` stays authoritative when set, because it
 /// is the only way to target a non-login account. ACP clients launched by GUI editors
 /// inherit a thinner environment than a shell, so the operating system supplies the
