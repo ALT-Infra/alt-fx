@@ -376,8 +376,31 @@ fn composeTitleRow(
     const content_width: usize = @as(usize, width) -| 1;
     const metadata_overhead = prefix_width + picker_presentation.inline_picker_column_gap_width + metadata_width;
     const available_title_width = content_width -| metadata_overhead;
+
+    // The row renders the ALT-pinned revision as part of the title, so the
+    // measured width must describe that exact text or the shared column grid
+    // middle-ellipsizes a label that had ample room.
+    var owned_title: ?[]u8 = null;
+    defer if (owned_title) |text| alloc.free(text);
+    const title_text: []const u8 = if (summary.orchestration) |binding| blk: {
+        const labeled = try std.fmt.allocPrint(
+            alloc,
+            "{s} · {s} r{d} · {s}",
+            .{
+                binding.extension_name,
+                binding.display_name,
+                binding.definition_revision,
+                session_catalog.displayTitle(summary),
+            },
+        );
+        owned_title = labeled;
+        break :blk labeled;
+    } else if (summary.orchestration_binding_invalid)
+        "Orchestration metadata unavailable"
+    else
+        session_catalog.displayTitle(summary);
     const show_metadata = metadata_width > 0 and available_title_width >= minimum_title_column_width;
-    const measured_title_width = @max(columns.title, display_width.visibleWidth(session_catalog.displayTitle(summary)));
+    const measured_title_width = @max(columns.title, display_width.visibleWidth(title_text));
     const title_col = if (show_metadata)
         @min(measured_title_width, available_title_width)
     else
@@ -391,29 +414,7 @@ fn composeTitleRow(
     // Selection is signaled by brightness: bold bright white when selected,
     // dim gray otherwise, so the two are clearly distinct. No marker glyph.
     try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else ui_render.dim_style);
-    if (summary.orchestration) |binding| {
-        const labeled_title = try std.fmt.allocPrint(
-            alloc,
-            "{s} · {s} r{d} · {s}",
-            .{
-                binding.extension_name,
-                binding.display_name,
-                binding.definition_revision,
-                session_catalog.displayTitle(summary),
-            },
-        );
-        defer alloc.free(labeled_title);
-        try row_text.appendSingleLineMiddleEllipsized(alloc, &row, labeled_title, title_budget);
-    } else if (summary.orchestration_binding_invalid) {
-        try row_text.appendSingleLineMiddleEllipsized(
-            alloc,
-            &row,
-            "Orchestration metadata unavailable",
-            title_budget,
-        );
-    } else {
-        try row_text.appendSingleLineMiddleEllipsized(alloc, &row, session_catalog.displayTitle(summary), title_budget);
-    }
+    try row_text.appendSingleLineMiddleEllipsized(alloc, &row, title_text, title_budget);
     try row.appendSlice(alloc, ui_render.reset_style);
 
     if (show_metadata) {
