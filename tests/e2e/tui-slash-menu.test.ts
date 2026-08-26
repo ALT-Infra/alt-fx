@@ -137,7 +137,10 @@ async function waitForSettingsMenu(session: TmuxSession): Promise<string[]> {
   while (Date.now() < deadline) {
     latest = await session.capturePaneGrid();
     const pane = latest.join("\n");
-    if (pane.includes("Settings") && pane.includes("←→ Change")) return latest;
+    if (
+      pane.includes("←→ Change") &&
+      (pane.includes("Settings") || pane.includes("Status line context"))
+    ) return latest;
     await Bun.sleep(100);
   }
   throw new Error(`Timed out waiting for settings menu.\nPane:\n${latest.join("\n")}`);
@@ -533,7 +536,7 @@ function createManySkillsMenuFixture(count: number) {
 
 function visibleFxSkillNames(grid: string[]): string[] {
   return grid
-    .filter((line) => line.includes("skill-") && line.includes("Fx · Global"))
+    .filter((line) => line.includes("skill-") && line.includes("fx · Global"))
     .map((line) => line.match(/skill-\d+/)?.[0])
     .filter((name): name is string => name !== undefined);
 }
@@ -1425,7 +1428,8 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendLiteralText("help");
       await session.sendKeys("Enter");
       pane = await session.waitForText("Commands", 5_000);
-      expect(pane).toContain("show available slash commands");
+      expect(pane).toContain("/help");
+      expect(pane).toContain("Enter Open");
 
       await session.sendKeys("Escape");
       await session.waitForPane(
@@ -1509,20 +1513,27 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendText("/help");
       let grid = await waitForHelpMenu(session, 37);
       let pane = grid.join("\n");
-      expect(pane).not.toContain("𝒇x");
-      expect(pane).not.toContain("Run /help for commands");
-      expect(pane).toContain("General");
+      expect(pane).toContain("𝒇x");
+      expect(pane).toContain("Run /help for commands");
+      expect(pane).toContain("[All]");
       expect(pane).toContain("/help");
       expect(pane).not.toContain("● /help");
       expect(pane).toContain("show available slash commands");
       expect(pane).toContain("↑↓ Navigate");
+      expect(pane).toContain("Tab Category");
       expect(pane).toContain("Enter Open");
+
+      await session.sendKeys("Tab");
+      grid = await waitForHelpMenu(session, 5);
+      expect(grid.join("\n")).toContain("[General]");
+      await session.sendKeys("BTab");
+      grid = await waitForHelpMenu(session, 37);
+      expect(grid.join("\n")).toContain("[All]");
 
       await session.sendLiteralText("clipboard");
       grid = await waitForHelpMenu(session, 1);
       pane = grid.join("\n");
       expect(composerContains(pane, "clipboard")).toBe(true);
-      expect(pane).toContain("Media");
       expect(pane).toContain("/paste");
       expect(pane).not.toContain("/clear");
 
@@ -1606,21 +1617,25 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendText("/settings");
       const grid = await waitForSettingsMenu(session);
       let pane = grid.join("\n");
-      expect(pane).not.toContain("𝒇x");
-      expect(pane).not.toContain("Run /help for commands");
+      expect(pane).toContain("𝒇x");
+      expect(pane).toContain("Run /help for commands");
       expect(pane).toContain("Settings");
       expect(pane).toContain("Interface");
-      expect(pane).toContain("Agent");
-      expect(pane).toContain("Notifications");
-      expect(pane).toContain("Advanced");
+      expect(pane).toContain("[All]");
       expect(pane).toContain("↑↓ Navigate");
+      expect(pane).toContain("Tab Category");
       expect(pane).toContain("←→ Change");
       expect(pane).toContain("Esc Close");
-      expect(pane).not.toContain("[All]");
       expect(pane).not.toContain("Enter Change");
 
       expect(pane).not.toContain("Input appearance");
       expect(pane).not.toContain("Maxxing mode");
+      await session.sendKeys("Tab");
+      pane = (await waitForSettingsMenu(session)).join("\n");
+      expect(pane).toContain("[Interface]");
+      await session.sendKeys("BTab");
+      pane = (await waitForSettingsMenu(session)).join("\n");
+      expect(pane).toContain("[All]");
       for (let index = 0; index < 2; index += 1) await session.sendKeys("Down");
       await session.waitForText(/Status line workspace\s+off/, 5_000);
       await session.sendKeys("Right");
@@ -1668,7 +1683,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
 
       await session.sendText("/help");
-      let pane = await session.waitForText("Commands 37", 5_000);
+      let pane = await session.waitForText("/help", 5_000);
       expect(pane).toContain("/help");
       expect(pane).not.toContain("● /help");
       await session.sendKeys("Escape");
@@ -2314,7 +2329,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   );
 
   test(
-    "skill and completion menus stay inline with the composer",
+    "command and completion menus stay inline with the composer",
     async () => {
       const fixture = createSkillsMenuFixture();
       const tapePath = join(fixture.home, "dollar-inline.fxtape");
@@ -2350,15 +2365,16 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeSkills);
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
       expect(pane).toContain("[All]");
-      expect(pane).toContain("Fx");
+      expect(pane).toContain("fx");
+      expect(pane).not.toContain("[Fx]");
       expect(pane).toContain("Workspace");
       expect(pane).toContain("Claude");
       expect(pane).toContain("Codex");
       expect(pane).toContain("Agents");
       expect(pane).toContain("managed-menu");
-      expect(pane).toContain("Fx · Global");
+      expect(pane).toContain("fx · Global");
       expect(pane).toContain("workspace-menu");
-      expect(pane).toContain("Fx · Workspace");
+      expect(pane).toContain("fx · Workspace");
       expect(pane).toContain("↑↓ Navigate");
       expect(pane).toContain("Enter Use");
 
@@ -2564,6 +2580,41 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForPane((current) => !current.includes("↑↓ Navigate"), 5_000);
       expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeSkills);
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
+
+      await session.sendText("/help");
+      grid = await waitForHelpMenu(session, 37);
+      expect(grid.join("\n")).toContain("Run /help for commands");
+      expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeSkills);
+      expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
+      await session.sendKeys("Escape");
+      await session.waitForPane(
+        (current) => hasEmptyComposer(current) && !current.includes("Enter Open"),
+        5_000,
+      );
+
+      await session.sendText("/settings");
+      grid = await waitForSettingsMenu(session);
+      expect(grid.join("\n")).toContain("Run /help for commands");
+      expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeSkills);
+      expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
+      await session.sendKeys("Escape");
+      await session.waitForPane(
+        (current) => hasEmptyComposer(current) && !current.includes("←→ Change"),
+        5_000,
+      );
+
+      await session.sendText("/resume");
+      await session.waitForText("Sessions 0", 5_000);
+      grid = await session.capturePaneGrid();
+      expect(grid.join("\n")).toContain("Run /help for commands");
+      expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeSkills);
+      expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
+      await session.sendKeys("Escape");
+      await session.waitForPane(
+        (current) => hasEmptyComposer(current) && !current.includes("Enter Resume"),
+        5_000,
+      );
+
       await session.sendKeys("C-u");
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);

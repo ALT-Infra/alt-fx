@@ -295,7 +295,8 @@ async function waitForSessionPicker(session: TmuxSession): Promise<string> {
   return session.waitForPane(
     (pane) => {
       const plain = stripAnsi(pane);
-      return plain.includes("Sessions") && SESSION_PICKER_META_RE.test(plain);
+      return plain.includes("Sessions") &&
+        (plain.includes("[Current workspace]") || plain.includes("[All workspaces]"));
     },
     TIMEOUT,
   );
@@ -5603,7 +5604,7 @@ test.skipIf(!tmuxAvailable())(
       const currentPicker = stripAnsi(await active.capturePane());
       expect(currentPicker).toContain("Sessions 1");
       expect(currentPicker).toContain("[Current workspace]");
-      expect(currentPicker).not.toContain("𝒇x");
+      expect(currentPicker).toContain("𝒇x");
       expect(currentPicker).toContain("Save the workspace A transcript.");
       expect(currentPicker).not.toContain("Save the workspace B transcript.");
 
@@ -5721,7 +5722,7 @@ test.skipIf(!tmuxAvailable())(
       }
       const rows = pane
         .split("\n")
-        .filter((line) => /(?:alpha|beta|gamma)\b.*\bturns?\b/.test(line))
+        .filter((line) => /(?:alpha|beta|gamma)\b/.test(line))
         .map((line) => line.trim());
       expect(new Set(rows).size).toBe(titles.length);
       expect(active.isPaneAlive()).toBe(true);
@@ -5801,7 +5802,7 @@ test.skipIf(!tmuxAvailable())(
       await waitForSessionPicker(active);
 
       let sessionEntries = visibleSessionPickerEntries(await active.capturePaneEscapes());
-      expect(sessionEntries.length).toBeGreaterThanOrEqual(7);
+      expect(sessionEntries).toHaveLength(2);
       expect(sessionEntries.findIndex((entry) => entry.selected)).toBe(0);
       const firstVisibleRow = sessionEntries[0]!.row;
       const firstVisibleTitle = sessionEntries[0]!.title;
@@ -5841,8 +5842,9 @@ test.skipIf(!tmuxAvailable())(
       expect(hintRow).toBeGreaterThan(loadMoreRow);
       const firstEntryRow = visibleSessionPickerEntries(await active.capturePaneEscapes())[0]!.row;
 
-      await active.sendKeys("Down");
-      await active.sendKeys("Down");
+      for (let index = 0; index < 10 - visibleCount; index += 1) {
+        await active.sendKeys("Down");
+      }
       await active.waitForPane((pane) => {
         const plain = stripAnsi(pane);
         return /Sessions 1[12]\b/.test(plain) && !plain.includes("Load more");

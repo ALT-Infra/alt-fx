@@ -26,7 +26,7 @@ pub const composeDividerRow = row_text.composeDividerRow;
 pub const appendClipped = row_text.appendClipped;
 pub const appendAbsoluteColumn = row_text.appendAbsoluteColumn;
 
-pub const PickerKind = enum { model_stage, file, slash, skills, auth };
+pub const PickerKind = enum { model_stage, file, slash, skills, help, settings, sessions, auth };
 pub const CappedInputRows = struct {
     row_limit: usize,
     total_lines: u16,
@@ -482,11 +482,11 @@ pub fn composeHelpMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool
     }
 
     const variants = [_][]const u8{
-        "↑↓ Navigate     Enter Open     Esc Close",
-        "↑↓ Navigate  Enter Open  Esc Close",
-        "↑↓ Move  Enter Open  Esc",
-        "Enter Open  Esc Close",
-        "Enter Esc",
+        "↑↓ Navigate     Tab Category     Enter Open     Esc Close",
+        "↑↓ Navigate  Tab Category  Enter Open  Esc Close",
+        "↑↓ Move  Tab Category  Enter  Esc",
+        "Tab Category  Enter Open  Esc",
+        "Tab Enter Esc",
     };
     var hint = variants[variants.len - 1];
     for (variants) |candidate| {
@@ -519,11 +519,11 @@ pub fn composeSettingsMenuHintRow(
     }
 
     const variants = [_][]const u8{
-        "↑↓ Navigate     ←→ Change     Esc Close",
-        "↑↓ Navigate  ←→ Change  Esc Close",
-        "↑↓ Move  ←→ Change  Esc",
-        "←→ Change  Esc Close",
-        "←→ Esc",
+        "↑↓ Navigate     Tab Category     ←→ Change     Esc Close",
+        "↑↓ Navigate  Tab Category  ←→ Change  Esc Close",
+        "↑↓ Move  Tab Category  ←→ Change  Esc",
+        "Tab Category  ←→ Change  Esc",
+        "Tab ←→ Esc",
     };
     var hint = variants[variants.len - 1];
     for (variants) |candidate| {
