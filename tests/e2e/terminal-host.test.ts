@@ -7865,7 +7865,7 @@ test("force close reports incomplete refresh descendant and shell delivery", asy
   for (const [index, stage] of stages.entries()) {
     const home = makeHome();
     const paths = hostPaths(home);
-    const host = startHost(home, undefined, 200, {
+    const host = startHost(home, undefined, TMUX_INITIAL_STARTUP_OBSERVATION_BUDGET_MS, {
       FX_TERMINAL_TEST_FAIL_SIGNAL_STAGE: stage,
     });
     await waitFor(() => existsSync(paths.socket));
