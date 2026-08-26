@@ -1917,12 +1917,12 @@ const App = struct {
                 debug_trace.preview(prompt, 120),
             },
         );
-        if (!try self.snapshotAndQueuePromptWithSkillBindings(
+        if (try self.snapshotAndQueuePromptWithSkillBindings(
             prompt,
             skill_tokens,
             review_draft,
             intent,
-        )) return false;
+        ) != .enqueued) return false;
         WorkerAppRuntime.syncState(
             self,
             app_callbacks.Bindings(App).worker_tool_lifecycle_presenter(self),
@@ -1958,7 +1958,7 @@ const App = struct {
             draft.skill_display_spans,
         );
         defer if (skill_tokens.len > 0) self.alloc.free(skill_tokens);
-        if (!try self.snapshotAndQueuePrompt(
+        const outcome = try self.snapshotAndQueuePrompt(
             draft.prompt,
             skill_tokens,
             null,
@@ -1967,7 +1967,14 @@ const App = struct {
             draft.turn_id,
             true,
             .queue,
-        )) return error.PendingPromptQueueRejected;
+        );
+        if (outcome == .absorbed_by_orchestration) {
+            // The canonical turn never enters the native worker queue, so no
+            // begin_presented_prompt event will complete this submission.
+            // Mark it absorbed; the submit runtime ends the lifecycle with
+            // presented-snapshot semantics and releases the turn start hold.
+            InputSubmitRuntime.markPendingSubmissionAbsorbed(self);
+        }
         WorkerAppRuntime.syncState(
             self,
             app_callbacks.Bindings(App).worker_tool_lifecycle_presenter(self),
@@ -2121,7 +2128,7 @@ const App = struct {
         skill_tokens: []const registered_entities.SkillTokenSpan,
         review_draft: ?worker_runtime.QueueReviewDraft,
         intent: PromptSubmitIntent,
-    ) !bool {
+    ) !PromptQueueOutcome {
         return self.snapshotAndQueuePrompt(
             prompt,
             skill_tokens,
@@ -2142,7 +2149,7 @@ const App = struct {
         self: *App,
         checkpoint: *const session_codec.RecoveryCheckpoint,
     ) !bool {
-        if (!try self.snapshotAndQueuePrompt(
+        if (try self.snapshotAndQueuePrompt(
             checkpoint.user.text,
             &.{},
             null,
@@ -2151,13 +2158,18 @@ const App = struct {
             checkpoint.turn_id,
             false,
             .queue,
-        )) return false;
+        ) != .enqueued) return false;
         WorkerAppRuntime.syncState(
             self,
             app_callbacks.Bindings(App).worker_tool_lifecycle_presenter(self),
         );
         return true;
     }
+
+    const PromptQueueOutcome = enum {
+        enqueued,
+        absorbed_by_orchestration,
+    };
 
     fn snapshotAndQueuePrompt(
         self: *App,
@@ -2169,7 +2181,7 @@ const App = struct {
         turn_id: u64,
         user_prompt_already_presented: bool,
         intent: PromptSubmitIntent,
-    ) !bool {
+    ) !PromptQueueOutcome {
         try self.reloadSkills();
 
         const source_images = if (recovery_checkpoint) |checkpoint|
@@ -2330,22 +2342,27 @@ const App = struct {
                         prompt,
                     );
                 if (accepted) {
-                    self.worker.pushEvent(std.heap.c_allocator, .{
-                        .begin_prompt_with_skill_bindings = .{
-                            .prompt = .{
-                                .text = prompt_copy,
-                                .images = images_copy,
+                    if (!user_prompt_already_presented) {
+                        // Deferred-presentation callers rely on us relaying
+                        // the prompt card; already-presented drafts (adoption
+                        // path) must not be rendered twice.
+                        self.worker.pushEvent(std.heap.c_allocator, .{
+                            .begin_prompt_with_skill_bindings = .{
+                                .prompt = .{
+                                    .text = prompt_copy,
+                                    .images = images_copy,
+                                },
+                                .skill_bindings = skill_bindings,
+                                .skill_display_spans = skill_display_spans,
                             },
-                            .skill_bindings = skill_bindings,
-                            .skill_display_spans = skill_display_spans,
-                        },
-                    }) catch |err| debug_trace.logf(
-                        "orchestration",
-                        "canonical {s} presentation deferred error={s}",
-                        .{ if (steering) "instruction" else "user", @errorName(err) },
-                    );
+                        }) catch |err| debug_trace.logf(
+                            "orchestration",
+                            "canonical {s} presentation deferred error={s}",
+                            .{ if (steering) "instruction" else "user", @errorName(err) },
+                        );
+                    }
+                    return .absorbed_by_orchestration;
                 }
-                return accepted;
             }
         }
         try self.worker.admitPrompt(
@@ -2354,7 +2371,7 @@ const App = struct {
             recovery_checkpoint == null and intent == .steer,
         );
         HerdrAppRuntime.reportWorking(self);
-        return true;
+        return .enqueued;
     }
 
     pub fn installInitialMcpRuntime(self: *App, runtime: ?*mcp_runtime_mod.McpRuntime) void {

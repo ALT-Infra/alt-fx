@@ -17,6 +17,7 @@ pub const PendingPhase = enum {
     awaiting_adoption,
     adopted,
     queued,
+    absorbed,
 };
 
 const PendingPhaseError = error{InvalidPendingPhase};
@@ -36,7 +37,7 @@ pub const PendingSubmission = struct {
     }
 
     fn ownsTurnStartHold(self: PendingSubmission) bool {
-        return self.phase != .queued;
+        return self.phase != .queued and self.phase != .absorbed;
     }
 
     fn markFrameCommitted(self: *PendingSubmission) bool {
@@ -195,6 +196,26 @@ pub fn SubmitRuntime(comptime App: type) type {
                 finishPendingSubmissionFailure(app, err);
                 return;
             };
+            if (pending.phase == .absorbed) {
+                // The extension owns this turn end to end and never hands the
+                // prompt to the native worker queue, so no
+                // begin_presented_prompt event will complete the submission.
+                // End it here with the presented-snapshot semantics.
+                app.worker.releaseTurnStartHold();
+                clearPendingSubmissionWithSnapshots(
+                    app,
+                    "absorbed_by_extension",
+                    .preserve,
+                );
+                debug_trace.eventf(
+                    "input",
+                    "pending_prompt_absorbed",
+                    .{ .turn_id = pending.draft.turn_id },
+                    "",
+                    .{},
+                );
+                return;
+            }
             if (!pending.markQueued()) {
                 debug_trace.eventf(
                     "input",
@@ -227,6 +248,13 @@ pub fn SubmitRuntime(comptime App: type) type {
                 "worker_begin_presented",
                 .preserve,
             );
+        }
+
+        pub fn markPendingSubmissionAbsorbed(app: *App) void {
+            if (comptime !@hasField(App, "submission")) return;
+            const pending = if (app.submission.pending) |*value| value else return;
+            if (pending.phase != .adopted) return;
+            pending.phase = .absorbed;
         }
 
         pub fn cancelPendingSubmission(app: *App) bool {
