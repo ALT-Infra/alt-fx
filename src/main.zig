@@ -1946,7 +1946,7 @@ const App = struct {
             draft.skill_display_spans,
         );
         defer if (skill_tokens.len > 0) self.alloc.free(skill_tokens);
-        if (!try self.snapshotAndQueuePrompt(
+        const outcome = try self.snapshotAndQueuePrompt(
             draft.prompt,
             skill_tokens,
             null,
@@ -1954,7 +1954,14 @@ const App = struct {
             draft.images,
             draft.turn_id,
             true,
-        )) return error.PendingPromptQueueRejected;
+        );
+        if (outcome == .absorbed_by_orchestration) {
+            // The canonical turn never enters the native worker queue, so no
+            // begin_presented_prompt event will complete this submission.
+            // Mark it absorbed; the submit runtime ends the lifecycle with
+            // presented-snapshot semantics and releases the turn start hold.
+            InputSubmitRuntime.markPendingSubmissionAbsorbed(self);
+        }
         WorkerAppRuntime.syncState(
             self,
             app_callbacks.Bindings(App).worker_tool_lifecycle_presenter(self),
@@ -2118,8 +2125,8 @@ const App = struct {
             false,
         );
         errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
-        if (try self.dispatchOrchestrationPrompt(queued, prompt, false)) |accepted| {
-            return accepted;
+        if (try self.dispatchOrchestrationPrompt(queued, prompt, false)) |outcome| {
+            return outcome == .accepted;
         }
         try self.worker.admitInteractivePrompt(std.heap.c_allocator, queued);
         HerdrAppRuntime.reportWorking(self);
@@ -2134,7 +2141,7 @@ const App = struct {
         self: *App,
         checkpoint: *const session_codec.RecoveryCheckpoint,
     ) !bool {
-        if (!try self.snapshotAndQueuePrompt(
+        if (try self.snapshotAndQueuePrompt(
             checkpoint.user.text,
             &.{},
             null,
@@ -2142,13 +2149,23 @@ const App = struct {
             null,
             checkpoint.turn_id,
             false,
-        )) return false;
+        ) != .enqueued) return false;
         WorkerAppRuntime.syncState(
             self,
             app_callbacks.Bindings(App).worker_tool_lifecycle_presenter(self),
         );
         return true;
     }
+
+    const PromptQueueOutcome = enum {
+        enqueued,
+        absorbed_by_orchestration,
+    };
+
+    const OrchestrationDispatchOutcome = enum {
+        accepted,
+        rejected,
+    };
 
     fn snapshotAndQueuePrompt(
         self: *App,
@@ -2159,7 +2176,7 @@ const App = struct {
         prompt_images: ?[]const types.ImageAttachment,
         turn_id: u64,
         user_prompt_already_presented: bool,
-    ) !bool {
+    ) !PromptQueueOutcome {
         const queued = try self.snapshotPrompt(
             prompt,
             skill_tokens,
@@ -2169,17 +2186,22 @@ const App = struct {
             turn_id,
             user_prompt_already_presented,
         );
-        errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
+        var owns_queued = true;
+        errdefer if (owns_queued) worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
         if (try self.dispatchOrchestrationPrompt(
             queued,
             prompt,
             user_prompt_already_presented,
-        )) |accepted| {
-            return accepted;
+        )) |outcome| {
+            owns_queued = false;
+            return switch (outcome) {
+                .accepted => .absorbed_by_orchestration,
+                .rejected => error.OrchestrationDispatchRejected,
+            };
         }
         try self.worker.enqueuePrompt(std.heap.c_allocator, queued);
         HerdrAppRuntime.reportWorking(self);
-        return true;
+        return .enqueued;
     }
 
     /// Returns null when the native worker still owns admission. A non-null
@@ -2190,7 +2212,7 @@ const App = struct {
         prompt: worker_runtime.QueuedPrompt,
         source_text: []const u8,
         user_prompt_already_presented: bool,
-    ) !?bool {
+    ) !?OrchestrationDispatchOutcome {
         if (comptime !build_options.orchestration_enabled) return null;
         if (!self.orchestration.active or prompt.recovery_checkpoint != null) return null;
 
@@ -2233,7 +2255,7 @@ const App = struct {
                 .{ if (steering) "instruction" else "user", @errorName(err) },
             );
         }
-        return accepted;
+        return if (accepted) .accepted else .rejected;
     }
 
     // Caller owns the returned prompt until worker admission succeeds.
