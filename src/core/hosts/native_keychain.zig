@@ -52,12 +52,13 @@ pub fn userDefaultKeychainAvailable(alloc: std.mem.Allocator) Error!bool {
     };
     defer alloc.free(result.stdout);
     defer alloc.free(result.stderr);
-    if (result.term == .exited and result.term.exited == 0) return true;
-    if (std.mem.find(u8, result.stderr, "default keychain could not be found") != null or
-        std.mem.find(u8, result.stderr, "A default keychain could not be found") != null)
-    {
-        debug_trace.logf("keychain", "availability unavailable reason=no_default_keychain", .{});
-        return false;
+    switch (result.term) {
+        .exited => |code| {
+            if (code == 0) return true;
+            debug_trace.logf("keychain", "availability unavailable exit_code={d}", .{code});
+            return false;
+        },
+        else => {},
     }
     debug_trace.logf("keychain", "availability failed step=default term={t}", .{result.term});
     return error.KeychainReadFailed;
