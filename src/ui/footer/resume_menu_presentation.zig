@@ -159,13 +159,15 @@ const SessionMenuLayout = struct {
         row_budget: u16,
     ) SessionMenuLayout {
         if (row_budget == 2) {
+            const selected_load_more = selected >= session_count;
             return .{
                 .session_count = session_count,
                 .navigation_count = navigation_count,
                 .selected = selected,
                 .visible_items = 1,
+                .visible_session_items = @intFromBool(!selected_load_more),
                 .first_item_row = 1,
-                .load_more_row = 1,
+                .load_more_row = if (selected_load_more) 1 else null,
                 .row_count = 2,
             };
         }
@@ -980,4 +982,33 @@ test "resume menu renders a navigable load more action" {
     );
     defer loading.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, loading.items, "↓ Loading more…") != null);
+}
+
+test "resume menu keeps the selected paginated action visible in two rows" {
+    const alloc = std.testing.allocator;
+    const summaries = [_]session_store.SessionSummary{.{
+        .id = @constCast("one"),
+        .workspace_root = @constCast("/workspace"),
+        .title = @constCast("Selected session"),
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+        .conversation_language = .literal("en"),
+        .history_len = 1,
+    }};
+    var projection: SessionMenuProjection = .{
+        .active = true,
+        .load_state = .ready,
+        .summaries = &summaries,
+        .has_more = true,
+    };
+
+    var selected_session = try composeSessionMenuRow(alloc, projection, 1, 80, 2);
+    defer selected_session.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, selected_session.items, "Selected session") != null);
+    try std.testing.expect(std.mem.find(u8, selected_session.items, "Load more") == null);
+
+    projection.selected_index = 1;
+    var selected_load_more = try composeSessionMenuRow(alloc, projection, 1, 80, 2);
+    defer selected_load_more.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, selected_load_more.items, "Load more") != null);
 }

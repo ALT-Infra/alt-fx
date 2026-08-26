@@ -360,7 +360,7 @@ async function thrash(
   pid: number,
 ): Promise<void> {
   const sizes = [
-    [48, 18],
+    [60, 12],
     [160, 44],
     [80, 24],
     [112, 32],

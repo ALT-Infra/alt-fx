@@ -5712,6 +5712,7 @@ test "core.app_render_runtime inline menus survive the VT size and resize matrix
     app.skills.items = @constCast(&skills);
     app.session_persistence.session_picker.summaries.items = summaries[0..];
     app.session_persistence.session_picker.load_state = .ready;
+    app.session_persistence.session_picker.has_more = true;
     try app.shell.initBacking(alloc);
     try app.shell.enableShadowVt(alloc);
     try app.shell.writeTranscript(alloc, &app.metrics, "inline menu matrix transcript\n", true);
