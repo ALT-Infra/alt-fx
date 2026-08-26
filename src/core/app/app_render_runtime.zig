@@ -1130,7 +1130,10 @@ pub fn Runtime(comptime App: type) type {
                 )) {
                     try requestNormalViewportRecovery(app);
                 }
-                if (orchestrationDefinitionManagerActive(app)) return .definition_manager_screen;
+                // The inline model picker only renders through the inline
+                // frame path. When a Team role borrows it, the editor screen
+                // must yield so the native catalog stays visible.
+                if (orchestrationDefinitionManagerActive(app) and !modelMenuActive(app)) return .definition_manager_screen;
             }
 
             if (app.terminal.catalogMenuScreenActive()) {
