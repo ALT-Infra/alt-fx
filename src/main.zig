@@ -3919,7 +3919,6 @@ test {
     _ = @import("core/config/settings_store.zig");
     _ = @import("ui/footer/compact_command_menu_presentation.zig");
     _ = @import("ui/footer/settings_menu_presentation.zig");
-    _ = @import("ui/settings_screen.zig");
     _ = @import("builtins/context.zig");
     _ = @import("builtins/gateway.zig");
     _ = @import("core/shared/debug_trace.zig");

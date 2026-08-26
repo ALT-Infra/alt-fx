@@ -1095,10 +1095,8 @@ pub fn Runtime(comptime App: type) type {
                     }
                 },
                 .toggle_permission_mode => {
-                    if (settingsMenuActive(app)) {
-                        return .done;
-                    } else if (helpMenuActive(app)) {
-                        return .done;
+                    if (cycleHelpMenuCategory(app, -1) or cycleSettingsMenuCategory(app, -1)) {
+                        app.shell.render_requests.request(.footer);
                     } else if (try toggleSessionPickerScopeIfActive(app)) {
                         app.shell.render_requests.request(.footer);
                     } else if (cycleModelMenuProvider(app, -1) or cycleSkillsMenuSource(app, -1)) {
@@ -1373,8 +1371,8 @@ pub fn Runtime(comptime App: type) type {
                     if (comptime @hasField(App, "queued_prompt_review")) {
                         queue_rt.markVisibleSelectionDirty(app);
                     }
-                    if (helpMenuActive(app) or settingsMenuActive(app)) {
-                        return;
+                    if (cycleHelpMenuCategory(app, 1) or cycleSettingsMenuCategory(app, 1)) {
+                        app.shell.render_requests.request(.footer);
                     } else if (moveAuthPickerIfActive(app, 1)) {
                         app.shell.render_requests.request(.footer);
                     } else if (try toggleSessionPickerScopeIfActive(app)) {
@@ -2301,7 +2299,13 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn cycleSettingsMenuCategory(app: *App, delta: i32) bool {
-            return app.input_runtime.settings_menu.cycleCategory(delta);
+            if (!app.input_runtime.settings_menu.cycleCategory(delta)) return false;
+            if (comptime @hasField(App, "model_cache")) app.model_cache.closeMenu();
+            return true;
+        }
+
+        fn cycleHelpMenuCategory(app: *App, delta: i32) bool {
+            return app.input_runtime.help_menu.cycleCategory(delta);
         }
 
         fn expireEscClearArm(app: *App, now: i64) void {
@@ -3600,7 +3604,7 @@ test "app_input_runtime slash completion window moves up before reverse scrollin
     try std.testing.expectEqual(@as(usize, 1), app.input_runtime.picker.slash_completion_window_start);
 }
 
-test "app_input_runtime session picker window moves up before reverse scrolling" {
+test "app_input_runtime one-row session picker keeps reverse scrolling sticky" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -3615,14 +3619,14 @@ test "app_input_runtime session picker window moves up before reverse scrolling"
         try Runtime(RoutingFakeApp).routeModifiedHistory(&app, .down, 1);
     }
     try std.testing.expectEqual(@as(usize, 5), picker.selected);
-    try std.testing.expectEqual(@as(usize, 2), picker.window_start);
+    try std.testing.expectEqual(@as(usize, 5), picker.window_start);
 
     try Runtime(RoutingFakeApp).routeModifiedHistory(&app, .up, -1);
     try std.testing.expectEqual(@as(usize, 4), picker.selected);
-    try std.testing.expectEqual(@as(usize, 2), picker.window_start);
+    try std.testing.expectEqual(@as(usize, 4), picker.window_start);
 }
 
-test "app_input_runtime session picker waits for rendered bottom before scrolling" {
+test "app_input_runtime roomy session picker scrolls after twenty inline rows" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -3636,15 +3640,19 @@ test "app_input_runtime session picker waits for rendered bottom before scrollin
     const picker = &app.session_persistence.session_picker;
     picker.active = true;
     picker.load_state = .ready;
-    for (0..10) |index| try appendRoutingSessionPickerSummary(alloc, picker, index);
+    for (0..25) |index| try appendRoutingSessionPickerSummary(alloc, picker, index);
 
     var down: usize = 0;
-    while (down < 7) : (down += 1) {
+    while (down < 20) : (down += 1) {
         try Runtime(RoutingFakeApp).routeModifiedHistory(&app, .down, 1);
     }
 
-    try std.testing.expectEqual(@as(usize, 7), picker.selected);
-    try std.testing.expectEqual(@as(usize, 0), picker.window_start);
+    try std.testing.expectEqual(@as(usize, 20), picker.selected);
+    try std.testing.expectEqual(@as(usize, 1), picker.window_start);
+
+    try Runtime(RoutingFakeApp).routeModifiedHistory(&app, .up, -1);
+    try std.testing.expectEqual(@as(usize, 19), picker.selected);
+    try std.testing.expectEqual(@as(usize, 1), picker.window_start);
 }
 
 test "app_input_runtime help menu navigation skips headings and Enter executes selection" {
@@ -3709,7 +3717,7 @@ test "app_input_runtime Escape closes help and clears its composer search" {
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
 }
 
-test "app_input_runtime session picker uses spare footer row before scrolling" {
+test "app_input_runtime session picker uses the expanded responsive window before scrolling" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -3734,7 +3742,7 @@ test "app_input_runtime session picker uses spare footer row before scrolling" {
     try std.testing.expectEqual(@as(usize, 0), picker.window_start);
 }
 
-test "app_input_runtime session picker navigation keeps fixed catalog rows" {
+test "app_input_runtime session picker navigation keeps the inline window stable" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -4401,6 +4409,52 @@ test "app_input_runtime Tab cycles skills menu sources while streaming" {
     try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
 
     try std.testing.expectEqual(skill_runtime.SkillMenuSourceFilter.fx, app.skills.menu.source_filter);
+}
+
+test "app_input_runtime Tab advances settings categories before autocomplete" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.input_runtime.settings_menu.open();
+    app.input_runtime.settings_menu.selected_index = 2;
+    app.input_runtime.settings_menu.window_start = 1;
+
+    try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
+
+    try std.testing.expectEqual(@import("../config/settings_catalog.zig").Category.interface, app.input_runtime.settings_menu.category);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.settings_menu.selected_index);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.settings_menu.window_start);
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+
+    app.input_runtime.settings_menu.selected_index = 2;
+    app.input_runtime.settings_menu.window_start = 1;
+    try feedRoutingBytes(&app, "\x1b[Z");
+    try std.testing.expectEqual(@import("../config/settings_catalog.zig").Category.all, app.input_runtime.settings_menu.category);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.settings_menu.selected_index);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.settings_menu.window_start);
+}
+
+test "app_input_runtime Tab advances help categories before autocomplete" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.input_runtime.help_menu.open();
+    app.input_runtime.help_menu.selected_index = 2;
+    app.input_runtime.help_menu.window_start = 1;
+
+    try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
+
+    try std.testing.expectEqual(@as(?command_specs.SlashPresentationCategory, .general), app.input_runtime.help_menu.category);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.help_menu.selected_index);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.help_menu.window_start);
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+
+    app.input_runtime.help_menu.selected_index = 2;
+    app.input_runtime.help_menu.window_start = 1;
+    try feedRoutingBytes(&app, "\x1b[Z");
+    try std.testing.expect(app.input_runtime.help_menu.category == null);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.help_menu.selected_index);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.help_menu.window_start);
 }
 
 test "app_input_runtime Tab toggles session picker scope before autocomplete" {

@@ -2232,7 +2232,7 @@ pub fn Runtime(comptime App: type) type {
                     picker.has_more,
                 );
             }
-            input_completion_runtime.CompletionRuntime(App).syncSessionPickerWindowStart(app);
+            try input_completion_runtime.CompletionRuntime(App).syncSessionPickerWindowStart(app);
         }
 
         pub fn loadMoreSessionPicker(app: *App) !bool {

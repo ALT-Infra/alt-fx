@@ -97,17 +97,18 @@ pub const SessionMenuProjection = struct {
 
 pub const HelpMenuProjection = struct {
     active: bool = false,
+    category: ?command_specs.SlashPresentationCategory = null,
     registry: command_specs.SlashRegistry = .{},
     selected_index: usize = 0,
     window_start: usize = 0,
     query: []const u8 = "",
 
     pub fn filteredItemCount(self: HelpMenuProjection) usize {
-        return command_specs.helpCatalogCount(self.registry, self.query);
+        return command_specs.helpCatalogCountForCategory(self.registry, self.category, self.query);
     }
 
     pub fn itemAt(self: HelpMenuProjection, display_index: usize) ?*const command_specs.SlashSpec {
-        return command_specs.helpCatalogSpecAt(self.registry, self.query, display_index);
+        return command_specs.helpCatalogSpecAtForCategory(self.registry, self.category, self.query, display_index);
     }
 };
 
@@ -220,6 +221,7 @@ pub fn helpMenuProjection(
 ) HelpMenuProjection {
     return .{
         .active = menu.active,
+        .category = menu.category,
         .registry = registry,
         .selected_index = menu.selected_index,
         .window_start = menu.window_start,
@@ -313,6 +315,8 @@ pub const RenderContext = struct {
         .include_skip = false,
     },
     skills_menu: SkillsMenuProjection = .{},
+    help_menu: HelpMenuProjection = .{},
+    settings_menu: SettingsMenuProjection = .{},
     model_menu: ModelMenuProjection = .{},
     session_menu: SessionMenuProjection = .{},
     statusline_menu: StatuslineMenuProjection = .{},

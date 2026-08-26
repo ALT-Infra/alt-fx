@@ -14,6 +14,7 @@ const row_text = @import("row_text.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 
 const Allocator = std.mem.Allocator;
+pub const inline_picker_column_gap_width: usize = 4;
 const team_query_prefix = "Vercel team · Search: ";
 const compact_team_query_prefix = "Search: ";
 
@@ -713,10 +714,24 @@ pub fn slashMenuLayout(
 }
 
 pub fn inlinePickerRowBudget(terminal_rows: u16, input_extra: u16, banner_rows: u16) u16 {
+    return inlinePickerRowBudgetCapped(
+        terminal_rows,
+        input_extra,
+        banner_rows,
+        input_presentation.max_model_picker_rows + 2,
+    );
+}
+
+pub fn inlinePickerRowBudgetCapped(
+    terminal_rows: u16,
+    input_extra: u16,
+    banner_rows: u16,
+    max_picker_rows: u16,
+) u16 {
     const fixed_rows: u16 = 5 +| input_extra +| banner_rows;
     const minimum_transcript_rows: u16 = 5;
     const available_picker_rows = (terminal_rows -| fixed_rows) -| minimum_transcript_rows;
-    return @min(input_presentation.max_model_picker_rows + 2, @max(available_picker_rows, 1));
+    return @min(max_picker_rows, @max(available_picker_rows, 1));
 }
 
 pub noinline fn composePickerOptionRow(
@@ -737,7 +752,7 @@ pub noinline fn composePickerOptionRow(
     // pickers keep the filled row.
     const selected_style = switch (kind) {
         .model_stage => ui_render.selected_completion_style,
-        .file, .slash, .skills, .auth => ui_render.approval_button_inactive_style,
+        .file, .slash, .skills, .help, .settings, .sessions, .auth => ui_render.approval_button_inactive_style,
     };
     try row.appendSlice(alloc, if (selected) selected_style else ui_render.dim_style);
 
@@ -807,6 +822,9 @@ pub fn composePickerStatusRow(
             "no matching files",
         .slash => "no matching slash commands",
         .skills => "no matching skills",
+        .help => "no matching commands",
+        .settings => "no matching settings",
+        .sessions => "no matching sessions",
         .auth => "authentication actions unavailable",
     };
 
