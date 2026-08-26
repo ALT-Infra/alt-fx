@@ -1706,7 +1706,12 @@ tmuxTest(
     await typeLiteral(active, "       /he");
     await active.waitForPane((pane) => pane.includes("/he"), READY_TIMEOUT);
     await active.sendKeys("Enter");
-    await active.waitForPane((pane) => pane.includes("Command"), READY_TIMEOUT);
+    await active.waitForPane(
+      (pane) => hasEmptyComposer(pane) && pane.includes("Tab Ente"),
+      READY_TIMEOUT,
+    );
+    await active.resizeWindow(80, 24, 300);
+    await active.waitForText("Commands 37", READY_TIMEOUT);
     expect(gateway?.requests).toHaveLength(0);
     expectCleanStderr();
   },
