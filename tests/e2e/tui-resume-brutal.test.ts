@@ -309,7 +309,7 @@ async function waitForMenu(
   marker: string,
   scope: "Current workspace" | "All workspaces",
 ): Promise<string> {
-  const visibleMarker = marker.slice(0, 8);
+  const visibleMarker = marker.slice(-7);
   return session.waitForPane((pane) => {
     const plain = stripAnsi(pane);
     return plain.includes(visibleMarker) && plain.includes(`[${scope}]`) && menuCount(plain) > 0;
