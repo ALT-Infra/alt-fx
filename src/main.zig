@@ -1976,6 +1976,21 @@ const App = struct {
         return self.executeToolCall(request);
     }
 
+    pub fn releaseAgentTerminalLease(self: *App, session_id: []const u8) !void {
+        return AgentAppRuntime.releaseAgentTerminalLease(
+            self,
+            session_id,
+            &ignored_list_entries,
+            max_list_entries,
+            max_read_file_bytes,
+            max_read_file_lines,
+            max_read_file_line_len,
+            max_command_output_bytes,
+            builtin_gateway.retry_count,
+            builtin_gateway.defaultChatUrl(),
+        );
+    }
+
     pub fn formatToolExecutionErrorForAgent(self: *App, arena: Allocator, tool_name: []const u8, err: anyerror) ![]const u8 {
         _ = self;
         return app_process_runtime.Runtime(App).formatToolExecutionError(arena, tool_name, err);
