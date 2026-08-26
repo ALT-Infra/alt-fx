@@ -3168,6 +3168,167 @@ describe("gateway stream lifecycle", () => {
     }
   }, 30_000);
 
+  test("terminal timeout reaps env-cleared Bash double-fork descendants", async () => {
+    const root = createFixtureRoot("terminal-timeout-reaps-env-bash-descendants");
+    const tracePath = join(root.root, "trace.log");
+    const pidPath = join(root.workspace, "escaped-timeout.pids");
+    const effectPath = join(root.workspace, "post-timeout-effect.txt");
+    const scriptPath = join(root.workspace, "spawn-descendants.sh");
+    const timeoutCallId = "terminal_timeout_reaps_env_bash_1";
+    const trailingMarker = "POST_TIMEOUT_BASH_STATEMENT_MUST_NOT_RUN";
+    const descendantCount = 8;
+    const readEscapedPids = (): number[] => {
+      if (!existsSync(pidPath)) return [];
+      return readFileSync(pidPath, "utf8")
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean)
+        .map(Number);
+    };
+    const python = [
+      "import os,sys,time",
+      "pid_path=sys.argv[1]",
+      `count=${descendantCount}`,
+      "for _ in range(count):",
+      " pid=os.fork()",
+      " if pid == 0:",
+      "  os.setsid()",
+      "  grandchild=os.fork()",
+      "  if grandchild > 0: os._exit(0)",
+      "  with open(pid_path, 'a') as output:",
+      "   output.write(str(os.getpid())+'\\n')",
+      "   output.flush()",
+      "  null=os.open('/dev/null',os.O_RDWR)",
+      "  os.dup2(null,0); os.dup2(null,1); os.dup2(null,2)",
+      "  time.sleep(30)",
+      "  os._exit(0)",
+      "while True: time.sleep(1)",
+    ].join("\n");
+    writeFileSync(
+      scriptPath,
+      `#!/bin/bash
+/usr/bin/python3 - ${JSON.stringify(pidPath)} <<'PY'
+${python}
+PY
+printf '%s\\n' ${JSON.stringify(trailingMarker)}
+printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
+`,
+    );
+    chmodSync(scriptPath, 0o700);
+    const command =
+      `/usr/bin/env -i PATH=/usr/bin:/bin /bin/bash ${JSON.stringify(scriptPath)}`;
+    let step = 0;
+    let escapedPids: number[] = [];
+    let timeoutOutput = "";
+    let aliveAtResult: number[] = [];
+    let effectExistedAtResult = false;
+    let gatewayObservationError: unknown;
+    const gateway = startGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeGatewayToolCall(timeoutCallId, "terminal", {
+            action: "exec",
+            command,
+            timeout_ms: 2_000,
+          });
+        case 1: {
+          try {
+            timeoutOutput = toolResultOutput(body, timeoutCallId);
+            escapedPids = readEscapedPids();
+            aliveAtResult = escapedPids.filter(isProcessAlive);
+            effectExistedAtResult = existsSync(effectPath);
+          } catch (error) {
+            gatewayObservationError = error;
+          }
+          return fakeGatewayFinalText("Combined timeout cleanup complete.");
+        }
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "--no-save", "Run the combined timeout fixture."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 20_000,
+        },
+      );
+      if (result.code !== 0) {
+        const trace = existsSync(tracePath)
+          ? readFileSync(tracePath, "utf8").slice(-4_000)
+          : "(trace missing)";
+        throw new Error(
+          `fx ask exited ${result.code}; signal=${result.signal}; timed_out=${result.timedOut}; kill_sent=${result.killSent}; elapsed_ms=${result.elapsedMs}; pid=${result.pid}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}\nprocess_at_timeout:\n${result.processStateAtTimeout}\nprocess_after_close:\n${result.processStateAfterClose}\ntrace:\n${trace}`,
+        );
+      }
+      const json = parseAskJson(result.stdout);
+
+      expect(json.output).toContain("Combined timeout cleanup complete.");
+      expect(gateway.requestCount()).toBe(2);
+      if (gatewayObservationError) throw gatewayObservationError;
+      expect(timeoutOutput).toContain("timeout=true");
+      expect(timeoutOutput).toContain(
+        "cleanup_scope=process_group_and_tracked_descendants",
+      );
+      expect(timeoutOutput).toContain("cleanup_guarantee=best_effort");
+      expect(escapedPids).toHaveLength(descendantCount);
+      expect(new Set(escapedPids).size).toBe(descendantCount);
+      for (const pid of escapedPids) {
+        expect(Number.isSafeInteger(pid) && pid > 0).toBe(true);
+      }
+      expect(aliveAtResult).toEqual([]);
+      expect(effectExistedAtResult).toBe(false);
+      expect(existsSync(effectPath)).toBe(false);
+      expect(timeoutOutput).not.toContain(trailingMarker);
+      expect(readFileSync(tracePath, "utf8")).toContain(
+        "command termination requested source=timeout",
+      );
+
+      const later = await runFx(["help"], {
+        cwd: root.workspace,
+        env: {
+          HOME: root.home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_E2E_DISABLE_DOTENV: "1",
+        },
+      });
+      expect(later.code).toBe(0);
+      expect(later.stdout).not.toBe("");
+      expect(later.stderr).toBe("");
+    } finally {
+      try {
+        const cleanupPids = [...new Set([...escapedPids, ...readEscapedPids()])]
+          .filter((pid) => Number.isSafeInteger(pid) && pid > 0);
+        for (const pid of cleanupPids) {
+          if (!isProcessAlive(pid)) continue;
+          try {
+            process.kill(pid, "SIGKILL");
+          } catch {}
+        }
+        const cleanupDeadline = Date.now() + 5_000;
+        while (
+          cleanupPids.some(isProcessAlive) &&
+          Date.now() < cleanupDeadline
+        ) {
+          await Bun.sleep(25);
+        }
+        const cleanupSurvivors = cleanupPids.filter(isProcessAlive);
+        if (cleanupSurvivors.length > 0) {
+          throw new Error(
+            `timeout test cleanup left live descendants: ${cleanupSurvivors.join(",")}`,
+          );
+        }
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }
+  }, 30_000);
+
   test("saved terminal replay handle remains readable after resume without re-execution", async () => {
     const root = createFixtureRoot("saved-terminal-replay");
     const firstTracePath = join(root.root, "first-trace.log");
