@@ -612,7 +612,7 @@ fn findConfig(configs: []const McpServerConfig, name: []const u8) ?*const McpSer
     return null;
 }
 
-fn logConfigFailure(action: []const u8, path: []const u8, err: anyerror) void {
+noinline fn logConfigFailure(action: []const u8, path: []const u8, err: anyerror) void {
     debug_trace.logf(
         "mcp",
         "failed to {s} config {s}: {s}",
