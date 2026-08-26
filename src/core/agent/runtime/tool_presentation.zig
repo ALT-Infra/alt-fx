@@ -1056,7 +1056,7 @@ pub fn commandOutcomeDecision(
             },
         .signal => |signal| .{
             .outcome = .failed,
-            .label = try std.fmt.allocPrint(arena, "Terminated by signal {d}", .{signal}),
+            .label = try std.fmt.allocPrint(arena, "Signaled {d}", .{signal}),
         },
         .timed_out => .{ .outcome = .failed, .label = "Timed out" },
         .output_capture_failed => .{
@@ -2244,7 +2244,7 @@ test "command process failures name the typed cause without changing model failu
         .{
             .id = "command_signal",
             .presentation = .{ .signal = 9 },
-            .expected_summary = "Terminated by signal 9 run_command",
+            .expected_summary = "Signaled 9 run_command",
         },
     };
     for (cases) |case| {

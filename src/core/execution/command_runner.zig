@@ -512,7 +512,7 @@ pub fn executeCommandInEnvironment(
     var effective_cfg = cfg;
     if (effective_cfg.timeout_started_ms == null) effective_cfg.timeout_started_ms = io_mod.milliTimestamp();
     try ExecutionControl.init(effective_cfg).check();
-    const invocation = try shell_resolver.capturedInvocation(environment, command);
+    const invocation = try shell_resolver.capturedInvocation(scratch, environment, command);
     debug_trace.logf(
         "core",
         "command runner explicit environment={s} shell={s}",
@@ -1585,6 +1585,89 @@ test "explicit captured profiles execute exact shells without synthetic stderr" 
             zsh_user.output,
         );
     } else |_| {}
+}
+
+test "zsh user profile reports natural SIGTERM after alias-safe startup" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
+        return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try tmp.dir.createDirPath(io_mod.getIo(), "wrapper");
+
+    const home = try io_mod.dirRealpathAlloc(arena, tmp.dir, "home");
+    const workspace = try io_mod.dirRealpathAlloc(arena, tmp.dir, "workspace");
+    const wrapper_dir = try io_mod.dirRealpathAlloc(arena, tmp.dir, "wrapper");
+    const wrapper_path = try std.fs.path.join(arena, &.{ wrapper_dir, "zsh" });
+    const debug_log = try std.fs.path.join(arena, &.{ workspace, "debug.log" });
+    const quoted_home = try shellQuote(arena, home);
+    const quoted_debug_log = try shellQuote(arena, debug_log);
+
+    {
+        var zshrc = try tmp.dir.createFile(
+            io_mod.getIo(),
+            "home/.zshrc",
+            .{ .truncate = true },
+        );
+        defer zshrc.close(io_mod.getIo());
+        try zshrc.writeStreamingAll(
+            io_mod.getIo(),
+            "alias builtin='print -r -- INTERCEPTED'\n" ++
+                "TRAPDEBUG() { print -r -- \"$ZSH_DEBUG_CMD\" >> \"$FX_SIGTERM_DEBUG_LOG\"; }\n",
+        );
+    }
+    {
+        var wrapper = try tmp.dir.createFile(
+            io_mod.getIo(),
+            "wrapper/zsh",
+            .{ .truncate = true },
+        );
+        defer wrapper.close(io_mod.getIo());
+        const source = try std.fmt.allocPrint(
+            arena,
+            "#!/bin/sh\nexport HOME={s}\nexport ZDOTDIR={s}\nexport FX_SIGTERM_DEBUG_LOG={s}\nexec /bin/zsh \"$@\"\n",
+            .{ quoted_home, quoted_home, quoted_debug_log },
+        );
+        try wrapper.writeStreamingAll(io_mod.getIo(), source);
+        try wrapper.setPermissions(
+            io_mod.getIo(),
+            std.Io.File.Permissions.fromMode(0o700),
+        );
+    }
+
+    const config = Config{ .max_command_output_bytes = 4096 };
+    const signaled = try executeCommandInEnvironment(
+        config,
+        arena,
+        "kill -TERM $$",
+        workspace,
+        .{ .user = wrapper_path },
+    );
+    try std.testing.expect(std.mem.startsWith(u8, signaled.output, "signal=15\n"));
+    const foreground = signaled.command_result.?.foreground;
+    try std.testing.expectEqual(@as(?i64, null), foreground.exit_code);
+    try std.testing.expectEqual(@as(?u32, @intFromEnum(std.posix.SIG.TERM)), foreground.signal);
+
+    const debug_output = try readAbsoluteFile(arena, debug_log, 4096);
+    try std.testing.expect(std.mem.find(u8, debug_output, "builtin trap - TERM") != null);
+    try std.testing.expect(std.mem.find(u8, debug_output, "kill -TERM $$") != null);
+
+    const trapped = try executeCommandInEnvironment(
+        config,
+        arena,
+        "trap 'exit 42' TERM; kill -TERM $$",
+        workspace,
+        .{ .user = wrapper_path },
+    );
+    try std.testing.expectEqual(@as(?i64, 42), trapped.command_result.?.foreground.exit_code);
+    try std.testing.expectEqual(@as(?u32, null), trapped.command_result.?.foreground.signal);
 }
 
 fn formatExitOutput(alloc: Allocator, command: []const u8, cwd: []const u8, exit_code: i64, stdout_raw: []const u8, stderr_raw: []const u8, duration_ms: ?u64) !command_contract.RunCommandResult {

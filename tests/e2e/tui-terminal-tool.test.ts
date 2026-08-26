@@ -2073,6 +2073,64 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
+  "TUI terminal exec reports and resumes natural SIGTERM",
+  async () => {
+    const fixture = createFixture("fx-tui-terminal-exec-sigterm-");
+    const command = "kill -TERM $$";
+    const callId = "terminal_exec_sigterm";
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall(callId, "terminal", {
+        action: "exec",
+        timeout_ms: 30_000,
+        command,
+      }),
+      (body) => {
+        const result = JSON.parse(toolResultText(body, callId)) as {
+          error: {
+            type: string;
+            details: { signal?: number; exit_code?: number };
+          };
+        };
+        expect(result.error.type).toBe("tool_execution_failed");
+        expect(result.error.details.signal).toBe(15);
+        expect(result.error.details.exit_code).toBeUndefined();
+        return fakeGatewayFinalText("TUI terminal SIGTERM presentation complete");
+      },
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway);
+
+    await active.sendText("Run the SIGTERM fixture.");
+    const pane = await active.waitForText(
+      "TUI terminal SIGTERM presentation complete",
+      TIMEOUT,
+    );
+    const header = "● 1 tool call · 1 command · 1 failed";
+    expect(pane).toContain(header);
+    expect(pane).toContain(`${header}\n└ Signaled 15 ${command}`);
+    expect(pane).not.toContain(`Ran ${command}`);
+    const requestCount = gateway.requests.length;
+    await active.sendText("/quit");
+    expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+    sessions.splice(sessions.indexOf(active), 1);
+
+    const resumed = await launch(
+      fixture,
+      gateway,
+      {},
+      `${FX_BIN} --resume-last`,
+    );
+    const resumedPane = await resumed.waitForText(`Signaled 15 ${command}`, TIMEOUT);
+    expect(resumedPane).toContain(header);
+    expect(resumedPane).toContain(`${header}\n└ Signaled 15 ${command}`);
+    expect(resumedPane).not.toContain(`Ran ${command}`);
+    expect(gateway.requests).toHaveLength(requestCount);
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
   "TUI terminal failure names the structured session error",
   async () => {
     const fixture = createFixture("fx-tui-terminal-structured-error-");
