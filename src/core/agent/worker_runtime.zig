@@ -1057,12 +1057,9 @@ pub const WorkerRuntime = struct {
             }
             var found = false;
             for (self.queued_prompts.items) |queued| {
-                if (queued.turn_id == replacement.turn_id and
-                    replacement.kind == if (queued.steer_target_turn_id != null) PromptDraftKind.steering else PromptDraftKind.queued)
-                {
-                    found = true;
-                    break;
-                }
+                if (queued.turn_id != replacement.turn_id) continue;
+                found = true;
+                break;
             }
             if (!found) return false;
         }
@@ -3180,6 +3177,33 @@ test "queue review atomically blocks steering consumption and edits by prompt id
     }
     try std.testing.expectEqual(@as(usize, 1), guidance.len);
     try std.testing.expectEqualStrings("after", guidance[0]);
+}
+
+test "queue review commits steering edit after active turn demotes it" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 41;
+
+    try runtime.admitPrompt(alloc, try makePrompt(alloc, "before", "model"), true);
+    try std.testing.expect(runtime.beginQueueReview(.manual));
+
+    const drafts = try runtime.snapshotQueuedPromptDrafts(alloc);
+    defer freeQueuedPromptDrafts(alloc, drafts);
+    try std.testing.expectEqual(@as(usize, 1), drafts.len);
+    try std.testing.expectEqual(PromptDraftKind.steering, drafts[0].kind);
+
+    runtime.finishProcessing();
+    try std.testing.expect(runtime.queued_prompts.items[0].steer_target_turn_id == null);
+
+    const edited_text = try alloc.dupe(u8, "after");
+    alloc.free(drafts[0].prompt);
+    drafts[0].prompt = edited_text;
+    try std.testing.expect(try runtime.replaceQueuedPromptDrafts(alloc, drafts));
+
+    try std.testing.expectEqualStrings("after", runtime.queued_prompts.items[0].prompt);
+    try std.testing.expect(runtime.queued_prompts.items[0].steer_target_turn_id == null);
 }
 
 test "late steering keeps admission order when demoted on finish" {
