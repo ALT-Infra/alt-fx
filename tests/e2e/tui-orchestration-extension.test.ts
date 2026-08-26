@@ -413,6 +413,15 @@ describe.skipIf(SKIP)("tui: orchestration extension host", () => {
           "event=activation_accepted",
         );
 
+        await session.sendLiteral("/al");
+        await session.waitForPane(
+          (pane) =>
+            pane.includes("/alt") &&
+            pane.includes("enter or leave ALT Team orchestration"),
+          5_000,
+        );
+        await session.sendKeys("C-u");
+        await session.waitForComposer(5_000);
         await session.sendText("/alt");
         await session.waitForText("ALT mode enabled.", 5_000);
         await session.waitForComposer(5_000);
@@ -428,7 +437,7 @@ describe.skipIf(SKIP)("tui: orchestration extension host", () => {
           ["/alt", "ALT mode is already enabled."],
           ["/alt off", "ALT mode disabled."],
           ["/alt off", "ALT mode is already disabled."],
-          ["/alt nonsense", "Use /alt or /alt off."],
+          ["/alt nonsense", "/alt [on|off]"],
         ] as const) {
           await session.sendText(command);
           await session.waitForText(expected, 5_000);

@@ -261,6 +261,11 @@ pub fn validateExtension(comptime Extension: type) void {
     if (descriptor.slash_command.len < 2 or descriptor.slash_command[0] != '/') {
         @compileError("orchestration extension command must begin with '/'");
     }
+    for (descriptor.slash_command) |byte| {
+        if (std.ascii.isWhitespace(byte)) {
+            @compileError("orchestration extension command must be one slash-command token");
+        }
+    }
     if (descriptor.summary.len == 0 or descriptor.usage.len == 0) {
         @compileError("orchestration extension copy cannot be empty");
     }

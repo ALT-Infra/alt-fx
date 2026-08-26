@@ -40,6 +40,7 @@ pub const ParsedCommand = union(enum) {
     notifications: []const u8,
     workspace: []const u8,
     version,
+    extension: []const u8,
     unknown,
 };
 
@@ -80,6 +81,7 @@ pub const CommandHandlers = struct {
     handle_notifications: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_workspace: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     show_version: *const fn (ctx: *anyopaque) anyerror!void,
+    handle_extension: *const fn (ctx: *anyopaque, payload: []const u8) anyerror!void,
     unknown: *const fn (ctx: *anyopaque, cmd: []const u8) anyerror!void,
 };
 
@@ -124,6 +126,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .notifications => .{ .notifications = payload },
         .workspace => .{ .workspace = payload },
         .version => .version,
+        .extension => .{ .extension = payload },
     };
 }
 
@@ -177,6 +180,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .notifications => |rest| try handlers.handle_notifications(handlers.ctx, rest),
         .workspace => |rest| try handlers.handle_workspace(handlers.ctx, rest),
         .version => try handlers.show_version(handlers.ctx),
+        .extension => |payload| try handlers.handle_extension(handlers.ctx, payload),
         .unknown => try handlers.unknown(handlers.ctx, cmd),
     }
 }
@@ -494,8 +498,36 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .handle_notifications = unexpectedPayload,
         .handle_workspace = unexpectedPayload,
         .show_version = unexpectedNoPayload,
+        .handle_extension = unexpectedPayload,
         .unknown = unexpectedPayload,
     };
+}
+
+fn extensionTestSlashRegistry() SlashRegistry {
+    const Fixture = struct {
+        const specs = @import("../../builtins/commands.zig").slash_specs ++ [_]command_specs.SlashSpec{.{
+            .kind = .extension,
+            .command = "/fixture",
+            .has_args = true,
+            .accepts_payload = true,
+        }};
+    };
+    return .{ .commands = Fixture.specs[0..] };
+}
+
+test "extension command is parsed and routed by the native router" {
+    switch (parse(extensionTestSlashRegistry(), "/fixture on")) {
+        .extension => |payload| try std.testing.expectEqualStrings("on", payload),
+        else => return error.TestExpectedExtensionCommand,
+    }
+
+    var ctx: TestContext = .{};
+    var handlers = testHandlers(&ctx);
+    handlers.handle_extension = recordUnknown;
+    try route(extensionTestSlashRegistry(), &handlers, "/fixture off");
+
+    try std.testing.expectEqualStrings("unknown", ctx.called);
+    try std.testing.expectEqualStrings("off", ctx.payload);
 }
 
 test "route calls expected no-payload handler" {

@@ -67,6 +67,7 @@ pub const SlashKind = enum {
     notifications,
     workspace,
     version,
+    extension,
 };
 
 pub const OptionDoc = struct {
@@ -1863,6 +1864,7 @@ test "slash specs cover every SlashKind" {
     }
     inline for (std.meta.fields(SlashKind)) |field| {
         const kind: SlashKind = @enumFromInt(field.value);
+        if (kind == .extension) continue;
         try std.testing.expect(seen[@intFromEnum(kind)]);
         _ = slashSpec(registry, kind);
     }
