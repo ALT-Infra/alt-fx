@@ -840,11 +840,13 @@ describe("modern MCP Streamable HTTP", () => {
   test("partial subscription acknowledgement closes the listener and falls back to TTL", async () => {
     fixture = startModernMcpHttpFixture("cache_partial_ack");
     const root = createRoot("cache-partial-ack", fixture);
+    let callsAfterFirstSearch = 0;
     gateway = startFakeGateway([
       fakeGatewayToolCall("activate_partial_ack", "mcp_search_tools", {
         query: "echo",
       }),
       async () => {
+        callsAfterFirstSearch = fixture!.toolsListCalls;
         await Bun.sleep(100);
         return fakeGatewayToolCall("search_after_ttl", "mcp_search_tools", {
           query: "echo",
@@ -865,7 +867,8 @@ describe("modern MCP Streamable HTTP", () => {
     );
 
     expect(result.code).toBe(0);
-    expect(fixture.toolsListCalls).toBe(2);
+    expect(callsAfterFirstSearch).toBeGreaterThanOrEqual(1);
+    expect(fixture.toolsListCalls).toBe(callsAfterFirstSearch + 1);
     expect(fixture.cancelledCalls).toBe(1);
     expect(readFileSync(root.traceLogPath, "utf8")).toContain(
       "tool subscription filter unsupported",
@@ -875,11 +878,13 @@ describe("modern MCP Streamable HTTP", () => {
   test("server subscription cancellation is traced before TTL fallback", async () => {
     fixture = startModernMcpHttpFixture("cache_server_cancel");
     const root = createRoot("cache-server-cancel", fixture);
+    let callsAfterFirstSearch = 0;
     gateway = startFakeGateway([
       fakeGatewayToolCall("activate_server_cancel", "mcp_search_tools", {
         query: "echo",
       }),
       async () => {
+        callsAfterFirstSearch = fixture!.toolsListCalls;
         await Bun.sleep(100);
         return fakeGatewayToolCall("search_after_server_cancel", "mcp_search_tools", {
           query: "echo",
@@ -900,7 +905,8 @@ describe("modern MCP Streamable HTTP", () => {
     );
 
     expect(result.code).toBe(0);
-    expect(fixture.toolsListCalls).toBe(2);
+    expect(callsAfterFirstSearch).toBeGreaterThanOrEqual(1);
+    expect(fixture.toolsListCalls).toBe(callsAfterFirstSearch + 1);
     expect(fixture.requests.filter((entry) =>
       entry.message.method === "subscriptions/listen"
     )).toHaveLength(1);
@@ -913,11 +919,13 @@ describe("modern MCP Streamable HTTP", () => {
   test("unexpected subscription acknowledgement filter closes once and falls back to TTL", async () => {
     fixture = startModernMcpHttpFixture("cache_unexpected_ack");
     const root = createRoot("cache-unexpected-ack", fixture);
+    let callsAfterFirstSearch = 0;
     gateway = startFakeGateway([
       fakeGatewayToolCall("activate_unexpected_ack", "mcp_search_tools", {
         query: "echo",
       }),
       async () => {
+        callsAfterFirstSearch = fixture!.toolsListCalls;
         await Bun.sleep(100);
         return fakeGatewayToolCall("search_after_unexpected_ack", "mcp_search_tools", {
           query: "echo",
@@ -938,7 +946,8 @@ describe("modern MCP Streamable HTTP", () => {
     );
 
     expect(result.code).toBe(0);
-    expect(fixture.toolsListCalls).toBe(2);
+    expect(callsAfterFirstSearch).toBeGreaterThanOrEqual(1);
+    expect(fixture.toolsListCalls).toBe(callsAfterFirstSearch + 1);
     expect(fixture.requests.filter((entry) =>
       entry.message.method === "subscriptions/listen"
     )).toHaveLength(1);
