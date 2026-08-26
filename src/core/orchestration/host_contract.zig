@@ -1,6 +1,7 @@
 const std = @import("std");
+const editor_contract = @import("editor_contract.zig");
 
-pub const api_version: u16 = 9;
+pub const api_version: u16 = 11;
 pub const AgentRunFailureKind = enum {
     interrupted,
     authentication,
@@ -20,7 +21,30 @@ pub const ExtensionDescriptor = struct {
     slash_command: []const u8,
     summary: []const u8,
     usage: []const u8,
+    definition_kind: []const u8,
+    definition_collection: []const u8,
 };
+
+pub const DefinitionMetadata = struct {
+    id: []u8,
+    revision: u32,
+    digest: [64]u8,
+    name: []u8,
+
+    pub fn deinit(self: *DefinitionMetadata, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.name);
+        self.* = undefined;
+    }
+};
+
+pub const CreateOptions = struct {
+    definition_source: []const u8,
+};
+
+pub const DefinitionEditorRow = editor_contract.Row;
+pub const DefinitionEditorProjection = editor_contract.Projection;
+pub const DefinitionEditorOutcome = editor_contract.Outcome;
 
 pub const CatalogScope = enum { provider_native, unified };
 
@@ -241,7 +265,13 @@ pub const Engine = struct {
 
 pub const CreateFn = *const fn (
     allocator: std.mem.Allocator,
+    options: CreateOptions,
 ) anyerror!Engine;
+
+pub const InspectDefinitionFn = *const fn (
+    allocator: std.mem.Allocator,
+    definition_source: []const u8,
+) anyerror!DefinitionMetadata;
 
 pub fn validateExtension(comptime Extension: type) void {
     if (!@hasDecl(Extension, "descriptor")) {
@@ -250,12 +280,17 @@ pub fn validateExtension(comptime Extension: type) void {
     if (!@hasDecl(Extension, "create")) {
         @compileError("orchestration extension must declare create()");
     }
+    if (!@hasDecl(Extension, "inspectDefinition")) {
+        @compileError("orchestration extension must declare inspectDefinition()");
+    }
 
     const descriptor: ExtensionDescriptor = Extension.descriptor();
     if (descriptor.api_version != api_version) {
         @compileError("orchestration extension host API version mismatch");
     }
-    if (descriptor.id.len == 0 or descriptor.display_name.len == 0) {
+    if (descriptor.id.len == 0 or descriptor.display_name.len == 0 or
+        descriptor.definition_kind.len == 0 or descriptor.definition_collection.len == 0)
+    {
         @compileError("orchestration extension identity cannot be empty");
     }
     if (descriptor.slash_command.len < 2 or descriptor.slash_command[0] != '/') {
@@ -271,7 +306,9 @@ pub fn validateExtension(comptime Extension: type) void {
     }
 
     const create_fn: CreateFn = Extension.create;
+    const inspect_fn: InspectDefinitionFn = Extension.inspectDefinition;
     _ = create_fn;
+    _ = inspect_fn;
 }
 
 test "engine forwards host events and borrowed intents through erased boundaries" {

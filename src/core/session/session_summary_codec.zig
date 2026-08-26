@@ -1713,6 +1713,11 @@ pub fn cloneSessionSummary(alloc: Allocator, source: SessionSummary) !SessionSum
     errdefer if (title) |value| alloc.free(value);
     const preview = if (source.preview) |value| try alloc.dupe(u8, value) else null;
     errdefer if (preview) |value| alloc.free(value);
+    const orchestration = if (source.orchestration) |binding|
+        try binding.dupe(alloc)
+    else
+        null;
+    errdefer if (orchestration) |*binding| binding.deinit(alloc);
     return .{
         .id = id,
         .workspace_root = workspace_root,
@@ -1725,6 +1730,8 @@ pub fn cloneSessionSummary(alloc: Allocator, source: SessionSummary) !SessionSum
         .conversation_language = source.conversation_language,
         .history_len = source.history_len,
         .has_managed_children = source.has_managed_children,
+        .orchestration = orchestration,
+        .orchestration_binding_invalid = source.orchestration_binding_invalid,
     };
 }
 

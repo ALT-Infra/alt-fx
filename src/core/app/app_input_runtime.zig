@@ -551,7 +551,7 @@ pub fn Runtime(comptime App: type) type {
                     }
                 },
                 .insert_newline => {
-                    if (commandSkillsMenuActive(app) or modelMenuActive(app) or sessionMenuActive(app)) return;
+                    if (commandSkillsMenuActive(app) or modelMenuActive(app) or sessionMenuActive(app) or orchestrationDefinitionManagerActive(app)) return;
                     dismissActiveMenusThenRedraw(app);
                     switch (try insertComposerSliceBounded(app, "\n", max_input_len, false)) {
                         .inserted => app.shell.render_requests.request(.footer),
@@ -1587,12 +1587,13 @@ pub fn Runtime(comptime App: type) type {
                     try image_commands.Commands(App).attachClipboard(app);
                 },
                 24 => {
-                    if (settingsMenuActive(app) or helpMenuActive(app) or skillsMenuActive(app) or modelMenuActive(app) or sessionMenuActive(app)) return;
+                    if (settingsMenuActive(app) or helpMenuActive(app) or skillsMenuActive(app) or modelMenuActive(app) or sessionMenuActive(app) or orchestrationDefinitionManagerActive(app)) return;
                     if (comptime runtime_profile.allows(App, .subagents)) {
                         try subagent_rt.toggleSubagentView(app);
                     }
                 },
                 '\r' => {
+                    if (try submitOrchestrationDefinitionManager(app)) return;
                     if (try submitSettingsMenuSelection(app)) return;
                     if (try submitHelpMenuSelection(app, max_input_len, max_prompt_history)) return;
                     if (try submitAuthPickerSelection(app)) return;
@@ -1773,6 +1774,7 @@ pub fn Runtime(comptime App: type) type {
             if (helpMenuActive(app)) return true;
             if (modelMenuActive(app)) return true;
             if (sessionMenuActive(app)) return true;
+            if (orchestrationDefinitionManagerActive(app)) return true;
             if (comptime !@hasField(App, "skills")) return false;
             if (!app.skills.menu.active) return false;
             return byte == ' ' or commandSkillsMenuActive(app);
@@ -1824,6 +1826,11 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
+        fn submitOrchestrationDefinitionManager(app: *App) !bool {
+            if (comptime !@hasDecl(App, "submitOrchestrationDefinitionManager")) return false;
+            return app.submitOrchestrationDefinitionManager();
+        }
+
         fn dismissAuthPickerForComposerEdit(app: *App) bool {
             if (comptime !@hasField(App, "auth")) return false;
             if (!app.auth.pickerView().active) return false;
@@ -1857,6 +1864,11 @@ pub fn Runtime(comptime App: type) type {
         fn sessionMenuActive(app: *App) bool {
             if (comptime !@hasField(App, "session_persistence")) return false;
             return app.session_persistence.session_picker.active;
+        }
+
+        fn orchestrationDefinitionManagerActive(app: *App) bool {
+            if (comptime !@hasDecl(App, "orchestrationDefinitionManagerActive")) return false;
+            return app.orchestrationDefinitionManagerActive();
         }
 
         fn helpMenuActive(app: *App) bool {
@@ -2439,6 +2451,7 @@ pub fn Runtime(comptime App: type) type {
             syncSkillsMenu(app);
             syncModelMenu(app);
             syncSessionMenu(app);
+            syncOrchestrationDefinitionManager(app);
         }
 
         fn syncSettingsMenu(app: *App) void {
@@ -2482,6 +2495,11 @@ pub fn Runtime(comptime App: type) type {
             const picker = &app.session_persistence.session_picker;
             if (!picker.active) return;
             picker.setQuery(app.input_runtime.edit_state.input.items);
+        }
+
+        fn syncOrchestrationDefinitionManager(app: *App) void {
+            if (comptime !@hasDecl(App, "syncOrchestrationDefinitionManagerQuery")) return;
+            app.syncOrchestrationDefinitionManagerQuery();
         }
 
         fn skillTokenEnd(items: []const u8, start: usize) usize {
@@ -2631,7 +2649,7 @@ pub fn Runtime(comptime App: type) type {
                     _ = disarmEscapeClear(app);
                     return;
                 }
-                if (cancelCompactCommandMenu(app) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app)) {
+                if (cancelCompactCommandMenu(app) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app) or cancelOrchestrationDefinitionManager(app)) {
                     _ = disarmEscapeClear(app);
                     app.shell.render_requests.request(.footer);
                     return;
@@ -2670,7 +2688,7 @@ pub fn Runtime(comptime App: type) type {
                     return;
                 }
             }
-            if (cancelCompactCommandMenu(app) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app)) {
+            if (cancelCompactCommandMenu(app) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app) or cancelOrchestrationDefinitionManager(app)) {
                 _ = disarmEscapeClear(app);
                 app.shell.render_requests.request(.footer);
                 return;
@@ -2760,6 +2778,11 @@ pub fn Runtime(comptime App: type) type {
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
             return true;
+        }
+
+        fn cancelOrchestrationDefinitionManager(app: *App) bool {
+            if (comptime !@hasDecl(App, "cancelOrchestrationDefinitionManager")) return false;
+            return app.cancelOrchestrationDefinitionManager();
         }
     };
 }

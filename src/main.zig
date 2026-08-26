@@ -18,6 +18,14 @@ const orchestration_run_manager = if (build_options.orchestration_enabled)
     @import("core/orchestration/run_manager.zig")
 else
     struct {};
+const orchestration_definition_app_runtime = if (build_options.orchestration_enabled)
+    @import("core/orchestration/definition_app_runtime.zig")
+else
+    struct {};
+const orchestration_definition_manager = if (build_options.orchestration_enabled)
+    @import("core/orchestration/definition_manager.zig")
+else
+    struct {};
 
 comptime {
     if (build_options.orchestration_enabled) {
@@ -27,6 +35,15 @@ comptime {
 
 const OrchestrationState = if (build_options.orchestration_enabled)
     orchestration_app_runtime.State(orchestration_host)
+else
+    struct {};
+const OrchestrationDefinitionManager = if (build_options.orchestration_enabled)
+    orchestration_definition_manager.State
+else
+    struct {};
+const OrchestrationDefinitionEditor = if (build_options.orchestration_enabled and
+    @hasDecl(orchestration_extension, "DefinitionEditor"))
+    orchestration_extension.DefinitionEditor
 else
     struct {};
 const OrchestrationTraceRecord = if (build_options.orchestration_enabled)
@@ -67,6 +84,7 @@ const prompt_history_runtime = @import("core/app/prompt_history_runtime.zig");
 const app_agent_runtime = @import("core/app/app_agent_runtime.zig");
 const app_runtime_setup = @import("core/app/app_runtime_setup.zig");
 const app_render_runtime = @import("core/app/app_render_runtime.zig");
+const render_input = @import("ui/footer/render_input.zig");
 const app_session_runtime = @import("core/app/app_session_runtime.zig");
 const app_upgrade_runtime = @import("core/app/app_upgrade_runtime.zig");
 const app_worker_runtime = @import("core/app/app_worker_runtime.zig");
@@ -522,6 +540,15 @@ const App = struct {
     const HerdrAppRuntime = builtin_hooks.Runtime(Self);
     const RenderAppRuntime = app_render_runtime.Runtime(Self);
     const SessionAppRuntime = app_session_runtime.Runtime(Self);
+    const OrchestrationDefinitionAppRuntime = if (build_options.orchestration_enabled)
+        orchestration_definition_app_runtime.Runtime(
+            orchestration_host,
+            orchestration_extension,
+            OrchestrationDefinitionEditor,
+            Self,
+        )
+    else
+        struct {};
     const UpgradeAppRuntime = app_upgrade_runtime.Runtime(Self);
     const WorkerAppRuntime = app_worker_runtime.Runtime(Self);
     const WorkspaceAppRuntime = app_workspace_runtime.Runtime(Self);
@@ -650,6 +677,8 @@ const App = struct {
     notifications: builtin_hooks.notifications.State = .{},
     herdr: builtin_hooks.Client = .{},
     orchestration: OrchestrationState = .{},
+    orchestration_definition_manager: OrchestrationDefinitionManager = .{},
+    orchestration_definition_editor: ?OrchestrationDefinitionEditor = null,
 
     session: SessionRuntime = SessionRuntime.initWithProviders(
         max_history_turns,
@@ -992,6 +1021,9 @@ const App = struct {
         self.input_runtime.deinit(self.alloc);
         self.terminal_input_runtime.deinit(self.alloc);
         if (comptime build_options.orchestration_enabled) {
+            if (self.orchestration_definition_editor) |*editor| editor.deinit();
+            self.orchestration_definition_editor = null;
+            self.orchestration_definition_manager.deinit(self.alloc);
             orchestration_app_runtime.deinit(orchestration_host, self.alloc, &self.orchestration);
         }
         self.shell.deinit(self.alloc);
@@ -1162,12 +1194,50 @@ const App = struct {
         if (comptime !build_options.orchestration_enabled) {
             return error.OrchestrationExtensionUnavailable;
         }
-        try orchestration_app_runtime.handlePayload(
-            orchestration_host,
-            orchestration_extension,
-            self,
-            payload,
-        );
+        try OrchestrationDefinitionAppRuntime.handleCommand(self, payload);
+    }
+
+    pub fn orchestrationDefinitionManagerActive(self: *const App) bool {
+        if (comptime !build_options.orchestration_enabled) return false;
+        return self.orchestration_definition_manager.active;
+    }
+
+    pub fn orchestrationDefinitionManagerProjection(
+        self: *App,
+    ) render_input.DefinitionManagerProjection {
+        if (comptime !build_options.orchestration_enabled) return .{};
+        const descriptor = orchestration_extension.descriptor();
+        var projection: render_input.DefinitionManagerProjection = .{
+            .active = self.orchestration_definition_manager.active,
+            .stage = self.orchestration_definition_manager.stage,
+            .state = &self.orchestration_definition_manager,
+            .definition_kind = "Team",
+            .extension_name = descriptor.display_name,
+        };
+        if (self.orchestration_definition_editor) |*editor| {
+            projection.editor = editor.projection();
+        }
+        return projection;
+    }
+
+    pub fn moveOrchestrationDefinitionManager(self: *App, delta: i32) bool {
+        if (comptime !build_options.orchestration_enabled) return false;
+        return OrchestrationDefinitionAppRuntime.moveManager(self, delta);
+    }
+
+    pub fn syncOrchestrationDefinitionManagerQuery(self: *App) void {
+        if (comptime !build_options.orchestration_enabled) return;
+        OrchestrationDefinitionAppRuntime.syncManagerQuery(self);
+    }
+
+    pub fn cancelOrchestrationDefinitionManager(self: *App) bool {
+        if (comptime !build_options.orchestration_enabled) return false;
+        return OrchestrationDefinitionAppRuntime.cancelManager(self);
+    }
+
+    pub fn submitOrchestrationDefinitionManager(self: *App) !bool {
+        if (comptime !build_options.orchestration_enabled) return false;
+        return OrchestrationDefinitionAppRuntime.submitManager(self);
     }
 
     pub fn orchestrationConversationId(self: *App) []const u8 {
@@ -1175,9 +1245,25 @@ const App = struct {
         return SessionAppRuntime.activeSessionId(self) orelse "";
     }
 
-    /// Native fx subagents and extension orchestration are deliberately
-    /// separate execution environments. Keeping this decision on App gives
-    /// every native-subagent admission surface one live source of truth.
+    pub fn restoreOrchestrationForSession(self: *App, session_id: []const u8) !void {
+        if (comptime !build_options.orchestration_enabled) return;
+        try OrchestrationDefinitionAppRuntime.restoreForSession(self, session_id);
+    }
+
+    pub fn startNewOrchestrationSession(
+        self: *App,
+        definition_source: []const u8,
+        persist_revision: bool,
+    ) !void {
+        if (comptime !build_options.orchestration_enabled) {
+            return error.OrchestrationExtensionUnavailable;
+        }
+        try OrchestrationDefinitionAppRuntime.startNewSession(
+            self,
+            definition_source,
+            persist_revision,
+        );
+    }
     pub fn nativeSubagentsAvailable(self: *const App) bool {
         if (comptime !build_options.orchestration_enabled) return true;
         return !self.orchestration.active;
@@ -1189,6 +1275,7 @@ const App = struct {
     pub fn nativeSubagentWorkActive(self: *App) !bool {
         if (comptime !build_options.orchestration_enabled) return false;
         const host_runtime = SessionAppRuntime.subagentHost(self) orelse return false;
+        _ = try host_runtime.reconcileAfterRestart(io_mod.milliTimestamp());
         switch (host_runtime.recoveryState()) {
             .pending, .scheduled, .running, .deferred => return error.NativeSubagentRecoveryUnsettled,
             .complete => {},
@@ -4931,6 +5018,8 @@ test {
     _ = @import("core/session/session_commands.zig");
     _ = @import("core/session/session_json.zig");
     _ = @import("core/session/session_store.zig");
+    _ = @import("core/orchestration/revision_store.zig");
+    _ = @import("core/orchestration/session_binding.zig");
     _ = @import("core/session/prompt_history_store.zig");
     _ = @import("core/app/prompt_history_runtime.zig");
     _ = @import("core/session/web_fetch_artifacts.zig");

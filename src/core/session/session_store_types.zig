@@ -2,6 +2,7 @@ const std = @import("std");
 const session = @import("session.zig");
 const session_codec = @import("session_codec.zig");
 const session_log = @import("session_log.zig");
+const orchestration_binding = @import("../orchestration/session_binding.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -65,6 +66,8 @@ pub const SessionSummary = struct {
     conversation_language: session.ConversationLanguage,
     history_len: usize,
     has_managed_children: bool = false,
+    orchestration: ?orchestration_binding.OwnedBinding = null,
+    orchestration_binding_invalid: bool = false,
 
     /// Frees owned summary strings and poisons the value.
     pub fn deinit(self: *SessionSummary, alloc: Allocator) void {
@@ -73,6 +76,7 @@ pub const SessionSummary = struct {
         if (self.origin_workspace_root) |wr| alloc.free(wr);
         if (self.title) |title| alloc.free(title);
         if (self.preview) |preview| alloc.free(preview);
+        if (self.orchestration) |*binding| binding.deinit(alloc);
         self.* = undefined;
     }
 };

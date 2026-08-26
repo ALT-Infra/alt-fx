@@ -41,6 +41,7 @@ const ui_input = @import("../../ui/input/runtime.zig");
 const input_visual_layout = @import("../../ui/input/visual_layout.zig");
 const registered_entities = @import("../input/registered_entities.zig");
 const approval_screen = @import("../../ui/approval_screen.zig");
+const definition_manager_screen = @import("../../ui/definition_manager_screen.zig");
 const full_transcript_screen = @import("../../ui/full_transcript_screen.zig");
 const session_child_store = @import("../session/session_child_store.zig");
 const render_engine = @import("../../ui/render_engine.zig");
@@ -151,6 +152,7 @@ const SurfaceFrameShell = struct {
 const RenderReconciliation = union(enum) {
     inline_render: InlineRenderReconciliation,
     file_approval_screen,
+    definition_manager_screen,
     frame_result: FrameAttemptResult,
 };
 
@@ -737,6 +739,10 @@ pub fn Runtime(comptime App: type) type {
                     .now_ms = now_ms,
                     .selection_failure = app.session_persistence.session_picker.selection_failure,
                 } else .{},
+                .definition_manager = if (comptime @hasDecl(App, "orchestrationDefinitionManagerProjection"))
+                    app.orchestrationDefinitionManagerProjection()
+                else
+                    .{},
                 .statusline_menu = render_input.statuslineMenuProjection(
                     &app.input_runtime.statusline_menu,
                     settings_snapshot,
@@ -1275,6 +1281,7 @@ pub fn Runtime(comptime App: type) type {
             else
                 .{};
             ctx.session_menu = .{};
+            ctx.definition_manager = .{};
             ctx.statusline_menu.active = false;
             ctx.usage_menu = .{};
             ctx.workspace_menu = .{};
@@ -1694,7 +1701,7 @@ pub fn Runtime(comptime App: type) type {
                     if (!question_active and approval == null and
                         (settingsMenuActive(app) or helpMenuActive(app) or
                             skillsMenuActive(app) or modelMenuActive(app) or
-                            sessionMenuActive(app)))
+                            sessionMenuActive(app) or orchestrationDefinitionManagerActive(app)))
                     {
                         app.shell.render_requests.request(.footer);
                     }
@@ -1704,7 +1711,7 @@ pub fn Runtime(comptime App: type) type {
                 },
             }
 
-            if (!question_active and approval == null and (settingsMenuActive(app) or helpMenuActive(app) or skillsMenuActive(app) or modelMenuActive(app) or sessionMenuActive(app))) {
+            if (!question_active and approval == null and (settingsMenuActive(app) or helpMenuActive(app) or skillsMenuActive(app) or modelMenuActive(app) or sessionMenuActive(app) or orchestrationDefinitionManagerActive(app))) {
                 if (try app_lifecycle.closeFullTranscriptIfActive(
                     app.alloc,
                     &app.terminal,
@@ -1713,6 +1720,7 @@ pub fn Runtime(comptime App: type) type {
                 )) {
                     try requestNormalViewportRecovery(app);
                 }
+                if (orchestrationDefinitionManagerActive(app)) return .definition_manager_screen;
             }
 
             if (app.terminal.catalogMenuScreenActive()) {
@@ -1832,6 +1840,7 @@ pub fn Runtime(comptime App: type) type {
             else switch (try reconcileBeforeFrameRender(app, render_input.queuedBannerRows(footer_ctx))) {
                 .inline_render => |inline_render| inline_render,
                 .file_approval_screen => return renderApprovalScreen(app),
+                .definition_manager_screen => return renderDefinitionManagerScreen(app, footer_ctx),
                 .frame_result => |result| return result,
             };
             const presentation_commits_transcript =
@@ -2518,6 +2527,37 @@ pub fn Runtime(comptime App: type) type {
             };
         }
 
+        fn renderDefinitionManagerScreen(app: *App, ctx: render_input.RenderContext) !FrameAttemptResult {
+            if (comptime !@hasField(App, "terminal") or
+                !@hasDecl(App, "orchestrationDefinitionManagerProjection"))
+            {
+                return error.MissingDefinitionManagerScreenRuntime;
+            }
+            const clear_display = !app.terminal.catalogMenuScreenActive();
+            try app_lifecycle.enterCatalogMenuScreen(&app.terminal, &app.shell, &app.metrics);
+            if (app.shell.shadow_vt) |grid| {
+                if (grid.cols != app.shell.layout.cols or grid.rows != app.shell.layout.rows) {
+                    try grid.resize(app.shell.layout.cols, app.shell.layout.rows);
+                }
+            }
+            var screen = try definition_manager_screen.paint(app.alloc, .{
+                .rows = app.shell.layout.rows,
+                .cols = app.shell.layout.cols,
+                .manager = ctx.definition_manager,
+                .composer = .{
+                    .input = ctx.input.edit_state.input.items,
+                    .cursor = ctx.input.edit_state.cursor,
+                    .images = ctx.pending_images,
+                    .pasted_blocks = ctx.input.entities.pasted_blocks.items,
+                    .image_tokens = ctx.input.entities.image_tokens.items,
+                    .skill_tokens = ctx.input.entities.skill_tokens.items,
+                },
+                .clear_display = clear_display,
+            });
+            defer screen.deinit(app.alloc);
+            try app_lifecycle.writeLifecycleTerminalBytes(&app.shell, &app.metrics, screen.bytes);
+            return .{ .shadow_state = .committed, .animation_visible = false };
+        }
         fn renderSubagentManagerScreen(app: *App) !FrameAttemptResult {
             if (comptime !@hasField(App, "terminal")) return .{
                 .shadow_state = .committed,
@@ -2643,6 +2683,11 @@ pub fn Runtime(comptime App: type) type {
             return false;
         }
 
+        fn orchestrationDefinitionManagerActive(app: *const App) bool {
+            if (comptime !@hasDecl(App, "orchestrationDefinitionManagerActive")) return false;
+            return app.orchestrationDefinitionManagerActive();
+        }
+
         fn helpMenuActive(app: *const App) bool {
             if (comptime @hasField(App, "input_runtime")) return app.input_runtime.help_menu.active;
             return false;
@@ -2654,7 +2699,8 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn catalogMenuActive(app: *const App) bool {
-            return modelMenuActive(app) and !settingsMenuActive(app);
+            return (modelMenuActive(app) and !settingsMenuActive(app)) or
+                orchestrationDefinitionManagerActive(app);
         }
 
         fn activityProjection(app: *const App) activity_runtime.ActivityProjection {

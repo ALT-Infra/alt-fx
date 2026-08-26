@@ -156,6 +156,16 @@ pub fn build(b: *std.Build) void {
                 "canonical steering preserves ordered user input and authorizes instruction attachments",
                 "isolated service is independent of native subagent modules",
                 "orchestration run manager has no native subagent dependency",
+                "revision store preserves immutable history through edit and delete",
+                "revision store rejects gaps replacement and digest mismatch",
+                "orchestration session binding round trips exact immutable identity",
+                "orchestration session binding rejects unknown fields",
+                "orchestration session binding persists beside the real session",
+                "resume menu labels ALT sessions with the pinned Team revision",
+                "session mode lookup distinguishes latest ALT and native conversations",
+                "definition manager requires a real Team and preserves edit intent",
+                "Team library never offers a primary-only preset",
+                "definition manager screen renders native Team library controls",
             },
         });
         const run_orchestration_host_tests = b.addRunArtifact(orchestration_host_tests);

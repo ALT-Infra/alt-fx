@@ -391,7 +391,29 @@ fn composeTitleRow(
     // Selection is signaled by brightness: bold bright white when selected,
     // dim gray otherwise, so the two are clearly distinct. No marker glyph.
     try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else ui_render.dim_style);
-    try row_text.appendSingleLineMiddleEllipsized(alloc, &row, session_catalog.displayTitle(summary), title_budget);
+    if (summary.orchestration) |binding| {
+        const labeled_title = try std.fmt.allocPrint(
+            alloc,
+            "{s} · {s} r{d} · {s}",
+            .{
+                binding.extension_name,
+                binding.display_name,
+                binding.definition_revision,
+                session_catalog.displayTitle(summary),
+            },
+        );
+        defer alloc.free(labeled_title);
+        try row_text.appendSingleLineMiddleEllipsized(alloc, &row, labeled_title, title_budget);
+    } else if (summary.orchestration_binding_invalid) {
+        try row_text.appendSingleLineMiddleEllipsized(
+            alloc,
+            &row,
+            "Orchestration metadata unavailable",
+            title_budget,
+        );
+    } else {
+        try row_text.appendSingleLineMiddleEllipsized(alloc, &row, session_catalog.displayTitle(summary), title_budget);
+    }
     try row.appendSlice(alloc, ui_render.reset_style);
 
     if (show_metadata) {
@@ -584,6 +606,40 @@ test "resume menu renders each session on one line with a right metadata cluster
     try std.testing.expect(std.mem.find(u8, title.items, "resume-catalog · 8m · 24 turns") != null);
     try std.testing.expect(std.mem.find(u8, title.items, "●") == null);
     try std.testing.expect(std.mem.find(u8, title.items, "○") == null);
+}
+
+test "resume menu labels ALT sessions with the pinned Team revision" {
+    const alloc = std.testing.allocator;
+    const summaries = [_]session_store.SessionSummary{.{
+        .id = @constCast("alt-session"),
+        .workspace_root = @constCast("/tmp/project"),
+        .title = @constCast("Implement the parser"),
+        .created_at_ms = 1,
+        .updated_at_ms = 1_000,
+        .conversation_language = .literal("en"),
+        .history_len = 3,
+        .orchestration = .{
+            .extension_id = @constCast("alt"),
+            .extension_name = @constCast("ALT"),
+            .definition_kind = @constCast("team"),
+            .definition_id = @constCast("engineering"),
+            .definition_revision = 7,
+            .definition_digest = [_]u8{'a'} ** 64,
+            .display_name = @constCast("Engineering"),
+        },
+    }};
+    const projection: SessionMenuProjection = .{
+        .active = true,
+        .load_state = .ready,
+        .summaries = &summaries,
+        .now_ms = 2_000,
+    };
+
+    var title = try composeSessionMenuRow(alloc, projection, 2, 120, 4);
+    defer title.deinit(alloc);
+    try std.testing.expect(
+        std.mem.find(u8, title.items, "ALT · Engineering r7 · Implement the parser") != null,
+    );
 }
 
 test "resume menu renders loading empty and failure states" {
