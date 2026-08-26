@@ -655,31 +655,31 @@ describe("gateway stream lifecycle", () => {
     }]);
     expect(findUnavailableCapabilityReferences(installSkillCurrent)).toEqual([]);
 
-    const mcpSearchOld = fixture("neutral", [{
+    const capabilitySearchOld = fixture("neutral", [{
       type: "function",
-      name: "mcp_search_tools",
+      name: "capability_search",
       description: "When NOT to use: memory, skill, or ask-user work.",
       inputSchema: { type: "object", properties: {} },
     }]);
-    expect(findUnavailableCapabilityReferences(mcpSearchOld)).toEqual([
+    expect(findUnavailableCapabilityReferences(capabilitySearchOld)).toEqual([
       {
         capability: "skill",
-        source: "tool:mcp_search_tools",
+        source: "tool:capability_search",
         clause: "memory, skill, or ask-user work",
       },
       {
         capability: "memory",
-        source: "tool:mcp_search_tools",
+        source: "tool:capability_search",
         clause: "memory, skill, or ask-user work",
       },
     ]);
-    const mcpSearchCurrent = fixture("neutral", [{
+    const capabilitySearchCurrent = fixture("neutral", [{
       type: "function",
-      name: "mcp_search_tools",
+      name: "capability_search",
       description: "When NOT to use: the needed capability is already advertised directly.",
       inputSchema: { type: "object", properties: {} },
     }]);
-    expect(findUnavailableCapabilityReferences(mcpSearchCurrent)).toEqual([]);
+    expect(findUnavailableCapabilityReferences(capabilitySearchCurrent)).toEqual([]);
 
     const excludedText = [
       "Use terminal and web_search.",
@@ -731,10 +731,10 @@ describe("gateway stream lifecycle", () => {
       expect(serializedToolNames(oracleRequest)).toEqual(
         AUTO_PERPLEXITY_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES,
       );
-      expect(request.tools).toHaveLength(26);
+      expect(request.tools).toHaveLength(25);
       expect(findUnavailableCapabilityReferences(oracleRequest)).toEqual([]);
       expect(customProviderGuidanceState(oracleRequest)).toEqual({
-          providerToolIndices: [23],
+          providerToolIndices: [22],
         guidanceMessageIndices: [1],
       });
       expect(request.prompt[0]?.role).toBe("system");
@@ -1719,7 +1719,7 @@ describe("gateway stream lifecycle", () => {
             throw new Error(`Expected two advertised ${skillName} locations, got ${JSON.stringify(locations)}`);
           }
           [advertisedA, advertisedB] = locations;
-          return fakeGatewayToolCall(searchCallId, "skill_search", {
+          return fakeGatewayToolCall(searchCallId, "capability_search", {
             query: "managed exact duplicate workflow",
           });
         }
@@ -1768,7 +1768,7 @@ describe("gateway stream lifecycle", () => {
       expect(firstJson.exit_code).toBe(0);
       expect(firstJson.error).toBeUndefined();
       expect(firstJson.tool_calls).toEqual([
-        { name: "skill_search", status: "success" },
+        { name: "capability_search", status: "success" },
         { name: "skill", status: "error" },
         { name: "skill", status: "success" },
       ]);
@@ -1778,17 +1778,17 @@ describe("gateway stream lifecycle", () => {
 
       const initialRequest = gatewayRequest(gateway.requests[0]!.body);
       const skillSchema = initialRequest.tools.find((tool) => tool.name === "skill");
-      const skillSearchSchema = initialRequest.tools.find((tool) =>
-        tool.name === "skill_search"
+      const capabilitySearchSchema = initialRequest.tools.find((tool) =>
+        tool.name === "capability_search"
       );
       expect(skillSchema).toBeDefined();
       expect(skillSchema?.inputSchema.type).toBe("object");
       expect(skillSchema?.inputSchema.properties.name.type).toBe("string");
       expect(skillSchema?.inputSchema.properties.location.type).toBe("string");
       expect(skillSchema?.inputSchema.required).toEqual(["name"]);
-      expect(skillSearchSchema).toBeDefined();
-      expect(skillSearchSchema?.inputSchema.required).toEqual(["query"]);
-      expect((skillSearchSchema?.inputSchema.properties.query as { maxLength?: number }).maxLength).toBe(4096);
+      expect(capabilitySearchSchema).toBeDefined();
+      expect(capabilitySearchSchema?.inputSchema.required).toEqual(["query"]);
+      expect((capabilitySearchSchema?.inputSchema.properties.query as { maxLength?: number }).maxLength).toBe(4096);
 
       const available = taggedBlock(gateway.requests[0]!.body, "available_skills");
       expect(promptText(gateway.requests[0]!.body)).toContain(
@@ -1806,11 +1806,11 @@ describe("gateway stream lifecycle", () => {
       const searchOutputText = toolResultOutput(gateway.requests[1]!.body, searchCallId);
       const searchOutput = JSON.parse(searchOutputText) as {
         skills: Array<{ name: string; description: string; location: string }>;
-        count: number;
-        more_available: boolean;
+        counts: { skills: number; mcp_tools: number };
+        more_available: { skills: boolean; mcp_tools: boolean };
       };
-      expect(searchOutput.count).toBe(2);
-      expect(searchOutput.more_available).toBe(false);
+      expect(searchOutput.counts.skills).toBe(2);
+      expect(searchOutput.more_available.skills).toBe(false);
       expect(searchOutput.skills.map((entry) => entry.location)).toEqual([
         advertisedB,
         advertisedA,
@@ -1845,7 +1845,7 @@ describe("gateway stream lifecycle", () => {
     }
   }, 45_000);
 
-  test("skill search ranks natural intent and keeps durable model-visible JSON exact after redaction", async () => {
+  test("capability search ranks natural skill intent and keeps durable model-visible JSON exact after redaction", async () => {
     const root = createFixtureRoot("skill-search-projection");
     const tracePath = join(root.root, "trace.log");
     const unsafeDirectory = join(
@@ -1884,19 +1884,19 @@ describe("gateway stream lifecycle", () => {
       `---\nname: mail-helper\ndescription: Send email messages. API_KEY=runtime-description-secret\n---\n\n${safeBody}\n`,
     );
 
-    const searchCallId = "projected_skill_search";
+    const searchCallId = "projected_capability_search";
     const loadCallId = "projected_skill_load";
     let projectedSearch: {
       skills: Array<{ name: string; description: string; location: string }>;
-      count: number;
-      more_available: boolean;
+      counts: { skills: number; mcp_tools: number };
+      more_available: { skills: boolean; mcp_tools: boolean };
     } | undefined;
     let responseIndex = 0;
     let gateway: GatewayFixture;
     gateway = startGateway(() => {
       switch (responseIndex++) {
         case 0:
-          return fakeGatewayToolCall(searchCallId, "skill_search", {
+          return fakeGatewayToolCall(searchCallId, "capability_search", {
             query: "send an email",
           });
         case 1: {
@@ -1936,7 +1936,7 @@ describe("gateway stream lifecycle", () => {
       expect(json.exit_code).toBe(0);
       expect(json.error).toBeUndefined();
       expect(json.tool_calls).toEqual([
-        { name: "skill_search", status: "success" },
+        { name: "capability_search", status: "success" },
         { name: "skill", status: "success" },
       ]);
       expect(projectedSearch?.skills[0]).toEqual({
@@ -1944,8 +1944,9 @@ describe("gateway stream lifecycle", () => {
         description: "Send email messages. API_KEY=[redacted]",
         location: safeDirectory,
       });
-      expect(projectedSearch?.count).toBe(8);
-      expect(projectedSearch?.more_available).toBe(true);
+      expect(projectedSearch?.counts.skills).toBe(8);
+      expect(projectedSearch?.counts.mcp_tools).toBe(0);
+      expect(projectedSearch?.more_available.skills).toBe(true);
       expect(projectedSearch?.skills.some((skill) => skill.name === "unsafe-workflow"))
         .toBe(false);
       const projectedText = toolResultOutput(gateway.requests[1]!.body, searchCallId);
@@ -4296,12 +4297,11 @@ describe("gateway stream lifecycle", () => {
     const broadSearchCallId = "mcp_search_broad_1";
     const selectCallId = "mcp_select_lazy_1";
     const responses = [
-      fakeGatewayToolCall(searchCallId, "mcp_search_tools", {
+      fakeGatewayToolCall(searchCallId, "capability_search", {
         query: "fixture input public",
       }),
-      fakeGatewayToolCall(broadSearchCallId, "mcp_search_tools", {
+      fakeGatewayToolCall(broadSearchCallId, "capability_search", {
         query: "fixture",
-        limit: 20,
       }),
       fakeGatewayToolCall(selectCallId, "mcp_select_tool", {
         name: DYNAMIC_MCP_TOOL_NAME,
@@ -4347,7 +4347,7 @@ describe("gateway stream lifecycle", () => {
       expect(existsSync(mcp.readyPath)).toBe(true);
 
       const searchOutput = toolResultOutput(gateway.requests[1]!.body, searchCallId);
-      const searchTools = JSON.stringify(JSON.parse(searchOutput).tools);
+      const searchTools = JSON.stringify(JSON.parse(searchOutput).mcp_tools);
       expect(searchOutput).toContain(DYNAMIC_MCP_TOOL_NAME);
       expect(searchTools).not.toContain("inputSchema");
       expect(searchTools).not.toContain("SECRET_SERVER_INSTRUCTION_SENTINEL");
@@ -4356,8 +4356,8 @@ describe("gateway stream lifecycle", () => {
       const broadSearchOutput = JSON.parse(
         toolResultOutput(gateway.requests[2]!.body, broadSearchCallId),
       );
-      expect(broadSearchOutput.count).toBe(20);
-      expect(broadSearchOutput.more_available).toBe(true);
+      expect(broadSearchOutput.counts.mcp_tools).toBe(8);
+      expect(broadSearchOutput.more_available.mcp_tools).toBe(true);
 
       const selectedRequest = gatewayRequest(gateway.requests[3]!.body);
       const selectedTool = selectedRequest.tools.find((tool) =>

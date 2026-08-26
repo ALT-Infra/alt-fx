@@ -1579,19 +1579,19 @@ describe("MCP remote authentication lifecycle", () => {
         }),
       );
       gateway = startFakeGateway([
-        fakeGatewayToolCall("search_exact", "mcp_search_tools", {
+        fakeGatewayToolCall("search_exact", "capability_search", {
           query: "Please use mcp_linear_echo for this request",
         }),
-        fakeGatewayToolCall("search_noisy", "mcp_search_tools", {
+        fakeGatewayToolCall("search_noisy", "capability_search", {
           query: "linear issue",
         }),
-        fakeGatewayToolCall("search_auth_collision", "mcp_search_tools", {
+        fakeGatewayToolCall("search_auth_collision", "capability_search", {
           query: "slack data",
         }),
-        fakeGatewayToolCall("search_targeted", "mcp_search_tools", {
+        fakeGatewayToolCall("search_targeted", "capability_search", {
           query: "authenticate slack now",
         }),
-        fakeGatewayToolCall("search_healthy", "mcp_search_tools", {
+        fakeGatewayToolCall("search_healthy", "capability_search", {
           query: "linear echo",
         }),
         fakeGatewayFinalText("MCP search isolation observed."),

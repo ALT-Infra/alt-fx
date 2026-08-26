@@ -91,20 +91,9 @@ pub fn call(
     erased: tool_dispatch.ToolInput,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const input = erased.as(Input);
-    var discovery = try builtin_skills.loadVisibleSkillsForTool(
-        ctx.allocator,
-        ctx.workspace_root,
-        ctx.skills_dir,
-    );
-    defer discovery.deinit(ctx.allocator);
-    skill_runtime.traceDiagnostics("skill_search", discovery.diagnostics);
-    try reportDiagnostics(ctx, discovery.diagnostics);
-
-    const model_output = renderProjectedSearch(
-        ctx.allocator,
+    const model_output = search(
+        ctx,
         &input.prepared,
-        discovery.skills,
-        ctx.context_limits.skill_description_bytes,
         @min(ctx.max_tool_result_bytes, result_store.large_result_threshold_bytes),
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -115,6 +104,29 @@ pub fn call(
         ) },
     };
     return .{ .success = model_output };
+}
+
+pub fn search(
+    ctx: tool_dispatch.DispatchContext,
+    query: *const lexical_relevance.PreparedQuery,
+    max_bytes: usize,
+) ![]u8 {
+    var discovery = try builtin_skills.loadVisibleSkillsForTool(
+        ctx.allocator,
+        ctx.workspace_root,
+        ctx.skills_dir,
+    );
+    defer discovery.deinit(ctx.allocator);
+    skill_runtime.traceDiagnostics("skill_search", discovery.diagnostics);
+    try reportDiagnostics(ctx, discovery.diagnostics);
+
+    return renderProjectedSearch(
+        ctx.allocator,
+        query,
+        discovery.skills,
+        ctx.context_limits.skill_description_bytes,
+        max_bytes,
+    );
 }
 
 pub fn readsOnly(_: tool_dispatch.ToolInput) bool {
