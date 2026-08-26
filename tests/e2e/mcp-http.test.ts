@@ -197,6 +197,45 @@ function assertModernWire(
 }
 
 describe("modern MCP Streamable HTTP", () => {
+  test("top-level mcp add persists HTTP and a later ask calls it", async () => {
+    fixture = startModernMcpHttpFixture("json");
+    const root = createEmptyRoot("top-level-add");
+    const added = await runFx(
+      ["mcp", "add", "--transport", "http", "fixture", fixture.url],
+      {
+        cwd: root.workspace,
+        env: {
+          HOME: root.home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+        },
+      },
+    );
+    expect(added.code).toBe(0);
+    expect(added.stdout).toContain("Saved MCP server 'fixture'");
+    expect(fixture.requests).toHaveLength(0);
+
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("top_level_select", "mcp_select_tool", { name: TOOL_NAME }),
+      fakeGatewayToolCall("top_level_call", TOOL_NAME, { text: "hello" }),
+      fakeGatewayFinalText("TOP_LEVEL_HTTP_MCP_READY"),
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Use the HTTP MCP echo tool."],
+      { cwd: root.workspace, env: fixtureEnv(root, gateway), timeoutMs: 20_000 },
+    );
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("TOP_LEVEL_HTTP_MCP_READY");
+    expect(fixture.requests.map((entry) => entry.message.method)).toEqual([
+      "server/discover",
+      "tools/list",
+      "tools/call",
+    ]);
+  }, 25_000);
+
   test.skipIf(!tmuxAvailable())(
     "/mcp add --transport http persists and reloads a remote server",
     async () => {

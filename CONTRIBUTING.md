@@ -170,13 +170,19 @@ They also read Claude-compatible workspace configuration from:
 * `<workspace>/.mcp.json`
 
 Project `.fx.json` does not define runnable MCP commands, URLs, env, or secrets.
-The profile file keeps fx's top-level `mcp` contract. The workspace file reads
-only top-level `mcpServers`, accepts `command` plus `args`, and is opened as a
+The profile file reads top-level `mcp` and accepts `mcpServers` as a
+compatibility alias; `mcp` wins when both exist, and every write uses `mcp`.
+Suspicious server-like unsupported keys produce a bounded warning and block
+profile mutation instead of being overwritten. The workspace file reads only
+top-level `mcpServers`, accepts `command` plus `args`, and is opened as a
 bounded no-follow regular file. Profile entries win native name collisions;
 ACP request entries win ACP name collisions without deduplicating the request
 array. Workspace entries are always optional and never load stored credentials.
 
-Interactive sessions keep pending and rejected workspace servers disconnected.
+Interactive sessions connect pending workspace servers for protocol and
+catalog discovery, then request project trust on the first tool use. Pending
+resource, prompt, completion, and authentication commands require explicit
+`/mcp trust approve <name>` and a retry. Rejected servers remain disconnected.
 Choices live only in profile `settings.json` under the canonical workspace key,
 using `enabledMcpjsonServers`, `disabledMcpjsonServers`, and
 `enableAllProjectMcpServers`. Repository files cannot persist their own
@@ -233,9 +239,16 @@ The interactive surface supports:
 
 * `/mcp path`
 
+The noninteractive profile mutation surface supports:
+
+* `fx mcp add <name> <command> [args...]`
+
+* `fx mcp add --transport http <name> <url>`
+
 The local form saves a stdio command. The HTTP form saves a remote Streamable
-HTTP endpoint. Both update `~/.fx/mcp.json` and evaluate the replacement MCP
-runtime immediately.
+HTTP endpoint. Slash forms evaluate a replacement MCP runtime immediately.
+Top-level forms exit after the locked profile update without constructing the
+TUI or MCP runtime.
 
 Remote authentication supports configured bearer tokens and OAuth credential
 discovery, persistence, refresh, scope challenges, and logout. Credential and

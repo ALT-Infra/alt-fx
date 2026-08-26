@@ -10,6 +10,7 @@ pub const max_external_scope_tail_bytes =
 pub const max_tool_arguments_preview_bytes = diff_mod.max_encoded_label_bytes;
 const max_explanation_bytes: usize = 256;
 const max_subagent_origin_bytes: usize = 128;
+pub const max_project_mcp_server_bytes: usize = 1024;
 pub const FileApprovalIntent = file_mutation_contract.FileApprovalIntent;
 pub const FileApprovalScope = file_mutation_contract.FileApprovalScope;
 
@@ -35,6 +36,8 @@ pub const PermissionRequest = struct {
     /// Renderers must still treat these bytes as untrusted terminal input.
     /// Execution must continue to use the original tool call payload.
     tool_arguments_preview: ?[]const u8 = null,
+    /// Exact workspace server identity for a combined project/tool approval.
+    project_mcp_server: ?[]const u8 = null,
     command: ?[]const u8 = null,
     file: ?FileApprovalRequest = null,
     amendment_allowed: bool = true,
@@ -48,6 +51,8 @@ pub const PermissionRequest = struct {
         if (a.explanation) |explanation| if (!std.mem.eql(u8, explanation, b.explanation.?)) return false;
         if ((a.tool_arguments_preview == null) != (b.tool_arguments_preview == null)) return false;
         if (a.tool_arguments_preview) |preview| if (!std.mem.eql(u8, preview, b.tool_arguments_preview.?)) return false;
+        if ((a.project_mcp_server == null) != (b.project_mcp_server == null)) return false;
+        if (a.project_mcp_server) |server| if (!std.mem.eql(u8, server, b.project_mcp_server.?)) return false;
         if ((a.command == null) != (b.command == null)) return false;
         if (a.command) |command| if (!std.mem.eql(u8, command, b.command.?)) return false;
         if (a.amendment_allowed != b.amendment_allowed) return false;
@@ -175,6 +180,7 @@ pub const RequestCloneError = PreviewCloneError || error{
     ScopeProjectionTooLarge,
     SubagentOriginTooLong,
     ToolArgumentsPreviewTooLong,
+    ProjectMcpServerTooLong,
     RequestIdExhausted,
 };
 
@@ -184,6 +190,7 @@ pub const OwnedPermissionRequest = struct {
     origin: RequestOrigin = .active_session,
     explanation: ?[]u8 = null,
     tool_arguments_preview: ?[]u8 = null,
+    project_mcp_server: ?[]u8 = null,
     command: ?[]u8 = null,
     file: ?FileApprovalRequest = null,
     amendment_allowed: bool = true,
@@ -206,6 +213,11 @@ pub const OwnedPermissionRequest = struct {
         else
             null;
         errdefer if (tool_arguments_preview) |value| alloc.free(value);
+        const project_mcp_server = if (request.project_mcp_server) |value|
+            try alloc.dupe(u8, value)
+        else
+            null;
+        errdefer if (project_mcp_server) |value| alloc.free(value);
         const command = if (request.command) |value| try alloc.dupe(u8, value) else null;
         errdefer if (command) |value| alloc.free(value);
         const file = if (request.file) |file_request|
@@ -219,6 +231,7 @@ pub const OwnedPermissionRequest = struct {
             .origin = origin,
             .explanation = explanation,
             .tool_arguments_preview = tool_arguments_preview,
+            .project_mcp_server = project_mcp_server,
             .command = command,
             .file = file,
             .amendment_allowed = request.amendment_allowed,
@@ -233,6 +246,7 @@ pub const OwnedPermissionRequest = struct {
             .origin = self.origin,
             .explanation = self.explanation,
             .tool_arguments_preview = self.tool_arguments_preview,
+            .project_mcp_server = self.project_mcp_server,
             .command = self.command,
             .file = self.file,
             .amendment_allowed = self.amendment_allowed,
@@ -246,6 +260,7 @@ pub const OwnedPermissionRequest = struct {
         }
         if (self.command) |command| alloc.free(command);
         if (self.tool_arguments_preview) |preview| alloc.free(preview);
+        if (self.project_mcp_server) |server| alloc.free(server);
         if (self.explanation) |explanation| alloc.free(explanation);
         deinitRequestOrigin(alloc, self.origin);
         alloc.free(self.label);
@@ -364,6 +379,10 @@ pub fn fileRequestFootprint(
     );
     footprint = try checkedAddFootprint(
         footprint,
+        try projectMcpServerLen(request),
+    );
+    footprint = try checkedAddFootprint(
+        footprint,
         file_request.preview.path.len,
     );
     footprint = try checkedAddFootprint(
@@ -412,6 +431,14 @@ fn toolArgumentsPreviewLen(request: PermissionRequest) RequestCloneError!usize {
         return error.ToolArgumentsPreviewTooLong;
     }
     return preview.len;
+}
+
+fn projectMcpServerLen(request: PermissionRequest) RequestCloneError!usize {
+    const server = request.project_mcp_server orelse return 0;
+    if (server.len > max_project_mcp_server_bytes) {
+        return error.ProjectMcpServerTooLong;
+    }
+    return server.len;
 }
 
 fn requestOriginLen(origin: RequestOrigin) RequestCloneError!usize {
@@ -522,6 +549,10 @@ fn preflightRequest(request: PermissionRequest) RequestCloneError!void {
     footprint = try checkedAddFootprint(
         footprint,
         try toolArgumentsPreviewLen(request),
+    );
+    footprint = try checkedAddFootprint(
+        footprint,
+        try projectMcpServerLen(request),
     );
     if (footprint > diff_mod.max_request_projection_bytes) {
         return error.RequestProjectionTooLarge;

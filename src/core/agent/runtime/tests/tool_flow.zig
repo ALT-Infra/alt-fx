@@ -1444,6 +1444,134 @@ test "selected dynamic MCP allow returned after cancellation never executes" {
     try std.testing.expectEqual(@as(usize, 0), hooks.rejected_names.items.len);
 }
 
+test "project MCP always blocks same-step siblings until the next model step" {
+    const alloc = std.testing.allocator;
+    const select_calls = [_]ToolCall{
+        toolCall("select", "mcp_select_tool", "{\"name\":\"mcp_fixture_echo\"}"),
+    };
+    const origin_calls = [_]ToolCall{
+        toolCall("approve", "mcp_fixture_echo", "{\"value\":\"first\"}"),
+        toolCall("sibling", "mcp_fixture_echo", "{\"value\":\"second\"}"),
+    };
+    const retry_calls = [_]ToolCall{
+        toolCall("retry", "mcp_fixture_echo", "{\"value\":\"first\"}"),
+    };
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &select_calls },
+        .{ .tool_calls = &origin_calls },
+        .{ .tool_calls = &retry_calls },
+        .{ .content = "done" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.current_mcp_generation = 2;
+    hooks.permission_decisions = &.{ .once, .always, .once };
+    hooks.permission_project_mcp_retries = &.{ null, .{
+        .server_name = "fixture",
+        .runtime_generation = 2,
+    }, null };
+    hooks.exec_plans = &.{
+        .{ .result = .{
+            .model_output = "selected",
+            .selected_dynamic_tool_name = "mcp_fixture_echo",
+            .selected_dynamic_tool_schema_json = "{\"type\":\"function\",\"name\":\"mcp_fixture_echo\",\"description\":\"Echo\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}",
+        } },
+        .{ .result = .{ .model_output = "retried" } },
+    };
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.permission_mode = .ask;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 4), gateway.index);
+    try std.testing.expectEqual(@as(usize, 2), hooks.executed_call_ids.items.len);
+    try std.testing.expectEqualStrings("select", hooks.executed_call_ids.items[0]);
+    try std.testing.expectEqualStrings("retry", hooks.executed_call_ids.items[1]);
+    try std.testing.expectEqual(@as(usize, 3), hooks.permission_call_ids.items.len);
+}
+
+test "child project MCP retry validates live authority before the next model step" {
+    const alloc = std.testing.allocator;
+    const select_calls = [_]ToolCall{
+        toolCall("child-select", "mcp_select_tool", "{\"name\":\"mcp_fixture_echo\"}"),
+    };
+    const origin_calls = [_]ToolCall{
+        toolCall("child-approve", "mcp_fixture_echo", "{\"value\":\"first\"}"),
+        toolCall("child-sibling", "mcp_fixture_echo", "{\"value\":\"second\"}"),
+    };
+    const retry_calls = [_]ToolCall{
+        toolCall("child-retry", "mcp_fixture_echo", "{\"value\":\"first\"}"),
+    };
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &select_calls },
+        .{ .tool_calls = &origin_calls },
+        .{ .tool_calls = &retry_calls },
+        .{ .content = "done" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.current_mcp_generation = 2;
+    hooks.permission_decisions = &.{ .once, .always, .once };
+    hooks.permission_project_mcp_retries = &.{ null, .{
+        .server_name = "fixture",
+        .runtime_generation = 2,
+    }, null };
+    hooks.exec_plans = &.{
+        .{ .result = .{
+            .model_output = "selected",
+            .selected_dynamic_tool_name = "mcp_fixture_echo",
+            .selected_dynamic_tool_schema_json = "{\"type\":\"function\",\"name\":\"mcp_fixture_echo\",\"description\":\"Echo\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}",
+        } },
+        .{ .result = .{ .model_output = "retried" } },
+    };
+    const Provider = struct {
+        const tools = [_][]const u8{ "mcp_select_tool", "mcp_fixture_echo" };
+        const integrations = [_][]const u8{"mcp_fixture_echo"};
+
+        fn resolve(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: ToolCall,
+            _: []const u8,
+            _: []const u8,
+            _: tool_dispatch.PermissionTargetKind,
+        ) !runtime_deps.ResolvedLiveToolAuthority {
+            return .{
+                .authority = .{
+                    .generation = 9,
+                    .root_id = "root",
+                    .tools = &tools,
+                    .integrations = &integrations,
+                    .rules = .{},
+                    .grants = &.{},
+                    .permission_mode = .ask,
+                },
+                .decision = .allow,
+            };
+        }
+    };
+    var provider_marker: u8 = 0;
+    hooks.live_tool_authority = .{
+        .context = &provider_marker,
+        .resolve_fn = Provider.resolve,
+    };
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.permission_mode = .ask;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 4), gateway.index);
+    try std.testing.expectEqual(@as(usize, 2), hooks.executed_call_ids.items.len);
+    try std.testing.expectEqualStrings("child-select", hooks.executed_call_ids.items[0]);
+    try std.testing.expectEqualStrings("child-retry", hooks.executed_call_ids.items[1]);
+}
+
 test "resumed persistent child review rejects child-authored authority provenance" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"README.md\"}")};

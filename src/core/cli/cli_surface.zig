@@ -43,7 +43,9 @@ else
 const context_contract = @import("../workspace/context_contract.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
+const mcp_command_provider = @import("../mcp/command_provider.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
@@ -65,6 +67,7 @@ pub const Command = union(enum) {
     setup: []const [:0]const u8,
     status: []const [:0]const u8,
     permissions: []const [:0]const u8,
+    mcp: []const [:0]const u8,
     models: []const [:0]const u8,
     provider: []const [:0]const u8,
     doctor: []const [:0]const u8,
@@ -196,6 +199,8 @@ pub const Config = struct {
     tool_set: tool_set_contract.ToolSet,
     inspect_mcp_profile_config: mcp_contract.InspectProfileConfigFn,
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
+    add_mcp_profile_server: mcp_command_provider.AddProfileServerFn =
+        mcp_command_provider.addProfileServerUnavailable,
     acp_runner: acp_runner.Runner,
 };
 
@@ -472,6 +477,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
             if (command_specs.matchesTopLevel(command_catalog, command, .logout)) return .{ .logout = args[1..] };
         },
         'm' => {
+            if (command_specs.matchesTopLevel(command_catalog, command, .mcp)) return .{ .mcp = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .models)) return .{ .models = args[1..] };
         },
         'p' => {
@@ -819,7 +825,10 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
         return .handled_failure;
     };
     switch (parsed_launch) {
-        .interactive => |launch| return .{ .interactive = launch },
+        .interactive => |launch| {
+            try writeMcpProfileWarningIfPresent(alloc, cfg, deps);
+            return .{ .interactive = launch };
+        },
         .noninteractive => |value| {
             var noninteractive = value;
             defer noninteractive.deinit(alloc);
@@ -869,6 +878,7 @@ fn runNonInteractiveWithDeps(
             return .handled_success;
         },
         .ask => |rest| {
+            try writeMcpProfileWarningIfPresent(alloc, cfg, deps);
             const exit_code = try cli_ask.run(alloc, rest, workflowConfigWithLaunchModifiers(cfg, global_args.modifiers), cfg.context_registry, cfg.tool_set);
             return if (exit_code == 0) .handled_success else .handled_failure;
         },
@@ -1127,6 +1137,50 @@ fn runNonInteractiveWithDeps(
             }).render(alloc, opts.format);
             defer alloc.free(text);
             try writeFormattedOutput(deps, text, opts.format);
+            return .handled_success;
+        },
+        .mcp => |rest| {
+            if (rest.len == 0 or !std.mem.eql(u8, rest[0], "add")) {
+                try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
+                return .handled_failure;
+            }
+            var tokens: std.ArrayList([]const u8) = .empty;
+            defer tokens.deinit(alloc);
+            try tokens.ensureTotalCapacity(alloc, rest.len - 1);
+            for (rest[1..]) |token| tokens.appendAssumeCapacity(token);
+            const intent = mcp_command_provider.parseAddIntent(tokens.items) catch |err| {
+                if (err == error.McpAddUsage) {
+                    try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
+                } else {
+                    try writeMcpAddFailure(alloc, deps, err);
+                }
+                return .handled_failure;
+            };
+            var result = cfg.add_mcp_profile_server(alloc, intent) catch |err| {
+                try writeMcpAddFailure(alloc, deps, err);
+                return .handled_failure;
+            };
+            defer result.deinit(alloc);
+            if (result.warning) |warning| {
+                try writeMcpProfileWarning(alloc, deps, warning);
+            }
+            const name = switch (intent) {
+                .local => |local| local.name,
+                .http => |http| http.name,
+            };
+            var encoded_path = try text_utils.encodeTerminalSafe(
+                alloc,
+                result.profile_path,
+                512,
+            );
+            defer encoded_path.deinit(alloc);
+            var out: std.Io.Writer.Allocating = .init(alloc);
+            defer out.deinit();
+            try out.writer.print(
+                "Saved MCP server '{s}' to {s}.\n",
+                .{ name, encoded_path.bytes },
+            );
+            try writeStdout(deps, out.written());
             return .handled_success;
         },
         .models => |rest| {
@@ -2011,8 +2065,12 @@ fn statusSnapshotFromStartupWithBuild(
         .build_channel = build.channel.label(),
         .build_revision = build.revision,
         .mcp_config_error = switch (mcp_config_diagnostic) {
-            .clear => null,
+            .clear, .warning => null,
             .failed => |err| @errorName(err),
+        },
+        .mcp_config_warning = switch (mcp_config_diagnostic) {
+            .warning => |warning| warning,
+            .clear, .failed => null,
         },
     };
 }
@@ -2076,6 +2134,49 @@ fn writeTopLevelUsage(command_catalog: CommandCatalog, deps: RunDeps, kind: TopL
     try writeStderr(deps, "usage: fx ");
     try writeStderr(deps, command_specs.topLevelUsage(command_catalog, kind));
     try writeStderr(deps, "\n");
+}
+
+fn writeMcpAddFailure(alloc: Allocator, deps: RunDeps, err: anyerror) !void {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.print("fx mcp add failed: {s}.\n", .{@errorName(err)});
+    try writeStderr(deps, out.written());
+}
+
+fn writeMcpProfileWarningIfPresent(
+    alloc: Allocator,
+    cfg: Config,
+    deps: RunDeps,
+) !void {
+    const diagnostic = try cfg.inspect_mcp_profile_config(alloc);
+    const warning = switch (diagnostic) {
+        .warning => |value| value,
+        .clear, .failed => return,
+    };
+    try writeMcpProfileWarning(alloc, deps, warning);
+}
+
+fn writeMcpProfileWarning(
+    alloc: Allocator,
+    deps: RunDeps,
+    warning: mcp_contract.ProfileConfigWarning,
+) !void {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.print(
+        "fx: ~/.fx/mcp.json warning: {s}",
+        .{@tagName(warning.cause)},
+    );
+    if (warning.key()) |key| {
+        var encoded = try text_utils.encodeTerminalSafe(alloc, key, 128);
+        defer encoded.deinit(alloc);
+        try out.writer.print(" key={s}", .{encoded.bytes});
+    }
+    try out.writer.print(
+        " additional_matches={d}\n",
+        .{warning.additional_matches},
+    );
+    try writeStderr(deps, out.written());
 }
 
 fn writeUsageOrJsonError(
@@ -3477,6 +3578,10 @@ test "parse recognizes every top-level command and preserves unknown commands" {
         .models => |rest| try std.testing.expectEqual(@as(usize, 1), rest.len),
         else => return error.TestExpectedEqual,
     }
+    switch (parse(command_catalog, &.{ @constCast("mcp"), @constCast("add"), @constCast("fixture"), @constCast("node") })) {
+        .mcp => |rest| try std.testing.expectEqual(@as(usize, 3), rest.len),
+        else => return error.TestExpectedEqual,
+    }
     switch (parse(command_catalog, &.{@constCast("doctor")})) {
         .doctor => |rest| try std.testing.expectEqual(@as(usize, 0), rest.len),
         else => return error.TestExpectedEqual,
@@ -4138,6 +4243,37 @@ test "runIfRequested help writes top-level help" {
     try std.testing.expectEqual(RunResult.handled_success, result);
     try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "𝒇x v0.0.0\nFast, native coding agent for the terminal."));
     try std.testing.expect(std.mem.find(u8, capture.stdout.written(), testConfig().version) != null);
+    try std.testing.expectEqualStrings("", capture.stderr.written());
+}
+
+test "top-level MCP add mutates through the focused provider without startup" {
+    const alloc = std.testing.allocator;
+    var capture = CaptureOutput.init(alloc);
+    defer capture.deinit();
+    var cfg = testConfig();
+    cfg.add_mcp_profile_server = captureMcpProfileAddForTest;
+    mcp_profile_add_calls_for_test = 0;
+    var deps = capture.deps();
+    deps.load_startup_state = failingStartupState;
+
+    const result = try runIfRequestedWithDeps(
+        alloc,
+        &.{
+            @constCast("mcp"),
+            @constCast("add"),
+            @constCast("fixture"),
+            @constCast("node"),
+            @constCast("server.js"),
+        },
+        cfg,
+        deps,
+    );
+    try std.testing.expectEqual(RunResult.handled_success, result);
+    try std.testing.expectEqual(@as(usize, 1), mcp_profile_add_calls_for_test);
+    try std.testing.expectEqualStrings(
+        "Saved MCP server 'fixture' to /tmp/test-home/.fx/mcp.json.\n",
+        capture.stdout.written(),
+    );
     try std.testing.expectEqualStrings("", capture.stderr.written());
 }
 
@@ -5188,6 +5324,25 @@ fn clearMcpConfigInspectionForTest(
 
 var mcp_config_inspection_calls_for_test: usize = 0;
 var mcp_runtime_load_calls_for_test: usize = 0;
+var mcp_profile_add_calls_for_test: usize = 0;
+
+fn captureMcpProfileAddForTest(
+    alloc: Allocator,
+    intent: mcp_command_provider.AddIntent,
+) anyerror!mcp_command_provider.ProfileAddResult {
+    mcp_profile_add_calls_for_test += 1;
+    switch (intent) {
+        .local => |local| {
+            try std.testing.expectEqualStrings("fixture", local.name);
+            try std.testing.expectEqualStrings("node", local.command);
+            try std.testing.expectEqualSlices([]const u8, &.{"server.js"}, local.args);
+        },
+        .http => return error.TestUnexpectedResult,
+    }
+    return .{
+        .profile_path = try alloc.dupe(u8, "/tmp/test-home/.fx/mcp.json"),
+    };
+}
 
 fn failingMcpConfigInspectionForTest(
     _: Allocator,

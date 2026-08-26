@@ -1894,21 +1894,21 @@ describe("MCP remote authentication lifecycle", () => {
         stderrPath: root.stderr,
       });
       await tui.waitForComposer(15_000);
-      await tui.waitForText("Project MCP server 'fixture' is defined in .mcp.json", 10_000);
-      await tui.sendKeys("Escape");
-      await tui.waitForText("Project MCP approval prompts dismissed for this process", 10_000);
 
       await tui.sendText("/mcp auth fixture --open");
       await tui.waitForText("McpWorkspaceApprovalRequired", 10_000);
       expect(existsSync(root.openLog)).toBe(false);
       expect(auth.authorizationRequests).toBe(0);
       expect(existsSync(credentialPath)).toBe(true);
+      await Bun.sleep(250);
+      const requestsBeforeLogout = auth.requests.length;
 
       await tui.sendText("/mcp logout fixture");
       await tui.waitForText("Logged out of MCP server 'fixture'", 10_000);
+      await Bun.sleep(250);
       expect(existsSync(credentialPath)).toBe(false);
       expect(auth.revocations).toBe(0);
-      expect(auth.requests).toHaveLength(0);
+      expect(auth.requests).toHaveLength(requestsBeforeLogout);
     },
     35_000,
   );

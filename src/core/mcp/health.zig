@@ -1,7 +1,9 @@
 const std = @import("std");
 const mcp_contract = @import("mcp_contract.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
+const max_pending_summary_names: usize = 4;
 
 pub const ConnectionState = enum {
     disconnected,
@@ -212,7 +214,17 @@ pub fn renderSummary(alloc: Allocator, snapshot: Snapshot) ![]u8 {
     var auth_required: usize = 0;
     var failed: usize = 0;
     var first_auth_server: ?[]const u8 = null;
+    var pending_names: [max_pending_summary_names][]const u8 = undefined;
+    var pending_count: usize = 0;
     for (snapshot.servers) |server| {
+        if (server.source == .workspace and
+            server.workspace_admission == .pending)
+        {
+            if (pending_count < pending_names.len) {
+                pending_names[pending_count] = server.configured_name;
+            }
+            pending_count += 1;
+        }
         if (server.authentication == .required) {
             auth_required += 1;
             if (first_auth_server == null) first_auth_server = server.configured_name;
@@ -241,6 +253,20 @@ pub fn renderSummary(alloc: Allocator, snapshot: Snapshot) ![]u8 {
     );
     if (first_auth_server) |name| {
         try out.writer.print(" Run /mcp auth {s} --open.", .{name});
+    }
+    if (pending_count > 0) {
+        try out.writer.writeAll(" Pending approval: ");
+        const rendered_count = @min(pending_count, pending_names.len);
+        for (pending_names[0..rendered_count], 0..) |name, index| {
+            if (index > 0) try out.writer.writeAll(", ");
+            var encoded = try text_utils.encodeTerminalSafe(alloc, name, 128);
+            defer encoded.deinit(alloc);
+            try out.writer.writeAll(encoded.bytes);
+        }
+        if (pending_count > rendered_count) {
+            try out.writer.print(", +{d} more", .{pending_count - rendered_count});
+        }
+        try out.writer.writeByte('.');
     }
     try out.writer.writeAll(" Use /mcp list for details.");
     return out.toOwnedSlice();
@@ -374,6 +400,39 @@ test "compact health summary reports actionable aggregate state" {
         "MCP: 4 servers — 1 ready, 1 connecting, 1 needs auth, 1 failed. Run /mcp auth plain --open. Use /mcp list for details.",
         summary,
     );
+}
+
+test "compact health summary names pending workspace servers" {
+    const alloc = std.testing.allocator;
+    var servers = [_]ServerSnapshot{
+        emptyServerSnapshot(),
+        emptyServerSnapshot(),
+        emptyServerSnapshot(),
+    };
+    servers[0].configured_name = @constCast("docs");
+    servers[0].source = .workspace;
+    servers[0].scope = .workspace;
+    servers[0].workspace_admission = .pending;
+    servers[1].configured_name = @constCast("db");
+    servers[1].source = .workspace;
+    servers[1].scope = .workspace;
+    servers[1].workspace_admission = .pending;
+    servers[2].configured_name = @constCast("approved");
+    servers[2].source = .workspace;
+    servers[2].scope = .workspace;
+    servers[2].workspace_admission = .approved;
+
+    const summary = try renderSummary(alloc, .{
+        .captured_at_ms = 0,
+        .servers = &servers,
+    });
+    defer alloc.free(summary);
+    try std.testing.expect(std.mem.find(
+        u8,
+        summary,
+        "Pending approval: docs, db.",
+    ) != null);
+    try std.testing.expect(std.mem.find(u8, summary, "Pending approval: approved") == null);
 }
 
 fn emptyServerSnapshot() ServerSnapshot {

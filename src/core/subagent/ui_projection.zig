@@ -57,6 +57,7 @@ pub const Approval = struct {
     status: communication.ApprovalStatus,
     label: []u8,
     explanation: ?[]u8,
+    project_mcp_server: ?[]u8 = null,
     command: ?[]u8 = null,
     file: ?permission_request.FileApprovalRequest = null,
 
@@ -64,6 +65,7 @@ pub const Approval = struct {
         alloc.free(self.id);
         alloc.free(self.label);
         if (self.explanation) |value| alloc.free(value);
+        if (self.project_mcp_server) |value| alloc.free(value);
         if (self.command) |value| alloc.free(value);
         if (self.file) |value| {
             permission_request.deinitFileApprovalRequest(alloc, value);
@@ -1496,6 +1498,11 @@ fn projectApproval(alloc: Allocator, approval: communication.Approval) !Approval
     else
         null;
     errdefer if (explanation) |value| alloc.free(value);
+    const project_mcp_server = if (approval.project_mcp_server) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    errdefer if (project_mcp_server) |value| alloc.free(value);
     const command = if (approval.command) |value|
         try alloc.dupe(u8, value)
     else
@@ -1514,6 +1521,7 @@ fn projectApproval(alloc: Allocator, approval: communication.Approval) !Approval
         .status = approval.status,
         .label = label,
         .explanation = explanation,
+        .project_mcp_server = project_mcp_server,
         .command = command,
         .file = file,
     };

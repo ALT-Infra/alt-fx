@@ -2378,6 +2378,14 @@ fn respondToLegacyUrlRequired(
     };
 }
 
+fn requireWorkspaceOperationApproval(server: *const McpServer) !void {
+    if (server.config.source == .workspace and
+        server.config.workspace_admission != .approved)
+    {
+        return error.McpWorkspaceApprovalRequired;
+    }
+}
+
 fn completeFeatureArgument(
     self: *McpRuntime,
     alloc: Allocator,
@@ -2397,6 +2405,7 @@ fn completeFeatureArgument(
     defer operation_access.deinit();
     try operation_access.authorize(.{ .feature_server = server_name });
     const server = self.findServer(server_name) orelse return error.McpServerNotFound;
+    try requireWorkspaceOperationApproval(server);
     if (!server.capabilities.completion) return error.McpCompletionUnsupported;
     switch (reference) {
         .prompt => if (!server.capabilities.prompts) return error.McpPromptsUnsupported,
@@ -3832,6 +3841,7 @@ pub const McpRuntime = struct {
     discovery_thread: ?std.Thread = null,
     deferred_discovery_state: std.atomic.Value(DiscoveryState) = .init(.idle),
     deferred_discovery_complete: std.Io.Event = .unset,
+    interactive_project_trust: std.atomic.Value(bool) = .init(false),
 
     pub fn init(alloc: Allocator) McpRuntime {
         return .{ .alloc = alloc, .generation = allocateRuntimeGeneration() };
@@ -4935,19 +4945,6 @@ pub const McpRuntime = struct {
         return names.toOwnedSlice(alloc);
     }
 
-    pub fn firstPendingWorkspaceName(
-        self: *const McpRuntime,
-        alloc: Allocator,
-    ) !?[]u8 {
-        for (self.servers.items) |server| {
-            if (!server.config.enabled or
-                server.config.source != .workspace or
-                server.config.workspace_admission != .pending) continue;
-            return @as(?[]u8, try alloc.dupe(u8, server.config.name));
-        }
-        return null;
-    }
-
     pub fn waitForDiscovery(
         self: *McpRuntime,
         cancel_flag: ?*std.atomic.Value(bool),
@@ -5309,6 +5306,7 @@ pub const McpRuntime = struct {
         phase: startup_admission.Phase,
     ) void {
         self.tool_registry = tool_registry;
+        self.interactive_project_trust.store(phase == .all, .release);
         var used_tool_names = std.StringHashMap(void).init(self.alloc);
         defer used_tool_names.deinit();
 
@@ -5536,6 +5534,7 @@ pub const McpRuntime = struct {
         removed: bool = false,
         revocation_failed: bool = false,
         repaired_entries: usize = 0,
+        local_only: bool = false,
     };
 
     const DetachedLogoutAuth = struct {
@@ -5622,6 +5621,7 @@ pub const McpRuntime = struct {
             return .{
                 .removed = deleted.removed > 0,
                 .repaired_entries = deleted.repaired_entries,
+                .local_only = true,
             };
         }
         server.auth_lock.lockUncancelable(io_mod.getIo());
@@ -5806,6 +5806,34 @@ pub const McpRuntime = struct {
 
     pub fn hasTool(self: *McpRuntime, name: []const u8) bool {
         return self.hasToolWithAccess(name, .unrestricted);
+    }
+
+    pub fn projectAdmissionForTool(
+        self: *McpRuntime,
+        alloc: Allocator,
+        name: []const u8,
+        access: tool_mcp_runtime.Access,
+    ) !?tool_mcp_runtime.ProjectToolAdmission {
+        if (self.isDiscovering()) return null;
+        var operation_access = try OperationAccessGuard.init(
+            self.alloc,
+            access,
+            self.generation,
+        );
+        defer operation_access.deinit();
+        try operation_access.authorize(.{ .tool = name });
+        self.catalog_mutex.lockSharedUncancelable(io_mod.getIo());
+        defer self.catalog_mutex.unlockShared(io_mod.getIo());
+        const match = self.lookupCallableTool(name) orelse return null;
+        if (match.server.config.source != .workspace) return null;
+        const admission = match.server.config.workspace_admission orelse
+            return error.McpConfigAdmissionMismatch;
+        return .{
+            .server_name = try alloc.dupe(u8, match.server.config.name),
+            .admission = admission,
+            .interactive_trust = self.interactive_project_trust.load(.acquire),
+            .runtime_generation = self.generation,
+        };
     }
 
     pub fn hasToolWithAccess(
@@ -7070,6 +7098,7 @@ pub const McpRuntime = struct {
         defer operation_access.deinit();
         try operation_access.authorize(.{ .feature_server = server_name });
         const server = self.findServer(server_name) orelse return error.McpServerNotFound;
+        try requireWorkspaceOperationApproval(server);
         if (!server.capabilities.resources) return error.McpResourcesUnsupported;
         const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
             .clock = .awake,
@@ -7144,6 +7173,7 @@ pub const McpRuntime = struct {
         defer operation_access.deinit();
         try operation_access.authorize(.{ .feature_server = server_name });
         const server = self.findServer(server_name) orelse return error.McpServerNotFound;
+        try requireWorkspaceOperationApproval(server);
         if (!server.capabilities.prompts) return error.McpPromptsUnsupported;
         const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
             .clock = .awake,
@@ -7192,6 +7222,7 @@ pub const McpRuntime = struct {
         defer operation_access.deinit();
         try operation_access.authorize(.{ .feature_server = server_name });
         const server = self.findServer(server_name) orelse return error.McpServerNotFound;
+        try requireWorkspaceOperationApproval(server);
         if (!server.capabilities.resources) return error.McpResourcesUnsupported;
         const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
             .clock = .awake,
@@ -7308,6 +7339,7 @@ pub const McpRuntime = struct {
         defer operation_access.deinit();
         try operation_access.authorize(.{ .feature_server = server_name });
         const server = self.findServer(server_name) orelse return error.McpServerNotFound;
+        try requireWorkspaceOperationApproval(server);
         if (!server.capabilities.prompts) return error.McpPromptsUnsupported;
         const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
             .clock = .awake,
@@ -18769,7 +18801,7 @@ test "runtime rejects source and workspace admission mismatches before installat
     var missing: McpServerConfig = .{
         .name = try alloc.dupe(u8, "missing"),
         .source = .workspace,
-        .scope = .profile,
+        .scope = .workspace,
         .command = try alloc.dupe(u8, "cmd"),
     };
     try std.testing.expectError(error.McpConfigAdmissionMismatch, runtime.addServer(missing));
@@ -18796,7 +18828,7 @@ test "interactive authentication requires approved workspace admission" {
         try runtime.addServer(.{
             .name = try alloc.dupe(u8, name),
             .source = .workspace,
-            .scope = .profile,
+            .scope = .workspace,
             .transport = .http,
             .url = try alloc.dupe(u8, "https://example.test/mcp"),
             .workspace_admission = admission,
@@ -18812,6 +18844,25 @@ test "interactive authentication requires approved workspace admission" {
         runtime.validateAuthenticationServer("rejected"),
     );
     try runtime.validateAuthenticationServer("approved");
+    try std.testing.expectError(
+        error.McpWorkspaceApprovalRequired,
+        runtime.listResources(
+            alloc,
+            "pending",
+            false,
+            null,
+            .unrestricted,
+        ),
+    );
+    try std.testing.expectError(
+        error.McpWorkspaceApprovalRequired,
+        runtime.listPrompts(
+            alloc,
+            "rejected",
+            null,
+            .unrestricted,
+        ),
+    );
 }
 
 test "tool schema uses prefixed name and call request uses raw name" {

@@ -200,6 +200,8 @@ pub const Context = struct {
     mcp_call_tool: ?tool_mcp_runtime.CallToolFn = null,
     mcp_search_tools: ?tool_mcp_runtime.SearchToolsFn = null,
     mcp_tool_schema: ?tool_mcp_runtime.ToolSchemaFn = null,
+    mcp_project_tool_admission: ?tool_mcp_runtime.ProjectToolAdmissionFn = null,
+    mcp_current_generation: ?*const fn (*anyopaque) ?u64 = null,
     mcp_call_feature: ?tool_mcp_runtime.FeatureCallFn = null,
     mcp_access: tool_mcp_runtime.Access = .unrestricted,
     mcp_input_responder: ?tool_mcp_runtime.InputResponder = null,
@@ -1162,6 +1164,7 @@ fn mcpRuntimeCapabilities(ctx: Context) tool_mcp_runtime.RuntimeCapabilities {
         .validate_tool = ctx.mcp_validate_tool,
         .call_tool = ctx.mcp_call_tool,
         .tool_schema = ctx.mcp_tool_schema,
+        .project_tool_admission = ctx.mcp_project_tool_admission,
         .access = ctx.mcp_access,
     };
 }

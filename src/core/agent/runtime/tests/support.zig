@@ -471,6 +471,7 @@ pub const FakeAgentRuntimeDeps = struct {
     context_registry: ?context_contract.Registry = null,
     context_enabled: bool = false,
     root_permission_mode: ?PermissionMode = null,
+    current_mcp_generation: ?u64 = null,
     execute_mutex: std.Io.Mutex = .init,
     log: std.ArrayList([]u8) = .empty,
     texts: std.ArrayList([]u8) = .empty,
@@ -517,6 +518,7 @@ pub const FakeAgentRuntimeDeps = struct {
     permission_feedback: []const []const u8 = &.{},
     permission_errors: []const ?anyerror = &.{},
     permission_human_approvals: []const command_admission.HumanApprovalProvenance = &.{},
+    permission_project_mcp_retries: []const ?command_admission.ProjectMcpRetry = &.{},
     permission_request_override: ?PermissionRequestOverride = null,
     permission_wait_index: ?usize = null,
     permission_waiting: ?*std.atomic.Value(bool) = null,
@@ -715,6 +717,10 @@ pub const FakeAgentRuntimeDeps = struct {
             .context_enabled = self.context_enabled,
             .snapshot_root_permission_mode = if (self.root_permission_mode != null)
                 snapshotRootPermissionMode
+            else
+                null,
+            .current_mcp_generation = if (self.current_mcp_generation != null)
+                snapshotCurrentMcpGeneration
             else
                 null,
             .finalize_turn = finalizeTurn,
@@ -1102,7 +1108,16 @@ pub const FakeAgentRuntimeDeps = struct {
             .denial_reason = denial_reason,
             .feedback = if (feedback.len == 0) null else try arena.dupe(u8, feedback),
             .auto_review_result = auto_review_result,
+            .project_mcp_retry = if (permission_index < self.permission_project_mcp_retries.len)
+                self.permission_project_mcp_retries[permission_index]
+            else
+                null,
         };
+    }
+
+    fn snapshotCurrentMcpGeneration(raw: *anyopaque) ?u64 {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        return self.current_mcp_generation;
     }
 
     fn testVisionPathAuthority(

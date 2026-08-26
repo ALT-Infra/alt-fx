@@ -4,6 +4,7 @@ const credentials = @import("../auth/credentials.zig");
 const background_store = @import("../background/background_store.zig");
 const doctor_runtime = @import("../cli/doctor_runtime.zig");
 const model_provider = @import("../config/model_provider.zig");
+const mcp_contract = @import("../mcp/mcp_contract.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
 const permissions = @import("../permissions/permissions.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
@@ -402,6 +403,7 @@ pub const StatusSnapshot = struct {
     auth: auth_runtime.StatusSnapshot = .{},
     auth_help: ?[]const u8 = null,
     mcp_config_error: ?[]const u8 = null,
+    mcp_config_warning: ?mcp_contract.ProfileConfigWarning = null,
     permission_mode: types.PermissionMode,
     workspace_root: []const u8,
     history_turns: usize,
@@ -430,6 +432,20 @@ pub const StatusSnapshot = struct {
         }
         if (self.mcp_config_error) |error_name| {
             try out.writer.print("[status] mcp_config_error={s}\n", .{error_name});
+        }
+        if (self.mcp_config_warning) |warning| {
+            try out.writer.print(
+                "[status] mcp_config_warning={s}",
+                .{@tagName(warning.cause)},
+            );
+            if (warning.key()) |key| {
+                try out.writer.writeAll(" key=");
+                try writeTerminalSafe(&out.writer, alloc, key);
+            }
+            try out.writer.print(
+                " additional_matches={d}\n",
+                .{warning.additional_matches},
+            );
         }
         try out.writer.print("[status] auth={s}\n", .{self.auth.activeSourceLabel()});
         if (self.provider != .gateway) {
@@ -508,6 +524,20 @@ pub const StatusSnapshot = struct {
         if (self.mcp_config_error) |error_name| {
             try writer.writeAll(",\"mcp_config_error\":");
             try std.json.Stringify.value(error_name, .{}, writer);
+        }
+        if (self.mcp_config_warning) |warning| {
+            try writer.writeAll(",\"mcp_config_warning\":{\"cause\":");
+            try std.json.Stringify.value(@tagName(warning.cause), .{}, writer);
+            try writer.writeAll(",\"key\":");
+            if (warning.key()) |key| {
+                try std.json.Stringify.value(key, .{}, writer);
+            } else {
+                try writer.writeAll("null");
+            }
+            try writer.print(
+                ",\"additional_matches\":{d}}}",
+                .{warning.additional_matches},
+            );
         }
         try writer.writeAll(",\"auth\":");
         try std.json.Stringify.value(self.auth.activeSourceLabel(), .{}, writer);
@@ -2064,6 +2094,34 @@ test "MCP config diagnostic renders in status text and JSON but not interactive 
     const interactive = try snapshot.renderInteractiveBody(std.testing.allocator);
     defer std.testing.allocator.free(interactive);
     try std.testing.expect(std.mem.find(u8, interactive, "mcp_config_error") == null);
+}
+
+test "MCP config warning renders bounded status text and JSON" {
+    const snapshot = StatusSnapshot{
+        .model = "test-model",
+        .permission_mode = .ask,
+        .workspace_root = "/tmp/project",
+        .history_turns = 0,
+        .session_permission_grants = 0,
+        .agent_step_limit = 10,
+        .mcp_config_warning = mcp_contract.ProfileConfigWarning.init(
+            .suspicious_server_key,
+            "MCP-Servers",
+            1,
+        ),
+    };
+    const text = try snapshot.renderText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.find(
+        u8,
+        text,
+        "[status] mcp_config_warning=suspicious_server_key key=MCP-Servers additional_matches=1\n",
+    ) != null);
+
+    const json = try snapshot.renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.find(u8, json, "\"mcp_config_warning\":{") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"key\":\"MCP-Servers\"") != null);
 }
 
 test "core permissions snapshot text and json stay stable" {

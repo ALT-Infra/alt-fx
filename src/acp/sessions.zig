@@ -775,7 +775,7 @@ fn readProjectMcpConfig(
     return project_config.parseWorkspaceJson(
         alloc,
         bytes,
-        .acp_session,
+        .workspace,
         choices,
     );
 }

@@ -128,6 +128,15 @@ pub const top_level_specs = [_]TopLevelSpec{
         },
     },
     .{
+        .kind = .mcp,
+        .token = "mcp",
+        .usage = "mcp add NAME COMMAND [ARGS...] | mcp add --transport http NAME URL",
+        .summary = "Add an MCP server to the profile",
+        .details = &.{
+            "Adds or replaces one server in ~/.fx/mcp.json without starting the interactive shell.",
+        },
+    },
+    .{
         .kind = .models,
         .token = "models",
         .usage = "models [--json]",
@@ -303,6 +312,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
     .{ .entries = &.{
         .{ .kind = .status, .usage = "status" },
         .{ .kind = .doctor, .usage = "doctor" },
+        .{ .kind = .mcp, .usage = "mcp add ..." },
         .{ .kind = .models, .usage = "models" },
         .{ .kind = .permissions, .usage = "permissions" },
         .{ .kind = .workspace, .usage = "workspace" },

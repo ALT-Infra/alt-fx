@@ -90,14 +90,97 @@ pub const WorkspaceParseResult = struct {
     }
 };
 
+pub const ProfileDiagnosticCause = mcp_contract.ProfileConfigWarningCause;
+pub const ProfileDiagnostic = mcp_contract.ProfileConfigWarning;
+
+pub const ProfileParseResult = struct {
+    configs: std.ArrayList(McpServerConfig) = .empty,
+    diagnostic: ?ProfileDiagnostic = null,
+    mutation_allowed: bool = true,
+
+    pub fn deinit(self: *ProfileParseResult, alloc: Allocator) void {
+        deinitConfigs(alloc, &self.configs);
+        self.* = undefined;
+    }
+};
+
+const max_profile_root_scan_entries: usize = 64;
+const max_profile_child_scan_entries: usize = 64;
+const max_profile_key_bytes: usize = mcp_contract.max_profile_config_warning_key_bytes;
+
+const SuspiciousKeyScan = union(enum) {
+    clear,
+    found: struct {
+        key: []const u8,
+        additional_matches: usize,
+    },
+    indeterminate,
+};
+
 pub fn parseProfileJson(alloc: Allocator, json_text: []const u8) !std.ArrayList(McpServerConfig) {
+    var result = try parseProfileDocument(alloc, json_text);
+    defer result.deinit(alloc);
+    const configs = result.configs;
+    result.configs = .empty;
+    return configs;
+}
+
+pub fn parseProfileDocument(alloc: Allocator, json_text: []const u8) !ProfileParseResult {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, json_text, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.McpConfigInvalidJson,
     };
     defer parsed.deinit();
     if (parsed.value != .object) return error.McpConfigRootMustBeObject;
-    const servers = parsed.value.object.get("mcp") orelse return .empty;
+
+    const object = parsed.value.object;
+    if (object.get("mcp")) |servers| {
+        var result = ProfileParseResult{
+            .configs = try parseProfileServerMap(alloc, servers),
+        };
+        errdefer result.deinit(alloc);
+        if (object.get("mcpServers")) |alias| {
+            if (profileAliasIsNonEmpty(alias)) {
+                result.diagnostic = ProfileDiagnostic.init(
+                    .ignored_mcp_servers_alias,
+                    "mcpServers",
+                    0,
+                );
+            }
+        }
+        return result;
+    }
+    if (object.get("mcpServers")) |servers| {
+        return .{ .configs = try parseProfileServerMap(alloc, servers) };
+    }
+
+    return switch (scanSuspiciousProfileKeys(object)) {
+        .clear => .{},
+        .found => |found| blk: {
+            break :blk .{
+                .diagnostic = ProfileDiagnostic.init(
+                    .suspicious_server_key,
+                    found.key,
+                    found.additional_matches,
+                ),
+                .mutation_allowed = false,
+            };
+        },
+        .indeterminate => .{
+            .diagnostic = ProfileDiagnostic.init(
+                .suspicious_key_scan_indeterminate,
+                null,
+                0,
+            ),
+            .mutation_allowed = false,
+        },
+    };
+}
+
+fn parseProfileServerMap(
+    alloc: Allocator,
+    servers: std.json.Value,
+) !std.ArrayList(McpServerConfig) {
     if (servers != .object) return error.McpConfigServersMustBeObject;
 
     var configs: std.ArrayList(McpServerConfig) = .empty;
@@ -116,6 +199,96 @@ pub fn parseProfileJson(alloc: Allocator, json_text: []const u8) !std.ArrayList(
         };
     }
     return configs;
+}
+
+fn profileAliasIsNonEmpty(value: std.json.Value) bool {
+    return switch (value) {
+        .object => value.object.count() > 0,
+        .array => value.array.items.len > 0,
+        .string => value.string.len > 0,
+        .null => false,
+        else => true,
+    };
+}
+
+fn scanSuspiciousProfileKeys(object: std.json.ObjectMap) SuspiciousKeyScan {
+    if (object.count() > max_profile_root_scan_entries) return .indeterminate;
+
+    var first: ?[]const u8 = null;
+    var additional_matches: usize = 0;
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        const value = entry.value_ptr.*;
+        if (key.len > max_profile_key_bytes) {
+            if (serverMapShape(value) != .clear) return .indeterminate;
+            continue;
+        }
+        if (!isSuspiciousNormalizedKey(key)) continue;
+        switch (serverMapShape(value)) {
+            .clear => {},
+            .match => {
+                if (first == null) {
+                    first = key;
+                } else {
+                    additional_matches += 1;
+                }
+            },
+            .indeterminate => return .indeterminate,
+        }
+    }
+    if (first) |key| return .{ .found = .{
+        .key = key,
+        .additional_matches = additional_matches,
+    } };
+    return .clear;
+}
+
+const ServerMapShape = enum { clear, match, indeterminate };
+
+fn serverMapShape(value: std.json.Value) ServerMapShape {
+    if (value != .object) return .clear;
+    var inspected: usize = 0;
+    var it = value.object.iterator();
+    while (it.next()) |entry| {
+        if (inspected == max_profile_child_scan_entries) return .indeterminate;
+        inspected += 1;
+        if (serverEntryShape(entry.value_ptr.*)) return .match;
+    }
+    return .clear;
+}
+
+fn serverEntryShape(value: std.json.Value) bool {
+    if (value != .object) return false;
+    if (value.object.get("command")) |command| {
+        if (command == .string or command == .array) return true;
+    }
+    if (value.object.get("url")) |url| if (url == .string) return true;
+    if (value.object.get("type")) |kind| {
+        if (kind != .string) return false;
+        return std.mem.eql(u8, kind.string, "local") or
+            std.mem.eql(u8, kind.string, "stdio") or
+            std.mem.eql(u8, kind.string, "http") or
+            std.mem.eql(u8, kind.string, "sse");
+    }
+    return false;
+}
+
+fn isSuspiciousNormalizedKey(raw: []const u8) bool {
+    var normalized: [max_profile_key_bytes]u8 = undefined;
+    var len: usize = 0;
+    for (raw) |byte| {
+        if (!std.ascii.isAlphanumeric(byte)) continue;
+        normalized[len] = std.ascii.toLower(byte);
+        len += 1;
+    }
+    const key = normalized[0..len];
+    return std.mem.eql(u8, key, "mcpserver") or
+        std.mem.eql(u8, key, "mcpservers") or
+        std.mem.eql(u8, key, "modelcontextprotocol") or
+        std.mem.eql(u8, key, "modelcontextprotocolserver") or
+        std.mem.eql(u8, key, "modelcontextprotocolservers") or
+        std.mem.eql(u8, key, "servers");
 }
 
 pub fn parseWorkspaceJson(
@@ -801,6 +974,69 @@ fn freeHttpHeaderEnvList(alloc: Allocator, headers: *std.ArrayList(McpHttpHeader
     headers.deinit(alloc);
 }
 
+test "profile document accepts mcpServers alias and preserves strict entry parsing" {
+    const alloc = std.testing.allocator;
+    var result = try parseProfileDocument(
+        alloc,
+        "{\"mcpServers\":{\"local\":{\"command\":\"node\",\"args\":[\"server.js\"]}}}",
+    );
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), result.configs.items.len);
+    try std.testing.expectEqualStrings("local", result.configs.items[0].name);
+    try std.testing.expectEqualStrings("node", result.configs.items[0].command.?);
+    try std.testing.expect(result.diagnostic == null);
+    try std.testing.expect(result.mutation_allowed);
+}
+
+test "profile document keeps canonical mcp and reports ignored nonempty alias" {
+    const alloc = std.testing.allocator;
+    var result = try parseProfileDocument(
+        alloc,
+        "{\"mcp\":{\"canonical\":{\"command\":\"one\"}},\"mcpServers\":{\"ignored\":{\"command\":\"two\"}}}",
+    );
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), result.configs.items.len);
+    try std.testing.expectEqualStrings("canonical", result.configs.items[0].name);
+    try std.testing.expectEqual(ProfileDiagnosticCause.ignored_mcp_servers_alias, result.diagnostic.?.cause);
+    try std.testing.expect(result.mutation_allowed);
+}
+
+test "profile document reports the first exact server-like unsupported key" {
+    const alloc = std.testing.allocator;
+    var result = try parseProfileDocument(
+        alloc,
+        "{\"metadata\":{\"entry\":{\"command\":\"ignored\"}},\"MCP-Servers\":{\"one\":{\"command\":\"node\"}},\"servers\":{\"two\":{\"url\":\"https://example.test/mcp\"}}}",
+    );
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), result.configs.items.len);
+    try std.testing.expectEqual(ProfileDiagnosticCause.suspicious_server_key, result.diagnostic.?.cause);
+    try std.testing.expectEqualStrings("MCP-Servers", result.diagnostic.?.key().?);
+    try std.testing.expectEqual(@as(usize, 1), result.diagnostic.?.additional_matches);
+    try std.testing.expect(!result.mutation_allowed);
+}
+
+test "profile document bounds suspicious-key scans" {
+    const alloc = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeByte('{');
+    for (0..65) |index| {
+        if (index > 0) try out.writer.writeByte(',');
+        try out.writer.print("\"metadata{d}\":{{}}", .{index});
+    }
+    try out.writer.writeByte('}');
+    const json = try out.toOwnedSlice();
+    defer alloc.free(json);
+
+    var result = try parseProfileDocument(alloc, json);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(ProfileDiagnosticCause.suspicious_key_scan_indeterminate, result.diagnostic.?.cause);
+    try std.testing.expect(!result.mutation_allowed);
+}
+
 test "profile parser preserves validation precedence for multiply invalid entries" {
     const cases = .{
         .{
@@ -837,12 +1073,12 @@ test "workspace parsing stamps optional credential-isolated configs" {
     const json =
         \\{"mcpServers":{"local":{"command":"node","args":["server.js"],"required":true},"remote":{"type":"http","url":"https://example.test/mcp"}}}
     ;
-    var result = try parseWorkspaceJson(alloc, json, .profile, .{});
+    var result = try parseWorkspaceJson(alloc, json, .workspace, .{});
     defer result.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), result.configs.items.len);
     for (result.configs.items) |config| {
         try std.testing.expectEqual(mcp_contract.ConfigSource.workspace, config.source);
-        try std.testing.expectEqual(mcp_contract.ConfigScope.profile, config.scope);
+        try std.testing.expectEqual(mcp_contract.ConfigScope.workspace, config.scope);
         try std.testing.expect(!config.required);
         try std.testing.expect(!config.allow_stored_credentials);
         try std.testing.expectEqual(mcp_contract.WorkspaceAdmission.pending, config.workspace_admission.?);
@@ -854,7 +1090,7 @@ test "workspace parsing isolates invalid entries" {
     const json =
         \\{"mcpServers":{"good":{"command":["node","server.js"]},"bad":{"command":3}}}
     ;
-    var result = try parseWorkspaceJson(alloc, json, .profile, .{});
+    var result = try parseWorkspaceJson(alloc, json, .workspace, .{});
     defer result.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), result.configs.items.len);
     try std.testing.expectEqualStrings("good", result.configs.items[0].name);
@@ -892,14 +1128,14 @@ test "native merge keeps the primary whole entry" {
     try workspace.append(alloc, .{
         .name = try alloc.dupe(u8, "same"),
         .source = .workspace,
-        .scope = .profile,
+        .scope = .workspace,
         .command = try alloc.dupe(u8, "workspace"),
         .workspace_admission = .approved,
     });
     try workspace.append(alloc, .{
         .name = try alloc.dupe(u8, "only"),
         .source = .workspace,
-        .scope = .profile,
+        .scope = .workspace,
         .command = try alloc.dupe(u8, "workspace"),
         .workspace_admission = .approved,
     });
@@ -931,14 +1167,14 @@ test "ACP primary duplicates remain ordered while workspace collisions are exclu
     try workspace.append(alloc, .{
         .name = try alloc.dupe(u8, "same"),
         .source = .workspace,
-        .scope = .acp_session,
+        .scope = .workspace,
         .command = try alloc.dupe(u8, "workspace"),
         .workspace_admission = .pending,
     });
     try workspace.append(alloc, .{
         .name = try alloc.dupe(u8, "only"),
         .source = .workspace,
-        .scope = .acp_session,
+        .scope = .workspace,
         .command = try alloc.dupe(u8, "workspace"),
         .workspace_admission = .pending,
     });
@@ -952,14 +1188,15 @@ test "ACP primary duplicates remain ordered while workspace collisions are exclu
 test "authority projection detects only removed workspace names" {
     const alloc = std.testing.allocator;
     const configs = [_]McpServerConfig{
-        .{ .name = "approved", .source = .workspace, .scope = .profile, .workspace_admission = .approved },
-        .{ .name = "pending", .source = .workspace, .scope = .profile, .workspace_admission = .pending },
+        .{ .name = "approved", .source = .workspace, .scope = .workspace, .workspace_admission = .approved },
+        .{ .name = "pending", .source = .workspace, .scope = .workspace, .workspace_admission = .pending },
         .{ .name = "profile", .source = .profile, .scope = .profile },
     };
     const interactive = try authorityNames(alloc, &configs, .all);
     defer freeOwnedStrings(alloc, interactive);
-    try std.testing.expectEqual(@as(usize, 1), interactive.len);
+    try std.testing.expectEqual(@as(usize, 2), interactive.len);
     try std.testing.expectEqualStrings("approved", interactive[0]);
+    try std.testing.expectEqualStrings("pending", interactive[1]);
     const headless = try authorityNames(alloc, &configs, .acp_startup);
     defer freeOwnedStrings(alloc, headless);
     try std.testing.expectEqual(@as(usize, 2), headless.len);
@@ -977,7 +1214,7 @@ test "workspace parsing releases every partial allocation failure" {
             std.testing.allocator,
             .{ .fail_index = fail_index },
         );
-        var result = parseWorkspaceJson(failing.allocator(), json, .profile, .{}) catch |err| switch (err) {
+        var result = parseWorkspaceJson(failing.allocator(), json, .workspace, .{}) catch |err| switch (err) {
             error.OutOfMemory => continue,
         };
         result.deinit(failing.allocator());

@@ -11,6 +11,7 @@ const types = @import("../shared/types.zig");
 const input_interrupt_runtime = @import("input_interrupt_runtime.zig");
 const input_queue_runtime = @import("input_queue_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
+const app_commands = @import("app_commands.zig");
 const app_render_runtime = @import("app_render_runtime.zig");
 const approval_registry = @import("../subagent/approval_registry.zig");
 const communication = @import("../subagent/communication.zig");
@@ -196,6 +197,40 @@ pub fn ApprovalRuntime(comptime App: type) type {
             if (app.approval_prompt.rule_management != null) {
                 try submitRuleManagementChoice(app, decision);
                 return;
+            }
+            if (decision == .always) {
+                if (app.approval_prompt.request.?.project_mcp_server) |server_name| {
+                    if (comptime !@hasDecl(App, "reloadMcpSynchronously")) {
+                        return error.McpProjectChoicesUnavailable;
+                    } else {
+                        _ = app_commands.Handlers(App).approveProjectMcpForTool(
+                            app,
+                            server_name,
+                        ) catch |err| {
+                            debug_trace.logf(
+                                "mcp",
+                                "project MCP first-use approval failed server={s} err={s}",
+                                .{ server_name, @errorName(err) },
+                            );
+                            if (comptime @hasDecl(App, "writeDomainNotice")) {
+                                const body = try std.fmt.allocPrint(
+                                    app.alloc,
+                                    "Project MCP approval failed: {s}.",
+                                    .{@errorName(err)},
+                                );
+                                defer app.alloc.free(body);
+                                try app.writeDomainNotice(.{
+                                    .topic = "mcp",
+                                    .tone = .warning,
+                                    .body = body,
+                                }, true);
+                                requestActiveSurfaceFrame(app);
+                                return;
+                            }
+                            return err;
+                        };
+                    }
+                }
             }
             if (try submitSubagentPermissionChoice(app, decision)) return;
             var affirmative_claimed = false;

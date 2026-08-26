@@ -233,6 +233,7 @@ pub const Registry = struct {
             .prepared_fingerprint = fingerprint,
             .label = request.label,
             .explanation = request.explanation,
+            .project_mcp_server = request.project_mcp_server,
             .command = request.command,
             .file = request.file,
             .grants = grants,

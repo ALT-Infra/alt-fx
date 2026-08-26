@@ -520,6 +520,39 @@ describe("modern MCP stdio compatibility", () => {
     await expectFixtureProcessesExited(readWire(root.wireLogPath));
   }, 25_000);
 
+  test("top-level mcp add persists stdio and a later ask calls it", async () => {
+    const root = createRoot("top-level-add", MODERN_FIXTURE);
+    writeFileSync(
+      join(root.home, ".fx", "mcp.json"),
+      JSON.stringify({ mcp: {} }),
+    );
+    gateway = startToolGateway("TOP_LEVEL_STDIO_MCP_READY");
+    const env = {
+      ...fixtureEnv(root, gateway),
+      FX_MCP_WIRE_LOG: root.wireLogPath,
+      FX_MCP_PID_PATH: join(root.root, "mcp.pid"),
+      FX_MCP_MODE: "normal",
+    };
+    const added = await runFx(
+      ["mcp", "add", "fixture", process.execPath, MODERN_FIXTURE],
+      { cwd: root.workspace, env },
+    );
+    expect(added.code).toBe(0);
+    expect(added.stdout).toContain("Saved MCP server 'fixture'");
+    expect(existsSync(root.wireLogPath)).toBe(false);
+
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Use the stdio MCP echo tool."],
+      { cwd: root.workspace, env, timeoutMs: 20_000 },
+    );
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("TOP_LEVEL_STDIO_MCP_READY");
+    expect(readWire(root.wireLogPath).filter((entry) =>
+      entry.message.method === "tools/call"
+    )).toHaveLength(1);
+    await expectFixtureProcessesExited(readWire(root.wireLogPath));
+  }, 25_000);
+
   test("headless project MCP traces encode hostile server names on recovery", async () => {
     const root = createRoot("workspace-trace-name", MODERN_FIXTURE, {
       mode: "crash_always",
@@ -592,14 +625,17 @@ describe("modern MCP stdio compatibility", () => {
   }, 25_000);
 
   test.skipIf(process.platform === "win32" || !tmuxAvailable())(
-    "interactive workspace MCP stays inert until approved and retires after rejection",
+    "interactive workspace MCP asks on first tool use and persists trust by workspace",
     async () => {
       const root = createRoot("workspace-interactive", MODERN_FIXTURE, {
         recordLaunchAttempts: true,
       });
       moveProfileFixtureToWorkspace(root);
       gateway = startFakeGateway([
-        fakeGatewayFinalText("workspace gateway should remain unused"),
+        fakeGatewayToolCall("project_select", "mcp_select_tool", { name: TOOL_NAME }),
+        fakeGatewayToolCall("project_original", TOOL_NAME, { text: "approved" }),
+        fakeGatewayToolCall("project_retry", TOOL_NAME, { text: "approved" }),
+        fakeGatewayFinalText("PROJECT_MCP_FIRST_USE_READY"),
       ], {
         models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
       });
@@ -612,83 +648,87 @@ describe("modern MCP stdio compatibility", () => {
       });
 
       await tui.waitForComposer(15_000);
-      await tui.waitForText("Project MCP server 'fixture' is defined in .mcp.json", 10_000);
-      expect(existsSync(root.launchLogPath)).toBe(false);
-
-      await tui.sendLiteral("1");
-      await Bun.sleep(250);
-      expect(readFileSync(root.traceLogPath, "utf8")).toContain(
-        "project prompt input byte=49 owns_input=true",
-      );
-      await tui.waitForText("MCP configuration reloaded successfully", 15_000);
+      await Bun.sleep(500);
+      expect(existsSync(root.launchLogPath)).toBe(true);
+      expect((await tui.capturePane())).not.toContain("defined in .mcp.json");
       await tui.sendText("/mcp list");
-      let pane = await tui.waitForText("admission=approved", 10_000);
-      expect(pane).toContain("state=ready");
+      const pendingHealth = await tui.waitForText("admission=pending", 10_000);
+      expect(pendingHealth).toContain("source=workspace scope=workspace");
+      expect(readWire(root.wireLogPath).some((entry) =>
+        entry.message.method === "tools/call"
+      )).toBe(false);
+
+      await tui.sendText("Use the workspace MCP echo tool.");
+      await tui.waitForText("defined in .mcp.json in this workspace", 15_000);
+      expect(readWire(root.wireLogPath).some((entry) =>
+        entry.message.method === "tools/call"
+      )).toBe(false);
+      await tui.sendKeys("2");
+      await tui.waitForText("PROJECT_MCP_FIRST_USE_READY", 25_000);
+      const calls = readWire(root.wireLogPath).filter((entry) =>
+        entry.message.method === "tools/call"
+      );
+      expect(calls).toHaveLength(1);
       expect(readFileSync(join(root.home, ".fx", "settings.json"), "utf8"))
         .toContain("enabledMcpjsonServers");
-
-      await tui.sendText("/mcp trust reset");
-      await tui.waitForText("MCP configuration reloaded successfully", 15_000);
-      await tui.waitForText("Project MCP server 'fixture' is defined in .mcp.json", 10_000);
-      await tui.sendLiteral("3");
-      await tui.waitForText("MCP configuration reloaded successfully", 15_000);
-      await tui.sendText("/mcp list");
-      pane = await tui.waitForText("admission=rejected", 10_000);
-      expect(pane).toContain("state=disabled");
-      expect(readFileSync(join(root.home, ".fx", "settings.json"), "utf8"))
-        .toContain("disabledMcpjsonServers");
 
       await tui.kill();
       tui = null;
       await expectFixtureProcessesExited(readWire(root.wireLogPath));
-    },
-    50_000,
-  );
 
-  test.skipIf(process.platform === "win32" || !tmuxAvailable())(
-    "Escape suppresses project MCP prompts only for the current process",
-    async () => {
-      const root = createRoot("workspace-escape", MODERN_FIXTURE, {
-        recordLaunchAttempts: true,
-      });
-      moveProfileFixtureToWorkspace(root);
-      gateway = startFakeGateway([], {
+      gateway.stop();
+      gateway = startFakeGateway([
+        fakeGatewayToolCall("restart_select", "mcp_select_tool", { name: TOOL_NAME }),
+        fakeGatewayToolCall("restart_call", TOOL_NAME, { text: "restart" }),
+        fakeGatewayFinalText("RESTARTED_WORKSPACE_READY"),
+      ], {
         models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
       });
-      const env = fixtureEnv(root, gateway);
       tui = await TmuxSession.create({
         isolated: true,
         cwd: root.workspace,
         width: 140,
         height: 36,
-        env,
+        env: { ...fixtureEnv(root, gateway), FX_PERMISSION_MODE: "yolo" },
       });
       await tui.waitForComposer(15_000);
-      await tui.waitForText("[Esc] Dismiss remaining prompts", 10_000);
-      await tui.pasteText("2");
-      await Bun.sleep(250);
-      expect((await tui.capturePane())).toContain("[2] Approve all");
-      expect(existsSync(root.launchLogPath)).toBe(false);
-      expect(readFileSync(join(root.home, ".fx", "settings.json"), "utf8"))
-        .not.toContain("enableAllProjectMcpServers");
-      await tui.sendKeys("Escape");
-      await tui.waitForText("Project MCP approval prompts dismissed for this process", 10_000);
-      expect(existsSync(root.launchLogPath)).toBe(false);
+      await tui.sendText("Use the workspace MCP echo tool again.");
+      await tui.waitForText("RESTARTED_WORKSPACE_READY", 20_000);
+      expect((await tui.capturePane())).not.toContain(
+        "defined in .mcp.json in this workspace",
+      );
       await tui.kill();
       tui = null;
 
+      gateway.stop();
+      gateway = startFakeGateway([
+        fakeGatewayToolCall("isolated_select", "mcp_select_tool", { name: TOOL_NAME }),
+        fakeGatewayToolCall("isolated_call", TOOL_NAME, { text: "isolated" }),
+        fakeGatewayFinalText("ISOLATED_WORKSPACE_READY"),
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      const secondWorkspace = join(root.root, "workspace-two");
+      mkdirSync(secondWorkspace, { recursive: true });
+      writeFileSync(
+        join(secondWorkspace, ".mcp.json"),
+        readFileSync(join(root.workspace, ".mcp.json")),
+      );
       tui = await TmuxSession.create({
         isolated: true,
-        cwd: root.workspace,
+        cwd: secondWorkspace,
         width: 140,
         height: 36,
-        env,
+        env: {
+          ...fixtureEnv({ ...root, workspace: secondWorkspace }, gateway),
+          FX_PERMISSION_MODE: "yolo",
+        },
       });
       await tui.waitForComposer(15_000);
-      await tui.waitForText("Project MCP server 'fixture' is defined in .mcp.json", 10_000);
-      expect(existsSync(root.launchLogPath)).toBe(false);
+      await tui.sendText("Use the workspace MCP echo tool.");
+      await tui.waitForText("defined in .mcp.json in this workspace", 15_000);
     },
-    40_000,
+    80_000,
   );
 
   test("fresh and resumed native sessions reconstruct MCP from the current profile", async () => {

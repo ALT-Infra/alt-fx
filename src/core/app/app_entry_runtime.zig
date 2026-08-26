@@ -19,6 +19,7 @@ const command_specs = @import("../slash_commands/command_specs.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
+const mcp_command_provider = @import("../mcp/command_provider.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const update_target = @import("../upgrade/update_target.zig");
@@ -64,6 +65,8 @@ pub const Config = struct {
     tool_set: tool_set_contract.ToolSet,
     inspect_mcp_profile_config: mcp_contract.InspectProfileConfigFn,
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
+    add_mcp_profile_server: mcp_command_provider.AddProfileServerFn =
+        mcp_command_provider.addProfileServerUnavailable,
     acp_runner: acp_runner.Runner,
 };
 
@@ -405,6 +408,7 @@ fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
         .tool_set = cfg.tool_set,
         .inspect_mcp_profile_config = cfg.inspect_mcp_profile_config,
         .load_mcp_runtime = cfg.load_mcp_runtime,
+        .add_mcp_profile_server = cfg.add_mcp_profile_server,
         .acp_runner = cfg.acp_runner,
     };
 }

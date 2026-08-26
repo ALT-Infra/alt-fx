@@ -685,6 +685,7 @@ fn hasTwoEquivalentDynamicMcpFailures(
         for (calls) |prior_call| {
             const status = completedResultStatus(results, prior_call) orelse continue;
             completed_calls += 1;
+            if (isProjectMcpRetryResult(results, prior_call)) continue;
             if (std.mem.eql(u8, prior_call.name, "mcp_select_tool") and
                 status == .success)
             {
@@ -712,6 +713,27 @@ fn hasTwoEquivalentDynamicMcpFailures(
         batch_end = assistant_index;
     }
     return false;
+}
+
+fn isProjectMcpRetryResult(
+    messages: []const types.ChatMessage,
+    call: ToolCall,
+) bool {
+    var matched = false;
+    for (messages) |message| {
+        if (message.role != .tool) continue;
+        const call_id = message.tool_call_id orelse continue;
+        if (!std.mem.eql(u8, call_id, call.id)) continue;
+        if (matched) return false;
+        matched = true;
+        const content = message.content orelse return false;
+        if (!std.mem.startsWith(
+            u8,
+            content,
+            "{\"project_mcp_retry_required\":",
+        )) return false;
+    }
+    return matched;
 }
 
 fn completedResultStatus(
