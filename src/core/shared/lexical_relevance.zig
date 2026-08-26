@@ -61,9 +61,9 @@ pub fn score(
     };
 
     for (query.tokenSlice()) |token| {
-        if (containsAny(strong_fields, token)) {
+        if (containsAnyCompleteToken(strong_fields, token)) {
             result.strong_hits += 1;
-        } else if (containsAny(weak_fields, token)) {
+        } else if (containsAnySubstring(weak_fields, token)) {
             result.weak_hits += 1;
         }
     }
@@ -81,9 +81,9 @@ pub fn score(
 pub fn order(a: Score, b: Score) std.math.Order {
     var result = std.math.order(@intFromBool(a.exact_identity), @intFromBool(b.exact_identity));
     if (result != .eq) return result;
-    result = std.math.order(a.strong_hits, b.strong_hits);
+    result = std.math.order(a.strong_hits +| a.weak_hits, b.strong_hits +| b.weak_hits);
     if (result != .eq) return result;
-    return std.math.order(a.weak_hits, b.weak_hits);
+    return std.math.order(a.strong_hits, b.strong_hits);
 }
 
 fn appendToken(
@@ -101,9 +101,30 @@ fn appendToken(
     prepared.token_count += 1;
 }
 
-fn containsAny(fields: []const []const u8, token: []const u8) bool {
+fn containsAnyCompleteToken(fields: []const []const u8, token: []const u8) bool {
+    for (fields) |field| {
+        if (containsCompleteTokenIgnoreCase(field, token)) return true;
+    }
+    return false;
+}
+
+fn containsAnySubstring(fields: []const []const u8, token: []const u8) bool {
     for (fields) |field| {
         if (containsIgnoreCase(field, token)) return true;
+    }
+    return false;
+}
+
+fn containsCompleteTokenIgnoreCase(field: []const u8, token: []const u8) bool {
+    if (token.len == 0 or token.len > field.len) return false;
+
+    var start: usize = 0;
+    while (start <= field.len - token.len) : (start += 1) {
+        const end = start + token.len;
+        if (!std.ascii.eqlIgnoreCase(field[start..end], token)) continue;
+        if (start > 0 and std.ascii.isAlphanumeric(field[start - 1])) continue;
+        if (end < field.len and std.ascii.isAlphanumeric(field[end])) continue;
+        return true;
     }
     return false;
 }
@@ -189,9 +210,68 @@ test "scores count distinct strong and weak hits with stable ordering" {
     try std.testing.expect(score(&irrelevant_query, &no_identities, &strong, &weak) == null);
 
     try std.testing.expectEqual(.gt, order(.{ .exact_identity = true }, .{ .strong_hits = 64 }));
-    try std.testing.expectEqual(.gt, order(.{ .strong_hits = 1 }, .{ .weak_hits = 64 }));
+    try std.testing.expectEqual(.lt, order(.{ .strong_hits = 1 }, .{ .weak_hits = 64 }));
     try std.testing.expectEqual(.eq, order(relevance, relevance));
 
     const large = Score{ .strong_hits = 65_536 };
     try std.testing.expectEqual(.gt, order(large, .{ .strong_hits = 65_535 }));
+}
+
+test "strong fields require complete normalized query tokens" {
+    const query = try prepare("send an email");
+    const no_identities = [_][]const u8{};
+    const analysis_names = [_][]const u8{"analysis-tools"};
+    const analysis_descriptions = [_][]const u8{"Analyze local source code"};
+    const mail_names = [_][]const u8{"mail-helper"};
+    const mail_descriptions = [_][]const u8{"Send email messages to recipients"};
+
+    const analysis = score(
+        &query,
+        &no_identities,
+        &analysis_names,
+        &analysis_descriptions,
+    ).?;
+    const mail = score(
+        &query,
+        &no_identities,
+        &mail_names,
+        &mail_descriptions,
+    ).?;
+
+    try std.testing.expectEqual(@as(usize, 0), analysis.strong_hits);
+    try std.testing.expectEqual(@as(usize, 1), analysis.weak_hits);
+    try std.testing.expectEqual(@as(usize, 2), mail.weak_hits);
+    try std.testing.expectEqual(.gt, order(mail, analysis));
+
+    const ui_query = try prepare("ui");
+    const ui_names = [_][]const u8{"terminal-ui-review"};
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        score(&ui_query, &no_identities, &ui_names, &.{}).?.strong_hits,
+    );
+}
+
+test "matched query coverage precedes strong field tie breaking" {
+    const query = try prepare("send email");
+    const no_identities = [_][]const u8{};
+    const one_name_match = score(
+        &query,
+        &no_identities,
+        &.{"send-tool"},
+        &.{},
+    ).?;
+    const two_description_matches = score(
+        &query,
+        &no_identities,
+        &.{"mail-helper"},
+        &.{"Send email messages to recipients"},
+    ).?;
+
+    try std.testing.expectEqual(@as(usize, 1), one_name_match.strong_hits);
+    try std.testing.expectEqual(@as(usize, 2), two_description_matches.weak_hits);
+    try std.testing.expectEqual(.gt, order(two_description_matches, one_name_match));
+
+    const equal_coverage_strong = Score{ .strong_hits = 1, .weak_hits = 1 };
+    const equal_coverage_weak = Score{ .weak_hits = 2 };
+    try std.testing.expectEqual(.gt, order(equal_coverage_strong, equal_coverage_weak));
 }

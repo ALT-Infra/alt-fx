@@ -1845,7 +1845,7 @@ describe("gateway stream lifecycle", () => {
     }
   }, 45_000);
 
-  test("skill search keeps durable model-visible JSON exact after redaction", async () => {
+  test("skill search ranks natural intent and keeps durable model-visible JSON exact after redaction", async () => {
     const root = createFixtureRoot("skill-search-projection");
     const tracePath = join(root.root, "trace.log");
     const unsafeDirectory = join(
@@ -1854,17 +1854,34 @@ describe("gateway stream lifecycle", () => {
       "skills",
       "TOKEN=runtime-location-secret",
     );
-    const safeDirectory = join(root.home, ".fx", "skills", "safe-workflow");
+    const safeDirectory = join(root.home, ".fx", "skills", "mail-helper");
     const safeBody = "SAFE_SKILL_SEARCH_BODY_SENTINEL";
     mkdirSync(unsafeDirectory, { recursive: true });
     mkdirSync(safeDirectory, { recursive: true });
+    for (const name of [
+      "humanizer",
+      "animate",
+      "animation-accessibility",
+      "animation-performance",
+      "animation-vocabulary",
+      "css-animations",
+      "find-animation-opportunities",
+      "hyperframes-animation",
+    ]) {
+      const directory = join(root.workspace, ".agents", "skills", name);
+      mkdirSync(directory, { recursive: true });
+      writeFileSync(
+        join(directory, "SKILL.md"),
+        `---\nname: ${name}\ndescription: Animation workflow for visual motion\n---\n\nDISTRACTOR_BODY_MUST_NOT_LOAD\n`,
+      );
+    }
     writeFileSync(
       join(unsafeDirectory, "SKILL.md"),
       "---\nname: unsafe-workflow\ndescription: Review unsafe workflow\n---\n\nUNSAFE_BODY_MUST_NOT_LOAD\n",
     );
     writeFileSync(
       join(safeDirectory, "SKILL.md"),
-      `---\nname: safe-workflow\ndescription: API_KEY=runtime-description-secret\n---\n\n${safeBody}\n`,
+      `---\nname: mail-helper\ndescription: Send email messages. API_KEY=runtime-description-secret\n---\n\n${safeBody}\n`,
     );
 
     const searchCallId = "projected_skill_search";
@@ -1880,7 +1897,7 @@ describe("gateway stream lifecycle", () => {
       switch (responseIndex++) {
         case 0:
           return fakeGatewayToolCall(searchCallId, "skill_search", {
-            query: "workflow",
+            query: "send an email",
           });
         case 1: {
           projectedSearch = JSON.parse(
@@ -1922,24 +1939,26 @@ describe("gateway stream lifecycle", () => {
         { name: "skill_search", status: "success" },
         { name: "skill", status: "success" },
       ]);
-      expect(projectedSearch).toEqual({
-        skills: [{
-          name: "safe-workflow",
-          description: "API_KEY=[redacted]",
-          location: safeDirectory,
-        }],
-        count: 1,
-        more_available: true,
+      expect(projectedSearch?.skills[0]).toEqual({
+        name: "mail-helper",
+        description: "Send email messages. API_KEY=[redacted]",
+        location: safeDirectory,
       });
+      expect(projectedSearch?.count).toBe(8);
+      expect(projectedSearch?.more_available).toBe(true);
+      expect(projectedSearch?.skills.some((skill) => skill.name === "unsafe-workflow"))
+        .toBe(false);
       const projectedText = toolResultOutput(gateway.requests[1]!.body, searchCallId);
       expect(projectedText).not.toContain("unsafe-workflow");
       expect(projectedText).not.toContain("TOKEN=runtime-location-secret");
       expect(projectedText).not.toContain("UNSAFE_BODY_MUST_NOT_LOAD");
+      expect(projectedText).not.toContain("DISTRACTOR_BODY_MUST_NOT_LOAD");
       expect(projectedText).not.toContain(safeBody);
 
       const loaded = toolResultOutput(gateway.requests[2]!.body, loadCallId);
       expect(loaded).toContain(safeBody);
       expect(loaded).not.toContain("UNSAFE_BODY_MUST_NOT_LOAD");
+      expect(loaded).not.toContain("DISTRACTOR_BODY_MUST_NOT_LOAD");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });

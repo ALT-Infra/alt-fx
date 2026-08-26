@@ -58,6 +58,8 @@ const default_mcp_search_limit: usize = 8;
 const max_mcp_search_limit: usize = 20;
 const max_mcp_tool_tags: usize = 16;
 const mcp_server_instruction_search_bytes = context_limits.Name.mcp_server_instructions_bytes.defaultBytes();
+const mcp_tool_description_search_bytes: usize = 2 * 1024;
+const mcp_tool_schema_search_bytes: usize = 4 * 1024;
 const max_pending_legacy_url_waiters: usize = 32;
 const max_early_legacy_url_completions_per_window: usize = 64;
 const max_legacy_url_completion_candidates: usize = 1024;
@@ -5974,6 +5976,14 @@ pub const McpRuntime = struct {
                 for (server.tool_catalog.tools.items) |*tool| {
                     if (!operation_access.allows(.{ .tool = tool.prefixed_name })) continue;
                     if (permissions.rulesDenyAllTargetsForPermission(permission_rules, tool.prefixed_name)) continue;
+                    const searchable_description = tool.description[0..context_limits.utf8PrefixLength(
+                        tool.description,
+                        mcp_tool_description_search_bytes,
+                    )];
+                    const searchable_schema = tool.input_schema_json[0..context_limits.utf8PrefixLength(
+                        tool.input_schema_json,
+                        mcp_tool_schema_search_bytes,
+                    )];
                     const exact_identities = [_][]const u8{
                         tool.original_name,
                         tool.prefixed_name,
@@ -5985,8 +5995,8 @@ pub const McpRuntime = struct {
                         "mcp",
                     };
                     const weak_fields = [_][]const u8{
-                        tool.description,
-                        tool.input_schema_json,
+                        searchable_description,
+                        searchable_schema,
                         searchable_instructions,
                     };
                     const candidate_score = lexical_relevance.score(
@@ -17783,6 +17793,58 @@ test "MCP search matches each retained source field" {
         missing.model_output,
     );
     try std.testing.expect(missing.notice == null);
+}
+
+test "MCP search bounds untrusted description and schema fields" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "bounded"),
+        .command = try alloc.dupe(u8, "fixture"),
+    });
+    runtime.servers.items[0].state = .ready;
+
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+    try parseAndStoreTools(
+        alloc,
+        &runtime.servers.items[0],
+        .{},
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"probe","description":"initial","inputSchema":{"type":"object"}}]}}
+    ,
+        &used,
+    );
+
+    const description = "zearly123 " ++ ("x" ** mcp_tool_description_search_bytes) ++ " zlate987";
+    const schema =
+        "{\"type\":\"object\",\"properties\":{\"zearly456\":{\"type\":\"string\"},\"padding\":{\"description\":\"" ++
+        ("x" ** mcp_tool_schema_search_bytes) ++
+        "zlate654\"}}}";
+    const tool = &runtime.servers.items[0].tool_catalog.tools.items[0];
+    alloc.free(tool.description);
+    tool.description = try alloc.dupe(u8, description);
+    alloc.free(tool.input_schema_json);
+    tool.input_schema_json = try alloc.dupe(u8, schema);
+
+    const cases = [_]struct {
+        query: []const u8,
+        expected_match: bool,
+    }{
+        .{ .query = "zearly123", .expected_match = true },
+        .{ .query = "zlate987", .expected_match = false },
+        .{ .query = "zearly456", .expected_match = true },
+        .{ .query = "zlate654", .expected_match = false },
+    };
+    for (cases) |case| {
+        var result = try runtime.searchTools(alloc, case.query, 5, .{}, .{}, .unrestricted);
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(
+            case.expected_match,
+            std.mem.find(u8, result.model_output, "mcp_bounded_probe") != null,
+        );
+    }
 }
 
 test "MCP search keeps bounded matches off the allocator" {
