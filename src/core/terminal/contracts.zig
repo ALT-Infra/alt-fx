@@ -4109,13 +4109,25 @@ test "next actions are the pure lifecycle authority and lease intersection" {
     );
     try std.testing.expectEqual(AllowedControls.observer(), observer);
 
-    const running = project_next_actions(
-        .running,
-        .full(),
-        .agent,
-        .{},
-    );
-    try std.testing.expect(running.monitor);
+    const lifecycle_cases = [_]struct {
+        lifecycle: Lifecycle,
+        monitor: bool,
+    }{
+        .{ .lifecycle = .starting, .monitor = true },
+        .{ .lifecycle = .running, .monitor = true },
+        .{ .lifecycle = .exited, .monitor = false },
+        .{ .lifecycle = .lost, .monitor = false },
+        .{ .lifecycle = .closed, .monitor = false },
+    };
+    for (lifecycle_cases) |case| {
+        const projected = project_next_actions(
+            case.lifecycle,
+            .full(),
+            .agent,
+            .{},
+        );
+        try std.testing.expectEqual(case.monitor, projected.monitor);
+    }
 
     const leased = project_next_actions(
         .running,

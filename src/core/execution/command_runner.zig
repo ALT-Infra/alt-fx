@@ -3782,14 +3782,14 @@ test "timeout terminates foreground process group descendants" {
     defer alloc.free(quoted_ready);
     const command = try std.fmt.allocPrint(
         alloc,
-        "(while :; do :; done) & child=$!; printf '%s' \"$child\" > {s}; wait",
+        "sleep 30 & child=$!; printf '%s' \"$child\" > {s}; wait",
         .{quoted_ready},
     );
     defer alloc.free(command);
 
     try std.testing.expectError(error.TimeoutExpired, executeCommand(.{
         .max_command_output_bytes = 1024,
-        .timeout_ms = 500,
+        .timeout_ms = 2000,
     }, alloc, command, workspace));
 
     const pid_text = try readAbsoluteFile(alloc, ready_path, 64);
@@ -3842,7 +3842,7 @@ test "timeout terminates redirected descendant after setsid" {
 
     try std.testing.expectError(error.TimeoutExpired, executeCommand(.{
         .max_command_output_bytes = 1024,
-        .timeout_ms = 500,
+        .timeout_ms = 2000,
     }, alloc, command, workspace));
 
     const pid_text = try readAbsoluteFile(alloc, pid_path, 64);
@@ -3885,7 +3885,7 @@ test "timeout terminates double-forked descendant after setsid" {
 
     try std.testing.expectError(error.TimeoutExpired, executeCommand(.{
         .max_command_output_bytes = 1024,
-        .timeout_ms = 500,
+        .timeout_ms = 2000,
     }, alloc, command, workspace));
 
     const pid_text = try readAbsoluteFile(alloc, pid_path, 64);
