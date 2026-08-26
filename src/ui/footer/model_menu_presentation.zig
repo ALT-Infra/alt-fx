@@ -24,6 +24,7 @@ const ModelMenuLayout = struct {
     first_item_row: u16 = header_rows,
     item_stride: u16 = item_rows,
     show_header: bool = true,
+    state_row: ?u16 = null,
     status_row: ?u16 = null,
     row_count: u16 = 0,
 
@@ -33,11 +34,25 @@ const ModelMenuLayout = struct {
         const match_count = projection.filteredItemCount();
         const selected = if (match_count > 0) projection.selected_index % match_count else 0;
         if (projection.load_state != .ready or match_count == 0) {
+            const state_row: u16 = if (row_budget == 1)
+                0
+            else if (row_budget == 2)
+                1
+            else
+                header_rows + roomy_top_gap_rows;
+            var row_count = state_row + 1;
+            const show_status = projection.load_state == .ready and
+                loadedCatalogStatusText(projection.catalog_state) != null and
+                row_budget >= row_count + status_gap_rows + 1;
+            const status_row = if (show_status) row_count + status_gap_rows else null;
+            if (status_row) |row| row_count = row + 1;
             return .{
                 .match_count = match_count,
                 .selected = selected,
                 .show_header = row_budget > 1,
-                .row_count = @min(row_budget, header_rows + roomy_top_gap_rows + 1),
+                .state_row = state_row,
+                .status_row = status_row,
+                .row_count = row_count,
             };
         }
         if (row_budget == 1) {
@@ -97,8 +112,12 @@ pub fn composeModelMenuRow(
     const layout = ModelMenuLayout.build(projection, row_count);
     if (layout.show_header and row_index == 0) return composeHeaderRow(alloc, projection, width);
     if (projection.load_state != .ready or layout.match_count == 0) {
-        if (row_index < layout.row_count -| 1) return row;
-        return composeStateRow(alloc, projection, width);
+        if (layout.state_row == row_index) return composeStateRow(alloc, projection, width);
+        if (layout.status_row == row_index) {
+            const text = loadedCatalogStatusText(projection.catalog_state) orelse return row;
+            return composeDimmedRow(alloc, text, width);
+        }
+        return row;
     }
     if (layout.status_row) |status_row| {
         if (row_index == status_row) {
@@ -565,6 +584,33 @@ test "model menu states and navigation budget stay bounded" {
     };
     const ready: ModelMenuProjection = .{ .active = true, .load_state = .ready, .items = &items };
     try std.testing.expectEqual(@as(u16, 3), visibleNavigationItemsForBudget(ready, 7));
+}
+
+test "empty model menu keeps catalog provenance below the empty state" {
+    const alloc = std.testing.allocator;
+    const projection: ModelMenuProjection = .{
+        .active = true,
+        .load_state = .ready,
+        .catalog_state = .{
+            .access_level = .public_only,
+            .public_only_reason = .no_credential,
+            .private_models_hidden = true,
+        },
+    };
+    const rows = menuRowCount(projection, 80, 10);
+    try std.testing.expectEqual(@as(u16, 5), rows);
+
+    var state = try composeModelMenuRow(alloc, projection, 2, 80, rows);
+    defer state.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, state.items, "No models available.") != null);
+
+    var gap = try composeModelMenuRow(alloc, projection, 3, 80, rows);
+    defer gap.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), gap.items.len);
+
+    var status = try composeModelMenuRow(alloc, projection, 4, 80, rows);
+    defer status.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, status.items, "Using the public model catalog") != null);
 }
 
 test "model menu caps inline browse at twenty and prioritizes tiny selection" {
