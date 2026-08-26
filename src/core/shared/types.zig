@@ -1483,6 +1483,8 @@ pub const FinishedPromptProjection = enum {
 };
 
 pub const SnapshotFileOwnership = struct {
+    /// Shared lifetime for snapshot files after worker completion. Copies must
+    /// retain/release; accepted history transfers deletion responsibility.
     ctx: *anyopaque,
     retain_fn: *const fn (*anyopaque) void,
     release_fn: *const fn (*anyopaque) void,
