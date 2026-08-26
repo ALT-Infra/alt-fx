@@ -347,7 +347,13 @@ pub fn Runtime(comptime App: type) type {
             if (!app.auth.signInEntryActive() and !app.auth.apiKeyEntryActive()) return false;
             return switch (action) {
                 .escape, .remapped_byte => false,
-                .paste_start, .paste_end => !app.auth.signInCodeEntryActive(),
+                .paste_start => blk: {
+                    if (app.auth.signInCodeEntryActive()) break :blk false;
+                    if (!app.auth.toggleSignInCodeEntry()) break :blk true;
+                    app.shell.render_requests.request(.footer);
+                    break :blk false;
+                },
+                .paste_end => !app.auth.signInCodeEntryActive(),
                 else => true,
             };
         }
@@ -1457,6 +1463,7 @@ const TestAuth = struct {
     sign_in_entry_active: bool = false,
     sign_in_code_entry_active: bool = false,
     sign_in_code_toggle_count: usize = 0,
+    sign_in_code_toggle_succeeds: bool = true,
     sign_in_code_submit_count: usize = 0,
     sign_in_code_submit_succeeds: bool = true,
 
@@ -1493,6 +1500,7 @@ const TestAuth = struct {
 
     fn toggleSignInCodeEntry(self: *TestAuth) bool {
         self.sign_in_code_toggle_count += 1;
+        if (!self.sign_in_code_toggle_succeeds) return false;
         self.sign_in_code_entry_active = !self.sign_in_code_entry_active;
         return true;
     }
@@ -1778,6 +1786,31 @@ test "interactive sign-in routes Tab to the auth-owned manual code toggle" {
     try std.testing.expect(app.auth.sign_in_code_entry_active);
     try std.testing.expectEqual(@as(usize, 0), app.test_url_opener.calls);
     try std.testing.expect(app.shell.render_requests.footer_requested);
+}
+
+test "interactive hidden manual code paste reveals entry for the paste owner" {
+    var app: TestApp = .{};
+    defer app.deinit();
+    app.auth.sign_in_entry_active = true;
+
+    try std.testing.expect(!Runtime(TestApp).routeAuthPickerEscapeAction(&app, .paste_start));
+
+    try std.testing.expectEqual(@as(usize, 1), app.auth.sign_in_code_toggle_count);
+    try std.testing.expect(app.auth.sign_in_code_entry_active);
+    try std.testing.expect(app.shell.render_requests.footer_requested);
+}
+
+test "interactive sign-in without manual fallback consumes hidden paste" {
+    var app: TestApp = .{};
+    defer app.deinit();
+    app.auth.sign_in_entry_active = true;
+    app.auth.sign_in_code_toggle_succeeds = false;
+
+    try std.testing.expect(Runtime(TestApp).routeAuthPickerEscapeAction(&app, .paste_start));
+
+    try std.testing.expectEqual(@as(usize, 1), app.auth.sign_in_code_toggle_count);
+    try std.testing.expect(!app.auth.sign_in_code_entry_active);
+    try std.testing.expect(!app.shell.render_requests.footer_requested);
 }
 
 test "interactive manual code entry never reopens the browser on empty submit" {

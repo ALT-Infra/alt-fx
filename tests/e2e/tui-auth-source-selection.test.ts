@@ -2544,7 +2544,7 @@ tmuxTest(
 );
 
 tmuxTest(
-  "interactive Grok login accepts a bracketed-paste authorization code",
+  "interactive Grok login auto-expands for a bracketed-paste authorization code",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-grok-tui-code-"));
     stderrPath = join(home, "stderr.log");
@@ -2564,24 +2564,22 @@ tmuxTest(
       await session.sendKeys("Down");
       await session.sendKeys("Enter");
       await session.waitForText("Browser didn't return? Press Tab to enter a code", TIMEOUT);
-      await session.sendKeys("Tab");
-      await session.waitForText("Paste the code shown by xAI", TIMEOUT);
-      const expanded = await session.capturePane();
-      expect(expanded).toMatch(/^  Open\s+Authorize with Grok\n\s*\n  Paste the code shown by xAI$/m);
-      await session.resizeWindow(80, 5);
-      const compactEntry = await session.waitForPane(
-        (pane) =>
-          pane.includes("Paste or type the code") &&
-          pane.includes("Enter submits") &&
-          pane.includes("Esc cancels"),
-        TIMEOUT,
-      );
-      expect(compactEntry).not.toContain("Paste the code shown by xAI");
       await session.pasteText("grok-code");
       await session.waitForPane(
         (pane) => pane.includes("•••••••••") && pane.includes("Enter submits"),
         TIMEOUT,
       );
+      const expanded = await session.capturePane();
+      expect(expanded).toMatch(/^  Open\s+Authorize with Grok\n\s*\n  Paste the code shown by xAI$/m);
+      await session.resizeWindow(80, 5);
+      const compactEntry = await session.waitForPane(
+        (pane) =>
+          pane.includes("•••••••••") &&
+          pane.includes("Enter submits") &&
+          pane.includes("Esc cancels"),
+        TIMEOUT,
+      );
+      expect(compactEntry).not.toContain("Paste the code shown by xAI");
       await session.sendKeys("Tab");
       const collapsedWithDraft = await session.waitForText("Tab enters code", TIMEOUT);
       expect(collapsedWithDraft).not.toContain("•••••••••");
