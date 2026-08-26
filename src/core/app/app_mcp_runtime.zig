@@ -270,6 +270,7 @@ const PendingAuthentication = struct {
 const SpawnPendingReloadFn = *const fn (*PendingReload) anyerror!std.Thread;
 
 fn spawnPendingReload(pending: *PendingReload) !std.Thread {
+    if (comptime builtin.single_threaded) return error.ThreadsUnsupported;
     return std.Thread.spawn(.{}, PendingReload.run, .{pending});
 }
 
