@@ -566,6 +566,14 @@ fn nthSlashCommandCompletionMatch(registry: SlashRegistry, prefix: []const u8, n
     return null;
 }
 
+pub fn argCompletionProviderOwns(prefix: []const u8) bool {
+    return allowlistArgCompletionPrefix(prefix) != null or
+        statuslineArgCompletionPrefix(prefix) != null or
+        notificationsArgCompletionPrefix(prefix) != null or
+        permissionsArgCompletionPrefix(prefix) != null or
+        workspaceArgCompletionPrefix(prefix) != null;
+}
+
 pub fn slashCompletionPrefix(registry: SlashRegistry, input: []const u8) ?[]const u8 {
     const prefix = std.mem.trimStart(u8, input, " \t\r\n");
     if (prefix.len == 0 or prefix[0] != '/') return null;
@@ -573,6 +581,10 @@ pub fn slashCompletionPrefix(registry: SlashRegistry, input: []const u8) ?[]cons
     const command_end = std.mem.indexOfAny(u8, prefix, " \t\r\n") orelse return prefix;
     const spec = registry.lookup(prefix[0..command_end]) orelse return prefix;
     if (!spec.has_args) return null;
+    // A fully typed command that accepts arguments but has no argument
+    // completion provider has nothing left to suggest. Close the picker
+    // instead of rendering an empty "no matching" state.
+    if (!argCompletionProviderOwns(prefix)) return null;
     return prefix;
 }
 
@@ -1936,6 +1948,18 @@ test "slash completion prefix yields to no-argument command submission" {
     try std.testing.expect(slashCompletionPrefix(registry, "/resume ") == null);
     try std.testing.expect(slashCompletionPrefix(registry, "\n\t/resume\nignored") == null);
     try std.testing.expect(slashCompletionPrefix(registry, "/exit\t") == null);
+}
+
+test "slash completion prefix closes the picker for argument commands without a provider" {
+    const registry = testSlashRegistry();
+
+    try std.testing.expectEqualStrings("/rename", slashCompletionPrefix(registry, "/rename").?);
+    try std.testing.expect(slashCompletionPrefix(registry, "/rename my title") == null);
+    try std.testing.expect(slashCompletionPrefix(registry, "/logout vercel") == null);
+    try std.testing.expectEqualStrings(
+        "/permissions re",
+        slashCompletionPrefix(registry, "/permissions re").?,
+    );
 }
 
 test "slash completions skip hidden subcommands" {
