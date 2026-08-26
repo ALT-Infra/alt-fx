@@ -3097,8 +3097,11 @@ test "ACP stream adapter forwards raw Markdown and suppresses rendered duplicate
         source_spans[0],
         source_spans[1],
         source_spans[2],
-        "status\n",
+        "status\n[docs](https://example.com)\n",
     };
+    const operational_span =
+        "\x1b[1mstatus\x1b[22m\n" ++
+        "\x1b]8;id=fx-1;https://example.com\x1b\\docs\x1b]8;;\x1b\\\n";
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -3124,7 +3127,7 @@ test "ACP stream adapter forwards raw Markdown and suppresses rendered duplicate
             try deps.push_text(deps.ctx, .{ .assistant_rendered = rendered });
         }
         try deps.push_text(deps.ctx, .{ .assistant_source = "" });
-        try deps.push_text(deps.ctx, .{ .operational = "status\n" });
+        try deps.push_text(deps.ctx, .{ .operational = operational_span });
         try capture.sync(io_mod.getIo());
     }
 
