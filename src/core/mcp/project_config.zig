@@ -104,7 +104,7 @@ pub fn renderWorkspaceDiagnostic(
         var encoded_variable = try text_utils.encodeTerminalSafe(
             alloc,
             diagnostic.environment_variable orelse "unknown",
-            max_environment_name_bytes,
+            max_rendered_environment_name_bytes,
         );
         defer encoded_variable.deinit(alloc);
         const field = if (diagnostic.environment_field) |value|
@@ -452,7 +452,7 @@ fn parseWorkspaceJsonInternal(
     return result;
 }
 
-const max_environment_name_bytes: usize = 128;
+const max_rendered_environment_name_bytes: usize = 128;
 const max_expanded_workspace_value_bytes: usize = 1024 * 1024;
 
 const WorkspaceTemplateExpansion = union(enum) {
@@ -493,7 +493,7 @@ fn expandWorkspaceTemplate(
         const default_marker = std.mem.find(u8, expression, ":-");
         const variable_name = if (default_marker) |index| expression[0..index] else expression;
         const default_value = if (default_marker) |index| expression[index + 2 ..] else null;
-        if (variable_name.len > max_environment_name_bytes or !isValidEnvName(variable_name)) {
+        if (!isValidEnvName(variable_name)) {
             return .invalid;
         }
         const replacement = environment.get(variable_name) orelse default_value orelse {
@@ -1377,6 +1377,23 @@ test "workspace template expansion is explicit bounded and deterministic" {
     var malformed = try expandWorkspaceTemplate(alloc, "${NOT-CLOSED", &environment);
     defer malformed.deinit(alloc);
     try std.testing.expect(malformed == .invalid);
+
+    var long_name: [129]u8 = undefined;
+    long_name[0] = 'A';
+    @memset(long_name[1..], 'B');
+    try environment.put(&long_name, "long-name-value");
+    const long_template = try std.fmt.allocPrint(alloc, "${{{s}}}", .{long_name});
+    defer alloc.free(long_template);
+    var long_expansion = try expandWorkspaceTemplate(
+        alloc,
+        long_template,
+        &environment,
+    );
+    defer long_expansion.deinit(alloc);
+    switch (long_expansion) {
+        .expanded => |value| try std.testing.expectEqualStrings("long-name-value", value),
+        .missing, .invalid => return error.TestUnexpectedResult,
+    }
 }
 
 test "workspace environment diagnostics isolate entries and profile values stay literal" {
