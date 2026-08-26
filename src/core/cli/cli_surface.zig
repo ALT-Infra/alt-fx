@@ -2241,10 +2241,10 @@ fn runTopLevelMcp(
         };
         defer loaded.deinit(alloc);
         try writeConfigDiagnostics(alloc, deps, loaded.startup.config_diagnostics);
-        const listing = if (loaded.runtime) |runtime|
-            try runtime.listServersAndTools(alloc)
-        else
-            try alloc.dupe(u8, "No MCP servers configured.\n");
+        const listing = if (loaded.runtime) |runtime| listing: {
+            try runtime.loadStoredCredentialsForHealthSnapshot();
+            break :listing try runtime.listServersAndTools(alloc);
+        } else try alloc.dupe(u8, "No MCP servers configured.\n");
         defer alloc.free(listing);
         try writeStdout(deps, listing);
         return .handled_success;

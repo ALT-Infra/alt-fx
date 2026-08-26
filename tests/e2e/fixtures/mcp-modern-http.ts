@@ -367,6 +367,7 @@ export function startModernMcpHttpFixture(
           _meta: {
             "io.modelcontextprotocol/serverInfo": {
               name: "modern-http-fixture",
+              version: "",
             },
           },
           capabilities: {

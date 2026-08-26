@@ -259,11 +259,11 @@ The noninteractive MCP surface supports:
 * `fx mcp remove <name>`
 
 The local form saves a stdio command. The HTTP form saves a remote Streamable
-HTTP endpoint. List reads effective profile and workspace configuration without
-connecting servers. Path prints the profile configuration path. Remove uses the
-same locked canonical profile writer as add. Auth and logout run the existing
-remote credential lifecycle. None of these commands constructs the TUI or
-contacts the Gateway.
+HTTP endpoint. List reads effective profile and workspace configuration plus
+stored authentication state without connecting servers. Path prints the profile
+configuration path. Remove uses the same locked canonical profile writer as
+add. Auth and logout run the existing remote credential lifecycle. None of these
+commands constructs the TUI or contacts the Gateway.
 
 Remote authentication supports configured bearer tokens and OAuth credential
 discovery, persistence, refresh, scope challenges, and logout. Credential and

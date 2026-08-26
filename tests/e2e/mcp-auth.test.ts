@@ -132,6 +132,21 @@ async function waitForFile(path: string, timeoutMs: number): Promise<boolean> {
   return existsSync(path);
 }
 
+async function waitForFileText(
+  path: string,
+  expected: string,
+  timeoutMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(path) && readFileSync(path, "utf8").includes(expected)) {
+      return true;
+    }
+    await Bun.sleep(10);
+  }
+  return existsSync(path) && readFileSync(path, "utf8").includes(expected);
+}
+
 afterEach(async () => {
   const activeTui = tui;
   const activeGateway = gateway;
@@ -547,6 +562,7 @@ function createRoot(
   const bin = join(root, "bin");
   const trace = join(root, "trace.log");
   const openLog = join(root, "open.log");
+  const callbackLog = join(root, "callback.html");
   const stderr = join(root, "stderr.log");
   mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
   mkdirSync(workspace, { recursive: true });
@@ -577,7 +593,7 @@ function createRoot(
     }),
   );
   const follow = followAuthorization
-    ? "nohup curl --location --silent --show-error \"$1\" >/dev/null 2>&1 &\n"
+    ? `nohup curl --location --silent --show-error "$1" > '${callbackLog}' 2>/dev/null &\n`
     : "";
   const opener =
     `#!/bin/sh\nprintf '%s\\n' "$1" > '${openLog}'\n${follow}exit 0\n`;
@@ -586,7 +602,7 @@ function createRoot(
     writeFileSync(path, opener);
     chmodSync(path, 0o700);
   }
-  return { root, home, workspace, bin, trace, openLog, stderr };
+  return { root, home, workspace, bin, trace, openLog, callbackLog, stderr };
 }
 
 function moveAuthFixtureToWorkspace(root: ReturnType<typeof createRoot>): void {
@@ -823,6 +839,12 @@ describe("MCP remote authentication lifecycle", () => {
     expect(auth.authorizationRequests).toBe(1);
     expect(auth.tokenExchanges).toBe(1);
     expect(existsSync(root.openLog)).toBe(true);
+    expect(
+      await waitForFileText(root.callbackLog, "Authorization complete", 5_000),
+    ).toBe(true);
+    const callbackPage = readFileSync(root.callbackLog, "utf8");
+    expect(callbackPage).toContain("<h1>Authorization complete</h1>");
+    expect(callbackPage).toContain("prefers-color-scheme:dark");
     const credentialPath = join(
       root.home,
       ".fx",
@@ -830,6 +852,21 @@ describe("MCP remote authentication lifecycle", () => {
       "credentials.json",
     );
     expect(existsSync(credentialPath)).toBe(true);
+    const profilePath = join(root.home, ".fx", "mcp.json");
+    const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+    delete profile.mcp.fixture.oauth;
+    writeFileSync(profilePath, JSON.stringify(profile));
+
+    const requestCountBeforeList = auth.requests.length;
+    const listed = await runFx(["mcp", "list"], {
+      cwd: root.workspace,
+      env,
+      timeoutMs: 20_000,
+    });
+    expect(listed.code).toBe(0);
+    expect(listed.stderr).toBe("");
+    expect(listed.stdout).toMatch(/fixture[\s\S]{0,240}auth=authenticated/);
+    expect(auth.requests).toHaveLength(requestCountBeforeList);
 
     const loggedOut = await runFx(["mcp", "logout", "fixture"], {
       cwd: root.workspace,
@@ -1841,6 +1878,21 @@ describe("MCP remote authentication lifecycle", () => {
         const persisted = JSON.parse(storedValue);
         expect(persisted.credentials[0].access_token).toBe(ACCESS_INITIAL);
         expect(persisted.credentials[0].refresh_token).toBe(REFRESH_INITIAL);
+
+        const profilePath = join(root.home, ".fx", "mcp.json");
+        const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+        delete profile.mcp.fixture.oauth;
+        writeFileSync(profilePath, JSON.stringify(profile));
+        const requestCountBeforeList = auth.requests.length;
+        const listed = await runFx(["mcp", "list"], {
+          cwd: root.workspace,
+          env: keychainEnv,
+          timeoutMs: 20_000,
+        });
+        expect(listed.code).toBe(0);
+        expect(listed.stderr).toBe("");
+        expect(listed.stdout).toMatch(/fixture[\s\S]{0,240}auth=authenticated/);
+        expect(auth.requests).toHaveLength(requestCountBeforeList);
 
         gateway.stop();
         gateway = startFakeGateway([

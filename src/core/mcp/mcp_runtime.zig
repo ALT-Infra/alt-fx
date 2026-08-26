@@ -3141,7 +3141,7 @@ fn snapshotServerHealthBeforeDiscoveryPublication(
         .connecting
     else
         .disconnected;
-    const authentication = configuredAuthenticationState(server);
+    const authentication = serverAuthenticationState(server);
     const failure = try healthFailureForState(
         alloc,
         server.config.required,
@@ -7192,6 +7192,17 @@ pub const McpRuntime = struct {
         retired.deinit(self.alloc);
     }
 
+    pub fn loadStoredCredentialsForHealthSnapshot(self: *McpRuntime) !void {
+        if (self.discovery_state.load(.acquire) != .idle) {
+            return error.McpDiscoveryInProgress;
+        }
+        for (self.servers.items) |*server| {
+            try loadStoredCredentials(self.alloc, server, .{
+                .lifecycle_cancel_flag = &self.retiring,
+            });
+        }
+    }
+
     pub fn listServersAndTools(self: *McpRuntime, alloc: Allocator) ![]u8 {
         var snapshot = try self.snapshotHealth(alloc, clockMillis());
         defer snapshot.deinit(alloc);
@@ -10607,11 +10618,11 @@ fn parseServerIdentity(value: std.json.Value) !ParsedServerIdentity {
     if (info != .object) return error.McpInvalidResult;
     const name = if (info.object.get("name")) |field| blk: {
         if (field != .string) return error.McpInvalidResult;
-        break :blk field.string;
+        break :blk if (field.string.len > 0) field.string else null;
     } else null;
     const version = if (info.object.get("version")) |field| blk: {
         if (field != .string) return error.McpInvalidResult;
-        break :blk field.string;
+        break :blk if (field.string.len > 0) field.string else null;
     } else null;
     return .{ .name = name, .version = version };
 }
@@ -16539,6 +16550,11 @@ test "server identity projection preserves independently optional modern fields"
             .version = "2.0.0",
         },
         .{
+            .json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"_meta\":{\"io.modelcontextprotocol/serverInfo\":{\"name\":\"AWSKnowledgeMCP\",\"version\":\"\"}}}}",
+            .name = "AWSKnowledgeMCP",
+            .version = null,
+        },
+        .{
             .json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"serverInfo\":{\"name\":\"name-only\"}}}",
             .name = "name-only",
             .version = null,
@@ -17641,7 +17657,7 @@ fn checkHealthSnapshotAllocationFailures(alloc: Allocator) !void {
     defer snapshot.deinit(alloc);
 }
 
-test "MCP health reads only immutable configuration during discovery" {
+test "MCP health reads only lock-free state during discovery" {
     const alloc = std.testing.allocator;
     var runtime = McpRuntime.init(alloc);
     defer runtime.deinit();
@@ -17679,7 +17695,7 @@ test "MCP health reads only immutable configuration during discovery" {
     try std.testing.expectEqual(@as(usize, 2), loading.servers.len);
     const loading_active = loading.servers[0];
     try std.testing.expectEqual(health.ConnectionState.connecting, loading_active.connection);
-    try std.testing.expectEqual(health.AuthenticationState.none, loading_active.authentication);
+    try std.testing.expectEqual(health.AuthenticationState.authenticated, loading_active.authentication);
     try std.testing.expectEqual(@as(?[]u8, null), loading_active.negotiated_name);
     try std.testing.expectEqual(@as(?[]u8, null), loading_active.negotiated_version);
     try std.testing.expectEqual(@as(?[]u8, null), loading_active.protocol_version);
