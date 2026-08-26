@@ -2760,7 +2760,10 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await waitForModelsMenu(session, 4);
       expect(await session.captureFullScrollback()).not.toContain(`● Model: ${currentModel}`);
       await session.sendKeys("Escape");
-      await session.waitForPane(hasEmptyComposer, 5_000);
+      await session.waitForPane(
+        (current) => hasEmptyComposer(current) && !current.includes("Tab Provider"),
+        5_000,
+      );
 
       await session.sendLiteralText("/model");
       await session.sendKeys("Tab");
