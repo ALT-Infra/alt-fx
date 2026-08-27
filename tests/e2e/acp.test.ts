@@ -2194,7 +2194,7 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "ACP session/new loads pending workspace MCP without persisting approval",
+    "ACP skips pending workspace MCP and loads it after explicit trust",
     async () => {
       const root = createIsolatedRoot("fx-acp-project-mcp-");
       const pidPath = join(root.root, "project-mcp.pid");
@@ -2222,16 +2222,17 @@ describe("acp: model-independent", () => {
         fakeGatewayToolCall("call_project", MCP_TOOL_NAME, { text: "acp" }),
         finalText("ACP project MCP complete"),
       ]);
+      const env = {
+        ...fakeGatewayEnv(root, gateway),
+        ACP_PROJECT_COMMAND: process.execPath,
+        ACP_PROJECT_FIXTURE: MCP_STDIO_FIXTURE,
+        ACP_PROJECT_PID: pidPath,
+        ACP_PROJECT_WIRE: wirePath,
+      };
       try {
         client = await AcpClient.create({
           cwd: root.workspace,
-          env: {
-            ...fakeGatewayEnv(root, gateway),
-            ACP_PROJECT_COMMAND: process.execPath,
-            ACP_PROJECT_FIXTURE: MCP_STDIO_FIXTURE,
-            ACP_PROJECT_PID: pidPath,
-            ACP_PROJECT_WIRE: wirePath,
-          },
+          env,
         });
         await client.request("initialize", { protocolVersion: 1 }, 1);
         const created = await client.request(
@@ -2241,7 +2242,27 @@ describe("acp: model-independent", () => {
         ) as any;
         expect(created.error).toBeUndefined();
         await client.readLine();
-        await client.request("session/set_mode", { modeId: "code" }, 3);
+        expect(existsSync(pidPath)).toBe(false);
+        expect(existsSync(wirePath)).toBe(false);
+        await client.close();
+        client = null;
+
+        const trusted = await runFx(
+          ["mcp", "trust", "approve", "fixture"],
+          { cwd: root.workspace, env },
+        );
+        expect(trusted.code).toBe(0);
+
+        client = await AcpClient.create({ cwd: root.workspace, env });
+        await client.request("initialize", { protocolVersion: 1 }, 10);
+        const trustedSession = await client.request(
+          "session/new",
+          { cwd: root.workspace, mcpServers: [] },
+          11,
+        ) as any;
+        expect(trustedSession.error).toBeUndefined();
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "code" }, 12);
         await runMcpToolPrompt(
           client,
           gateway,
@@ -2250,14 +2271,9 @@ describe("acp: model-independent", () => {
         );
         expect(existsSync(pidPath)).toBe(true);
         const settingsPath = join(root.home, ".fx", "settings.json");
-        if (existsSync(settingsPath)) {
-          const settings = readFileSync(settingsPath, "utf8");
-          for (const key of [
-            "enabledMcpjsonServers",
-            "disabledMcpjsonServers",
-            "enableAllProjectMcpServers",
-          ]) expect(settings).not.toContain(key);
-        }
+        expect(readFileSync(settingsPath, "utf8")).toContain(
+          "enabledMcpjsonServers",
+        );
       } finally {
         await client?.close();
         client = null;
@@ -2324,7 +2340,7 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "ACP session/new keeps rejected and unavailable workspace MCP optional",
+    "ACP session/new keeps rejected and pending workspace MCP inert",
     async () => {
       const root = createIsolatedRoot("fx-acp-project-mcp-optional-");
       const pidPath = join(root.root, "rejected-project-mcp.pid");
@@ -2376,7 +2392,7 @@ describe("acp: model-independent", () => {
         expect(created.error).toBeUndefined();
         expect(created.result.sessionId).toBeTruthy();
         expect(existsSync(pidPath)).toBe(false);
-        expect(unavailableAttempts).toBe(1);
+        expect(unavailableAttempts).toBe(0);
       } finally {
         await client?.close();
         client = null;
@@ -2394,6 +2410,14 @@ describe("acp: model-independent", () => {
       const root = createIsolatedRoot("fx-acp-project-mcp-reduce-");
       const pidPath = join(root.root, "active-project-mcp.pid");
       const wirePath = join(root.root, "active-project-mcp-wire.jsonl");
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        JSON.stringify({
+          workspaces: {
+            [root.workspace]: { enabledMcpjsonServers: ["fixture"] },
+          },
+        }),
+      );
       writeFileSync(
         join(root.workspace, ".mcp.json"),
         JSON.stringify({
@@ -2482,6 +2506,14 @@ describe("acp: model-independent", () => {
       const root = createIsolatedRoot("fx-acp-project-mcp-new-reduce-");
       const pidPath = join(root.root, "active-project-mcp.pid");
       writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        JSON.stringify({
+          workspaces: {
+            [root.workspace]: { enabledMcpjsonServers: ["fixture"] },
+          },
+        }),
+      );
+      writeFileSync(
         join(root.workspace, ".mcp.json"),
         JSON.stringify({
           mcpServers: {
@@ -2547,6 +2579,14 @@ describe("acp: model-independent", () => {
       const root = createIsolatedRoot("fx-acp-project-mcp-subagent-reduce-");
       const pidPath = join(root.root, "subagent-project-mcp.pid");
       const wirePath = join(root.root, "subagent-project-mcp-wire.jsonl");
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        JSON.stringify({
+          workspaces: {
+            [root.workspace]: { enabledMcpjsonServers: ["fixture"] },
+          },
+        }),
+      );
       writeFileSync(
         join(root.workspace, ".mcp.json"),
         JSON.stringify({
