@@ -357,6 +357,9 @@ pub fn Runtime(comptime App: type) type {
                     },
                 );
                 try app.writeTranscriptClassified(welcome_message, true, .welcome);
+                if (comptime @hasDecl(App, "presentProjectMcpPrompt")) {
+                    try app.presentProjectMcpPrompt();
+                }
             }
             if (app.skills.diagnostics.len > 0) {
                 var notice_writer: std.Io.Writer.Allocating = .init(app.alloc);

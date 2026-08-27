@@ -27,7 +27,8 @@ pub fn decide(
         return switch (admission) {
             .rejected => .disabled,
             .pending => switch (phase) {
-                .all, .ask_startup, .acp_startup => .connect,
+                .all => .disabled,
+                .ask_startup, .acp_startup => .connect,
                 .ask_deferred => .deferred,
             },
             .approved => switch (phase) {
@@ -76,7 +77,7 @@ test "workspace admission is phase derived and reject is absorbing" {
         acp_startup: Decision,
     }{
         .{ .admission = .approved, .all = .connect, .ask_startup = .connect, .ask_deferred = .deferred, .acp_startup = .connect },
-        .{ .admission = .pending, .all = .connect, .ask_startup = .connect, .ask_deferred = .deferred, .acp_startup = .connect },
+        .{ .admission = .pending, .all = .disabled, .ask_startup = .connect, .ask_deferred = .deferred, .acp_startup = .connect },
         .{ .admission = .rejected, .all = .disabled, .ask_startup = .disabled, .ask_deferred = .disabled, .acp_startup = .disabled },
     };
     for (cases) |case| {

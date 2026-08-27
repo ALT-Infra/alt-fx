@@ -808,7 +808,6 @@ pub const PermissionScope = settings_store.PermissionScope;
 pub const StatuslineItem = settings_store.StatuslineItem;
 pub const UserSettingsPatch = settings_store.UserSettingsPatch;
 pub const WorkspaceDirectoryMutation = settings_store.WorkspaceDirectoryMutation;
-pub const ProjectMcpMutation = settings_store.ProjectMcpMutation;
 pub const CommitOutcome = settings_store.CommitOutcome;
 pub const LegacyCleanup = settings_store.LegacyCleanup;
 

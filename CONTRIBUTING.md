@@ -182,8 +182,8 @@ Workspace `command`, `args`, `env`, and HTTP header values expand `${VAR}` and
 `${VAR:-default}` from the fx process environment. Missing required variables
 leave that server unloaded and appear in `/mcp list` without exposing values.
 
-Interactive sessions connect pending workspace servers for protocol and
-catalog discovery, then request project trust on the first tool use. Pending
+Interactive sessions keep pending workspace servers disconnected and request
+project trust before any project-defined process or network effect. Pending
 resource, prompt, completion, and authentication commands require explicit
 `/mcp trust approve <name>` and a retry. Rejected servers remain disconnected.
 Choices live only in profile `settings.json` under the canonical workspace key,

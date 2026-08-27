@@ -67,6 +67,7 @@ pub const WorkspaceDiagnosticCause = enum {
     servers_must_be_object,
     invalid_entry,
     missing_environment_variable,
+    environment_expansion_limit_exceeded,
     approved_rejected_overlap,
 };
 
@@ -142,7 +143,7 @@ pub const WorkspaceParseResult = struct {
     }
 };
 
-pub const ProfileDiagnosticCause = mcp_contract.ProfileConfigWarningCause;
+const ProfileDiagnosticCause = mcp_contract.ProfileConfigWarningCause;
 pub const ProfileDiagnostic = mcp_contract.ProfileConfigWarning;
 
 pub const ProfileParseResult = struct {
@@ -343,7 +344,7 @@ fn isSuspiciousNormalizedKey(raw: []const u8) bool {
         std.mem.eql(u8, key, "servers");
 }
 
-pub fn parseWorkspaceJson(
+fn parseWorkspaceJson(
     alloc: Allocator,
     json_text: []const u8,
     scope: mcp_contract.ConfigScope,
@@ -390,6 +391,7 @@ fn parseWorkspaceJsonInternal(
         return result;
     }
 
+    var expansion_budget = WorkspaceExpansionBudget.init();
     var it = servers.object.iterator();
     while (it.next()) |entry| {
         const admission = resolveAdmission(entry.key_ptr.*, choices);
@@ -414,7 +416,8 @@ fn parseWorkspaceJsonInternal(
         };
         if (environment) |values| {
             var mutable = config;
-            if (try expandWorkspaceConfig(alloc, &mutable, values)) |failure| {
+            var entry_budget = expansion_budget;
+            if (try expandWorkspaceConfig(alloc, &mutable, values, &entry_budget)) |failure| {
                 defer mutable.deinit(alloc);
                 const server_name = try alloc.dupe(u8, entry.key_ptr.*);
                 errdefer alloc.free(server_name);
@@ -434,6 +437,12 @@ fn parseWorkspaceJsonInternal(
                             .cause = .invalid_entry,
                         });
                     },
+                    .limit_exceeded => {
+                        try result.diagnostics.append(alloc, .{
+                            .server_name = server_name,
+                            .cause = .environment_expansion_limit_exceeded,
+                        });
+                    },
                 }
                 continue;
             }
@@ -441,6 +450,7 @@ fn parseWorkspaceJsonInternal(
                 mutable.deinit(alloc);
                 return err;
             };
+            expansion_budget = entry_budget;
             continue;
         }
         result.configs.append(alloc, config) catch |err| {
@@ -454,6 +464,21 @@ fn parseWorkspaceJsonInternal(
 
 const max_rendered_environment_name_bytes: usize = 128;
 const max_expanded_workspace_value_bytes: usize = 1024 * 1024;
+const max_expanded_workspace_total_bytes: usize = 1024 * 1024;
+
+const WorkspaceExpansionBudget = struct {
+    remaining: usize,
+
+    fn init() WorkspaceExpansionBudget {
+        return .{ .remaining = max_expanded_workspace_total_bytes };
+    }
+
+    fn consume(self: *WorkspaceExpansionBudget, byte_count: usize) bool {
+        if (byte_count > self.remaining) return false;
+        self.remaining -= byte_count;
+        return true;
+    }
+};
 
 const WorkspaceTemplateExpansion = union(enum) {
     expanded: []u8,
@@ -510,7 +535,11 @@ fn appendExpandedBytes(
     output: *std.ArrayList(u8),
     bytes: []const u8,
 ) Allocator.Error!bool {
-    if (bytes.len > max_expanded_workspace_value_bytes - output.items.len) return false;
+    if (output.items.len > max_expanded_workspace_value_bytes or
+        bytes.len > max_expanded_workspace_value_bytes - output.items.len)
+    {
+        return false;
+    }
     try output.appendSlice(alloc, bytes);
     return true;
 }
@@ -521,30 +550,32 @@ const WorkspaceExpansionFailure = union(enum) {
         variable_name: []u8,
     },
     invalid,
+    limit_exceeded,
 };
 
 fn expandWorkspaceConfig(
     alloc: Allocator,
     config: *McpServerConfig,
     environment: *const std.process.Environ.Map,
+    budget: *WorkspaceExpansionBudget,
 ) Allocator.Error!?WorkspaceExpansionFailure {
     if (config.command) |*command| {
-        if (try expandOwnedConstWorkspaceValue(alloc, command, environment, .command)) |failure| {
+        if (try expandOwnedConstWorkspaceValue(alloc, command, environment, .command, budget)) |failure| {
             return failure;
         }
     }
     for (@constCast(config.args)) |*argument| {
-        if (try expandOwnedConstWorkspaceValue(alloc, argument, environment, .argument)) |failure| {
+        if (try expandOwnedConstWorkspaceValue(alloc, argument, environment, .argument, budget)) |failure| {
             return failure;
         }
     }
     for (config.env) |*entry| {
-        if (try expandOwnedMutableWorkspaceValue(alloc, &entry.value, environment, .environment)) |failure| {
+        if (try expandOwnedMutableWorkspaceValue(alloc, &entry.value, environment, .environment, budget)) |failure| {
             return failure;
         }
     }
     for (config.headers) |*header| {
-        if (try expandOwnedMutableWorkspaceValue(alloc, &header.value, environment, .http_header)) |failure| {
+        if (try expandOwnedMutableWorkspaceValue(alloc, &header.value, environment, .http_header, budget)) |failure| {
             return failure;
         }
     }
@@ -557,10 +588,15 @@ fn expandOwnedConstWorkspaceValue(
     value: *[]const u8,
     environment: *const std.process.Environ.Map,
     field: WorkspaceEnvironmentField,
+    budget: *WorkspaceExpansionBudget,
 ) Allocator.Error!?WorkspaceExpansionFailure {
     var expansion = try expandWorkspaceTemplate(alloc, value.*, environment);
     switch (expansion) {
         .expanded => |expanded| {
+            if (!budget.consume(expanded.len)) {
+                expansion.deinit(alloc);
+                return .limit_exceeded;
+            }
             alloc.free(value.*);
             value.* = expanded;
             expansion = undefined;
@@ -582,6 +618,7 @@ fn expandOwnedMutableWorkspaceValue(
     value: *[]u8,
     environment: *const std.process.Environ.Map,
     field: WorkspaceEnvironmentField,
+    budget: *WorkspaceExpansionBudget,
 ) Allocator.Error!?WorkspaceExpansionFailure {
     var borrowed: []const u8 = value.*;
     const failure = try expandOwnedConstWorkspaceValue(
@@ -589,6 +626,7 @@ fn expandOwnedMutableWorkspaceValue(
         &borrowed,
         environment,
         field,
+        budget,
     );
     value.* = @constCast(borrowed);
     return failure;
@@ -696,7 +734,7 @@ pub fn applyAction(
     };
 }
 
-pub fn resolveAdmission(
+fn resolveAdmission(
     name: []const u8,
     choices: ProjectMcpChoices,
 ) mcp_contract.WorkspaceAdmission {
@@ -1426,6 +1464,34 @@ test "workspace environment diagnostics isolate entries and profile values stay 
     try std.testing.expectEqualStrings("${COMMAND}", profile.configs.items[0].command.?);
 }
 
+test "workspace environment expansion enforces one aggregate file budget" {
+    const alloc = std.testing.allocator;
+    var environment = std.process.Environ.Map.init(alloc);
+    defer environment.deinit();
+    const large = try alloc.alloc(u8, 600 * 1024);
+    defer alloc.free(large);
+    @memset(large, 'x');
+    try environment.put("LARGE", large);
+
+    var workspace = try parseWorkspaceJsonWithEnvironment(
+        alloc,
+        "{\"mcpServers\":{\"first\":{\"command\":\"${LARGE}\"},\"second\":{\"command\":\"${LARGE}\"}}}",
+        .workspace,
+        .{},
+        &environment,
+    );
+    defer workspace.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), workspace.configs.items.len);
+    try std.testing.expectEqualStrings("first", workspace.configs.items[0].name);
+    try std.testing.expectEqual(@as(usize, 1), workspace.diagnostics.items.len);
+    try std.testing.expectEqual(
+        WorkspaceDiagnosticCause.environment_expansion_limit_exceeded,
+        workspace.diagnostics.items[0].cause,
+    );
+    try std.testing.expectEqualStrings("second", workspace.diagnostics.items[0].server_name.?);
+}
+
 test "workspace Authorization header expansion does not broaden profile headers" {
     const alloc = std.testing.allocator;
     var environment = std.process.Environ.Map.init(alloc);
@@ -1561,9 +1627,8 @@ test "authority projection detects only removed workspace names" {
     };
     const interactive = try authorityNames(alloc, &configs, .all);
     defer freeOwnedStrings(alloc, interactive);
-    try std.testing.expectEqual(@as(usize, 2), interactive.len);
+    try std.testing.expectEqual(@as(usize, 1), interactive.len);
     try std.testing.expectEqualStrings("approved", interactive[0]);
-    try std.testing.expectEqualStrings("pending", interactive[1]);
     const headless = try authorityNames(alloc, &configs, .acp_startup);
     defer freeOwnedStrings(alloc, headless);
     try std.testing.expectEqual(@as(usize, 2), headless.len);

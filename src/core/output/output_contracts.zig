@@ -1344,7 +1344,11 @@ pub const DoctorSnapshot = struct {
         if (self.mcp) |mcp| try mcp.writeText(&out.writer, alloc, "doctor");
 
         for (self.checks) |entry| {
-            try out.writer.print("[{s}] {s}: {s}\n", .{ checkStatusLabel(entry.status), entry.name, entry.detail });
+            try out.writer.print("[{s}] ", .{checkStatusLabel(entry.status)});
+            try writeTerminalSafe(&out.writer, alloc, entry.name);
+            try out.writer.writeAll(": ");
+            try writeTerminalSafe(&out.writer, alloc, entry.detail);
+            try out.writer.writeByte('\n');
         }
 
         return try out.toOwnedSlice();
@@ -2918,6 +2922,38 @@ test "core doctor snapshot text and json stay stable" {
         "{\"kind\":\"doctor\",\"ok_count\":1,\"warn_count\":1,\"fail_count\":0,\"workspace\":\"/tmp/fx\",\"model\":\"alpha\",\"auth\":\"AI_GATEWAY_API_KEY\",\"auth_refreshable\":false,\"permission_mode\":\"ask\",\"agent_step_limit\":24,\"checks\":[{\"name\":\"auth\",\"status\":\"ok\",\"detail\":\"AI_GATEWAY_API_KEY is configured\"},{\"name\":\"gh\",\"status\":\"warn\",\"detail\":\"GitHub CLI not found in PATH\"}]}",
         json,
     );
+}
+
+test "doctor text escapes hostile check details while json preserves data" {
+    const checks = [_]doctor_runtime.Check{.{
+        .name = "mcp_config",
+        .status = .warn,
+        .detail = "warning key=bad\n\x1b]0;pwn\x07",
+    }};
+    const snapshot = DoctorSnapshot{
+        .workspace_root = "/tmp/fx",
+        .model = "alpha",
+        .permission_mode = .ask,
+        .agent_step_limit = 24,
+        .checks = &checks,
+    };
+
+    const text = try snapshot.renderText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.find(
+        u8,
+        text,
+        "warning key=bad\\x0a\\x1b]0;pwn\\x07",
+    ) != null);
+    try std.testing.expect(std.mem.findScalar(u8, text, 0x1b) == null);
+
+    const json = try snapshot.renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.find(
+        u8,
+        json,
+        "\"detail\":\"warning key=bad\\n\\u001b]0;pwn\\u0007\"",
+    ) != null);
 }
 
 test "background output contracts import background store" {

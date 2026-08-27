@@ -4953,6 +4953,19 @@ pub const McpRuntime = struct {
         return names.toOwnedSlice(alloc);
     }
 
+    pub fn firstPendingWorkspaceName(
+        self: *const McpRuntime,
+        alloc: Allocator,
+    ) !?[]u8 {
+        for (self.servers.items) |server| {
+            if (!server.config.enabled or
+                server.config.source != .workspace or
+                server.config.workspace_admission != .pending) continue;
+            return @as(?[]u8, try alloc.dupe(u8, server.config.name));
+        }
+        return null;
+    }
+
     pub fn takeWorkspaceDiagnostics(
         self: *McpRuntime,
         diagnostics: *std.ArrayList(project_config.WorkspaceDiagnostic),

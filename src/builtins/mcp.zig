@@ -746,25 +746,6 @@ pub fn loadConfigFromPath(alloc: Allocator, path: []const u8) !std.ArrayList(Mcp
     };
 }
 
-fn addOrReplaceLocalServer(alloc: Allocator, path: []const u8, name: []const u8, command: []const []const u8) !void {
-    if (command.len == 0) return error.McpMissingCommand;
-    if (!command_provider_contract.isValidServerName(name)) return error.McpInvalidServerName;
-    _ = try addOrReplaceServer(
-        alloc,
-        path,
-        try configFromCommandParts(alloc, name, command[0], command[1..]),
-    );
-}
-
-fn addOrReplaceHttpServer(
-    alloc: Allocator,
-    path: []const u8,
-    name: []const u8,
-    url: []const u8,
-) !void {
-    _ = try addProfileServerToPath(alloc, path, try command_provider_contract.parseAddIntent(&.{ "--transport", "http", name, url }));
-}
-
 fn addProfileServerToPath(
     alloc: Allocator,
     path: []const u8,
@@ -2345,7 +2326,7 @@ test "invalid stdio lifecycle policy reports its field" {
     }
 }
 
-test "addOrReplaceLocalServer roundtrip and remove" {
+test "addProfileServerToPath roundtrips local replacement and remove" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2356,7 +2337,11 @@ test "addOrReplaceLocalServer roundtrip and remove" {
     const path = try configPathFromHome(alloc, home);
     defer alloc.free(path);
 
-    try addOrReplaceLocalServer(alloc, path, "everything", &.{ "npx", "-y", "@modelcontextprotocol/server-everything" });
+    _ = try addProfileServerToPath(
+        alloc,
+        path,
+        try command_provider_contract.parseAddIntent(&.{ "everything", "npx", "-y", "@modelcontextprotocol/server-everything" }),
+    );
 
     var configs = try loadConfigFromPath(alloc, path);
     defer freeConfigs(alloc, &configs);
@@ -2364,7 +2349,11 @@ test "addOrReplaceLocalServer roundtrip and remove" {
     try std.testing.expectEqualStrings("everything", configs.items[0].name);
     try std.testing.expectEqualStrings("npx", try configs.items[0].stdioCommand());
 
-    try addOrReplaceLocalServer(alloc, path, "everything", &.{ "node", "server.js" });
+    _ = try addProfileServerToPath(
+        alloc,
+        path,
+        try command_provider_contract.parseAddIntent(&.{ "everything", "node", "server.js" }),
+    );
 
     var replaced = try loadConfigFromPath(alloc, path);
     defer freeConfigs(alloc, &replaced);
@@ -2379,20 +2368,13 @@ test "addOrReplaceLocalServer roundtrip and remove" {
     try std.testing.expectEqual(@as(usize, 0), after.items.len);
 }
 
-test "addOrReplaceLocalServer rejects invalid server names" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const root = try tmpRoot(alloc, tmp);
-    defer alloc.free(root);
-    const path = try tmpPath(alloc, root, "mcp.json");
-    defer alloc.free(path);
-
-    try std.testing.expectError(error.McpInvalidServerName, addOrReplaceLocalServer(alloc, path, "", &.{"node"}));
-    try std.testing.expectError(error.McpInvalidServerName, addOrReplaceLocalServer(alloc, path, "bad/name", &.{"node"}));
-    try std.testing.expectError(error.McpInvalidServerName, addOrReplaceLocalServer(alloc, path, "bad name", &.{"node"}));
-    try std.testing.expectError(error.McpInvalidServerName, addOrReplaceLocalServer(alloc, path, "bad.name", &.{"node"}));
+test "MCP add intent rejects invalid server names" {
+    for ([_][]const u8{ "", "bad/name", "bad name", "bad.name" }) |name| {
+        try std.testing.expectError(
+            error.McpInvalidServerName,
+            command_provider_contract.parseAddIntent(&.{ name, "node" }),
+        );
+    }
 }
 
 test "removeServerFromPath remains permissive for odd legacy names" {

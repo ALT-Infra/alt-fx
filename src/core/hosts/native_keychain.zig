@@ -41,12 +41,40 @@ pub fn isDisabled() bool {
 }
 
 pub fn userDefaultKeychainAvailable(alloc: std.mem.Allocator) Error!bool {
+    return userDefaultKeychainAvailableControlled(alloc, null);
+}
+
+pub fn userDefaultKeychainAvailableCancellable(
+    alloc: std.mem.Allocator,
+    cancel_flag: *const std.atomic.Value(bool),
+) Error!bool {
+    return userDefaultKeychainAvailableControlled(alloc, cancel_flag);
+}
+
+fn userDefaultKeychainAvailableControlled(
+    alloc: std.mem.Allocator,
+    cancel_flag: ?*const std.atomic.Value(bool),
+) Error!bool {
     if (!isAvailable()) return false;
-    const result = std.process.run(alloc, io_mod.getIo(), .{
-        .argv = &.{ "/usr/bin/security", "default-keychain", "-d", "user" },
-        .stdout_limit = .limited(4096),
-        .stderr_limit = .limited(4096),
-    }) catch |err| {
+    return userDefaultKeychainAvailableForCommand(
+        alloc,
+        &.{ "/usr/bin/security", "default-keychain", "-d", "user" },
+        cancel_flag,
+    );
+}
+
+fn userDefaultKeychainAvailableForCommand(
+    alloc: std.mem.Allocator,
+    argv: []const []const u8,
+    cancel_flag: ?*const std.atomic.Value(bool),
+) Error!bool {
+    const result = runMcpKeychainProcess(
+        alloc,
+        argv,
+        cancel_flag,
+        .limited(4096),
+    ) catch |err| {
+        if (err == error.Cancelled) return error.Cancelled;
         debug_trace.logf("keychain", "availability failed step=spawn err={s}", .{@errorName(err)});
         return error.KeychainReadFailed;
     };
@@ -767,6 +795,35 @@ test "cancellable MCP Keychain runner interrupts and reaps a stalled child" {
             &.{ "/bin/sh", "-c", "exec sleep 60" },
             &cancel,
             .limited(16),
+        ),
+    );
+    thread.join();
+    try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1_000);
+}
+
+test "default Keychain availability probe is cancellable" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    const Canceller = struct {
+        flag: *std.atomic.Value(bool),
+
+        fn run(self: *@This()) void {
+            io_mod.sleep(25 * std.time.ns_per_ms);
+            self.flag.store(true, .release);
+        }
+    };
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var canceller = Canceller{ .flag = &cancel };
+    const thread = try std.Thread.spawn(.{}, Canceller.run, .{&canceller});
+    const started_ms = io_mod.milliTimestamp();
+    try std.testing.expectError(
+        error.Cancelled,
+        userDefaultKeychainAvailableForCommand(
+            std.testing.allocator,
+            &.{ "/bin/sh", "-c", "exec sleep 60" },
+            &cancel,
         ),
     );
     thread.join();

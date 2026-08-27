@@ -104,12 +104,17 @@ fn selectStorageBackend(
     return .profile_file;
 }
 
-fn storageBackend(alloc: Allocator) !StorageBackend {
+fn storageBackend(
+    alloc: Allocator,
+    cancel_flag: ?*const std.atomic.Value(bool),
+) !StorageBackend {
     const disabled = native_keychain.isDisabled();
-    const available = if (builtin.os.tag == .macos and !disabled)
-        try native_keychain.userDefaultKeychainAvailable(alloc)
-    else
-        false;
+    const available = if (builtin.os.tag == .macos and !disabled) blk: {
+        break :blk if (cancel_flag) |flag|
+            try native_keychain.userDefaultKeychainAvailableCancellable(alloc, flag)
+        else
+            try native_keychain.userDefaultKeychainAvailable(alloc);
+    } else false;
     return selectStorageBackend(builtin.os.tag, disabled, available);
 }
 
@@ -217,7 +222,7 @@ fn loadControlled(
     configured_issuer: ?[]const u8,
     cancel_flag: ?*const std.atomic.Value(bool),
 ) !?mcp_auth.Credentials {
-    const backend = try storageBackend(alloc);
+    const backend = try storageBackend(alloc, cancel_flag);
     var locked = (try openLockedDirForReadControlled(
         backend,
         cancel_flag,
@@ -282,7 +287,7 @@ pub fn save(
     server_identity: []const u8,
     credentials: mcp_auth.Credentials,
 ) !SaveResult {
-    const backend = try storageBackend(alloc);
+    const backend = try storageBackend(alloc, null);
     var locked = try openOrCreateLockedDir();
     defer locked.deinit();
     var store = try loadStore(alloc, &locked.dir, backend, native_keychain_backend);
@@ -314,7 +319,7 @@ pub fn delete(
     server_identity: []const u8,
     endpoint: []const u8,
 ) !DeleteResult {
-    const backend = try storageBackend(alloc);
+    const backend = try storageBackend(alloc, null);
     var locked = (try openLockedDirForRead(backend)) orelse return .{};
     defer locked.deinit();
     var store = try loadStore(alloc, &locked.dir, backend, native_keychain_backend);

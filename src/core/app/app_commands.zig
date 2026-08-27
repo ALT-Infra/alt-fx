@@ -464,6 +464,10 @@ pub fn Handlers(comptime App: type) type {
                 .tone = if (warning) .warning else .neutral,
                 .body = body,
             }, true);
+            if (comptime @hasDecl(App, "refreshProjectMcpPrompt")) {
+                try app.refreshProjectMcpPrompt();
+                try app.presentProjectMcpPrompt();
+            }
         }
 
         pub fn collectMcpAuthenticationFacts(app: *App) !void {
@@ -1227,6 +1231,9 @@ pub fn Handlers(comptime App: type) type {
             {
                 return error.McpProjectChoicesUnavailable;
             } else {
+                if (comptime @hasDecl(App, "clearProjectMcpPrompt")) {
+                    app.clearProjectMcpPrompt();
+                }
                 const reducing_requested = switch (action) {
                     .reject, .reset => true,
                     .approve, .approve_all => false,
@@ -1242,7 +1249,11 @@ pub fn Handlers(comptime App: type) type {
                 defer if (owned_notice) |notice| app.alloc.free(notice);
                 switch (attempt) {
                     .outcome => |outcome| switch (outcome) {
-                        .unchanged => {},
+                        .unchanged => {
+                            if (comptime @hasDecl(App, "refreshProjectMcpPrompt")) {
+                                try app.refreshProjectMcpPrompt();
+                            }
+                        },
                         .committed => |committed| {
                             if (committed.authority_reduced) {
                                 try app.beginMcpAuthorityReduction(true);
@@ -1265,6 +1276,9 @@ pub fn Handlers(comptime App: type) type {
                                 "Project MCP choices were not applied: {s}.",
                                 .{@errorName(failure.err)},
                             );
+                            if (comptime @hasDecl(App, "refreshProjectMcpPrompt")) {
+                                try app.refreshProjectMcpPrompt();
+                            }
                         }
                     },
                 }
@@ -1273,6 +1287,11 @@ pub fn Handlers(comptime App: type) type {
                     .tone = if (warning) .warning else .neutral,
                     .body = owned_notice orelse success_body,
                 }, true);
+                if (warning and owned_notice != null and
+                    comptime @hasDecl(App, "presentProjectMcpPrompt"))
+                {
+                    try app.presentProjectMcpPrompt();
+                }
             }
         }
 
