@@ -396,7 +396,7 @@ fn writeConnectedProvidersText(writer: *std.Io.Writer, auth: auth_runtime.Status
 }
 
 pub const McpLocalSnapshot = struct {
-    servers: []const mcp_health.ServerSnapshot = &.{},
+    servers: []const mcp_health.ConfiguredServerSnapshot = &.{},
     configuration_issues: []const mcp_health.ConfigurationIssue = &.{},
     inspection_error: ?[]const u8 = null,
 
@@ -2207,27 +2207,13 @@ test "MCP config warning renders bounded status text and JSON" {
 }
 
 test "status and doctor share a side-effect-free MCP inspection contract" {
-    const servers = [_]mcp_health.ServerSnapshot{.{
+    const servers = [_]mcp_health.ConfiguredServerSnapshot{.{
         .configured_name = @constCast("project-docs"),
-        .negotiated_name = null,
-        .negotiated_version = null,
         .source = .workspace,
         .scope = .profile,
         .workspace_admission = .pending,
         .required = false,
         .transport = .http,
-        .protocol_version = null,
-        .connection = .disconnected,
-        .authentication = .none,
-        .counts = .{},
-        .cache_freshness = .unavailable,
-        .subscription = .unavailable,
-        .runtime_generation = 1,
-        .catalog_generation = 0,
-        .retry_attempt = 0,
-        .retry_in_ms = null,
-        .last_successful_discovery_ms = null,
-        .failure = null,
     }};
     const issues = [_]mcp_health.ConfigurationIssue{.{
         .message = @constCast("broken entry was ignored"),

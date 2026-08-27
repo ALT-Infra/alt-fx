@@ -3845,7 +3845,6 @@ pub const McpRuntime = struct {
     discovery_thread: ?std.Thread = null,
     deferred_discovery_state: std.atomic.Value(DiscoveryState) = .init(.idle),
     deferred_discovery_complete: std.Io.Event = .unset,
-    interactive_project_trust: std.atomic.Value(bool) = .init(false),
 
     pub fn init(alloc: Allocator) McpRuntime {
         return .{ .alloc = alloc, .generation = allocateRuntimeGeneration() };
@@ -4966,6 +4965,15 @@ pub const McpRuntime = struct {
         return null;
     }
 
+    pub fn hasPendingWorkspace(self: *const McpRuntime) bool {
+        for (self.servers.items) |server| {
+            if (server.config.enabled and
+                server.config.source == .workspace and
+                server.config.workspace_admission == .pending) return true;
+        }
+        return false;
+    }
+
     pub fn takeWorkspaceDiagnostics(
         self: *McpRuntime,
         diagnostics: *std.ArrayList(project_config.WorkspaceDiagnostic),
@@ -5361,7 +5369,6 @@ pub const McpRuntime = struct {
         phase: startup_admission.Phase,
     ) void {
         self.tool_registry = tool_registry;
-        self.interactive_project_trust.store(phase == .all, .release);
         var used_tool_names = std.StringHashMap(void).init(self.alloc);
         defer used_tool_names.deinit();
 
@@ -5874,34 +5881,6 @@ pub const McpRuntime = struct {
 
     pub fn hasTool(self: *McpRuntime, name: []const u8) bool {
         return self.hasToolWithAccess(name, .unrestricted);
-    }
-
-    pub fn projectAdmissionForTool(
-        self: *McpRuntime,
-        alloc: Allocator,
-        name: []const u8,
-        access: tool_mcp_runtime.Access,
-    ) !?tool_mcp_runtime.ProjectToolAdmission {
-        if (self.isDiscovering()) return null;
-        var operation_access = try OperationAccessGuard.init(
-            self.alloc,
-            access,
-            self.generation,
-        );
-        defer operation_access.deinit();
-        try operation_access.authorize(.{ .tool = name });
-        self.catalog_mutex.lockSharedUncancelable(io_mod.getIo());
-        defer self.catalog_mutex.unlockShared(io_mod.getIo());
-        const match = self.lookupCallableTool(name) orelse return null;
-        if (match.server.config.source != .workspace) return null;
-        const admission = match.server.config.workspace_admission orelse
-            return error.McpConfigAdmissionMismatch;
-        return .{
-            .server_name = try alloc.dupe(u8, match.server.config.name),
-            .admission = admission,
-            .interactive_trust = self.interactive_project_trust.load(.acquire),
-            .runtime_generation = self.generation,
-        };
     }
 
     pub fn hasToolWithAccess(

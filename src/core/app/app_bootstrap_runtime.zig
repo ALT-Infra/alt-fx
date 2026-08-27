@@ -326,7 +326,7 @@ pub fn Runtime(comptime App: type) type {
                 .{ .form = true, .url = true },
             );
             if (comptime @hasDecl(App, "installInitialMcpRuntime")) {
-                try app.installInitialMcpRuntime(profile_mcp);
+                app.installInitialMcpRuntime(profile_mcp);
             } else {
                 app.mcp_runtime = profile_mcp;
             }

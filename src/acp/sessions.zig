@@ -14,6 +14,7 @@ const session_runtime = @import("../core/session/session.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
 const mcp_contract = @import("../core/mcp/mcp_contract.zig");
 const project_config = @import("../core/mcp/project_config.zig");
+const workspace_config = @import("../core/mcp/workspace_config.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const provider_set = @import("../core/gateway/provider_set.zig");
@@ -711,9 +712,10 @@ fn appendProjectMcpConfigs(
         };
     defer choices.deinit(alloc);
 
-    var workspace = try readProjectMcpConfig(
+    var workspace = try workspace_config.load(
         alloc,
         state.workspace_root,
+        .workspace,
         choices.choices,
     );
     defer workspace.deinit(alloc);
@@ -741,54 +743,6 @@ fn appendProjectMcpConfigs(
         alloc,
         &configs.items,
         &workspace.configs,
-    );
-}
-
-fn readProjectMcpConfig(
-    alloc: Allocator,
-    workspace_root: []const u8,
-    choices: project_config.ProjectMcpChoices,
-) !project_config.WorkspaceParseResult {
-    var dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), workspace_root, .{}) catch |err| switch (err) {
-        error.FileNotFound, error.NotDir => return .{},
-        else => return err,
-    };
-    defer dir.close(io_mod.getIo());
-    var file = io_mod.openExistingRegularFile(dir, ".mcp.json", .read_only) catch |err| switch (err) {
-        error.FileNotFound => return .{},
-        else => {
-            var result: project_config.WorkspaceParseResult = .{};
-            try result.diagnostics.append(alloc, .{ .cause = .invalid_entry });
-            return result;
-        },
-    };
-    defer file.close(io_mod.getIo());
-    const stat = try file.stat(io_mod.getIo());
-    if (stat.size > 1024 * 1024) {
-        var result: project_config.WorkspaceParseResult = .{};
-        try result.diagnostics.append(alloc, .{ .cause = .invalid_entry });
-        return result;
-    }
-    const bytes = io_mod.readFileToEnd(alloc, &file, 1024 * 1024) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            var result: project_config.WorkspaceParseResult = .{};
-            try result.diagnostics.append(alloc, .{ .cause = .invalid_entry });
-            return result;
-        },
-    };
-    defer alloc.free(bytes);
-    var environment = io_mod.cloneEnvironMap(alloc) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => std.process.Environ.Map.init(alloc),
-    };
-    defer environment.deinit();
-    return project_config.parseWorkspaceJsonWithEnvironment(
-        alloc,
-        bytes,
-        .workspace,
-        choices,
-        &environment,
     );
 }
 
@@ -1673,7 +1627,12 @@ test "ACP project MCP loading expands workspace environment templates" {
     try test_home.map.put("ACP_MCP_COMMAND", "node");
     try test_home.map.put("ACP_MCP_TOKEN", "secret-value");
 
-    var result = try readProjectMcpConfig(alloc, workspace_path, .{});
+    var result = try workspace_config.load(
+        alloc,
+        workspace_path,
+        .workspace,
+        .{},
+    );
     defer result.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), result.configs.items.len);
     const config = result.configs.items[0];

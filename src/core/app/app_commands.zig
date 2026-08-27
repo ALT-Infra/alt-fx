@@ -465,8 +465,7 @@ pub fn Handlers(comptime App: type) type {
                 .tone = if (warning) .warning else .neutral,
                 .body = body,
             }, true);
-            if (comptime @hasDecl(App, "refreshProjectMcpPrompt")) {
-                try app.refreshProjectMcpPrompt();
+            if (comptime @hasDecl(App, "presentProjectMcpPrompt")) {
                 try app.presentProjectMcpPrompt();
             }
         }
@@ -1352,9 +1351,6 @@ pub fn Handlers(comptime App: type) type {
             {
                 return error.McpProjectChoicesUnavailable;
             } else {
-                if (comptime @hasDecl(App, "clearProjectMcpPrompt")) {
-                    app.clearProjectMcpPrompt();
-                }
                 const reducing_requested = switch (action) {
                     .reject, .reset => true,
                     .approve, .approve_all => false,
@@ -1370,11 +1366,7 @@ pub fn Handlers(comptime App: type) type {
                 defer if (owned_notice) |notice| app.alloc.free(notice);
                 switch (attempt) {
                     .outcome => |outcome| switch (outcome) {
-                        .unchanged => {
-                            if (comptime @hasDecl(App, "refreshProjectMcpPrompt")) {
-                                try app.refreshProjectMcpPrompt();
-                            }
-                        },
+                        .unchanged => {},
                         .committed => |committed| {
                             if (committed.authority_reduced) {
                                 try app.beginMcpAuthorityReduction(true);
@@ -1397,9 +1389,6 @@ pub fn Handlers(comptime App: type) type {
                                 "Project MCP choices were not applied: {s}.",
                                 .{@errorName(failure.err)},
                             );
-                            if (comptime @hasDecl(App, "refreshProjectMcpPrompt")) {
-                                try app.refreshProjectMcpPrompt();
-                            }
                         }
                     },
                 }
@@ -1413,29 +1402,6 @@ pub fn Handlers(comptime App: type) type {
                 {
                     try app.presentProjectMcpPrompt();
                 }
-            }
-        }
-
-        pub fn approveProjectMcpForTool(
-            app: *App,
-            server_name: []const u8,
-        ) !u64 {
-            if (comptime !@hasField(App, "workspace_root") or
-                !@hasDecl(App, "reloadMcpSynchronously"))
-            {
-                return error.McpProjectChoicesUnavailable;
-            } else {
-                var attempt = config_runtime.attemptProjectMcpMutation(
-                    app.alloc,
-                    app.workspace_root,
-                    .{ .approve = server_name },
-                );
-                defer attempt.deinit(app.alloc);
-                switch (attempt) {
-                    .failure => |failure| return failure.err,
-                    .outcome => {},
-                }
-                return app.reloadMcpSynchronously();
             }
         }
 

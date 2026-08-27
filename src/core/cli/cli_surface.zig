@@ -200,6 +200,8 @@ pub const Config = struct {
     mode_registry: mode_registry.Registry,
     tool_set: tool_set_contract.ToolSet,
     inspect_mcp_profile_config: mcp_contract.InspectProfileConfigFn,
+    inspect_mcp_local_config: mcp_health.InspectLocalConfigFn =
+        mcp_health.inspectLocalConfigUnavailable,
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
     add_mcp_profile_server: mcp_command_provider.AddProfileServerFn =
         mcp_command_provider.addProfileServerUnavailable,
@@ -1109,11 +1111,8 @@ fn runNonInteractiveWithDeps(
             );
             defer startup.deinit(alloc);
             try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
-            const mcp_config_diagnostic = try cfg.inspect_mcp_profile_config(alloc);
-
-            var mcp_inspection = try inspectLocalMcp(
+            var mcp_inspection = try cfg.inspect_mcp_local_config(
                 alloc,
-                cfg,
                 startup.workspace_root,
             );
             defer mcp_inspection.deinit(alloc);
@@ -1122,8 +1121,8 @@ fn runNonInteractiveWithDeps(
                 .channel = cfg.build_channel,
                 .version = cfg.version,
                 .revision = cfg.revision,
-            }, mcp_config_diagnostic);
-            snapshot.mcp = mcp_inspection.view();
+            }, mcp_inspection.profile_diagnostic);
+            snapshot.mcp = localMcpView(&mcp_inspection);
             if (opts.format == .json) {
                 try writeStatusJsonLine(alloc, deps, snapshot);
                 return .handled_success;
@@ -1231,25 +1230,24 @@ fn runNonInteractiveWithDeps(
                 return .handled_failure;
             };
 
-            const mcp_config_diagnostic = try cfg.inspect_mcp_profile_config(alloc);
+            const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+            defer alloc.free(workspace_root);
+            var mcp_inspection = try cfg.inspect_mcp_local_config(
+                alloc,
+                workspace_root,
+            );
+            defer mcp_inspection.deinit(alloc);
             var snapshot = try doctor_runtime.collect(
                 alloc,
                 cfg.secret_store,
                 cfg.default_model,
                 cfg.default_agent_step_limit,
-                mcp_config_diagnostic,
+                mcp_inspection.profile_diagnostic,
             );
             defer snapshot.deinit(alloc);
 
-            var mcp_inspection = try inspectLocalMcp(
-                alloc,
-                cfg,
-                snapshot.workspace_root,
-            );
-            defer mcp_inspection.deinit(alloc);
-
             var output_snapshot = doctorSnapshotFromRuntime(snapshot);
-            output_snapshot.mcp = mcp_inspection.view();
+            output_snapshot.mcp = localMcpView(&mcp_inspection);
             if (opts.format == .json) {
                 try writeDoctorJsonLine(alloc, deps, output_snapshot);
                 return .handled_success;
@@ -2134,56 +2132,14 @@ const McpCommandRuntime = struct {
     }
 };
 
-const LocalMcpInspection = struct {
-    runtime: ?*mcp_runtime.McpRuntime = null,
-    snapshot: ?mcp_health.Snapshot = null,
-    inspection_error: ?[]const u8 = null,
-
-    fn deinit(self: *LocalMcpInspection, alloc: Allocator) void {
-        if (self.snapshot) |*snapshot| snapshot.deinit(alloc);
-        if (self.runtime) |runtime| {
-            runtime.deinit();
-            alloc.destroy(runtime);
-        }
-        self.* = .{};
-    }
-
-    fn view(self: *const LocalMcpInspection) output_contracts.McpLocalSnapshot {
-        const snapshot = self.snapshot orelse return .{
-            .inspection_error = self.inspection_error,
-        };
-        return .{
-            .servers = snapshot.servers,
-            .configuration_issues = snapshot.configuration_issues,
-            .inspection_error = self.inspection_error,
-        };
-    }
-};
-
-fn inspectLocalMcp(
-    alloc: Allocator,
-    cfg: Config,
-    workspace_root: []const u8,
-) !LocalMcpInspection {
-    const runtime = cfg.load_mcp_runtime(
-        alloc,
-        workspace_root,
-        .{ .form = true, .url = true },
-    ) catch |err| {
-        if (err == error.OutOfMemory) return err;
-        return .{ .inspection_error = @errorName(err) };
-    } orelse return .{};
-    var result = LocalMcpInspection{ .runtime = runtime };
-    errdefer result.deinit(alloc);
-    result.snapshot = runtime.snapshotHealth(
-        alloc,
-        @intCast(@max(io_mod.milliTimestamp(), 0)),
-    ) catch |err| {
-        if (err == error.OutOfMemory) return err;
-        result.inspection_error = @errorName(err);
-        return result;
+fn localMcpView(
+    inspection: *const mcp_health.LocalConfigInspection,
+) output_contracts.McpLocalSnapshot {
+    return .{
+        .servers = inspection.snapshot.servers,
+        .configuration_issues = inspection.snapshot.configuration_issues,
+        .inspection_error = inspection.inspection_error,
     };
-    return result;
 }
 
 fn loadMcpCommandRuntime(
@@ -5480,11 +5436,9 @@ test "status and doctor inspect MCP configuration once per command" {
     io_mod.setEnvironMap(&environ);
     defer io_mod.setEnvironMap(stable_environ);
 
-    mcp_config_inspection_calls_for_test = 0;
-    mcp_runtime_load_calls_for_test = 0;
+    mcp_local_inspection_calls_for_test = 0;
     var cfg = testConfig();
-    cfg.inspect_mcp_profile_config = failingMcpConfigInspectionForTest;
-    cfg.load_mcp_runtime = countingMcpRuntimeForTest;
+    cfg.inspect_mcp_local_config = failingMcpLocalInspectionForTest;
 
     var status_capture = CaptureOutput.init(alloc);
     defer status_capture.deinit();
@@ -5497,16 +5451,14 @@ test "status and doctor inspect MCP configuration once per command" {
         status_deps,
     );
     try std.testing.expectEqual(RunResult.handled_success, status_result);
-    try std.testing.expectEqual(@as(usize, 1), mcp_config_inspection_calls_for_test);
-    try std.testing.expectEqual(@as(usize, 1), mcp_runtime_load_calls_for_test);
+    try std.testing.expectEqual(@as(usize, 1), mcp_local_inspection_calls_for_test);
     try std.testing.expect(std.mem.find(
         u8,
         status_capture.stdout.written(),
         "\"mcp_config_error\":\"McpConfigInvalidJson\"",
     ) != null);
 
-    mcp_config_inspection_calls_for_test = 0;
-    mcp_runtime_load_calls_for_test = 0;
+    mcp_local_inspection_calls_for_test = 0;
     var doctor_capture = CaptureOutput.init(alloc);
     defer doctor_capture.deinit();
     const doctor_result = try runIfRequestedWithDeps(
@@ -5516,8 +5468,7 @@ test "status and doctor inspect MCP configuration once per command" {
         doctor_capture.deps(),
     );
     try std.testing.expectEqual(RunResult.handled_success, doctor_result);
-    try std.testing.expectEqual(@as(usize, 1), mcp_config_inspection_calls_for_test);
-    try std.testing.expectEqual(@as(usize, 1), mcp_runtime_load_calls_for_test);
+    try std.testing.expectEqual(@as(usize, 1), mcp_local_inspection_calls_for_test);
     try std.testing.expectEqual(
         @as(usize, 1),
         std.mem.count(
@@ -5716,8 +5667,7 @@ fn clearMcpConfigInspectionForTest(
     return .clear;
 }
 
-var mcp_config_inspection_calls_for_test: usize = 0;
-var mcp_runtime_load_calls_for_test: usize = 0;
+var mcp_local_inspection_calls_for_test: usize = 0;
 var mcp_profile_add_calls_for_test: usize = 0;
 var mcp_profile_remove_calls_for_test: usize = 0;
 
@@ -5768,20 +5718,18 @@ fn configuredMcpRuntimeForTest(
     return runtime;
 }
 
-fn failingMcpConfigInspectionForTest(
-    _: Allocator,
-) error{OutOfMemory}!mcp_contract.ProfileConfigDiagnostic {
-    mcp_config_inspection_calls_for_test += 1;
-    return .{ .failed = error.McpConfigInvalidJson };
-}
-
-fn countingMcpRuntimeForTest(
-    _: Allocator,
-    _: []const u8,
-    _: @import("../mcp/elicitation.zig").Capabilities,
-) !?*mcp_runtime.McpRuntime {
-    mcp_runtime_load_calls_for_test += 1;
-    return null;
+fn failingMcpLocalInspectionForTest(
+    alloc: Allocator,
+    workspace_root: []const u8,
+) error{OutOfMemory}!mcp_health.LocalConfigInspection {
+    mcp_local_inspection_calls_for_test += 1;
+    var result = try mcp_health.inspectLocalConfigUnavailable(
+        alloc,
+        workspace_root,
+    );
+    result.profile_diagnostic = .{ .failed = error.McpConfigInvalidJson };
+    result.inspection_error = "McpConfigInvalidJson";
+    return result;
 }
 
 var stable_cli_test_environ: ?*std.process.Environ.Map = null;

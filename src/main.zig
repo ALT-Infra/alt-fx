@@ -1454,9 +1454,8 @@ const App = struct {
         return true;
     }
 
-    pub fn installInitialMcpRuntime(self: *App, runtime: ?*mcp_runtime_mod.McpRuntime) !void {
+    pub fn installInitialMcpRuntime(self: *App, runtime: ?*mcp_runtime_mod.McpRuntime) void {
         self.mcp.installInitial(runtime);
-        try self.mcp.refreshProjectPrompt(self.alloc);
     }
 
     pub fn acquireMcpRuntime(self: *App) ?app_mcp_runtime.Lease {
@@ -1498,27 +1497,6 @@ const App = struct {
             self.toolRegistry(),
             @intCast(@max(io_mod.milliTimestamp(), 0)),
         );
-    }
-
-    pub fn reloadMcpSynchronously(self: *App) !u64 {
-        var outcome = try self.mcp.reload(
-            self.alloc,
-            self.workspace_root,
-            .{ .form = true, .url = true },
-            if (comptime host_target.is_wasm)
-                loadNoMcpRuntime
-            else
-                builtin_mcp.loadRuntime,
-            builtin_mcp.previewNativeWorkspaceAuthority,
-            self.toolRegistry(),
-            @intCast(@max(io_mod.milliTimestamp(), 0)),
-        );
-        defer outcome.deinit(self.alloc);
-        return switch (outcome) {
-            .published => |published| published.generation orelse
-                error.McpRuntimeUnavailable,
-            .retained_required_failure => error.McpRequiredServerUnavailable,
-        };
     }
 
     pub fn beginMcpAuthorityReduction(self: *App, rebuild: bool) !void {
@@ -1588,20 +1566,12 @@ const App = struct {
         return self.mcp.projectPromptActive();
     }
 
-    pub fn refreshProjectMcpPrompt(self: *App) !void {
-        try self.mcp.refreshProjectPrompt(self.alloc);
-    }
-
     pub fn projectMcpPromptName(self: *App, alloc: Allocator) !?[]u8 {
         return self.mcp.projectPromptName(alloc);
     }
 
-    pub fn clearProjectMcpPrompt(self: *App) void {
-        self.mcp.clearProjectPrompt(self.alloc);
-    }
-
     pub fn suppressProjectMcpPrompts(self: *App) void {
-        self.mcp.suppressProjectPrompts(self.alloc);
+        self.mcp.suppressProjectPrompts();
     }
 
     fn effectiveToolSet(self: *const App) tool_set_contract.ToolSet {
@@ -3483,6 +3453,7 @@ fn fullEntryConfig() app_entry_runtime.Config {
         .mode_registry = builtin_modes.registry,
         .tool_set = builtin_tools.advertisement_set,
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
+        .inspect_mcp_local_config = builtin_mcp.inspectLocalConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,
         .add_mcp_profile_server = builtin_mcp.addProfileServer,
         .remove_mcp_profile_server = builtin_mcp.removeProfileServer,
@@ -3520,6 +3491,7 @@ fn localEntryConfig() app_entry_runtime.Config {
         .mode_registry = builtin_modes.registry,
         .tool_set = builtin_tools.advertisement_set,
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
+        .inspect_mcp_local_config = builtin_mcp.inspectLocalConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,
         .add_mcp_profile_server = builtin_mcp.addProfileServer,
         .remove_mcp_profile_server = builtin_mcp.removeProfileServer,
@@ -3557,6 +3529,7 @@ fn emptyEntryConfig() app_entry_runtime.Config {
         .mode_registry = builtin_modes.registry,
         .tool_set = builtin_tools.advertisement_set,
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
+        .inspect_mcp_local_config = builtin_mcp.inspectLocalConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,
         .add_mcp_profile_server = builtin_mcp.addProfileServer,
         .remove_mcp_profile_server = builtin_mcp.removeProfileServer,

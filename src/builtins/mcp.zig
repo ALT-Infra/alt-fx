@@ -5,7 +5,9 @@ const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
 const command_provider_contract = @import("../core/mcp/command_provider.zig");
 const mcp_contract = @import("../core/mcp/mcp_contract.zig");
+const mcp_health = @import("../core/mcp/health.zig");
 const project_config = @import("../core/mcp/project_config.zig");
+const workspace_config = @import("../core/mcp/workspace_config.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
 const elicitation = @import("../core/mcp/elicitation.zig");
@@ -565,7 +567,7 @@ pub fn loadRuntime(
         );
     }
 
-    var workspace = try loadWorkspaceConfig(
+    var workspace = try workspace_config.load(
         alloc,
         workspace_root,
         .workspace,
@@ -604,7 +606,7 @@ pub fn previewNativeWorkspaceAuthority(
         return alloc.alloc([]u8, 0);
     };
     defer choice_load.deinit(alloc);
-    var workspace = try loadWorkspaceConfig(
+    var workspace = try workspace_config.load(
         alloc,
         workspace_root,
         .workspace,
@@ -612,55 +614,6 @@ pub fn previewNativeWorkspaceAuthority(
     );
     defer workspace.deinit(alloc);
     return project_config.authorityNames(alloc, workspace.configs.items, .all);
-}
-
-fn loadWorkspaceConfig(
-    alloc: Allocator,
-    workspace_root: []const u8,
-    scope: mcp_contract.ConfigScope,
-    choices: project_config.ProjectMcpChoices,
-) !project_config.WorkspaceParseResult {
-    var dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), workspace_root, .{}) catch |err| switch (err) {
-        error.FileNotFound, error.NotDir => return .{},
-        else => return err,
-    };
-    defer dir.close(io_mod.getIo());
-    var file = io_mod.openExistingRegularFile(dir, ".mcp.json", .read_only) catch |err| switch (err) {
-        error.FileNotFound => return .{},
-        else => {
-            var result: project_config.WorkspaceParseResult = .{};
-            try result.diagnostics.append(alloc, .{ .cause = .invalid_entry });
-            return result;
-        },
-    };
-    defer file.close(io_mod.getIo());
-    const stat = try file.stat(io_mod.getIo());
-    if (stat.size > 1024 * 1024) {
-        var result: project_config.WorkspaceParseResult = .{};
-        try result.diagnostics.append(alloc, .{ .cause = .invalid_entry });
-        return result;
-    }
-    const bytes = io_mod.readFileToEnd(alloc, &file, 1024 * 1024) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            var result: project_config.WorkspaceParseResult = .{};
-            try result.diagnostics.append(alloc, .{ .cause = .invalid_entry });
-            return result;
-        },
-    };
-    defer alloc.free(bytes);
-    var environment = io_mod.cloneEnvironMap(alloc) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => std.process.Environ.Map.init(alloc),
-    };
-    defer environment.deinit();
-    return project_config.parseWorkspaceJsonWithEnvironment(
-        alloc,
-        bytes,
-        scope,
-        choices,
-        &environment,
-    );
 }
 
 fn traceWorkspaceDiagnostics(diagnostics: []const project_config.WorkspaceDiagnostic) void {
@@ -702,6 +655,132 @@ pub fn inspectProfileConfig(
         .{ .warning = warning }
     else
         .clear;
+}
+
+pub fn inspectLocalConfig(
+    alloc: Allocator,
+    workspace_root: []const u8,
+) error{OutOfMemory}!mcp_health.LocalConfigInspection {
+    var profile: std.ArrayList(McpServerConfig) = .empty;
+    defer freeConfigs(alloc, &profile);
+    var profile_diagnostic: mcp_contract.ProfileConfigDiagnostic = .clear;
+    if (io_mod.getenv("HOME")) |home| {
+        const config_path = try configPathFromHome(alloc, home);
+        defer alloc.free(config_path);
+        var document = loadProfileDocumentFromPath(alloc, config_path) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return emptyLocalInspection(alloc, .{ .failed = err }, @errorName(err));
+        };
+        defer document.deinit(alloc);
+        profile_diagnostic = if (document.diagnostic) |warning|
+            .{ .warning = warning }
+        else
+            .clear;
+        profile = document.configs;
+        document.configs = .empty;
+    }
+
+    var choice_load = config_runtime.loadProjectMcpChoices(alloc, workspace_root) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return localInspectionFromConfigs(
+            alloc,
+            profile.items,
+            &.{},
+            profile_diagnostic,
+            null,
+        );
+    };
+    defer choice_load.deinit(alloc);
+    var workspace = workspace_config.load(
+        alloc,
+        workspace_root,
+        .workspace,
+        choice_load.choices,
+    ) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return emptyLocalInspection(
+            alloc,
+            profile_diagnostic,
+            @errorName(err),
+        );
+    };
+    defer workspace.deinit(alloc);
+    var configs = project_config.mergeNative(
+        alloc,
+        &profile,
+        &workspace.configs,
+    ) catch return error.OutOfMemory;
+    defer freeConfigs(alloc, &configs);
+    return localInspectionFromConfigs(
+        alloc,
+        configs.items,
+        workspace.diagnostics.items,
+        profile_diagnostic,
+        null,
+    );
+}
+
+fn emptyLocalInspection(
+    alloc: Allocator,
+    profile_diagnostic: mcp_contract.ProfileConfigDiagnostic,
+    inspection_error: ?[]const u8,
+) error{OutOfMemory}!mcp_health.LocalConfigInspection {
+    return localInspectionFromConfigs(
+        alloc,
+        &.{},
+        &.{},
+        profile_diagnostic,
+        inspection_error,
+    );
+}
+
+fn localInspectionFromConfigs(
+    alloc: Allocator,
+    configs: []const McpServerConfig,
+    diagnostics: []const project_config.WorkspaceDiagnostic,
+    profile_diagnostic: mcp_contract.ProfileConfigDiagnostic,
+    inspection_error: ?[]const u8,
+) error{OutOfMemory}!mcp_health.LocalConfigInspection {
+    const servers = try alloc.alloc(mcp_health.ConfiguredServerSnapshot, configs.len);
+    var servers_initialized: usize = 0;
+    errdefer {
+        for (servers[0..servers_initialized]) |*server| server.deinit(alloc);
+        alloc.free(servers);
+    }
+    for (configs, 0..) |config, index| {
+        var encoded_name = try text_utils.encodeTerminalSafe(alloc, config.name, 256);
+        servers[index] = .{
+            .configured_name = encoded_name.bytes,
+            .source = config.source,
+            .scope = config.scope,
+            .workspace_admission = config.workspace_admission,
+            .required = config.required,
+            .transport = config.transport,
+        };
+        encoded_name = undefined;
+        servers_initialized += 1;
+    }
+
+    const issues = try alloc.alloc(mcp_health.ConfigurationIssue, diagnostics.len);
+    var issues_initialized: usize = 0;
+    errdefer {
+        for (issues[0..issues_initialized]) |*issue| issue.deinit(alloc);
+        alloc.free(issues);
+    }
+    for (diagnostics, 0..) |diagnostic, index| {
+        issues[index] = .{
+            .message = try project_config.renderWorkspaceDiagnostic(alloc, diagnostic),
+        };
+        issues_initialized += 1;
+    }
+    return .{
+        .profile_diagnostic = profile_diagnostic,
+        .snapshot = .{
+            .servers = servers,
+            .configuration_issues = issues,
+        },
+        .inspection_error = inspection_error,
+    };
 }
 
 fn runtimeFromConfigs(
@@ -1327,7 +1406,7 @@ test "workspace MCP loading expands command args environment and HTTP headers" {
     try environment.map.put("MCP_COMMAND", "node");
     try environment.map.put("MCP_TOKEN", "secret-value");
 
-    var result = try loadWorkspaceConfig(
+    var result = try workspace_config.load(
         alloc,
         workspace_root,
         .workspace,

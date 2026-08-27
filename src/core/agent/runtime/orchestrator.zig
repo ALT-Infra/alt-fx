@@ -51,7 +51,6 @@ const runtime_stop_policy = @import("stop_policy.zig");
 const runtime_tool_admission = @import("tool_admission.zig");
 const runtime_interruption = @import("interruption.zig");
 const runtime_parallel_execution = @import("parallel_execution.zig");
-const runtime_project_mcp_retry = @import("project_mcp_retry.zig");
 const runtime_tool_batch = @import("tool_batch.zig");
 const model_response_recovery = @import("model_response_recovery.zig");
 const tool_mcp_runtime = @import("../../tooling/tool_mcp_runtime.zig");
@@ -1261,53 +1260,6 @@ fn appendNotExecutedToolResult(
             .increment_total = false,
             .status = .failure,
         },
-    );
-}
-
-fn appendProjectMcpRetryResult(
-    deps: *const AgentRuntimeDeps,
-    provisional_statuses: *runtime_tool_presentation.ProvisionalToolStatuses,
-    provisional_alloc: Allocator,
-    arena: Allocator,
-    turn_id: u64,
-    call: ToolCall,
-    reason: runtime_project_mcp_retry.Reason,
-    advertised_dynamic_tool_names: []const []const u8,
-    step_ctx: TraceContext,
-    within_turn_suffix: *std.ArrayList(ChatMessage),
-    completed_tool_names: *std.ArrayList([]u8),
-    batch: *runtime_tool_batch.StepBatchState,
-) !void {
-    const output = try runtime_project_mcp_retry.renderRetryJson(
-        arena,
-        call.name,
-        reason,
-    );
-    _ = try provisional_statuses.settleAdmittedCall(
-        deps,
-        provisional_alloc,
-        arena,
-        turn_id,
-        call,
-        output,
-        advertised_dynamic_tool_names,
-    );
-    debug_trace.eventf(
-        "tool",
-        "execution_result",
-        step_ctx,
-        "call_id={s} name={s} result_kind=project_mcp_retry reason={s} transport_started=false",
-        .{ call.id, call.name, @tagName(reason) },
-    );
-    try runtime_tool_batch.appendToolResultContent(
-        arena,
-        within_turn_suffix,
-        completed_tool_names,
-        batch,
-        call,
-        output,
-        null,
-        .{ .increment_error = true },
     );
 }
 
@@ -3138,7 +3090,6 @@ fn processQueuedPromptLoop(
     var terminal_validation_retry: runtime_tool_admission.TerminalValidationRetryState = .{};
     defer terminal_validation_retry.deinit(arena);
     var malformed_arguments_retry: runtime_tool_admission.MalformedArgumentsRetryState = .{};
-    var project_mcp_retry_state: runtime_project_mcp_retry.State = .open;
     var completed_tool_names = completed_tool_names_ptr.*;
     defer completed_tool_names_ptr.* = completed_tool_names;
     var context_delivery_state: context_contract.DeliveryState = if (deps.context_enabled)
@@ -3251,44 +3202,6 @@ fn processQueuedPromptLoop(
     while (agent_steps.allowsStep(config.agent_step_limit, step)) : (step += 1) {
         current_step_index = step + 1;
         const step_ctx: TraceContext = .{ .turn_id = turn_id, .step_id = debug_trace.nextStepId(), .subagent_id = config.subagent_id };
-        if (project_mcp_retry_state == .blocked) {
-            const token = project_mcp_retry_state.blocked;
-            const action_generation = if (deps.live_tool_authority != null) live: {
-                const retry_call = ToolCall{
-                    .id = token.call_id,
-                    .name = token.tool_name,
-                    .arguments_json = token.arguments_json,
-                };
-                const resolved = resolveLiveToolAuthority(
-                    deps,
-                    arena,
-                    retry_call,
-                    config.workspace_root,
-                    selected_dynamic_tool_names.items,
-                    null,
-                ) catch break :live 0;
-                if (liveAuthorityRejectsExecution(resolved)) break :live 0;
-                break :live resolved.authority.generation;
-            } else runtime_project_mcp_retry.actionGeneration(local_grants.items);
-            const runtime_generation = if (deps.current_mcp_generation) |snapshot|
-                snapshot(deps.ctx)
-            else
-                null;
-            const retry_step = runtime_project_mcp_retry.enterModelStep(
-                &project_mcp_retry_state,
-                turn_id,
-                current_step_index,
-                runtime_generation,
-                action_generation,
-            );
-            debug_trace.eventf(
-                "mcp",
-                "project_retry_step",
-                step_ctx,
-                "origin_epoch={d} expected_epoch={d} outcome={s}",
-                .{ token.origin_epoch, token.expected_epoch, @tagName(retry_step) },
-            );
-        }
         const presentation_group_id = runtime_tool_presentation.presentationGroupForStep(
             active_presentation_group_id,
             turn_id,
@@ -5477,38 +5390,6 @@ fn processQueuedPromptLoop(
         for (prepared_tool_calls, 0..) |prepared_tool_call, tool_call_index| {
             if (tool_call_index < parallel_skip_until) continue;
             const tool_call = prepared_tool_call.call();
-            const project_tool_class: runtime_project_mcp_retry.ToolClass =
-                if (tool_mcp_runtime.isAdvertisedDynamicToolName(
-                    advertised_dynamic_tool_names,
-                    tool_call.name,
-                ))
-                    .dynamic_mcp
-                else
-                    .non_mcp;
-            switch (runtime_project_mcp_retry.decideTool(
-                project_mcp_retry_state,
-                current_step_index,
-                project_tool_class,
-            )) {
-                .execute => {},
-                .settle_origin_retry, .stale_closed => {
-                    try appendProjectMcpRetryResult(
-                        deps,
-                        &stream_ctx.provisional_statuses,
-                        stream_ctx.alloc,
-                        arena,
-                        turn_id,
-                        tool_call,
-                        .origin_step_invalidated,
-                        advertised_dynamic_tool_names,
-                        step_ctx,
-                        &within_turn_suffix,
-                        &completed_tool_names,
-                        &step_batch,
-                    );
-                    continue;
-                },
-            }
             const root_live_permission_mode = snapshotRootPermissionMode(deps);
             const root_action_permission_mode = permissionModeForAction(
                 job.permission_mode,
@@ -6765,7 +6646,6 @@ fn processQueuedPromptLoop(
                 return;
             }
             var permission_result = maybe_permission.?;
-            const project_mcp_retry = permission_result.project_mcp_retry;
             var validated_permission_generation = permission_authority_generation;
             var exact_human_approval = permission_result.human_approval;
             while (permission_result.tool_failure == null and
@@ -6846,7 +6726,6 @@ fn processQueuedPromptLoop(
                     return;
                 }
                 permission_result = maybe_revalidated.?;
-                permission_result.project_mcp_retry = project_mcp_retry;
                 if (exact_human_approval != .once) {
                     exact_human_approval = permission_result.human_approval;
                 }
@@ -7095,43 +6974,6 @@ fn processQueuedPromptLoop(
                     const target_path = try deps.permission_target_for_call(deps.ctx, arena, tool_call, advertised_dynamic_tool_names);
                     try runtime_tool_admission.applyInitialSessionGrants(deps, arena, &local_grants, config.workspace_root, tool_call, target_path);
                 }
-            }
-
-            if (permission_outcome.project_mcp_retry) |retry| {
-                const expected_epoch = std.math.add(
-                    usize,
-                    current_step_index,
-                    1,
-                ) catch return error.AgentStepOverflow;
-                project_mcp_retry_state = .{ .blocked = .{
-                    .turn_id = turn_id,
-                    .origin_epoch = current_step_index,
-                    .expected_epoch = expected_epoch,
-                    .runtime_generation = retry.runtime_generation,
-                    .action_generation = if (live_authority) |resolved|
-                        resolved.authority.generation
-                    else
-                        runtime_project_mcp_retry.actionGeneration(local_grants.items),
-                    .call_id = tool_call.id,
-                    .tool_name = tool_call.name,
-                    .arguments_json = tool_call.arguments_json,
-                    .server_name = retry.server_name,
-                } };
-                try appendProjectMcpRetryResult(
-                    deps,
-                    &stream_ctx.provisional_statuses,
-                    stream_ctx.alloc,
-                    arena,
-                    turn_id,
-                    tool_call,
-                    .approval_published,
-                    advertised_dynamic_tool_names,
-                    step_ctx,
-                    &within_turn_suffix,
-                    &completed_tool_names,
-                    &step_batch,
-                );
-                continue;
             }
 
             var one_time_execution_grants: std.ArrayList(PermissionGrant) = .empty;

@@ -284,7 +284,6 @@ pub const Approval = struct {
     identity_fingerprint: [32]u8 = [_]u8{0} ** 32,
     label: []u8,
     explanation: ?[]u8,
-    project_mcp_server: ?[]u8 = null,
     command: ?[]u8 = null,
     file: ?permission_request.FileApprovalRequest = null,
     grants: []types.PermissionGrant,
@@ -301,7 +300,6 @@ pub const Approval = struct {
         if (self.relationship) |*value| value.deinit(alloc);
         alloc.free(self.label);
         if (self.explanation) |value| alloc.free(value);
-        if (self.project_mcp_server) |value| alloc.free(value);
         if (self.command) |value| alloc.free(value);
         if (self.file) |value| {
             permission_request.deinitFileApprovalRequest(alloc, value);
@@ -325,11 +323,6 @@ pub const Approval = struct {
         errdefer alloc.free(label);
         const explanation = if (self.explanation) |value| try alloc.dupe(u8, value) else null;
         errdefer if (explanation) |value| alloc.free(value);
-        const project_mcp_server = if (self.project_mcp_server) |value|
-            try alloc.dupe(u8, value)
-        else
-            null;
-        errdefer if (project_mcp_server) |value| alloc.free(value);
         const command = if (self.command) |value| try alloc.dupe(u8, value) else null;
         errdefer if (command) |value| alloc.free(value);
         const file = if (self.file) |value|
@@ -350,7 +343,6 @@ pub const Approval = struct {
             .identity_fingerprint = self.identity_fingerprint,
             .label = label,
             .explanation = explanation,
-            .project_mcp_server = project_mcp_server,
             .command = command,
             .file = file,
             .grants = try types.dupePermissionGrantSlice(alloc, self.grants),
@@ -637,12 +629,6 @@ pub fn validateLedger(ledger: Ledger) ValidationError!void {
         validateContent(approval.label) catch return error.InvalidLedger;
         if (approval.explanation) |value| validateContent(value) catch
             return error.InvalidLedger;
-        if (approval.project_mcp_server) |value| {
-            validateContent(value) catch return error.InvalidLedger;
-            if (value.len > permission_request.max_project_mcp_server_bytes) {
-                return error.InvalidLedger;
-            }
-        }
         if (approval.command) |value| validateApprovalProjection(value) catch
             return error.InvalidLedger;
         if (approval.file) |file| {
@@ -2555,7 +2541,6 @@ pub const ApprovalInput = struct {
     prepared_fingerprint: [32]u8,
     label: []const u8,
     explanation: ?[]const u8,
-    project_mcp_server: ?[]const u8 = null,
     command: ?[]const u8 = null,
     file: ?permission_request.FileApprovalRequest = null,
     grants: []const types.PermissionGrant,
@@ -2584,7 +2569,6 @@ pub fn approvalIdentityFingerprint(input: ApprovalInput) [32]u8 {
     hash.update(&input.prepared_fingerprint);
     hashString(&hash, input.label);
     hashOptionalString(&hash, input.explanation);
-    hashOptionalString(&hash, input.project_mcp_server);
     if (input.command) |command| {
         hash.update("command-projection\x00");
         hashString(&hash, command);
@@ -2623,12 +2607,6 @@ pub fn registerApproval(
     validateContent(input.label) catch return error.InvalidApproval;
     if (input.explanation) |value| validateContent(value) catch
         return error.InvalidApproval;
-    if (input.project_mcp_server) |value| {
-        validateContent(value) catch return error.InvalidApproval;
-        if (value.len > permission_request.max_project_mcp_server_bytes) {
-            return error.InvalidApproval;
-        }
-    }
     if (input.command) |value| validateApprovalProjection(value) catch
         return error.InvalidApproval;
     if (input.file) |file| {
@@ -2694,11 +2672,6 @@ pub fn registerApproval(
     errdefer alloc.free(label);
     const explanation = if (input.explanation) |value| try alloc.dupe(u8, value) else null;
     errdefer if (explanation) |value| alloc.free(value);
-    const project_mcp_server = if (input.project_mcp_server) |value|
-        try alloc.dupe(u8, value)
-    else
-        null;
-    errdefer if (project_mcp_server) |value| alloc.free(value);
     const command = if (input.command) |value| try alloc.dupe(u8, value) else null;
     errdefer if (command) |value| alloc.free(value);
     const file = if (input.file) |value|
@@ -2724,7 +2697,6 @@ pub fn registerApproval(
         .identity_fingerprint = identity_fingerprint,
         .label = label,
         .explanation = explanation,
-        .project_mcp_server = project_mcp_server,
         .command = command,
         .file = file,
         .grants = grants,
@@ -3034,7 +3006,6 @@ pub fn preparedRequestFingerprint(request: permission_request.PermissionRequest)
         hash.update("tool-arguments-preview\x00");
         hashString(&hash, preview);
     }
-    hashOptionalString(&hash, request.project_mcp_server);
     hashOptionalString(&hash, request.command);
     hashBool(&hash, request.amendment_allowed);
     if (request.file) |file| {
@@ -3153,7 +3124,6 @@ fn approvalAsInput(approval: Approval) ApprovalInput {
         .prepared_fingerprint = approval.prepared_fingerprint,
         .label = approval.label,
         .explanation = approval.explanation,
-        .project_mcp_server = approval.project_mcp_server,
         .command = approval.command,
         .file = approval.file,
         .grants = approval.grants,

@@ -47,5 +47,4 @@ test {
     _ = @import("runtime/tests/finalization_flow.zig");
     _ = @import("runtime/orchestrator.zig");
     _ = @import("runtime/vision_contracts.zig");
-    _ = @import("runtime/project_mcp_retry.zig");
 }

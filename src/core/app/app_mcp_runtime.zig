@@ -286,7 +286,6 @@ pub const State = struct {
     runtime: ?*mcp_runtime.McpRuntime = null,
     pending_reload: ?*PendingReload = null,
     pending_authentication: ?*PendingAuthentication = null,
-    project_prompt_name: ?[]u8 = null,
     project_prompts_suppressed: bool = false,
 
     pub fn installInitial(self: *State, runtime: ?*mcp_runtime.McpRuntime) void {
@@ -294,61 +293,41 @@ pub const State = struct {
         self.runtime = runtime;
     }
 
-    pub fn refreshProjectPrompt(self: *State, alloc: Allocator) !void {
-        const next = if (self.acquire()) |lease_value| next: {
-            var lease = lease_value;
-            defer lease.deinit();
-            break :next try lease.runtime.firstPendingWorkspaceName(alloc);
-        } else null;
-        var next_owned = next;
-        errdefer if (next_owned) |name| alloc.free(name);
-
-        self.lock.lockUncancelable(io_mod.getIo());
-        defer self.lock.unlock(io_mod.getIo());
-        if (self.project_prompts_suppressed) {
-            if (next_owned) |name| alloc.free(name);
-            next_owned = null;
-        }
-        if (self.project_prompt_name) |name| alloc.free(name);
-        self.project_prompt_name = next_owned;
-        next_owned = null;
-    }
-
     pub fn projectPromptActive(self: *State) bool {
-        self.lock.lockSharedUncancelable(io_mod.getIo());
-        defer self.lock.unlockShared(io_mod.getIo());
-        return self.project_prompt_name != null and !self.project_prompts_suppressed;
+        var lease = self.acquireProjectPromptRuntime() orelse return false;
+        defer lease.deinit();
+        return lease.runtime.hasPendingWorkspace();
     }
 
     pub fn projectPromptName(self: *State, alloc: Allocator) !?[]u8 {
-        self.lock.lockSharedUncancelable(io_mod.getIo());
-        defer self.lock.unlockShared(io_mod.getIo());
-        const name = self.project_prompt_name orelse return null;
-        return @as(?[]u8, try alloc.dupe(u8, name));
+        var lease = self.acquireProjectPromptRuntime() orelse return null;
+        defer lease.deinit();
+        return lease.runtime.firstPendingWorkspaceName(alloc);
     }
 
     pub fn projectPromptDisplayName(self: *State, alloc: Allocator) !?[]u8 {
-        self.lock.lockSharedUncancelable(io_mod.getIo());
-        defer self.lock.unlockShared(io_mod.getIo());
-        const name = self.project_prompt_name orelse return null;
+        const name = (try self.projectPromptName(alloc)) orelse return null;
+        defer alloc.free(name);
         const encoded = try text_utils.encodeTerminalSafe(alloc, name, 256);
         return @as(?[]u8, encoded.bytes);
     }
 
-    pub fn clearProjectPrompt(self: *State, alloc: Allocator) void {
+    pub fn suppressProjectPrompts(self: *State) void {
         self.lock.lockUncancelable(io_mod.getIo());
         defer self.lock.unlock(io_mod.getIo());
-        if (self.project_prompt_name) |name| alloc.free(name);
-        self.project_prompt_name = null;
-    }
-
-    pub fn suppressProjectPrompts(self: *State, alloc: Allocator) void {
-        self.lock.lockUncancelable(io_mod.getIo());
-        defer self.lock.unlock(io_mod.getIo());
-        if (self.project_prompt_name) |name| alloc.free(name);
-        self.project_prompt_name = null;
         self.project_prompts_suppressed = true;
         debug_trace.logf("mcp", "project MCP approval prompts suppressed for process", .{});
+    }
+
+    fn acquireProjectPromptRuntime(self: *State) ?Lease {
+        self.lock.lockSharedUncancelable(io_mod.getIo());
+        defer self.lock.unlockShared(io_mod.getIo());
+        if (self.project_prompts_suppressed or self.pending_reload != null) {
+            return null;
+        }
+        const runtime = self.runtime orelse return null;
+        if (!runtime.acquireUse()) return null;
+        return .{ .runtime = runtime };
     }
 
     pub fn startDiscovery(self: *State, registry: tool_dispatch.Registry) void {
@@ -1037,11 +1016,8 @@ pub const State = struct {
         self.lock.lockUncancelable(io_mod.getIo());
         const previous = self.runtime;
         self.runtime = null;
-        const project_prompt_name = self.project_prompt_name;
-        self.project_prompt_name = null;
         self.lock.unlock(io_mod.getIo());
         if (previous) |runtime| destroyRuntime(alloc, runtime);
-        if (project_prompt_name) |name| alloc.free(name);
         self.* = .{};
     }
 };
@@ -1267,7 +1243,6 @@ test "project prompt display escapes repository control bytes" {
         .workspace_admission = .pending,
     });
     state.installInitial(runtime);
-    try state.refreshProjectPrompt(alloc);
     const display = (try state.projectPromptDisplayName(alloc)).?;
     defer alloc.free(display);
     try std.testing.expect(text_utils.isTerminalSafe(display));
@@ -1294,7 +1269,7 @@ test "project prompt allocation failure releases the runtime lease" {
     );
     try std.testing.expectError(
         error.OutOfMemory,
-        state.refreshProjectPrompt(failing.allocator()),
+        state.projectPromptName(failing.allocator()),
     );
     state.deinit(alloc);
 }

@@ -102,12 +102,6 @@ pub const PermissionOutcome = struct {
     feedback: ?[]const u8 = null,
     /// Owned by the allocator passed to the permission request.
     auto_review_result: ?auto_classifier.Result = null,
-    project_mcp_retry: ?ProjectMcpRetry = null,
-};
-
-pub const ProjectMcpRetry = struct {
-    server_name: []const u8,
-    runtime_generation: u64,
 };
 
 pub const PermissionRequirement = enum {

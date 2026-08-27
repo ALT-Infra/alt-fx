@@ -535,7 +535,6 @@ pub const FakeAgentRuntimeDeps = struct {
     permission_feedback: []const []const u8 = &.{},
     permission_errors: []const ?anyerror = &.{},
     permission_human_approvals: []const command_admission.HumanApprovalProvenance = &.{},
-    permission_project_mcp_retries: []const ?command_admission.ProjectMcpRetry = &.{},
     permission_request_override: ?PermissionRequestOverride = null,
     permission_wait_index: ?usize = null,
     permission_waiting: ?*std.atomic.Value(bool) = null,
@@ -1156,10 +1155,6 @@ pub const FakeAgentRuntimeDeps = struct {
             .denial_reason = denial_reason,
             .feedback = if (feedback.len == 0) null else try arena.dupe(u8, feedback),
             .auto_review_result = auto_review_result,
-            .project_mcp_retry = if (permission_index < self.permission_project_mcp_retries.len)
-                self.permission_project_mcp_retries[permission_index]
-            else
-                null,
         };
     }
 

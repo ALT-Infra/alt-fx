@@ -280,7 +280,6 @@ pub fn Runtime(comptime App: type) type {
                 .mcp_call_tool = if (comptime runtime_profile.allows(App, .mcp)) callMcpTool else null,
                 .mcp_search_tools = if (comptime runtime_profile.allows(App, .mcp)) searchMcpTools else null,
                 .mcp_tool_schema = if (comptime runtime_profile.allows(App, .mcp)) mcpToolSchemaJson else null,
-                .mcp_project_tool_admission = if (comptime runtime_profile.allows(App, .mcp)) mcpProjectToolAdmission else null,
                 .mcp_current_generation = if (comptime runtime_profile.allows(App, .mcp)) mcpCurrentGeneration else null,
                 .mcp_call_feature = if (comptime runtime_profile.allows(App, .mcp)) callMcpFeature else null,
                 .mcp_progress_ctx = @ptrCast(app),
@@ -457,19 +456,6 @@ pub fn Runtime(comptime App: type) type {
                 return app.mcpToolSchemaJson(arena, name, permission_rules, access);
             }
             return null;
-        }
-
-        fn mcpProjectToolAdmission(
-            raw_ctx: *anyopaque,
-            arena: Allocator,
-            name: []const u8,
-            access: tool_mcp_runtime.Access,
-        ) anyerror!?tool_mcp_runtime.ProjectToolAdmission {
-            if (comptime !@hasDecl(App, "acquireMcpRuntime")) return null;
-            const app: *App = @ptrCast(@alignCast(raw_ctx));
-            var lease = app.acquireMcpRuntime() orelse return null;
-            defer lease.deinit();
-            return lease.runtime.projectAdmissionForTool(arena, name, access);
         }
 
         fn mcpCurrentGeneration(raw_ctx: *anyopaque) ?u64 {

@@ -198,40 +198,6 @@ pub fn ApprovalRuntime(comptime App: type) type {
                 try submitRuleManagementChoice(app, decision);
                 return;
             }
-            if (decision == .always) {
-                if (app.approval_prompt.request.?.project_mcp_server) |server_name| {
-                    if (comptime !@hasDecl(App, "reloadMcpSynchronously")) {
-                        return error.McpProjectChoicesUnavailable;
-                    } else {
-                        _ = app_commands.Handlers(App).approveProjectMcpForTool(
-                            app,
-                            server_name,
-                        ) catch |err| {
-                            debug_trace.logf(
-                                "mcp",
-                                "project MCP first-use approval failed server={s} err={s}",
-                                .{ server_name, @errorName(err) },
-                            );
-                            if (comptime @hasDecl(App, "writeDomainNotice")) {
-                                const body = try std.fmt.allocPrint(
-                                    app.alloc,
-                                    "Project MCP approval failed: {s}.",
-                                    .{@errorName(err)},
-                                );
-                                defer app.alloc.free(body);
-                                try app.writeDomainNotice(.{
-                                    .topic = "mcp",
-                                    .tone = .warning,
-                                    .body = body,
-                                }, true);
-                                requestActiveSurfaceFrame(app);
-                                return;
-                            }
-                            return err;
-                        };
-                    }
-                }
-            }
             if (try submitSubagentPermissionChoice(app, decision)) return;
             var affirmative_claimed = false;
             if (decision != .deny and

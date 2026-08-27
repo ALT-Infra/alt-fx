@@ -14,12 +14,6 @@ pub const CallToolFn = *const fn (*anyopaque, Allocator, []const u8, []const u8,
 pub const PreparedQuery = lexical_relevance.PreparedQuery;
 pub const SearchToolsFn = *const fn (*anyopaque, Allocator, *const PreparedQuery, usize, types.PermissionRuleSet, context_limits.Values, Access) anyerror!SearchResult;
 pub const ToolSchemaFn = *const fn (*anyopaque, Allocator, []const u8, types.PermissionRuleSet, context_limits.Values, Access) anyerror!?ToolSchemaResult;
-pub const ProjectToolAdmissionFn = *const fn (
-    *anyopaque,
-    Allocator,
-    []const u8,
-    Access,
-) anyerror!?ProjectToolAdmission;
 pub const FeatureCallFn = *const fn (
     *anyopaque,
     Allocator,
@@ -307,31 +301,8 @@ pub const RuntimeCapabilities = struct {
     validate_tool: ?ValidateToolFn = null,
     call_tool: ?CallToolFn = null,
     tool_schema: ?ToolSchemaFn = null,
-    project_tool_admission: ?ProjectToolAdmissionFn = null,
     access: Access = .unrestricted,
 };
-
-pub const ProjectToolAdmission = struct {
-    server_name: []u8,
-    admission: mcp_contract.WorkspaceAdmission,
-    interactive_trust: bool,
-    runtime_generation: u64,
-
-    pub fn deinit(self: *ProjectToolAdmission, alloc: Allocator) void {
-        alloc.free(self.server_name);
-        self.* = undefined;
-    }
-};
-
-pub fn projectAdmissionForTool(
-    runtime: RuntimeCapabilities,
-    alloc: Allocator,
-    name: []const u8,
-) !?ProjectToolAdmission {
-    const context = runtime.context orelse return null;
-    const resolve = runtime.project_tool_admission orelse return null;
-    return resolve(context, alloc, name, runtime.access);
-}
 
 pub fn validateAdvertisedDynamicTool(
     input: AvailabilityInput,
