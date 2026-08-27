@@ -112,7 +112,7 @@ Open Team management directly, or begin a new Team in the guided builder:
 /alt new
 ```
 
-The builder configures the Team name, unified provider, primary, peers, specialists, per-role model and instructions, and callable specialist authority. Team IDs are opaque and generated automatically. Role models are chosen through fx's native live model catalog instead of typed from memory. Every primary and peer can consult every other peer; specialist access is assigned independently to each primary or peer, so a specialist may be exclusive to one of them.
+The builder configures the Team name, unified provider, primary, peers, specialists, per-role model and instructions, and callable specialist authority. Team and role IDs are opaque, generated automatically, and never presented as authoring fields. Role models are chosen through fx's native live model catalog instead of typed from memory. Write each role's instructions only as that role's identity and expertise: ALT separately supplies every primary and peer with the complete peer roster and exact peer definitions. Every primary and peer can consult every other peer; specialist access is supplied separately and may be exclusive to one of them.
 
 The Team library can start the latest revision in a new conversation, edit it as the next immutable revision in another new conversation, or remove it from the active library. Editing preserves the hidden Team identity. Removed Teams remain available through sessions that already pin one of their revisions. A Team must contain a primary and at least one peer or callable specialist; alt-fx does not offer a single-agent ALT preset.
 
@@ -141,6 +141,7 @@ The runtime enforces these boundaries:
 - A consultation never transfers leadership or answers the user.
 - A consultant may call any other Team peer and the specialists assigned to it.
 - Nested results return only to the immediate caller and unwind one frame at a time.
+- Handoffs, consultation boundaries, and specialist boundaries appear as compact native fx notices naming the source and destination catalog models.
 - Context-bearing peer surfaces are serialized while unrelated child work may run concurrently.
 - Specialist batches may express dependency ordering with `depends_on`.
 - Specialists are clean-slate leaf calls with bounded projections, selected attachments, and fx's real tools—but no conversation or Team state.

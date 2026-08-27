@@ -19,6 +19,12 @@ fn generateDefinitionId(
     );
 }
 
+fn generateDefinitionEditorIdentitySeed() [32]u8 {
+    var seed: [32]u8 = undefined;
+    io_mod.getIo().random(&seed);
+    return seed;
+}
+
 /// Owns the interactive definition-library and session-binding workflow. The
 /// composition root exposes narrow callbacks while this runtime keeps Team
 /// management out of `main.zig` and independent of ALT's document schema.
@@ -297,7 +303,12 @@ pub fn Runtime(
             defer app.alloc.free(template);
             app.orchestration_definition_manager.enterCreateEditor(app.alloc);
             if (app.orchestration_definition_editor) |*editor| editor.deinit();
-            app.orchestration_definition_editor = try Editor.init(app.alloc, template);
+            app.orchestration_definition_editor = try Editor.init(
+                app.alloc,
+                template,
+                generateDefinitionEditorIdentitySeed(),
+                true,
+            );
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
         }
 
@@ -322,7 +333,12 @@ pub fn Runtime(
             defer app.alloc.free(revised);
             try app.orchestration_definition_manager.enterReviseEditor(app.alloc);
             if (app.orchestration_definition_editor) |*editor| editor.deinit();
-            app.orchestration_definition_editor = try Editor.init(app.alloc, revised);
+            app.orchestration_definition_editor = try Editor.init(
+                app.alloc,
+                revised,
+                generateDefinitionEditorIdentitySeed(),
+                false,
+            );
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
         }
 
@@ -495,4 +511,8 @@ test "definition identities are opaque random host values" {
     try std.testing.expect(std.mem.startsWith(u8, first, "team-"));
     try std.testing.expectEqual(@as(usize, "team-".len + 24), first.len);
     try std.testing.expect(!std.mem.eql(u8, first, second));
+
+    const first_seed = generateDefinitionEditorIdentitySeed();
+    const second_seed = generateDefinitionEditorIdentitySeed();
+    try std.testing.expect(!std.mem.eql(u8, &first_seed, &second_seed));
 }

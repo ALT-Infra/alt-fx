@@ -423,6 +423,13 @@ pub fn Runtime(comptime host: type) type {
                     call.peer_id,
                     call.id,
                 ));
+                try self.emitActivity(
+                    sink,
+                    ownerAgentId(session, location.owner),
+                    call.peer_id,
+                    "consultation started",
+                    .info,
+                );
                 return;
             }
             if (specialistCallLocation(session, started.run_id)) |location| {
@@ -445,6 +452,13 @@ pub fn Runtime(comptime host: type) type {
                     call.specialist_id,
                     call.id,
                 ));
+                try self.emitActivity(
+                    sink,
+                    ownerAgentId(session, location.owner),
+                    call.specialist_id,
+                    "specialist started",
+                    .info,
+                );
                 return;
             }
             const current_run_id = session.current_run_id orelse {
@@ -687,6 +701,13 @@ pub fn Runtime(comptime host: type) type {
                 peer_id,
                 "",
             ));
+            try self.emitActivity(
+                sink,
+                completed_agent_id,
+                peer_id,
+                "leadership handed off",
+                .info,
+            );
             const context_projection = try std.fmt.allocPrint(
                 self.allocator,
                 "The previous leader transferred this exact user turn to you.\nReason: {s}",
@@ -847,6 +868,13 @@ pub fn Runtime(comptime host: type) type {
                 call.specialist_id,
                 call.id,
             ));
+            try self.emitActivity(
+                sink,
+                call.specialist_id,
+                ownerAgentId(session, location.owner),
+                "specialist returned",
+                .info,
+            );
             try self.scheduleReadySpecialists(location.owner, sink);
             try self.maybeResumeOwnerAfterTeamWork(location.owner, completed.run_id, sink);
         }
@@ -983,6 +1011,13 @@ pub fn Runtime(comptime host: type) type {
                 call.id,
             ));
             const parent = session.consultation_frames.items[frame_index].parent;
+            try self.emitActivity(
+                sink,
+                call.peer_id,
+                ownerAgentId(session, parent),
+                "consultation returned",
+                .info,
+            );
             try self.scheduleAllReadyPeers(sink);
             try self.maybeResumeOwnerAfterTeamWork(parent, completed.run_id, sink);
         }
@@ -1421,11 +1456,14 @@ pub fn Runtime(comptime host: type) type {
                     call.peer_id,
                     if (failed.interrupted) "interrupted" else "provider_or_runtime_failure",
                 ));
-                try sink.emit(.{ .notice = .{
-                    .tone = .warning,
-                    .text = "A Team consultation failed; its immediate caller will decide how to continue.",
-                } });
                 const parent = session.consultation_frames.items[frame_index].parent;
+                try self.emitActivity(
+                    sink,
+                    call.peer_id,
+                    ownerAgentId(session, parent),
+                    "consultation failed",
+                    .warning,
+                );
                 try self.scheduleAllReadyPeers(sink);
                 try self.maybeResumeOwnerAfterTeamWork(parent, failed.run_id, sink);
                 return;
@@ -1442,10 +1480,13 @@ pub fn Runtime(comptime host: type) type {
                     call.specialist_id,
                     if (failed.interrupted) "interrupted" else "provider_or_runtime_failure",
                 ));
-                try sink.emit(.{ .notice = .{
-                    .tone = .warning,
-                    .text = "A specialist call failed; its immediate caller will decide how to continue.",
-                } });
+                try self.emitActivity(
+                    sink,
+                    call.specialist_id,
+                    ownerAgentId(session, location.owner),
+                    "specialist failed",
+                    .warning,
+                );
                 try self.maybeResumeOwnerAfterTeamWork(location.owner, failed.run_id, sink);
                 return;
             }
@@ -1823,6 +1864,54 @@ pub fn Runtime(comptime host: type) type {
 
         fn trace(_: *Self, sink: host.IntentSink, record: host.TraceRecord) !void {
             try sink.emit(.{ .trace = record });
+        }
+
+        fn roleModel(self: *Self, role_id: []const u8) ?team_mod.Model {
+            const model_id = if (self.team.agent(role_id)) |agent|
+                agent.model_id
+            else if (self.team.specialist(role_id)) |specialist|
+                specialist.model_id
+            else
+                return null;
+            return self.team.model(model_id);
+        }
+
+        fn modelLabel(self: *Self, role_id: []const u8) ![]u8 {
+            const model = self.roleModel(role_id) orelse return error.UnknownModel;
+            if (std.mem.eql(u8, self.team.provider_id, "opencode") and
+                std.mem.eql(u8, model.route, "zen"))
+            {
+                return self.allocator.dupe(u8, model.name);
+            }
+            return std.fmt.allocPrint(
+                self.allocator,
+                "{s}/{s}",
+                .{ model.route, model.name },
+            );
+        }
+
+        fn emitActivity(
+            self: *Self,
+            sink: host.IntentSink,
+            from_role_id: []const u8,
+            to_role_id: []const u8,
+            action: []const u8,
+            tone: host.NoticeTone,
+        ) !void {
+            const from_model = try self.modelLabel(from_role_id);
+            defer self.allocator.free(from_model);
+            const to_model = try self.modelLabel(to_role_id);
+            defer self.allocator.free(to_model);
+            const text = try std.fmt.allocPrint(
+                self.allocator,
+                "{s} → {s} · {s}.",
+                .{ from_model, to_model, action },
+            );
+            defer self.allocator.free(text);
+            try sink.emit(.{ .notice = .{
+                .tone = tone,
+                .text = text,
+            } });
         }
 
         fn sessionTrace(self: *Self, event: []const u8, detail: []const u8) host.TraceRecord {
@@ -2277,6 +2366,8 @@ test "one user turn can hand leadership to a peer and publish that peer answer" 
         answer_len: usize = 0,
         answer_agent: [64]u8 = undefined,
         answer_agent_len: usize = 0,
+        handoff_notice: [128]u8 = undefined,
+        handoff_notice_len: usize = 0,
 
         fn copyInto(destination: []u8, source: []const u8) usize {
             const len = @min(destination.len, source.len);
@@ -2327,7 +2418,12 @@ test "one user turn can hand leadership to a peer and publish that peer answer" 
                     self.answer_len = copyInto(&self.answer, answer.text);
                     self.answer_agent_len = copyInto(&self.answer_agent, answer.agent_id);
                 },
-                .mode_entered, .mode_left, .notice, .cancel_agent_run, .turn_failed => {},
+                .notice => |notice| {
+                    if (std.mem.find(u8, notice.text, "leadership handed off") != null) {
+                        self.handoff_notice_len = copyInto(&self.handoff_notice, notice.text);
+                    }
+                },
+                .mode_entered, .mode_left, .cancel_agent_run, .turn_failed => {},
             }
         }
 
@@ -2389,6 +2485,10 @@ test "one user turn can hand leadership to a peer and publish that peer answer" 
     try std.testing.expectEqual(@as(u64, 41), capture.source_turn_ids[1]);
     try std.testing.expect(capture.exact_models);
     try std.testing.expectEqual(@as(usize, 2), capture.canonical_inputs);
+    try std.testing.expectEqualStrings(
+        "free/deepseek-code → free/research-model · leadership handed off.",
+        capture.handoff_notice[0..capture.handoff_notice_len],
+    );
 
     const peer_run_id = try std.testing.allocator.dupe(u8, capture.runId(1));
     defer std.testing.allocator.free(peer_run_id);
@@ -2584,6 +2684,9 @@ test "nested consultations unwind one caller at a time while child work remains 
         visible_lens: [9]usize = [_]usize{0} ** 9,
         answer: [128]u8 = undefined,
         answer_len: usize = 0,
+        notices: [16][128]u8 = undefined,
+        notice_lens: [16]usize = [_]usize{0} ** 16,
+        notice_count: usize = 0,
         failed: bool = false,
 
         fn copyInto(destination: []u8, source: []const u8) usize {
@@ -2620,8 +2723,16 @@ test "nested consultations unwind one caller at a time while child work remains 
                 .publish_answer => |answer| {
                     self.answer_len = copyInto(&self.answer, answer.text);
                 },
+                .notice => |notice| {
+                    if (self.notice_count >= self.notices.len) return error.TooManyNotices;
+                    self.notice_lens[self.notice_count] = copyInto(
+                        &self.notices[self.notice_count],
+                        notice.text,
+                    );
+                    self.notice_count += 1;
+                },
                 .turn_failed => self.failed = true,
-                .trace, .mode_entered, .mode_left, .notice, .cancel_agent_run => {},
+                .trace, .mode_entered, .mode_left, .cancel_agent_run => {},
             }
         }
 
@@ -2635,6 +2746,17 @@ test "nested consultations unwind one caller at a time while child work remains 
 
         fn visibleInput(self: *@This(), index: usize) []const u8 {
             return self.visible[index][0..self.visible_lens[index]];
+        }
+
+        fn hasNotice(self: *@This(), expected: []const u8) bool {
+            for (self.notices[0..self.notice_count], 0..) |_, index| {
+                if (std.mem.eql(
+                    u8,
+                    self.notices[index][0..self.notice_lens[index]],
+                    expected,
+                )) return true;
+            }
+            return false;
         }
     };
 
@@ -2669,6 +2791,7 @@ test "nested consultations unwind one caller at a time while child work remains 
     try std.testing.expectEqualStrings("beta", capture.agentId(1));
 
     try runtime.dispatch(.{ .agent_run_started = .{ .run_id = capture.runId(1) } }, sink);
+    try std.testing.expect(capture.hasNotice("go/alpha → go/beta · consultation started."));
     try runtime.dispatch(.{ .agent_run_completed = .{
         .run_id = capture.runId(1),
         .output =
@@ -2682,6 +2805,7 @@ test "nested consultations unwind one caller at a time while child work remains 
     try std.testing.expectEqualStrings("gamma", capture.agentId(3));
 
     try runtime.dispatch(.{ .agent_run_started = .{ .run_id = capture.runId(3) } }, sink);
+    try std.testing.expect(capture.hasNotice("go/beta → go/gamma · consultation started."));
     try runtime.dispatch(.{ .agent_run_completed = .{
         .run_id = capture.runId(3),
         .output =
@@ -2697,6 +2821,7 @@ test "nested consultations unwind one caller at a time while child work remains 
         .run_id = capture.runId(4),
         .output = "{\"result\":\"GAMMA-RAW-LEAF\",\"findings\":[],\"risks\":[],\"confidence\":1}",
     } }, sink);
+    try std.testing.expect(capture.hasNotice("go/lens → go/gamma · specialist returned."));
     try std.testing.expectEqual(@as(usize, 6), capture.run_count);
     try std.testing.expectEqualStrings("gamma", capture.agentId(5));
     try std.testing.expect(std.mem.find(u8, capture.visibleInput(5), "GAMMA-RAW-LEAF") != null);
@@ -2706,6 +2831,7 @@ test "nested consultations unwind one caller at a time while child work remains 
         .run_id = capture.runId(5),
         .output = "{\"result\":\"GAMMA-SYNTHESIS\",\"findings\":[],\"risks\":[],\"confidence\":0.9}",
     } }, sink);
+    try std.testing.expect(capture.hasNotice("go/gamma → go/beta · consultation returned."));
     try std.testing.expectEqual(@as(usize, 6), capture.run_count);
 
     try runtime.dispatch(.{ .agent_run_started = .{ .run_id = capture.runId(2) } }, sink);
@@ -2734,6 +2860,7 @@ test "nested consultations unwind one caller at a time while child work remains 
         .run_id = capture.runId(7),
         .output = "{\"result\":\"BETA-SYNTHESIS\",\"findings\":[],\"risks\":[],\"confidence\":0.95}",
     } }, sink);
+    try std.testing.expect(capture.hasNotice("go/beta → go/alpha · consultation returned."));
     try std.testing.expectEqual(@as(usize, 9), capture.run_count);
     try std.testing.expectEqualStrings("alpha", capture.agentId(8));
     try std.testing.expect(std.mem.find(u8, capture.visibleInput(8), "BETA-SYNTHESIS") != null);
