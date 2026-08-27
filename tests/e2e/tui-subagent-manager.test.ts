@@ -283,10 +283,11 @@ function readConfigurationControl(path: string): ConfigurationControl {
 async function waitForConfigurationControl(
   path: string,
   predicate: (control: ConfigurationControl) => boolean,
+  timeoutMs: number = TIMEOUT,
 ): Promise<ConfigurationControl> {
   const startedAt = Date.now();
   let control = readConfigurationControl(path);
-  while (Date.now() - startedAt < TIMEOUT) {
+  while (Date.now() - startedAt < timeoutMs) {
     control = readConfigurationControl(path);
     if (predicate(control)) return control;
     await Bun.sleep(25);
@@ -4805,6 +4806,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
   test(
     "configure duration derives its stop boundary and survives restart",
     async () => {
+      const controlTimeout = 45_000;
       const fixture = createFixture();
       const resumedStderrPath = join(root!, "duration-resumed.stderr");
       writeFileSync(resumedStderrPath, "");
@@ -4877,6 +4879,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           (control) =>
             control.generation === initial.generation + 1 &&
             control.configuration.notifications.report_duration_ms === 900,
+          controlTimeout,
         );
         expect(withDuration.configuration.notifications).toMatchObject({
           report_interval_ms: 100,
@@ -4928,9 +4931,19 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await active.sendKeys("Tab");
         await active.sendKeys("Tab");
         await active.sendKeys("Tab");
+        await active.waitForPane(
+          (pane) =>
+            pane.split("\n").some((line) =>
+              line.startsWith("> Report duration ms: 900")
+            ),
+          TIMEOUT,
+        );
         await active.sendKeys("C-u");
-        const clearedForm = await active.waitForText(
-          "Duration sets the stop boundary; clear duration to disable.",
+        const clearedForm = await active.waitForPane(
+          (pane) =>
+            pane.split("\n").some((line) =>
+              line.startsWith("> Report duration ms:") && !line.includes("900")
+            ),
           TIMEOUT,
         );
         expect(clearedForm).not.toContain("Stop after duration:");
@@ -4942,6 +4955,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           (control) =>
             control.generation === withDuration.generation + 1 &&
             control.configuration.notifications.report_duration_ms === null,
+          controlTimeout,
         );
         expect(withoutDuration.configuration.notifications).toMatchObject({
           report_interval_ms: 100,

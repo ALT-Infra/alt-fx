@@ -453,19 +453,19 @@ fn runtimeFromConfigs(
 pub fn loadConfigFromPath(alloc: Allocator, path: []const u8) !std.ArrayList(McpServerConfig) {
     var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch |err| {
         if (err == error.FileNotFound) return .empty;
-        debug_trace.logf("mcp", "failed to open config {s}: {s}", .{ path, @errorName(err) });
+        logConfigFailure("open", path, err);
         return err;
     };
     defer file.close(io_mod.getIo());
 
     const json_text = io_mod.readFileToEnd(alloc, &file, 1024 * 1024) catch |err| {
-        debug_trace.logf("mcp", "failed to read config {s}: {s}", .{ path, @errorName(err) });
+        logConfigFailure("read", path, err);
         return err;
     };
     defer alloc.free(json_text);
 
     return loadConfigFromJson(alloc, json_text) catch |err| {
-        debug_trace.logf("mcp", "failed to load config {s}: {s}", .{ path, @errorName(err) });
+        logConfigFailure("load", path, err);
         return err;
     };
 }
@@ -547,7 +547,7 @@ fn loadConfigFromJson(alloc: Allocator, json_text: []const u8) !std.ArrayList(Mc
     errdefer freeConfigs(alloc, &configs);
 
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, json_text, .{}) catch |err| {
-        debug_trace.logf("mcp", "failed to parse config json: {s}", .{@errorName(err)});
+        logConfigFailure("parse", "json", err);
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return error.McpConfigInvalidJson;
     };
@@ -564,7 +564,13 @@ fn loadConfigFromJson(alloc: Allocator, json_text: []const u8) !std.ArrayList(Mc
 
     var it = servers.object.iterator();
     while (it.next()) |entry| {
-        const config = try parseServerConfig(alloc, entry.key_ptr.*, entry.value_ptr.*);
+        var config: McpServerConfig = undefined;
+        try parseServerConfigInto(
+            &config,
+            alloc,
+            entry.key_ptr.*,
+            entry.value_ptr.*,
+        );
         configs.append(alloc, config) catch |err| {
             var mutable = config;
             mutable.deinit(alloc);
@@ -606,9 +612,46 @@ fn findConfig(configs: []const McpServerConfig, name: []const u8) ?*const McpSer
     return null;
 }
 
-fn parseServerConfig(alloc: Allocator, name: []const u8, value: std.json.Value) !McpServerConfig {
+noinline fn logConfigFailure(action: []const u8, path: []const u8, err: anyerror) void {
+    debug_trace.logf(
+        "mcp",
+        "failed to {s} config {s}: {s}",
+        .{ action, path, @errorName(err) },
+    );
+}
+
+fn logServerIssue(prefix: []const u8, name: []const u8, detail: []const u8) void {
+    debug_trace.logf(
+        "mcp",
+        "{s}{s}: {s}",
+        .{ prefix, name, detail },
+    );
+}
+
+fn logServerIssueValue(
+    prefix: []const u8,
+    name: []const u8,
+    detail: []const u8,
+    separator: []const u8,
+    value: []const u8,
+) void {
+    debug_trace.logf(
+        "mcp",
+        "{s}{s}: {s}{s}{s}",
+        .{ prefix, name, detail, separator, value },
+    );
+}
+
+// Keep fallible config construction behind caller-owned storage so error
+// returns do not materialize the complete config payload.
+noinline fn parseServerConfigInto(
+    out: *McpServerConfig,
+    alloc: Allocator,
+    name: []const u8,
+    value: std.json.Value,
+) !void {
     if (value != .object) {
-        debug_trace.logf("mcp", "invalid server {s}: expected object", .{name});
+        logServerIssue("invalid server ", name, "expected object");
         return error.McpConfigServerMustBeObject;
     }
 
@@ -626,7 +669,13 @@ fn parseServerConfig(alloc: Allocator, name: []const u8, value: std.json.Value) 
         .stdio;
 
     if (transport == .stdio and !std.mem.eql(u8, type_string, "local") and !std.mem.eql(u8, type_string, "stdio")) {
-        debug_trace.logf("mcp", "invalid server {s}: unsupported type {s}", .{ name, type_string });
+        logServerIssueValue(
+            "invalid server ",
+            name,
+            "unsupported type",
+            " ",
+            type_string,
+        );
         return error.McpConfigInvalidType;
     }
 
@@ -641,15 +690,21 @@ fn parseServerConfig(alloc: Allocator, name: []const u8, value: std.json.Value) 
 
     if (transport != .stdio) {
         const url_value = object.get("url") orelse {
-            debug_trace.logf("mcp", "invalid remote server {s}: missing url", .{name});
+            logServerIssue("invalid remote server ", name, "missing url");
             return error.McpConfigMissingUrl;
         };
         if (url_value != .string) {
-            debug_trace.logf("mcp", "invalid remote server {s}: url is not a string", .{name});
+            logServerIssue("invalid remote server ", name, "url is not a string");
             return error.McpConfigInvalidUrl;
         }
         streamable_http.validateEndpoint(url_value.string) catch |err| {
-            debug_trace.logf("mcp", "invalid remote server {s}: invalid endpoint: {s}", .{ name, @errorName(err) });
+            logServerIssueValue(
+                "invalid remote server ",
+                name,
+                "invalid endpoint",
+                ": ",
+                @errorName(err),
+            );
             return error.McpConfigInvalidUrl;
         };
 
@@ -660,7 +715,7 @@ fn parseServerConfig(alloc: Allocator, name: []const u8, value: std.json.Value) 
             1,
             std.math.maxInt(u32),
         ) catch {
-            debug_trace.logf("mcp", "invalid remote server {s}: invalid startup_timeout_ms", .{name});
+            logServerIssue("invalid remote server ", name, "invalid startup_timeout_ms");
             return error.McpConfigInvalidStartupTimeout;
         };
         const operation_timeout_ms = parseUnsignedPolicy(
@@ -670,7 +725,7 @@ fn parseServerConfig(alloc: Allocator, name: []const u8, value: std.json.Value) 
             1,
             std.math.maxInt(u32),
         ) catch {
-            debug_trace.logf("mcp", "invalid remote server {s}: invalid operation_timeout_ms", .{name});
+            logServerIssue("invalid remote server ", name, "invalid operation_timeout_ms");
             return error.McpConfigInvalidOperationTimeout;
         };
 
@@ -687,7 +742,9 @@ fn parseServerConfig(alloc: Allocator, name: []const u8, value: std.json.Value) 
             else => return error.McpConfigInvalidHeaders,
         };
         errdefer freeHttpHeaderEnv(alloc, header_env);
-        const bearer_token_env = try parseOptionalOwnedString(
+        var bearer_token_env: ?[]u8 = undefined;
+        try parseOptionalOwnedStringInto(
+            &bearer_token_env,
             alloc,
             object,
             "bearer_token_env",
@@ -695,11 +752,12 @@ fn parseServerConfig(alloc: Allocator, name: []const u8, value: std.json.Value) 
         errdefer if (bearer_token_env) |env_name| alloc.free(env_name);
         if (bearer_token_env) |env_name| {
             if (!isValidEnvName(env_name)) {
-                debug_trace.logf("mcp", "invalid remote server {s}: invalid bearer_token_env", .{name});
+                logServerIssue("invalid remote server ", name, "invalid bearer_token_env");
                 return error.McpConfigInvalidBearerEnvironment;
             }
         }
-        var auth = parseProfileAuth(alloc, object, name) catch |err| switch (err) {
+        var auth: ?McpAuthConfig = undefined;
+        parseProfileAuthInto(&auth, alloc, object, name) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return error.McpConfigInvalidOAuth,
         };
@@ -711,7 +769,7 @@ fn parseServerConfig(alloc: Allocator, name: []const u8, value: std.json.Value) 
         const owned_url = try alloc.dupe(u8, url_value.string);
         errdefer alloc.free(owned_url);
 
-        return .{
+        out.* = .{
             .name = owned_name,
             .source = .profile,
             .scope = .profile,
@@ -728,6 +786,7 @@ fn parseServerConfig(alloc: Allocator, name: []const u8, value: std.json.Value) 
             .startup_timeout_ms = @intCast(startup_timeout_ms),
             .operation_timeout_ms = @intCast(operation_timeout_ms),
         };
+        return;
     }
 
     const startup_timeout_ms = parseUnsignedPolicy(
@@ -737,7 +796,7 @@ fn parseServerConfig(alloc: Allocator, name: []const u8, value: std.json.Value) 
         1,
         std.math.maxInt(u32),
     ) catch {
-        debug_trace.logf("mcp", "invalid stdio server {s}: invalid startup_timeout_ms", .{name});
+        logServerIssue("invalid stdio server ", name, "invalid startup_timeout_ms");
         return error.McpConfigInvalidStartupTimeout;
     };
     const operation_timeout_ms = parseUnsignedPolicy(
@@ -747,7 +806,7 @@ fn parseServerConfig(alloc: Allocator, name: []const u8, value: std.json.Value) 
         1,
         std.math.maxInt(u32),
     ) catch {
-        debug_trace.logf("mcp", "invalid stdio server {s}: invalid operation_timeout_ms", .{name});
+        logServerIssue("invalid stdio server ", name, "invalid operation_timeout_ms");
         return error.McpConfigInvalidOperationTimeout;
     };
     const restart_limit = parseUnsignedPolicy(
@@ -757,14 +816,21 @@ fn parseServerConfig(alloc: Allocator, name: []const u8, value: std.json.Value) 
         0,
         std.math.maxInt(u8),
     ) catch {
-        debug_trace.logf("mcp", "invalid stdio server {s}: invalid restart_limit", .{name});
+        logServerIssue("invalid stdio server ", name, "invalid restart_limit");
         return error.McpConfigInvalidRestartLimit;
     };
 
-    const parsed_command = parseCommandSpec(alloc, object) catch |err| switch (err) {
+    var parsed_command: ParsedCommandSpec = undefined;
+    parseCommandSpecInto(&parsed_command, alloc, object) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => {
-            debug_trace.logf("mcp", "invalid stdio server {s}: invalid command spec: {s}", .{ name, @errorName(err) });
+            logServerIssueValue(
+                "invalid stdio server ",
+                name,
+                "invalid command spec",
+                ": ",
+                @errorName(err),
+            );
             return error.McpConfigInvalidCommand;
         },
     };
@@ -773,7 +839,7 @@ fn parseServerConfig(alloc: Allocator, name: []const u8, value: std.json.Value) 
     const env = try parseSelectedEnvironment(alloc, object, name);
     errdefer freeEnvVars(alloc, env);
 
-    return .{
+    out.* = .{
         .name = try alloc.dupe(u8, name),
         .source = .profile,
         .scope = .profile,
@@ -796,7 +862,7 @@ fn parseProfileRemoteHeaders(
 ) ![]McpHttpHeader {
     const value = object.get("headers") orelse return @constCast(&.{});
     if (value != .object) {
-        debug_trace.logf("mcp", "invalid remote server {s}: headers must be an object", .{server_name});
+        logServerIssue("invalid remote server ", server_name, "headers must be an object");
         return error.McpInvalidHttpHeaders;
     }
 
@@ -812,7 +878,7 @@ fn parseProfileRemoteHeaders(
     var it = value.object.iterator();
     while (it.next()) |entry| {
         if (entry.value_ptr.* != .string) {
-            debug_trace.logf("mcp", "invalid remote server {s}: header value must be a string", .{server_name});
+            logServerIssue("invalid remote server ", server_name, "header value must be a string");
             return error.McpInvalidHttpHeaders;
         }
         if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "authorization")) {
@@ -833,7 +899,13 @@ fn parseProfileRemoteHeaders(
     }
 
     streamable_http.validateStaticHeaders(headers.items) catch |err| {
-        debug_trace.logf("mcp", "invalid remote server {s}: invalid headers: {s}", .{ server_name, @errorName(err) });
+        logServerIssueValue(
+            "invalid remote server ",
+            server_name,
+            "invalid headers",
+            ": ",
+            @errorName(err),
+        );
         return error.McpInvalidHttpHeaders;
     };
     return try headers.toOwnedSlice(alloc);
@@ -846,7 +918,7 @@ fn parseProfileRemoteHeaderEnv(
 ) ![]McpHttpHeaderEnv {
     const value = object.get("header_env") orelse return @constCast(&.{});
     if (value != .object) {
-        debug_trace.logf("mcp", "invalid remote server {s}: header_env must be an object", .{server_name});
+        logServerIssue("invalid remote server ", server_name, "header_env must be an object");
         return error.McpInvalidHttpHeaders;
     }
 
@@ -864,7 +936,7 @@ fn parseProfileRemoteHeaderEnv(
             !isValidEnvName(entry.value_ptr.*.string) or
             std.ascii.eqlIgnoreCase(entry.key_ptr.*, "authorization"))
         {
-            debug_trace.logf("mcp", "invalid remote server {s}: invalid header_env entry", .{server_name});
+            logServerIssue("invalid remote server ", server_name, "invalid header_env entry");
             return error.McpInvalidHttpHeaders;
         }
         try refs.append(alloc, .{
@@ -879,7 +951,7 @@ fn parseProfileRemoteHeaderEnv(
         validation_headers[index] = .{ .name = ref.name, .value = @constCast("value") };
     }
     streamable_http.validateStaticHeaders(validation_headers) catch {
-        debug_trace.logf("mcp", "invalid remote server {s}: invalid header_env names", .{server_name});
+        logServerIssue("invalid remote server ", server_name, "invalid header_env names");
         return error.McpInvalidHttpHeaders;
     };
     for (refs.items, 0..) |ref, index| {
@@ -892,28 +964,34 @@ fn parseProfileRemoteHeaderEnv(
     return refs.toOwnedSlice(alloc);
 }
 
-fn parseProfileAuth(
+fn parseProfileAuthInto(
+    out: *?McpAuthConfig,
     alloc: Allocator,
     object: std.json.ObjectMap,
     server_name: []const u8,
-) !?McpAuthConfig {
-    const value = object.get("oauth") orelse return null;
+) !void {
+    const value = object.get("oauth") orelse {
+        out.* = null;
+        return;
+    };
     if (value != .object) {
-        debug_trace.logf("mcp", "invalid remote server {s}: oauth must be an object", .{server_name});
+        logServerIssue("invalid remote server ", server_name, "oauth must be an object");
         return error.InvalidMcpOAuthConfig;
     }
     const auth_object = value.object;
     var auth: McpAuthConfig = .{};
     errdefer auth.deinit(alloc);
-    auth.resource = try parseOptionalOwnedString(alloc, auth_object, "resource");
-    auth.issuer = try parseOptionalOwnedString(alloc, auth_object, "issuer");
-    auth.client_id = try parseOptionalOwnedString(alloc, auth_object, "client_id");
-    auth.client_secret_env = try parseOptionalOwnedString(
+    try parseOptionalOwnedStringInto(&auth.resource, alloc, auth_object, "resource");
+    try parseOptionalOwnedStringInto(&auth.issuer, alloc, auth_object, "issuer");
+    try parseOptionalOwnedStringInto(&auth.client_id, alloc, auth_object, "client_id");
+    try parseOptionalOwnedStringInto(
+        &auth.client_secret_env,
         alloc,
         auth_object,
         "client_secret_env",
     );
-    auth.client_metadata_url = try parseOptionalOwnedString(
+    try parseOptionalOwnedStringInto(
+        &auth.client_metadata_url,
         alloc,
         auth_object,
         "client_metadata_url",
@@ -937,20 +1015,27 @@ fn parseProfileAuth(
         mcp_auth.validateClientMetadataUrl(url) catch
             return error.InvalidMcpOAuthConfig;
     }
-    return auth;
+    out.* = auth;
 }
 
-fn parseOptionalOwnedString(
+fn parseOptionalOwnedStringInto(
+    out: *?[]u8,
     alloc: Allocator,
     object: std.json.ObjectMap,
     key: []const u8,
-) !?[]u8 {
-    const value = object.get(key) orelse return null;
-    if (value == .null) return null;
+) !void {
+    const value = object.get(key) orelse {
+        out.* = null;
+        return;
+    };
+    if (value == .null) {
+        out.* = null;
+        return;
+    }
     if (value != .string or std.mem.trim(u8, value.string, " \t\r\n").len == 0) {
         return error.InvalidMcpOAuthConfig;
     }
-    return try alloc.dupe(u8, value.string);
+    out.* = try alloc.dupe(u8, value.string);
 }
 
 fn isValidEnvName(value: []const u8) bool {
@@ -983,7 +1068,11 @@ fn parseSelectedEnvironment(alloc: Allocator, object: std.json.ObjectMap, server
     return parseEnvironment(alloc, maybe_value) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => {
-            debug_trace.logf("mcp", "invalid environment for server {s}: {s}", .{ server_name, @errorName(err) });
+            logServerIssue(
+                "invalid environment for server ",
+                server_name,
+                @errorName(err),
+            );
             return error.McpConfigInvalidEnvironment;
         },
     };
@@ -1139,17 +1228,22 @@ const ParsedCommandSpec = struct {
     args: [][]u8,
 };
 
-fn parseCommandSpec(alloc: Allocator, object: std.json.ObjectMap) !ParsedCommandSpec {
+fn parseCommandSpecInto(
+    out: *ParsedCommandSpec,
+    alloc: Allocator,
+    object: std.json.ObjectMap,
+) !void {
     const command_value = object.get("command") orelse return error.McpMissingCommand;
 
     switch (command_value) {
         .string => {
             const args: [][]u8 = if (object.get("args")) |args_value| try parseStringArray(alloc, args_value) else &.{};
             errdefer freeOwnedStrings(alloc, args);
-            return .{
+            out.* = .{
                 .command = try alloc.dupe(u8, command_value.string),
                 .args = args,
             };
+            return;
         },
         .array => {
             if (command_value.array.items.len == 0) return error.McpMissingCommand;
@@ -1174,7 +1268,7 @@ fn parseCommandSpec(alloc: Allocator, object: std.json.ObjectMap) !ParsedCommand
                 parsed += 1;
             }
 
-            return .{ .command = command, .args = args };
+            out.* = .{ .command = command, .args = args };
         },
         else => return error.McpMissingCommand,
     }
