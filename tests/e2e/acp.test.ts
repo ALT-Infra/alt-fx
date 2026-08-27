@@ -1490,6 +1490,60 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP forwards exact Markdown source without rendered duplicates",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-markdown-source-");
+      const markdown = [
+        "# Heading\n\n- **bold** item\n\n",
+        "| A | B |\n| - | - |\n| 1 | 2 |\n\n",
+        "```zig\nconst x = 1;\n```\n",
+      ];
+      const gateway = startFakeGateway([
+        fakeGatewaySse([
+          ...markdown.map((delta) => ({
+            type: "text-delta",
+            id: "answer_1",
+            delta,
+          })),
+          {
+            type: "finish",
+            finishReason: { unified: "stop", raw: "stop" },
+            usage: {
+              inputTokens: { total: 3 },
+              outputTokens: { total: 5 },
+            },
+          },
+        ]),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await startCodeSession(client);
+
+        const result = await runPrompt(client, "Return the Markdown fixture.", TIMEOUT);
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        const responseText = result.messages
+          .filter((message) =>
+            message.method === "session/update" &&
+            message.params?.update?.sessionUpdate === "agent_message_chunk"
+          )
+          .map((message) => message.params.update.content.text)
+          .join("");
+        expect(responseText).toBe(markdown.join(""));
+        expect(responseText).not.toContain("\u001b");
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "ACP reload replays pending execution once and clears recovery after completion",
     async () => {
       const root = createIsolatedRoot("fx-acp-reload-model-recovery-");
