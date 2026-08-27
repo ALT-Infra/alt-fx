@@ -52,7 +52,7 @@ const MALFORMED_LABEL_SENTINEL = "FX_MALFORMED_LABEL_SENTINEL";
 const MALFORMED_STREAMED_ARGUMENTS =
   `{"path":"${MALFORMED_LABEL_SENTINEL}",`;
 const LONG_QUESTION =
-  "When you ask Fx to ask a question interactively, the question text must remain fully visible even when it wraps.";
+  "When you ask fx to ask a question interactively, the question text must remain fully visible even when it wraps.";
 const LONG_QUESTION_ANSWER =
   "Run the complete verification suite before pushing this branch";
 const LONG_QUESTION_DESCRIPTION =
@@ -2626,7 +2626,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         .find((line) => line.includes("remain fully visible even when it wraps."));
       const questionLead = pane
         .split("\n")
-        .find((line) => line.includes("When you ask Fx to ask a question"));
+        .find((line) => line.includes("When you ask fx to ask a question"));
       const labelContinuation = pane
         .split("\n")
         .find((line) => line.includes("verification suite before"));
@@ -2640,7 +2640,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         .split("\n")
         .find((line) => line.includes("Keep the entire explanation"));
       expect(questionContinuation?.indexOf("remain fully visible even when it wraps.")).toBe(
-        questionLead?.indexOf("When you ask Fx to ask a question"),
+        questionLead?.indexOf("When you ask fx to ask a question"),
       );
       expect(labelContinuation?.indexOf("verification suite before")).toBe(
         labelLead?.indexOf("Run the complete"),

@@ -1713,7 +1713,7 @@ fn streamReplaySafe(
 const read_failure_tool_recovery_instruction =
     \\<network_recovery>
     \\The previous response stream ended because the network connection was interrupted.
-    \\Fx did not execute the incomplete tool call from that stream. Recreate the tool call if it is still needed.
+    \\fx did not execute the incomplete tool call from that stream. Recreate the tool call if it is still needed.
     \\</network_recovery>
 ;
 

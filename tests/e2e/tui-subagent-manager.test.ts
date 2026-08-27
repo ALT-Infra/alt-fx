@@ -1091,7 +1091,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
   );
 
   test(
-    "one Ctrl-C cancels a streaming persistent child without exiting Fx",
+    "one Ctrl-C cancels a streaming persistent child without exiting fx",
     async () => {
       const fixture = createFixture();
       const childName = "ctrl-c-child";
@@ -3595,7 +3595,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         const idleActions = await parent.waitForPane(
           (pane) =>
             pane.includes(`Actions — ${childName}`) &&
-            pane.includes("another Fx process owns this child"),
+            pane.includes("another fx process owns this child"),
           TIMEOUT,
         );
         expect(idleActions).not.toContain("C cancel");
@@ -3630,7 +3630,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await parent.sendKeys("Tab");
         await parent.sendLiteralText("x");
         const queuedActions = await parent.waitForText(
-          "another Fx process owns this child",
+          "another fx process owns this child",
           TIMEOUT,
         );
         expect(queuedActions).not.toContain("C cancel");
@@ -3662,7 +3662,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         const locallyOwnedChild = await parent.waitForPane(
           (pane) =>
             pane.includes(childName) &&
-            !pane.includes("another Fx process owns this child") &&
+            !pane.includes("another fx process owns this child") &&
             ((pane.includes(`Actions — ${childName}`) &&
               (pane.includes("Current state: idle") ||
                 pane.includes("Current state: interrupted"))) ||
@@ -3670,7 +3670,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           TIMEOUT,
         );
         expect(locallyOwnedChild).not.toContain(
-          "another Fx process owns this child",
+          "another fx process owns this child",
         );
         expect(gateway.requests.filter((request) =>
           latestPrompt(request.body).includes(directMessage)
@@ -4615,10 +4615,11 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
 
         const requestCountBeforeSkills = gateway.requestCount();
         await active.sendText("/skills");
-        await active.waitForPane(
+        const openedSkills = await active.waitForPane(
           (pane) => pane.includes("Skills 1") && pane.includes(skillName),
           TIMEOUT,
         );
+        expect(openedSkills).toContain("CHILD_LOCAL_SKILLS_READY");
         expect(gateway.requestCount()).toBe(requestCountBeforeSkills);
         expect(
           gateway.requests.some((request) =>

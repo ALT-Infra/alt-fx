@@ -6831,7 +6831,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
             type: "tool-result",
             toolCallId: "provider_search_direct",
             result: {
-              results: [{ title: "Fx provider source", url: sourceUrl }],
+              results: [{ title: "fx provider source", url: sourceUrl }],
             },
           },
           {
