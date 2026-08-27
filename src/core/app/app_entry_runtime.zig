@@ -237,7 +237,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
                 return .{ .exit = 1 };
             },
             error.SessionBusy => {
-                writeStderr(deps, "fx: another Fx process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n");
+                writeStderr(deps, "fx: another fx process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n");
                 return .{ .exit = 1 };
             },
             error.SessionLockUnsupported => {
@@ -1177,7 +1177,7 @@ test "app entry maps unavailable session state to one expected startup failure" 
     }{
         .{
             .init_error = error.SessionBusy,
-            .message = "fx: another Fx process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n",
+            .message = "fx: another fx process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n",
         },
         .{
             .init_error = error.SessionLockUnsupported,

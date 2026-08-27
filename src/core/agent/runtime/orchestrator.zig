@@ -1762,7 +1762,7 @@ fn streamReplaySafe(
 const read_failure_tool_recovery_instruction =
     \\<network_recovery>
     \\The previous response stream ended because the network connection was interrupted.
-    \\Fx did not execute the incomplete tool call from that stream. Recreate the tool call if it is still needed.
+    \\fx did not execute the incomplete tool call from that stream. Recreate the tool call if it is still needed.
     \\</network_recovery>
 ;
 
@@ -2448,18 +2448,18 @@ fn pushAutoRetryStatus(
     return deadline;
 }
 
-const AutoRetryAdmission = struct {
+const ProviderAdmission = struct {
     deps: *const AgentRuntimeDeps,
+    stream: *runtime_assistant_stream.StreamChunkContext,
     pending_status: *?types.RouteRecoveryStatus,
-    published: bool = false,
 
     fn admit(raw: *anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        if (self.published) return;
-        const status = self.pending_status.* orelse return;
-        try pushRouteRecoveryStatus(self.deps, status);
-        self.pending_status.* = null;
-        self.published = true;
+        runtime_assistant_stream.publishTurnPhase(self.stream, .thinking);
+        if (self.pending_status.*) |status| {
+            try pushRouteRecoveryStatus(self.deps, status);
+            self.pending_status.* = null;
+        }
     }
 };
 
@@ -3596,8 +3596,9 @@ fn processQueuedPromptLoop(
                 .stream = &stream_ctx,
                 .required_vision = vision_mode == .required,
             };
-            var auto_retry_admission = AutoRetryAdmission{
+            var provider_admission = ProviderAdmission{
                 .deps = deps,
+                .stream = &stream_ctx,
                 .pending_status = &pending_auto_retry_status,
             };
             var model_request = agent_stream_provider.ModelRequest{
@@ -3632,10 +3633,7 @@ fn processQueuedPromptLoop(
                 .delivery = &gateway_delivery,
                 .attempt_evidence = &gateway_attempt_evidence,
                 .events = .{ .context = &provider_events, .emit_fn = onProviderEvent },
-                .admission = if (pending_auto_retry_status != null)
-                    .{ .context = &auto_retry_admission, .admit_fn = AutoRetryAdmission.admit }
-                else
-                    .{},
+                .admission = .{ .context = &provider_admission, .admit_fn = ProviderAdmission.admit },
                 .cancel_flag = config.cancel_flag,
                 .provider_attempt_owner = .agent,
             };

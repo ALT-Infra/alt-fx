@@ -8935,7 +8935,7 @@ fn renderAuthenticationRequired(
         try writeEncodedJsonScalar(alloc, &out.writer, server.config.name);
         switch (mode) {
             .oauth => try out.writer.writeAll(
-                ",\"interactive\":true,\"message\":\"Run /mcp auth for this server in an interactive Fx session.\"",
+                ",\"interactive\":true,\"message\":\"Run /mcp auth for this server in an interactive fx session.\"",
             ),
             .bearer_environment => {
                 try out.writer.writeAll(
@@ -8947,7 +8947,7 @@ fn renderAuthenticationRequired(
                     server.config.bearer_token_env.?,
                 );
                 try out.writer.writeAll(
-                    ",\"message\":\"Set this environment variable before starting Fx.\"",
+                    ",\"message\":\"Set this environment variable before starting fx.\"",
                 );
             },
         }

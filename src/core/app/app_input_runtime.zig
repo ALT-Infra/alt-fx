@@ -51,6 +51,8 @@ const approval_ui = @import("../../ui/footer/approval_ui.zig");
 const interaction_state = @import("../../ui/footer/interaction_state.zig");
 const approval_prompt = @import("../permissions/approval_prompt.zig");
 const picker_presentation = @import("../../ui/footer/picker_presentation.zig");
+const compact_command_menu_presentation = @import("../../ui/footer/compact_command_menu_presentation.zig");
+const render_input = @import("../../ui/footer/render_input.zig");
 const paste_blocks = @import("../input/pasted_blocks.zig");
 const registered_entities = @import("../input/registered_entities.zig");
 const prompt_history_runtime = @import("prompt_history_runtime.zig");
@@ -1356,10 +1358,13 @@ pub fn Runtime(comptime App: type) type {
                     return true;
                 }
                 switch (byte) {
+                    '\t' => if (menu == .usage) {
+                        try cycleUsageMenuScope(app, 1);
+                    },
                     '\r' => try submitCompactCommandMenuSelection(app, menu, max_input_len),
                     'r', 'R' => if (menu == .usage) {
                         if (comptime runtime_profile.allows(App, .profile_usage)) {
-                            try refreshUsageMenu(
+                            try reloadUsageMenu(
                                 app,
                                 app.input_runtime.usage_menu.navigationScope(),
                             );
@@ -2057,7 +2062,7 @@ pub fn Runtime(comptime App: type) type {
             }
             if (menu == .usage) {
                 _ = app.input_runtime.usage_menu.toggleExpanded(
-                    app.shell.layout.rows,
+                    usageMenuVisibleModelItems(app),
                 );
                 app.shell.render_requests.request(.footer);
                 return;
@@ -2109,7 +2114,7 @@ pub fn Runtime(comptime App: type) type {
                 .statusline => app.input_runtime.statusline_menu.move(delta),
                 .usage => app.input_runtime.usage_menu.moveModel(
                     delta,
-                    app.shell.layout.rows,
+                    usageMenuVisibleModelItems(app),
                 ),
                 .workspace => if (comptime @hasDecl(App, "workspaceAccess"))
                     app.input_runtime.workspace_menu.move(
@@ -2119,6 +2124,27 @@ pub fn Runtime(comptime App: type) type {
                 else
                     false,
             };
+        }
+
+        fn usageMenuVisibleModelItems(app: *App) u16 {
+            const projection = render_input.usageMenuProjection(
+                &app.input_runtime.usage_menu,
+            );
+            const menu: render_input.CompactCommandMenuProjection = .{
+                .usage = projection,
+            };
+            const visible_rows = @min(
+                compact_command_menu_presentation.desiredRowCount(
+                    menu,
+                    app.shell.layout.cols,
+                ),
+                app.shell.layout.rows -| 3,
+            );
+            return compact_command_menu_presentation.usageVisibleModelItems(
+                projection,
+                visible_rows,
+                app.shell.layout.cols,
+            );
         }
 
         fn routeCompactCommandMenuEscapeAction(
@@ -2137,6 +2163,10 @@ pub fn Runtime(comptime App: type) type {
                 if (next != current) {
                     try refreshUsageMenu(app, next);
                 }
+                return;
+            }
+            if (menu == .usage and resolved == .toggle_permission_mode) {
+                try cycleUsageMenuScope(app, -1);
                 return;
             }
             if (menu == .statusline and
@@ -2169,6 +2199,35 @@ pub fn Runtime(comptime App: type) type {
             } else {
                 try app_commands.Handlers(App).refreshUsageMenu(app, scope);
             }
+        }
+
+        fn reloadUsageMenu(app: *App, scope: usage_report.Scope) !void {
+            if (comptime !runtime_profile.allows(App, .profile_usage)) return;
+            if (comptime @hasDecl(App, "reloadUsageMenu")) {
+                try app.reloadUsageMenu(scope);
+            } else if (comptime @hasDecl(App, "refreshUsageMenu")) {
+                try app.refreshUsageMenu(scope);
+            } else {
+                try app_commands.Handlers(App).reloadUsageMenu(app, scope);
+            }
+        }
+
+        fn cycleUsageMenuScope(app: *App, delta: i32) !void {
+            const current = app.input_runtime.usage_menu.navigationScope();
+            const next: usage_report.Scope = if (delta < 0)
+                switch (current) {
+                    .days_30 => .session,
+                    .days_7 => .days_30,
+                    .hours_24 => .days_7,
+                    .session => .hours_24,
+                }
+            else switch (current) {
+                .days_30 => .days_7,
+                .days_7 => .hours_24,
+                .hours_24 => .session,
+                .session => .days_30,
+            };
+            try refreshUsageMenu(app, next);
         }
 
         fn submitHelpMenuSelection(app: *App, max_input_len: usize, max_prompt_history: usize) !bool {
@@ -4632,6 +4691,23 @@ test "app_input_runtime Tab advances help categories before autocomplete" {
     try std.testing.expect(app.input_runtime.help_menu.category == null);
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.help_menu.selected_index);
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.help_menu.window_start);
+}
+
+test "app_input_runtime Tab cycles usage scopes in both directions" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try app.input_runtime.usage_menu.openError(
+        alloc,
+        .days_30,
+        "usage is unavailable",
+    );
+
+    try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
+    try std.testing.expectEqual(usage_report.Scope.days_7, app.input_runtime.usage_menu.navigationScope());
+
+    try feedRoutingBytes(&app, "\x1b[Z");
+    try std.testing.expectEqual(usage_report.Scope.days_30, app.input_runtime.usage_menu.navigationScope());
 }
 
 test "app_input_runtime Tab toggles session picker scope before autocomplete" {

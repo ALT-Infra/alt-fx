@@ -6345,6 +6345,65 @@ test "saved noninteractive terminal exec captures replay by capability" {
     );
 }
 
+test "registered read_tool_result restores an omitted stored-result suffix" {
+    const result_store = @import("../session/result_store.zig");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(
+        io_mod.getIo(),
+        "session",
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer session_dir.close(io_mod.getIo());
+    const session_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "session");
+    defer alloc.free(session_path);
+    var capability = try session_child_store.SessionChildCapability.initForTesting(
+        alloc,
+        session_dir,
+        session_path,
+        .writable,
+        .{},
+    );
+    defer capability.deinit();
+
+    const handle = try result_store.storeLargeResultManaged(
+        alloc,
+        &capability,
+        "integration-call",
+        "web_fetch",
+        "integration suffix needle",
+    );
+    defer alloc.free(handle);
+    try std.testing.expect(std.mem.endsWith(u8, handle, ".txt"));
+    const suffixless_handle = handle[0 .. handle.len - ".txt".len];
+
+    var rt = TestRuntime{ .session_child_capability = &capability };
+    defer rt.deinit(alloc);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const arguments_json = try std.fmt.allocPrint(
+        arena,
+        "{{\"handle\":\"{s}\",\"query\":\"suffix needle\"}}",
+        .{suffixless_handle},
+    );
+
+    const result = try executeToolCall(rt.context(), arena, .{
+        .id = "suffixless-result-read",
+        .name = "read_tool_result",
+        .arguments_json = arguments_json,
+    });
+
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
+    try expectContains(result.model_output, "integration suffix needle");
+    try expectContains(result.model_output, handle);
+}
+
 test "no-save terminal exec publishes one readable ephemeral replay" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
 

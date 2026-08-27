@@ -34,6 +34,7 @@ const skill_runtime = @import("../skills/skill_runtime.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const session_commands = @import("../session/session_commands.zig");
 const usage_recovery = @import("../session/usage_recovery.zig");
+const usage_dashboard_runtime = @import("usage_dashboard_runtime.zig");
 const usage_report = @import("../session/usage_report.zig");
 const types = @import("../shared/types.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
@@ -1020,6 +1021,10 @@ pub fn Handlers(comptime App: type) type {
             closeHelpMenuIfPresent(app);
             app.input_runtime.settings_menu.close();
             closeInlineCommandMenusIfPresent(app);
+            if (comptime @hasField(App, "usage_dashboard")) {
+                try openUsageDashboard(app, .days_30);
+                return;
+            }
             var usage = loadUsageSnapshot(app, .days_30) catch |err| {
                 debug_trace.logf(
                     "usage",
@@ -1043,26 +1048,142 @@ pub fn Handlers(comptime App: type) type {
             app: *App,
             scope: usage_report.Scope,
         ) !void {
-            var usage = loadUsageSnapshot(app, scope) catch |err| {
-                debug_trace.logf(
-                    "usage",
-                    "usage dashboard refresh failed scope={s} reason={s}",
-                    .{ @tagName(scope), @errorName(err) },
-                );
-                try app.input_runtime.usage_menu.recordRefreshFailure(
-                    app.alloc,
-                    scope,
-                    "Local usage data is unavailable",
-                );
+            if (comptime @hasField(App, "usage_dashboard")) {
+                if (scope == .session) {
+                    var usage = loadUsageSnapshot(app, scope) catch |err| {
+                        try recordUsageRefreshFailure(app, scope, err);
+                        return;
+                    };
+                    errdefer usage.deinit(app.alloc);
+                    installUsageSnapshot(app, usage);
+                    return;
+                }
+                if (try app.usage_dashboard.snapshot(app.alloc, scope)) |usage| {
+                    installUsageSnapshot(app, usage);
+                    return;
+                }
+                app.input_runtime.usage_menu.setLoadingScope(app.alloc, scope);
+                try requestUsageDashboardRefresh(app);
                 app.shell.render_requests.request(.footer);
+                return;
+            }
+            var usage = loadUsageSnapshot(app, scope) catch |err| {
+                try recordUsageRefreshFailure(app, scope, err);
                 return;
             };
             errdefer usage.deinit(app.alloc);
+            installUsageSnapshot(app, usage);
+        }
+
+        pub fn reloadUsageMenu(
+            app: *App,
+            scope: usage_report.Scope,
+        ) !void {
+            if (comptime !@hasField(App, "usage_dashboard")) {
+                try refreshUsageMenu(app, scope);
+                return;
+            }
+            if (scope == .session) {
+                try refreshUsageMenu(app, scope);
+                return;
+            }
+            app.input_runtime.usage_menu.requested_scope = scope;
+            requestUsageDashboardRefresh(app) catch |err| {
+                try recordUsageRefreshFailure(app, scope, err);
+                return;
+            };
+            app.shell.render_requests.request(.footer);
+        }
+
+        pub fn collectUsageDashboardFacts(app: *App) !bool {
+            if (comptime !@hasField(App, "usage_dashboard")) return false;
+            const transition = app.usage_dashboard.pollTransition();
+            if (transition == .none) return false;
+            if (!app.input_runtime.usage_menu.active or
+                app.input_runtime.usage_menu.navigationScope() == .session)
+            {
+                return false;
+            }
+            const scope = app.input_runtime.usage_menu.navigationScope();
+            if (transition == .failed) {
+                const err = app.usage_dashboard.lastError() orelse
+                    error.ProfileUsageUnavailable;
+                try recordUsageRefreshFailure(app, scope, err);
+                return true;
+            }
+            if (try app.usage_dashboard.snapshot(app.alloc, scope)) |usage| {
+                installUsageSnapshot(app, usage);
+                return true;
+            }
+            const err = app.usage_dashboard.lastError() orelse
+                error.ProfileUsageUnavailable;
+            try recordUsageRefreshFailure(app, scope, err);
+            return true;
+        }
+
+        fn openUsageDashboard(
+            app: *App,
+            scope: usage_report.Scope,
+        ) !void {
+            const cached = try app.usage_dashboard.snapshot(app.alloc, scope);
+            if (cached) |usage| {
+                app.input_runtime.usage_menu.openOwned(app.alloc, usage);
+            } else {
+                app.input_runtime.usage_menu.openLoading(app.alloc, scope);
+            }
+            requestUsageDashboardRefresh(app) catch |err| {
+                try recordUsageRefreshFailure(app, scope, err);
+                return;
+            };
+            app.shell.render_requests.request(.footer);
+        }
+
+        fn requestUsageDashboardRefresh(app: *App) !void {
+            const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+            const availability = try app.session.ensureProfileUsageReadable(
+                app.alloc,
+                home,
+            );
+            if (availability == .unavailable) {
+                return app.session.profile_usage.lastError() orelse
+                    error.ProfileUsageUnavailable;
+            }
+            _ = try app.usage_dashboard.requestRefresh(
+                usage_dashboard_runtime.profileProvider(
+                    &app.session.profile_usage,
+                ),
+                home,
+                @max(io_mod.milliTimestamp(), 0),
+            );
+        }
+
+        fn installUsageSnapshot(
+            app: *App,
+            usage: usage_report.Snapshot,
+        ) void {
             if (app.input_runtime.usage_menu.active) {
                 app.input_runtime.usage_menu.replaceOwned(app.alloc, usage);
             } else {
                 app.input_runtime.usage_menu.openOwned(app.alloc, usage);
             }
+            app.shell.render_requests.request(.footer);
+        }
+
+        fn recordUsageRefreshFailure(
+            app: *App,
+            scope: usage_report.Scope,
+            err: anyerror,
+        ) !void {
+            debug_trace.logf(
+                "usage",
+                "usage dashboard refresh failed scope={s} reason={s}",
+                .{ @tagName(scope), @errorName(err) },
+            );
+            try app.input_runtime.usage_menu.recordRefreshFailure(
+                app.alloc,
+                scope,
+                "Local usage data is unavailable",
+            );
             app.shell.render_requests.request(.footer);
         }
 
