@@ -923,12 +923,30 @@ pub fn handleListSessions(state: *server.ServerState, alloc: Allocator, msg: *js
     defer out.deinit();
 
     try out.writer.writeAll("{\"sessions\":[");
-    for (session_list.items, 0..) |summary, i| {
-        if (i > 0) try out.writer.writeAll(",");
+    var wrote_session = false;
+    for (session_list.items) |summary| {
+        const workspace_root = summary.workspace_root orelse {
+            debug_trace.logf(
+                "acp",
+                "session operation=list outcome=omitted id={s} reason=workspace_unknown",
+                .{summary.id},
+            );
+            continue;
+        };
+        if (!std.fs.path.isAbsolute(workspace_root)) {
+            debug_trace.logf(
+                "acp",
+                "session operation=list outcome=omitted id={s} reason=workspace_not_absolute",
+                .{summary.id},
+            );
+            continue;
+        }
+        if (wrote_session) try out.writer.writeAll(",");
+        wrote_session = true;
         try out.writer.writeAll("{\"sessionId\":");
         try writeJsonStr(summary.id, &out.writer);
         try out.writer.writeAll(",\"cwd\":");
-        try writeJsonStr(summary.workspace_root orelse state.workspace_root, &out.writer);
+        try writeJsonStr(workspace_root, &out.writer);
         try out.writer.writeAll(",\"updatedAt\":");
         const iso = try formatIso8601(alloc, summary.updated_at_ms);
         defer alloc.free(iso);
@@ -950,7 +968,10 @@ fn parseListSessionsCwd(
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidParams;
     const cwd = parsed.value.object.get("cwd") orelse return null;
-    if (cwd != .string) return error.InvalidParams;
+    if (cwd == .null) return null;
+    if (cwd != .string or !std.fs.path.isAbsolute(cwd.string)) {
+        return error.InvalidParams;
+    }
     return try alloc.dupe(u8, cwd.string);
 }
 
