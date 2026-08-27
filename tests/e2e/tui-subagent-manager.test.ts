@@ -3852,8 +3852,6 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         expect(gateway.requests.some((request) => request.body.includes(childPrompt))).toBe(true);
         await active.sendKeys("C-o");
         await active.waitForText("Full detail · ctrl o close", TIMEOUT);
-        await active.sendKeys("Right");
-        await active.waitForText("Full detail · ctrl o close", TIMEOUT);
         releaseChildApproval(fakeGatewayToolCall(callId, "terminal", {
           action: "exec",
           timeout_ms: 600_000,
@@ -5302,7 +5300,6 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           (pane) => pane.includes("CHILD_POSITION_"),
           TIMEOUT,
         );
-        await active.sendKeys("Right");
         await active.waitForText("Full detail · ctrl o close", TIMEOUT);
         for (let index = 0; index < 5; index += 1) {
           const before = await active.capturePane();
@@ -5317,10 +5314,8 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await active.sendKeys("C-x");
         await active.waitForText("Agents & processes", TIMEOUT);
         await active.sendKeys("Enter");
-        const afterFullRoundTrip = await active.waitForPane(
-          (pane) => pane.includes("CHILD_POSITION_"),
-          TIMEOUT,
-        );
+        await active.waitForText("Full detail · ctrl o close", TIMEOUT);
+        const afterFullRoundTrip = await active.capturePane();
         expect(visibleRange(afterFullRoundTrip)).toEqual(beforeFullRoundTrip);
         expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
       } finally {
@@ -5862,8 +5857,6 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await active.sendKeys("Escape");
         await active.waitForText("Subagent: approval-second", TIMEOUT);
         await active.sendKeys("C-o");
-        await active.waitForText("Full detail · ctrl o close", TIMEOUT);
-        await active.sendKeys("Right");
         await active.waitForText("Full detail · ctrl o close", TIMEOUT);
         await active.sendKeys("PageDown");
         expect(await active.capturePane()).toContain("Full detail · ctrl o close");
@@ -6794,7 +6787,6 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           TIMEOUT,
         );
         expect(fullChild).not.toContain("Create the live manager fixture.");
-        await active.sendKeys("Right");
         await active.waitForText("Full detail · ctrl o close", TIMEOUT);
         const fullChildGrid = await active.capturePaneGrid();
         expect(fullChildGrid).not.toEqual(settledChildGrid);
