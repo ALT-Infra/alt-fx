@@ -520,7 +520,13 @@ fn buildFooterSurfaceProjection(
     else if (question_projection) |projection|
         try question_ui.questionPanelRowsForLayout(alloc, projection, shell.layout.cols)
     else if (compact_command_menu) |menu|
-        @min(compact_command_menu_presentation.desiredRowCount(menu), shell.layout.rows -| 3)
+        @min(
+            compact_command_menu_presentation.desiredRowCount(
+                menu,
+                shell.layout.cols,
+            ),
+            shell.layout.rows -| 3,
+        )
     else if (show_auth_picker)
         picker_presentation.authPickerReservedRows(
             ctx.auth_picker,

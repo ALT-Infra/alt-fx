@@ -1670,7 +1670,7 @@ describe("MCP remote authentication lifecycle", () => {
       ).toHaveLength(1);
       expect(gateway.requests[1]?.body).toContain("authentication_required");
       expect(gateway.requests[1]?.body).toContain(
-        "Run /mcp auth for this server in an interactive Fx session.",
+        "Run /mcp auth for this server in an interactive fx session.",
       );
       expect(
         existsSync(join(root.home, ".fx", "mcp-credentials")),
