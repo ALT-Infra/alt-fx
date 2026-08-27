@@ -3068,7 +3068,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         () => queuedGateway.requests.length === 1 && hold.started,
         "held active Gateway request",
       );
-      await session.waitForText("Thinking", TIMEOUT);
+      await session.waitForText("Generating", TIMEOUT);
 
       await session.sendText(`/image ${image}`);
       await session.waitForText("attached image: queued-snapshot.png", TIMEOUT);
@@ -3232,7 +3232,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
             visible.includes(toolHeader) &&
             visible.includes(toolMarker) &&
             visible.includes(permissionMarker) &&
-            visible.includes("Thinking");
+            visible.includes("Generating");
         },
         "local permissions output during held post-tool continuation",
       );
@@ -3244,7 +3244,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         (pane) =>
           pane.includes(activeBefore.trim()) &&
           pane.includes(activeAfter.trim()) &&
-          !pane.includes("Thinking"),
+          !pane.includes("Generating"),
         TIMEOUT,
       );
       expect(heldGateway.requests).toHaveLength(2);
@@ -3256,7 +3256,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
       await session.waitForText(followupResponse, TIMEOUT);
       await session.waitForPane(
-        (pane) => pane.includes(followupResponse) && !pane.includes("Thinking"),
+        (pane) => pane.includes(followupResponse) && !pane.includes("Generating"),
         TIMEOUT,
       );
 
@@ -3476,7 +3476,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         "hidden queue review before stream cancellation",
       );
       await session.waitForPane(
-        (pane) => pane.includes("Thinking"),
+        (pane) => pane.includes("Generating"),
         TIMEOUT,
       );
       expect(hold.cancelled).toBe(false);

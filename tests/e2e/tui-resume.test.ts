@@ -724,7 +724,7 @@ function expectNoRawToolReplay(scrollback: string): void {
 
 function normalizeVolatileStatusRows(grid: string[]): string[] {
   return grid.map((line) =>
-    /^• Thinking(?: \(\d+s\))?$/.test(line) ||
+    /^• (?:Thinking|Generating|Running)(?: \(\d+s\))?$/.test(line) ||
       /^• Streaming \([^)]*\)$/.test(line) ||
       isVolatileTokenStatusRow(line)
       ? "<status>"
@@ -6129,7 +6129,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Keep this response active.");
       await waitForCondition(() => hold.started, "held gateway response");
-      await active.waitForText("Thinking", TIMEOUT);
+      await active.waitForText("Generating", TIMEOUT);
 
       await active.sendText("/resume");
       await active.waitForText("resume is unavailable until the response finishes", TIMEOUT);

@@ -3053,13 +3053,13 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendText("Keep this response active.");
       await waitForHeldSkillStream(stream);
-      await session.waitForText("Thinking", 10_000);
+      await session.waitForText("Generating", 10_000);
       await session.sendLiteralText("$");
       await waitForSkillsMenu(session, 4);
 
       await session.sendKeys("C-[");
       await session.waitForPane(
-        (pane) => pane.includes("Thinking") && !pane.includes("↑↓ Navigate"),
+        (pane) => pane.includes("Generating") && !pane.includes("↑↓ Navigate"),
         5_000,
       );
       expect(stream.cancelled).toBe(false);
@@ -3102,14 +3102,14 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendText("Keep this slash response active.");
       await waitForHeldSkillStream(stream);
-      await session.waitForText("Thinking", 10_000);
+      await session.waitForText("Generating", 10_000);
       await session.sendLiteralText("/he");
       await session.waitForText("Esc Close", 10_000);
 
       await session.sendKeys("Escape");
       await session.waitForPane(
         (pane) =>
-          pane.includes("Thinking") &&
+          pane.includes("Generating") &&
           pane.includes("/he") &&
           !pane.includes("Esc Close"),
         5_000,
