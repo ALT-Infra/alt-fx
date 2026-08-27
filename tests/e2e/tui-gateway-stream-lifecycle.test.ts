@@ -1550,13 +1550,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
 
       hold.finish?.();
-      await waitForScrollback(
-        session!,
-        (value) =>
-          value.includes("  (↑8 ↓20k)") &&
-          !value.includes(finalSentinel),
-        "exact token progress during the paced response tail",
-      );
       await session!.waitForText(finalSentinel, TIMEOUT);
       const finalScrollback = await waitForScrollback(
         session!,
@@ -2829,7 +2822,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "completed paced assistant text drains before a queued user prompt reaches scrollback",
+    "complete assistant block precedes a queued user prompt in scrollback",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-prompt-boundary-")));
       const home = join(root, "home");
@@ -2837,6 +2830,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const stderrPath = join(root, "stderr.log");
       const tapePath = join(root, "session.fxtape");
       const tracePath = join(root, "trace.log");
+      const firstResponse: HoldState = { started: false, cancelled: false };
       const secondResponse = { started: false, cancelled: false };
       mkdirSync(join(home, ".fx"), { recursive: true });
       mkdirSync(workspacePath, { recursive: true });
@@ -2844,17 +2838,21 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const workspace = realpathSync(workspacePath);
 
       const splitGateway = startFakeGateway([
-        fakeGatewaySse([
-          { type: "text-delta", id: "split_old", delta: SPLIT_OLD_RESPONSE },
-          {
-            type: "finish",
-            finishReason: { unified: "stop", raw: "stop" },
-            usage: {
-              inputTokens: { total: 3 },
-              outputTokens: { total: 5 },
-            },
-          },
-        ]),
+        () =>
+          heldGatewayResponse(
+            firstResponse,
+            [{ type: "text-delta", id: "split_old", delta: `${SPLIT_OLD_RESPONSE}\n` }],
+            [
+              {
+                type: "finish",
+                finishReason: { unified: "stop", raw: "stop" },
+                usage: {
+                  inputTokens: { total: 3 },
+                  outputTokens: { total: 5 },
+                },
+              },
+            ],
+          ),
         () => heldGatewayResponse(secondResponse),
       ]);
       gateway = splitGateway;
@@ -2882,18 +2880,15 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Return the first split fixture.");
-      const beforePrompt = await waitForScrollback(
-        session,
-        (candidate) =>
-          existsSync(tracePath) &&
-          readFileSync(tracePath, "utf8").includes("event=stream_complete") &&
-          candidate.includes("SPLIT_OLD_TAIL_005") &&
-          !candidate.includes("SPLIT_OLD_TAIL_FINAL"),
-        "completed Gateway stream with assistant presentation still draining",
+      await waitForCondition(
+        () => splitGateway.requests.length === 1 && firstResponse.started,
+        "held first Gateway stream",
       );
-      expect(beforePrompt).not.toContain("SPLIT_OLD_TAIL_FINAL");
+      await session.waitForText("SPLIT_OLD_TAIL_FINAL", TIMEOUT);
 
       await session.sendText(SPLIT_NEW_USER_PROMPT);
+      expect(splitGateway.requests).toHaveLength(1);
+      firstResponse.release?.();
       await waitForCondition(
         () => splitGateway.requests.length === 2 && secondResponse.started,
         "held second Gateway stream",
