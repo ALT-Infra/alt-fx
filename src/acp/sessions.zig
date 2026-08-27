@@ -1626,12 +1626,13 @@ test "ACP project MCP loading expands workspace environment templates" {
     defer test_home.deinit();
     try test_home.map.put("ACP_MCP_COMMAND", "node");
     try test_home.map.put("ACP_MCP_TOKEN", "secret-value");
+    var approved_names = [_][]u8{@constCast("expanded")};
 
     var result = try workspace_config.load(
         alloc,
         workspace_path,
         .workspace,
-        .{},
+        .{ .approved = &approved_names },
     );
     defer result.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), result.configs.items.len);
