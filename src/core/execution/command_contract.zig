@@ -87,6 +87,12 @@ pub const ForegroundCommandResultSnapshot = struct {
     duration_ms: ?u64 = null,
 };
 
+pub const ForegroundStatusProjection = struct {
+    exit_code: ?i64,
+    signal: ?u32,
+    termination_indeterminate: bool,
+};
+
 pub fn formatForegroundCommandResult(
     alloc: std.mem.Allocator,
     snapshot: ForegroundCommandResultSnapshot,
@@ -99,15 +105,16 @@ pub fn formatForegroundCommandResult(
 
     try writeForegroundStatusLine(&out.writer, snapshot.status);
     try writeForegroundOutputEnvelopes(&out.writer, stdout_text, stderr_text);
+    const status = projectForegroundStatus(snapshot.status);
 
     return .{
         .output = try out.toOwnedSlice(),
         .command_result = .{ .foreground = .{
             .command = snapshot.command,
             .cwd = snapshot.cwd,
-            .exit_code = foregroundExitCode(snapshot.status),
-            .signal = foregroundSignal(snapshot.status),
-            .termination_indeterminate = snapshot.status == .indeterminate,
+            .exit_code = status.exit_code,
+            .signal = status.signal,
+            .termination_indeterminate = status.termination_indeterminate,
             .duration_ms = snapshot.duration_ms,
             .stdout_bytes = snapshot.stdout_bytes,
             .stderr_bytes = snapshot.stderr_bytes,
@@ -115,7 +122,7 @@ pub fn formatForegroundCommandResult(
     };
 }
 
-fn writeForegroundStatusLine(writer: *std.Io.Writer, status: ForegroundCommandStatus) !void {
+pub fn writeForegroundStatusLine(writer: *std.Io.Writer, status: ForegroundCommandStatus) !void {
     switch (status) {
         .exit_code => |code| try writer.print("exit_code={d}\n", .{code}),
         .signal => |signal| try writer.print("signal={d}\n", .{signal}),
@@ -143,17 +150,30 @@ fn writeForegroundOutputEnvelopes(writer: *std.Io.Writer, stdout_text: []const u
     }
 }
 
-fn foregroundExitCode(status: ForegroundCommandStatus) ?i64 {
+pub fn projectForegroundStatus(
+    status: ForegroundCommandStatus,
+) ForegroundStatusProjection {
     return switch (status) {
-        .exit_code => |code| code,
-        else => null,
-    };
-}
-
-fn foregroundSignal(status: ForegroundCommandStatus) ?u32 {
-    return switch (status) {
-        .signal => |signal| signal,
-        else => null,
+        .exit_code => |code| .{
+            .exit_code = code,
+            .signal = null,
+            .termination_indeterminate = false,
+        },
+        .signal => |signal| .{
+            .exit_code = null,
+            .signal = signal,
+            .termination_indeterminate = false,
+        },
+        .finished => .{
+            .exit_code = null,
+            .signal = null,
+            .termination_indeterminate = false,
+        },
+        .indeterminate => .{
+            .exit_code = null,
+            .signal = null,
+            .termination_indeterminate = true,
+        },
     };
 }
 

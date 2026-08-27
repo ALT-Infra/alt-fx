@@ -252,18 +252,14 @@ fn foregroundRequestAtDeadline(
 const ChildWaiter = struct {
     child: *std.process.Child,
     io: std.Io,
-    inject_indeterminate: bool,
     ready: std.atomic.Value(bool) = .init(false),
-    result: (std.process.Child.WaitError || error{
-        InjectedChildTerminationIndeterminate,
-    })!std.process.Child.Term = undefined,
+    result: std.process.Child.WaitError!std.process.Child.Term = undefined,
     future: ?std.Io.Future(void) = null,
 
-    fn init(child: *std.process.Child, inject_indeterminate: bool) ChildWaiter {
+    fn init(child: *std.process.Child) ChildWaiter {
         return .{
             .child = child,
             .io = io_mod.getIo(),
-            .inject_indeterminate = inject_indeterminate,
         };
     }
 
@@ -276,17 +272,7 @@ const ChildWaiter = struct {
     }
 
     fn waitMain(self: *ChildWaiter) void {
-        const term = self.child.wait(self.io) catch |err| {
-            self.result = err;
-            self.ready.store(true, .release);
-            return;
-        };
-        self.result = if (self.inject_indeterminate and io_mod.getenv(
-            "FX_COMMAND_TEST_INDETERMINATE_AFTER_EXIT",
-        ) != null)
-            error.InjectedChildTerminationIndeterminate
-        else
-            term;
+        self.result = self.child.wait(self.io);
         self.ready.store(true, .release);
     }
 
@@ -331,7 +317,7 @@ fn waitForForegroundTarget(
         try descendants.refresh(target_pid);
         try std.posix.kill(target_pid, std.posix.SIG.CONT);
     }
-    var waiter = ChildWaiter.init(target, false);
+    var waiter = ChildWaiter.init(target);
     try waiter.start();
     var wait_pending = true;
     defer if (wait_pending) waiter.abort(target_pid);
@@ -673,14 +659,8 @@ fn emitAcceptedOutputChunk(
     try callback(ctx, cfg.output_chunk_lifecycle_id, stream, bytes);
 }
 
-const ProcessTermination = struct {
-    term: std.process.Child.Term,
-    indeterminate: bool = false,
-};
-
 const CollectedProcess = struct {
-    term: std.process.Child.Term,
-    termination_indeterminate: bool = false,
+    status: command_contract.ForegroundCommandStatus,
     stdout: []const u8,
     stderr: []const u8,
     stdout_bytes: usize,
@@ -932,15 +912,14 @@ const OutputCollector = struct {
 
     fn finish(
         self: *OutputCollector,
-        termination: ProcessTermination,
+        status: command_contract.ForegroundCommandStatus,
     ) !CollectedProcess {
         if (self.artifact) |*artifact| {
             try artifact.sync();
             try artifact.contentAddressManagedOutput(self.alloc);
             const truncated = self.totalBytes() > self.cfg.max_command_output_bytes;
             return .{
-                .term = termination.term,
-                .termination_indeterminate = termination.indeterminate,
+                .status = status,
                 .stdout = "",
                 .stderr = "",
                 .stdout_bytes = self.stdout_bytes,
@@ -955,8 +934,7 @@ const OutputCollector = struct {
         }
 
         return .{
-            .term = termination.term,
-            .termination_indeterminate = termination.indeterminate,
+            .status = status,
             .stdout = try self.stdout.toOwnedSlice(self.alloc),
             .stderr = try self.stderr.toOwnedSlice(self.alloc),
             .stdout_bytes = self.stdout_bytes,
@@ -991,7 +969,7 @@ const OutputCollector = struct {
 
 fn finishCollectedProcess(
     output: *OutputCollector,
-    termination: ProcessTermination,
+    status: command_contract.ForegroundCommandStatus,
     duration_ms: u64,
     source: TerminationSource,
 ) !CollectedProcess {
@@ -1009,7 +987,7 @@ fn finishCollectedProcess(
         },
     }
 
-    var result = output.finish(termination) catch |err| {
+    var result = output.finish(status) catch |err| {
         if (source != .cancelled) return err;
         debug_trace.logf("core", "cancelled command artifact finalization failed err={s}", .{@errorName(err)});
         return error.Cancelled;
@@ -1088,7 +1066,7 @@ fn executeProcessWithInput(
 
     return finishCollectedProcess(
         &output,
-        collected.termination,
+        collected.status,
         duration_ms,
         collected.source,
     );
@@ -1228,13 +1206,13 @@ fn executeProcessWithDetachedSession(
     const duration_ms = elapsedMs(started_ms, io_mod.milliTimestamp());
 
     if (foregroundSessionReplacementError(
-        collected.termination.term,
+        collected.status,
         launch_failure_probe,
     )) |launch_err| return launch_err;
     if (script_write_error) |write_err| return write_err;
     return finishCollectedProcess(
         &output,
-        collected.termination,
+        collected.status,
         duration_ms,
         collected.source,
     );
@@ -1324,11 +1302,11 @@ fn cleanupForegroundSessionChild(
 }
 
 fn foregroundSessionReplacementError(
-    term: std.process.Child.Term,
+    status: command_contract.ForegroundCommandStatus,
     probe: ForegroundLaunchFailureProbe,
 ) ?(std.process.ReplaceError || error{CommandLaunchFailed}) {
-    switch (term) {
-        .exited => |code| if (code != foreground_session_replace_failure_exit_code) return null,
+    switch (status) {
+        .exit_code => |code| if (code != foreground_session_replace_failure_exit_code) return null,
         else => return null,
     }
     if (probe.status != .failed) return null;
@@ -1381,7 +1359,7 @@ fn executeProcessWithScriptUnisolated(
 
     return finishCollectedProcess(
         &output,
-        collected.termination,
+        collected.status,
         duration_ms,
         collected.source,
     );
@@ -1822,10 +1800,7 @@ fn formatCollectedOutputValue(alloc: Allocator, command: []const u8, cwd: []cons
         alloc,
         command,
         cwd,
-        if (result.termination_indeterminate)
-            .indeterminate
-        else
-            foregroundCommandStatusFromTerm(result.term),
+        result.status,
         result.stdout,
         result.stderr,
         result.duration_ms,
@@ -1833,14 +1808,7 @@ fn formatCollectedOutputValue(alloc: Allocator, command: []const u8, cwd: []cons
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    if (result.termination_indeterminate) {
-        try out.writer.writeAll(
-            "termination_indeterminate=true\n" ++
-                "message=the command was started, but fx could not confirm its final process status; do not retry unchanged because side effects may already exist\n",
-        );
-    } else {
-        try writeTermLine(&out.writer, result.term);
-    }
+    try command_contract.writeForegroundStatusLine(&out.writer, result.status);
     try out.writer.print("truncated={s}\n", .{if (result.truncated) "true" else "false"});
     try out.writer.print("stdout_bytes={d}\n", .{result.stdout_bytes});
     try out.writer.print("stderr_bytes={d}\n", .{result.stderr_bytes});
@@ -1852,15 +1820,16 @@ fn formatCollectedOutputValue(alloc: Allocator, command: []const u8, cwd: []cons
         try writePreviewEnvelope(alloc, &out.writer, "stderr", result.stderr_preview);
     }
     const output = try out.toOwnedSlice();
+    const status = command_contract.projectForegroundStatus(result.status);
     return .{
         .output = output,
         .cancelled = result.cancelled,
         .command_result = .{ .foreground = .{
             .command = command,
             .cwd = cwd,
-            .exit_code = termExitCode(result.term),
-            .signal = termSignal(result.term),
-            .termination_indeterminate = result.termination_indeterminate,
+            .exit_code = status.exit_code,
+            .signal = status.signal,
+            .termination_indeterminate = status.termination_indeterminate,
             .duration_ms = result.duration_ms,
             .stdout_bytes = result.stdout_bytes,
             .stderr_bytes = result.stderr_bytes,
@@ -1869,28 +1838,6 @@ fn formatCollectedOutputValue(alloc: Allocator, command: []const u8, cwd: []cons
             .stdout_file = metadataField(output, "stdout_file="),
             .stderr_file = metadataField(output, "stderr_file="),
         } },
-    };
-}
-
-fn writeTermLine(writer: *std.Io.Writer, term: std.process.Child.Term) !void {
-    switch (term) {
-        .exited => |code| try writer.print("exit_code={d}\n", .{code}),
-        .signal => |sig| try writer.print("signal={d}\n", .{sig}),
-        else => try writer.writeAll("process finished\n"),
-    }
-}
-
-fn termExitCode(term: std.process.Child.Term) ?i64 {
-    return switch (term) {
-        .exited => |code| @intCast(code),
-        else => null,
-    };
-}
-
-fn termSignal(term: std.process.Child.Term) ?u32 {
-    return switch (term) {
-        .signal => |sig| @intFromEnum(sig),
-        else => null,
     };
 }
 
@@ -2215,7 +2162,7 @@ const ProcessObserver = struct {
             child.stderr = null;
         }
         return .{
-            .waiter = ChildWaiter.init(child, true),
+            .waiter = ChildWaiter.init(child),
             .process_id = process_id,
             .stdout = stdout,
             .stderr = stderr,
@@ -2236,24 +2183,19 @@ const ProcessObserver = struct {
         try self.waiter.start();
     }
 
-    fn observe(self: *ProcessObserver) ?ProcessTermination {
+    fn observe(self: *ProcessObserver) ?command_contract.ForegroundCommandStatus {
         if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return null;
         if (!self.waiter.isReady()) return null;
         const term = self.waiter.awaitReady() catch |err| {
-            debug_trace.logf(
-                "core",
-                "command termination became indeterminate err={s}",
-                .{@errorName(err)},
-            );
-            return .{ .term = .{ .unknown = 0 }, .indeterminate = true };
+            return indeterminateStatus(err);
         };
-        return .{ .term = term };
+        return statusFromTerm(term);
     }
 
     fn awaitTermination(
         self: *ProcessObserver,
         source: TerminationSource,
-    ) !ProcessTermination {
+    ) !command_contract.ForegroundCommandStatus {
         if (comptime builtin.os.tag != .windows and builtin.os.tag != .wasi) {
             self.waiter.awaitDiscard();
             return self.observe().?;
@@ -2261,15 +2203,7 @@ const ProcessObserver = struct {
         const term = self.waiter.child.wait(self.waiter.io) catch |err| {
             return switch (source) {
                 .natural => blk: {
-                    debug_trace.logf(
-                        "core",
-                        "command termination became indeterminate err={s}",
-                        .{@errorName(err)},
-                    );
-                    break :blk .{
-                        .term = .{ .unknown = 0 },
-                        .indeterminate = true,
-                    };
+                    break :blk indeterminateStatus(err);
                 },
                 .cancelled, .timed_out => mapTerminationError(
                     source,
@@ -2279,7 +2213,32 @@ const ProcessObserver = struct {
                 ),
             };
         };
-        return .{ .term = term };
+        return statusFromTerm(term);
+    }
+
+    fn statusFromTerm(
+        term: std.process.Child.Term,
+    ) command_contract.ForegroundCommandStatus {
+        if (io_mod.getenv("FX_COMMAND_TEST_INDETERMINATE_AFTER_EXIT") != null) {
+            debug_trace.logf(
+                "core",
+                "command termination became indeterminate reason=injected_after_exit",
+                .{},
+            );
+            return .indeterminate;
+        }
+        return foregroundCommandStatusFromTerm(term);
+    }
+
+    fn indeterminateStatus(
+        err: anyerror,
+    ) command_contract.ForegroundCommandStatus {
+        debug_trace.logf(
+            "core",
+            "command termination became indeterminate err={s}",
+            .{@errorName(err)},
+        );
+        return .indeterminate;
     }
 
     fn signal(
@@ -2330,7 +2289,7 @@ fn collectOutput(
     launch_failure_probe: ?*ForegroundLaunchFailureProbe,
     process_group_id: ?std.posix.pid_t,
     termination_protocol: TerminationProtocol,
-    leader_termination: *?ProcessTermination,
+    leader_status: *?command_contract.ForegroundCommandStatus,
 ) !TerminationSource {
     const zio = io_mod.getIo();
     var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
@@ -2360,9 +2319,9 @@ fn collectOutput(
             &signal_started_ms,
             &force_kill_sent,
         );
-        if (leader_termination.* == null) {
-            if (observer.observe()) |termination| {
-                leader_termination.* = termination;
+        if (leader_status.* == null) {
+            if (observer.observe()) |status| {
+                leader_status.* = status;
                 if (process_group_id) |pid| {
                     if (source.* == .natural) {
                         terminateRemainingProcessGroup(pid);
@@ -2444,7 +2403,7 @@ fn collectOutputForProcess(
     launch_failure_probe: ?*ForegroundLaunchFailureProbe,
     process_group_id: ?std.posix.pid_t,
     termination_protocol: TerminationProtocol,
-    leader_termination: *?ProcessTermination,
+    leader_status: *?command_contract.ForegroundCommandStatus,
 ) !TerminationSource {
     var source: TerminationSource = .natural;
     return collectOutput(
@@ -2456,7 +2415,7 @@ fn collectOutputForProcess(
         launch_failure_probe,
         process_group_id,
         termination_protocol,
-        leader_termination,
+        leader_status,
     ) catch |err|
         return mapTerminationError(source, cfg.cancel_flag, "output collection", err);
 }
@@ -2465,24 +2424,24 @@ fn waitForCollectedProcess(
     observer: *ProcessObserver,
     source: TerminationSource,
     process_group_id: ?std.posix.pid_t,
-    leader_termination: ?ProcessTermination,
-) !ProcessTermination {
-    if (leader_termination) |termination| {
+    leader_status: ?command_contract.ForegroundCommandStatus,
+) !command_contract.ForegroundCommandStatus {
+    if (leader_status) |status| {
         if (comptime builtin.os.tag != .windows and builtin.os.tag != .wasi) {
             observer.waiter.awaitDiscard();
         }
-        return termination;
+        return status;
     }
-    const termination = try observer.awaitTermination(source);
+    const status = try observer.awaitTermination(source);
     if (process_group_id) |pid| {
         terminateRemainingProcessGroup(pid);
     }
-    return termination;
+    return status;
 }
 
 const CollectedTermination = struct {
     source: TerminationSource,
-    termination: ProcessTermination,
+    status: command_contract.ForegroundCommandStatus,
 };
 
 fn collectSpawnedProcess(
@@ -2508,17 +2467,14 @@ fn collectSpawnedProcess(
         cleanupChild(child);
         return .{
             .source = .natural,
-            .termination = .{
-                .term = .{ .unknown = 0 },
-                .indeterminate = true,
-            },
+            .status = .indeterminate,
         };
     };
 
     var wait_pending = true;
     defer if (wait_pending) observer.abort(process_group_id);
 
-    var leader_termination: ?ProcessTermination = null;
+    var leader_status: ?command_contract.ForegroundCommandStatus = null;
     const source = try collectOutputForProcess(
         arena,
         &observer,
@@ -2527,16 +2483,16 @@ fn collectSpawnedProcess(
         launch_failure_probe,
         process_group_id,
         termination_protocol,
-        &leader_termination,
+        &leader_status,
     );
-    const termination = try waitForCollectedProcess(
+    const status = try waitForCollectedProcess(
         &observer,
         source,
         process_group_id,
-        leader_termination,
+        leader_status,
     );
     wait_pending = false;
-    return .{ .source = source, .termination = termination };
+    return .{ .source = source, .status = status };
 }
 
 fn mapTerminationError(
@@ -3944,7 +3900,7 @@ test "artifact write failure after cancellation remains a bare error" {
     defer observer.deinit();
     try observer.start();
     defer observer.abort(process_group_id);
-    var leader_termination: ?ProcessTermination = null;
+    var leader_status: ?command_contract.ForegroundCommandStatus = null;
     try std.testing.expectError(error.Cancelled, collectOutputForProcess(
         alloc,
         &observer,
@@ -3953,7 +3909,7 @@ test "artifact write failure after cancellation remains a bare error" {
         null,
         process_group_id,
         .process_group,
-        &leader_termination,
+        &leader_status,
     ));
     try std.testing.expect(ready_seen.load(.seq_cst));
 }
