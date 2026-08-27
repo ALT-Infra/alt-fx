@@ -1403,20 +1403,20 @@ pub fn Runtime(comptime App: type) type {
             if (!app.approval_prompt.isActive()) return false;
             if (!app.subagents.isViewActive()) return true;
             const request = app.approval_prompt.request orelse return false;
-            if (comptime @hasField(App, "approval_screen")) {
-                if (app.approval_screen.screen_commit) |commit| {
-                    // Once this exact approval is visible, its input ownership
-                    // survives a transient subagent projection refresh.
-                    if (commit.request_id == request.id) return true;
-                }
-            }
             if (comptime !@hasDecl(@TypeOf(app.subagents), "childRouteId") or
                 !@hasDecl(@TypeOf(app.subagents), "mainApprovalBinding"))
             {
                 return true;
             }
-            const child_id = app.subagents.childRouteId() orelse return false;
             const binding = app.subagents.mainApprovalBinding(request.id) orelse return false;
+            if (comptime @hasField(App, "approval_screen")) {
+                if (app.approval_screen.screen_commit) |commit| {
+                    // A committed, still-resolvable approval keeps ownership
+                    // while the selected child route refreshes.
+                    if (commit.request_id == request.id) return true;
+                }
+            }
+            const child_id = app.subagents.childRouteId() orelse return false;
             return std.mem.eql(u8, binding.child_id, child_id);
         }
 
@@ -10625,6 +10625,10 @@ test "committed child approval owns input while its refreshed binding catches up
         .changed_or_notice_visible = true,
         .document_scrollable = false,
     });
+    try std.testing.expect(
+        !Runtime(ApprovalOwnershipApp).approvalOwnsCurrentSurface(&app),
+    );
+    app.subagents.binding = .{ .child_id = "approval-child" };
     try std.testing.expect(
         Runtime(ApprovalOwnershipApp).approvalOwnsCurrentSurface(&app),
     );
