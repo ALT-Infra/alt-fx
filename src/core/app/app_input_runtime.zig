@@ -1408,14 +1408,23 @@ pub fn Runtime(comptime App: type) type {
             {
                 return true;
             }
-            const binding = app.subagents.mainApprovalBinding(request.id) orelse return false;
-            if (comptime @hasField(App, "approval_screen")) {
-                if (app.approval_screen.screen_commit) |commit| {
-                    // A committed, still-resolvable approval keeps ownership
-                    // while the selected child route refreshes.
-                    if (commit.request_id == request.id) return true;
+            const committed = if (comptime @hasField(App, "approval_screen"))
+                if (app.approval_screen.screen_commit) |commit|
+                    commit.request_id == request.id
+                else
+                    false
+            else
+                false;
+            var maybe_binding = app.subagents.mainApprovalBinding(request.id);
+            if (maybe_binding == null and committed) {
+                if (comptime @hasDecl(@TypeOf(app.subagents), "mainApprovalCardBinding")) {
+                    maybe_binding = app.subagents.mainApprovalCardBinding(request.id);
                 }
             }
+            const binding = maybe_binding orelse return false;
+            // The current card remains resolvable while its presented flag and
+            // selected child route catch up with the committed approval screen.
+            if (committed) return true;
             const child_id = app.subagents.childRouteId() orelse return false;
             return std.mem.eql(u8, binding.child_id, child_id);
         }
@@ -10580,7 +10589,8 @@ const ApprovalOwnershipBinding = struct {
 const ApprovalOwnershipSubagents = struct {
     view_active: bool = true,
     child_id: []const u8 = "selected-child",
-    binding: ?ApprovalOwnershipBinding = null,
+    presented_binding: ?ApprovalOwnershipBinding = null,
+    card_binding: ?ApprovalOwnershipBinding = null,
 
     pub fn isViewActive(self: *const ApprovalOwnershipSubagents) bool {
         return self.view_active;
@@ -10594,7 +10604,14 @@ const ApprovalOwnershipSubagents = struct {
         self: *const ApprovalOwnershipSubagents,
         _: u64,
     ) ?ApprovalOwnershipBinding {
-        return self.binding;
+        return self.presented_binding;
+    }
+
+    pub fn mainApprovalCardBinding(
+        self: *const ApprovalOwnershipSubagents,
+        _: u64,
+    ) ?ApprovalOwnershipBinding {
+        return self.card_binding;
     }
 };
 
@@ -10628,7 +10645,7 @@ test "committed child approval owns input while its refreshed binding catches up
     try std.testing.expect(
         !Runtime(ApprovalOwnershipApp).approvalOwnsCurrentSurface(&app),
     );
-    app.subagents.binding = .{ .child_id = "approval-child" };
+    app.subagents.card_binding = .{ .child_id = "approval-child" };
     try std.testing.expect(
         Runtime(ApprovalOwnershipApp).approvalOwnsCurrentSurface(&app),
     );
