@@ -2211,18 +2211,14 @@ fn runTopLevelMcp(
             try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
             return .handled_failure;
         };
-        var startup = deps.load_startup_state_without_credentials(
-            alloc,
-            cfg.default_model,
-            cfg.default_agent_step_limit,
-        ) catch |err| {
+        const workspace_root = io_mod.realpathAlloc(alloc, ".") catch |err| {
             try writeMcpOperationFailure(alloc, deps, "trust", err);
             return .handled_failure;
         };
-        defer startup.deinit(alloc);
+        defer alloc.free(workspace_root);
         var attempt = config_runtime.attemptProjectMcpMutation(
             alloc,
-            startup.workspace_root,
+            workspace_root,
             action,
         );
         defer attempt.deinit(alloc);
@@ -2233,7 +2229,7 @@ fn runTopLevelMcp(
             },
             .outcome => {},
         }
-        try writeMcpTrustSuccess(alloc, deps, startup.workspace_root, action);
+        try writeMcpTrustSuccess(alloc, deps, workspace_root, action);
         return .handled_success;
     }
     if (std.mem.eql(u8, operation, "path")) {
@@ -4709,6 +4705,8 @@ test "top-level MCP list loads configuration without discovery and remove uses i
 
 test "top-level MCP trust persists project approval without interactive startup" {
     const alloc = std.testing.allocator;
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    defer alloc.free(workspace_root);
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
@@ -4724,7 +4722,7 @@ test "top-level MCP trust persists project approval without interactive startup"
     var capture = CaptureOutput.init(alloc);
     defer capture.deinit();
     var deps = capture.deps();
-    deps.load_startup_state_without_credentials = stubLoadStartupStateWithoutCredentials;
+    deps.load_startup_state_without_credentials = failingStartupStateWithoutCredentials;
 
     const result = try runIfRequestedWithDeps(
         alloc,
@@ -4733,13 +4731,16 @@ test "top-level MCP trust persists project approval without interactive startup"
         deps,
     );
     try std.testing.expectEqual(RunResult.handled_success, result);
-    try std.testing.expectEqualStrings(
-        "Approved project MCP server 'fixture' for /tmp/fx.\n",
-        capture.stdout.written(),
+    const expected = try std.fmt.allocPrint(
+        alloc,
+        "Approved project MCP server 'fixture' for {s}.\n",
+        .{workspace_root},
     );
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, capture.stdout.written());
     try std.testing.expectEqualStrings("", capture.stderr.written());
 
-    var choices = try config_runtime.loadProjectMcpChoices(alloc, "/tmp/fx");
+    var choices = try config_runtime.loadProjectMcpChoices(alloc, workspace_root);
     defer choices.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), choices.choices.approved.len);
     try std.testing.expectEqualStrings("fixture", choices.choices.approved[0]);
@@ -5933,6 +5934,14 @@ fn stubLoadStartupStateWithoutCredentials(
     errdefer state.deinit(alloc);
     state.workspace_root = try alloc.dupe(u8, "/tmp/fx");
     return state;
+}
+
+fn failingStartupStateWithoutCredentials(
+    _: Allocator,
+    _: []const u8,
+    _: usize,
+) !app_lifecycle.StartupState {
+    return error.StartupShouldNotRun;
 }
 
 fn stubLoadCatalogStartupState(

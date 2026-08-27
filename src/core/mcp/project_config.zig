@@ -507,57 +507,16 @@ const WorkspaceExpansionBudget = struct {
     }
 };
 
-const WorkspaceTemplateMeasure = union(enum) {
-    expanded: usize,
-    missing: []const u8,
-    invalid,
-};
-
-fn measureWorkspaceTemplate(
-    input: []const u8,
-    environment: *const std.process.Environ.Map,
-) WorkspaceTemplateMeasure {
-    var expanded_len: usize = 0;
-    var cursor: usize = 0;
-    while (cursor < input.len) {
-        const relative_start = std.mem.find(u8, input[cursor..], "${") orelse {
-            if (!addWorkspaceExpandedLength(&expanded_len, input.len - cursor)) return .invalid;
-            return .{ .expanded = expanded_len };
-        };
-        const start = cursor + relative_start;
-        if (!addWorkspaceExpandedLength(&expanded_len, start - cursor)) return .invalid;
-        const expression_start = start + 2;
-        const relative_end = std.mem.findScalar(u8, input[expression_start..], '}') orelse
-            return .invalid;
-        const end = expression_start + relative_end;
-        const expression = input[expression_start..end];
-        const default_marker = std.mem.find(u8, expression, ":-");
-        const variable_name = if (default_marker) |index| expression[0..index] else expression;
-        const default_value = if (default_marker) |index| expression[index + 2 ..] else null;
-        if (!isValidEnvName(variable_name)) return .invalid;
-        const replacement = environment.get(variable_name) orelse default_value orelse
-            return .{ .missing = variable_name };
-        if (!addWorkspaceExpandedLength(&expanded_len, replacement.len)) return .invalid;
-        cursor = end + 1;
-    }
-    return .{ .expanded = expanded_len };
-}
-
-fn addWorkspaceExpandedLength(total: *usize, byte_count: usize) bool {
-    if (byte_count > max_expanded_workspace_value_bytes - total.*) return false;
-    total.* += byte_count;
-    return true;
-}
-
 const WorkspaceTemplateExpansion = union(enum) {
     expanded: []u8,
     missing: []u8,
     invalid,
+    limit_exceeded,
 
     pub fn deinit(self: *WorkspaceTemplateExpansion, alloc: Allocator) void {
         switch (self.*) {
             .expanded, .missing => |value| alloc.free(value),
-            .invalid => {},
+            .invalid, .limit_exceeded => {},
         }
         self.* = undefined;
     }
@@ -567,6 +526,7 @@ fn expandWorkspaceTemplate(
     alloc: Allocator,
     input: []const u8,
     environment: *const std.process.Environ.Map,
+    budget: *WorkspaceExpansionBudget,
 ) Allocator.Error!WorkspaceTemplateExpansion {
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(alloc);
@@ -574,11 +534,11 @@ fn expandWorkspaceTemplate(
     var cursor: usize = 0;
     while (cursor < input.len) {
         const relative_start = std.mem.find(u8, input[cursor..], "${") orelse {
-            if (!try appendExpandedBytes(alloc, &output, input[cursor..])) return .invalid;
+            if (!try appendExpandedBytes(alloc, &output, input[cursor..], budget)) return .limit_exceeded;
             return .{ .expanded = try output.toOwnedSlice(alloc) };
         };
         const start = cursor + relative_start;
-        if (!try appendExpandedBytes(alloc, &output, input[cursor..start])) return .invalid;
+        if (!try appendExpandedBytes(alloc, &output, input[cursor..start], budget)) return .limit_exceeded;
         const expression_start = start + 2;
         const relative_end = std.mem.findScalar(u8, input[expression_start..], '}') orelse
             return .invalid;
@@ -593,7 +553,7 @@ fn expandWorkspaceTemplate(
         const replacement = environment.get(variable_name) orelse default_value orelse {
             return .{ .missing = try alloc.dupe(u8, variable_name) };
         };
-        if (!try appendExpandedBytes(alloc, &output, replacement)) return .invalid;
+        if (!try appendExpandedBytes(alloc, &output, replacement, budget)) return .limit_exceeded;
         cursor = end + 1;
     }
     return .{ .expanded = try output.toOwnedSlice(alloc) };
@@ -603,12 +563,14 @@ fn appendExpandedBytes(
     alloc: Allocator,
     output: *std.ArrayList(u8),
     bytes: []const u8,
+    budget: *WorkspaceExpansionBudget,
 ) Allocator.Error!bool {
     if (output.items.len > max_expanded_workspace_value_bytes or
         bytes.len > max_expanded_workspace_value_bytes - output.items.len)
     {
         return false;
     }
+    if (!budget.consume(bytes.len)) return false;
     try output.appendSlice(alloc, bytes);
     return true;
 }
@@ -659,15 +621,7 @@ fn expandOwnedConstWorkspaceValue(
     field: WorkspaceEnvironmentField,
     budget: *WorkspaceExpansionBudget,
 ) Allocator.Error!?WorkspaceExpansionFailure {
-    switch (measureWorkspaceTemplate(value.*, environment)) {
-        .expanded => |byte_count| if (!budget.consume(byte_count)) return .limit_exceeded,
-        .missing => |variable_name| return .{ .missing = .{
-            .field = field,
-            .variable_name = try alloc.dupe(u8, variable_name),
-        } },
-        .invalid => return .invalid,
-    }
-    var expansion = try expandWorkspaceTemplate(alloc, value.*, environment);
+    var expansion = try expandWorkspaceTemplate(alloc, value.*, environment, budget);
     switch (expansion) {
         .expanded => |expanded| {
             alloc.free(value.*);
@@ -683,6 +637,7 @@ fn expandOwnedConstWorkspaceValue(
             } };
         },
         .invalid => return .invalid,
+        .limit_exceeded => return .limit_exceeded,
     }
 }
 
@@ -1486,22 +1441,25 @@ test "workspace template expansion is explicit bounded and deterministic" {
         .{ .input = "${SET}/${SET}", .expected = "value/value" },
     };
     for (cases) |case| {
-        var expansion = try expandWorkspaceTemplate(alloc, case.input, &environment);
+        var budget = WorkspaceExpansionBudget.init();
+        var expansion = try expandWorkspaceTemplate(alloc, case.input, &environment, &budget);
         defer expansion.deinit(alloc);
         switch (expansion) {
             .expanded => |value| try std.testing.expectEqualStrings(case.expected, value),
-            .missing, .invalid => return error.TestUnexpectedResult,
+            .missing, .invalid, .limit_exceeded => return error.TestUnexpectedResult,
         }
     }
 
-    var missing = try expandWorkspaceTemplate(alloc, "Bearer ${REQUIRED}", &environment);
+    var missing_budget = WorkspaceExpansionBudget.init();
+    var missing = try expandWorkspaceTemplate(alloc, "Bearer ${REQUIRED}", &environment, &missing_budget);
     defer missing.deinit(alloc);
     switch (missing) {
         .missing => |name| try std.testing.expectEqualStrings("REQUIRED", name),
-        .expanded, .invalid => return error.TestUnexpectedResult,
+        .expanded, .invalid, .limit_exceeded => return error.TestUnexpectedResult,
     }
 
-    var malformed = try expandWorkspaceTemplate(alloc, "${NOT-CLOSED", &environment);
+    var malformed_budget = WorkspaceExpansionBudget.init();
+    var malformed = try expandWorkspaceTemplate(alloc, "${NOT-CLOSED", &environment, &malformed_budget);
     defer malformed.deinit(alloc);
     try std.testing.expect(malformed == .invalid);
 
@@ -1511,15 +1469,17 @@ test "workspace template expansion is explicit bounded and deterministic" {
     try environment.put(&long_name, "long-name-value");
     const long_template = try std.fmt.allocPrint(alloc, "${{{s}}}", .{long_name});
     defer alloc.free(long_template);
+    var long_budget = WorkspaceExpansionBudget.init();
     var long_expansion = try expandWorkspaceTemplate(
         alloc,
         long_template,
         &environment,
+        &long_budget,
     );
     defer long_expansion.deinit(alloc);
     switch (long_expansion) {
         .expanded => |value| try std.testing.expectEqualStrings("long-name-value", value),
-        .missing, .invalid => return error.TestUnexpectedResult,
+        .missing, .invalid, .limit_exceeded => return error.TestUnexpectedResult,
     }
 }
 
