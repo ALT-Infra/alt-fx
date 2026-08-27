@@ -729,7 +729,11 @@ function collectRegularFiles(root: string): string[] {
   return files;
 }
 
-function toolResultText(body: string, toolCallId: string): string {
+function toolResultText(
+  body: string,
+  toolCallId: string,
+  outputType: "text" | "error-text" = "text",
+): string {
   const request = JSON.parse(body) as {
     prompt?: Array<{ content?: Array<Record<string, unknown>> }>;
   };
@@ -740,7 +744,7 @@ function toolResultText(body: string, toolCallId: string): string {
     );
   if (!result) throw new Error(`Missing tool result for ${toolCallId}`);
   const output = result.output as Record<string, unknown>;
-  if (output.type !== "text" || typeof output.value !== "string") {
+  if (output.type !== outputType || typeof output.value !== "string") {
     throw new Error(`Invalid tool result for ${toolCallId}`);
   }
   return output.value;
@@ -1047,10 +1051,10 @@ describe("MCP remote authentication lifecycle", () => {
     );
     expect(result.code).toBe(0);
     const finalBody = gateway.requests.at(-1)!.body;
-    expect(toolResultText(finalBody, "template_auth_read")).toContain(
+    expect(toolResultText(finalBody, "template_auth_read", "error-text")).toContain(
       "McpAuthenticationRequired",
     );
-    expect(toolResultText(finalBody, "template_auth_read")).not.toContain(
+    expect(toolResultText(finalBody, "template_auth_read", "error-text")).not.toContain(
       "McpResourceNotFound",
     );
     expect(auth.requests.filter((request) =>
@@ -1239,7 +1243,7 @@ describe("MCP remote authentication lifecycle", () => {
     expect(toolResultText(finalBody, "private_read_a")).toContain(
       "HTTP_RESOURCE_TEXT",
     );
-    expect(toolResultText(finalBody, "private_rotate")).toContain(
+    expect(toolResultText(finalBody, "private_rotate", "error-text")).toContain(
       "tool_execution_failed",
     );
     for (const callId of [
@@ -1248,7 +1252,7 @@ describe("MCP remote authentication lifecycle", () => {
       "private_prompts_b",
       "private_read_b",
     ]) {
-      const output = toolResultText(finalBody, callId);
+      const output = toolResultText(finalBody, callId, "error-text");
       expect(output).not.toContain("custom://alpha");
       expect(output).not.toContain("custom://project/{path}");
       expect(output).not.toContain("review");
@@ -1437,7 +1441,11 @@ describe("MCP remote authentication lifecycle", () => {
       expect(toolResultText(finalBody, "ordered_read_a")).toContain(
         "HTTP_RESOURCE_TEXT",
       );
-      const second = toolResultText(finalBody, "ordered_read_b");
+      const second = toolResultText(
+        finalBody,
+        "ordered_read_b",
+        readCacheCase.publicCache ? "text" : "error-text",
+      );
       if (readCacheCase.publicCache) {
         expect(second).toContain("HTTP_RESOURCE_TEXT");
         expect(auth.refreshes).toBeGreaterThanOrEqual(1);
