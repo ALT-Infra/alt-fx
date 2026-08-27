@@ -1894,7 +1894,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   );
 
   test(
-    "usage dashboard refresh discovers usage created after startup",
+    "usage dashboard reopen discovers usage created after its initial snapshot",
     async () => {
       const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-usage-late-")));
       workDirs.push(root);
@@ -1917,6 +1917,8 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
       await session.sendText("/usage");
       await session.waitForText("Tracking has not started", TIMEOUT);
+      await session.sendKeys("Escape");
+      await session.waitForComposer(5_000);
 
       const fxDir = join(home, ".fx");
       const now = Date.now();
@@ -1948,7 +1950,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       );
       writeFileSync(join(fxDir, "usage.lock"), "", { mode: 0o600 });
 
-      await session.sendLiteral("R");
+      await session.sendText("/usage");
       const pane = await session.waitForText(/12 tokens/, TIMEOUT);
       expect(pane).toContain("provider/a");
 

@@ -1116,12 +1116,10 @@ pub fn Handlers(comptime App: type) type {
             } else {
                 app.input_runtime.usage_menu.openLoading(app.alloc, scope);
             }
-            if (cached == null) {
-                requestUsageDashboardRefresh(app) catch |err| {
-                    try recordUsageRefreshFailure(app, scope, err);
-                    return;
-                };
-            }
+            requestUsageDashboardRefresh(app) catch |err| {
+                try recordUsageRefreshFailure(app, scope, err);
+                return;
+            };
             app.shell.render_requests.request(.footer);
         }
 
