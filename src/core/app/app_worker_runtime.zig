@@ -3144,7 +3144,7 @@ test "core.app_worker_runtime cancellation snapshot stays coupled to detached ev
     try std.testing.expectEqual(@as(usize, 0), capture.text_count);
 }
 
-test "core.app_worker_runtime lifecycle starts drain real paced text into one assistant entry first" {
+test "core.app_worker_runtime publishes rendered block before opening tool entries" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
     app.worker.processing = true;
@@ -3165,6 +3165,8 @@ test "core.app_worker_runtime lifecycle starts drain real paced text into one as
     try Runtime(FakeApp).tick(&app, noopTaskCompletion, bridge.handlers());
 
     try std.testing.expectEqual(@as(usize, 2), bridge.drain_count);
+    try std.testing.expect(!bridge.pacer.hasPending());
+    try std.testing.expectEqual(@as(usize, 0), app.worker.events.items.len);
     try std.testing.expectEqual(@as(usize, 3), app.shell.lifecycle.entries.items.len);
     try std.testing.expect(app.shell.lifecycle.entries.items[0] == .assistant_turn);
     try std.testing.expect(app.shell.lifecycle.entries.items[1] == .raw_bytes);
@@ -3250,7 +3252,6 @@ test "core.app_worker_runtime lifecycle boundary survives an incomplete assistan
     try queueToolStart(&app, 1, "read_a", "read_file");
 
     try Runtime(FakeApp).tick(&app, noopTaskCompletion, bridge.handlers());
-    try Runtime(FakeApp).tick(&app, noopTaskCompletion, bridge.handlers());
 
     try std.testing.expectEqual(@as(usize, 1), bridge.drain_count);
     try std.testing.expectEqual(@as(usize, 2), app.shell.lifecycle.entries.items.len);
@@ -3275,10 +3276,10 @@ test "app worker drains prior paced batch without splitting assistant turn" {
     try Runtime(FakeApp).tick(&app, noopTaskCompletion, bridge.handlers());
     try bridge.tickPacer(0);
 
-    try std.testing.expect(bridge.pacer.hasPending());
+    try std.testing.expect(!bridge.pacer.hasPending());
     try std.testing.expectEqual(@as(usize, 1), app.shell.lifecycle.entries.items.len);
     try std.testing.expectEqualStrings(
-        "p",
+        "paced before start",
         app.shell.lifecycle.entries.items[0].assistant_turn.segments.text.items,
     );
 
@@ -3311,7 +3312,7 @@ test "core.app_worker_runtime question boundary drains paced text before opening
     });
     try Runtime(FakeApp).tick(&app, noopTaskCompletion, bridge.handlers());
     try bridge.tickPacer(0);
-    try std.testing.expect(bridge.pacer.hasPending());
+    try std.testing.expect(!bridge.pacer.hasPending());
 
     app.worker.pending_question = true;
     try app.worker.pushEvent(std.heap.c_allocator, .question_requested);
@@ -3341,7 +3342,7 @@ test "core.app_worker_runtime prompt boundary drains paced text before writing t
     });
     try Runtime(FakeApp).tick(&app, noopTaskCompletion, bridge.handlers());
     try bridge.tickPacer(0);
-    try std.testing.expect(bridge.pacer.hasPending());
+    try std.testing.expect(!bridge.pacer.hasPending());
 
     app.stream = .{
         .active = true,
@@ -3662,7 +3663,7 @@ test "core.app_worker_runtime semantic notice handler failure returns through dr
     try std.testing.expectEqual(@as(usize, 0), app.worker.events.items.len);
 }
 
-test "core.app_worker_runtime text turn finish remains deferred through the pacer" {
+test "core.app_worker_runtime text turn finishes after its rendered block" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
     app.worker.processing = true;
@@ -3693,11 +3694,12 @@ test "core.app_worker_runtime text turn finish remains deferred through the pace
 
     try bridge.tickPacer(0);
     try std.testing.expectEqualStrings(
-        "s",
+        "slow",
         app.shell.lifecycle.entries.items[0].assistant_turn.segments.text.items,
     );
-    try std.testing.expectEqual(@as(usize, 0), bridge.finish_count);
-    try std.testing.expect(bridge.pacer.deferred_turn != null);
+    try std.testing.expectEqual(@as(usize, 1), bridge.finish_count);
+    try std.testing.expect(bridge.pacer.deferred_turn == null);
+    try std.testing.expect(!bridge.pacer.hasPending());
 }
 
 test "core.app_worker_runtime queued begin waits for deferred completed turn summary" {
