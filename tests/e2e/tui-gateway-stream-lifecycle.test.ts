@@ -333,7 +333,7 @@ type ToolPayloadHoldState = HoldState & {
 
 function streamingOutputTokens(scrollback: string): number | null {
   const matches = [...scrollback.matchAll(
-    /^  \(↑\d+(?:\.\d)?k? ↓(\d+(?:\.\d)?k?)\)$/gm,
+    /^• Generating \(\d+(?:h\d+m\d+s|m\d+s|s)\) \(↑\d+(?:\.\d)?k? ↓(\d+(?:\.\d)?k?)\)$/gm,
   )];
   const value = matches.at(-1)?.[1];
   if (!value) return null;
@@ -344,7 +344,7 @@ function streamingOutputTokens(scrollback: string): number | null {
 
 function quietToolPayloadOutputTokens(scrollback: string): number | null {
   const matches = [...scrollback.matchAll(
-    /^•(?: \(\d+s\))? \(↑\d+(?:\.\d)?k? ↓(\d+(?:\.\d)?k?)\)$/gm,
+    /^• Running \(\d+(?:h\d+m\d+s|m\d+s|s)\) \(↑\d+(?:\.\d)?k? ↓(\d+(?:\.\d)?k?)\)$/gm,
   )];
   const value = matches.at(-1)?.[1];
   if (!value) return null;
@@ -1577,6 +1577,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     "streamed write payload keeps the activity row live",
     async () => {
       const hold: ToolPayloadHoldState = { started: false, cancelled: false };
+      const nextStep: HoldState = { started: false, cancelled: false };
       const payloadPath = "payload-progress.md";
       // Preserve two substantial streamed input chunks for the live
       // activity-row assertions.
@@ -1593,7 +1594,17 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
               payloadPath,
               payloadContent,
             ),
-          fakeGatewayFinalText(finalSentinel),
+          () => heldGatewayResponse(nextStep, [], [
+            { type: "text-delta", id: "answer_2", delta: finalSentinel },
+            {
+              type: "finish",
+              finishReason: { unified: "stop", raw: "stop" },
+              usage: {
+                inputTokens: { total: 8 },
+                outputTokens: { total: 5 },
+              },
+            },
+          ]),
         ],
       );
 
@@ -1622,6 +1633,20 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
 
       hold.finish?.();
+      await waitForCondition(
+        () => queuedGateway.requests.length === 2 && nextStep.started,
+        "next model step after tool completion",
+      );
+      const nextStepPane = await waitForScrollback(
+        session!,
+        (value) =>
+          /• Thinking \(\d+(?:h\d+m\d+s|m\d+s|s)\) \(↑\d+(?:\.\d)?k? ↓\d+(?:\.\d)?k?\)/.test(
+            value,
+          ) && !value.includes(finalSentinel),
+        "thinking activity during the next admitted model step",
+      );
+      expect(nextStepPane).not.toContain(finalSentinel);
+      nextStep.release?.();
       await session!.waitForText(finalSentinel, TIMEOUT);
       expect(queuedGateway.classifierRequests).toHaveLength(0);
       const writtenPath = join(root!, "workspace", payloadPath);
@@ -3043,7 +3068,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         () => queuedGateway.requests.length === 1 && hold.started,
         "held active Gateway request",
       );
-      await session.waitForText("Thinking", TIMEOUT);
+      await session.waitForText("Generating", TIMEOUT);
 
       await session.sendText(`/image ${image}`);
       await session.waitForText("attached image: queued-snapshot.png", TIMEOUT);
@@ -3207,7 +3232,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
             visible.includes(toolHeader) &&
             visible.includes(toolMarker) &&
             visible.includes(permissionMarker) &&
-            visible.includes("Thinking");
+            visible.includes("Generating");
         },
         "local permissions output during held post-tool continuation",
       );
@@ -3219,7 +3244,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         (pane) =>
           pane.includes(activeBefore.trim()) &&
           pane.includes(activeAfter.trim()) &&
-          !pane.includes("Thinking"),
+          !pane.includes("Generating"),
         TIMEOUT,
       );
       expect(heldGateway.requests).toHaveLength(2);
@@ -3231,7 +3256,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
       await session.waitForText(followupResponse, TIMEOUT);
       await session.waitForPane(
-        (pane) => pane.includes(followupResponse) && !pane.includes("Thinking"),
+        (pane) => pane.includes(followupResponse) && !pane.includes("Generating"),
         TIMEOUT,
       );
 
@@ -3451,7 +3476,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         "hidden queue review before stream cancellation",
       );
       await session.waitForPane(
-        (pane) => pane.includes("Thinking"),
+        (pane) => pane.includes("Generating"),
         TIMEOUT,
       );
       expect(hold.cancelled).toBe(false);
@@ -6240,7 +6265,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(running).toContain(
         "● 2 tool calls · 1 read · 1 command\n├ Read seven.txt\n└ Running sleep 1; printf SECOND_GROUP_LIVE_COMMAND",
       );
-      expect(running).toMatch(/\n *(?:• )?Thinking \(\d+s\)/);
+      expect(running).toMatch(/\n *(?:• )?Running \(\d+s\)/);
       await session.waitForText(finalText, TIMEOUT);
       const compact = await session.capturePane();
       expect(compact).toContain(
@@ -6697,7 +6722,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       const reviewing = await session.capturePane();
       expect(reviewing).toContain("I will inspect the process list.");
-      expect(reviewing).toMatch(/Thinking \(\d+s\)/);
+      expect(reviewing).toMatch(/Running \(\d+s\)/);
       expect(reviewing).not.toContain(finalText);
 
       releaseClassifier(fakeGatewayPermissionDecision("clear"));
@@ -6712,7 +6737,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         execFileSync(FX_BIN, ["replay", tapePath, "--frames"], {
           encoding: "utf8",
         }),
-      ).toMatch(/Thinking \(\d+s\)/);
+      ).toMatch(/Running \(\d+s\)/);
     },
     TIMEOUT,
   );
@@ -6773,7 +6798,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const scrollback = await waitForScrollback(
         session,
         (candidate) =>
-          candidate.includes("Thinking") &&
+          candidate.includes("Running") &&
           !candidate.includes("● Preparing command") &&
           !candidate.includes("Using terminal") &&
           !hasBareRunningRow(candidate),
@@ -6788,7 +6813,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(scrollback).not.toContain("● Preparing command");
       expect(scrollback).not.toContain("Using terminal");
       expect(scrollback).not.toContain("Used terminal");
-      expect(scrollback).toContain("Thinking");
+      expect(scrollback).toContain("Running");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(existsSync(tapePath)).toBe(true);
       expect(existsSync(tracePath)).toBe(true);

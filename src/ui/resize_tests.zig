@@ -2484,7 +2484,7 @@ test "thinking shimmer reserves assistant-gap rows and clears back to stable foo
     try std.testing.expectEqual(footer_idle, footer_after);
 }
 
-test "completed presentation tail keeps thinking slot until turn summary" {
+test "completed presentation tail keeps activity slot until turn summary" {
     var h = try Harness.init(std.testing.allocator, 80, 22, 4);
     defer h.deinit();
 
@@ -2519,11 +2519,9 @@ test "completed presentation tail keeps thinking slot until turn summary" {
     try h.flush();
 
     const assistant_row = try findRowContaining(&h, "assistant starts here");
-    const thinking_after_provider_finish = try findRowContaining(&h, "Thinking");
-    try std.testing.expect(thinking_after_provider_finish > thinking_row);
-    try expectExactlyOneBlankRowBetween(&h, assistant_row, thinking_after_provider_finish);
-    const footer_after_assistant = try findFirstDividerRowAfter(&h, thinking_after_provider_finish);
-    try expectExactlyOneBlankRowBetween(&h, thinking_after_provider_finish, footer_after_assistant);
+    try expectGridNotContains(&h, "Thinking");
+    const footer_after_assistant = try findFirstDividerRowAfter(&h, assistant_row);
+    try expectOnlyBlankRowsBetween(&h, assistant_row, footer_after_assistant);
 
     _ = try h.shell.appendTurnSummaryEntry(h.alloc, .{
         .thinking_duration_ms = 1_000,

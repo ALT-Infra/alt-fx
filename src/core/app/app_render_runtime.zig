@@ -1133,7 +1133,7 @@ pub fn Runtime(comptime App: type) type {
                 .question_requested,
                 .open_model_picker,
                 .turn_token_update,
-                .tool_payload_started,
+                .turn_phase_update,
                 .finish_prompt,
                 .session_grant,
                 => {},

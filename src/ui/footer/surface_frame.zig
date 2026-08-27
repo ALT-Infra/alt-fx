@@ -742,7 +742,7 @@ fn assembleSurfaceFooterFrame(
         .activity_label = activity_label,
         .tool_activity_label = tool_activity_label,
         .shimmer_pos = assembly.planner_input.ctx.shimmer_pos,
-        .thinking_blink = activity_status.thinkingBlinkVisible(
+        .thinking_blink = activity_status.activityBlinkVisible(
             assembly.planner_input.ctx.stream,
             assembly.planner_input.ctx.now_ms,
         ),
