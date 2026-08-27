@@ -136,7 +136,11 @@ function startToolGateway(finalText: string) {
   });
 }
 
-function toolResultText(body: string, toolCallId: string): string {
+function toolResultText(
+  body: string,
+  toolCallId: string,
+  outputType: "text" | "error-text" = "text",
+): string {
   const request = JSON.parse(body) as {
     prompt?: Array<{ content?: Array<Record<string, unknown>> }>;
   };
@@ -147,7 +151,7 @@ function toolResultText(body: string, toolCallId: string): string {
     );
   if (!result) throw new Error(`Missing tool result for ${toolCallId}`);
   const output = result.output as Record<string, unknown>;
-  if (output.type !== "text" || typeof output.value !== "string") {
+  if (output.type !== outputType || typeof output.value !== "string") {
     throw new Error(`Invalid tool result for ${toolCallId}`);
   }
   return output.value;
@@ -741,6 +745,7 @@ describe("modern MCP Streamable HTTP", () => {
     const cancelled = toolResultText(
       gateway.requests.at(-1)!.body,
       "http_resource_stall",
+      "error-text",
     );
     expect(cancelled).toContain("tool_execution_failed");
     expect(cancelled).not.toContain("HTTP_RESOURCE_TEXT");
