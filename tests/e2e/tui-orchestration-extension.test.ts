@@ -540,8 +540,7 @@ describe.skipIf(SKIP)("tui: orchestration extension host", () => {
         await session.sendKeys("Down");
         await session.sendKeys("Down");
         await session.sendKeys("Enter");
-        await session.waitForText("Primary · primary", 5_000);
-        await session.sendKeys("Down");
+        await session.waitForText("Primary", 5_000);
         await session.sendKeys("Enter");
         await session.waitForText("Models", 5_000);
         await session.sendLiteral("deepseek-v4-flash");
@@ -559,10 +558,9 @@ describe.skipIf(SKIP)("tui: orchestration extension host", () => {
           await session.waitForPane((pane) => pane.includes(`› ${label}`), 5_000);
         }
         await session.sendKeys("Enter");
-        await session.waitForPane((pane) => pane.includes("› peer") && pane.includes("+ Add peer"), 5_000);
+        await session.waitForPane((pane) => pane.includes("› Peer 1") && pane.includes("+ Add peer"), 5_000);
         await session.sendKeys("Enter");
-        await session.waitForText("Peer · peer", 5_000);
-        await session.sendKeys("Down");
+        await session.waitForText("Peer 1", 5_000);
         await session.sendKeys("Enter");
         await session.waitForText("Models", 5_000);
         await session.sendLiteral("go/deepseek-v4-pro");
@@ -613,7 +611,7 @@ describe.skipIf(SKIP)("tui: orchestration extension host", () => {
           latest_revision: 1,
           deleted: false,
         });
-        expect(existsSync(join(
+        const initialRevisionPath = join(
           home,
           ".fx",
           "extensions",
@@ -621,7 +619,12 @@ describe.skipIf(SKIP)("tui: orchestration extension host", () => {
           "teams",
           teamId,
           `1-${initialManifest.latest_digest}.json`,
-        ))).toBe(true);
+        );
+        expect(existsSync(initialRevisionPath)).toBe(true);
+        const initialTeam = JSON.parse(readFileSync(initialRevisionPath, "utf8"));
+        expect(initialTeam.primary.id).toMatch(/^role-[0-9a-f]{24}$/);
+        expect(initialTeam.peers[0].id).toMatch(/^role-[0-9a-f]{24}$/);
+        expect(initialTeam.primary.id).not.toBe(initialTeam.peers[0].id);
 
         await session.sendText("/alt off");
         await session.waitForText("ALT mode disabled.", 5_000);
@@ -1296,6 +1299,12 @@ describe.skipIf(SKIP)("tui: orchestration extension host", () => {
         const trace = await waitForFileText(tracePath, "event=answer_published", 20_000);
         await session.waitForText(NESTED_ANSWER_MARKER, 10_000);
         await session.waitForComposer(10_000);
+
+        const transcript = await session.captureFullScrollback();
+        expect(transcript).toContain("go/kimi-k3 → go/deepseek-v4-flash · consultation started.");
+        expect(transcript).toContain("go/deepseek-v4-flash → go/mimo-v2.5 · specialist started.");
+        expect(transcript).toContain("go/mimo-v2.5 → go/deepseek-v4-flash · specialist returned.");
+        expect(transcript).toContain("go/deepseek-v4-flash → go/kimi-k3 · consultation returned.");
 
         expect(provider.requestBodies.length).toBe(6);
         const specialistRequest = provider.requestBodies[2];
