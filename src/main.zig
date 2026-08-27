@@ -211,6 +211,8 @@ const tool_mcp_runtime = @import("core/tooling/tool_mcp_runtime.zig");
 const tool_runtime = @import("core/tooling/tool_runtime.zig");
 const web_fetch_runtime = @import("core/tooling/web_fetch_runtime.zig");
 const web_search_runtime = @import("core/tooling/web_search_runtime.zig");
+const parallel_session = @import("core/auth/parallel_session.zig");
+const builtin_parallel = @import("builtins/parallel.zig");
 const worker_runtime = @import("core/agent/worker_runtime.zig");
 const question_prompt = @import("core/agent/question_prompt.zig");
 const gateway_client = @import("gateway/client.zig");
@@ -682,6 +684,10 @@ const App = struct {
     web_search_runtime: web_search_runtime.Runtime = web_search_runtime.Runtime.init(.{
         .provider = if (host_profile.web_search) builtin_providers.native.gateway.fx_search else null,
     }),
+    parallel_web_search_runtime: web_search_runtime.Runtime = web_search_runtime.Runtime.init(.{
+        .provider = if (host_profile.web_search) builtin_parallel.default_web_search_provider else null,
+    }),
+    parallel_connection: ?parallel_session.Session = null,
     web_search_models_path: []const u8 = builtin_gateway.models_path,
     lifecycle_runtime: hooks.Runtime = hooks.Runtime.init(std.heap.c_allocator),
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
@@ -812,6 +818,10 @@ const App = struct {
                 .terminal_title = app.terminalTitle(),
             },
         );
+        app.parallel_connection = parallel_session.loadConfigured(alloc) catch |err| blk: {
+            debug_trace.logf("auth", "Parallel connection unavailable err={s}", .{@errorName(err)});
+            break :blk null;
+        };
         errdefer app.deinit();
         try WorkspaceAppRuntime.applyLaunch(
             &app,
@@ -1014,6 +1024,9 @@ const App = struct {
         self.worker.deinit(std.heap.c_allocator);
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
+        self.parallel_web_search_runtime.deinit();
+        if (self.parallel_connection) |*connection| connection.deinit(self.alloc);
+        self.parallel_connection = null;
         self.queued_prompt_review.deinit(self.alloc);
         self.prompt_history.deinit(self.alloc);
         self.clearPendingImages();
@@ -1517,9 +1530,10 @@ const App = struct {
                 return error.InvalidOrchestrationReasoningEffort;
         }
 
-        var projection = try self.snapshotModelToolProjection(
+        var projection = try self.snapshotModelToolProjectionForProvider(
             self.alloc,
             prompt.permission_mode,
+            provider,
         );
         var owns_projection = true;
         errdefer if (owns_projection) projection.deinit(self.alloc);
@@ -1570,7 +1584,31 @@ const App = struct {
         tool_context.permission_rules = permission_rules;
         tool_context.subagent_host = null;
         tool_context.subagent_caller_id = null;
-        if (!bundle.capabilities.fx_search) {
+        if (bundle.capabilities.fx_search) {
+            self.web_search_runtime.configure(.{
+                .api_key = prompt.api_key,
+                .credential_source = prompt.credential_source,
+                .gateway_team = prompt.gateway_team,
+                .worker_model = prompt.model,
+                .gateway_retry_count = builtin_gateway.retry_count,
+                .gateway_chat_url = builtin_gateway.defaultChatUrl(),
+                .usage = &self.session.usage,
+                .usage_allocator = self.alloc,
+            });
+            tool_context.web_search_backend = self.web_search_runtime.dispatchBackend();
+            tool_context.web_search_runtime_ready = false;
+        } else if (self.parallel_connection) |*connection| {
+            self.parallel_web_search_runtime.configure(.{
+                .api_key = connection.api_key,
+                .worker_model = prompt.model,
+                .gateway_retry_count = 0,
+                .gateway_chat_url = "",
+                .usage = &self.session.usage,
+                .usage_allocator = self.alloc,
+            });
+            tool_context.web_search_backend = self.parallel_web_search_runtime.dispatchBackend();
+            tool_context.web_search_runtime_ready = true;
+        } else {
             tool_context.web_search_backend = null;
             tool_context.web_search_runtime_ready = false;
         }
@@ -2879,6 +2917,23 @@ const App = struct {
             alloc,
             permission_mode,
             self.permission_engine.rules,
+            provider_runtime.provider(self),
+        );
+    }
+
+    pub fn snapshotModelToolProjectionForProvider(
+        self: *App,
+        alloc: Allocator,
+        permission_mode: types.PermissionMode,
+        provider: model_provider.ProviderId,
+    ) !tool_projection.EffectiveToolProjection {
+        self.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
+        defer self.permission_state.authority_mutex.unlock(io_mod.getIo());
+        return self.snapshotModelToolProjectionForRules(
+            alloc,
+            permission_mode,
+            self.permission_engine.rules,
+            provider,
         );
     }
 
@@ -2892,6 +2947,7 @@ const App = struct {
             alloc,
             permission_mode,
             permission_rules,
+            provider_runtime.provider(self),
         );
     }
 
@@ -2900,13 +2956,21 @@ const App = struct {
         alloc: Allocator,
         permission_mode: types.PermissionMode,
         permission_rules: types.PermissionRuleSet,
+        provider: model_provider.ProviderId,
     ) !tool_projection.EffectiveToolProjection {
         return app_mcp_runtime.buildModelToolProjection(&self.mcp, alloc, self.toolAdvertisementSet(), .{
             .permission_mode = permission_mode,
             .permission_rules = permission_rules,
             .subagent_available = self.session_persistence.subagent_host != null and
                 self.nativeSubagentsAvailable(),
+            .web_search_mode = self.webSearchModeForProvider(provider),
         });
+    }
+
+    fn webSearchModeForProvider(self: *const App, provider: model_provider.ProviderId) tool_projection.WebSearchMode {
+        if (self.providerSet().select(provider).capabilities.fx_search) return .provider;
+        if (self.parallel_connection != null) return .local;
+        return .unavailable;
     }
 
     pub fn subagentToolContextForAdmission(
@@ -5232,6 +5296,8 @@ test {
     _ = @import("core/auth/grok_session.zig");
     _ = @import("core/auth/grok_oauth.zig");
     _ = @import("core/auth/opencode_session.zig");
+    _ = @import("core/auth/parallel_session.zig");
+    _ = @import("builtins/parallel.zig");
     _ = @import("gateway/xai_grok_models.zig");
     _ = @import("gateway/xai_grok.zig");
     _ = @import("gateway/xai_grok_permission_reviewer.zig");

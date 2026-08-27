@@ -1432,27 +1432,43 @@ fn writeWrappedLineDecorated(writer: *std.Io.Writer, prefix: []const u8, continu
     try writer.writeAll(prefix);
     try writer.writeAll(text_start);
     while (words.next()) |word| {
-        const word_width = display_width.visibleWidthIgnoringAnsi(word);
-        if (line_width == 0) {
-            try writer.writeAll(word);
-            line_width = word_width;
-            continue;
-        }
+        var cursor: usize = 0;
+        while (cursor < word.len) {
+            if (line_width > 0) {
+                const word_width = display_width.visibleWidthIgnoringAnsi(word[cursor..]);
+                if (line_width + 1 + word_width <= budget) {
+                    try writer.writeByte(' ');
+                    try writer.writeAll(word[cursor..]);
+                    line_width += 1 + word_width;
+                    cursor = word.len;
+                    break;
+                }
+                try writer.writeAll(text_end);
+                try writer.writeByte('\n');
+                try writer.writeAll(continuation_prefix);
+                try writer.writeAll(text_start);
+                budget = if (columns > continuation_width) columns - continuation_width else 1;
+                line_width = 0;
+            }
 
-        if (line_width + 1 + word_width <= budget) {
-            try writer.writeByte(' ');
-            try writer.writeAll(word);
-            line_width += 1 + word_width;
-            continue;
+            // A word wider than the line budget breaks at complete UTF-8
+            // code points so continuation lines always respect the width.
+            const space_left = budget -| line_width;
+            if (space_left == 0) continue;
+            var take = @min(word.len - cursor, space_left);
+            while (take > 1 and cursor + take < word.len and
+                (word[cursor + take] & 0xC0) == 0x80) : (take -= 1)
+            {}
+            if (take == 1 and (word[cursor] & 0x80) != 0) {
+                // Keep multi-byte code points whole even past the budget.
+                var end = cursor + 1;
+                while (end < word.len and (word[end] & 0xC0) == 0x80) : (end += 1) {}
+                take = end - cursor;
+            }
+            try writer.writeAll(word[cursor .. cursor + take]);
+            line_width += display_width.visibleWidthIgnoringAnsi(word[cursor .. cursor + take]);
+            cursor += take;
         }
-
-        try writer.writeAll(text_end);
-        try writer.writeByte('\n');
-        try writer.writeAll(continuation_prefix);
-        try writer.writeAll(text_start);
-        budget = if (columns > continuation_width) columns - continuation_width else 1;
-        try writer.writeAll(word);
-        line_width = word_width;
     }
     try writer.writeAll(text_end);
     try writer.writeByte('\n');

@@ -6,6 +6,7 @@ const auth_runtime = @import("../auth/auth_runtime.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
 const grok_oauth = @import("../auth/grok_oauth.zig");
 const opencode_session = @import("../auth/opencode_session.zig");
+const parallel_session = @import("../auth/parallel_session.zig");
 const acp_runner = @import("acp_runner.zig");
 const cli_ask = @import("cli_ask.zig");
 const cli_replay = @import("cli_replay.zig");
@@ -206,6 +207,10 @@ fn parseLoginProvider(rest: []const [:0]const u8) !?model_provider.ProviderId {
     if (rest.len == 0) return null;
     if (rest.len != 1) return error.InvalidLoginProviderArgs;
     return provider_catalog.parse(rest[0]) orelse error.InvalidLoginProviderArgs;
+}
+
+fn isParallelLoginTarget(rest: []const [:0]const u8) bool {
+    return rest.len == 1 and std.mem.eql(u8, rest[0], "parallel");
 }
 
 fn selectCatalogModel(
@@ -940,8 +945,23 @@ fn runNonInteractiveWithDeps(
         .pr => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .pull_request),
         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
         .login => |rest| {
+            if (isParallelLoginTarget(rest)) {
+                const key = io_mod.getenv("PARALLEL_API_KEY") orelse {
+                    try writeStderr(deps, "fx login: set PARALLEL_API_KEY to your Parallel API key first\n");
+                    return .handled_failure;
+                };
+                var session = parallel_session.Session{ .api_key = try alloc.dupe(u8, key) };
+                defer session.deinit(alloc);
+                parallel_session.saveNewSession(alloc, session) catch |err| {
+                    debug_trace.logf("auth", "Parallel connection save failed err={s}", .{@errorName(err)});
+                    try writeStderr(deps, "fx login: failed to store the Parallel API key\n");
+                    return .handled_failure;
+                };
+                try writeStdout(deps, "Connected Parallel web search.\n");
+                return .handled_success;
+            }
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx login [vercel|codex|grok|opencode]\n");
+                try writeStderr(deps, "usage: fx login [vercel|codex|grok|opencode|parallel]\n");
                 return .handled_failure;
             };
             // Preserve the original `fx login` behavior for scripts and users.
@@ -1028,8 +1048,28 @@ fn runNonInteractiveWithDeps(
             return .handled_success;
         },
         .logout => |rest| {
+            if (isParallelLoginTarget(rest)) {
+                const outcome = parallel_session.logout() catch {
+                    try writeStderr(deps, "fx logout: failed to durably remove the Parallel connection\n");
+                    return .handled_failure;
+                };
+                return switch (outcome) {
+                    .deleted => result: {
+                        try writeStdout(deps, "Disconnected Parallel web search.\n");
+                        break :result .handled_success;
+                    },
+                    .missing => result: {
+                        try writeStdout(deps, "No Parallel connection found.\n");
+                        break :result .handled_success;
+                    },
+                    .deleted_not_durable => result: {
+                        try writeStderr(deps, "fx logout: failed to durably remove the Parallel connection\n");
+                        break :result .handled_failure;
+                    },
+                };
+            }
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx logout [vercel|codex|grok|opencode]\n");
+                try writeStderr(deps, "usage: fx logout [vercel|codex|grok|opencode|parallel]\n");
                 return .handled_failure;
             };
             // Preserve the original `fx logout` behavior for scripts and users.

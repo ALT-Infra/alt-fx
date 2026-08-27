@@ -277,6 +277,7 @@ pub const DispatchContext = struct {
     web_fetch_artifact_store: ?*web_fetch_artifacts.Store = null,
     web_fetch_artifact_error: ?anyerror = null,
     web_search_backend: ?WebSearchBackend = null,
+    web_search_session_id: ?[]const u8 = null,
     tool_call_id: []const u8 = "",
     tool_call_name: []const u8 = "",
     web_search_progress_ctx: ?*anyopaque = null,

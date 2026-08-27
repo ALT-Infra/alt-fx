@@ -13,6 +13,16 @@ pub const Options = struct {
     permission_rules: types.PermissionRuleSet = .{},
     mcp_runtime: ?*mcp_runtime.McpRuntime = null,
     subagent_available: bool = false,
+    web_search_mode: WebSearchMode = .provider,
+};
+
+/// How the selected model transport will receive `web_search` for this run.
+/// Provider-native search is advertised through the provider protocol, while
+/// local search is an ordinary fx function backed by a configured runtime.
+pub const WebSearchMode = enum {
+    provider,
+    local,
+    unavailable,
 };
 
 const BuildKind = enum { full, read_only };
@@ -669,15 +679,21 @@ fn appendBuiltinTool(
     if (!includeBuiltinForKind(tool.name, kind, tool_set)) return;
     if (std.mem.eql(u8, tool.name, "subagent") and !options.subagent_available) return;
     if (std.mem.eql(u8, tool.name, "vision")) return;
+    const is_web_search = std.mem.eql(u8, tool.name, "web_search");
+    if (is_web_search and options.web_search_mode == .unavailable) return;
+    const provider_executed = tool.provider_executed and
+        !(is_web_search and options.web_search_mode == .local);
+    const provider_advertised = tool.write_provider_advertisement_fn != null and
+        !(is_web_search and options.web_search_mode == .local);
     if (options.permission_mode != .yolo) {
-        if (tool.provider_executed and !providerExecutionIsAllowed(tool.name, options.permission_rules)) return;
+        if (provider_executed and !providerExecutionIsAllowed(tool.name, options.permission_rules)) return;
         if (permissions.rulesDenyAllTargetsForTool(options.permission_rules, tool.name)) return;
     }
     try advertised_names.append(alloc, tool.name);
-    if (!tool.provider_executed and tool.write_provider_advertisement_fn == null) {
+    if (!provider_executed and !provider_advertised) {
         try advertised_functions.append(alloc, tool.model_schema);
     }
-    if (tool.write_provider_advertisement_fn != null) {
+    if (provider_advertised) {
         if (first_custom_guidance.*) {
             first_custom_guidance.* = false;
         } else {
@@ -807,6 +823,39 @@ test "provider-executed search follows settled advertisement permission" {
             projection.custom_guidance,
         );
     }
+}
+
+test "web search projection matches its effective execution route" {
+    var provider = try buildTestModelToolProjection(std.testing.allocator, .{
+        .web_search_mode = .provider,
+    });
+    defer provider.deinit(std.testing.allocator);
+    try expectContainsName(provider.advertised_names, "web_search");
+    var found_provider_schema = false;
+    for (provider.advertised_functions) |function| {
+        if (std.mem.eql(u8, function.name, "web_search")) found_provider_schema = true;
+    }
+    try std.testing.expect(!found_provider_schema);
+    try std.testing.expectEqualStrings(test_web_search.description, provider.custom_guidance);
+
+    var local = try buildTestModelToolProjection(std.testing.allocator, .{
+        .web_search_mode = .local,
+    });
+    defer local.deinit(std.testing.allocator);
+    try expectContainsName(local.advertised_names, "web_search");
+    var found_local_schema = false;
+    for (local.advertised_functions) |function| {
+        if (std.mem.eql(u8, function.name, "web_search")) found_local_schema = true;
+    }
+    try std.testing.expect(found_local_schema);
+    try std.testing.expectEqualStrings("", local.custom_guidance);
+
+    var unavailable = try buildTestModelToolProjection(std.testing.allocator, .{
+        .web_search_mode = .unavailable,
+    });
+    defer unavailable.deinit(std.testing.allocator);
+    try expectNotContainsName(unavailable.advertised_names, "web_search");
+    try std.testing.expectEqualStrings("", unavailable.custom_guidance);
 }
 
 test "provider execution gate follows the registry declaration" {

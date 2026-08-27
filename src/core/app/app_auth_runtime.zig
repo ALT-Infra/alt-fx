@@ -11,6 +11,7 @@ const login_flow = @import("../auth/login_flow.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
 const grok_oauth = @import("../auth/grok_oauth.zig");
 const opencode_session = @import("../auth/opencode_session.zig");
+const parallel_session = @import("../auth/parallel_session.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
 const auth_transition = @import("../auth/auth_transition.zig");
 const model_provider = @import("../config/model_provider.zig");
@@ -149,14 +150,36 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return;
             }
-            const requested_provider = if (std.mem.trim(u8, target, " \t\r\n").len == 0)
+            const trimmed_target = std.mem.trim(u8, target, " \t\r\n");
+            if (std.ascii.eqlIgnoreCase(trimmed_target, "parallel")) {
+                try app.flushBeforeBlockingExternalWork();
+                const outcome = parallel_session.logout() catch {
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .@"error",
+                        .body = "Could not durably disconnect Parallel web search.",
+                    });
+                    return;
+                };
+                if (comptime @hasField(App, "parallel_connection")) {
+                    if (app.parallel_connection) |*connection| connection.deinit(app.alloc);
+                    app.parallel_connection = null;
+                }
+                try writeAuthNotice(app, switch (outcome) {
+                    .deleted => .{ .topic = "auth", .tone = .neutral, .body = "Disconnected Parallel web search." },
+                    .missing => .{ .topic = "auth", .tone = .neutral, .body = "No Parallel connection found." },
+                    .deleted_not_durable => .{ .topic = "auth", .tone = .warning, .body = "Disconnected Parallel web search, but could not confirm the profile directory update." },
+                });
+                return;
+            }
+            const requested_provider = if (trimmed_target.len == 0)
                 null
             else
-                provider_catalog.parse(std.mem.trim(u8, target, " \t\r\n")) orelse {
+                provider_catalog.parse(trimmed_target) orelse {
                     try writeAuthNotice(app, .{
                         .topic = "auth",
                         .tone = .warning,
-                        .body = "Usage: /logout [vercel|codex|grok|opencode]",
+                        .body = "Usage: /logout [vercel|codex|grok|opencode|parallel]",
                     });
                     return;
                 };

@@ -80,6 +80,17 @@ The Grok route uses subscription access directly at xAI and never sends its OAut
 
 `fx login opencode` imports `OPENCODE_API_KEY` into a private copy at `~/.fx/opencode-auth.json`; later commands use that saved copy, so `fx logout opencode` remains effective even while the environment variable is exported. The OpenCode route sends the saved key only to OpenCode. fx currently lists the Zen and Go models whose published endpoint uses OpenAI-compatible Chat Completions; models requiring OpenAI Responses, Anthropic Messages, or Gemini protocols remain hidden. Go model IDs use the `go/<model-id>` prefix in fx.
 
+### Web search through Parallel
+
+Gateway, Codex, and Grok models search through their own native routes. Models without native search (OpenCode) borrow [Parallel](https://parallel.ai/) when it is configured, so `web_search` stays available everywhere:
+
+```bash
+export PARALLEL_API_KEY=<your-parallel-api-key>
+fx login parallel
+```
+
+`fx login parallel` imports `PARALLEL_API_KEY` into a private copy at `~/.fx/parallel-auth.json`; the session is stored at that path and `fx logout parallel` removes it. Searches default to the low-latency `fast` mode; the model may pass focused `search_queries` (at most five) and request `advanced` depth for genuinely multi-hop research. Each result keeps Parallel's LLM-optimized excerpt and publish date, and searches never send your API key anywhere except Parallel.
+
 To use an AI Gateway API key instead:
 
 ```bash

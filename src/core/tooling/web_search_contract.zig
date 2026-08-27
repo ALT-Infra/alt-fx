@@ -31,23 +31,36 @@ pub const BackendCapabilities = struct {
     result_bounds: BackendFeatureMode = .unsupported,
 };
 
+pub const SearchMode = enum {
+    turbo,
+    fast,
+    basic,
+    advanced,
+};
+
 pub const Request = struct {
     query: []const u8,
+    search_queries: ?[]const []const u8 = null,
+    mode: ?SearchMode = null,
     allowed_domains: ?[]const []const u8 = null,
     blocked_domains: ?[]const []const u8 = null,
+    session_id: ?[]const u8 = null,
 };
 
 pub const ProviderRequest = struct {
     backend: SearchBackendId,
     query: []const u8,
+    search_queries: ?[]const []const u8 = null,
+    mode: ?SearchMode = null,
     allowed_domains: ?[]const []const u8 = null,
     blocked_domains: ?[]const []const u8 = null,
+    session_id: ?[]const u8 = null,
     max_uses: u8 = 8,
     max_results: u8 = 10,
     max_output_tokens: u32 = 4096,
     max_output_chars: usize = 100_000,
     timeout_ms: u32 = 30_000,
-    cancel_flag: *const std.atomic.Value(bool),
+    cancel_flag: *std.atomic.Value(bool),
 };
 
 pub const Progress = union(enum) {
@@ -63,10 +76,14 @@ pub const ProgressFn = *const fn (*anyopaque, Progress) void;
 pub const Source = struct {
     title: []const u8,
     url: []const u8,
+    excerpt: ?[]const u8 = null,
+    publish_date: ?[]const u8 = null,
 
     pub fn deinit(self: Source, alloc: Allocator) void {
         alloc.free(self.title);
         alloc.free(self.url);
+        if (self.excerpt) |excerpt| alloc.free(excerpt);
+        if (self.publish_date) |publish_date| alloc.free(publish_date);
     }
 };
 

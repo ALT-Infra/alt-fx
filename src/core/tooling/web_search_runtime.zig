@@ -166,6 +166,7 @@ pub const Runtime = struct {
         if (!model_request_budget.searchWorkerInputFitsLimit(
             if (self.provider) |provider| provider.input_overhead_bytes else 0,
             input.query,
+            input.search_queries,
             input.allowed_domains,
             input.blocked_domains,
             self.policy.max_input_bytes,
@@ -175,8 +176,11 @@ pub const Runtime = struct {
         const request = web_search_contract.ProviderRequest{
             .backend = selected_backend.id,
             .query = input.query,
+            .search_queries = input.search_queries,
+            .mode = input.mode,
             .allowed_domains = input.allowed_domains,
             .blocked_domains = input.blocked_domains,
+            .session_id = input.session_id,
             .max_uses = self.policy.max_uses,
             .max_results = self.policy.max_results,
             .max_output_tokens = self.policy.max_output_tokens,
@@ -279,9 +283,11 @@ fn executeForDispatch(
 ) anyerror!web_search_contract.ExecutionOutput {
     const self: *Runtime = @ptrCast(@alignCast(raw_ctx));
     var progress_forwarder = ProgressForwarder{ .dispatch = ctx };
+    var scoped_request = request;
+    scoped_request.session_id = ctx.web_search_session_id;
     return self.executeWithProgress(
         ctx.allocator,
-        request,
+        scoped_request,
         ctx.cancel_flag orelse &self.fallback_cancel_flag,
         if (ctx.on_web_search_progress != null) ProgressForwarder.onProgress else null,
         if (ctx.on_web_search_progress != null) @ptrCast(&progress_forwarder) else null,

@@ -1008,6 +1008,7 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .managed_executions = ctx.managed_executions,
         .command_artifact_dir = ctx.command_artifact_dir,
         .terminal_owner_session_id = ctx.lifecycle_scope.session_id,
+        .web_search_session_id = ctx.lifecycle_scope.session_id,
         .terminal_transport_role = switch (ctx.lifecycle_scope.kind) {
             .interactive, .subagent => .interactive,
             .ask => .headless,

@@ -331,8 +331,21 @@ pub fn Runtime(comptime App: type) type {
                         .usage_allocator = app.alloc,
                     });
                     ctx.web_search_backend = app.web_search_runtime.dispatchBackend();
+                    ctx.web_search_runtime_ready = false;
+                } else if (comptime @hasField(App, "parallel_web_search_runtime") and @hasField(App, "parallel_connection")) {
+                    if (app.parallel_connection) |*connection| {
+                        app.parallel_web_search_runtime.configure(.{
+                            .api_key = connection.api_key,
+                            .worker_model = provider_runtime.model(app),
+                            .gateway_retry_count = 0,
+                            .gateway_chat_url = "",
+                            .usage = &app.session.usage,
+                            .usage_allocator = app.alloc,
+                        });
+                        ctx.web_search_backend = app.parallel_web_search_runtime.dispatchBackend();
+                        ctx.web_search_runtime_ready = true;
+                    }
                 }
-                ctx.web_search_runtime_ready = false;
                 ctx.web_search_progress_ctx = @ptrCast(app);
                 ctx.on_web_search_progress = app_callbacks.Bindings(App).onWebSearchProgress;
             }
