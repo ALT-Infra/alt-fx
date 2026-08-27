@@ -4,6 +4,7 @@ const worker_runtime = @import("../agent/worker_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const model_provider = @import("../config/model_provider.zig");
+const model_capabilities = @import("../config/model_capabilities.zig");
 const provider_set = @import("../gateway/provider_set.zig");
 const auto_classifier = @import("../permissions/auto_classifier.zig");
 const command_admission = @import("../permissions/command_admission.zig");
@@ -31,6 +32,12 @@ const parent_delivery_projector = @import("parent_delivery_projector.zig");
 const tool_host = @import("tool_host.zig");
 
 const Allocator = std.mem.Allocator;
+
+fn childModelCapabilityResolver(
+    parent: ?model_capabilities.Resolver,
+) ?model_capabilities.Resolver {
+    return parent;
+}
 
 pub const Config = struct {
     host: *tool_host.Runtime,
@@ -89,7 +96,9 @@ const Context = struct {
         result.on_web_search_progress = null;
         result.web_fetch_progress_ctx = null;
         result.on_web_fetch_progress = null;
-        result.model_capability_resolver = null;
+        result.model_capability_resolver = childModelCapabilityResolver(
+            result.model_capability_resolver,
+        );
         result.lifecycle_view = self.config.lifecycle_view;
         result.lifecycle_scope = .{
             .kind = .subagent,
@@ -456,6 +465,27 @@ test "subagent model catalog counts only tools in the captured MCP view" {
     try std.testing.expectEqualStrings("chrome-devtools", snapshot.servers[0].name);
     try std.testing.expectEqual(model_catalog.Availability.ready, snapshot.servers[0].availability);
     try std.testing.expectEqual(@as(?usize, 2), snapshot.servers[0].tool_count);
+}
+
+test "subagent inherits model capabilities" {
+    const ResolverFixture = struct {
+        fn resolve(
+            _: *anyopaque,
+            _: Allocator,
+            _: []const u8,
+        ) model_capabilities.ResolveError!model_capabilities.Capabilities {
+            return .{};
+        }
+    };
+    var resolver_context: u8 = 0;
+    const resolver = model_capabilities.Resolver{
+        .ctx = &resolver_context,
+        .resolve_fn = ResolverFixture.resolve,
+    };
+    const inherited = childModelCapabilityResolver(resolver);
+    try std.testing.expect(inherited != null);
+    try std.testing.expectEqual(resolver.ctx, inherited.?.ctx);
+    try std.testing.expectEqual(resolver.resolve_fn, inherited.?.resolve_fn);
 }
 
 fn validateToolCall(raw: *anyopaque, arena: Allocator, call: types.ToolCall) !agent_runtime.ToolCallValidationResult {
