@@ -649,10 +649,11 @@ function expectSkillsMenuGrid(
   const text = grid.join("\n");
   expect(text).toContain(`Skills ${count}`);
   expect(text).toContain("[All]");
-  expect(text).toContain("Fx");
+  expect(text).toContain("fx");
+  expect(text).not.toContain("[Fx]");
   expect(text).toContain("Workspace");
   expect(text).toContain("Codex");
-  expect(text).toContain("Fx · Global");
+  expect(text).toContain("fx · Global");
   expect(names.some((name) => text.includes(name))).toBe(true);
   expect(text).not.toContain("Visible skills (");
   expect(findInlineSkillsPicker(grid)).not.toBeNull();
@@ -1057,14 +1058,18 @@ function findInlineSkillsPicker(
   };
 }
 
-function findHelpScreen(grid: string[]): { topDivider: number; header: number; bottomDivider: number; hint: number } | null {
+function findInlineHelpPicker(
+  grid: string[],
+): { input: number; topDivider: number; header: number; bottomDivider: number; hint: number } | null {
   const header = grid.findIndex((line) => line.includes("Commands "));
-  if (header <= 0 || !isDividerRow(grid[header - 1]!)) return null;
-  if (!isInputRow(grid[0]!)) return null;
+  if (header <= 1 || !isDividerRow(grid[header - 1]!)) return null;
+  const input = header - 2;
+  if (!isInputRow(grid[input]!)) return null;
   const bottomDivider = grid.findLastIndex((line) => isDividerRow(line));
   if (bottomDivider <= header || bottomDivider + 1 >= grid.length) return null;
   if (!grid[bottomDivider + 1]!.includes("Enter Open")) return null;
   return {
+    input,
     topDivider: header - 1,
     header,
     bottomDivider,
@@ -2424,7 +2429,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       await session.waitForText("/help", 10_000);
       await waitForSelectedSlashLabel(session, "/help");
       const shrinkStage = await session.captureFullScrollback();
-      expect(shrinkStage).toContain("Commands 37 · Type to filter");
+      expect(shrinkStage).toContain("Commands 36 · Type to filter");
       expect(shrinkStage).toContain("1–4");
       writeFileSync(join(root, "scrollback-after-shrink.txt"), shrinkStage);
 
@@ -2537,10 +2542,10 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const baselineFooter = findFooter(baseline)!;
 
       await session.sendLiteral("/mod");
-      await session.waitForText("/models", 10_000);
+      await session.waitForText("/model", 10_000);
       await session.sendKeys("Escape");
       await session.waitForPane(
-        (pane) => !pane.includes("/models"),
+        (pane) => !pane.includes("/model"),
         10_000,
       );
       await Bun.sleep(250);
@@ -2593,12 +2598,12 @@ describe.skipIf(SKIP)("tui: resize", () => {
       label: "help",
       width: 72,
       height: 16,
-      surfaceMarker: "Commands ",
+      surfaceMarker: "Enter Open",
       editedInput: "x",
       async openSurface(active) {
         await active.resizeWindow(60, 12, 500);
         await active.sendText("/help");
-        await active.waitForText("Commands ", TIMEOUT);
+        await active.waitForText("Enter Open", TIMEOUT);
       },
     },
     {
@@ -2620,7 +2625,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       width: 120,
       height: 36,
       surfaceMarker: "provider/model-a",
-      editedInput: "/model x",
+      editedInput: "x",
       fakeModels: true,
       async openSurface(active) {
         await active.sendText("/model");
@@ -3401,12 +3406,12 @@ describe.skipIf(SKIP)("tui: resize", () => {
     async () => {
       session = await launchAt(120, 40);
       await session.sendText("/help");
-      await session.waitForText("Commands 37", 5_000);
+      await session.waitForText("Commands 36", 5_000);
       await session.resizeWindow(76, 24, 400);
 
       const grid = await session.capturePaneGrid();
-      expect(grid.join("\n")).toContain("Commands 37");
-      expect(findHelpScreen(grid)).not.toBeNull();
+      expect(grid.join("\n")).toContain("Commands 36");
+      expect(findInlineHelpPicker(grid)).not.toBeNull();
 
       await session.sendKeys("Escape");
       await session.waitForPane((pane) => !pane.includes("Enter Open"), 5_000);
@@ -3423,7 +3428,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
     async () => {
       session = await launchAt(120, 40);
       await session.sendText("/help");
-      await session.waitForText("Commands 37", 5_000);
+      await session.waitForText("Commands 36", 5_000);
 
       const captureScrollback = () =>
         execSync(`tmux capture-pane -t ${session!.name} -p -S -`, {
@@ -3431,9 +3436,8 @@ describe.skipIf(SKIP)("tui: resize", () => {
           stdio: "pipe",
         });
       const expectHelpCatalog = (grid: string[]) => {
-        expect(grid.join("\n")).toContain("Commands 37");
-        expect(grid.join("\n")).not.toContain("Run /help for commands");
-        expect(findHelpScreen(grid)).not.toBeNull();
+        expect(grid.join("\n")).toContain("Commands 36");
+        expect(findInlineHelpPicker(grid)).not.toBeNull();
       };
 
       await session.resizeWindow(72, 20, 500);
@@ -3443,11 +3447,14 @@ describe.skipIf(SKIP)("tui: resize", () => {
       expectHelpCatalog(await session.capturePaneGrid());
 
       await session.sendKeys("Escape");
-      await session.waitForText("Run /help for commands", 5_000);
+      await session.waitForPane(
+        (pane) => hasEmptyComposer(pane) && !pane.includes("Enter Open"),
+        5_000,
+      );
       const restored = captureScrollback();
       expect(restored.match(/𝒇x v\d+\.\d+\.\d+\b/g)).toHaveLength(1);
       expect(restored.match(/Run \/help for commands/g)).toHaveLength(1);
-      expect(restored).not.toContain("Commands 37");
+      expect(restored).not.toContain("Commands 36");
       expect(findFooter(await session.capturePaneGrid())).not.toBeNull();
     },
     TIMEOUT,
@@ -3961,22 +3968,21 @@ describe.skipIf(SKIP)("tui: resize", () => {
         expect(await session.captureFullScrollback()).toContain(marker);
 
         await session.sendText("/help");
-        await session.waitForText("Commands 37", 5_000);
+        await session.waitForText("Commands 36", 5_000);
         await session.resizeWindow(84, 28, 500);
 
         const catalog = await session.capturePaneGrid();
         expect(catalog.join("\n")).not.toContain(marker);
-        expect(catalog.join("\n")).not.toContain("Run /help for commands");
-        expect(findHelpScreen(catalog)).not.toBeNull();
+        expect(findInlineHelpPicker(catalog)).not.toBeNull();
 
         await session.sendKeys("Escape");
-        await session.waitForText("Run /help for commands", 5_000);
+        await session.waitForPane(
+          (pane) => hasEmptyComposer(pane) && !pane.includes("Enter Open"),
+          5_000,
+        );
         const scrollback = await session.captureFullScrollback();
         expect(scrollback).not.toContain(marker);
-        expect(scrollback.match(/𝒇x v\d+\.\d+\.\d+\b/g)).toHaveLength(1);
-        expect(scrollback.match(/Run \/help for commands/g)).toHaveLength(1);
-        expect(scrollback.split("\n")[0]).toMatch(/𝒇x v\d+\.\d+\.\d+\b/);
-        expect(scrollback).not.toContain("Commands 37");
+        expect(scrollback).not.toContain("Commands 36");
         const finalGrid = await session.capturePaneGrid();
         expect(findFooter(finalGrid), finalGrid.join("\n")).not.toBeNull();
 

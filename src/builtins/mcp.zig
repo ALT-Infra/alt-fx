@@ -729,19 +729,19 @@ fn runtimeFromConfigs(
 pub fn loadConfigFromPath(alloc: Allocator, path: []const u8) !std.ArrayList(McpServerConfig) {
     var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch |err| {
         if (err == error.FileNotFound) return .empty;
-        debug_trace.logf("mcp", "failed to open config {s}: {s}", .{ path, @errorName(err) });
+        logConfigFailure("open", path, err);
         return err;
     };
     defer file.close(io_mod.getIo());
 
     const json_text = io_mod.readFileToEnd(alloc, &file, 1024 * 1024) catch |err| {
-        debug_trace.logf("mcp", "failed to read config {s}: {s}", .{ path, @errorName(err) });
+        logConfigFailure("read", path, err);
         return err;
     };
     defer alloc.free(json_text);
 
     return loadConfigFromJson(alloc, json_text) catch |err| {
-        debug_trace.logf("mcp", "failed to load config {s}: {s}", .{ path, @errorName(err) });
+        logConfigFailure("load", path, err);
         return err;
     };
 }
@@ -911,6 +911,14 @@ fn findConfig(configs: []const McpServerConfig, name: []const u8) ?*const McpSer
         if (std.mem.eql(u8, config.name, name)) return config;
     }
     return null;
+}
+
+noinline fn logConfigFailure(action: []const u8, path: []const u8, err: anyerror) void {
+    debug_trace.logf(
+        "mcp",
+        "failed to {s} config {s}: {s}",
+        .{ action, path, @errorName(err) },
+    );
 }
 
 fn configFromCommandParts(
