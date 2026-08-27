@@ -22,6 +22,7 @@ const context_contract = @import("../workspace/context_contract.zig");
 const hooks = @import("../hooks/hooks.zig");
 const execution_memory = @import("../agent/execution_memory.zig");
 const gateway_error_format = @import("../shared/gateway_error_format.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const session_codec = @import("../session/session_codec.zig");
 const types = @import("../shared/types.zig");
@@ -61,6 +62,7 @@ const Context = struct {
     turn: *execution.TurnContext,
     admission: domain.AdmissionSnapshot,
     cancel: *std.atomic.Value(bool),
+    subagent_id: u64,
     input_tokens: u64 = 0,
     output_tokens: u64 = 0,
     turn_outcome: ?types.TurnPresentationOutcome = null,
@@ -104,6 +106,7 @@ const Context = struct {
             .kind = .subagent,
             .workspace_root = result.workspace_root,
             .session_id = self.turn.child_id,
+            .subagent_id = self.subagent_id,
         };
         return result;
     }
@@ -177,17 +180,22 @@ pub fn run(
         routed_config.tool_context.web_search_backend = null;
         routed_config.tool_context.web_search_runtime_ready = false;
     }
+    const trace_context = debug_trace.TraceContext{
+        .turn_id = debug_trace.nextTurnId(),
+        .subagent_id = debug_trace.nextSubagentId(),
+    };
     var context = Context{
         .config = routed_config,
         .turn = turn,
         .admission = admission,
         .cancel = cancel,
+        .subagent_id = trace_context.subagent_id,
     };
     const history = turn.sessionRuntime().snapshotHistory(arena) catch return error.OutOfMemory;
     const recovery_checkpoint = turn.snapshotRecoveryCheckpoint(arena) catch
         return error.OutOfMemory;
     const prompt = worker_runtime.QueuedPrompt{
-        .turn_id = 1,
+        .turn_id = trace_context.turn_id,
         .prompt = arena.dupe(u8, message.content) catch return error.OutOfMemory,
         .images = &.{},
         .model = arena.dupe(u8, admission.model) catch return error.OutOfMemory,
@@ -218,6 +226,17 @@ pub fn run(
         .recovery_checkpoint = recovery_checkpoint,
         .recovery_source_already_presented = recovery_checkpoint != null,
     };
+    debug_trace.eventf(
+        "subagent",
+        "trace_identity",
+        trace_context,
+        "child_id={s} parent_id={s} work_id={s}",
+        .{
+            turn.child_id orelse "unknown",
+            admission.parent_id,
+            turn.active_work_id orelse "unknown",
+        },
+    );
     const deps = runtimeDeps(&context);
     execution.runNormalAgentTurn(
         &deps,
@@ -228,6 +247,7 @@ pub fn run(
                 .kind = .subagent,
                 .workspace_root = config.tool_context.workspace_root,
                 .session_id = turn.child_id,
+                .subagent_id = trace_context.subagent_id,
             },
             .outcome_allocator = turn.alloc,
         },
@@ -255,6 +275,7 @@ pub fn run(
             .root_user_messages = message.root_user_messages,
             .root_user_evidence_complete = message.root_user_evidence_complete,
             .session_child_capability = turn.childCapability() catch null,
+            .subagent_id = trace_context.subagent_id,
             .context_limits = config.tool_context.context_limits,
         },
         prompt,

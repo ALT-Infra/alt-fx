@@ -2598,14 +2598,25 @@ pub fn processQueuedPrompt(
     if (effective_job.turn_id == 0) {
         effective_job.turn_id = debug_trace.nextTurnId();
     }
+    var effective_config = config;
+    if (effective_config.origin == .subagent and effective_config.subagent_id == 0) {
+        effective_config.subagent_id = debug_trace.nextSubagentId();
+    }
+    var effective_lifecycle = lifecycle;
+    if (effective_config.origin == .subagent and
+        effective_lifecycle.scope.kind == .subagent and
+        effective_lifecycle.scope.subagent_id == null)
+    {
+        effective_lifecycle.scope.subagent_id = effective_config.subagent_id;
+    }
     var finalization = TurnFinalizationGuard.init(
         deps,
         effective_job.turn_id,
-        lifecycle,
+        effective_lifecycle,
     );
     defer finalization.deinit();
 
-    processQueuedPromptInner(deps, semantic_presentation, lifecycle, config, effective_job, &finalization) catch |err| {
+    processQueuedPromptInner(deps, semantic_presentation, effective_lifecycle, effective_config, effective_job, &finalization) catch |err| {
         if (finalization.state == .open) {
             finalization.finish(.failed, null, null) catch |finalization_err| return finalization_err;
         }

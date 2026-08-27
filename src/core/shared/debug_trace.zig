@@ -30,6 +30,7 @@ var state_mutex: std.Io.Mutex = .init;
 var state: State = .{};
 var next_turn_id = std.atomic.Value(u64).init(1);
 var next_step_id = std.atomic.Value(u64).init(1);
+var next_subagent_id = std.atomic.Value(u64).init(1);
 
 pub fn configureFromEnv(alloc: Allocator, workspace_root: []const u8) void {
     const options = loadOptionsFromEnv(alloc, workspace_root) catch return;
@@ -65,6 +66,11 @@ pub fn nextTurnId() u64 {
 pub fn nextStepId() u64 {
     if (comptime @import("builtin").os.tag == .wasi) return 1;
     return next_step_id.fetchAdd(1, .seq_cst);
+}
+
+pub fn nextSubagentId() u64 {
+    if (comptime @import("builtin").os.tag == .wasi) return 1;
+    return next_subagent_id.fetchAdd(1, .seq_cst);
 }
 
 pub fn logf(scope: []const u8, comptime fmt: []const u8, args: anytype) void {
@@ -288,6 +294,7 @@ pub fn resetForTest() void {
     shutdown();
     next_turn_id.store(1, .seq_cst);
     next_step_id.store(1, .seq_cst);
+    next_subagent_id.store(1, .seq_cst);
 }
 
 pub fn configureForTest(alloc: Allocator, path: []const u8) !void {
