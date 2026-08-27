@@ -471,11 +471,14 @@ fn expectPermissionDeniedToolResult(gateway: *const FakeGateway, index: usize, t
             if (part_tool_name != .string or !std.mem.eql(u8, part_tool_name.string, tool_name)) continue;
             const output = part.object.get("output") orelse continue;
             if (output != .object) continue;
-            const value = output.object.get("value") orelse continue;
-            if (value != .string) continue;
+            const output_type = output.object.get("type") orelse continue;
+            if (output_type != .string or !std.mem.eql(u8, output_type.string, "execution-denied")) continue;
+            try std.testing.expect(output.object.get("value") == null);
+            const reason_value = output.object.get("reason") orelse continue;
+            if (reason_value != .string) continue;
 
-            try std.testing.expect(tool_result_errors.isToolPermissionDeniedOutput(value.string));
-            var payload = try std.json.parseFromSlice(std.json.Value, alloc, value.string, .{});
+            try std.testing.expect(tool_result_errors.isToolPermissionDeniedOutput(reason_value.string));
+            var payload = try std.json.parseFromSlice(std.json.Value, alloc, reason_value.string, .{});
             defer payload.deinit();
             const error_obj = payload.value.object.get("error").?.object;
             try std.testing.expectEqualStrings("tool_permission_denied", error_obj.get("type").?.string);
