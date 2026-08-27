@@ -3,6 +3,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -356,6 +357,108 @@ async function expectProcessesExited(pids: Iterable<number>, timeoutMs = 5_000) 
 }
 
 describe("modern MCP stdio compatibility", () => {
+  test("direct docker run servers are cleaned through the injected cidfile", async () => {
+    const root = createRoot("docker-cidfile-cleanup", MODERN_FIXTURE);
+    const fakeDocker = join(root.root, "docker");
+    const cleanupLog = join(root.root, "docker-cleanup.log");
+    const cidfileLog = join(root.root, "docker-cidfile.log");
+    const dockerLaunchLog = join(root.root, "docker-launches.txt");
+    writeFileSync(
+      fakeDocker,
+      `#!/bin/sh
+if [ "$1" = "rm" ]; then
+  printf '%s\\n' "$*" > "$FX_DOCKER_CLEANUP_LOG"
+  exit 0
+fi
+printf '%s\\n' "$$" >> "$FX_DOCKER_LAUNCH_LOG"
+test "$1" = "run" || exit 21
+shift
+test "$1" = "--cidfile" || exit 22
+cidfile=$2
+shift 2
+printf '%s\\n' '0123456789abcdef' > "$cidfile"
+printf '%s\\n' "$cidfile" >> "$FX_DOCKER_CIDFILE_LOG"
+exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
+`,
+      { mode: 0o755 },
+    );
+    const profilePath = join(root.home, ".fx", "mcp.json");
+    const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+    profile.mcp.fixture.command = [
+      fakeDocker,
+      "run",
+      "--rm",
+      "-i",
+      "fixture-image",
+    ];
+    profile.mcp.fixture.environment.FX_DOCKER_CLEANUP_LOG = cleanupLog;
+    profile.mcp.fixture.environment.FX_DOCKER_CIDFILE_LOG = cidfileLog;
+    profile.mcp.fixture.environment.FX_DOCKER_LAUNCH_LOG = dockerLaunchLog;
+    profile.mcp.fixture.environment.FX_MCP_FIXTURE_RUNTIME = process.execPath;
+    profile.mcp.fixture.environment.FX_MCP_FIXTURE_PATH = MODERN_FIXTURE;
+    writeFileSync(profilePath, JSON.stringify(profile));
+
+    const result = await runFx(["mcp", "list", "--connect"], {
+      cwd: root.workspace,
+      env: {
+        HOME: root.home,
+        TMPDIR: root.root,
+        AI_GATEWAY_API_KEY: undefined,
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_TRACE_LOG: root.traceLogPath,
+        FX_TRACE_SCOPES: "mcp",
+      },
+      timeoutMs: 20_000,
+    });
+
+    expect(result.code).toBe(0);
+    expect(result.stdout).toMatch(/fixture[\s\S]{0,240}state=ready/);
+    expect(readFileSync(cleanupLog, "utf8").trim()).toBe(
+      "rm -f 0123456789abcdef",
+    );
+    expect(readdirSync(root.root).some((name) =>
+      name.startsWith("fx-mcp-") && name.endsWith(".cid")
+    )).toBe(false);
+    expect(readFileSync(root.traceLogPath, "utf8")).toContain(
+      "docker MCP container cleanup complete",
+    );
+    await expectProcessesExited(readAttemptedPids(dockerLaunchLog));
+
+    rmSync(cleanupLog);
+    rmSync(cidfileLog);
+    profile.mcp.fixture.environment.FX_MCP_MODE = "stall_startup";
+    profile.mcp.fixture.startup_timeout_ms = 50;
+    profile.mcp.fixture.restart_limit = 0;
+    writeFileSync(profilePath, JSON.stringify(profile));
+    const timedOut = await runFx(["mcp", "list", "--connect"], {
+      cwd: root.workspace,
+      env: {
+        HOME: root.home,
+        TMPDIR: root.root,
+        AI_GATEWAY_API_KEY: undefined,
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_TRACE_LOG: root.traceLogPath,
+        FX_TRACE_SCOPES: "mcp",
+      },
+      timeoutMs: 20_000,
+    });
+    expect(timedOut.code).toBe(0);
+    expect(timedOut.stdout).toMatch(/fixture[\s\S]{0,240}state=failed/);
+    if (existsSync(cidfileLog)) {
+      expect(readFileSync(cleanupLog, "utf8").trim()).toBe(
+        "rm -f 0123456789abcdef",
+      );
+    } else {
+      expect(existsSync(cleanupLog)).toBe(false);
+    }
+    expect(readdirSync(root.root).some((name) =>
+      name.startsWith("fx-mcp-") && name.endsWith(".cid")
+    )).toBe(false);
+    await expectProcessesExited(readAttemptedPids(dockerLaunchLog));
+  }, 30_000);
+
   test.skipIf(!tmuxAvailable())(
     "the TUI shows exact dynamic MCP arguments before human approval",
     async () => {
@@ -1802,9 +1905,10 @@ describe("modern MCP stdio compatibility", () => {
     expect(initialize.map((entry) => entry.message.params?.protocolVersion)).toEqual([
       "2025-11-25",
       "2025-06-18",
+      "2025-03-26",
       "2024-11-05",
     ]);
-    expect(new Set(initialize.map((entry) => entry.pid)).size).toBe(3);
+    expect(new Set(initialize.map((entry) => entry.pid)).size).toBe(4);
     expect(wire.filter((entry) => entry.message.method === "tools/call"))
       .toHaveLength(1);
     await expectFixtureProcessesExited(wire);

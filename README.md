@@ -125,7 +125,7 @@ Add reusable instructions with [skills](https://fx.sh/docs/capabilities/skills),
 
 Use `fx mcp list`, `fx mcp path`, and `fx mcp remove NAME` for noninteractive profile management. `fx mcp trust approve|reject NAME`, `fx mcp trust approve-all`, and `fx mcp trust reset` manage workspace-scoped project trust. `fx mcp auth NAME` and `fx mcp logout NAME` run the existing remote credential lifecycle without opening the TUI or contacting the Gateway.
 
-MongoDB Atlas Managed MCP configuration service accounts use OAuth client credentials, which fx does not acquire directly. Export `MDB_MCP_API_CLIENT_ID` and `MDB_MCP_API_CLIENT_SECRET`, then run `fx mcp add MongoDB npx -y mongodb-atlas-mcp-remote@latest`. MongoDB's browser-based Atlas App Connection flow is a separate user-delegated authentication model and is not interchangeable with those configuration credentials.
+MCP servers have a 30-second startup timeout by default; set `startup_timeout_ms` on a server when its cold start needs a different bound. For direct `docker run` stdio entries, fx uses a private container ID file to remove the owned container after shutdown or startup failure. A configuration that already supplies `--cidfile` keeps ownership of its own cleanup policy.
 
 ## Documentation
 

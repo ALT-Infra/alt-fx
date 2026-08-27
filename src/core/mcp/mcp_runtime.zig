@@ -27,6 +27,7 @@ const operation_control = @import("operation_control.zig");
 const controlled_lock = @import("controlled_lock.zig");
 const mcp_json = @import("mcp_json.zig");
 const protocol_negotiation = @import("protocol_negotiation.zig");
+const docker_run = @import("docker_run.zig");
 const stdio_dispatcher = @import("stdio_dispatcher.zig");
 const streamable_http = @import("streamable_http.zig");
 const feature_cache = @import("feature_cache.zig");
@@ -10351,8 +10352,17 @@ fn spawnStdioServer(alloc: Allocator, server: *McpServer, argv: []const []const 
     const generation = server.next_generation;
     server.next_generation = std.math.add(u64, generation, 1) catch
         return error.McpGenerationExhausted;
+    var prepared = try docker_run.prepare(alloc, argv);
+    defer prepared.deinit(alloc);
+    var docker_cleanup = prepared.takeCleanup();
+    defer if (docker_cleanup) |*cleanup| cleanup.deinit(alloc);
+    if (docker_cleanup) |*cleanup| {
+        if (server.env_map) |*environment| {
+            try cleanup.cloneEnvironment(alloc, environment);
+        }
+    }
     const child = try std.process.spawn(io_mod.getIo(), .{
-        .argv = argv,
+        .argv = prepared.argv,
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .ignore,
@@ -10360,13 +10370,20 @@ fn spawnStdioServer(alloc: Allocator, server: *McpServer, argv: []const []const 
         .pgid = if (builtin.os.tag == .windows) null else 0,
     });
 
-    server.dispatcher = try stdio_dispatcher.StdioDispatcher.create(
+    server.dispatcher = stdio_dispatcher.StdioDispatcher.create(
         alloc,
         std.heap.c_allocator,
         child,
         generation,
         mcp_discovery_response_frame_cap_bytes,
-    );
+    ) catch |err| {
+        if (docker_cleanup) |*cleanup| cleanup.run(alloc);
+        return err;
+    };
+    if (docker_cleanup) |cleanup| {
+        server.dispatcher.?.installDockerCleanup(cleanup);
+        docker_cleanup = null;
+    }
 }
 
 fn connectServerLegacy(
@@ -16001,11 +16018,14 @@ test "legacy stdio initialization transitions are bounded and monotonic" {
         .{ .offered = .v2025_11_25, .observation = .{ .accepted = .v2025_11_25 }, .expected = .{ .accept = .v2025_11_25 } },
         .{ .offered = .v2025_11_25, .observation = .{ .accepted = .v2024_11_05 }, .expected = .{ .accept = .v2024_11_05 } },
         .{ .offered = .v2025_06_18, .observation = .{ .accepted = .v2025_11_25 }, .expected = .{ .accept = .v2025_11_25 } },
+        .{ .offered = .v2025_03_26, .observation = .{ .accepted = .v2025_03_26 }, .expected = .{ .accept = .v2025_03_26 } },
         .{ .offered = .v2025_11_25, .observation = .connection_closed, .expected = .{ .retry = .v2025_06_18 } },
-        .{ .offered = .v2025_06_18, .observation = .connection_closed, .expected = .{ .retry = .v2024_11_05 } },
+        .{ .offered = .v2025_06_18, .observation = .connection_closed, .expected = .{ .retry = .v2025_03_26 } },
+        .{ .offered = .v2025_03_26, .observation = .connection_closed, .expected = .{ .retry = .v2024_11_05 } },
         .{ .offered = .v2024_11_05, .observation = .connection_closed, .expected = .fail },
         .{ .offered = .v2025_11_25, .observation = .{ .unsupported = null }, .expected = .{ .retry = .v2025_06_18 } },
-        .{ .offered = .v2025_06_18, .observation = .{ .unsupported = null }, .expected = .{ .retry = .v2024_11_05 } },
+        .{ .offered = .v2025_06_18, .observation = .{ .unsupported = null }, .expected = .{ .retry = .v2025_03_26 } },
+        .{ .offered = .v2025_03_26, .observation = .{ .unsupported = null }, .expected = .{ .retry = .v2024_11_05 } },
         .{ .offered = .v2024_11_05, .observation = .{ .unsupported = null }, .expected = .fail },
         .{ .offered = .v2025_11_25, .observation = .{ .unsupported = .v2024_11_05 }, .expected = .{ .retry = .v2024_11_05 } },
         .{ .offered = .v2025_11_25, .observation = .{ .unsupported = .v2025_11_25 }, .expected = .fail },
