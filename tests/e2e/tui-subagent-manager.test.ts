@@ -4931,9 +4931,19 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await active.sendKeys("Tab");
         await active.sendKeys("Tab");
         await active.sendKeys("Tab");
+        await active.waitForPane(
+          (pane) =>
+            pane.split("\n").some((line) =>
+              line.startsWith("> Report duration ms: 900")
+            ),
+          TIMEOUT,
+        );
         await active.sendKeys("C-u");
-        const clearedForm = await active.waitForText(
-          "Duration sets the stop boundary; clear duration to disable.",
+        const clearedForm = await active.waitForPane(
+          (pane) =>
+            pane.split("\n").some((line) =>
+              line.startsWith("> Report duration ms:") && !line.includes("900")
+            ),
           TIMEOUT,
         );
         expect(clearedForm).not.toContain("Stop after duration:");
