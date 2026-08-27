@@ -3,6 +3,7 @@ const std = @import("std");
 pub fn searchWorkerInputFitsLimit(
     input_overhead_bytes: usize,
     query: []const u8,
+    search_queries: ?[]const []const u8,
     allowed_domains: ?[]const []const u8,
     blocked_domains: ?[]const []const u8,
     max_input_bytes: usize,
@@ -10,6 +11,7 @@ pub fn searchWorkerInputFitsLimit(
     var input_bytes: usize = 0;
     addBytes(&input_bytes, input_overhead_bytes) catch return false;
     addBytes(&input_bytes, query.len) catch return false;
+    addOptionalStrings(&input_bytes, search_queries) catch return false;
     addOptionalStrings(&input_bytes, allowed_domains) catch return false;
     addOptionalStrings(&input_bytes, blocked_domains) catch return false;
     return input_bytes <= max_input_bytes;
@@ -25,6 +27,7 @@ fn addBytes(total: *usize, count: usize) !void {
 }
 
 test "search worker input cap uses conservative serialized bytes" {
-    try std.testing.expect(searchWorkerInputFitsLimit("system".len, "query", &.{"allowed"}, null, 18));
-    try std.testing.expect(!searchWorkerInputFitsLimit("system".len, "query", &.{"allowed"}, null, 17));
+    try std.testing.expect(searchWorkerInputFitsLimit("system".len, "query", null, &.{"allowed"}, null, 18));
+    try std.testing.expect(!searchWorkerInputFitsLimit("system".len, "query", null, &.{"allowed"}, null, 17));
+    try std.testing.expect(!searchWorkerInputFitsLimit(0, "query", &.{"second query"}, null, null, 16));
 }

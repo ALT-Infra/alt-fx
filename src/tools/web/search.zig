@@ -29,6 +29,8 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
     const input = erased.as(Input);
     var execution = backend.execute(ctx, .{
         .query = input.query,
+        .search_queries = optionalConstStrings(input.search_queries),
+        .mode = input.mode,
         .allowed_domains = optionalConstStrings(input.allowed_domains),
         .blocked_domains = optionalConstStrings(input.blocked_domains),
     }) catch |err| return backendFailure(ctx.allocator, err);
@@ -79,6 +81,16 @@ pub fn formatOutput(alloc: Allocator, output: Output) ![]u8 {
                     try appendBounded(&out, alloc, "](", body_limit);
                     try appendMarkdownUrl(&out, alloc, source.url, body_limit);
                     try appendBounded(&out, alloc, ")\n", body_limit);
+                    if (source.publish_date) |publish_date| {
+                        try appendBounded(&out, alloc, "  Published: ", body_limit);
+                        try appendBounded(&out, alloc, publish_date, body_limit);
+                        try appendBounded(&out, alloc, "\n", body_limit);
+                    }
+                    if (source.excerpt) |excerpt| {
+                        try appendBounded(&out, alloc, "  Excerpt: ", body_limit);
+                        try appendBounded(&out, alloc, excerpt, body_limit);
+                        try appendBounded(&out, alloc, "\n", body_limit);
+                    }
                 }
             },
             .error_text => |text| {

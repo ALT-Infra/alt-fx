@@ -1116,4 +1116,162 @@ describe("web_search Gateway fixture", () => {
     TIMEOUT,
   );
 
+
+  test(
+    "opencode model without fx search borrows a configured local Parallel backend",
+    async () => {
+      const SENTINEL = "PARALLEL_LOCAL_EXCERPT_SENTINEL";
+      const opencodeApiKey = "opencode-local-search-key";
+      const parallelApiKey = "parallel-e2e-key";
+      let loginSettings: Record<string, unknown> = {};
+
+      const opencode = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        async fetch(request) {
+          const url = new URL(request.url);
+          if (url.pathname === "/zen/models") {
+            return Response.json({ data: [
+              { id: "gpt-5.6-sol", object: "model" },
+              { id: "big-pickle", object: "model" },
+            ] });
+          }
+          if (url.pathname === "/go/models") {
+            return Response.json({ data: [{ id: "kimi-k3", object: "model" }] });
+          }
+          if (url.pathname === "/chat") {
+            const body = await request.text();
+            if (!body.includes("PARALLEL_LOCAL_EXCERPT_SENTINEL")) {
+              return new Response(
+                `data: ${JSON.stringify({
+                  id: "opencode-search-turn",
+                  choices: [{
+                    delta: {
+                      tool_calls: [{
+                        index: 0,
+                        id: "opencode_search_1",
+                        type: "function",
+                        function: {
+                          name: "web_search",
+                          arguments: JSON.stringify({ query: "latest Zig release" }),
+                        },
+                      }],
+                    },
+                    finish_reason: null,
+                  }],
+                })}\n\n` +
+                  `data: ${JSON.stringify({
+                    choices: [{ delta: {}, finish_reason: "tool_calls" }],
+                  })}\n\ndata: [DONE]\n\n`,
+                { headers: { "content-type": "text/event-stream" } },
+              );
+            }
+            return new Response(
+              `data: ${JSON.stringify({
+                id: "opencode-final-turn",
+                choices: [{
+                  delta: { content: "PARALLEL_LOCAL_SEARCH_COMPLETE" },
+                  finish_reason: null,
+                }],
+              })}\n\n` +
+                `data: ${JSON.stringify({
+                  choices: [{ delta: {}, finish_reason: "stop" }],
+                  usage: { prompt_tokens: 6, completion_tokens: 3 },
+                })}\n\ndata: [DONE]\n\n`,
+              { headers: { "content-type": "text/event-stream" } },
+            );
+          }
+          return new Response("not found", { status: 404 });
+        },
+      });
+      const parallelRequests: Array<{ authorization: string | null; body: string }> = [];
+      const parallel = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        async fetch(request) {
+          if (new URL(request.url).pathname !== "/search") {
+            return new Response("not found", { status: 404 });
+          }
+          parallelRequests.push({
+            authorization: request.headers.get("x-api-key"),
+            body: await request.text(),
+          });
+          return Response.json({
+            search_id: "search_local_e2e_1",
+            results: [{
+              title: "Zig downloads",
+              url: SOURCE_URL,
+              publish_date: "2026-08-01",
+              excerpts: [SENTINEL],
+            }],
+          });
+        },
+      });
+
+      const root = createIsolatedRoot();
+      const opencodeEnv = {
+        FX_E2E_OPENCODE_ZEN_MODELS_URL: `http://127.0.0.1:${opencode.port}/zen/models`,
+        FX_E2E_OPENCODE_GO_MODELS_URL: `http://127.0.0.1:${opencode.port}/go/models`,
+        FX_E2E_OPENCODE_CHAT_URL: `http://127.0.0.1:${opencode.port}/chat`,
+      };
+      try {
+        const login = await runFx(["login", "opencode"], {
+          env: { ...opencodeEnv, HOME: root.home, OPENCODE_API_KEY: opencodeApiKey },
+          timeoutMs: TIMEOUT,
+        });
+        expect(login.code, `stdout: ${login.stdout}\nstderr: ${login.stderr}`).toBe(0);
+
+        loginSettings = JSON.parse(
+          readFileSync(join(root.home, ".fx", "settings.json"), "utf8"),
+        ) as Record<string, unknown>;
+        writeFileSync(
+          join(root.home, ".fx", "settings.json"),
+          JSON.stringify({
+            ...loginSettings,
+            permission: { web_search: { "*": "allow" } },
+          }),
+        );
+
+        const result = await runFx(
+          ["ask", "--auto", "--json", "--no-save", "Search the web for the latest Zig release."],
+          {
+            cwd: root.workspace,
+            env: {
+              ...opencodeEnv,
+              HOME: root.home,
+              OPENCODE_API_KEY: undefined,
+              PARALLEL_API_KEY: parallelApiKey,
+              FX_E2E_PARALLEL_SEARCH_URL: `http://127.0.0.1:${parallel.port}/search`,
+              AI_GATEWAY_API_KEY: undefined,
+              VERCEL_OIDC_TOKEN: undefined,
+              FX_AUTO_UPGRADE: "0",
+            },
+            timeoutMs: TIMEOUT,
+          },
+        );
+
+        expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+        const json = parseFxJson(result);
+        expect(json.output).toContain("PARALLEL_LOCAL_SEARCH_COMPLETE");
+        expect(parallelRequests).toHaveLength(1);
+        expect(parallelRequests[0]!.authorization).toBe(parallelApiKey);
+        const parallelBody = JSON.parse(parallelRequests[0]!.body) as Record<string, unknown>;
+        expect(parallelBody["objective"]).toBe("latest Zig release");
+        expect(parallelBody["mode"]).toBe("fast");
+        expect(parallelBody["client_model"]).toBe(loginSettings.models
+          ? (loginSettings.models as Record<string, string>)["opencode"]
+          : undefined);
+        expect(json.tool_calls.some((call) =>
+          call.name === "web_search" && call.status === "success" &&
+          call.web_search?.searches === 1
+        )).toBe(true);
+      } finally {
+        opencode.stop(true);
+        parallel.stop(true);
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
 });

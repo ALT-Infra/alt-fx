@@ -2,14 +2,18 @@ const std = @import("std");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 
 const Allocator = std.mem.Allocator;
+const web_search_contract = @import("../../core/tooling/web_search_contract.zig");
 
 pub const Input = struct {
     query: []u8,
+    search_queries: ?[][]u8 = null,
+    mode: ?web_search_contract.SearchMode = null,
     allowed_domains: ?[][]u8 = null,
     blocked_domains: ?[][]u8 = null,
 
     pub fn deinit(self: *Input, alloc: Allocator) void {
         alloc.free(self.query);
+        freeOptionalStrings(alloc, self.search_queries);
         freeOptionalStrings(alloc, self.allowed_domains);
         freeOptionalStrings(alloc, self.blocked_domains);
         self.* = .{ .query = &.{} };
@@ -46,6 +50,34 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
     defer owned.deinit();
 
     owned.query = try ctx.allocator.dupe(u8, query_value.string);
+
+    const search_queries_decoded = try decodeOptionalStrings(ctx, parsed.value.object, "search_queries");
+    owned.search_queries = switch (search_queries_decoded) {
+        .strings => |strings| strings,
+        .failure => |reason| return .{ .failure = reason },
+    };
+    if (owned.search_queries) |queries| {
+        if (queries.len > 5) {
+            return .{ .failure = try ctx.allocator.dupe(u8, "web_search field \"search_queries\" accepts at most five queries") };
+        }
+        for (queries, 0..) |query, index| {
+            const len = std.unicode.utf8CountCodepoints(query) catch {
+                return .{ .failure = try std.fmt.allocPrint(ctx.allocator, "web_search field \"search_queries\" item {d} must be valid UTF-8", .{index}) };
+            };
+            if (len < 2) {
+                return .{ .failure = try std.fmt.allocPrint(ctx.allocator, "web_search field \"search_queries\" item {d} must contain at least two characters", .{index}) };
+            }
+        }
+    }
+
+    if (parsed.value.object.get("mode")) |mode_value| {
+        if (mode_value != .string) {
+            return .{ .failure = try ctx.allocator.dupe(u8, "web_search field \"mode\" must be a string") };
+        }
+        owned.mode = std.meta.stringToEnum(web_search_contract.SearchMode, mode_value.string) orelse {
+            return .{ .failure = try ctx.allocator.dupe(u8, "web_search field \"mode\" must be turbo, fast, basic, or advanced") };
+        };
+    }
 
     const allowed_decoded = try decodeOptionalStrings(ctx, parsed.value.object, "allowed_domains");
     owned.allowed_domains = switch (allowed_decoded) {
@@ -100,14 +132,18 @@ const OptionalStringsDecodeResult = union(enum) {
 const DecodeOwned = struct {
     alloc: Allocator,
     query: ?[]u8 = null,
+    search_queries: ?[][]u8 = null,
+    mode: ?web_search_contract.SearchMode = null,
     allowed_domains: ?[][]u8 = null,
     blocked_domains: ?[][]u8 = null,
 
     fn deinit(self: *DecodeOwned) void {
         if (self.query) |query| self.alloc.free(query);
+        freeOptionalStrings(self.alloc, self.search_queries);
         freeOptionalStrings(self.alloc, self.allowed_domains);
         freeOptionalStrings(self.alloc, self.blocked_domains);
         self.query = null;
+        self.search_queries = null;
         self.allowed_domains = null;
         self.blocked_domains = null;
     }
@@ -115,10 +151,13 @@ const DecodeOwned = struct {
     fn take(self: *DecodeOwned) Input {
         const input = Input{
             .query = self.query.?,
+            .search_queries = self.search_queries,
+            .mode = self.mode,
             .allowed_domains = self.allowed_domains,
             .blocked_domains = self.blocked_domains,
         };
         self.query = null;
+        self.search_queries = null;
         self.allowed_domains = null;
         self.blocked_domains = null;
         return input;
@@ -159,6 +198,8 @@ fn unknownField(object: std.json.ObjectMap) ?[]const u8 {
     var fields = object.iterator();
     while (fields.next()) |entry| {
         if (std.mem.eql(u8, entry.key_ptr.*, "query")) continue;
+        if (std.mem.eql(u8, entry.key_ptr.*, "search_queries")) continue;
+        if (std.mem.eql(u8, entry.key_ptr.*, "mode")) continue;
         if (std.mem.eql(u8, entry.key_ptr.*, "allowed_domains")) continue;
         if (std.mem.eql(u8, entry.key_ptr.*, "blocked_domains")) continue;
         return entry.key_ptr.*;

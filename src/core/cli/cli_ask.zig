@@ -23,6 +23,8 @@ const host = @import("../hosts/host.zig");
 const pathing = @import("../workspace/pathing.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const parallel_session = @import("../auth/parallel_session.zig");
+const builtin_parallel = @import("../../builtins/parallel.zig");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation = @import("../tooling/file_mutation.zig");
 const gateway_error_format = @import("../shared/gateway_error_format.zig");
@@ -583,6 +585,8 @@ const AskContext = struct {
     step_count: usize = 0,
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
     web_search_runtime: web_search_runtime.Runtime,
+    parallel_web_search_runtime: web_search_runtime.Runtime,
+    parallel_connection: ?parallel_session.Session,
     capability_resolver: gateway_provider.CapabilityResolver = .{},
     lifecycle_runtime: hooks.Runtime,
     lifecycle_view: hooks.RuntimeView,
@@ -609,6 +613,13 @@ const AskContext = struct {
             .web_search_runtime = web_search_runtime.Runtime.init(.{
                 .provider = cfg.provider_set.gateway.fx_search.?,
             }),
+            .parallel_web_search_runtime = web_search_runtime.Runtime.init(.{
+                .provider = builtin_parallel.default_web_search_provider,
+            }),
+            .parallel_connection = parallel_session.loadConfigured(alloc) catch |err| blk: {
+                debug_trace.logf("auth", "Parallel connection unavailable err={s}", .{@errorName(err)});
+                break :blk null;
+            },
             .background = BackgroundRuntime.init(
                 cfg.background_process_provider,
             ),
@@ -725,6 +736,8 @@ const AskContext = struct {
         }
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
+        self.parallel_web_search_runtime.deinit();
+        if (self.parallel_connection) |*connection| connection.deinit(self.alloc);
         self.capability_resolver.deinit(self.alloc);
         self.lifecycle_runtime.deinit();
         if (self.writable) |*writable| writable.deinit(self.alloc);
@@ -951,6 +964,8 @@ const AskContext = struct {
 
     fn toolContext(self: *AskContext) tool_runtime.Context {
         const provider_capabilities = self.cfg.provider_set.select(self.provider).capabilities;
+        var web_search_runtime_ready = false;
+        var web_search_backend: ?tool_dispatch.WebSearchBackend = null;
         if (provider_capabilities.fx_search) {
             self.web_search_runtime.configure(.{
                 .api_key = self.api_key,
@@ -962,6 +977,18 @@ const AskContext = struct {
                 .usage = &self.session.usage,
                 .usage_allocator = self.alloc,
             });
+            web_search_backend = self.web_search_runtime.dispatchBackend();
+        } else if (self.parallel_connection) |*connection| {
+            self.parallel_web_search_runtime.configure(.{
+                .api_key = connection.api_key,
+                .worker_model = self.model,
+                .gateway_retry_count = 0,
+                .gateway_chat_url = "",
+                .usage = &self.session.usage,
+                .usage_allocator = self.alloc,
+            });
+            web_search_runtime_ready = true;
+            web_search_backend = self.parallel_web_search_runtime.dispatchBackend();
         }
         var tc: tool_runtime.Context = .{
             .workspace_root = self.workspace_root,
@@ -1027,8 +1054,8 @@ const AskContext = struct {
             .web_fetch_artifact_error = self.session.webFetchArtifactError(),
             .web_fetch_progress_ctx = @ptrCast(self),
             .on_web_fetch_progress = onWebFetchProgress,
-            .web_search_runtime_ready = false,
-            .web_search_backend = if (provider_capabilities.fx_search) self.web_search_runtime.dispatchBackend() else null,
+            .web_search_runtime_ready = web_search_runtime_ready,
+            .web_search_backend = web_search_backend,
             .web_search_progress_ctx = @ptrCast(self),
             .on_web_search_progress = onWebSearchProgress,
             .model_capability_resolver = .{
