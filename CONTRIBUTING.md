@@ -277,6 +277,11 @@ add. Trust updates the canonical workspace entry in profile settings. Auth and
 logout run the existing remote credential lifecycle. None of these commands
 constructs the TUI or contacts the Gateway.
 
+The default MCP startup timeout is 30 seconds and remains overridable per
+server with `startup_timeout_ms`. Exact direct `docker run` stdio commands
+without `--cidfile` receive a private cidfile so fx can remove the container
+after shutdown or startup failure. An explicit cidfile remains user-owned.
+
 MongoDB Atlas Managed MCP configuration service accounts use the OAuth
 client-credentials grant. fx does not implement that grant directly. Use
 MongoDB's `mongodb-atlas-mcp-remote` stdio wrapper with inherited

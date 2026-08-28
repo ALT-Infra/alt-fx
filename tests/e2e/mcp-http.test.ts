@@ -247,6 +247,70 @@ describe("modern MCP Streamable HTTP", () => {
     ]);
   }, 25_000);
 
+  test("GitMCP-like plain-text discovery error falls back to legacy initialize", async () => {
+    fixture = startModernMcpHttpFixture("legacy_plaintext_session_required");
+    const root = createRoot("gitmcp-legacy-fallback", fixture);
+
+    const result = await runFx(
+      ["mcp", "list", "--connect"],
+      {
+        cwd: root.workspace,
+        env: {
+          HOME: root.home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_TRACE_LOG: root.traceLogPath,
+          FX_TRACE_SCOPES: "mcp",
+        },
+        timeoutMs: 20_000,
+      },
+    );
+
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toMatch(/fixture[\s\S]{0,240}state=ready/);
+    expect(result.stdout).toContain("protocol=2025-03-26");
+    expect(result.stdout).toContain(
+      "negotiated_name=gitmcp-fixture negotiated_version=1.0.0",
+    );
+    expect(result.stdout).toContain("tools=1");
+    expect(fixture.requests.map((entry) => entry.message.method)).toEqual([
+      "server/discover",
+      "initialize",
+      "notifications/initialized",
+      "tools/list",
+    ]);
+  }, 25_000);
+
+  test("plain-text discovery auth rejection fails closed without aborting fx", async () => {
+    fixture = startModernMcpHttpFixture("legacy_plaintext_auth_rejection");
+    const root = createRoot("plaintext-auth-rejection", fixture);
+
+    const result = await runFx(
+      ["mcp", "list", "--connect"],
+      {
+        cwd: root.workspace,
+        env: {
+          HOME: root.home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_TRACE_LOG: root.traceLogPath,
+          FX_TRACE_SCOPES: "mcp",
+        },
+        timeoutMs: 20_000,
+      },
+    );
+
+    expect(result.code).toBe(0);
+    expect(result.stdout).toMatch(/fixture[\s\S]{0,240}auth=required/);
+    expect(result.stdout).not.toContain("InvalidJsonResponse");
+    expect(fixture.requests.map((entry) => entry.message.method)).toEqual([
+      "server/discover",
+    ]);
+  }, 25_000);
+
   test("top-level mcp add persists HTTP and a later ask calls it", async () => {
     fixture = startModernMcpHttpFixture("json");
     const root = createEmptyRoot("top-level-add");

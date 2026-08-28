@@ -196,6 +196,7 @@ function startAuthFixture(
     authorizationResponseIssuer?: string;
     omitScopes?: boolean;
     rejectDiscoveryWithoutChallenge?: boolean;
+    rejectDiscoveryWithRestAuthorizationDocument?: boolean;
   } = {},
 ) {
   const transport = options.transport ?? "http";
@@ -260,6 +261,19 @@ function startAuthFixture(
           options.rejectDiscoveryWithoutChallenge
         ) {
           return new Response("", { status: 403 });
+        }
+        if (
+          message?.method === "server/discover" &&
+          options.rejectDiscoveryWithRestAuthorizationDocument
+        ) {
+          return Response.json(
+            {
+              error: 401,
+              reason: "Unauthorized",
+              detail: "You are not authorized for this resource.",
+            },
+            { status: 400 },
+          );
         }
         if (message?.method === "resources/read") {
           resourceReadRequests += 1;
@@ -978,6 +992,85 @@ describe("MCP remote authentication lifecycle", () => {
       "notifications/initialized",
       "tools/list",
     ]);
+  }, 30_000);
+
+  test("OAuth-authenticated MongoDB deployed session error reaches legacy tools", async () => {
+    upstream = startModernMcpHttpFixture("legacy_mongodb_session_required");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const env = {
+      ...baseEnv(root),
+      AI_GATEWAY_API_KEY: undefined,
+    };
+
+    const authenticated = await runFx(["mcp", "auth", "fixture"], {
+      cwd: root.workspace,
+      env,
+      timeoutMs: 20_000,
+    });
+    expect(authenticated.code).toBe(0);
+    expect(authenticated.stdout).toContain("Authenticated MCP server 'fixture'");
+
+    const listed = await runFx(["mcp", "list", "--connect"], {
+      cwd: root.workspace,
+      env,
+      timeoutMs: 20_000,
+    });
+    expect(listed.code).toBe(0);
+    expect(listed.stderr).toBe("");
+    expect(listed.stdout).toMatch(
+      /fixture[\s\S]{0,240}state=ready auth=authenticated/,
+    );
+    expect(listed.stdout).toContain("protocol=2025-11-25");
+    expect(listed.stdout).toContain(
+      "negotiated_name=mongodb-managed-fixture negotiated_version=1.0.0",
+    );
+    expect(listed.stdout).toContain("tools=1");
+    expect(upstream.requests.map((entry) => entry.message.method)).toEqual([
+      "server/discover",
+      "initialize",
+      "notifications/initialized",
+      "tools/list",
+    ]);
+  }, 30_000);
+
+  test("MongoDB-like REST authorization document rejects stored credentials", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, {
+      rejectDiscoveryWithRestAuthorizationDocument: true,
+    });
+    const root = createRoot(auth);
+    const env = {
+      ...baseEnv(root),
+      AI_GATEWAY_API_KEY: undefined,
+    };
+
+    const authenticated = await runFx(["mcp", "auth", "fixture"], {
+      cwd: root.workspace,
+      env,
+      timeoutMs: 20_000,
+    });
+    expect(authenticated.code).toBe(0);
+    expect(authenticated.stdout).toContain("Authenticated MCP server 'fixture'");
+
+    const listed = await runFx(["mcp", "list", "--connect"], {
+      cwd: root.workspace,
+      env,
+      timeoutMs: 20_000,
+    });
+    expect(listed.code).toBe(0);
+    expect(listed.stdout).toMatch(/fixture[\s\S]{0,240}auth=required/);
+    expect(listed.stdout).not.toContain("auth=authenticated");
+    expect(listed.stdout).toContain("Authentication is required");
+    expect(listed.stdout).not.toContain("InvalidJsonResponse");
+    expect(upstream.requests).toHaveLength(0);
+    for (const secret of [ACCESS_INITIAL, REFRESH_INITIAL]) {
+      expect(listed.stdout).not.toContain(secret);
+      expect(listed.stderr).not.toContain(secret);
+      if (existsSync(root.trace)) {
+        expect(readFileSync(root.trace, "utf8")).not.toContain(secret);
+      }
+    }
   }, 30_000);
 
   test.skipIf(process.platform !== "darwin")(
