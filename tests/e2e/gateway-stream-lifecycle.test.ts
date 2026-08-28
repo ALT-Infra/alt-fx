@@ -1787,8 +1787,14 @@ describe("gateway stream lifecycle", () => {
       expect(skillSchema?.inputSchema.properties.location.type).toBe("string");
       expect(skillSchema?.inputSchema.required).toEqual(["name"]);
       expect(capabilitySearchSchema).toBeDefined();
-      expect(capabilitySearchSchema?.inputSchema.required).toEqual(["query"]);
+      expect(capabilitySearchSchema?.inputSchema.required).toBeUndefined();
       expect((capabilitySearchSchema?.inputSchema.properties.query as { maxLength?: number }).maxLength).toBe(4096);
+      expect((capabilitySearchSchema?.inputSchema.properties.kind as { enum?: string[] }).enum).toEqual([
+        "all",
+        "skill",
+        "mcp",
+      ]);
+      expect((capabilitySearchSchema?.inputSchema.properties.limit as { maximum?: number }).maximum).toBe(20);
 
       const available = taggedBlock(gateway.requests[0]!.body, "available_skills");
       expect(promptText(gateway.requests[0]!.body)).toContain(
@@ -1944,9 +1950,9 @@ describe("gateway stream lifecycle", () => {
         description: "Send email messages. API_KEY=[redacted]",
         location: safeDirectory,
       });
-      expect(projectedSearch?.counts.skills).toBe(8);
+      expect(projectedSearch?.counts.skills).toBe(1);
       expect(projectedSearch?.counts.mcp_tools).toBe(0);
-      expect(projectedSearch?.more_available.skills).toBe(true);
+      expect(projectedSearch?.more_available.skills).toBe(false);
       expect(projectedSearch?.skills.some((skill) => skill.name === "unsafe-workflow"))
         .toBe(false);
       const projectedText = toolResultOutput(gateway.requests[1]!.body, searchCallId);
@@ -4741,33 +4747,62 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
-  test("dynamic MCP search stays metadata-only and exact selection reveals instructions and schema", async () => {
+  test("scoped MCP search pages every tool before exact selection and execution", async () => {
     const root = createFixtureRoot("mcp-lazy-context");
     const tracePath = join(root.root, "trace.log");
-    const mcp = writeMcpFixture(root, { toolCount: 30 });
+    const distractorSkill = join(root.workspace, ".agents", "skills", "prompt-master");
+    mkdirSync(distractorSkill, { recursive: true });
+    writeFileSync(
+      join(distractorSkill, "SKILL.md"),
+      "---\nname: prompt-master\ndescription: Write prompts for tools and servers\n---\n\nDISTRACTOR_SKILL_BODY\n",
+    );
+    const mcp = writeMcpFixture(root, { toolCount: 28 });
     const searchCallId = "mcp_search_targeted_1";
-    const broadSearchCallId = "mcp_search_broad_1";
+    const firstPageCallId = "mcp_search_fixture_page_1";
+    const secondPageCallId = "mcp_search_fixture_page_2";
     const selectCallId = "mcp_select_lazy_1";
-    const responses = [
-      fakeGatewayToolCall(searchCallId, "capability_search", {
-        query: "fixture input public",
-      }),
-      fakeGatewayToolCall(broadSearchCallId, "capability_search", {
-        query: "fixture",
-      }),
-      fakeGatewayToolCall(selectCallId, "mcp_select_tool", {
-        name: DYNAMIC_MCP_TOOL_NAME,
-      }),
-      fakeGatewayToolCall("mcp_call_lazy_1", DYNAMIC_MCP_TOOL_NAME, {
-        text: "lazy MCP proof",
-      }),
-      fakeGatewayFinalText("MCP lazy context complete."),
-    ];
     let requestIndex = 0;
     const gateway = startDynamicFakeGateway(() => {
       if (requestIndex === 0) expect(existsSync(mcp.pidPath)).toBe(false);
-      requestIndex += 1;
-      return responses.shift() ?? new Response("unexpected request", { status: 500 });
+      switch (requestIndex++) {
+        case 0:
+          return fakeGatewayToolCall(searchCallId, "capability_search", {
+            query: "fixture input public",
+          });
+        case 1:
+          return fakeGatewayToolCall(firstPageCallId, "capability_search", {
+            kind: "mcp",
+            server: "fixture",
+            query: "",
+            limit: 20,
+          });
+        case 2: {
+          const firstPage = JSON.parse(
+            toolResultOutput(gateway.requests[2]!.body, firstPageCallId),
+          ) as {
+            next_cursors: { mcp_tools: string };
+          };
+          return fakeGatewayToolCall(secondPageCallId, "capability_search", {
+            kind: "mcp",
+            server: "fixture",
+            query: "",
+            limit: 20,
+            cursor: firstPage.next_cursors.mcp_tools,
+          });
+        }
+        case 3:
+          return fakeGatewayToolCall(selectCallId, "mcp_select_tool", {
+            name: DYNAMIC_MCP_TOOL_NAME,
+          });
+        case 4:
+          return fakeGatewayToolCall("mcp_call_lazy_1", DYNAMIC_MCP_TOOL_NAME, {
+            text: "lazy MCP proof",
+          });
+        case 5:
+          return fakeGatewayFinalText("MCP lazy context complete.");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
     }, {
       classifierDecision: "clear",
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -4786,7 +4821,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
 
       expect(result.code).toBe(0);
       expect(json.output).toContain("MCP lazy context complete.");
-      expect(gateway.requestCount()).toBe(5);
+      expect(gateway.requestCount()).toBe(6);
       const initialPrompt = promptText(gateway.requests[0]!.body);
       const initialServer = initialPrompt.match(
         /<server name="fixture" state="available_on_demand"[^>]*\/>/,
@@ -4805,13 +4840,30 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(searchTools).not.toContain("SECRET_SERVER_INSTRUCTION_SENTINEL");
       expect(searchTools).not.toContain("EXACT_SCHEMA_QUERY_SENTINEL");
 
-      const broadSearchOutput = JSON.parse(
-        toolResultOutput(gateway.requests[2]!.body, broadSearchCallId),
+      const firstPageOutput = JSON.parse(
+        toolResultOutput(gateway.requests[2]!.body, firstPageCallId),
       );
-      expect(broadSearchOutput.counts.mcp_tools).toBe(8);
-      expect(broadSearchOutput.more_available.mcp_tools).toBe(true);
+      const secondPageOutput = JSON.parse(
+        toolResultOutput(gateway.requests[3]!.body, secondPageCallId),
+      );
+      expect(firstPageOutput.counts.mcp_tools).toBe(20);
+      expect(firstPageOutput.total_matches.mcp_tools).toBe(28);
+      expect(firstPageOutput.more_available.mcp_tools).toBe(true);
+      expect(typeof firstPageOutput.next_cursors.mcp_tools).toBe("string");
+      expect(firstPageOutput.skills).toEqual([]);
+      expect(secondPageOutput.counts.mcp_tools).toBe(8);
+      expect(secondPageOutput.total_matches.mcp_tools).toBe(28);
+      expect(secondPageOutput.more_available.mcp_tools).toBe(false);
+      expect(secondPageOutput.next_cursors.mcp_tools).toBeNull();
+      expect(secondPageOutput.skills).toEqual([]);
+      const pagedNames = [
+        ...firstPageOutput.mcp_tools,
+        ...secondPageOutput.mcp_tools,
+      ].map((tool: { name: string }) => tool.name);
+      expect(new Set(pagedNames).size).toBe(28);
+      expect(pagedNames.every((name: string) => name.startsWith("mcp_fixture_"))).toBe(true);
 
-      const selectedRequest = gatewayRequest(gateway.requests[3]!.body);
+      const selectedRequest = gatewayRequest(gateway.requests[4]!.body);
       const selectedTool = selectedRequest.tools.find((tool) =>
         tool.name === DYNAMIC_MCP_TOOL_NAME
       );
@@ -4819,10 +4871,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(selectedTool?.inputSchema.properties.text.description).toBe(
         "EXACT_SCHEMA_QUERY_SENTINEL",
       );
-      expect(gateway.requests[3]!.body).toContain(
+      expect(gateway.requests[4]!.body).toContain(
         "SECRET_SERVER_INSTRUCTION_SENTINEL",
       );
-      expect(toolResultOutput(gateway.requests[4]!.body, "mcp_call_lazy_1")).toContain(
+      expect(toolResultOutput(gateway.requests[5]!.body, "mcp_call_lazy_1")).toContain(
         "unexpected MCP call",
       );
       expect(readFileSync(mcp.callLogPath, "utf8").trim().split("\n")).toHaveLength(1);

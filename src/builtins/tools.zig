@@ -13,6 +13,7 @@ const tool_set_contract = @import("../core/tooling/tool_set.zig");
 const tool_specs = @import("../core/tooling/tool_specs.zig");
 const types = @import("../core/shared/types.zig");
 const lexical_relevance = @import("../core/shared/lexical_relevance.zig");
+const capability_retrieval = @import("../core/tooling/capability_retrieval.zig");
 const permission_gate = @import("../core/permissions/permission_gate.zig");
 const ask_user_question_impl = @import("../tools/agent/ask_user_question.zig");
 const subagent_impl = @import("../tools/agent/subagent.zig");
@@ -412,7 +413,8 @@ const skill_description =
 const skill_search_description =
     "Search bounded metadata for installed skills by natural-language use case without loading skill instructions. When to use: a task may match an installed skill but its exact name is unknown. When NOT to use: an exact skill is already known, ordinary local inspection is sufficient, or the user asks to install a missing skill. After discovery, call skill with the returned exact name and location.";
 const capability_search_description =
-    "Search installed skill metadata and configured MCP tool metadata together from one natural-language task. When to use: the task may need a specialized capability but its exact skill or MCP tool name is unknown. When NOT to use: the exact capability is already advertised, or ordinary local inspection, execution, web, or user interaction is sufficient. After discovery, call skill with an exact returned name and location, or mcp_select_tool with an exact returned MCP tool name.";
+    "Search bounded installed-skill and configured-MCP metadata without loading skill bodies or MCP schemas. Set kind when the domain is known, set server to an exact configured MCP alias to search or list only that server, and follow next_cursors with the same query and filters. After discovery, call skill with an exact returned name and location, or mcp_select_tool with an exact returned MCP tool name.";
+const capability_search_kinds = [_][]const u8{ "all", "skill", "mcp" };
 const install_skill_description =
     "Install a reusable skill from a supported source into fx managed skill storage. When to use: the user asks to install a skill or pastes a skills install command. When NOT to use: no installation is required, install packages, fetch unrelated repos, or modify project code.";
 const mcp_search_tools_description =
@@ -927,9 +929,12 @@ pub const capability_search = ToolSpec{
         .description = capability_search_description,
         .input_schema = .{
             .properties = &.{
-                .{ .name = "query", .json_type = .string, .bounds = &.{ .max_length = lexical_relevance.max_query_bytes }, .description = "Natural-language task over installed skills and configured MCP tools." },
+                .{ .name = "query", .json_type = .string, .bounds = &.{ .max_length = lexical_relevance.max_query_bytes }, .description = "Natural-language task. May be empty only when server is set for deterministic inventory listing." },
+                .{ .name = "kind", .json_type = .string, .shape = &.{ .enum_values = &capability_search_kinds }, .description = "Optional domain filter. Defaults to all." },
+                .{ .name = "server", .json_type = .string, .bounds = &.{ .min_length = 1 }, .description = "Optional exact configured MCP server alias. Excludes skills." },
+                .{ .name = "limit", .json_type = .integer, .bounds = &.{ .minimum = 1, .maximum = capability_retrieval.max_limit }, .description = "Maximum results per requested domain. Defaults to 5." },
+                .{ .name = "cursor", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = capability_retrieval.max_cursor_bytes }, .description = "Opaque continuation cursor returned by a prior search with the same query and filters." },
             },
-            .required = &.{"query"},
             .additional_properties = false,
         },
     },
@@ -940,6 +945,7 @@ pub const capability_search = ToolSpec{
     .completed_action_label = "Searched capabilities",
     .label_arg_kind = .query,
     .label_arg_default = "capabilities",
+    .presentation_fn = capability_search_impl.presentation,
     .permission_target_kind = .none,
     .decode = capability_search_impl.decode,
     .validate = capability_search_impl.validate,
@@ -1299,7 +1305,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "2bd29939ef7288131a7a2c6f1cb97da0e76a351bf6a8f7e39c3010a444d31df9",
+        "b59994b338a0e5c60949ccf5cc253ec21459cd40939b25147d67829adc84f6a7",
         &actual_hex,
     );
 }
@@ -2453,14 +2459,19 @@ test "built-in capability_search owns unified bounded metadata schema and callba
     defer std.testing.allocator.free(schema_json);
 
     try std.testing.expectEqualStrings("capability_search", capability_search.name);
-    try std.testing.expect(std.mem.find(u8, capability_search.description, "skill metadata and configured MCP tool metadata together") != null);
+    try std.testing.expect(std.mem.find(u8, capability_search.description, "configured-MCP metadata") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"query\":{\"type\":\"string\",\"maxLength\":4096") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"query\"]") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"kind\":{\"type\":\"string\",\"enum\":[\"all\",\"skill\",\"mcp\"]") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"server\":{\"type\":\"string\",\"minLength\":1") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":20") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"cursor\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":160") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\"") == null);
     try std.testing.expect(capability_search.model_visible);
     try std.testing.expectEqual(tool_dispatch.ExecutorKind.skill, capability_search.executor_kind);
     try std.testing.expectEqual(types.ToolActivityKind.read, capability_search.activity_kind);
     try std.testing.expect(!capability_search.requires_approval);
     try std.testing.expectEqual(tool_dispatch.LabelArgKind.query, capability_search.label_arg_kind);
+    try std.testing.expect(capability_search.presentation_fn.? == capability_search_impl.presentation);
     try std.testing.expect(capability_search.decode == capability_search_impl.decode);
     try std.testing.expect(capability_search.call == capability_search_impl.call);
     try std.testing.expect(capability_search.reads_only_fn == capability_search_impl.readsOnly);

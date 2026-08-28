@@ -13,7 +13,7 @@ pub const PreparedQuery = struct {
     tokens: [max_query_tokens][]const u8,
     token_count: usize,
 
-    fn tokenSlice(self: *const PreparedQuery) []const []const u8 {
+    pub fn tokenSlice(self: *const PreparedQuery) []const []const u8 {
         return self.tokens[0..self.token_count];
     }
 };

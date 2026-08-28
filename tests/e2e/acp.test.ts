@@ -2130,6 +2130,12 @@ describe("acp: model-independent", () => {
       const root = createIsolatedRoot("fx-acp-mcp-http-");
       const httpFixture = startModernMcpHttpFixture("json");
       const gateway = startFakeGateway([
+        fakeGatewayToolCall("search_http", "capability_search", {
+          kind: "mcp",
+          server: "fixture",
+          query: "echo",
+          limit: 5,
+        }),
         fakeGatewayToolCall("select_http", "mcp_select_tool", {
           name: MCP_TOOL_NAME,
         }),
@@ -2158,12 +2164,14 @@ describe("acp: model-independent", () => {
         expect(created.error).toBeUndefined();
         await client.readLine();
         await client.request("session/set_mode", { modeId: "code" }, 3);
-        await runMcpToolPrompt(
-          client,
-          gateway,
-          "call_http",
-          `${MODERN_HTTP_TOOL_RESULT}:acp`,
-        );
+        const requestStart = gateway.requests.length;
+        const prompt = await runPrompt(client, "Find and call the supplied MCP echo tool.", TIMEOUT);
+        expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(requestStart + 4);
+        expect(acpToolResultText(gateway.requests[requestStart + 1]!.body, "search_http"))
+          .toContain(MCP_TOOL_NAME);
+        expect(acpToolResultText(gateway.requests[requestStart + 3]!.body, "call_http"))
+          .toContain(MODERN_HTTP_TOOL_RESULT + ":acp");
 
         const initialPrompt = acpGatewayRequest(gateway.requests[0]!.body).prompt
           .map((message) => acpContentText(message.content))
