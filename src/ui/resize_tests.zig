@@ -2113,7 +2113,7 @@ test "semantic code block keeps readable light theme colors through resize" {
     try std.testing.expect(keyword_cell.style.fg.eql(.{ .indexed = 238 }));
 }
 
-test "semantic code block keeps dotted rules while source reflows" {
+test "semantic code block keeps solid rules while source reflows" {
     var h = try Harness.init(std.testing.allocator, 44, 40, 4);
     defer h.deinit();
     try h.shell.initViewport(&h.metrics, 1);
@@ -2133,20 +2133,20 @@ test "semantic code block keeps dotted rules while source reflows" {
     }
     try h.renderTranscriptFrame();
     try h.flush();
-    try expectGridContains(&h, "┈ text");
+    try expectGridContains(&h, "─ text");
 
     try h.driveResize(40, 40, 4, true);
-    try expectGridContains(&h, "┈ text");
+    try expectGridContains(&h, "─ text");
     const first_source_row = try findRowContaining(&h, "┌────────────────────────────────┐");
     try expectRowTrimmedEquals(&h, first_source_row, "      ┌────────────────────────────────┐");
     try expectRowTrimmedEquals(&h, first_source_row + 1, "      │ ROOT                           │");
     try expectRowTrimmedEquals(&h, first_source_row + 2, "      └────────────────────────────────┘");
 
     try h.driveResize(39, 40, 4, true);
-    try expectGridContains(&h, "┈ text");
+    try expectGridContains(&h, "─ text");
 
     try h.driveResize(44, 40, 4, true);
-    try expectGridContains(&h, "┈ text");
+    try expectGridContains(&h, "─ text");
 }
 
 test "streamed paragraphs keep words together through shrink and grow" {
