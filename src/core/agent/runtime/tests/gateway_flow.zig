@@ -607,7 +607,7 @@ test "processQueuedPrompt gates text-only images through the real Vision runtime
     try std.testing.expectEqualStrings("Final selected-model answer", hooks.finish_assistant_text.?);
 }
 
-test "processQueuedPrompt recovers when a model rejects post-Vision assistant prefill" {
+test "processQueuedPrompt post-Vision decision prompt leaves the selected-model request ending in user guidance" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -622,13 +622,9 @@ test "processQueuedPrompt recovers when a model rejects post-Vision assistant pr
         "vision",
         "{\"image_ids\":[1],\"focus\":\"describe the image\"}",
     )};
-    const prefill_rejection =
-        "{\"error\":{\"message\":\"AI_APICallError: This model does not support " ++
-        "assistant message prefill. The conversation must end with a user message.\"}}";
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &calls },
         .{ .content = "{\"images\":[{\"image_id\":1,\"status\":\"ok\",\"summary\":\"FX logo\",\"visible_text\":[],\"details\":[]}] }" },
-        .{ .status = .bad_request, .err_body = prefill_rejection },
         .{ .content = "Recovered final answer" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
@@ -648,18 +644,12 @@ test "processQueuedPrompt recovers when a model rejects post-Vision assistant pr
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
-    try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
     try expectGatewayPromptTailText(
         &gateway,
         2,
-        .tool,
-        "FX logo",
-    );
-    try expectGatewayPromptTailText(
-        &gateway,
-        3,
         .user,
-        "Continue from the preceding tool result.",
+        "Before choosing the next action, identify the concrete unmet requirement.",
     );
     try std.testing.expectEqual(@as(?std.http.Status, null), hooks.http_status);
     try std.testing.expectEqualStrings("Recovered final answer", hooks.finish_assistant_text.?);
@@ -3375,7 +3365,7 @@ test "processQueuedPrompt keeps supplied system prompt components in stable orde
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
     const first_roles = [_]types.ChatRole{ .system, .system, .system, .system, .system, .system, .user, .assistant, .user };
-    const second_roles = [_]types.ChatRole{ .system, .system, .system, .system, .system, .system, .user, .assistant, .user, .assistant, .tool };
+    const second_roles = [_]types.ChatRole{ .system, .system, .system, .system, .system, .system, .user, .assistant, .user, .assistant, .tool, .user };
     try expectGatewayPromptRoles(&gateway, 0, &first_roles);
     try expectGatewayPromptRoles(&gateway, 1, &second_roles);
     inline for (&.{ @as(usize, 0), @as(usize, 1) }) |request_index| {
@@ -3397,6 +3387,7 @@ test "processQueuedPrompt keeps supplied system prompt components in stable orde
         };
         try expectBodyContainsInOrder(&gateway, request_index, &order);
     }
+    try expectGatewayPromptTailText(&gateway, 1, .user, "Before choosing the next action, identify the concrete unmet requirement.");
 
     try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
     const persisted = hooks.history_turns.items[0].assistant;
@@ -3450,11 +3441,12 @@ test "processQueuedPrompt refreshes runtime overlay each step and preserves turn
     try expectBodyContains(&gateway, 1, "\"toolName\":\"read_file\"");
     try expectBodyContains(&gateway, 1, "\"value\":\"ok\"");
     const first_request_roles = [_]types.ChatRole{ .system, .system, .user };
-    const second_request_roles = [_]types.ChatRole{ .system, .system, .user, .assistant, .tool };
+    const second_request_roles = [_]types.ChatRole{ .system, .system, .user, .assistant, .tool, .user };
     try expectGatewayPromptRoles(&gateway, 0, &first_request_roles);
     try expectGatewayPromptRoles(&gateway, 1, &second_request_roles);
     const second_request_order = [_][]const u8{ "runtime overlay step two", "user prompt", "Checking.", "\"value\":\"ok\"" };
     try expectBodyContainsInOrder(&gateway, 1, &second_request_order);
+    try expectGatewayPromptTailText(&gateway, 1, .user, "Before choosing the next action, identify the concrete unmet requirement.");
 }
 
 test "processQueuedPrompt refreshes and acknowledges parent deliveries for each tool step" {
@@ -3677,7 +3669,7 @@ test "processQueuedPrompt projects history exactly once into each gateway reques
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
     const first_request_roles = [_]types.ChatRole{ .system, .user, .assistant, .user };
-    const second_request_roles = [_]types.ChatRole{ .system, .user, .assistant, .user, .assistant, .tool };
+    const second_request_roles = [_]types.ChatRole{ .system, .user, .assistant, .user, .assistant, .tool, .user };
     try expectGatewayPromptRoles(&gateway, 0, &first_request_roles);
     try expectGatewayPromptRoles(&gateway, 1, &second_request_roles);
     for (0..gateway.request_bodies.items.len) |i| {
@@ -3685,6 +3677,7 @@ test "processQueuedPrompt projects history exactly once into each gateway reques
         try expectGatewayPromptTextCount(&gateway, i, "past assistant unique history needle", 1);
         try expectGatewayPromptTextCount(&gateway, i, "user prompt", 1);
     }
+    try expectGatewayPromptTailText(&gateway, 1, .user, "Before choosing the next action, identify the concrete unmet requirement.");
 }
 
 test "processQueuedPrompt keeps completed history before the final current user prompt" {
@@ -3824,6 +3817,12 @@ test "processQueuedPrompt preserves a confirmed provider tool result across reco
     try expectBodyContains(&gateway, 1, "provider_search_1");
     try expectBodyContains(&gateway, 1, "exact provider evidence");
     try expectBodyContains(&gateway, 1, "confirmed tool result");
+    try expectGatewayPromptTailText(
+        &gateway,
+        1,
+        .user,
+        "Before choosing the next action, identify the concrete unmet requirement.",
+    );
     const execution = hooks.history_turns.items[0].assistant.execution;
     try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
     try std.testing.expectEqual(@as(usize, 1), execution.tool_steps[0].tool_results.len);
@@ -3868,6 +3867,12 @@ test "processQueuedPrompt preserves a confirmed provider tool result across reco
 
     try expectBodyContains(&restored_gateway, 0, "provider_search_1");
     try expectBodyContains(&restored_gateway, 0, "exact provider evidence");
+    try expectGatewayPromptTailText(
+        &restored_gateway,
+        0,
+        .user,
+        "Before choosing the next action, identify the concrete unmet requirement.",
+    );
 }
 
 test "processQueuedPrompt preserves the provider-executed subset of mixed failed tools" {
