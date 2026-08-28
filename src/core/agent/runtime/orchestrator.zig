@@ -4649,6 +4649,7 @@ fn processQueuedPromptLoop(
                     recovery_strategy = null;
                     recovery_cause = .transport_interrupted;
                     preserved_tool_evidence = .none;
+                    post_tool_decision_pending = true;
                     continue;
                 }
                 completion.finish_reason = .stop;
@@ -7563,7 +7564,7 @@ fn processQueuedPromptLoop(
             &within_turn_suffix,
             &step_batch,
         );
-        post_tool_decision_pending = step_batch.step_total_count > 0;
+        post_tool_decision_pending = true;
         if (malformed_arguments_retry.finishBatch()) {
             debug_trace.eventf(
                 "agent",

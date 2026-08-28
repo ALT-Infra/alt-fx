@@ -3958,6 +3958,7 @@ test "processQueuedPrompt pauses uncertain tool recovery with an inspection acti
 
 test "processQueuedPrompt suppresses a repeated confirmed provider tool identity" {
     const alloc = std.testing.allocator;
+    const decision_prompt = "Before choosing the next action, identify the concrete unmet requirement. If one remains, use only the tool needed for it. If none remains, respond normally.";
     const calls = [_]ToolCall{.{
         .id = "provider_search_repeat",
         .name = "perplexity_search",
@@ -3982,6 +3983,20 @@ test "processQueuedPrompt suppresses a repeated confirmed provider tool identity
 
     try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    for ([_]usize{ 1, 2 }) |request_index| {
+        try expectGatewayPromptTailText(
+            &gateway,
+            request_index,
+            .user,
+            decision_prompt,
+        );
+        try expectGatewayPromptTextCount(
+            &gateway,
+            request_index,
+            decision_prompt,
+            1,
+        );
+    }
     const execution = hooks.history_turns.items[0].assistant.execution;
     try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
     try std.testing.expectEqual(@as(usize, 1), execution.tool_steps[0].tool_results.len);

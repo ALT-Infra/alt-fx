@@ -3956,6 +3956,7 @@ test "processQueuedPrompt denied registered run command compatibility never reac
 
 test "processQueuedPrompt legacy auto denial retains lifecycle source" {
     const alloc = std.testing.allocator;
+    const decision_prompt = "Before choosing the next action, identify the concrete unmet requirement. If one remains, use only the tool needed for it. If none remains, respond normally.";
     const calls = [_]ToolCall{toolCall("call_1", "write_file", "{\"path\":\"a\",\"content\":\"x\"}")};
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &calls },
@@ -3982,6 +3983,14 @@ test "processQueuedPrompt legacy auto denial retains lifecycle source" {
         hooks.lifecycle_events.items[2].terminal.outcome.kind,
     );
     try expectPermissionDeniedToolResult(&gateway, 1, "write_file", .auto_denied);
+    try expectBodyContainsInOrder(&gateway, 1, &.{
+        "tool_permission_denied",
+        decision_prompt,
+    });
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countNeedle(gateway.request_bodies.items[1], decision_prompt),
+    );
 }
 
 test "exact caution is reused while the agent continues to a normal completion" {
