@@ -1043,13 +1043,12 @@ fn appendCodePanelHeader(
     const label = if (label_prefix.len > 0) label_prefix else "?";
     const label_width = display_width.visibleWidth(label);
 
-    try out.appendSlice(alloc, "─ ");
-    try out.appendSlice(alloc, "\x1b[2m");
+    try out.appendSlice(alloc, "\x1b[2m─ ");
     try out.appendSlice(alloc, label);
-    try out.appendSlice(alloc, "\x1b[22m ");
+    try out.append(alloc, ' ');
     var edge: usize = 0;
     while (edge < panel_width - 3 - label_width) : (edge += 1) try out.appendSlice(alloc, "─");
-    try out.append(alloc, '\n');
+    try out.appendSlice(alloc, "\x1b[22m\n");
 }
 
 fn appendCodePanelRule(
@@ -1057,9 +1056,10 @@ fn appendCodePanelRule(
     out: *std.ArrayList(u8),
     panel_width: usize,
 ) !void {
+    try out.appendSlice(alloc, "\x1b[2m");
     var edge: usize = 0;
     while (edge < panel_width) : (edge += 1) try out.appendSlice(alloc, "─");
-    try out.append(alloc, '\n');
+    try out.appendSlice(alloc, "\x1b[22m\n");
 }
 
 fn appendCodePanelLine(
@@ -2958,7 +2958,7 @@ test "notice palette changes leave non-system rendering unchanged" {
     try std.testing.expectEqualStrings(first, second);
 }
 
-test "renderCodeBlockForTranscript uses solid horizontal rules without side rails" {
+test "renderCodeBlockForTranscript dims solid horizontal rules without side rails" {
     const alloc = std.testing.allocator;
 
     const labeled_language = try alloc.dupe(u8, "zig");
@@ -2971,9 +2971,9 @@ test "renderCodeBlockForTranscript uses solid horizontal rules without side rail
     }, 80);
     defer alloc.free(labeled);
     try std.testing.expectEqualStrings(
-        "─ \x1b[2mzig\x1b[22m ─\n" ++
+        "\x1b[2m─ zig ─\x1b[22m\n" ++
             "x\n" ++
-            "───────\n",
+            "\x1b[2m───────\x1b[22m\n",
         labeled,
     );
 
@@ -2987,9 +2987,9 @@ test "renderCodeBlockForTranscript uses solid horizontal rules without side rail
     }, 80);
     defer alloc.free(unlabeled);
     try std.testing.expectEqualStrings(
-        "──────\n" ++
+        "\x1b[2m──────\x1b[22m\n" ++
             "x\n" ++
-            "──────\n",
+            "\x1b[2m──────\x1b[22m\n",
         unlabeled,
     );
 
@@ -3003,9 +3003,9 @@ test "renderCodeBlockForTranscript uses solid horizontal rules without side rail
     }, 8);
     defer alloc.free(truncated);
     try std.testing.expectEqualStrings(
-        "─ \x1b[2mtype\x1b[22m ─\n" ++
+        "\x1b[2m─ type ─\x1b[22m\n" ++
             "x\n" ++
-            "────────\n",
+            "\x1b[2m────────\x1b[22m\n",
         truncated,
     );
 
@@ -3019,9 +3019,9 @@ test "renderCodeBlockForTranscript uses solid horizontal rules without side rail
     }, 6);
     defer alloc.free(wide_rune);
     try std.testing.expectEqualStrings(
-        "─ \x1b[2m漢\x1b[22m ─\n" ++
+        "\x1b[2m─ 漢 ─\x1b[22m\n" ++
             "x\n" ++
-            "──────\n",
+            "\x1b[2m──────\x1b[22m\n",
         wide_rune,
     );
 }
