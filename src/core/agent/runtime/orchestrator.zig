@@ -67,8 +67,6 @@ const AgentRuntimeDeps = runtime_deps.AgentRuntimeDeps;
 const CredentialRefreshMode = runtime_deps.CredentialRefreshMode;
 
 const http_error_detail_max_bytes: usize = 4096;
-const assistant_prefill_recovery_prompt =
-    "Continue from the preceding tool result.";
 const post_tool_decision_prompt =
     "Before choosing the next action, identify the concrete unmet requirement. If one remains, use only the tool needed for it. If none remains, respond normally.";
 const repeated_terminal_validation_notice =
@@ -2175,22 +2173,6 @@ fn failureHttpStatus(kind: agent_stream_provider.FailureKind) std.http.Status {
     };
 }
 
-fn isPostVisionAssistantPrefillRejection(
-    status: std.http.Status,
-    detail: []const u8,
-    messages: []const ChatMessage,
-) bool {
-    if (status != .bad_request or messages.len == 0) return false;
-    const tail = messages[messages.len - 1];
-    if (tail.role != .tool or
-        !std.mem.eql(u8, tail.tool_name orelse return false, "vision"))
-    {
-        return false;
-    }
-    return std.mem.find(u8, detail, "does not support assistant message prefill") != null and
-        std.mem.find(u8, detail, "must end with a user message") != null;
-}
-
 fn recovery_deadline(delay_ns: u64) std.Io.Clock.Timestamp {
     const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
     return .{
@@ -3347,7 +3329,6 @@ fn processQueuedPromptLoop(
         var successful_vision_mode: runtime_gateway_step.VisionToolMode = .unavailable;
         var reset_stream_for_next_attempt = false;
         var auth_retry_used = false;
-        var assistant_prefill_recovery_used = false;
         var skip_next_preflight_refresh = false;
         var recovery_has_unexecuted_tool_start = false;
         var successful_recovery_strategy: ?model_response_recovery.Strategy = null;
@@ -4159,36 +4140,6 @@ fn processQueuedPromptLoop(
             }
             const gateway_wait_finished_ms = io_mod.milliTimestamp();
             summary_accumulator.addThinkingWait(gateway_wait_started_ms, stream_ctx.first_model_output_at_ms orelse gateway_wait_finished_ms);
-
-            if (!assistant_prefill_recovery_used and
-                semantic_attempt + 1 < semantic_limit and
-                streamReplaySafe(&stream_ctx) and
-                isPostVisionAssistantPrefillRejection(
-                    if (response_failure) |failure| failureHttpStatus(failure.kind) else .ok,
-                    if (response_failure) |failure| failure.detail orelse "" else "",
-                    request_messages,
-                ))
-            {
-                try within_turn_suffix.append(arena, .{
-                    .role = .user,
-                    .content = assistant_prefill_recovery_prompt,
-                    .cache_policy = .no_cache,
-                });
-                debug_trace.eventf(
-                    "gateway",
-                    "assistant_prefill_recovery",
-                    step_ctx,
-                    "tool_name=vision provider_attempt={d}/{d}",
-                    .{ semantic_attempt + 1, semantic_limit },
-                );
-                stream_result.deinit(arena);
-                stream_result_set = false;
-                assistant_prefill_recovery_used = true;
-                semantic_attempt += 1;
-                retry_pacing = .idle;
-                reset_stream_for_next_attempt = true;
-                continue;
-            }
 
             if (response_failure) |failure| if (isRetryableModelFailure(failure.kind)) {
                 const cause: model_response_recovery.FailureCause = if (failure.kind == .rate_limited)
