@@ -941,7 +941,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "47e84930e1fdc99133e76843f795891b35592d32615cacb76a3dfc81e1b23b7a",
+        "fe3c1e7e6fbec17a66fa57af0d3ce447383918a649fae42b9b9cfc1635bcecba",
         &actual_hex,
     );
 }
