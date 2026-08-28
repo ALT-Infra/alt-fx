@@ -7848,7 +7848,8 @@ fn finishCommonBackgroundTerminal(
         arena,
         current_turn_messages,
     );
-    const turn: HistoryTurn = .{ .background_command = .{
+    const completed_summary = summary_accumulator.finish();
+    var turn: HistoryTurn = .{ .background_command = .{
         .user = .{ .text = job.prompt, .images = job.images },
         .assistant = @constCast(assistant_text),
         .execution = execution_memory,
@@ -7857,11 +7858,12 @@ fn finishCommonBackgroundTerminal(
         .url = if (background.url) |url| @constCast(url) else null,
         .background_record_id = background.background_record_id,
     } };
+    types.setHistoryTurnSummary(&turn, completed_summary);
     const finished = try types.dupeFinishedPrompt(
         std.heap.c_allocator,
         .{
             .turn = turn,
-            .summary = summary_accumulator.finish(),
+            .summary = completed_summary,
         },
     );
 

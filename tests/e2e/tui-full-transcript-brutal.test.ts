@@ -909,14 +909,14 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
     await waitForMode(session, "main", DRAFT);
     expect(performance.now() - escapeStarted).toBeLessThan(INPUT_SANITY_BUDGET_MS);
 
-    const repeatedToggleTraceStart = traceSize(paths.tracePath);
-    const repeatedToggleStarted = performance.now();
-    session.sendKeysImmediate(["C-o", "Right"]);
-    await waitForTraceAfter(paths.tracePath, repeatedToggleTraceStart, [
+    const repeatedOpenTraceStart = traceSize(paths.tracePath);
+    const repeatedOpenStarted = performance.now();
+    session.sendKeysImmediate(["C-o"]);
+    await waitForTraceAfter(paths.tracePath, repeatedOpenTraceStart, [
       "depth_transition from=inline to=full route=root trigger=ctrl_o",
     ]);
     await waitForMode(session, "full", DRAFT);
-    expect(performance.now() - repeatedToggleStarted).toBeLessThan(
+    expect(performance.now() - repeatedOpenStarted).toBeLessThan(
       INPUT_SANITY_BUDGET_MS,
     );
     await session.sendKeys("Escape");
@@ -926,11 +926,11 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
     await waitForMode(session, "full", DRAFT);
     const burstScrollWindow = await waitForScrollableProjection(paths.tracePath);
     const burstScrollTraceStart = traceSize(paths.tracePath);
-    const burstToggleStarted = performance.now();
+    const burstScrollStarted = performance.now();
     session.sendRepeatedKeyThenImmediate(
       "PPage",
       BURST_NAVIGATION_EVENTS,
-      "Right",
+      "PPage",
     );
     await waitForMode(session, "full", DRAFT);
     await waitForScrolledViewport(
@@ -938,7 +938,7 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
       burstScrollTraceStart,
       burstScrollWindow.offset,
     );
-    expect(performance.now() - burstToggleStarted).toBeLessThan(
+    expect(performance.now() - burstScrollStarted).toBeLessThan(
       INPUT_SANITY_BUDGET_MS,
     );
 

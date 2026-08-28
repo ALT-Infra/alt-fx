@@ -924,8 +924,7 @@ pub const ExecutionMemory = struct {
     turn_summary: ?TurnSummary = null,
 
     pub fn isEmpty(self: ExecutionMemory) bool {
-        return self.tool_steps.len == 0 and self.files.len == 0 and
-            self.steering.len == 0 and self.turn_summary == null;
+        return self.tool_steps.len == 0 and self.files.len == 0 and self.steering.len == 0;
     }
 };
 

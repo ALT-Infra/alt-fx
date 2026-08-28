@@ -189,9 +189,10 @@ pub const Task = struct {
         };
         debug_trace.logf(
             "full_transcript_cache",
-            "page_built generation={d} entries={d} details={d} blocks={d} segments={d} rows={d}",
+            "page_built revision={d} cols={d} entries={d} details={d} blocks={d} segments={d} rows={d}",
             .{
-                self.source.request.generation,
+                self.source.request.content_revision,
+                self.source.request.cols,
                 self.source.entries.items.len,
                 self.source.details.items.len,
                 self.source.command_blocks.items.len,
@@ -242,18 +243,10 @@ pub fn cloneCommandBlockForPageSnapshot(
 
 pub const Load = struct {
     task: ?*Task = null,
-    next_generation: u64 = 1,
 
     pub fn deinit(self: *Load) void {
         if (self.task) |task| task.deinit();
         self.* = .{};
-    }
-
-    pub fn allocateGeneration(self: *Load) u64 {
-        const generation = self.next_generation;
-        self.next_generation +%= 1;
-        if (self.next_generation == 0) self.next_generation = 1;
-        return generation;
     }
 
     pub fn schedule(self: *Load, source: Source) !void {
@@ -279,7 +272,7 @@ pub const Load = struct {
 
     pub fn hasRequest(self: *const Load, request: full_transcript_page.Request) bool {
         if (self.task) |task| {
-            if (sameRequest(task.source.request, request) and
+            if (full_transcript_page.sameRequest(task.source.request, request) and
                 !task.cancel_requested.load(.acquire)) return true;
         }
         return false;
@@ -310,13 +303,3 @@ pub const Load = struct {
         self.task = task;
     }
 };
-
-fn sameRequest(
-    lhs: full_transcript_page.Request,
-    rhs: full_transcript_page.Request,
-) bool {
-    return lhs.generation == rhs.generation and
-        lhs.content_revision == rhs.content_revision and
-        lhs.cols == rhs.cols and
-        std.meta.eql(lhs.anchor, rhs.anchor);
-}

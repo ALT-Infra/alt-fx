@@ -312,7 +312,7 @@ pub fn writeHistoryTurn(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
             try writer.writeByte('}');
         },
         .background_command => |entry| {
-            const extended = entry.assistant != null or !entry.execution.isEmpty();
+            const extended = entry.assistant != null or hasDurableExecutionMemory(entry.execution);
             try writer.writeAll("{\"kind\":\"background_command\",\"user\":");
             try writeUserTurn(writer, entry.user);
             try writer.writeAll(",\"log_path\":");
@@ -354,7 +354,7 @@ pub fn writeHistoryTurn(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
             try writer.writeByte(']');
             try writer.writeAll(",\"terminal_reason\":");
             try writeJsonString(writer, @tagName(entry.terminal_reason));
-            if (!entry.execution.isEmpty()) {
+            if (hasDurableExecutionMemory(entry.execution)) {
                 try writer.writeAll(",\"execution\":");
                 try writeExecutionMemory(writer, entry.execution);
             }
@@ -1132,6 +1132,10 @@ fn writeExecutionMemory(writer: *std.Io.Writer, execution: session.ExecutionMemo
         try writer.writeAll("null");
     }
     try writer.writeByte('}');
+}
+
+fn hasDurableExecutionMemory(execution: session.ExecutionMemory) bool {
+    return !execution.isEmpty() or execution.turn_summary != null;
 }
 
 fn writeTurnSummary(writer: *std.Io.Writer, summary: types.TurnSummary) !void {
@@ -3002,6 +3006,42 @@ test "execution memory codec preserves feedback and reads v1 results without it"
     try std.testing.expect(v2_decoded.assistant.execution.tool_steps[0].tool_results[0].committed_file_presentation == null);
     try std.testing.expect(v2_decoded.assistant.execution.tool_steps[0].tool_results[0].command_output_replay == null);
     try std.testing.expect(v2_decoded.assistant.execution.tool_steps[0].tool_results[0].command_process_presentation == null);
+}
+
+test "private codec preserves summary-only specialized turns" {
+    const alloc = std.testing.allocator;
+    const summary = types.TurnSummary{
+        .started_at_ms = 100,
+        .completed_at_ms = 250,
+        .thinking_duration_ms = 40,
+        .turn_duration_ms = 150,
+        .token_progress = .{ .input_tokens = 12, .output_tokens = 34 },
+    };
+
+    const turns = [_]session.HistoryTurn{
+        .{ .background_command = .{
+            .user = .{ .text = @constCast("start server") },
+            .execution = .{ .turn_summary = summary },
+            .log_path = @constCast("/tmp/server.log"),
+            .expect_url = false,
+        } },
+        .{ .interrupted = .{
+            .user = .{ .text = @constCast("inspect repository") },
+            .execution = .{ .turn_summary = summary },
+        } },
+    };
+
+    for (turns) |turn| {
+        var encoded: std.Io.Writer.Allocating = .init(alloc);
+        defer encoded.deinit();
+        try writeHistoryTurn(&encoded.writer, turn);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+        defer parsed.deinit();
+        const decoded = try parseHistoryTurn(alloc, parsed.value);
+        defer session.freeHistoryTurn(alloc, decoded);
+        try std.testing.expectEqual(summary, types.historyTurnSummary(decoded).?);
+    }
 }
 
 test "command process presentation codec preserves every terminal cause" {

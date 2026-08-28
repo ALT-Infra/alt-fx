@@ -94,6 +94,30 @@ test "processQueuedPrompt normal final completion propagates normalized history 
     try expectBodyNotContains(&gateway, 0, "<turn_aborted>");
 }
 
+test "processQueuedPrompt propagates completed summary with durable history" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{
+        .content = "complete",
+        .usage = .{ .input_tokens = 12, .output_tokens = 34 },
+    }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    const propagated_summary = types.historyTurnSummary(
+        hooks.history_turns.items[0],
+    ) orelse return error.TestExpectedTurnSummary;
+    try std.testing.expectEqual(
+        hooks.finish_summary.?,
+        propagated_summary,
+    );
+}
+
 test "processQueuedPrompt pauses missing finish without synthesizing output" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{.{ .omit_finish = true }};

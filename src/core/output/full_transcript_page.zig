@@ -9,16 +9,9 @@ pub const Anchor = union(enum) {
 };
 
 pub const Request = struct {
-    generation: u64,
     content_revision: u64,
     cols: u16,
     anchor: Anchor,
-};
-
-pub const Key = struct {
-    generation: u64,
-    content_revision: u64,
-    cols: u16,
 };
 
 pub const SourceRange = struct {
@@ -46,36 +39,18 @@ pub fn sourceRange(request: Request, total_entries: usize) SourceRange {
     return .{ .start = start, .end = start + max_source_entries };
 }
 
-pub fn accepts(request: Request, key: Key) bool {
-    return request.generation == key.generation and
-        request.content_revision == key.content_revision and
-        request.cols == key.cols;
+pub fn sameRequest(lhs: Request, rhs: Request) bool {
+    return lhs.content_revision == rhs.content_revision and
+        lhs.cols == rhs.cols and
+        std.meta.eql(lhs.anchor, rhs.anchor);
 }
 
 pub fn sameSurface(lhs: Request, rhs: Request) bool {
     return lhs.cols == rhs.cols and std.meta.eql(lhs.anchor, rhs.anchor);
 }
 
-pub fn reusable(
-    installed: Request,
-    key: Key,
-    content_revision: u64,
-    cols: u16,
-    anchor: Anchor,
-) bool {
-    return installed.content_revision == content_revision and
-        installed.cols == cols and
-        std.meta.eql(installed.anchor, anchor) and
-        accepts(installed, key);
-}
-
 pub fn liveRefreshDue(installed_revision: u64, current_revision: u64) bool {
     return current_revision -% installed_revision >= live_refresh_revision_stride;
-}
-
-pub fn coalesce(current: ?Request, next: Request) Request {
-    const existing = current orelse return next;
-    return if (next.generation >= existing.generation) next else existing;
 }
 
 pub fn previousAnchor(range: SourceRange) ?Anchor {
@@ -90,7 +65,6 @@ pub fn nextAnchor(range: SourceRange, total_entries: usize) ?Anchor {
 
 test "full transcript page range stays bounded at the tail" {
     const request = Request{
-        .generation = 7,
         .content_revision = 41,
         .cols = 80,
         .anchor = .tail,
@@ -103,7 +77,6 @@ test "full transcript page range stays bounded at the tail" {
 
 test "full transcript page range centers an entry without crossing bounds" {
     const middle = sourceRange(.{
-        .generation = 8,
         .content_revision = 42,
         .cols = 120,
         .anchor = .{ .entry_index = 5_000 },
@@ -113,7 +86,6 @@ test "full transcript page range centers an entry without crossing bounds" {
     try std.testing.expectEqual(max_source_entries, middle.len());
 
     const head = sourceRange(.{
-        .generation = 9,
         .content_revision = 42,
         .cols = 120,
         .anchor = .{ .entry_index = 0 },
@@ -121,44 +93,41 @@ test "full transcript page range centers an entry without crossing bounds" {
     try std.testing.expectEqual(SourceRange{ .start = 0, .end = 3 }, head);
 }
 
-test "full transcript page accepts only the exact generation revision and width" {
+test "full transcript page request identity includes revision width and anchor" {
     const request = Request{
-        .generation = 11,
         .content_revision = 73,
         .cols = 96,
         .anchor = .tail,
     };
-    try std.testing.expect(accepts(request, .{
-        .generation = 11,
+    try std.testing.expect(sameRequest(request, .{
         .content_revision = 73,
         .cols = 96,
+        .anchor = .tail,
     }));
-    try std.testing.expect(!accepts(request, .{
-        .generation = 10,
-        .content_revision = 73,
-        .cols = 96,
-    }));
-    try std.testing.expect(!accepts(request, .{
-        .generation = 11,
+    try std.testing.expect(!sameRequest(request, .{
         .content_revision = 72,
         .cols = 96,
+        .anchor = .tail,
     }));
-    try std.testing.expect(!accepts(request, .{
-        .generation = 11,
+    try std.testing.expect(!sameRequest(request, .{
         .content_revision = 73,
         .cols = 80,
+        .anchor = .tail,
+    }));
+    try std.testing.expect(!sameRequest(request, .{
+        .content_revision = 73,
+        .cols = 96,
+        .anchor = .{ .entry_index = 42 },
     }));
 }
 
 test "full transcript page surface ignores revisions but not width or anchor" {
     const original = Request{
-        .generation = 11,
         .content_revision = 73,
         .cols = 96,
         .anchor = .tail,
     };
     var changed = original;
-    changed.generation = 12;
     changed.content_revision = 74;
     try std.testing.expect(sameSurface(original, changed));
 
@@ -169,49 +138,10 @@ test "full transcript page surface ignores revisions but not width or anchor" {
     try std.testing.expect(!sameSurface(original, changed));
 }
 
-test "full transcript page reuse requires exact installed content and surface" {
-    const installed = Request{
-        .generation = 11,
-        .content_revision = 73,
-        .cols = 96,
-        .anchor = .tail,
-    };
-    const key = Key{ .generation = 11, .content_revision = 73, .cols = 96 };
-    try std.testing.expect(reusable(installed, key, 73, 96, .tail));
-    try std.testing.expect(!reusable(installed, key, 74, 96, .tail));
-    try std.testing.expect(!reusable(installed, key, 73, 80, .tail));
-    try std.testing.expect(!reusable(
-        installed,
-        key,
-        73,
-        96,
-        .{ .entry_index = 1 },
-    ));
-}
-
 test "live full transcript refresh is bounded by revision stride" {
     try std.testing.expect(!liveRefreshDue(40, 47));
     try std.testing.expect(liveRefreshDue(40, 48));
     try std.testing.expect(liveRefreshDue(std.math.maxInt(u64) - 3, 4));
-}
-
-test "full transcript page coalescing keeps the newest generation" {
-    const older = Request{
-        .generation = 20,
-        .content_revision = 90,
-        .cols = 80,
-        .anchor = .tail,
-    };
-    const newer = Request{
-        .generation = 21,
-        .content_revision = 91,
-        .cols = 120,
-        .anchor = .{ .entry_index = 500 },
-    };
-
-    try std.testing.expectEqual(newer, coalesce(older, newer));
-    try std.testing.expectEqual(newer, coalesce(newer, older));
-    try std.testing.expectEqual(newer, coalesce(null, newer));
 }
 
 test "full transcript page navigation stops at document boundaries" {

@@ -165,7 +165,7 @@ fn writeToolCallJson(writer: *std.Io.Writer, tool_call: session.ToolCall) !void 
 }
 
 pub fn writeExecutionMemoryJson(writer: *std.Io.Writer, execution: session.ExecutionMemory) !void {
-    try writer.writeAll("{\"schema_version\":3,\"tool_steps\":[");
+    try writer.writeAll("{\"schema_version\":2,\"tool_steps\":[");
     for (execution.tool_steps, 0..) |step, i| {
         if (i > 0) try writer.writeByte(',');
         try writer.writeAll("{\"assistant\":");
@@ -196,9 +196,7 @@ pub fn writeExecutionMemoryJson(writer: *std.Io.Writer, execution: session.Execu
         if (i > 0) try writer.writeByte(',');
         try std.json.Stringify.value(text, .{}, writer);
     }
-    try writer.writeAll("],\"turn_summary\":");
-    try std.json.Stringify.value(execution.turn_summary, .{}, writer);
-    try writer.writeByte('}');
+    try writer.writeAll("]}");
 }
 
 fn writePersistedToolResultJson(writer: *std.Io.Writer, result: session.PersistedToolResult) !void {
@@ -759,9 +757,7 @@ fn parseOptionalExecutionMemory(alloc: Allocator, maybe_value: ?std.json.Value) 
     if (value == .null) return .{};
     const object = try requireObject(value);
     const schema_version: i64 = if (object.get("schema_version")) |version| blk: {
-        if (version != .integer or
-            (version.integer != 1 and version.integer != 2 and version.integer != 3))
-        {
+        if (version != .integer or (version.integer != 1 and version.integer != 2)) {
             return error.InvalidSessionFormat;
         }
         break :blk version.integer;
@@ -775,42 +771,7 @@ fn parseOptionalExecutionMemory(alloc: Allocator, maybe_value: ?std.json.Value) 
     const steering = try parseOptionalStringArray(alloc, object.get("steering"));
     errdefer types.freePermissionFeedback(alloc, steering);
     const files = try parseFileEvidenceSlice(alloc, object.get("files"));
-    const turn_summary = if (schema_version == 3 and object.get("turn_summary") != null)
-        try parseOptionalTurnSummary(object.get("turn_summary").?)
-    else
-        null;
-    return .{
-        .tool_steps = tool_steps,
-        .files = files,
-        .steering = steering,
-        .turn_summary = turn_summary,
-    };
-}
-
-fn parseOptionalTurnSummary(value: std.json.Value) !?types.TurnSummary {
-    if (value == .null) return null;
-    const object = try requireObject(value);
-    const token_progress = try requireObject(
-        object.get("token_progress") orelse return error.InvalidSessionFormat,
-    );
-    const summary = types.TurnSummary{
-        .started_at_ms = try requireI64(object, "started_at_ms"),
-        .completed_at_ms = try requireI64(object, "completed_at_ms"),
-        .thinking_duration_ms = try requireU64(object, "thinking_duration_ms"),
-        .turn_duration_ms = try requireU64(object, "turn_duration_ms"),
-        .token_progress = .{
-            .input_tokens = try requireU64(token_progress, "input_tokens"),
-            .output_tokens = try requireU64(token_progress, "output_tokens"),
-            .input_exact = try requireBool(token_progress, "input_exact"),
-            .output_exact = try requireBool(token_progress, "output_exact"),
-        },
-    };
-    if (summary.started_at_ms < 0 or
-        summary.completed_at_ms < summary.started_at_ms)
-    {
-        return error.InvalidSessionFormat;
-    }
-    return summary;
+    return .{ .tool_steps = tool_steps, .files = files, .steering = steering };
 }
 
 fn parseToolExecutionSteps(
@@ -1383,12 +1344,6 @@ noinline fn requireUsize(object: std.json.ObjectMap, key: []const u8) !usize {
     return @intCast(value);
 }
 
-fn requireU64(object: std.json.ObjectMap, key: []const u8) !u64 {
-    const value = try requireI64(object, key);
-    if (value < 0) return error.InvalidSessionFormat;
-    return @intCast(value);
-}
-
 noinline fn optionalStringDup(alloc: Allocator, maybe_value: ?std.json.Value) !?[]u8 {
     const value = maybe_value orelse return null;
     return switch (value) {
@@ -1674,7 +1629,7 @@ test "session JSON round-trips assistant execution memory" {
     try std.testing.expect(std.mem.find(u8, json, "\"execution\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"tool_steps\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"files\"") != null);
-    try std.testing.expect(std.mem.find(u8, json, "\"schema_version\":3") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"schema_version\":2") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"permission_feedback\"") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"steering\":[\"focus on rendering\"]") != null);
 

@@ -1527,6 +1527,56 @@ test "ACP interrupted history replay hides model-only abort context" {
     try std.testing.expect(std.mem.find(u8, captured, "<turn_aborted>") == null);
 }
 
+test "ACP summary-only history emits only real user and assistant chunks" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    var capture = try tmp.dir.createFile(
+        io_mod.getIo(),
+        "acp-summary-only-history.jsonl",
+        .{ .read = true },
+    );
+    defer capture.close(io_mod.getIo());
+
+    {
+        var state = try initAcpSessionTestState(arena, workspace, capture);
+        defer state.deinit();
+        try sendHistoryTurnAsUpdates(&state, arena, "session-1", .{ .assistant = .{
+            .user = .{ .text = @constCast("real user history") },
+            .assistant = @constCast("real assistant history"),
+            .execution = .{ .turn_summary = .{
+                .started_at_ms = 100,
+                .completed_at_ms = 250,
+                .turn_duration_ms = 150,
+                .token_progress = .{ .input_tokens = 12, .output_tokens = 34 },
+            } },
+        } });
+        try capture.sync(io_mod.getIo());
+    }
+
+    var captured_file = try tmp.dir.openFile(
+        io_mod.getIo(),
+        "acp-summary-only-history.jsonl",
+        .{},
+    );
+    defer captured_file.close(io_mod.getIo());
+    const captured = try io_mod.readFileToEnd(alloc, &captured_file, 16 * 1024);
+    defer alloc.free(captured);
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        std.mem.count(u8, captured, "\"method\":\"session/update\""),
+    );
+    try std.testing.expect(std.mem.find(u8, captured, "real user history") != null);
+    try std.testing.expect(std.mem.find(u8, captured, "real assistant history") != null);
+    try std.testing.expect(std.mem.find(u8, captured, "Previous tool execution:") == null);
+}
+
 test "ACP load maps one-off child denial to invalid params" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

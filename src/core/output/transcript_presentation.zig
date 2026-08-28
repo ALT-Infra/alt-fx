@@ -101,6 +101,17 @@ pub const State = struct {
         return next;
     }
 
+    pub fn select_page_boundary(self: State, entry_id: u32) State {
+        var next = self;
+        next.scroll_rows = 0;
+        next.follow_tail = false;
+        next.anchor_pending = false;
+        next.bookmark_entry_id = entry_id;
+        next.bookmark_intra_row = 0;
+        next.bookmark_pending = true;
+        return next;
+    }
+
     pub fn prepare_projection(self: State, cols: u16) State {
         var next = self;
         if (next.projection_cols) |previous_cols| {

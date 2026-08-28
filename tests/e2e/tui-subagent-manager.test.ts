@@ -3845,8 +3845,6 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         await active.waitForText("[pending]", TIMEOUT);
         await active.sendKeys("C-o");
         await active.waitForText("Full detail · ctrl o close", TIMEOUT);
-        await active.sendKeys("Right");
-        await active.waitForText("Full detail · ctrl o close", TIMEOUT);
         heldStream.release("CHECKPOINT2_PARENT_FOLLOWUP_COMPLETE");
         const childApprovalRequestStartedAt = Date.now();
         while (
@@ -3880,13 +3878,11 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         expect(childApproval).toContain("❯ 1. Yes");
         expect(childApproval).not.toContain("APPROVAL_MAIN_COMPOSER");
         expect(childApproval).not.toContain("Full detail · ctrl o close");
-        expect(childApproval).not.toContain("Full detail · ctrl o close");
 
         await active.sendKeys("C-o");
         await Bun.sleep(100);
         const approvalAfterCtrlO = await active.capturePane();
         expect(approvalAfterCtrlO).toContain("Subagent approval-child needs permission");
-        expect(approvalAfterCtrlO).not.toContain("Full detail · ctrl o close");
         expect(approvalAfterCtrlO).not.toContain("Full detail · ctrl o close");
 
         await active.sendKeys("C-x");

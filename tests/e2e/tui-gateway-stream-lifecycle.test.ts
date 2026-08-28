@@ -4702,8 +4702,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
         await session.sendKeys("C-o");
         await Bun.sleep(250);
-        await session.sendKeys("Right");
-        await Bun.sleep(250);
         await session.sendKeys("C-o");
         await session.waitForText(draft, TIMEOUT);
         if (scenario.resize) {
@@ -5972,18 +5970,14 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(resized).toContain(`Ran ${supportedCommand}`);
 
       await session.sendKeys("C-o");
-      const review = await session.waitForText(
+      const full = await session.waitForText(
         `├ Failed ${unsupportedToolName}`,
         TIMEOUT,
       );
-      expect(review).toContain(`└ Ran ${supportedCommand}`);
-      expect(countOccurrences(review, `Failed ${unsupportedToolName}`)).toBe(1);
-      expect(countOccurrences(review, `Ran ${supportedCommand}`)).toBe(1);
-
-      await session.sendKeys("Right");
-      const full = await session.waitForText("Full detail · ctrl o close", TIMEOUT);
       expect(full).toContain(`├ Failed ${unsupportedToolName}`);
       expect(full).toContain(`└ Ran ${supportedCommand}`);
+      expect(countOccurrences(full, `Failed ${unsupportedToolName}`)).toBe(1);
+      expect(countOccurrences(full, `Ran ${supportedCommand}`)).toBe(1);
       await session.sendKeys("C-o");
       await session.waitForText(header, TIMEOUT);
       expect(unsupportedGateway.requests).toHaveLength(2);
@@ -6422,8 +6416,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.sendKeys("C-o");
       await session.waitForText("MINIMAL_GROUP_DETAIL_SIX", TIMEOUT);
-      await session.sendKeys("Right");
-      await session.waitForText("Full detail · ctrl o close", TIMEOUT);
       const full = await session.captureFullScrollback();
       expect(full).toContain("MINIMAL_GROUP_DETAIL_ONE");
       expect(full).toContain("├ Read one.txt");

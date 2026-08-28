@@ -739,6 +739,70 @@ test("volatile status rows normalize before stable-grid comparison", () => {
 });
 
 test.skipIf(!tmuxAvailable())(
+  "saved fx ask metadata appears after interactive Ctrl-O resume",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-ask-metadata-resume-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+    );
+    writeFileSync(stderrPath, "");
+
+    const prompt = "Persist this fx ask metadata.";
+    const answer = "FX_ASK_METADATA_COMPLETE";
+    const askGateway = startFakeGateway([fakeGatewayFinalText(answer)]);
+    let active: TmuxSession | null = null;
+    try {
+      const ask = await runFx(["ask", "--json", "--auto", prompt], {
+        cwd: realpathSync(workspace),
+        env: gatewayEnv(home, askGateway),
+        timeoutMs: TIMEOUT,
+      });
+      expect(ask.code).toBe(0);
+      expect(ask.stderr).toBe("");
+      expect(JSON.parse(ask.stdout).session_id).toBeTruthy();
+
+      const resumeGateway = startFakeGateway([]);
+      try {
+        active = await TmuxSession.create({
+          cmd: `${FX_BIN} --resume-last`,
+          cwd: realpathSync(workspace),
+          env: gatewayEnv(home, resumeGateway),
+          stderrPath,
+          width: 100,
+          height: 32,
+        });
+        await active.waitForComposer(TIMEOUT);
+        await active.waitForText(answer, TIMEOUT);
+        await active.sendKeys("C-o");
+        const full = await active.waitForPane(
+          (pane) =>
+            pane.includes("Full detail · ctrl o close") &&
+            pane.includes("UTC · Usage") &&
+            /\(↑\d+ ↓5\)/.test(pane),
+          TIMEOUT,
+        );
+        expect(full).toContain(prompt);
+        expect(full).toContain(answer);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (active) await active.kill();
+        resumeGateway.stop();
+      }
+    } finally {
+      askGateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
   "session resume command group opens last and explicit session ids",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-session-resume-command-")));
@@ -1158,8 +1222,6 @@ test.skipIf(!tmuxAvailable())(
       }
       await active.waitForText(tailMarker, TIMEOUT);
 
-      await active.sendKeys("Left");
-      await active.waitForText("Full detail · ctrl o close · PgUp/PgDn scroll · Esc close", TIMEOUT);
       await active.sendKeys("C-o");
       await active.waitForText("● 1 tool call · 1 command", TIMEOUT);
       const restored = await active.capturePane();
@@ -2472,7 +2534,7 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
-  "streaming wheel input stays inline until Ctrl-O",
+  "streaming scroll stays inline while Ctrl-O preserves native selection and ignores horizontal arrows",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-stream-scroll-inline-")));
     const home = join(root, "home");
@@ -2541,10 +2603,15 @@ test.skipIf(!tmuxAvailable())(
 
       await active.sendKeys("C-o");
       await active.waitForText("┃ Full detail · ctrl o close", TIMEOUT);
-      await active.sendHexBytes(["1b", "5b", "3c", "36", "34", "3b", "31", "3b", "31", "4d"]);
+      await active.sendKeys("Left");
+      await active.waitForText("┃ Full detail · ctrl o close", TIMEOUT);
+      await active.sendKeys("Right");
+      await active.waitForText("┃ Full detail · ctrl o close", TIMEOUT);
+      expect(readFileSync(tapePath)).not.toContain(Buffer.from("\x1b[?1000h\x1b[?1006h"));
+      await active.sendHexBytes(["1b", "5b", "35", "7e"]);
       await waitForCondition(
-        () => readFileSync(tracePath, "utf8").includes("unit=wheel rows=3"),
-        "viewer wheel trace",
+        () => readFileSync(tracePath, "utf8").includes("unit=page"),
+        "viewer page trace",
       );
       const readingBefore = await active.capturePaneGrid();
       expect(readingBefore.join("\n")).toContain("Full detail · ctrl o close");
@@ -2560,7 +2627,7 @@ test.skipIf(!tmuxAvailable())(
         if (/^└ (?:Running|Ran) /.test(row)) return "<command status>";
         if (/^│  \d+ output lines$/.test(row)) return "<output count>";
         if (/^│  \d+ more lines · → to expand$/.test(row)) return "<fold count>";
-        if (row.includes("enter queue · ctrl+enter steer")) return "<status line>";
+        if (row.includes("enter queue ·")) return "<status line>";
         if (/^(?:auto · )?gpt-5$/.test(row)) return "<status line>";
         return row;
       });
@@ -2597,10 +2664,10 @@ test.skipIf(!tmuxAvailable())(
           .filter((frame) => frame.kind === 1)
           .map((frame) => frame.payload),
       ).toString("binary");
-      expect(countOccurrences(stdout, "\x1b[?1000h")).toBe(1);
-      expect(countOccurrences(stdout, "\x1b[?1006h")).toBe(1);
-      expect(countOccurrences(stdout, "\x1b[?1000l")).toBe(2);
-      expect(countOccurrences(stdout, "\x1b[?1006l")).toBe(2);
+      expect(countOccurrences(stdout, "\x1b[?1000h")).toBe(0);
+      expect(countOccurrences(stdout, "\x1b[?1006h")).toBe(0);
+      expect(countOccurrences(stdout, "\x1b[?1000l")).toBe(1);
+      expect(countOccurrences(stdout, "\x1b[?1006l")).toBe(1);
       expect(stdout).toContain("\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1004l\x1b[?1006l");
       expect(countOccurrences(stdout, "\x1b[?1049h")).toBe(1);
       expect(countOccurrences(stdout, "\x1b[?1049l")).toBe(1);

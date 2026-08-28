@@ -762,15 +762,17 @@ test "live full transcript content requests one frame per revision stride" {
         .full_transcript = .{ .depth = .full },
         .full_transcript_content_revision = 40,
         .command_output_display = .{ .open_command_block = 0 },
-        .full_transcript_page_source = .{
-            .request = .{
-                .generation = 1,
-                .content_revision = 40,
-                .cols = 80,
-                .anchor = .tail,
+        .full_transcript_installed_page = .{
+            .source = .{
+                .request = .{
+                    .content_revision = 40,
+                    .cols = 80,
+                    .anchor = .tail,
+                },
+                .range = .{ .start = 0, .end = 0 },
+                .styles = .{},
             },
-            .range = .{ .start = 0, .end = 0 },
-            .styles = .{},
+            .projection = .{ .styles = .{} },
         },
     };
     defer runtime.deinit(alloc);
@@ -844,7 +846,6 @@ test "full transcript page snapshot retains active command records" {
     try runtime.command_output_blocks.append(alloc, block);
 
     var source = try runtime.snapshotFullTranscriptPage(.{
-        .generation = 1,
         .content_revision = runtime.full_transcript_content_revision,
         .cols = 80,
         .anchor = .tail,
@@ -908,19 +909,171 @@ test "full transcript page navigation preserves tail intent while the page loads
             .hint_row = 12,
         },
         .full_transcript = .{ .depth = .full },
-        .full_transcript_page_request = .{
-            .generation = 1,
+    };
+    const task = try std.heap.c_allocator.create(full_transcript_worker.Task);
+    task.* = .{ .source = .{
+        .request = .{
             .content_revision = 0,
             .cols = 60,
             .anchor = .tail,
         },
-    };
+        .range = .{ .start = 0, .end = 0 },
+        .styles = .{},
+    } };
+    runtime.full_transcript_page_load.task = task;
     defer runtime.deinit(std.testing.allocator);
 
     runtime.scrollFullTranscript(.up, .page);
 
     try std.testing.expect(runtime.full_transcript.follow_tail);
     try std.testing.expectEqual(@as(u32, 0), runtime.full_transcript.scroll_rows);
+}
+
+test "cancelled full transcript page completion is never installed" {
+    var runtime = TranscriptRuntime{ .layout = testLayoutWithRows(12) };
+    runtime.layout.cols = 60;
+    defer runtime.deinit(std.testing.allocator);
+
+    const task = try std.heap.c_allocator.create(full_transcript_worker.Task);
+    task.* = .{
+        .source = .{
+            .request = .{
+                .content_revision = 0,
+                .cols = 60,
+                .anchor = .tail,
+            },
+            .range = .{ .start = 0, .end = 0 },
+            .styles = .{},
+        },
+        .projection = .{ .styles = .{} },
+    };
+    task.cancel_requested.store(true, .release);
+    task.done.store(true, .release);
+    runtime.full_transcript_page_load.task = task;
+
+    try std.testing.expect(!try runtime.pollFullTranscriptPageLoad());
+    try std.testing.expect(runtime.full_transcript_installed_page == null);
+}
+
+test "full transcript page boundaries preserve monotonic navigation" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 20,
+            .divider_top_row = 21,
+            .input_row = 22,
+            .divider_bottom_row = 23,
+            .hint_row = 24,
+        },
+        .owned_top_row = 1,
+        .full_transcript = .{ .depth = .full, .follow_tail = false },
+    };
+    defer runtime.deinit(alloc);
+
+    for (0..1_000) |_| {
+        _ = try runtime.appendRawTranscriptEntryClassified(
+            alloc,
+            "row\n",
+            .unknown_raw,
+        );
+    }
+
+    const PageWindow = struct {
+        fn install(
+            current: *TranscriptRuntime,
+            request: full_transcript_page.Request,
+        ) !*InstalledFullTranscriptPage {
+            const range = full_transcript_page.sourceRange(
+                request,
+                current.entries.items.len,
+            );
+            if (current.full_transcript_installed_page == null) {
+                current.full_transcript_installed_page = .{
+                    .source = .{
+                        .request = request,
+                        .range = range,
+                        .styles = .{},
+                    },
+                    .projection = .{ .styles = .{} },
+                };
+            }
+            const page = &current.full_transcript_installed_page.?;
+            page.source.request = request;
+            page.source.range = range;
+            page.projection.measured_item_rows.clearRetainingCapacity();
+            for (range.start..range.end) |entry_index| {
+                try page.projection.measured_item_rows.append(std.heap.c_allocator, .{
+                    .entry_id = current.entries.items[entry_index].id(),
+                    .row = @intCast(entry_index - range.start),
+                });
+            }
+            page.projection.measured_total_rows = @intCast(range.len());
+            return page;
+        }
+    };
+
+    const tail_request = full_transcript_page.Request{
+        .content_revision = runtime.full_transcript_content_revision,
+        .cols = runtime.layout.cols,
+        .anchor = .tail,
+    };
+    var installed = try PageWindow.install(&runtime, tail_request);
+    const tail_start = installed.source.range.start;
+
+    runtime.scrollFullTranscript(.up, .page);
+    const older_anchor = switch (runtime.full_transcript_page_anchor) {
+        .entry_index => |index| index,
+        .tail => return error.TestExpectedOlderPage,
+    };
+    try std.testing.expectEqual(@as(usize, 743), older_anchor);
+    try std.testing.expect(runtime.full_transcript.bookmark_pending);
+    try std.testing.expectEqual(
+        @as(?u32, runtime.entries.items[older_anchor].id()),
+        runtime.full_transcript.bookmark_entry_id,
+    );
+
+    var older_request = tail_request;
+    older_request.anchor = .{ .entry_index = older_anchor };
+    installed = try PageWindow.install(&runtime, older_request);
+    var selected = runtime.full_transcript.select_visual_offset(
+        installed.projection.measured_total_rows,
+        20,
+        installed.projection.measured_item_rows.items,
+    );
+    runtime.full_transcript = selected.state;
+    const after_page_up = installed.source.range.start + @as(usize, @intCast(selected.offset));
+    try std.testing.expectEqual(@as(usize, 743), after_page_up);
+    try std.testing.expect(after_page_up < tail_start);
+
+    const max_offset = installed.projection.measured_total_rows - 20;
+    runtime.full_transcript.scroll_rows = max_offset;
+    runtime.full_transcript.follow_tail = true;
+    const before_page_down = installed.source.range.start + @as(usize, max_offset);
+    runtime.scrollFullTranscript(.down, .page);
+    const newer_anchor = switch (runtime.full_transcript_page_anchor) {
+        .entry_index => |index| index,
+        .tail => return error.TestExpectedNewerPage,
+    };
+    try std.testing.expectEqual(@as(usize, 871), newer_anchor);
+    try std.testing.expect(runtime.full_transcript.bookmark_pending);
+    try std.testing.expectEqual(
+        @as(?u32, runtime.entries.items[newer_anchor].id()),
+        runtime.full_transcript.bookmark_entry_id,
+    );
+
+    var newer_request = older_request;
+    newer_request.anchor = .{ .entry_index = newer_anchor };
+    installed = try PageWindow.install(&runtime, newer_request);
+    selected = runtime.full_transcript.select_visual_offset(
+        installed.projection.measured_total_rows,
+        20,
+        installed.projection.measured_item_rows.items,
+    );
+    const after_page_down = installed.source.range.start + @as(usize, @intCast(selected.offset));
+    try std.testing.expectEqual(@as(usize, 871), after_page_down);
+    try std.testing.expect(after_page_down > before_page_down);
 }
 
 test "opening the full transcript leaves compact command projection unchanged" {
@@ -1003,7 +1156,7 @@ test "full transcript staging paints its selected wheel viewport without reselec
     try std.testing.expect(std.mem.find(u8, staged.source.bytes, "row-0") == null);
 }
 
-test "full transcript projection cache survives navigation and invalidates on content change" {
+test "compact transcript cache survives navigation and invalidates on content change" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{
         .layout = .{
@@ -1064,41 +1217,6 @@ test "full transcript projection cache survives navigation and invalidates on co
     committed_compact.deinit(alloc);
     runtime.has_committed_frame = false;
 
-    const projection = try runtime.cachedFullTranscriptProjection(alloc, null);
-    _ = try full_transcript_screen.measureProjectionInterruptible(alloc, projection, null, 40, null);
-    try std.testing.expectEqual(@as(?u16, 40), projection.measurement_cols);
-    const same_projection = try runtime.cachedFullTranscriptProjection(alloc, null);
-    try std.testing.expectEqual(projection, same_projection);
-    runtime.full_transcript = runtime.full_transcript.capture_anchor(1);
-    const reanchored = try runtime.cachedFullTranscriptProjection(alloc, null);
-    try std.testing.expectEqual(projection, reanchored);
-
-    for ([_]u16{ 20, 30, 50 }) |cols| {
-        runtime.layout.cols = cols;
-        const resized = try runtime.cachedFullTranscriptProjection(alloc, null);
-        _ = try full_transcript_screen.measureProjectionInterruptible(alloc, resized, null, cols, null);
-    }
-    runtime.layout.cols = 40;
-    const original_width = try runtime.cachedFullTranscriptProjection(alloc, null);
-    try std.testing.expectEqual(@as(?u16, 40), original_width.measurement_cols);
-
-    runtime.markTranscriptCommandOutputDirty();
-    const after_live_output = try runtime.cachedFullTranscriptProjection(alloc, null);
-    try std.testing.expectEqual(@as(?u16, null), after_live_output.measurement_cols);
-    _ = try full_transcript_screen.measureProjectionInterruptible(
-        alloc,
-        after_live_output,
-        null,
-        40,
-        null,
-    );
-
-    runtime.command_output_display.open_command_block = 0;
-    runtime.markTranscriptContentDirty();
-    const during_live_command = try runtime.cachedFullTranscriptProjection(alloc, null);
-    try std.testing.expectEqual(@as(?u16, null), during_live_command.measurement_cols);
-    runtime.command_output_display.open_command_block = null;
-
     runtime.markTranscriptContentDirty();
     var rebuilt_compact = try runtime.cachedTranscriptSource(alloc);
     defer rebuilt_compact.deinit(alloc);
@@ -1107,437 +1225,6 @@ test "full transcript projection cache survives navigation and invalidates on co
         runtime.layout.cols,
         runtime.has_committed_frame,
     ).?.bytes.ptr);
-    const rebuilt_projection = try runtime.cachedFullTranscriptProjection(alloc, null);
-    try std.testing.expectEqual(@as(?u16, null), rebuilt_projection.measurement_cols);
-}
-
-const CacheBuildProbe = struct {
-    polls: usize = 0,
-    pending_after: ?usize = null,
-
-    fn pending(context: *anyopaque) bool {
-        const self: *CacheBuildProbe = @ptrCast(@alignCast(context));
-        self.polls += 1;
-        return if (self.pending_after) |limit| self.polls >= limit else false;
-    }
-};
-
-fn cacheTestRuntime(depth: transcript_presentation.Depth, cols: u16) TranscriptRuntime {
-    var layout = testLayoutWithRows(8);
-    layout.cols = cols;
-    return .{
-        .layout = layout,
-        .owned_top_row = 1,
-        .full_transcript = .{ .depth = depth },
-    };
-}
-
-fn appendCacheTestEntries(
-    runtime: *TranscriptRuntime,
-    alloc: Allocator,
-    count: usize,
-) !void {
-    try runtime.entries.ensureUnusedCapacity(alloc, count);
-    for (0..count) |_| {
-        const bytes = try alloc.dupe(u8, "retained\n");
-        runtime.entries.appendAssumeCapacity(.{ .raw_bytes = .{
-            .id = runtime.next_entry_id,
-            .bytes = bytes,
-        } });
-        runtime.next_entry_id +%= 1;
-    }
-    runtime.markTranscriptContentDirty();
-}
-
-fn renderCacheTail(
-    alloc: Allocator,
-    runtime: *TranscriptRuntime,
-    projection: *full_transcript_screen.Projection,
-    rows: u16,
-) ![]u8 {
-    const measurement = try full_transcript_screen.measureProjectionInterruptible(
-        alloc,
-        projection,
-        null,
-        runtime.layout.cols,
-        null,
-    );
-    return full_transcript_screen.renderProjectionViewportSourceInterruptible(
-        alloc,
-        projection,
-        null,
-        runtime.layout.cols,
-        rows,
-        measurement.total_rows -| rows,
-        null,
-    );
-}
-
-test "full transcript cache reuses retained entries across append and width changes" {
-    const alloc = std.testing.allocator;
-    for ([_]transcript_presentation.Depth{ .full, .full }) |depth| {
-        var runtime = cacheTestRuntime(depth, 40);
-        defer runtime.deinit(alloc);
-
-        try appendCacheTestEntries(&runtime, alloc, 4_500);
-        _ = try runtime.cachedFullTranscriptProjection(alloc, null);
-        if (depth == .full) {
-            runtime.layout.cols = 41;
-            var resize_probe: CacheBuildProbe = .{};
-            var resize_checkpoint = build_checkpoint.BuildCheckpoint.init(
-                &resize_probe,
-                CacheBuildProbe.pending,
-            );
-            _ = try runtime.cachedFullTranscriptProjectionInterruptible(
-                alloc,
-                null,
-                &resize_checkpoint,
-            );
-            try std.testing.expectEqual(@as(usize, 2), resize_probe.polls);
-            runtime.layout.cols = 40;
-        }
-        _ = try runtime.appendRawTranscriptEntryClassified(
-            alloc,
-            "APPENDED_TAIL\n",
-            .unknown_raw,
-        );
-
-        var probe: CacheBuildProbe = .{};
-        var checkpoint = build_checkpoint.BuildCheckpoint.init(&probe, CacheBuildProbe.pending);
-        const projection = try runtime.cachedFullTranscriptProjectionInterruptible(
-            alloc,
-            null,
-            &checkpoint,
-        );
-
-        try std.testing.expectEqual(@as(usize, 0), probe.polls);
-        const tail = try renderCacheTail(alloc, &runtime, projection, 2);
-        defer alloc.free(tail);
-        try std.testing.expect(std.mem.find(u8, tail, "APPENDED_TAIL") != null);
-    }
-}
-
-test "review cache retains block spacing across a hidden tail" {
-    const alloc = std.testing.allocator;
-    var runtime = cacheTestRuntime(.full, 40);
-    defer runtime.deinit(alloc);
-    _ = try runtime.appendRawTranscriptEntryClassified(alloc, "BEFORE\n", .unknown_raw);
-    _ = try runtime.appendRawTranscriptEntryClassified(alloc, "HIDDEN\n", .command_output);
-    _ = try runtime.cachedFullTranscriptProjection(alloc, null);
-    _ = try runtime.appendRawTranscriptEntryClassified(alloc, "AFTER\n", .unknown_raw);
-
-    const incremental = try runtime.cachedFullTranscriptProjection(alloc, null);
-    const incremental_tail = try renderCacheTail(alloc, &runtime, incremental, 16);
-    defer alloc.free(incremental_tail);
-    var rebuilt = try runtime.buildFullTranscriptProjection(alloc, null);
-    defer rebuilt.deinit(alloc);
-    const rebuilt_tail = try renderCacheTail(alloc, &runtime, &rebuilt, 16);
-    defer alloc.free(rebuilt_tail);
-
-    try std.testing.expectEqualStrings(rebuilt_tail, incremental_tail);
-}
-
-test "full transcript cache updates only the streamed assistant tail" {
-    const alloc = std.testing.allocator;
-    var runtime = cacheTestRuntime(.full, 40);
-    defer runtime.deinit(alloc);
-    try appendCacheTestEntries(&runtime, alloc, 4_500);
-    var metrics: Metrics = .{};
-    _ = try runtime.streamAssistantChunk(alloc, &metrics, "assistant");
-    _ = try runtime.cachedFullTranscriptProjection(alloc, null);
-    _ = try runtime.streamAssistantChunk(alloc, &metrics, " tail");
-
-    var probe: CacheBuildProbe = .{};
-    var checkpoint = build_checkpoint.BuildCheckpoint.init(&probe, CacheBuildProbe.pending);
-    const projection = try runtime.cachedFullTranscriptProjectionInterruptible(
-        alloc,
-        null,
-        &checkpoint,
-    );
-
-    try std.testing.expectEqual(@as(usize, 0), probe.polls);
-    const tail = try renderCacheTail(alloc, &runtime, projection, 2);
-    defer alloc.free(tail);
-    try std.testing.expect(std.mem.find(u8, tail, "assistant tail") != null);
-}
-
-test "command output admission invalidates cached prefixes when reservation trims retention" {
-    const alloc = std.testing.allocator;
-    var runtime = cacheTestRuntime(.full, 40);
-    defer runtime.deinit(alloc);
-
-    const payload = try alloc.alloc(u8, 256);
-    defer alloc.free(payload);
-    @memset(payload, 'x');
-    for (0..8) |_| {
-        _ = try runtime.appendRawTranscriptEntryClassified(
-            alloc,
-            payload,
-            .unknown_raw,
-        );
-    }
-    runtime.full_transcript.depth = .full;
-    _ = try runtime.cachedFullTranscriptProjection(alloc, null);
-    runtime.full_transcript.depth = .full;
-    _ = try runtime.cachedFullTranscriptProjection(alloc, null);
-    const entry_count_before = runtime.entries.items.len;
-    runtime.max_retained_transcript_bytes = 512;
-
-    var metrics: Metrics = .{};
-    try runtime.writeCommandOutputChunk(
-        alloc,
-        &metrics,
-        .{},
-        .stdout,
-        "new output\n",
-        true,
-    );
-
-    try std.testing.expect(runtime.entries.items.len < entry_count_before + 1);
-    try std.testing.expect(
-        runtime.full_transcript_projection_cache.full.entries[0].?.dirty == .all,
-    );
-    try std.testing.expect(
-        runtime.full_transcript_projection_cache.full.entries[0].?.dirty == .all,
-    );
-}
-
-test "command and lifecycle updates reuse measured prefix and publish atomically" {
-    const alloc = std.testing.allocator;
-    var runtime = cacheTestRuntime(.full, 40);
-    defer runtime.deinit(alloc);
-    try appendCacheTestEntries(&runtime, alloc, 4_500);
-
-    const styles: Styles = .{
-        .system_notice_label_style = "",
-        .system_notice_text_style = "",
-        .reset_style = "",
-        .dim_style = "",
-        .red_style = "",
-    };
-    var metrics: Metrics = .{};
-    try runtime.writeCommandOutputChunk(
-        alloc,
-        &metrics,
-        styles,
-        .stdout,
-        "command",
-        true,
-    );
-    const command_entry_id = runtime.command_output_blocks.items[0].lines.items[0].entry_id.?;
-    const initial = try runtime.cachedFullTranscriptProjection(alloc, null);
-    _ = try full_transcript_screen.measureProjectionInterruptible(alloc, initial, null, 40, null);
-
-    const continuation = try alloc.alloc(u8, 16 * 1024);
-    defer alloc.free(continuation);
-    @memset(continuation, 'x');
-    try runtime.writeCommandOutputChunk(
-        alloc,
-        &metrics,
-        styles,
-        .stdout,
-        continuation,
-        true,
-    );
-    const dirty_after_append = switch (runtime.full_transcript_projection_cache.full.entries[0].?.dirty) {
-        .entry => |entry| entry.id,
-        .clean, .all => return error.TestExpectedExactCommandDirtyEntry,
-    };
-    try std.testing.expectEqual(command_entry_id, dirty_after_append);
-
-    const updated = try runtime.cachedFullTranscriptProjection(alloc, null);
-    const prefix_before = updated.measurement_prefix orelse
-        return error.TestExpectedMeasurementPrefix;
-    const checkpoints_before = updated.measured_segment_checkpoints.items.len;
-    var probe: CacheBuildProbe = .{ .pending_after = 1 };
-    var checkpoint = build_checkpoint.BuildCheckpoint.init(&probe, CacheBuildProbe.pending);
-    try std.testing.expectError(
-        error.InputPending,
-        full_transcript_screen.measureProjectionInterruptible(
-            alloc,
-            updated,
-            null,
-            40,
-            &checkpoint,
-        ),
-    );
-    try std.testing.expectEqual(@as(?u16, null), updated.measurement_cols);
-    try std.testing.expectEqual(
-        prefix_before.segment_count,
-        updated.measurement_prefix.?.segment_count,
-    );
-    try std.testing.expectEqual(
-        checkpoints_before,
-        updated.measured_segment_checkpoints.items.len,
-    );
-    for (0..2) |fail_index| {
-        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
-        try std.testing.expectError(
-            error.OutOfMemory,
-            full_transcript_screen.measureProjectionInterruptible(
-                failing.allocator(),
-                updated,
-                null,
-                40,
-                null,
-            ),
-        );
-        try std.testing.expectEqual(
-            checkpoints_before,
-            updated.measured_segment_checkpoints.items.len,
-        );
-    }
-
-    const resumed = try full_transcript_screen.measureProjectionInterruptible(alloc, updated, null, 40, null);
-    var rebuilt = try runtime.buildFullTranscriptProjection(alloc, null);
-    defer rebuilt.deinit(alloc);
-    const baseline = try full_transcript_screen.measureProjectionInterruptible(alloc, &rebuilt, null, 40, null);
-    try std.testing.expectEqual(baseline.total_rows, resumed.total_rows);
-    try std.testing.expectEqual(baseline.anchor_row, resumed.anchor_row);
-    try std.testing.expectEqualSlices(
-        transcript_presentation.ItemRow,
-        baseline.item_rows,
-        resumed.item_rows,
-    );
-
-    try runtime.flushCommandOutputSummary(alloc, &metrics, styles, true);
-    const dirty_after_close = switch (runtime.full_transcript_projection_cache.full.entries[0].?.dirty) {
-        .entry => |entry| entry.id,
-        .clean, .all => return error.TestExpectedExactCommandDirtyEntry,
-    };
-    try std.testing.expectEqual(command_entry_id, dirty_after_close);
-    const closed = try runtime.cachedFullTranscriptProjection(alloc, null);
-    try std.testing.expect(closed.measurement_prefix != null);
-    const closed_measurement = try full_transcript_screen.measureProjectionInterruptible(alloc, closed, null, 40, null);
-    var rebuilt_closed = try runtime.buildFullTranscriptProjection(alloc, null);
-    defer rebuilt_closed.deinit(alloc);
-    const closed_baseline = try full_transcript_screen.measureProjectionInterruptible(
-        alloc,
-        &rebuilt_closed,
-        null,
-        40,
-        null,
-    );
-    try std.testing.expectEqual(closed_baseline.total_rows, closed_measurement.total_rows);
-    try std.testing.expectEqualSlices(
-        transcript_presentation.ItemRow,
-        closed_baseline.item_rows,
-        closed_measurement.item_rows,
-    );
-
-    const status_entry_id = try runtime.appendRawTranscriptEntryClassified(
-        alloc,
-        "● Running command\n",
-        .tool_status,
-    );
-    runtime.entries.items[runtime.entries.items.len - 1].raw_bytes.lifecycle_pinned = true;
-    const before_status_update = try runtime.cachedFullTranscriptProjection(alloc, null);
-    _ = try full_transcript_screen.measureProjectionInterruptible(alloc, before_status_update, null, 40, null);
-    try std.testing.expect(try transcript_store.replacePinnedToolStatusAtomic(
-        &runtime,
-        alloc,
-        status_entry_id,
-        "● Ran command\n",
-    ));
-    const dirty_after_status = switch (runtime.full_transcript_projection_cache.full.entries[0].?.dirty) {
-        .entry => |entry| entry.id,
-        .clean, .all => return error.TestExpectedExactLifecycleDirtyEntry,
-    };
-    try std.testing.expectEqual(status_entry_id, dirty_after_status);
-    const updated_status = try runtime.cachedFullTranscriptProjection(alloc, null);
-    try std.testing.expect(updated_status.measurement_prefix != null);
-    _ = try full_transcript_screen.measureProjectionInterruptible(alloc, updated_status, null, 40, null);
-
-    try transcript_store.clearLifecyclePinsAtomic(&runtime, alloc, &.{status_entry_id});
-    const dirty_after_cleanup = switch (runtime.full_transcript_projection_cache.full.entries[0].?.dirty) {
-        .entry => |entry| entry.id,
-        .clean, .all => return error.TestExpectedExactLifecycleDirtyEntry,
-    };
-    try std.testing.expectEqual(status_entry_id, dirty_after_cleanup);
-    const cleaned_status = try runtime.cachedFullTranscriptProjection(alloc, null);
-    try std.testing.expect(cleaned_status.measurement_prefix != null);
-    _ = try full_transcript_screen.measureProjectionInterruptible(alloc, cleaned_status, null, 40, null);
-}
-
-test "full transcript cache rebuilds a changed tool group without its old prefix" {
-    const alloc = std.testing.allocator;
-    var runtime = cacheTestRuntime(.full, 80);
-    defer runtime.deinit(alloc);
-    try appendCacheTestEntries(&runtime, alloc, 8);
-    var tool_ids: [3]u32 = undefined;
-    for (&tool_ids, 0..) |*entry_id, index| {
-        entry_id.* = try runtime.appendRawTranscriptEntryClassified(
-            alloc,
-            "● Read file.zig\n",
-            .tool_status,
-        );
-        try runtime.tool_details.append(alloc, .{
-            .entry_id = entry_id.*,
-            .tool_name = try std.fmt.allocPrint(alloc, "read_{d}", .{index}),
-            .activity_kind = .read,
-            .outcome = .completed,
-            .presentation_group_id = .{ .turn_id = 1, .anchor_step_id = 1 },
-        });
-    }
-    _ = try runtime.cachedFullTranscriptProjection(alloc, null);
-
-    runtime.tool_details.items[runtime.tool_details.items.len - 1].outcome = .failed;
-    runtime.markTranscriptContentDirtyFrom(tool_ids[2]);
-    const projection = try runtime.cachedFullTranscriptProjection(alloc, null);
-    const tail = try renderCacheTail(alloc, &runtime, projection, 10);
-    defer alloc.free(tail);
-    try std.testing.expect(std.mem.find(u8, tail, "1 failed") != null);
-}
-
-test "full transcript cancellation preserves the prior cache and viewport for retry" {
-    const alloc = std.testing.allocator;
-    var runtime = cacheTestRuntime(.full, 40);
-    defer runtime.deinit(alloc);
-    try appendCacheTestEntries(&runtime, alloc, 5_000);
-    const previous = try runtime.cachedFullTranscriptProjection(alloc, null);
-    try std.testing.expect(&runtime.full_transcript_projection_cache.full.entries[0].?.projection == previous);
-    runtime.full_transcript.scroll_rows = 7;
-    runtime.full_transcript.follow_tail = false;
-    runtime.full_transcript.bookmark_entry_id = 12;
-    runtime.full_transcript.bookmark_intra_row = 2;
-    const viewport_before = runtime.snapshotFullTranscriptViewport();
-
-    try appendCacheTestEntries(&runtime, alloc, 5_000);
-    _ = try runtime.appendRawTranscriptEntryClassified(
-        alloc,
-        "CANCEL_RETRY_TAIL\n",
-        .unknown_raw,
-    );
-    const Probe = struct {
-        fn pending(_: *anyopaque) bool {
-            return true;
-        }
-    };
-    var context: u8 = 0;
-    var checkpoint = build_checkpoint.BuildCheckpoint.init(&context, Probe.pending);
-    try std.testing.expectError(
-        error.InputPending,
-        runtime.cachedFullTranscriptProjectionInterruptible(
-            alloc,
-            null,
-            &checkpoint,
-        ),
-    );
-
-    try std.testing.expect(&runtime.full_transcript_projection_cache.full.entries[0].?.projection == previous);
-    try std.testing.expect(runtime.full_transcript_projection_cache.full.find(
-        runtime.full_transcript_content_revision,
-        runtime.layout.cols,
-        null,
-    ) == null);
-    try std.testing.expect(std.meta.eql(
-        viewport_before,
-        runtime.snapshotFullTranscriptViewport(),
-    ));
-    const retry = try runtime.cachedFullTranscriptProjection(alloc, null);
-    const tail = try renderCacheTail(alloc, &runtime, retry, 2);
-    defer alloc.free(tail);
-    try std.testing.expect(std.mem.find(u8, tail, "CANCEL_RETRY_TAIL") != null);
 }
 
 test "cached compact transcript refreshes after streamed assistant text" {
@@ -1573,7 +1260,7 @@ test "cached compact transcript refreshes after streamed assistant text" {
     try std.testing.expect(std.mem.find(u8, after.bytes, "streamed assistant") != null);
 }
 
-test "clearing a transcript releases cached sources and projections" {
+test "clearing a transcript releases compact source and installed page" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{
         .layout = .{
@@ -1597,18 +1284,25 @@ test "clearing a transcript releases cached sources and projections" {
 
     var compact = try runtime.cachedTranscriptSource(alloc);
     compact.deinit(alloc);
-    _ = try runtime.cachedFullTranscriptProjection(alloc, null);
     const content_revision = runtime.full_transcript_content_revision;
+    runtime.full_transcript_installed_page = .{
+        .source = .{
+            .request = .{
+                .content_revision = content_revision,
+                .cols = runtime.layout.cols,
+                .anchor = .tail,
+            },
+            .range = .{ .start = 0, .end = 0 },
+            .styles = .{},
+        },
+        .projection = .{ .styles = .{} },
+    };
     try std.testing.expect(runtime.compact_transcript_source_cache.find(
         content_revision,
         runtime.layout.cols,
         runtime.has_committed_frame,
     ) != null);
-    try std.testing.expect(runtime.full_transcript_projection_cache.full.find(
-        content_revision,
-        runtime.layout.cols,
-        null,
-    ) != null);
+    try std.testing.expect(runtime.full_transcript_installed_page != null);
 
     runtime.clearTranscript(alloc);
 
@@ -1617,11 +1311,7 @@ test "clearing a transcript releases cached sources and projections" {
         runtime.layout.cols,
         runtime.has_committed_frame,
     ) == null);
-    try std.testing.expect(runtime.full_transcript_projection_cache.full.find(
-        content_revision,
-        runtime.layout.cols,
-        null,
-    ) == null);
+    try std.testing.expect(runtime.full_transcript_installed_page == null);
 }
 
 test "cached compact transcript preserves pending resume flow" {
@@ -1694,6 +1384,17 @@ test "startup resume view release preserves later structured notices" {
     try std.testing.expect(!try runtime.releaseStartupResumeViewEntry(alloc, resume_entry_id));
 }
 
+const PendingBuildProbe = struct {
+    polls: usize = 0,
+    pending_after: ?usize = null,
+
+    fn pending(context: *anyopaque) bool {
+        const self: *PendingBuildProbe = @ptrCast(@alignCast(context));
+        self.polls += 1;
+        return if (self.pending_after) |limit| self.polls >= limit else false;
+    }
+};
+
 test "pending resume source publishes its line index once" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{ .layout = testLayoutWithRows(8) };
@@ -1710,10 +1411,10 @@ test "pending resume source publishes its line index once" {
     );
     const flow_ptr = runtime.pendingResumeFlow().ptr;
 
-    var cancelled_probe = CacheBuildProbe{ .pending_after = 1 };
+    var cancelled_probe = PendingBuildProbe{ .pending_after = 1 };
     var cancelled = build_checkpoint.BuildCheckpoint.init(
         &cancelled_probe,
-        CacheBuildProbe.pending,
+        PendingBuildProbe.pending,
     );
     try std.testing.expectError(
         error.InputPending,
@@ -1722,16 +1423,16 @@ test "pending resume source publishes its line index once" {
     try std.testing.expectEqual(@as(usize, 0), runtime.pending_resume_source.?.hard_line_starts.len);
     try std.testing.expectEqual(flow_ptr, runtime.pendingResumeFlow().ptr);
 
-    var build_probe = CacheBuildProbe{};
-    var build = build_checkpoint.BuildCheckpoint.init(&build_probe, CacheBuildProbe.pending);
+    var build_probe = PendingBuildProbe{};
+    var build = build_checkpoint.BuildCheckpoint.init(&build_probe, PendingBuildProbe.pending);
     const source = (try runtime.pendingResumeSourceInterruptible(alloc, &build)).?;
     const source_ptr = source;
     const index_ptr = source.hard_line_starts.ptr;
     try std.testing.expect(source.hard_line_starts.len > 0);
 
     runtime.layout.cols = 41;
-    var resize_probe = CacheBuildProbe{ .pending_after = 2 };
-    var resize = build_checkpoint.BuildCheckpoint.init(&resize_probe, CacheBuildProbe.pending);
+    var resize_probe = PendingBuildProbe{ .pending_after = 2 };
+    var resize = build_checkpoint.BuildCheckpoint.init(&resize_probe, PendingBuildProbe.pending);
     try std.testing.expectError(
         error.InputPending,
         runtime.pendingResumeSourceInterruptible(alloc, &resize),
@@ -1741,8 +1442,8 @@ test "pending resume source publishes its line index once" {
     runtime.layout.cols = 40;
 
     for (0..3) |_| {
-        var reuse_probe = CacheBuildProbe{};
-        var reuse = build_checkpoint.BuildCheckpoint.init(&reuse_probe, CacheBuildProbe.pending);
+        var reuse_probe = PendingBuildProbe{};
+        var reuse = build_checkpoint.BuildCheckpoint.init(&reuse_probe, PendingBuildProbe.pending);
         const reused = (try runtime.pendingResumeSourceInterruptible(alloc, &reuse)).?;
         try std.testing.expectEqual(source_ptr, reused);
         try std.testing.expectEqual(index_ptr, reused.hard_line_starts.ptr);
@@ -3968,132 +3669,14 @@ pub const FullTranscriptPrimaryRestore = enum {
     resized,
 };
 
-const ProjectionCacheDirty = union(enum) {
-    clean,
-    all,
-    entry: struct {
-        id: u32,
-        index: usize,
-    },
-
-    fn markEntry(self: *ProjectionCacheDirty, entry_id: u32, entry_index: usize) void {
-        self.* = switch (self.*) {
-            .clean => .{ .entry = .{ .id = entry_id, .index = entry_index } },
-            .all => .all,
-            .entry => |current| if (entry_index < current.index)
-                .{ .entry = .{ .id = entry_id, .index = entry_index } }
-            else
-                .{ .entry = current },
-        };
-    }
-};
-
-test "projection cache dirtiness follows transcript position instead of entry id" {
-    var dirty: ProjectionCacheDirty = .clean;
-    dirty.markEntry(1, 3);
-    dirty.markEntry(9, 1);
-    const earliest = switch (dirty) {
-        .entry => |entry| entry,
-        .clean, .all => return error.TestExpectedExactDirtyEntry,
-    };
-    try std.testing.expectEqual(@as(u32, 9), earliest.id);
-    try std.testing.expectEqual(@as(usize, 1), earliest.index);
-}
-
-const CachedFullTranscriptProjection = struct {
+const InstalledFullTranscriptPage = struct {
+    source: full_transcript_worker.Source,
     projection: full_transcript_screen.Projection,
-    content_revision: u64,
-    entry_count: usize,
-    prefix_last_entry_id: ?u32,
-    cols: u16,
-    resolver: ?full_transcript_screen.FullDiffResolver,
-    dirty: ProjectionCacheDirty = .clean,
 
-    fn matches(
-        self: *const CachedFullTranscriptProjection,
-        content_revision: u64,
-        cols: u16,
-        resolver: ?full_transcript_screen.FullDiffResolver,
-    ) bool {
-        return self.content_revision == content_revision and
-            self.cols == cols and
-            sameFullDiffResolver(self.resolver, resolver);
-    }
-};
-
-const FullTranscriptProjectionCache = struct {
-    full: ProjectionCacheSet = .{},
-    relationships: FullTranscriptRelationshipCache = .{},
-
-    fn deinit(self: *FullTranscriptProjectionCache, alloc: Allocator) void {
-        self.full.deinit(alloc);
-        self.relationships.deinit(alloc);
-        self.* = .{};
-    }
-};
-
-const CachedFullTranscriptRelationships = struct {
-    projection: tool_group_projection.Projection,
-    content_revision: u64,
-    entry_count: usize,
-    prefix_last_entry_id: ?u32,
-    dirty: ProjectionCacheDirty = .clean,
-};
-
-fn entryPrefixBoundaryId(entries: []const TranscriptEntry, entry_count: usize) ?u32 {
-    if (entry_count == 0 or entry_count > entries.len) return null;
-    return entries[entry_count - 1].id();
-}
-
-fn cachedEntryPrefixMatches(
-    entries: []const TranscriptEntry,
-    entry_count: usize,
-    prefix_last_entry_id: ?u32,
-) bool {
-    if (entry_count > entries.len) return false;
-    return entryPrefixBoundaryId(entries, entry_count) == prefix_last_entry_id;
-}
-
-test "cached entry prefix rejects retention and lifecycle reposition" {
-    const original = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "one" } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "two" } },
-    };
-    const retained = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 2, .bytes = "two" } },
-        .{ .raw_bytes = .{ .id = 3, .bytes = "three" } },
-    };
-    const repositioned = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 2, .bytes = "two" } },
-        .{ .raw_bytes = .{ .id = 1, .bytes = "one" } },
-    };
-
-    const boundary = entryPrefixBoundaryId(&original, original.len);
-    try std.testing.expect(cachedEntryPrefixMatches(&original, original.len, boundary));
-    try std.testing.expect(!cachedEntryPrefixMatches(&retained, original.len, boundary));
-    try std.testing.expect(!cachedEntryPrefixMatches(&repositioned, original.len, boundary));
-}
-
-const FullTranscriptRelationshipCache = struct {
-    cached: ?CachedFullTranscriptRelationships = null,
-
-    fn deinit(self: *FullTranscriptRelationshipCache, alloc: Allocator) void {
-        if (self.cached) |*cached| cached.projection.deinit(alloc);
-        self.* = .{};
-    }
-
-    fn markDirtyFrom(
-        self: *FullTranscriptRelationshipCache,
-        entry_id: u32,
-        entry_index: usize,
-    ) void {
-        const cached = if (self.cached) |*value| value else return;
-        cached.dirty.markEntry(entry_id, entry_index);
-    }
-
-    fn markDirtyAll(self: *FullTranscriptRelationshipCache) void {
-        const cached = if (self.cached) |*value| value else return;
-        cached.dirty = .all;
+    fn deinit(self: *InstalledFullTranscriptPage) void {
+        self.projection.deinit(std.heap.c_allocator);
+        self.source.deinit(std.heap.c_allocator);
+        self.* = undefined;
     }
 };
 
@@ -4155,101 +3738,6 @@ const CompactTranscriptSourceCache = struct {
         return &self.entries[index].?.source;
     }
 };
-
-const ProjectionCacheSet = struct {
-    const capacity = 4;
-
-    entries: [capacity]?CachedFullTranscriptProjection = .{null} ** capacity,
-    next_replacement: usize = 0,
-
-    fn deinit(self: *ProjectionCacheSet, alloc: Allocator) void {
-        for (&self.entries) |*entry| {
-            if (entry.*) |*cached| cached.projection.deinit(alloc);
-        }
-        self.* = .{};
-    }
-
-    fn markDirtyFrom(self: *ProjectionCacheSet, entry_id: u32, entry_index: usize) void {
-        for (&self.entries) |*entry| {
-            if (entry.*) |*cached| {
-                cached.dirty.markEntry(entry_id, entry_index);
-            }
-        }
-    }
-
-    fn markDirtyAll(self: *ProjectionCacheSet) void {
-        for (&self.entries) |*entry| {
-            if (entry.*) |*cached| {
-                cached.dirty = .all;
-            }
-        }
-    }
-
-    fn find(
-        self: *ProjectionCacheSet,
-        content_revision: u64,
-        cols: u16,
-        resolver: ?full_transcript_screen.FullDiffResolver,
-    ) ?*full_transcript_screen.Projection {
-        for (&self.entries) |*entry| {
-            if (entry.*) |*cached| {
-                if (cached.matches(
-                    content_revision,
-                    cols,
-                    resolver,
-                )) return &cached.projection;
-            }
-        }
-        return null;
-    }
-
-    fn incrementalCandidate(
-        self: *ProjectionCacheSet,
-        cols: u16,
-        resolver: ?full_transcript_screen.FullDiffResolver,
-    ) ?*CachedFullTranscriptProjection {
-        for (&self.entries) |*entry| {
-            if (entry.*) |*cached| {
-                if (cached.cols != cols or
-                    !sameFullDiffResolver(cached.resolver, resolver)) continue;
-                switch (cached.dirty) {
-                    .entry => return cached,
-                    .clean, .all => {},
-                }
-            }
-        }
-        return null;
-    }
-
-    fn insert(
-        self: *ProjectionCacheSet,
-        alloc: Allocator,
-        replacement: CachedFullTranscriptProjection,
-    ) *full_transcript_screen.Projection {
-        var index = self.next_replacement;
-        for (self.entries, 0..) |entry, candidate| {
-            if (entry == null) {
-                index = candidate;
-                break;
-            }
-        } else {
-            self.next_replacement = (self.next_replacement + 1) % capacity;
-        }
-        if (self.entries[index]) |*cached| cached.projection.deinit(alloc);
-        self.entries[index] = replacement;
-        return &self.entries[index].?.projection;
-    }
-};
-
-fn sameFullDiffResolver(
-    lhs: ?full_transcript_screen.FullDiffResolver,
-    rhs: ?full_transcript_screen.FullDiffResolver,
-) bool {
-    if (lhs == null or rhs == null) return lhs == null and rhs == null;
-    return lhs.?.context == rhs.?.context and
-        lhs.?.full_for_marker == rhs.?.full_for_marker and
-        lhs.?.has_full_for_lifecycle == rhs.?.has_full_for_lifecycle;
-}
 
 pub const TranscriptRuntime = struct {
     stdout_file: std.Io.File = std.Io.File.stdout(),
@@ -4324,14 +3812,9 @@ pub const TranscriptRuntime = struct {
     full_transcript_open_cols: u16 = 0,
     full_transcript_open_rows: u16 = 0,
     full_transcript_primary_recovery_entry_id: ?u32 = null,
-    full_transcript_projection_cache: FullTranscriptProjectionCache = .{},
     full_transcript_page_load: full_transcript_worker.Load = .{},
-    full_transcript_page_request: ?full_transcript_page.Request = null,
-    full_transcript_page_key: ?full_transcript_page.Key = null,
-    full_transcript_page_range: full_transcript_page.SourceRange = .{ .start = 0, .end = 0 },
     full_transcript_page_anchor: full_transcript_page.Anchor = .tail,
-    full_transcript_page_projection: ?full_transcript_screen.Projection = null,
-    full_transcript_page_source: ?full_transcript_worker.Source = null,
+    full_transcript_installed_page: ?InstalledFullTranscriptPage = null,
     full_transcript_loading_projection: ?full_transcript_screen.Projection = null,
     full_transcript_content_revision: u64 = 0,
     compact_transcript_source_cache: CompactTranscriptSourceCache = .{},
@@ -4426,18 +3909,8 @@ pub const TranscriptRuntime = struct {
 
     pub noinline fn init() TranscriptRuntime {
         var result: TranscriptRuntime = .{
-            .full_transcript_projection_cache = undefined,
             .compact_transcript_source_cache = undefined,
         };
-        for (&result.full_transcript_projection_cache.review.entries) |*entry| {
-            entry.* = null;
-        }
-        result.full_transcript_projection_cache.review.next_replacement = 0;
-        for (&result.full_transcript_projection_cache.full.entries) |*entry| {
-            entry.* = null;
-        }
-        result.full_transcript_projection_cache.full.next_replacement = 0;
-        result.full_transcript_projection_cache.relationships.cached = null;
         for (&result.compact_transcript_source_cache.entries) |*entry| {
             entry.* = null;
         }
@@ -4464,17 +3937,11 @@ pub const TranscriptRuntime = struct {
     pub fn deinit(self: *TranscriptRuntime, alloc: Allocator) void {
         self.disableShadowVt();
         self.full_transcript_page_load.deinit();
-        if (self.full_transcript_page_projection) |*projection| {
-            projection.deinit(std.heap.c_allocator);
-        }
-        if (self.full_transcript_page_source) |*source| {
-            source.deinit(std.heap.c_allocator);
-        }
+        if (self.full_transcript_installed_page) |*page| page.deinit();
         if (self.full_transcript_loading_projection) |*projection| {
             projection.deinit(alloc);
         }
         self.compact_transcript_source_cache.deinit(alloc);
-        self.full_transcript_projection_cache.deinit(alloc);
         self.lifecycle_state.deinit(alloc);
         for (self.tool_details.items) |*detail| detail.deinit(alloc);
         self.tool_details.deinit(alloc);
@@ -5985,7 +5452,9 @@ pub const TranscriptRuntime = struct {
 
     pub fn clearFullTranscriptDetails(self: *TranscriptRuntime, alloc: Allocator) void {
         self.compact_transcript_source_cache.deinit(alloc);
-        self.full_transcript_projection_cache.deinit(alloc);
+        self.resetFullTranscriptPageNavigation();
+        if (self.full_transcript_installed_page) |*page| page.deinit();
+        self.full_transcript_installed_page = null;
         self.clearToolDetails(alloc);
         self.full_transcript = self.full_transcript.closed();
     }
@@ -6527,7 +5996,6 @@ pub const TranscriptRuntime = struct {
 
     fn resetFullTranscriptPageNavigation(self: *TranscriptRuntime) void {
         self.full_transcript_page_anchor = .tail;
-        self.full_transcript_page_request = null;
         self.full_transcript_page_load.cancelActive();
     }
 
@@ -6544,7 +6012,7 @@ pub const TranscriptRuntime = struct {
         direction: input_action.MouseWheel,
         unit: FullTranscriptScrollUnit,
     ) void {
-        if (self.full_transcript_page_request != null and
+        if (self.full_transcript_page_load.busy() and
             self.installedFullTranscriptPageProjection() == null)
         {
             debug_trace.logf(
@@ -6564,31 +6032,39 @@ pub const TranscriptRuntime = struct {
             .down => .down,
         }, rows);
         const local_visible_rows = @max(@as(u32, 1), self.layout.rows -| 4);
-        const local_total_rows = if (self.full_transcript_page_projection) |*projection|
-            projection.measured_total_rows
+        const local_total_rows = if (self.full_transcript_installed_page) |*page|
+            page.projection.measured_total_rows
         else
             0;
         const local_max_offset = local_total_rows -| local_visible_rows;
         const adjacent_anchor = switch (direction) {
             .up => if (before == 0 and self.full_transcript.scroll_rows == 0)
-                full_transcript_page.previousAnchor(self.full_transcript_page_range)
+                if (self.full_transcript_installed_page) |*page|
+                    full_transcript_page.previousAnchor(page.source.range)
+                else
+                    null
             else
                 null,
             .down => if (before >= local_max_offset and
-                self.full_transcript_page_projection != null)
+                self.full_transcript_installed_page != null)
                 full_transcript_page.nextAnchor(
-                    self.full_transcript_page_range,
+                    self.full_transcript_installed_page.?.source.range,
                     self.entries.items.len,
                 )
             else
                 null,
         };
         if (adjacent_anchor) |anchor| {
-            self.full_transcript_page_anchor = anchor;
-            self.full_transcript.scroll_rows = 0;
-            self.full_transcript.follow_tail = direction == .up;
-            self.full_transcript.bookmark_pending = false;
-            self.full_transcript.anchor_pending = false;
+            const boundary_index = switch (anchor) {
+                .entry_index => |index| index,
+                .tail => unreachable,
+            };
+            if (boundary_index < self.entries.items.len) {
+                self.full_transcript_page_anchor = anchor;
+                self.full_transcript = self.full_transcript.select_page_boundary(
+                    self.entries.items[boundary_index].id(),
+                );
+            }
         }
         debug_trace.logf(
             "full_transcript_cache",
@@ -9608,35 +9084,27 @@ pub const TranscriptRuntime = struct {
         defer task.deinit();
 
         const request = task.source.request;
-        const key = full_transcript_page.Key{
-            .generation = request.generation,
-            .content_revision = request.content_revision,
-            .cols = request.cols,
-        };
+        const desired = self.desiredFullTranscriptPageRequest();
         var installed = false;
         if (task.failure) |failure| {
             if (failure != error.InputPending) {
                 debug_trace.logf(
                     "full_transcript_cache",
-                    "page_build_failed generation={d} err={s}",
-                    .{ request.generation, @errorName(failure) },
+                    "page_build_failed revision={d} cols={d} err={s}",
+                    .{ request.content_revision, request.cols, @errorName(failure) },
                 );
             }
-        } else if (self.full_transcript_page_request) |current| {
-            if (full_transcript_page.accepts(current, key) or
-                full_transcript_page.sameSurface(current, request))
-            {
-                if (self.full_transcript_page_projection) |*projection| {
-                    projection.deinit(std.heap.c_allocator);
-                }
-                if (self.full_transcript_page_source) |*source| {
-                    source.deinit(std.heap.c_allocator);
-                }
-                self.full_transcript_page_projection = task.takeProjection();
-                self.full_transcript_page_source = task.takeSource();
-                self.full_transcript_page_key = key;
-                self.full_transcript_page_range = task.source.range;
-                installed = self.full_transcript_page_projection != null;
+        } else if (!task.cancel_requested.load(.acquire) and
+            full_transcript_page.sameSurface(desired, request))
+        {
+            if (task.takeProjection()) |projection| {
+                const source = task.takeSource();
+                if (self.full_transcript_installed_page) |*page| page.deinit();
+                self.full_transcript_installed_page = .{
+                    .source = source,
+                    .projection = projection,
+                };
+                installed = true;
             }
         }
 
@@ -9661,30 +9129,28 @@ pub const TranscriptRuntime = struct {
     fn installedFullTranscriptPageProjection(
         self: *TranscriptRuntime,
     ) ?*full_transcript_screen.Projection {
-        const request = self.full_transcript_page_request orelse return null;
-        const projection = if (self.full_transcript_page_projection) |*value|
-            value
-        else
-            return null;
-        if (self.full_transcript_page_source) |*source| {
-            if (full_transcript_page.sameSurface(request, source.request)) {
-                return projection;
-            }
-        }
-        if (self.full_transcript_page_key) |key| {
-            if (full_transcript_page.accepts(request, key)) return projection;
-        }
-        return null;
+        const page = if (self.full_transcript_installed_page) |*value| value else return null;
+        return if (full_transcript_page.sameSurface(
+            self.desiredFullTranscriptPageRequest(),
+            page.source.request,
+        )) &page.projection else null;
     }
 
     pub fn preparedFullTranscriptPageCapability(
         self: *TranscriptRuntime,
     ) ?*session_child_store.SessionChildCapability {
-        const source = if (self.full_transcript_page_source) |*value|
-            value
-        else
-            return null;
-        return if (source.capability) |*capability| capability else null;
+        const page = if (self.full_transcript_installed_page) |*value| value else return null;
+        return if (page.source.capability) |*capability| capability else null;
+    }
+
+    fn desiredFullTranscriptPageRequest(
+        self: *const TranscriptRuntime,
+    ) full_transcript_page.Request {
+        return .{
+            .content_revision = self.full_transcript_content_revision,
+            .cols = self.layout.cols,
+            .anchor = self.full_transcript_page_anchor,
+        };
     }
 
     fn ensureFullTranscriptPageLoad(
@@ -9692,59 +9158,25 @@ pub const TranscriptRuntime = struct {
         capability: ?*session_child_store.SessionChildCapability,
         full_diff_resolver: ?full_transcript_screen.FullDiffResolver,
     ) !void {
-        if (self.full_transcript_page_request == null and
-            self.full_transcript_page_projection != null)
-        {
-            if (self.full_transcript_page_source) |source| {
-                if (self.full_transcript_page_key) |key| {
-                    if (full_transcript_page.reusable(
-                        source.request,
-                        key,
-                        self.full_transcript_content_revision,
-                        self.layout.cols,
-                        self.full_transcript_page_anchor,
-                    )) {
-                        self.full_transcript_page_request = source.request;
-                        return;
-                    }
-                }
-            }
-        }
-        if (self.full_transcript_page_request) |request| {
-            const same_viewport = request.content_revision == self.full_transcript_content_revision and
-                request.cols == self.layout.cols and
-                std.meta.eql(request.anchor, self.full_transcript_page_anchor);
-            if (same_viewport) {
-                if (self.full_transcript_page_key) |key| {
-                    if (full_transcript_page.accepts(request, key) and
-                        self.full_transcript_page_projection != null) return;
-                }
-                if (self.full_transcript_page_load.hasRequest(request)) return;
-                if (self.full_transcript_page_load.busy()) return;
-            }
+        const request = self.desiredFullTranscriptPageRequest();
+        if (self.full_transcript_installed_page) |*page| {
+            if (full_transcript_page.sameRequest(request, page.source.request)) return;
         }
         if (self.command_output_display.open_command_block != null) {
-            if (self.full_transcript_page_source) |source| {
-                const same_surface = source.request.cols == self.layout.cols and
-                    std.meta.eql(source.request.anchor, self.full_transcript_page_anchor);
-                if (same_surface and !full_transcript_page.liveRefreshDue(
-                    source.request.content_revision,
-                    self.full_transcript_content_revision,
-                )) return;
+            if (self.full_transcript_installed_page) |*page| {
+                if (full_transcript_page.sameSurface(request, page.source.request) and
+                    !full_transcript_page.liveRefreshDue(
+                        page.source.request.content_revision,
+                        self.full_transcript_content_revision,
+                    )) return;
             }
         }
 
-        const request = full_transcript_page.Request{
-            .generation = self.full_transcript_page_load.allocateGeneration(),
-            .content_revision = self.full_transcript_content_revision,
-            .cols = self.layout.cols,
-            .anchor = self.full_transcript_page_anchor,
-        };
+        if (self.full_transcript_page_load.hasRequest(request)) return;
         if (self.full_transcript_page_load.busy()) {
             if (!self.full_transcript_page_load.hasCompatibleRequest(request)) {
                 self.full_transcript_page_load.cancelActive();
             }
-            self.full_transcript_page_request = request;
             return;
         }
         var source = try self.snapshotFullTranscriptPage(
@@ -9756,7 +9188,6 @@ pub const TranscriptRuntime = struct {
         errdefer if (source_owned) source.deinit(std.heap.c_allocator);
         try self.full_transcript_page_load.schedule(source);
         source_owned = false;
-        self.full_transcript_page_request = request;
     }
 
     fn snapshotFullTranscriptPage(
@@ -9860,9 +9291,10 @@ pub const TranscriptRuntime = struct {
         }
         debug_trace.logf(
             "full_transcript_cache",
-            "page_snapshot generation={d} range={d}..{d} entries={d} details={d} blocks={d} diffs={d}",
+            "page_snapshot revision={d} cols={d} range={d}..{d} entries={d} details={d} blocks={d} diffs={d}",
             .{
-                request.generation,
+                request.content_revision,
+                request.cols,
                 range.start,
                 range.end,
                 source.entries.items.len,
@@ -10086,140 +9518,6 @@ pub const TranscriptRuntime = struct {
         return &self.full_transcript_loading_projection.?;
     }
 
-    pub fn cachedFullTranscriptProjection(
-        self: *TranscriptRuntime,
-        alloc: Allocator,
-        full_diff_resolver: ?full_transcript_screen.FullDiffResolver,
-    ) !*full_transcript_screen.Projection {
-        return self.cachedFullTranscriptProjectionInterruptible(
-            alloc,
-            full_diff_resolver,
-            null,
-        ) catch |err| switch (err) {
-            error.InputPending => unreachable,
-            else => |other| return other,
-        };
-    }
-
-    pub fn cachedFullTranscriptProjectionInterruptible(
-        self: *TranscriptRuntime,
-        alloc: Allocator,
-        full_diff_resolver: ?full_transcript_screen.FullDiffResolver,
-        checkpoint: ?*build_checkpoint.BuildCheckpoint,
-    ) !*full_transcript_screen.Projection {
-        self.prepareFullTranscriptProjectionLayout();
-        const cache = switch (self.full_transcript.depth) {
-            .inline_mode, .full => &self.full_transcript_projection_cache.full,
-        };
-        const content_revision = switch (self.full_transcript.depth) {
-            .inline_mode, .full => self.full_transcript_content_revision,
-        };
-        if (cache.find(
-            content_revision,
-            self.layout.cols,
-            full_diff_resolver,
-        )) |projection| {
-            debug_trace.logf(
-                "full_transcript_cache",
-                "hit depth={s} revision={d} cols={d} measured_cols={any}",
-                .{ @tagName(self.full_transcript.depth), content_revision, self.layout.cols, projection.measurement_cols },
-            );
-            return projection;
-        }
-
-        debug_trace.logf(
-            "full_transcript_cache",
-            "miss depth={s} revision={d} cols={d}",
-            .{ @tagName(self.full_transcript.depth), content_revision, self.layout.cols },
-        );
-
-        if (cache.incrementalCandidate(self.layout.cols, full_diff_resolver)) |cached| {
-            const dirty_entry = switch (cached.dirty) {
-                .entry => |entry| entry,
-                .clean, .all => unreachable,
-            };
-            if (cachedEntryPrefixMatches(
-                self.entries.items,
-                cached.entry_count,
-                cached.prefix_last_entry_id,
-            )) {
-                if (tool_group_projection.incrementalRebuildStart(
-                    self.entries.items,
-                    self.tool_details.items,
-                    dirty_entry.index,
-                )) |relationship_start| {
-                    var start_index = relationship_start;
-                    if (start_index > 0) {
-                        const previous_id = self.entries.items[start_index - 1].id();
-                        const context_id = cached.projection.retainedContextEntryId(previous_id);
-                        start_index = if (context_id) |entry_id|
-                            tool_group_projection.incrementalRebuildStart(
-                                self.entries.items,
-                                self.tool_details.items,
-                                self.transcriptEntryIndex(entry_id) orelse start_index - 1,
-                            ) orelse start_index - 1
-                        else
-                            0;
-                    }
-                    if (start_index < cached.entry_count) {
-                        var suffix = try self.buildFullTranscriptProjectionUncachedFrom(
-                            alloc,
-                            full_diff_resolver,
-                            null,
-                            start_index,
-                            checkpoint,
-                        );
-                        defer suffix.deinit(alloc);
-                        if (try cached.projection.replaceFromEntry(
-                            alloc,
-                            self.entries.items[start_index].id(),
-                            &suffix,
-                        )) {
-                            cached.content_revision = content_revision;
-                            cached.entry_count = self.entries.items.len;
-                            cached.prefix_last_entry_id = entryPrefixBoundaryId(
-                                self.entries.items,
-                                self.entries.items.len,
-                            );
-                            cached.dirty = .clean;
-                            debug_trace.logf(
-                                "full_transcript_cache",
-                                "append depth={s} revision={d} start_entry_id={d} entries={d}",
-                                .{
-                                    @tagName(self.full_transcript.depth),
-                                    content_revision,
-                                    self.entries.items[start_index].id(),
-                                    self.entries.items.len - start_index,
-                                },
-                            );
-                            return &cached.projection;
-                        }
-                    }
-                }
-            }
-            cached.dirty = .all;
-        }
-
-        var replacement = try self.buildFullTranscriptProjectionUncached(
-            alloc,
-            full_diff_resolver,
-            null,
-            checkpoint,
-        );
-        errdefer replacement.deinit(alloc);
-        return cache.insert(alloc, .{
-            .projection = replacement,
-            .content_revision = content_revision,
-            .entry_count = self.entries.items.len,
-            .prefix_last_entry_id = entryPrefixBoundaryId(
-                self.entries.items,
-                self.entries.items.len,
-            ),
-            .cols = self.layout.cols,
-            .resolver = full_diff_resolver,
-        });
-    }
-
     fn prepareFullTranscriptProjectionLayout(self: *TranscriptRuntime) void {
         self.full_transcript = self.full_transcript.prepare_projection(
             self.layout.cols,
@@ -10250,13 +9548,16 @@ pub const TranscriptRuntime = struct {
         start_index: usize,
         checkpoint: ?*build_checkpoint.BuildCheckpoint,
     ) !full_transcript_screen.Projection {
-        const relationships = try self.cachedFullTranscriptRelationshipsInterruptible(
+        var relationships = try tool_group_projection.buildExpandedRelationshipsInterruptible(
             alloc,
+            self.entries.items,
+            self.tool_details.items,
             checkpoint,
         );
+        defer relationships.deinit(alloc);
         var entry_actions = try tool_group_projection.materializeExpandedRelationshipsRangeInterruptible(
             alloc,
-            relationships,
+            &relationships,
             start_index,
             self.layout.cols,
             .{
@@ -10279,88 +9580,6 @@ pub const TranscriptRuntime = struct {
             entry_actions.entry_actions.items,
             checkpoint,
         );
-    }
-
-    fn cachedFullTranscriptRelationshipsInterruptible(
-        self: *TranscriptRuntime,
-        alloc: Allocator,
-        checkpoint: ?*build_checkpoint.BuildCheckpoint,
-    ) !*tool_group_projection.Projection {
-        const cache = &self.full_transcript_projection_cache.relationships;
-        if (cache.cached) |*cached| {
-            switch (cached.dirty) {
-                .clean => if (cached.content_revision == self.full_transcript_content_revision) {
-                    debug_trace.logf(
-                        "full_transcript_cache",
-                        "relationships_hit revision={d} entries={d}",
-                        .{ cached.content_revision, cached.entry_count },
-                    );
-                    return &cached.projection;
-                },
-                .entry => |entry| {
-                    if (cachedEntryPrefixMatches(
-                        self.entries.items,
-                        cached.entry_count,
-                        cached.prefix_last_entry_id,
-                    )) {
-                        if (tool_group_projection.incrementalRebuildStart(
-                            self.entries.items,
-                            self.tool_details.items,
-                            entry.index,
-                        )) |start_index| {
-                            if (start_index <= cached.projection.entry_actions.items.len) {
-                                var suffix = try tool_group_projection.buildExpandedRelationshipsInterruptible(
-                                    alloc,
-                                    self.entries.items[start_index..],
-                                    self.tool_details.items,
-                                    checkpoint,
-                                );
-                                defer suffix.deinit(alloc);
-                                try cached.projection.replaceSuffix(alloc, start_index, &suffix);
-                                cached.content_revision = self.full_transcript_content_revision;
-                                cached.entry_count = self.entries.items.len;
-                                cached.prefix_last_entry_id = entryPrefixBoundaryId(
-                                    self.entries.items,
-                                    self.entries.items.len,
-                                );
-                                cached.dirty = .clean;
-                                debug_trace.logf(
-                                    "full_transcript_cache",
-                                    "relationships_append revision={d} start_index={d} entries={d}",
-                                    .{ cached.content_revision, start_index, cached.entry_count },
-                                );
-                                return &cached.projection;
-                            }
-                        }
-                    }
-                },
-                .all => {},
-            }
-        }
-
-        var replacement = try tool_group_projection.buildExpandedRelationshipsInterruptible(
-            alloc,
-            self.entries.items,
-            self.tool_details.items,
-            checkpoint,
-        );
-        errdefer replacement.deinit(alloc);
-        if (cache.cached) |*cached| cached.projection.deinit(alloc);
-        cache.cached = .{
-            .projection = replacement,
-            .content_revision = self.full_transcript_content_revision,
-            .entry_count = self.entries.items.len,
-            .prefix_last_entry_id = entryPrefixBoundaryId(
-                self.entries.items,
-                self.entries.items.len,
-            ),
-        };
-        debug_trace.logf(
-            "full_transcript_cache",
-            "relationships_rebuild revision={d} entries={d}",
-            .{ self.full_transcript_content_revision, self.entries.items.len },
-        );
-        return &cache.cached.?.projection;
     }
 
     pub noinline fn prepareFullTranscriptSurfacePaint(
@@ -10544,14 +9763,14 @@ pub const TranscriptRuntime = struct {
             return false;
         }
         if (self.full_transcript_page_load.busy()) return true;
-        const source = self.full_transcript_page_source orelse return false;
-        if (source.request.cols != self.layout.cols or
-            !std.meta.eql(source.request.anchor, self.full_transcript_page_anchor))
+        const page = if (self.full_transcript_installed_page) |*value| value else return false;
+        if (page.source.request.cols != self.layout.cols or
+            !std.meta.eql(page.source.request.anchor, self.full_transcript_page_anchor))
         {
             return false;
         }
         return !full_transcript_page.liveRefreshDue(
-            source.request.content_revision,
+            page.source.request.content_revision,
             self.full_transcript_content_revision,
         );
     }
@@ -10566,8 +9785,6 @@ pub const TranscriptRuntime = struct {
 
     pub fn markTranscriptContentDirty(self: *TranscriptRuntime) void {
         self.full_transcript_content_revision +%= 1;
-        self.full_transcript_projection_cache.relationships.markDirtyAll();
-        self.full_transcript_projection_cache.full.markDirtyAll();
         debug_trace.logf(
             "full_transcript_cache",
             "content_dirty content_revision={d} command_open={s}",
@@ -10581,8 +9798,6 @@ pub const TranscriptRuntime = struct {
 
     pub fn markTranscriptStructureDirty(self: *TranscriptRuntime) void {
         self.full_transcript_content_revision +%= 1;
-        self.full_transcript_projection_cache.relationships.markDirtyAll();
-        self.full_transcript_projection_cache.full.markDirtyAll();
         debug_trace.logf(
             "full_transcript_cache",
             "structure_dirty content_revision={d}",
@@ -10591,26 +9806,11 @@ pub const TranscriptRuntime = struct {
         self.markTranscriptDirty();
     }
 
-    fn transcriptEntryIndex(self: *const TranscriptRuntime, entry_id: u32) ?usize {
-        var index = self.entries.items.len;
-        while (index > 0) {
-            index -= 1;
-            if (self.entries.items[index].id() == entry_id) return index;
-        }
-        return null;
-    }
-
     pub fn markTranscriptContentDirtyFrom(
         self: *TranscriptRuntime,
         entry_id: u32,
     ) void {
-        const entry_index = self.transcriptEntryIndex(entry_id) orelse {
-            self.markTranscriptContentDirty();
-            return;
-        };
         self.full_transcript_content_revision +%= 1;
-        self.full_transcript_projection_cache.relationships.markDirtyFrom(entry_id, entry_index);
-        self.full_transcript_projection_cache.full.markDirtyFrom(entry_id, entry_index);
         debug_trace.logf(
             "full_transcript_cache",
             "content_dirty_from entry_id={d} content_revision={d} command_open={s}",
@@ -10625,8 +9825,6 @@ pub const TranscriptRuntime = struct {
 
     pub fn markTranscriptCommandOutputDirty(self: *TranscriptRuntime) void {
         self.full_transcript_content_revision +%= 1;
-        self.full_transcript_projection_cache.relationships.markDirtyAll();
-        self.full_transcript_projection_cache.full.markDirtyAll();
         debug_trace.logf(
             "full_transcript_cache",
             "command_output_dirty content_revision={d}",
@@ -10639,13 +9837,7 @@ pub const TranscriptRuntime = struct {
         self: *TranscriptRuntime,
         entry_id: u32,
     ) void {
-        const entry_index = self.transcriptEntryIndex(entry_id) orelse {
-            self.markTranscriptCommandOutputDirty();
-            return;
-        };
         self.full_transcript_content_revision +%= 1;
-        self.full_transcript_projection_cache.relationships.markDirtyFrom(entry_id, entry_index);
-        self.full_transcript_projection_cache.full.markDirtyFrom(entry_id, entry_index);
         debug_trace.logf(
             "full_transcript_cache",
             "command_output_dirty_from entry_id={d} content_revision={d}",
@@ -10752,27 +9944,10 @@ pub const TranscriptRuntime = struct {
     }
 };
 
-test "transcript runtime initializer preserves empty projection caches" {
+test "transcript runtime initializer preserves an empty compact source cache" {
     var runtime = TranscriptRuntime.init();
     defer runtime.deinit(std.testing.allocator);
 
-    for (runtime.full_transcript_projection_cache.review.entries) |entry| {
-        try std.testing.expect(entry == null);
-    }
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        runtime.full_transcript_projection_cache.review.next_replacement,
-    );
-    for (runtime.full_transcript_projection_cache.full.entries) |entry| {
-        try std.testing.expect(entry == null);
-    }
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        runtime.full_transcript_projection_cache.full.next_replacement,
-    );
-    try std.testing.expect(
-        runtime.full_transcript_projection_cache.relationships.cached == null,
-    );
     for (runtime.compact_transcript_source_cache.entries) |entry| {
         try std.testing.expect(entry == null);
     }
