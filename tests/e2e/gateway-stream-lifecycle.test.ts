@@ -731,10 +731,10 @@ describe("gateway stream lifecycle", () => {
       expect(serializedToolNames(oracleRequest)).toEqual(
         AUTO_PERPLEXITY_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES,
       );
-      expect(request.tools).toHaveLength(25);
+      expect(request.tools).toHaveLength(17);
       expect(findUnavailableCapabilityReferences(oracleRequest)).toEqual([]);
       expect(customProviderGuidanceState(oracleRequest)).toEqual({
-          providerToolIndices: [22],
+        providerToolIndices: [14],
         guidanceMessageIndices: [1],
       });
       expect(request.prompt[0]?.role).toBe("system");

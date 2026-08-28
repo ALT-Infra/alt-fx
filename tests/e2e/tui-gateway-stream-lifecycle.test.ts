@@ -7019,7 +7019,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           .toHaveLength(1);
         expect(findUnavailableCapabilityReferences(request)).toEqual([]);
         expect(customProviderGuidanceState(request)).toEqual({
-          providerToolIndices: [23],
+          providerToolIndices: [15],
           guidanceMessageIndices: [1],
         });
         expect(
