@@ -1421,7 +1421,7 @@ test "session JSON round-trips images summaries and background commands" {
         .snapshot_path = @constCast("/tmp/fx-session/images/image-1.bin"),
         .snapshot_sha256 = @constCast("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
     }};
-    var completed_tool_names = [_][]u8{ @constCast("list_files"), @constCast("glob_files") };
+    var completed_tool_names = [_][]u8{ @constCast("glob_files"), @constCast("glob_files") };
     var root_user_messages = [_][]u8{ @constCast("first exact request"), @constCast("second exact request") };
     const history = [_]session.HistoryTurn{
         .{ .assistant = .{
@@ -1509,7 +1509,7 @@ test "session JSON round-trips images summaries and background commands" {
     try std.testing.expect(loaded.history[4].interrupted.tool_call == null);
     try std.testing.expectEqualStrings("test tools", loaded.history[5].interrupted.user.text);
     try std.testing.expectEqual(@as(usize, 2), loaded.history[5].interrupted.completed_tool_names.len);
-    try std.testing.expectEqualStrings("list_files", loaded.history[5].interrupted.completed_tool_names[0]);
+    try std.testing.expectEqualStrings("glob_files", loaded.history[5].interrupted.completed_tool_names[0]);
     try std.testing.expectEqualStrings("glob_files", loaded.history[5].interrupted.completed_tool_names[1]);
 
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -1908,7 +1908,7 @@ test "legacy interrupted session sanitizes duplicate-key tool arguments" {
         "{\"schema_version\":1,\"id\":\"legacy-interrupted\",\"created_at_ms\":1,\"updated_at_ms\":2," ++
         "\"workspace_root\":\"/tmp/workspace\",\"conversation_language\":\"en\",\"history_len\":1,\"history\":[" ++
         "{\"kind\":\"interrupted\",\"user\":{\"text\":\"inspect\",\"images\":[]},\"assistant\":\"working\"," ++
-        "\"tool_call\":{\"id\":\"call_bad\",\"name\":\"list_files\",\"arguments_json\":\"{\\\"depth\\\":1,\\\"depth\\\":2}\",\"provider_result\":null}," ++
+        "\"tool_call\":{\"id\":\"call_bad\",\"name\":\"glob_files\",\"arguments_json\":\"{\\\"depth\\\":1,\\\"depth\\\":2}\",\"provider_result\":null}," ++
         "\"completed_tool_names\":[]}]}";
 
     var loaded = try parseStoredSession(TestStoredSession, std.testing.allocator, json);
@@ -1924,7 +1924,7 @@ test "legacy session JSON rejects ambiguous malformed tool result pairings" {
         "\"output\":\"stale\",\"output_handle\":null,\"preview\":null,\"output_bytes\":5,\"stored_output_bytes\":5," ++
         "\"truncated\":false,\"provider_native\":false,\"created_at_ms\":1}";
     const list_result =
-        "{\"tool_call_id\":\"call_bad\",\"tool_name\":\"list_files\",\"status\":\"success\"," ++
+        "{\"tool_call_id\":\"call_bad\",\"tool_name\":\"glob_files\",\"status\":\"success\"," ++
         "\"output\":\"stale\",\"output_handle\":null,\"preview\":null,\"output_bytes\":5,\"stored_output_bytes\":5," ++
         "\"truncated\":false,\"provider_native\":false,\"created_at_ms\":1}";
     const cases = [_]struct {
