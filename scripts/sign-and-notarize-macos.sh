@@ -56,7 +56,6 @@ printf '%s' "${APPLE_NOTARY_KEY_P8_BASE64}" \
 "${security_bin}" import "${certificate_path}" \
     -k "${signing_keychain}" \
     -P "${APPLE_DEVELOPER_ID_P12_PASSWORD}" \
-    -t cert \
     -f pkcs12 \
     -T /usr/bin/codesign \
     -T /usr/bin/security
