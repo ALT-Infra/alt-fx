@@ -198,6 +198,12 @@ function startOpenCodeTeamUxServer() {
           { id: "deepseek-v4-pro", object: "model" },
         ] });
       }
+      if (url.pathname === "/protocols") {
+        return Response.json({
+          opencode: { npm: "@ai-sdk/openai-compatible", models: {} },
+          "opencode-go": { npm: "@ai-sdk/openai-compatible", models: {} },
+        });
+      }
       if (url.pathname !== "/chat") return new Response("not found", { status: 404 });
       await request.text();
       requestCount += 1;
@@ -223,6 +229,7 @@ function startOpenCodeTeamUxServer() {
     chatUrl: `http://127.0.0.1:${server.port}/chat`,
     zenModelsUrl: `http://127.0.0.1:${server.port}/zen/models`,
     goModelsUrl: `http://127.0.0.1:${server.port}/go/models`,
+    protocolMetadataUrl: `http://127.0.0.1:${server.port}/protocols`,
     stop() {
       server.stop(true);
     },
@@ -523,6 +530,7 @@ describe.skipIf(SKIP)("tui: orchestration extension host", () => {
             FX_E2E_OPENCODE_CHAT_URL: provider.chatUrl,
             FX_E2E_OPENCODE_ZEN_MODELS_URL: provider.zenModelsUrl,
             FX_E2E_OPENCODE_GO_MODELS_URL: provider.goModelsUrl,
+            FX_E2E_OPENCODE_PROTOCOL_METADATA_URL: provider.protocolMetadataUrl,
             FX_SKIP_ONBOARDING: "1",
             OPENCODE_API_KEY: undefined,
           },

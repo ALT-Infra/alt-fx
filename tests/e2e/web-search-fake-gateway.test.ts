@@ -1190,6 +1190,12 @@ describe("web_search Gateway fixture", () => {
           if (url.pathname === "/go/models") {
             return Response.json({ data: [{ id: "kimi-k3", object: "model" }] });
           }
+          if (url.pathname === "/protocols") {
+            return Response.json({
+              opencode: { npm: "@ai-sdk/openai-compatible", models: {} },
+              "opencode-go": { npm: "@ai-sdk/openai-compatible", models: {} },
+            });
+          }
           if (url.pathname === "/chat") {
             const body = await request.text();
             if (!body.includes(SEARCH_SENTINEL)) {
@@ -1308,6 +1314,7 @@ describe("web_search Gateway fixture", () => {
       const opencodeEnv = {
         FX_E2E_OPENCODE_ZEN_MODELS_URL: `http://127.0.0.1:${opencode.port}/zen/models`,
         FX_E2E_OPENCODE_GO_MODELS_URL: `http://127.0.0.1:${opencode.port}/go/models`,
+        FX_E2E_OPENCODE_PROTOCOL_METADATA_URL: `http://127.0.0.1:${opencode.port}/protocols`,
         FX_E2E_OPENCODE_CHAT_URL: `http://127.0.0.1:${opencode.port}/chat`,
       };
       try {

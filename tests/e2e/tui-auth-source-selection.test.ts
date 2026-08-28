@@ -781,7 +781,24 @@ function startFakeOpenCode() {
         return Response.json({ data: [
           { id: "minimax-m3", object: "model" },
           { id: "kimi-k3", object: "model" },
+          { id: "glm-5.3-flash", object: "model" },
         ] });
+      }
+      if (url.pathname === "/protocols") {
+        return Response.json({
+          opencode: {
+            npm: "@ai-sdk/openai-compatible",
+            models: {
+              "gpt-5.6-sol": { provider: { npm: "@ai-sdk/openai" } },
+            },
+          },
+          "opencode-go": {
+            npm: "@ai-sdk/openai-compatible",
+            models: {
+              "minimax-m3": { provider: { npm: "@ai-sdk/anthropic" } },
+            },
+          },
+        });
       }
       if (url.pathname === "/chat") {
         return new Response(
@@ -801,6 +818,7 @@ function startFakeOpenCode() {
     env: {
       FX_E2E_OPENCODE_ZEN_MODELS_URL: `${baseUrl}/zen/models`,
       FX_E2E_OPENCODE_GO_MODELS_URL: `${baseUrl}/go/models`,
+      FX_E2E_OPENCODE_PROTOCOL_METADATA_URL: `${baseUrl}/protocols`,
       FX_E2E_OPENCODE_CHAT_URL: `${baseUrl}/chat`,
     },
     stop() { server.stop(true); },
@@ -2801,7 +2819,7 @@ test("OpenCode CLI login filters protocols, routes its key directly, and logs ou
     expect(models.code, `stdout: ${models.stdout}\nstderr: ${models.stderr}`).toBe(0);
     const modelIds = (JSON.parse(models.stdout) as { models: Array<{ id: string }> }).models
       .map((model) => model.id);
-    expect(modelIds).toEqual(["big-pickle", "go/kimi-k3"]);
+    expect(modelIds).toEqual(["big-pickle", "go/kimi-k3", "go/glm-5.3-flash"]);
 
     const ask = await runFx(["ask", "--json", "--auto", "--no-save", "Answer directly."], {
       env: storedEnv,

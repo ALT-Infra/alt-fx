@@ -78,7 +78,7 @@ The OpenAI Codex route uses ChatGPT subscription access directly and never sends
 
 The Grok route uses subscription access directly at xAI and never sends its OAuth token to Vercel AI Gateway or OpenAI. Its session is stored privately at `~/.fx/grok-auth.json`, refreshed when needed, and used only with the authenticated xAI catalog and Responses API.
 
-`fx login opencode` imports `OPENCODE_API_KEY` into a private copy at `~/.fx/opencode-auth.json`; later commands use that saved copy, so `fx logout opencode` remains effective even while the environment variable is exported. The OpenCode route sends the saved key only to OpenCode. fx currently lists the Zen and Go models whose published endpoint uses OpenAI-compatible Chat Completions; models requiring OpenAI Responses, Anthropic Messages, or Gemini protocols remain hidden. Go model IDs use the `go/<model-id>` prefix in fx.
+`fx login opencode` imports `OPENCODE_API_KEY` into a private copy at `~/.fx/opencode-auth.json`; later commands use that saved copy, so `fx logout opencode` remains effective even while the environment variable is exported. The OpenCode route sends the saved key only to OpenCode. fx discovers availability from OpenCode's live Zen and Go catalogs and uses the live provider metadata maintained by OpenCode's models.dev project to select models served through OpenAI-compatible Chat Completions. New compatible models therefore appear without an fx release, while models explicitly assigned to OpenAI Responses, Anthropic Messages, or Gemini protocols remain hidden until fx supports those transports. Go model IDs use the `go/<model-id>` prefix in fx.
 
 ### Web search through Parallel
 
