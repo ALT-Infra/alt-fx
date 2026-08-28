@@ -2053,13 +2053,11 @@ test "semantic code block colors source and keeps current footer rail styled thr
     try h.flush();
 
     var code_row = try findRowContaining(&h, "const hook");
-    var code_cell = h.vt.cellAt(code_row, 5) orelse return error.TestMissingCodeCell;
+    var code_cell = h.vt.cellAt(code_row, 3) orelse return error.TestMissingCodeCell;
     try std.testing.expectEqual(@as(u21, 'c'), code_cell.codepoint);
     try std.testing.expect(code_cell.style.fg.eql(.{ .indexed = 252 }));
-    const code_border = h.vt.cellAt(code_row, 3) orelse return error.TestMissingCodeBorder;
-    try std.testing.expect(code_border.style.fg.eql(.default));
     var python_row = try findRowContaining(&h, "def ready");
-    var python_cell = h.vt.cellAt(python_row, 5) orelse return error.TestMissingCodeCell;
+    var python_cell = h.vt.cellAt(python_row, 3) orelse return error.TestMissingCodeCell;
     try std.testing.expectEqual(@as(u21, 'd'), python_cell.codepoint);
     try std.testing.expect(python_cell.style.fg.eql(.{ .indexed = 252 }));
     const initial_footer = try findFirstDividerRowAfter(&h, code_row);
@@ -2073,11 +2071,9 @@ test "semantic code block colors source and keeps current footer rail styled thr
     try h.flush();
 
     code_row = try findRowContaining(&h, "const hook");
-    code_cell = h.vt.cellAt(code_row, 5) orelse return error.TestMissingCodeCell;
+    code_cell = h.vt.cellAt(code_row, 3) orelse return error.TestMissingCodeCell;
     try std.testing.expectEqual(@as(u21, 'c'), code_cell.codepoint);
     try std.testing.expect(code_cell.style.fg.eql(.{ .indexed = 252 }));
-    const resized_border = h.vt.cellAt(code_row, 3) orelse return error.TestMissingCodeBorder;
-    try std.testing.expect(resized_border.style.fg.eql(.default));
     python_row = try findRowContaining(&h, "def ready");
     python_cell = h.vt.cellAt(python_row, 3) orelse return error.TestMissingCodeCell;
     try std.testing.expectEqual(@as(u21, 'd'), python_cell.codepoint);
@@ -2106,18 +2102,18 @@ test "semantic code block keeps readable light theme colors through resize" {
     try h.flush();
 
     var code_row = try findRowContaining(&h, "const value");
-    var keyword_cell = h.vt.cellAt(code_row, 5) orelse return error.TestMissingCodeCell;
+    var keyword_cell = h.vt.cellAt(code_row, 3) orelse return error.TestMissingCodeCell;
     try std.testing.expectEqual(@as(u21, 'c'), keyword_cell.codepoint);
     try std.testing.expect(keyword_cell.style.fg.eql(.{ .indexed = 238 }));
 
     try h.driveResize(20, 40, 4, true);
     code_row = try findRowContaining(&h, "const value");
-    keyword_cell = h.vt.cellAt(code_row, 5) orelse return error.TestMissingCodeCell;
+    keyword_cell = h.vt.cellAt(code_row, 3) orelse return error.TestMissingCodeCell;
     try std.testing.expectEqual(@as(u21, 'c'), keyword_cell.codepoint);
     try std.testing.expect(keyword_cell.style.fg.eql(.{ .indexed = 238 }));
 }
 
-test "semantic code block drops its frame before wrapping source that fits" {
+test "semantic code block keeps solid rules while source reflows" {
     var h = try Harness.init(std.testing.allocator, 44, 40, 4);
     defer h.deinit();
     try h.shell.initViewport(&h.metrics, 1);
@@ -2137,20 +2133,20 @@ test "semantic code block drops its frame before wrapping source that fits" {
     }
     try h.renderTranscriptFrame();
     try h.flush();
-    try expectGridContains(&h, "┌ text");
+    try expectGridContains(&h, "─ text");
 
     try h.driveResize(40, 40, 4, true);
-    try expectGridNotContains(&h, "┌ text");
+    try expectGridContains(&h, "─ text");
     const first_source_row = try findRowContaining(&h, "┌────────────────────────────────┐");
     try expectRowTrimmedEquals(&h, first_source_row, "      ┌────────────────────────────────┐");
     try expectRowTrimmedEquals(&h, first_source_row + 1, "      │ ROOT                           │");
     try expectRowTrimmedEquals(&h, first_source_row + 2, "      └────────────────────────────────┘");
 
     try h.driveResize(39, 40, 4, true);
-    try expectGridContains(&h, "┌ text");
+    try expectGridContains(&h, "─ text");
 
     try h.driveResize(44, 40, 4, true);
-    try expectGridContains(&h, "┌ text");
+    try expectGridContains(&h, "─ text");
 }
 
 test "streamed paragraphs keep words together through shrink and grow" {
