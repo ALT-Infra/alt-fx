@@ -4650,6 +4650,7 @@ test "processQueuedPrompt fails closed without stable credential authority" {
 
 test "processQueuedPrompt counts only failed provider attempts across tool followups" {
     const alloc = std.testing.allocator;
+    const decision_prompt = "Before choosing the next action, identify the concrete unmet requirement. If one remains, use only the tool needed for it. If none remains, respond normally.";
     const first_calls = [_]ToolCall{
         toolCall("call_first", "read_file", "{\"path\":\"first.txt\"}"),
     };
@@ -4700,6 +4701,18 @@ test "processQueuedPrompt counts only failed provider attempts across tool follo
     try std.testing.expectEqual(@as(usize, 1), continued_gateway.request_models.items.len);
     try expectBodyContains(&continued_gateway, 0, "call_first");
     try expectBodyContains(&continued_gateway, 0, "Re-run the response for the same user request.");
+    try expectGatewayPromptTailText(
+        &continued_gateway,
+        0,
+        .user,
+        decision_prompt,
+    );
+    try expectGatewayPromptTextCount(
+        &continued_gateway,
+        0,
+        decision_prompt,
+        1,
+    );
     try std.testing.expectEqualStrings("Finished after Continue", continued_hooks.history_assistant_text.?);
 }
 

@@ -3262,7 +3262,10 @@ fn processQueuedPromptLoop(
     else
         .none;
     var restore_recovery_source = job.recovery_checkpoint != null;
-    var post_tool_decision_pending = false;
+    var post_tool_decision_pending = if (job.recovery_checkpoint) |checkpoint|
+        checkpoint.execution.tool_steps.len > 0
+    else
+        false;
     var step: usize = 0;
     while (agent_steps.allowsStep(config.agent_step_limit, step)) : (step += 1) {
         current_step_index = step + 1;
