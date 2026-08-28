@@ -62,6 +62,7 @@ pub const ClientConfig = struct {
     client_secret: ?[]const u8 = null,
     client_metadata_url: ?[]const u8 = null,
     scopes: []const []const u8 = &.{},
+    callback_port: ?u16 = null,
 };
 
 pub const Credentials = struct {
@@ -1014,6 +1015,13 @@ pub fn authorizeAutomated(
     );
 }
 
+fn callbackRedirectUri(alloc: Allocator, configured_port: ?u16, bound_port: u16) ![]u8 {
+    if (configured_port) |port| {
+        return std.fmt.allocPrint(alloc, "http://localhost:{d}/callback", .{port});
+    }
+    return std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/callback", .{bound_port});
+}
+
 pub fn authorizeInteractive(
     alloc: Allocator,
     options: InteractiveAuthorizationOptions,
@@ -1021,13 +1029,17 @@ pub fn authorizeInteractive(
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
         return error.InteractiveMcpAuthorizationUnsupported;
     }
-    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
-    var listener = try address.listen(io_mod.getIo(), .{ .reuse_address = true });
+    const configured_port = options.config.callback_port;
+    var address = try std.Io.net.IpAddress.parse("127.0.0.1", configured_port orelse 0);
+    var listener = address.listen(io_mod.getIo(), .{ .reuse_address = true }) catch |err| {
+        if (configured_port != null) return error.McpCallbackPortUnavailable;
+        return err;
+    };
     defer listener.deinit(io_mod.getIo());
-    const redirect_uri = try std.fmt.allocPrint(
+    const redirect_uri = try callbackRedirectUri(
         alloc,
-        "http://127.0.0.1:{d}/callback",
-        .{listener.socket.address.getPort()},
+        configured_port,
+        listener.socket.address.getPort(),
     );
     defer alloc.free(redirect_uri);
     var context = InteractiveAuthorizationContext{
@@ -2463,6 +2475,21 @@ test "authorization redirect target must match the registered callback" {
             "http://localhost:3000/callback",
         ),
     );
+}
+
+test "interactive callback redirect honors a pinned port" {
+    const alloc = std.testing.allocator;
+
+    const pinned = try callbackRedirectUri(alloc, 3118, 54321);
+    defer alloc.free(pinned);
+    try std.testing.expectEqualStrings("http://localhost:3118/callback", pinned);
+    try std.testing.expect(isLoopbackEndpoint(pinned));
+    try validateRedirectTarget("http://localhost:3118/callback?code=one&state=two", pinned);
+
+    const ephemeral = try callbackRedirectUri(alloc, null, 54321);
+    defer alloc.free(ephemeral);
+    try std.testing.expectEqualStrings("http://127.0.0.1:54321/callback", ephemeral);
+    try std.testing.expect(isLoopbackEndpoint(ephemeral));
 }
 
 test "interactive callback wait observes caller and lifecycle cancellation" {
