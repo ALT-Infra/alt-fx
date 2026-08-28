@@ -1031,7 +1031,7 @@ pub fn authorizeInteractive(
     }
     const configured_port = options.config.callback_port;
     var address = try std.Io.net.IpAddress.parse("127.0.0.1", configured_port orelse 0);
-    var listener = address.listen(io_mod.getIo(), .{ .reuse_address = true }) catch |err| {
+    var listener = address.listen(io_mod.getIo(), .{ .reuse_address = configured_port == null }) catch |err| {
         if (configured_port != null) return error.McpCallbackPortUnavailable;
         return err;
     };
@@ -2490,6 +2490,31 @@ test "interactive callback redirect honors a pinned port" {
     defer alloc.free(ephemeral);
     try std.testing.expectEqualStrings("http://127.0.0.1:54321/callback", ephemeral);
     try std.testing.expect(isLoopbackEndpoint(ephemeral));
+}
+
+test "interactive callback rejects a pinned port already listening" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try address.listen(std.testing.io, .{ .reuse_address = true });
+    defer listener.deinit(std.testing.io);
+    var cancelled = std.atomic.Value(bool).init(true);
+    const OpenUrl = struct {
+        fn run(_: ?*anyopaque, _: Allocator, _: []const u8) anyerror!bool {
+            return true;
+        }
+    };
+    try std.testing.expectError(
+        error.McpCallbackPortUnavailable,
+        authorizeInteractive(std.testing.allocator, .{
+            .endpoint = "http://127.0.0.1:8080",
+            .challenge = .{},
+            .config = .{ .callback_port = listener.socket.address.getPort() },
+            .open_url = OpenUrl.run,
+            .cancel_flag = &cancelled,
+        }),
+    );
 }
 
 test "interactive callback wait observes caller and lifecycle cancellation" {
