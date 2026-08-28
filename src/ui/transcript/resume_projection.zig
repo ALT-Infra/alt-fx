@@ -192,11 +192,7 @@ pub const ResumeProjection = struct {
     }
 
     pub fn appendTurnSummary(self: *ResumeProjection, summary: types.TurnSummary) !void {
-        _ = try self.runtime.appendTurnSummaryEntryAt(
-            self.alloc,
-            summary,
-            summary.completed_at_ms,
-        );
+        _ = try self.runtime.appendTurnSummaryEntry(self.alloc, summary);
     }
 
     pub fn appendCommandOutput(

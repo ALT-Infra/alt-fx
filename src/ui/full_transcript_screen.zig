@@ -381,14 +381,6 @@ const ProjectionWindowStart = struct {
     checkpoint: ProjectionCheckpoint,
 };
 
-const ProjectionMeasurementPrefix = struct {
-    cols: u16,
-    segment_count: usize,
-    item_count: usize,
-    checkpoint: ProjectionCheckpoint,
-    anchor_row: ?u32,
-};
-
 /// A width-rendered Ctrl-O document. Static transcript bytes and retained
 /// command fallbacks are owned by the projection; stored-result handles remain
 /// borrowed and are read through the session capability only on demand.
@@ -401,44 +393,12 @@ pub const Projection = struct {
     measurement_cols: ?u16 = null,
     measured_total_rows: u32 = 0,
     measured_anchor_row: ?u32 = null,
-    measurement_prefix: ?ProjectionMeasurementPrefix = null,
     styles: transcript_blocks.Styles,
 
     fn invalidateMeasurement(self: *Projection) void {
         self.measurement_cols = null;
         self.measured_total_rows = 0;
         self.measured_anchor_row = null;
-        self.measurement_prefix = null;
-    }
-
-    fn reusableMeasurementPrefix(
-        self: *const Projection,
-        first_item: usize,
-        first_segment: usize,
-    ) ?ProjectionMeasurementPrefix {
-        if (self.measurement_cols) |cols| {
-            if (self.measured_item_rows.items.len == self.item_boundaries.items.len and
-                self.measured_segment_checkpoints.items.len == self.segments.items.len and
-                first_segment < self.measured_segment_checkpoints.items.len)
-            {
-                return .{
-                    .cols = cols,
-                    .segment_count = first_segment,
-                    .item_count = first_item,
-                    .checkpoint = self.measured_segment_checkpoints.items[first_segment],
-                    .anchor_row = if (self.anchor_segment_index) |anchor_index|
-                        if (anchor_index < first_segment) self.measured_anchor_row else null
-                    else
-                        null,
-                };
-            }
-        }
-        if (self.measurement_prefix) |prefix| {
-            if (first_segment >= prefix.segment_count and first_item >= prefix.item_count) {
-                return prefix;
-            }
-        }
-        return null;
     }
 
     fn windowStart(self: *const Projection, cols: u16, start_row: u32) ProjectionWindowStart {
@@ -475,118 +435,12 @@ pub const Projection = struct {
         self.measured_segment_checkpoints.deinit(alloc);
         self.* = undefined;
     }
-
-    fn boundaryIndexForEntry(self: *const Projection, entry_id: u32) ?usize {
-        var index = self.item_boundaries.items.len;
-        while (index > 0) {
-            index -= 1;
-            if (self.item_boundaries.items[index].entry_id == entry_id) return index;
-        }
-        return null;
-    }
-
-    fn boundaryHasContent(self: *const Projection, index: usize) bool {
-        const start = self.item_boundaries.items[index].segment_index;
-        const end = if (index + 1 < self.item_boundaries.items.len)
-            self.item_boundaries.items[index + 1].segment_index
-        else
-            self.segments.items.len;
-        for (self.segments.items[start..end]) |segment| switch (segment) {
-            .stored_result => return true,
-            .static => |bytes| if (std.mem.trim(u8, bytes, "\r\n").len > 0) return true,
-        };
-        return false;
-    }
-
-    pub fn retainedContextEntryId(self: *const Projection, entry_id: u32) ?u32 {
-        const index = self.boundaryIndexForEntry(entry_id) orelse return null;
-        if (self.boundaryHasContent(index)) return entry_id;
-        const segment_index = self.item_boundaries.items[index].segment_index;
-
-        var low: usize = 0;
-        var high = index;
-        while (low < high) {
-            const middle = low + (high - low) / 2;
-            if (self.item_boundaries.items[middle].segment_index < segment_index) {
-                low = middle + 1;
-            } else {
-                high = middle;
-            }
-        }
-        return if (low == 0) null else self.item_boundaries.items[low - 1].entry_id;
-    }
-
-    pub fn replaceFromEntry(
-        self: *Projection,
-        alloc: Allocator,
-        entry_id: u32,
-        suffix: *Projection,
-    ) !bool {
-        const first_item = self.boundaryIndexForEntry(entry_id) orelse return false;
-        const first_segment = self.item_boundaries.items[first_item].segment_index;
-        const measurement_prefix = self.reusableMeasurementPrefix(first_item, first_segment);
-        try self.segments.ensureTotalCapacity(
-            alloc,
-            first_segment + suffix.segments.items.len,
-        );
-        try self.item_boundaries.ensureTotalCapacity(
-            alloc,
-            first_item + suffix.item_boundaries.items.len,
-        );
-        try self.measured_item_rows.ensureTotalCapacity(
-            alloc,
-            first_item + suffix.item_boundaries.items.len,
-        );
-        try self.measured_segment_checkpoints.ensureTotalCapacity(
-            alloc,
-            first_segment + suffix.segments.items.len,
-        );
-        for (self.segments.items[first_segment..]) |segment| switch (segment) {
-            .static => |bytes| alloc.free(bytes),
-            .stored_result => |stored| stored.deinit(alloc),
-        };
-        self.segments.items.len = first_segment;
-        for (suffix.segments.items) |segment| self.segments.appendAssumeCapacity(segment);
-        suffix.segments.items.len = 0;
-
-        self.item_boundaries.items.len = first_item;
-        for (suffix.item_boundaries.items) |boundary| {
-            self.item_boundaries.appendAssumeCapacity(.{
-                .entry_id = boundary.entry_id,
-                .segment_index = first_segment + boundary.segment_index,
-            });
-        }
-        suffix.item_boundaries.items.len = 0;
-
-        self.anchor_segment_index = if (suffix.anchor_segment_index) |index|
-            first_segment + index
-        else if (self.anchor_segment_index) |index|
-            if (index < first_segment) index else null
-        else
-            null;
-        self.invalidateMeasurement();
-        self.measurement_prefix = measurement_prefix;
-        return true;
-    }
 };
 
 const ItemBoundary = struct {
     entry_id: u32,
     segment_index: usize,
 };
-
-test "projection finds a repositioned entry by transcript order" {
-    const alloc = std.testing.allocator;
-    var projection = Projection{ .styles = .{} };
-    defer projection.deinit(alloc);
-    try projection.item_boundaries.appendSlice(alloc, &.{
-        .{ .entry_id = 2, .segment_index = 0 },
-        .{ .entry_id = 3, .segment_index = 1 },
-        .{ .entry_id = 1, .segment_index = 2 },
-    });
-
-    try std.testing.expectEqual(@as(?usize, 2), projection.boundaryIndexForEntry(1));
-}
 
 test "projection applies actions by transcript position after lifecycle reposition" {
     const alloc = std.testing.allocator;
@@ -3747,21 +3601,10 @@ pub fn measureProjectionInterruptible(
         .item_rows = projection.measured_item_rows.items,
     };
     while (true) {
-        const prefix = if (projection.measurement_prefix) |candidate|
-            if (candidate.cols == cols and
-                candidate.segment_count <= projection.segments.items.len and
-                candidate.item_count <= projection.item_boundaries.items.len)
-                candidate
-            else
-                null
-        else
-            null;
         var item_rows: std.ArrayList(transcript_presentation.ItemRow) = .empty;
         defer item_rows.deinit(alloc);
         var segment_checkpoints: std.ArrayList(ProjectionCheckpoint) = .empty;
         defer segment_checkpoints.deinit(alloc);
-        const start_segment_index = if (prefix) |retained| retained.segment_count else 0;
-        const start_item_index = if (prefix) |retained| retained.item_count else 0;
         const capture_item_rows = projection.measured_item_rows.capacity >=
             projection.item_boundaries.items.len;
         const capture_segment_checkpoints = projection.measured_segment_checkpoints.capacity >=
@@ -3769,47 +3612,39 @@ pub fn measureProjectionInterruptible(
         if (capture_item_rows) {
             try item_rows.ensureTotalCapacity(
                 alloc,
-                projection.item_boundaries.items.len - start_item_index,
+                projection.item_boundaries.items.len,
             );
         }
         if (capture_segment_checkpoints) {
             try segment_checkpoints.ensureTotalCapacity(
                 alloc,
-                projection.segments.items.len - start_segment_index,
+                projection.segments.items.len,
             );
         }
 
-        var walker = if (prefix) |retained|
-            ProjectionRowWalker.initMeasureAt(cols, retained.checkpoint, checkpoint)
-        else
-            ProjectionRowWalker.initMeasure(cols, checkpoint);
-        const suffix_anchor_row = walkProjectionSegments(
+        var walker = ProjectionRowWalker.initMeasure(cols, checkpoint);
+        const anchor_row = walkProjectionSegments(
             alloc,
             projection,
             capability,
             &walker,
-            start_segment_index,
-            start_item_index,
+            0,
+            0,
             if (capture_item_rows) &item_rows else null,
             if (capture_segment_checkpoints) &segment_checkpoints else null,
         ) catch |err| switch (err) {
             error.StoredSegmentDegraded => continue,
             else => |other| return other,
         };
-        const anchor_row = suffix_anchor_row orelse if (prefix) |retained| retained.anchor_row else null;
-        projection.measured_item_rows.items.len = if (capture_item_rows) start_item_index else 0;
+        projection.measured_item_rows.items.len = 0;
         projection.measured_item_rows.appendSliceAssumeCapacity(item_rows.items);
-        projection.measured_segment_checkpoints.items.len = if (capture_segment_checkpoints)
-            start_segment_index
-        else
-            0;
+        projection.measured_segment_checkpoints.items.len = 0;
         projection.measured_segment_checkpoints.appendSliceAssumeCapacity(
             segment_checkpoints.items,
         );
         projection.measured_total_rows = walker.totalRows();
         projection.measured_anchor_row = anchor_row;
         projection.measurement_cols = cols;
-        projection.measurement_prefix = null;
         return .{
             .total_rows = projection.measured_total_rows,
             .anchor_row = projection.measured_anchor_row,
@@ -3894,20 +3729,6 @@ const ProjectionRowWalker = struct {
 
     fn initMeasure(cols: u16, build_checkpoint_ptr: ?*BuildCheckpoint) ProjectionRowWalker {
         return .{ .cols = @max(cols, 1), .build_checkpoint = build_checkpoint_ptr };
-    }
-
-    fn initMeasureAt(
-        cols: u16,
-        start_checkpoint: ProjectionCheckpoint,
-        build_checkpoint_ptr: ?*BuildCheckpoint,
-    ) ProjectionRowWalker {
-        return .{
-            .cols = @max(cols, 1),
-            .row = start_checkpoint.row,
-            .col = start_checkpoint.col,
-            .row_has_bytes = start_checkpoint.row_has_bytes,
-            .build_checkpoint = build_checkpoint_ptr,
-        };
     }
 
     fn initWindow(

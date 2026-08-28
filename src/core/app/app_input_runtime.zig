@@ -9669,7 +9669,7 @@ test "app_input_runtime full transcript rejects ctrl-x manager entry without los
     try std.testing.expect(app.terminal.fullTranscriptScreenActive());
 }
 
-test "app_input_runtime full transcript page and wheel keys scroll the projection" {
+test "app_input_runtime full transcript page wheel and alternate-scroll keys scroll the projection" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -9689,6 +9689,11 @@ test "app_input_runtime full transcript page and wheel keys scroll the projectio
     try feedRoutingBytes(&app, "\x1b[<64;1;1M");
     try std.testing.expectEqual(@as(u32, 17), app.shell.full_transcript.scroll_rows);
     try feedRoutingBytes(&app, "\x1b[<65;1;1M");
+    try std.testing.expectEqual(@as(u32, 20), app.shell.full_transcript.scroll_rows);
+
+    try feedRoutingBytes(&app, "\x1b[A");
+    try std.testing.expectEqual(@as(u32, 17), app.shell.full_transcript.scroll_rows);
+    try feedRoutingBytes(&app, "\x1b[B");
     try std.testing.expectEqual(@as(u32, 20), app.shell.full_transcript.scroll_rows);
 
     try std.testing.expect(app.terminal.fullTranscriptScreenActive());

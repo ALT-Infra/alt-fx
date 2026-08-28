@@ -515,7 +515,6 @@ async function runActiveToolPlacement(
       (pane) => pane.includes("┃ Full detail · ctrl o close"),
       10_000,
     );
-    await session.sendKeys("Right");
     await captureMatching(
       context,
       session,

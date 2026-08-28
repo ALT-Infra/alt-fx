@@ -5576,19 +5576,6 @@ pub const TranscriptRuntime = struct {
     }
 
     pub fn appendTurnSummaryEntry(self: *TranscriptRuntime, alloc: Allocator, summary: types.TurnSummary) !u32 {
-        return self.appendTurnSummaryEntryAt(
-            alloc,
-            summary,
-            summary.completed_at_ms,
-        );
-    }
-
-    pub fn appendTurnSummaryEntryAt(
-        self: *TranscriptRuntime,
-        alloc: Allocator,
-        summary: types.TurnSummary,
-        created_at_ms: i64,
-    ) !u32 {
         var line_buf: [128]u8 = undefined;
         const line = formatTurnSummaryLine(&line_buf, summary);
         const entry = try std.fmt.allocPrint(alloc, "{s}{s}{s}\n", .{ ui_render.dim_style, line, ui_render.reset_style });
@@ -5598,7 +5585,7 @@ pub const TranscriptRuntime = struct {
             alloc,
             entry,
             .turn_summary,
-            if (created_at_ms > 0) created_at_ms else io_mod.milliTimestamp(),
+            if (summary.completed_at_ms > 0) summary.completed_at_ms else io_mod.milliTimestamp(),
         );
         if (self.worker_status.clear_recovered_route()) self.render_requests.request(.footer);
         return entry_id;

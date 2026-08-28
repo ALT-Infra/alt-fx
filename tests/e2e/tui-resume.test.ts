@@ -2608,6 +2608,19 @@ test.skipIf(!tmuxAvailable())(
       await active.sendKeys("Right");
       await active.waitForText("┃ Full detail · ctrl o close", TIMEOUT);
       expect(readFileSync(tapePath)).not.toContain(Buffer.from("\x1b[?1000h\x1b[?1006h"));
+      const alternateScrollTraceStart = statSync(tracePath).size;
+      await active.sendHexBytes(["1b", "5b", "41"]);
+      await active.sendHexBytes(["1b", "5b", "42"]);
+      await waitForCondition(
+        () => {
+          const appended = readFileSync(tracePath)
+            .subarray(alternateScrollTraceStart)
+            .toString("utf8");
+          return appended.includes("direction=up unit=wheel") &&
+            appended.includes("direction=down unit=wheel");
+        },
+        "viewer alternate-scroll trace",
+      );
       await active.sendHexBytes(["1b", "5b", "35", "7e"]);
       await waitForCondition(
         () => readFileSync(tracePath, "utf8").includes("unit=page"),

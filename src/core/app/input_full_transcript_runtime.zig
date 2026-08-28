@@ -125,21 +125,14 @@ pub fn Runtime(comptime App: type) type {
                     &app.metrics,
                 );
                 requestActiveSurfaceFrame(app);
-            } else if (to == .inline_mode) {
+            } else {
+                std.debug.assert(to == .inline_mode);
                 try app_lifecycle.closeFullTranscript(
                     app.alloc,
                     &app.terminal,
                     &app.shell,
                     &app.metrics,
                 );
-            } else {
-                const changed = try app.shell.setTranscriptPresentationDepth(app.alloc, to);
-                debug_trace.logf(
-                    "full_transcript",
-                    "depth_set to={s} changed={} depth_after_set={s}",
-                    .{ depthName(to), changed, depthName(app.shell.transcriptPresentationDepth()) },
-                );
-                requestActiveSurfaceFrame(app);
             }
             logDepthTransition(
                 from,
@@ -195,6 +188,8 @@ pub fn Runtime(comptime App: type) type {
                 .toggle_full_transcript => .toggle,
                 .cursor_left => .{ .navigate = .left },
                 .cursor_right => .{ .navigate = .right },
+                .cursor_up => .{ .wheel_scroll = .up },
+                .cursor_down => .{ .wheel_scroll = .down },
                 .escape => .close,
                 .mouse_wheel => |direction| .{ .wheel_scroll = direction },
                 .page_up => .{ .page_scroll = .up },
