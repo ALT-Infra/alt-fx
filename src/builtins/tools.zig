@@ -977,6 +977,7 @@ pub const skill = ToolSpec{
     .completed_action_label = "Loaded skill",
     .label_arg_kind = .name,
     .label_arg_default = "skill",
+    .presentation_fn = skill_impl.presentation,
     .permission_target_kind = .none,
     .decode = skill_impl.decode,
     .validate = skill_impl.validate,
@@ -2371,6 +2372,7 @@ test "built-in skill owns product metadata schema and callbacks" {
     try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.none, skill.permission_target_kind);
     try std.testing.expectEqualStrings("Loading skill", skill.action_label);
     try std.testing.expectEqualStrings("Loaded skill", skill.completed_action_label);
+    try std.testing.expect(skill.presentation_fn == skill_impl.presentation);
     try std.testing.expect(skill.decode == skill_impl.decode);
     try std.testing.expect(skill.validate.? == skill_impl.validate);
     try std.testing.expect(skill.call == skill_impl.call);

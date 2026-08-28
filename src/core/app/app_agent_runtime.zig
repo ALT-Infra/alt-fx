@@ -2288,6 +2288,21 @@ test "tool labels preserve skill name value" {
     try std.testing.expect(std.mem.find(u8, completed, "Loaded skill") != null);
     try std.testing.expect(std.mem.find(u8, completed, "workflow") != null);
 
+    const resource_call: ToolCall = .{
+        .id = "skill_resource",
+        .name = "skill",
+        .arguments_json = "{\"name\":\"workflow\",\"resource\":\"references/contract-design.md\"}",
+    };
+    const resource_active = try app.describeToolAction(arena, resource_call);
+    try std.testing.expect(std.mem.find(u8, resource_active, "Reading skill resource") != null);
+    try std.testing.expect(std.mem.find(u8, resource_active, "references/contract-design.md") != null);
+    try std.testing.expect(std.mem.find(u8, resource_active, "Loading skill workflow") == null);
+
+    const resource_completed = try app.describeToolActionCompleted(arena, resource_call);
+    try std.testing.expect(std.mem.find(u8, resource_completed, "Read skill resource") != null);
+    try std.testing.expect(std.mem.find(u8, resource_completed, "references/contract-design.md") != null);
+    try std.testing.expect(std.mem.find(u8, resource_completed, "Loaded skill workflow") == null);
+
     const install_call: ToolCall = .{
         .id = "install_skill",
         .name = "install_skill",

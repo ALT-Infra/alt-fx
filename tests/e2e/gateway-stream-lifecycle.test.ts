@@ -1987,6 +1987,75 @@ describe("gateway stream lifecycle", () => {
     }
   }, 45_000);
 
+  test("skill progress distinguishes the main document from supporting resources", async () => {
+    const root = createFixtureRoot("skill-resource-progress");
+    const tracePath = join(root.root, "trace.log");
+    const skillName = "system-design-fixture";
+    const skillDirectory = join(root.home, ".fx", "skills", skillName);
+    mkdirSync(join(skillDirectory, "references"), { recursive: true });
+    writeFileSync(
+      join(skillDirectory, "SKILL.md"),
+      `---\nname: ${skillName}\ndescription: Design a system architecture\n---\n\nMAIN_SKILL_BODY\n`,
+    );
+    writeFileSync(
+      join(skillDirectory, "references", "contract-design.md"),
+      "CONTRACT_DESIGN_RESOURCE\n",
+    );
+
+    const mainCallId = "skill_main";
+    const resourceCallId = "skill_resource";
+    const responses = [
+      fakeGatewayToolCall(mainCallId, "skill", {
+        name: skillName,
+        location: skillDirectory,
+      }),
+      fakeGatewayToolCall(resourceCallId, "skill", {
+        name: skillName,
+        location: skillDirectory,
+        resource: "references/contract-design.md",
+      }),
+      fakeGatewayFinalText("Skill resource progress complete."),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Design the fixture system."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_AUTO_UPGRADE: "0",
+          },
+          timeoutMs: 20_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+
+      expect(result.code).toBe(0);
+      expect(result.stderr).toBe(
+        `Loading skill ${skillName}\nReading skill resource references/contract-design.md\n`,
+      );
+      expect(json.exit_code).toBe(0);
+      expect(json.tool_calls).toEqual([
+        { name: "skill", status: "success" },
+        { name: "skill", status: "success" },
+      ]);
+      expect(toolResultOutput(gateway.requests[1]!.body, mainCallId)).toContain(
+        "MAIN_SKILL_BODY",
+      );
+      expect(toolResultOutput(gateway.requests[2]!.body, resourceCallId)).toContain(
+        "CONTRACT_DESIGN_RESOURCE",
+      );
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("dynamic model-context values stay data", async () => {
     const root = createFixtureRoot(
       "dynamic-context<workspace>\ninjected_workspace",
