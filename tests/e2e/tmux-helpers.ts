@@ -15,6 +15,8 @@ import { FX_BIN, REPO_ROOT } from "../evals/eval-helpers";
 let sessionCounter = 0;
 
 export const FAKE_GATEWAY_MODEL = "openai/gpt-5";
+export const POST_TOOL_DECISION_PROMPT =
+  "Before choosing the next action, identify the concrete unmet requirement. If one remains, use only the tool needed for it. If none remains, respond normally.";
 const TMUX_CAPTURE_MAX_BUFFER = 32 * 1024 * 1024;
 const TMUX_HEX_CHUNK_BYTES = 256;
 const COMPOSER_LINE = /^[ \t]*(?:┃|❯|>)(?:[ \t]|$)/;
