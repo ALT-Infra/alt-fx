@@ -1182,6 +1182,7 @@ fn validateFinalResponse(
 
 const legacy_sessionless_invalid_request_code: i64 = -32004;
 const legacy_session_required_code: i64 = -32000;
+const legacy_missing_session_header_code: i64 = -32600;
 
 fn isLegacyDiscoveryCompatibilityError(object: std.json.ObjectMap) bool {
     if (object.contains("result")) return false;
@@ -1193,7 +1194,13 @@ fn isLegacyDiscoveryCompatibilityError(object: std.json.ObjectMap) bool {
     return (code.integer == legacy_sessionless_invalid_request_code and
         std.mem.eql(u8, message.string, "invalid request")) or
         (code.integer == legacy_session_required_code and
-            std.mem.eql(u8, message.string, "Bad Request: Mcp-Session-Id header is required"));
+            std.mem.eql(u8, message.string, "Bad Request: Mcp-Session-Id header is required")) or
+        (code.integer == legacy_missing_session_header_code and
+            std.mem.eql(
+                u8,
+                message.string,
+                "Missing required Mcp-Session-Id header. Non-initialize requests must include a session ID.",
+            ));
 }
 
 fn isLegacyDiscoveryCompatibilityResponse(alloc: Allocator, body: []const u8) Allocator.Error!bool {
@@ -1736,6 +1743,24 @@ test "modern MCP JSON responses are bounded and retain request ownership" {
     );
     defer alloc.free(stock_session_error_body);
     try std.testing.expectEqualStrings(stock_session_error, stock_session_error_body);
+
+    const mongodb_deployed_session_error =
+        "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32600,\"message\":\"Missing required Mcp-Session-Id header. Non-initialize requests must include a session ID.\"}}";
+    var mongodb_deployed_session_error_reader = std.Io.Reader.fixed(
+        mongodb_deployed_session_error,
+    );
+    const mongodb_deployed_session_error_body = try readJsonResponse(
+        alloc,
+        &mongodb_deployed_session_error_reader,
+        7,
+        mongodb_deployed_session_error.len,
+        true,
+    );
+    defer alloc.free(mongodb_deployed_session_error_body);
+    try std.testing.expectEqualStrings(
+        mongodb_deployed_session_error,
+        mongodb_deployed_session_error_body,
+    );
 
     var unrelated_session_error = try std.json.parseFromSlice(
         std.json.Value,

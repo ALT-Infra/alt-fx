@@ -994,8 +994,8 @@ describe("MCP remote authentication lifecycle", () => {
     ]);
   }, 30_000);
 
-  test("OAuth-authenticated missing-id session error reaches legacy tools", async () => {
-    upstream = startModernMcpHttpFixture("legacy_json_session_required");
+  test("OAuth-authenticated MongoDB deployed session error reaches legacy tools", async () => {
+    upstream = startModernMcpHttpFixture("legacy_mongodb_session_required");
     auth = startAuthFixture(upstream.url);
     const root = createRoot(auth);
     const env = {

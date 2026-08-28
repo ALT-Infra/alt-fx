@@ -39,6 +39,7 @@ export type ModernHttpMode =
   | "mrtr_form"
   | "legacy_session_required"
   | "legacy_json_session_required"
+  | "legacy_mongodb_session_required"
   | "legacy_plaintext_auth_rejection"
   | "legacy_plaintext_session_required";
 
@@ -88,6 +89,7 @@ export function startModernMcpHttpFixture(
       httpMethods.push(request.method);
       const legacySessionRequired = mode === "legacy_session_required" ||
         mode === "legacy_json_session_required" ||
+        mode === "legacy_mongodb_session_required" ||
         mode === "legacy_plaintext_session_required";
       if (legacySessionRequired && request.method === "GET") {
         return new Response("Method Not Allowed", {
@@ -129,6 +131,19 @@ export function startModernMcpHttpFixture(
       if (legacySessionRequired) {
         const sessionId = "mongodb-managed-session";
         if (message.method === "server/discover") {
+          if (mode === "legacy_mongodb_session_required") {
+            return Response.json(
+              {
+                jsonrpc: "2.0",
+                error: {
+                  code: -32600,
+                  message:
+                    "Missing required Mcp-Session-Id header. Non-initialize requests must include a session ID.",
+                },
+              },
+              { status: 400 },
+            );
+          }
           if (mode === "legacy_json_session_required") {
             return Response.json(
               {
