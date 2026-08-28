@@ -77,7 +77,10 @@ import sys
 
 args = sys.argv[1:]
 with pathlib.Path(os.environ["FX_SIGNING_TEST_LOG"]).open("a") as log:
-    log.write("security " + " ".join(args[:1]) + "\\n")
+    log.write("security " + " ".join(args) + "\\n")
+if args and args[0] == "set-key-partition-list" and "-s" in args:
+    print("error: The specified item could not be found in the keychain.", file=sys.stderr)
+    raise SystemExit(1)
 if args and args[0] == "find-identity":
     print('  1) HASH "{SIGNING_IDENTITY}"')
     print("     1 valid identities found")
@@ -225,6 +228,24 @@ else:
             self.assertIn("--timestamp", events)
             self.assertIn("xcrun notarytool submit", events)
             self.assertIn("xcrun notarytool log", events)
+
+    def test_imports_pkcs12_for_codesign_and_security(self) -> None:
+        self.assertTrue(SCRIPT_PATH.is_file(), "macOS signing helper is missing")
+        with tempfile.TemporaryDirectory(prefix="fx-macos-signing-test-") as tmp:
+            root = pathlib.Path(tmp)
+            result, _, _, event_log = self.run_script(root)
+
+            output = result.stdout + result.stderr
+            self.assertEqual(0, result.returncode, output)
+            import_event = next(
+                line
+                for line in event_log.read_text(encoding="utf-8").splitlines()
+                if line.startswith("security import ")
+            )
+            self.assertIn(" -t cert ", f" {import_event} ")
+            self.assertIn(" -f pkcs12 ", f" {import_event} ")
+            self.assertIn(" -T /usr/bin/codesign ", f" {import_event} ")
+            self.assertIn(" -T /usr/bin/security ", f" {import_event} ")
 
     def test_rejects_notarization_log_issues_and_cleans_credentials(self) -> None:
         self.assertTrue(SCRIPT_PATH.is_file(), "macOS signing helper is missing")
