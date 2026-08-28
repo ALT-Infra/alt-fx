@@ -1199,7 +1199,7 @@ pub fn suggestedSessionGrants(alloc: std.mem.Allocator, workspace_root: []const 
         return grants.toOwnedSlice(alloc);
     }
 
-    if (shouldSuggestBroadPathGrants(tool_name, target_kind) and workspace_root.len > 0 and pathing.pathInside(workspace_root, target_path)) {
+    if (isPathBasedTool(target_kind) and workspace_root.len > 0 and pathing.pathInside(workspace_root, target_path)) {
         const workspace_pattern = try directoryTreePattern(alloc, workspace_root);
         defer alloc.free(workspace_pattern);
 
@@ -1209,7 +1209,7 @@ pub fn suggestedSessionGrants(alloc: std.mem.Allocator, workspace_root: []const 
         return grants.toOwnedSlice(alloc);
     }
 
-    if (shouldSuggestBroadPathGrants(tool_name, target_kind)) {
+    if (isPathBasedTool(target_kind)) {
         if (externalPathGrantRoot(alloc, workspace_root, target_path)) |external_root| {
             defer alloc.free(external_root);
             const external_pattern = try directoryTreePattern(alloc, external_root);
@@ -1492,11 +1492,6 @@ fn isPathBasedTool(target_kind: PermissionTargetKind) bool {
         .path_existing, .path_optional_existing, .path_create_parent, .path_existing_parent => true,
         else => false,
     };
-}
-
-fn shouldSuggestBroadPathGrants(tool_name: []const u8, target_kind: PermissionTargetKind) bool {
-    _ = tool_name;
-    return isPathBasedTool(target_kind);
 }
 
 fn externalPathGrantRoot(alloc: std.mem.Allocator, workspace_root: []const u8, target_path: []const u8) ?[]u8 {
