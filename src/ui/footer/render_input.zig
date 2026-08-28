@@ -4,6 +4,9 @@ const approval_prompt = @import("../../core/permissions/approval_prompt.zig");
 const auth_runtime = @import("../../core/auth/auth_runtime.zig");
 const activity_status = @import("../../core/output/activity_status.zig");
 const model_cache_runtime = @import("../../core/app/model_cache_runtime.zig");
+const mcp_health = @import("../../core/mcp/health.zig");
+const mcp_menu_state = @import("../../core/mcp/menu_state.zig");
+const mcp_runtime = @import("../../core/mcp/mcp_runtime.zig");
 const picker_state = @import("../../core/input/picker_state.zig");
 const session_catalog = @import("../../core/session/session_catalog.zig");
 const session_store = @import("../../core/session/session_store.zig");
@@ -62,6 +65,43 @@ pub const ModelMenuProjection = struct {
 
     pub fn itemAt(self: ModelMenuProjection, display_index: usize) ?*const model_cache_runtime.ModelMenuItem {
         return model_cache_runtime.modelMenuItemAt(self.items, self.providerFilter(), self.query, display_index);
+    }
+};
+
+pub const McpMenuProjection = struct {
+    state: mcp_menu_state.State = .{},
+    servers: []const mcp_health.ServerSnapshot = &.{},
+    tools: []const []const u8 = &.{},
+    resources: []const mcp_runtime.ResourceSummary = &.{},
+    resource_templates: []const mcp_runtime.ResourceSummary = &.{},
+    prompts: []const mcp_runtime.PromptSummary = &.{},
+    configuration_issue_count: usize = 0,
+    preview: ?[]const u8 = null,
+    feedback: ?[]const u8 = null,
+    add_name: []const u8 = "",
+    add_target: []const u8 = "",
+    add_arguments: []const u8 = "",
+    add_draft: []const u8 = "",
+
+    pub fn itemCount(self: McpMenuProjection) usize {
+        return switch (self.state.section) {
+            .servers => self.servers.len,
+            .tools => self.tools.len,
+            .resources => self.resources.len + self.resource_templates.len,
+            .prompts => self.prompts.len,
+        };
+    }
+
+    pub fn selectedServer(self: McpMenuProjection) ?*const mcp_health.ServerSnapshot {
+        if (self.state.selected_server_index >= self.servers.len) return null;
+        return &self.servers[self.state.selected_server_index];
+    }
+
+    pub fn resourceAt(self: McpMenuProjection, index: usize) ?*const mcp_runtime.ResourceSummary {
+        if (index < self.resources.len) return &self.resources[index];
+        const template_index = index - self.resources.len;
+        if (template_index < self.resource_templates.len) return &self.resource_templates[template_index];
+        return null;
     }
 };
 
@@ -316,6 +356,7 @@ pub const RenderContext = struct {
         .include_skip = false,
     },
     skills_menu: SkillsMenuProjection = .{},
+    mcp_menu: McpMenuProjection = .{},
     help_menu: HelpMenuProjection = .{},
     settings_menu: SettingsMenuProjection = .{},
     model_menu: ModelMenuProjection = .{},

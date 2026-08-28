@@ -9,6 +9,7 @@ const mcp_command_provider = @import("../mcp/command_provider.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 const elicitation = @import("../mcp/elicitation.zig");
 const mcp_health = @import("../mcp/health.zig");
+const mcp_menu_state = @import("../mcp/menu_state.zig");
 const mcp_model_catalog = @import("../mcp/model_catalog.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
 const context_limits = @import("../config/context_limits.zig");
@@ -113,6 +114,11 @@ const ReloadPolicy = enum {
     authority_reducing,
 };
 
+pub const PresentationOrigin = union(enum) {
+    command,
+    menu: u64,
+};
+
 const PendingReload = struct {
     owner: *State,
     alloc: Allocator,
@@ -122,6 +128,7 @@ const PendingReload = struct {
     preview_workspace_authority: ?mcp_runtime.PreviewNativeWorkspaceAuthorityFn = null,
     registry: tool_dispatch.Registry,
     captured_at_ms: u64,
+    presentation_origin: PresentationOrigin = .command,
     cancel_requested: std.atomic.Value(bool) = .init(false),
     done: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
@@ -223,6 +230,7 @@ const PendingAuthentication = struct {
     server_name: []u8,
     lease: Lease,
     opener: host.UrlOpener,
+    presentation_origin: PresentationOrigin = .command,
     cancel_requested: std.atomic.Value(bool) = .init(false),
     done: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
@@ -267,6 +275,406 @@ const PendingAuthentication = struct {
     }
 };
 
+const max_menu_preview_bytes: usize = 64 * 1024;
+
+pub const MenuResourceCatalog = struct {
+    resources: mcp_runtime.ResourceCatalogResult,
+    templates: mcp_runtime.ResourceCatalogResult,
+
+    fn deinit(self: *MenuResourceCatalog, alloc: Allocator) void {
+        self.resources.deinit(alloc);
+        self.templates.deinit(alloc);
+        self.* = undefined;
+    }
+
+    fn count(self: MenuResourceCatalog) usize {
+        return self.resources.items.len + self.templates.items.len;
+    }
+
+    fn item(self: MenuResourceCatalog, index: usize) ?*const mcp_runtime.ResourceSummary {
+        if (index < self.resources.items.len) return &self.resources.items[index];
+        const template_index = index - self.resources.items.len;
+        if (template_index < self.templates.items.len) return &self.templates.items[template_index];
+        return null;
+    }
+};
+
+const MenuPreview = struct {
+    display: []u8,
+    insert: []u8,
+
+    fn deinit(self: *MenuPreview, alloc: Allocator) void {
+        alloc.free(self.display);
+        alloc.free(self.insert);
+        self.* = undefined;
+    }
+};
+
+const MenuOperationResult = union(enum) {
+    tools: [][]u8,
+    resources: MenuResourceCatalog,
+    prompts: mcp_runtime.PromptCatalogResult,
+    preview: MenuPreview,
+    action: MenuActionResult,
+    failed: anyerror,
+    cancelled,
+
+    fn deinit(self: *MenuOperationResult, alloc: Allocator) void {
+        switch (self.*) {
+            .tools => |items| {
+                for (items) |item| alloc.free(item);
+                alloc.free(items);
+            },
+            .resources => |*catalog| catalog.deinit(alloc),
+            .prompts => |*catalog| catalog.deinit(alloc),
+            .preview => |*preview| preview.deinit(alloc),
+            .action => |*action| action.deinit(alloc),
+            .failed, .cancelled => {},
+        }
+        self.* = undefined;
+    }
+};
+
+const MenuActionResult = struct {
+    feedback: []u8,
+    reload: bool = false,
+
+    fn deinit(self: *MenuActionResult, alloc: Allocator) void {
+        alloc.free(self.feedback);
+        self.* = undefined;
+    }
+};
+
+const MenuOperationKind = enum { catalog, preview, action };
+
+const MenuOperation = struct {
+    kind: MenuOperationKind,
+    request: mcp_menu_state.Request,
+};
+
+const PendingMenuOperation = struct {
+    alloc: Allocator,
+    request: mcp_menu_state.Request,
+    kind: MenuOperationKind,
+    lease: Lease,
+    permission_rules: types.PermissionRuleSet,
+    limits: context_limits.Values,
+    server_name: ?[]u8 = null,
+    identity: ?[]u8 = null,
+    argument_name: ?[]u8 = null,
+    resource_template: bool = false,
+    action: ?mcp_menu_state.Action = null,
+    cancel_requested: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
+    result: ?MenuOperationResult = null,
+
+    fn run(self: *PendingMenuOperation) void {
+        self.result = self.perform() catch |err| if (err == error.Cancelled)
+            .cancelled
+        else
+            .{ .failed = err };
+        self.done.store(true, .release);
+    }
+
+    fn perform(self: *PendingMenuOperation) !MenuOperationResult {
+        if (self.cancel_requested.load(.acquire)) return error.Cancelled;
+        return switch (self.kind) {
+            .catalog => switch (self.request.section) {
+                .servers => error.McpMenuInvalidOperation,
+                .tools => .{ .tools = try self.lease.runtime.snapshotToolNames(
+                    self.alloc,
+                    self.permission_rules,
+                ) },
+                .resources => resources: {
+                    const server_name = self.server_name orelse return error.McpServerNotFound;
+                    var resources = try self.lease.runtime.listResources(
+                        self.alloc,
+                        server_name,
+                        false,
+                        &self.cancel_requested,
+                        .unrestricted,
+                    );
+                    errdefer resources.deinit(self.alloc);
+                    const templates = try self.lease.runtime.listResources(
+                        self.alloc,
+                        server_name,
+                        true,
+                        &self.cancel_requested,
+                        .unrestricted,
+                    );
+                    break :resources .{ .resources = .{
+                        .resources = resources,
+                        .templates = templates,
+                    } };
+                },
+                .prompts => .{ .prompts = try self.lease.runtime.listPrompts(
+                    self.alloc,
+                    self.server_name orelse return error.McpServerNotFound,
+                    &self.cancel_requested,
+                    .unrestricted,
+                ) },
+            },
+            .preview => switch (self.request.section) {
+                .servers => error.McpMenuInvalidOperation,
+                .tools => .{ .preview = try self.previewTool() },
+                .resources => .{ .preview = try self.previewResource() },
+                .prompts => .{ .preview = try self.previewPrompt() },
+            },
+            .action => switch (self.action orelse return error.McpMenuInvalidOperation) {
+                .logout => .{ .action = try self.logoutServer() },
+                else => error.McpMenuInvalidOperation,
+            },
+        };
+    }
+
+    fn logoutServer(self: *PendingMenuOperation) !MenuActionResult {
+        const server_name = self.server_name orelse return error.McpServerNotFound;
+        const result = try self.lease.runtime.logoutServer(server_name);
+        const feedback = if (!result.removed)
+            try std.fmt.allocPrint(
+                self.alloc,
+                "No stored MCP credentials found for '{s}'.",
+                .{server_name},
+            )
+        else if (result.revocation_failed)
+            try std.fmt.allocPrint(
+                self.alloc,
+                "Logged out of '{s}' locally; remote revocation failed.",
+                .{server_name},
+            )
+        else
+            try std.fmt.allocPrint(self.alloc, "Logged out of MCP server '{s}'.", .{server_name});
+        return .{ .feedback = feedback, .reload = result.removed and !result.local_only };
+    }
+
+    fn previewTool(self: *PendingMenuOperation) !MenuPreview {
+        var schema = (try self.lease.runtime.toolSchemaJsonByNameWithAccess(
+            self.alloc,
+            self.identity orelse return error.McpToolNotFound,
+            self.permission_rules,
+            self.limits,
+            .unrestricted,
+        )) orelse return error.McpToolNotFound;
+        defer schema.deinit(self.alloc);
+        const payload = switch (schema) {
+            .selected => |value| value,
+            .rejected => return error.McpAccessDenied,
+        };
+        return makeMenuPreview(self.alloc, "MCP tool schema · untrusted metadata\n\n", payload.model_output);
+    }
+
+    fn previewResource(self: *PendingMenuOperation) !MenuPreview {
+        const server_name = self.server_name orelse return error.McpServerNotFound;
+        const identity = self.identity orelse return error.McpResourceNotFound;
+        if (self.resource_template) {
+            const open = std.mem.findScalar(u8, identity, '{') orelse
+                return makeMenuPreview(
+                    self.alloc,
+                    "MCP resource template · no variable found\n\n",
+                    identity,
+                );
+            const relative_close = std.mem.findScalar(u8, identity[open + 1 ..], '}') orelse
+                return error.McpResourceTemplateInvalid;
+            const close = open + 1 + relative_close;
+            const variable_name = identity[open + 1 .. close];
+            var completion = try self.lease.runtime.completeResourceTemplateArgument(
+                self.alloc,
+                server_name,
+                identity,
+                .{ .name = variable_name, .value = "" },
+                &.{},
+                &self.cancel_requested,
+                .unrestricted,
+            );
+            defer completion.deinit(self.alloc);
+            const value = if (completion.values.len > 0) completion.values[0] else return makeMenuPreview(
+                self.alloc,
+                "MCP resource template · no completions available\n\n",
+                identity,
+            );
+            const resolved = try std.mem.concat(
+                self.alloc,
+                u8,
+                &.{ identity[0..open], value, identity[close + 1 ..] },
+            );
+            defer self.alloc.free(resolved);
+            return self.readResourcePreview(server_name, resolved);
+        }
+        return self.readResourcePreview(server_name, identity);
+    }
+
+    fn readResourcePreview(
+        self: *PendingMenuOperation,
+        server_name: []const u8,
+        identity: []const u8,
+    ) !MenuPreview {
+        var result = try self.lease.runtime.readResource(
+            self.alloc,
+            server_name,
+            identity,
+            .{ .cancel_flag = &self.cancel_requested, .access = .unrestricted },
+        );
+        defer result.deinit(self.alloc);
+        var raw: std.Io.Writer.Allocating = .init(self.alloc);
+        defer raw.deinit();
+        for (result.contents, 0..) |content, index| {
+            if (index > 0) try raw.writer.writeAll("\n\n");
+            switch (content.data) {
+                .text => |value| try raw.writer.writeAll(value),
+                .blob => try raw.writer.writeAll("[binary MCP resource content omitted]"),
+            }
+        }
+        const insert = try boundedOwnedSlice(self.alloc, raw.written(), max_menu_preview_bytes);
+        errdefer self.alloc.free(insert);
+        return makeMenuPreviewOwned(
+            self.alloc,
+            "MCP resource · untrusted content\n\n",
+            insert,
+        );
+    }
+
+    fn previewPrompt(self: *PendingMenuOperation) !MenuPreview {
+        var arguments_json: []u8 = try self.alloc.dupe(u8, "{}");
+        defer self.alloc.free(arguments_json);
+        if (self.argument_name) |argument_name| {
+            var completion = try self.lease.runtime.completePromptArgument(
+                self.alloc,
+                self.server_name orelse return error.McpServerNotFound,
+                self.identity orelse return error.McpPromptNotFound,
+                .{ .name = argument_name, .value = "" },
+                &.{},
+                &self.cancel_requested,
+                .unrestricted,
+            );
+            defer completion.deinit(self.alloc);
+            if (completion.values.len > 0) {
+                var json: std.Io.Writer.Allocating = .init(self.alloc);
+                defer json.deinit();
+                try json.writer.writeByte('{');
+                try std.json.Stringify.value(argument_name, .{}, &json.writer);
+                try json.writer.writeByte(':');
+                try std.json.Stringify.value(completion.values[0], .{}, &json.writer);
+                try json.writer.writeByte('}');
+                const next_arguments_json = try json.toOwnedSlice();
+                self.alloc.free(arguments_json);
+                arguments_json = next_arguments_json;
+            }
+        }
+        var result = try self.lease.runtime.getPrompt(
+            self.alloc,
+            self.server_name orelse return error.McpServerNotFound,
+            self.identity orelse return error.McpPromptNotFound,
+            arguments_json,
+            .{ .cancel_flag = &self.cancel_requested, .access = .unrestricted },
+        );
+        defer result.deinit(self.alloc);
+        var raw: std.Io.Writer.Allocating = .init(self.alloc);
+        defer raw.deinit();
+        for (result.messages, 0..) |message, index| {
+            if (index > 0) try raw.writer.writeAll("\n\n");
+            try raw.writer.print("{s}: {s}", .{ @tagName(message.role), message.content_json });
+        }
+        const insert = try boundedOwnedSlice(self.alloc, raw.written(), max_menu_preview_bytes);
+        errdefer self.alloc.free(insert);
+        return makeMenuPreviewOwned(
+            self.alloc,
+            "MCP prompt · untrusted content\n\n",
+            insert,
+        );
+    }
+
+    fn join(self: *PendingMenuOperation) void {
+        if (comptime builtin.single_threaded) {
+            std.debug.assert(self.thread == null);
+            return;
+        }
+        if (self.thread) |thread| {
+            self.thread = null;
+            thread.join();
+        }
+    }
+
+    fn deinit(self: *PendingMenuOperation) void {
+        self.join();
+        if (self.result) |*result| result.deinit(self.alloc);
+        if (self.server_name) |value| self.alloc.free(value);
+        if (self.identity) |value| self.alloc.free(value);
+        if (self.argument_name) |value| self.alloc.free(value);
+        types.freePermissionRuleSlice(self.alloc, self.permission_rules.rules);
+        self.lease.deinit();
+        self.alloc.destroy(self);
+    }
+};
+
+fn spawnPendingMenuOperation(pending: *PendingMenuOperation) !std.Thread {
+    if (comptime builtin.single_threaded) return error.ThreadsUnsupported;
+    return std.Thread.spawn(.{}, PendingMenuOperation.run, .{pending});
+}
+
+fn boundedOwnedSlice(alloc: Allocator, bytes: []const u8, max_bytes: usize) ![]u8 {
+    const bounded = text_utils.utf8PrefixByBytes(bytes, @min(bytes.len, max_bytes));
+    return alloc.dupe(u8, bounded);
+}
+
+fn makeMenuPreview(alloc: Allocator, heading: []const u8, raw: []const u8) !MenuPreview {
+    return makeMenuPreviewOwned(
+        alloc,
+        heading,
+        try boundedOwnedSlice(alloc, raw, max_menu_preview_bytes),
+    );
+}
+
+fn makeMenuPreviewOwned(alloc: Allocator, heading: []const u8, insert: []u8) !MenuPreview {
+    errdefer alloc.free(insert);
+    var encoded = try text_utils.encodeTerminalSafe(alloc, insert, max_menu_preview_bytes);
+    defer encoded.deinit(alloc);
+    return .{
+        .display = try std.mem.concat(alloc, u8, &.{ heading, encoded.bytes }),
+        .insert = insert,
+    };
+}
+
+pub const MenuAddForm = struct {
+    name: std.ArrayList(u8) = .empty,
+    target: std.ArrayList(u8) = .empty,
+    arguments: std.ArrayList(u8) = .empty,
+
+    fn deinit(self: *MenuAddForm, alloc: Allocator) void {
+        self.name.deinit(alloc);
+        self.target.deinit(alloc);
+        self.arguments.deinit(alloc);
+        self.* = .{};
+    }
+
+    fn value(self: *const MenuAddForm, field_index: usize) []const u8 {
+        return switch (field_index) {
+            0 => self.name.items,
+            1 => self.target.items,
+            2 => self.arguments.items,
+            else => "",
+        };
+    }
+
+    fn set(self: *MenuAddForm, alloc: Allocator, field_index: usize, bytes: []const u8) !void {
+        const field = switch (field_index) {
+            0 => &self.name,
+            1 => &self.target,
+            2 => &self.arguments,
+            else => return error.McpMenuInvalidField,
+        };
+        try field.ensureTotalCapacity(alloc, bytes.len);
+        field.clearRetainingCapacity();
+        field.appendSliceAssumeCapacity(bytes);
+    }
+};
+
+pub const MenuCompletionEffect = union(enum) {
+    none,
+    repaint,
+    reload: u64,
+};
+
 const SpawnPendingReloadFn = *const fn (*PendingReload) anyerror!std.Thread;
 
 fn spawnPendingReload(pending: *PendingReload) !std.Thread {
@@ -286,7 +694,543 @@ pub const State = struct {
     runtime: ?*mcp_runtime.McpRuntime = null,
     pending_reload: ?*PendingReload = null,
     pending_authentication: ?*PendingAuthentication = null,
+    pending_menu_operation: ?*PendingMenuOperation = null,
+    last_reload_completion_origin: PresentationOrigin = .command,
+    last_authentication_completion_origin: PresentationOrigin = .command,
     project_prompts_suppressed: bool = false,
+    menu: mcp_menu_state.State = .{},
+    menu_health: ?mcp_health.Snapshot = null,
+    menu_tools: ?[][]u8 = null,
+    menu_resources: ?MenuResourceCatalog = null,
+    menu_prompts: ?mcp_runtime.PromptCatalogResult = null,
+    menu_preview: ?MenuPreview = null,
+    menu_feedback: ?[]u8 = null,
+    menu_add_form: MenuAddForm = .{},
+
+    pub const MenuView = struct {
+        state: mcp_menu_state.State,
+        health: ?*const mcp_health.Snapshot,
+        tools: []const []const u8,
+        resources: ?*const MenuResourceCatalog,
+        prompts: ?*const mcp_runtime.PromptCatalogResult,
+        preview: ?[]const u8,
+        insert: ?[]const u8,
+        feedback: ?[]const u8,
+        add_form: *const MenuAddForm,
+    };
+
+    pub fn menuView(self: *const State) MenuView {
+        return .{
+            .state = self.menu,
+            .health = if (self.menu_health) |*snapshot| snapshot else null,
+            .tools = self.menu_tools orelse &.{},
+            .resources = if (self.menu_resources) |*catalog| catalog else null,
+            .prompts = if (self.menu_prompts) |*catalog| catalog else null,
+            .preview = if (self.menu_preview) |preview| preview.display else null,
+            .insert = if (self.menu_preview) |preview| preview.insert else null,
+            .feedback = self.menu_feedback,
+            .add_form = &self.menu_add_form,
+        };
+    }
+
+    pub fn openMenu(self: *State, alloc: Allocator, captured_at_ms: u64) !void {
+        self.clearMenuOwned(alloc);
+        var snapshot = if (self.acquire()) |lease_value| snapshot: {
+            var lease = lease_value;
+            defer lease.deinit();
+            break :snapshot try lease.runtime.snapshotHealth(alloc, captured_at_ms);
+        } else try emptyHealthSnapshot(alloc, captured_at_ms);
+        errdefer snapshot.deinit(alloc);
+        self.menu_health = snapshot;
+        self.menu = mcp_menu_state.reduce(.{}, .{ .open = snapshot.servers.len }).state;
+    }
+
+    fn emptyHealthSnapshot(alloc: Allocator, captured_at_ms: u64) !mcp_health.Snapshot {
+        const servers = try alloc.alloc(mcp_health.ServerSnapshot, 0);
+        errdefer alloc.free(servers);
+        const configuration_issues = try alloc.alloc(mcp_health.ConfigurationIssue, 0);
+        return .{
+            .captured_at_ms = captured_at_ms,
+            .servers = servers,
+            .configuration_issues = configuration_issues,
+        };
+    }
+
+    pub fn closeMenu(self: *State, alloc: Allocator) void {
+        const transition = mcp_menu_state.reduce(self.menu, .close);
+        if (transition.effect) |effect| switch (effect) {
+            .cancel => self.cancelPendingMenuOperation("menu_closed"),
+            .load_catalog, .load_preview, .action => {},
+        };
+        self.clearMenuOwned(alloc);
+        self.menu = .{};
+    }
+
+    fn clearMenuOwned(self: *State, alloc: Allocator) void {
+        if (self.menu_health) |*snapshot| snapshot.deinit(alloc);
+        self.menu_health = null;
+        if (self.menu_tools) |items| {
+            for (items) |item| alloc.free(item);
+            alloc.free(items);
+        }
+        self.menu_tools = null;
+        if (self.menu_resources) |*catalog| catalog.deinit(alloc);
+        self.menu_resources = null;
+        if (self.menu_prompts) |*catalog| catalog.deinit(alloc);
+        self.menu_prompts = null;
+        if (self.menu_preview) |*preview| preview.deinit(alloc);
+        self.menu_preview = null;
+        if (self.menu_feedback) |feedback| alloc.free(feedback);
+        self.menu_feedback = null;
+        self.menu_add_form.deinit(alloc);
+    }
+
+    pub fn setMenuAddField(
+        self: *State,
+        alloc: Allocator,
+        field_index: usize,
+        value: []const u8,
+    ) !void {
+        try self.menu_add_form.set(alloc, field_index, value);
+    }
+
+    pub fn menuAddFieldValue(self: *const State, field_index: usize) []const u8 {
+        return self.menu_add_form.value(field_index);
+    }
+
+    pub fn setMenuFeedback(self: *State, alloc: Allocator, text: []const u8) !void {
+        const owned = try alloc.dupe(u8, text);
+        if (self.menu_feedback) |previous| alloc.free(previous);
+        self.menu_feedback = owned;
+    }
+
+    pub fn returnMenuToServers(self: *State) void {
+        self.menu.section = .servers;
+        self.menu.screen = .browse;
+        self.menu.selected_index = self.menu.selected_server_index;
+        self.menu.window_start = 0;
+        self.menu.confirmation_action = null;
+    }
+
+    pub fn beginMenuEffect(
+        self: *State,
+        alloc: Allocator,
+        effect: mcp_menu_state.Effect,
+        permission_rules: types.PermissionRuleSet,
+        limits: context_limits.Values,
+    ) !void {
+        var action: ?mcp_menu_state.Action = null;
+        const operation: MenuOperation = switch (effect) {
+            .load_catalog => |request| .{ .kind = MenuOperationKind.catalog, .request = request },
+            .load_preview => |request| .{ .kind = MenuOperationKind.preview, .request = request },
+            .action => |request| action_operation: {
+                if (request.action != .logout) return error.McpMenuInvalidOperation;
+                action = request.action;
+                break :action_operation .{
+                    .kind = .action,
+                    .request = .{
+                        .generation = request.generation,
+                        .section = self.menu.section,
+                        .server_index = self.menu.selected_server_index,
+                        .selected_index = request.selected_index,
+                    },
+                };
+            },
+            .cancel => return error.McpMenuInvalidOperation,
+        };
+        self.cancelPendingMenuOperation("superseded");
+
+        if (operation.kind == .catalog and
+            (operation.request.section == .resources or operation.request.section == .prompts))
+        {
+            const health = self.menu_health orelse {
+                self.completeEmptyMenuCatalog(alloc, operation.request);
+                return;
+            };
+            if (operation.request.server_index >= health.servers.len) {
+                self.completeEmptyMenuCatalog(alloc, operation.request);
+                return;
+            }
+        }
+        var lease = self.acquire() orelse {
+            if (operation.kind == .catalog) {
+                self.completeEmptyMenuCatalog(alloc, operation.request);
+                return;
+            }
+            return error.McpRuntimeUnavailable;
+        };
+        var lease_owned = true;
+        errdefer if (lease_owned) lease.deinit();
+        const owned_rules = try types.dupePermissionRuleSet(alloc, permission_rules);
+        var rules_owned = true;
+        errdefer if (rules_owned) types.freePermissionRuleSlice(alloc, owned_rules.rules);
+
+        var server_name: ?[]u8 = null;
+        var identity: ?[]u8 = null;
+        var argument_name: ?[]u8 = null;
+        var resource_template = false;
+        errdefer {
+            if (server_name) |value| alloc.free(value);
+            if (identity) |value| alloc.free(value);
+            if (argument_name) |value| alloc.free(value);
+        }
+        if (operation.kind == .action or
+            operation.request.section == .resources or
+            operation.request.section == .prompts)
+        {
+            const health = self.menu_health orelse return error.McpRuntimeUnavailable;
+            if (operation.request.server_index >= health.servers.len) return error.McpServerNotFound;
+            server_name = try alloc.dupe(
+                u8,
+                health.servers[operation.request.server_index].configured_name,
+            );
+        }
+        if (operation.kind == .preview) switch (operation.request.section) {
+            .servers => return error.McpMenuInvalidOperation,
+            .tools => {
+                const tools = self.menu_tools orelse return error.McpToolNotFound;
+                if (operation.request.selected_index >= tools.len) return error.McpToolNotFound;
+                identity = try alloc.dupe(u8, tools[operation.request.selected_index]);
+            },
+            .resources => {
+                const catalog = self.menu_resources orelse return error.McpResourceNotFound;
+                const item = catalog.item(operation.request.selected_index) orelse
+                    return error.McpResourceNotFound;
+                identity = try alloc.dupe(u8, item.uri);
+                resource_template = item.is_template;
+            },
+            .prompts => {
+                const catalog = self.menu_prompts orelse return error.McpPromptNotFound;
+                if (operation.request.selected_index >= catalog.items.len) return error.McpPromptNotFound;
+                const prompt = catalog.items[operation.request.selected_index];
+                identity = try alloc.dupe(u8, prompt.name);
+                if (prompt.arguments.len > 0) {
+                    argument_name = try alloc.dupe(u8, prompt.arguments[0].name);
+                }
+            },
+        };
+
+        const pending = try alloc.create(PendingMenuOperation);
+        pending.* = .{
+            .alloc = alloc,
+            .request = operation.request,
+            .kind = operation.kind,
+            .lease = lease,
+            .permission_rules = owned_rules,
+            .limits = limits,
+            .server_name = server_name,
+            .identity = identity,
+            .argument_name = argument_name,
+            .resource_template = resource_template,
+            .action = action,
+        };
+        lease_owned = false;
+        rules_owned = false;
+        server_name = null;
+        identity = null;
+        argument_name = null;
+
+        self.lock.lockUncancelable(io_mod.getIo());
+        std.debug.assert(self.pending_menu_operation == null);
+        self.pending_menu_operation = pending;
+        self.lock.unlock(io_mod.getIo());
+        if (comptime builtin.single_threaded) {
+            pending.run();
+        } else {
+            pending.thread = spawnPendingMenuOperation(pending) catch |err| {
+                self.lock.lockUncancelable(io_mod.getIo());
+                if (self.pending_menu_operation == pending) self.pending_menu_operation = null;
+                self.lock.unlock(io_mod.getIo());
+                pending.deinit();
+                return err;
+            };
+        }
+    }
+
+    fn completeEmptyMenuCatalog(
+        self: *State,
+        alloc: Allocator,
+        request: mcp_menu_state.Request,
+    ) void {
+        switch (request.section) {
+            .servers => {},
+            .tools => {
+                if (self.menu_tools) |items| {
+                    for (items) |item| alloc.free(item);
+                    alloc.free(items);
+                }
+                self.menu_tools = null;
+            },
+            .resources => {
+                if (self.menu_resources) |*catalog| catalog.deinit(alloc);
+                self.menu_resources = null;
+            },
+            .prompts => {
+                if (self.menu_prompts) |*catalog| catalog.deinit(alloc);
+                self.menu_prompts = null;
+            },
+        }
+        if (self.menu_feedback) |feedback| alloc.free(feedback);
+        self.menu_feedback = null;
+        self.menu = mcp_menu_state.reduce(self.menu, .{ .catalog_loaded = .{
+            .generation = request.generation,
+            .item_count = 0,
+        } }).state;
+    }
+
+    pub fn collectMenuCompletion(self: *State, alloc: Allocator) !MenuCompletionEffect {
+        self.lock.lockUncancelable(io_mod.getIo());
+        const pending = self.pending_menu_operation orelse {
+            self.lock.unlock(io_mod.getIo());
+            return .none;
+        };
+        if (!pending.done.load(.acquire)) {
+            self.lock.unlock(io_mod.getIo());
+            return .none;
+        }
+        self.pending_menu_operation = null;
+        self.lock.unlock(io_mod.getIo());
+
+        pending.join();
+        const request = pending.request;
+        const kind = pending.kind;
+        var result = pending.result.?;
+        pending.result = null;
+        pending.deinit();
+        defer result.deinit(alloc);
+        if (!self.menu.active or self.menu.pending_generation != request.generation) return .none;
+
+        if (self.menu_feedback) |feedback| alloc.free(feedback);
+        self.menu_feedback = null;
+        switch (result) {
+            .tools => |items| {
+                if (self.menu_tools) |previous| {
+                    for (previous) |item| alloc.free(item);
+                    alloc.free(previous);
+                }
+                self.menu_tools = items;
+                result = .cancelled;
+                self.menu = mcp_menu_state.reduce(self.menu, .{ .catalog_loaded = .{
+                    .generation = request.generation,
+                    .item_count = items.len,
+                } }).state;
+            },
+            .resources => |catalog| {
+                if (self.menu_resources) |*previous| previous.deinit(alloc);
+                const count = catalog.count();
+                self.menu_resources = catalog;
+                result = .cancelled;
+                self.menu = mcp_menu_state.reduce(self.menu, .{ .catalog_loaded = .{
+                    .generation = request.generation,
+                    .item_count = count,
+                } }).state;
+            },
+            .prompts => |catalog| {
+                if (self.menu_prompts) |*previous| previous.deinit(alloc);
+                const count = catalog.items.len;
+                self.menu_prompts = catalog;
+                result = .cancelled;
+                self.menu = mcp_menu_state.reduce(self.menu, .{ .catalog_loaded = .{
+                    .generation = request.generation,
+                    .item_count = count,
+                } }).state;
+            },
+            .preview => |preview| {
+                if (self.menu_preview) |*previous| previous.deinit(alloc);
+                self.menu_preview = preview;
+                result = .cancelled;
+                self.menu = mcp_menu_state.reduce(
+                    self.menu,
+                    .{ .preview_loaded = request.generation },
+                ).state;
+            },
+            .action => |action_result| {
+                self.menu_feedback = action_result.feedback;
+                const needs_reload = action_result.reload;
+                result = .cancelled;
+                self.returnMenuToServers();
+                if (needs_reload) return .{ .reload = request.generation };
+                self.menu = mcp_menu_state.reduce(
+                    self.menu,
+                    .{ .action_succeeded = request.generation },
+                ).state;
+            },
+            .failed => |err| {
+                self.menu_feedback = try std.fmt.allocPrint(
+                    alloc,
+                    "MCP {s} failed: {s}",
+                    .{
+                        switch (kind) {
+                            .catalog => "catalog",
+                            .preview => "preview",
+                            .action => "action",
+                        },
+                        @errorName(err),
+                    },
+                );
+                self.menu = mcp_menu_state.reduce(
+                    self.menu,
+                    .{ .effect_failed = request.generation },
+                ).state;
+            },
+            .cancelled => {
+                self.menu = mcp_menu_state.reduce(
+                    self.menu,
+                    .{ .effect_cancelled = request.generation },
+                ).state;
+            },
+        }
+        return .repaint;
+    }
+
+    pub fn recordMenuEffectFailure(
+        self: *State,
+        alloc: Allocator,
+        generation: u64,
+        err: anyerror,
+    ) !void {
+        if (!self.menu.active or self.menu.pending_generation != generation) return;
+        if (self.menu_feedback) |feedback| alloc.free(feedback);
+        self.menu_feedback = try std.fmt.allocPrint(
+            alloc,
+            "MCP operation failed: {s}",
+            .{@errorName(err)},
+        );
+        self.menu = mcp_menu_state.reduce(
+            self.menu,
+            .{ .effect_failed = generation },
+        ).state;
+    }
+
+    pub fn applyMenuReloadCompletion(
+        self: *State,
+        alloc: Allocator,
+        generation: u64,
+        completion: *const ReloadCompletion,
+        captured_at_ms: u64,
+    ) !void {
+        if (!self.menu.active or self.menu.pending_generation != generation) return;
+        if (self.menu_feedback) |feedback| alloc.free(feedback);
+        self.menu_feedback = switch (completion.*) {
+            .outcome => |outcome| switch (outcome) {
+                .published => |published| if (published.health == .ready)
+                    try alloc.dupe(u8, "MCP configuration reloaded.")
+                else
+                    try std.fmt.allocPrint(
+                        alloc,
+                        "MCP reloaded with {d} unavailable server{s}.",
+                        .{
+                            published.unavailable_server_names.len,
+                            if (published.unavailable_server_names.len == 1) "" else "s",
+                        },
+                    ),
+                .retained_required_failure => try alloc.dupe(
+                    u8,
+                    "MCP reload failed; the previous runtime remains active.",
+                ),
+            },
+            .failed => |err| try std.fmt.allocPrint(
+                alloc,
+                "MCP reload failed: {s}",
+                .{@errorName(err)},
+            ),
+        };
+        self.menu = switch (completion.*) {
+            .outcome => |outcome| switch (outcome) {
+                .published => mcp_menu_state.reduce(
+                    self.menu,
+                    .{ .action_succeeded = generation },
+                ).state,
+                .retained_required_failure => mcp_menu_state.reduce(
+                    self.menu,
+                    .{ .effect_failed = generation },
+                ).state,
+            },
+            .failed => mcp_menu_state.reduce(
+                self.menu,
+                .{ .effect_failed = generation },
+            ).state,
+        };
+
+        var snapshot = if (self.acquire()) |lease_value| snapshot: {
+            var lease = lease_value;
+            defer lease.deinit();
+            break :snapshot try lease.runtime.snapshotHealth(alloc, captured_at_ms);
+        } else try emptyHealthSnapshot(alloc, captured_at_ms);
+        errdefer snapshot.deinit(alloc);
+        if (self.menu_health) |*previous| previous.deinit(alloc);
+        self.menu_health = snapshot;
+    }
+
+    pub fn selectedMenuServerName(self: *const State) ?[]const u8 {
+        const health = self.menu_health orelse return null;
+        if (self.menu.selected_server_index >= health.servers.len) return null;
+        return health.servers[self.menu.selected_server_index].configured_name;
+    }
+
+    pub fn applyMenuAuthenticationCompletion(
+        self: *State,
+        alloc: Allocator,
+        generation: u64,
+        completion: *const AuthenticationCompletion,
+    ) !bool {
+        if (!self.menu.active or self.menu.pending_generation != generation) return false;
+        if (self.menu_feedback) |feedback| alloc.free(feedback);
+        self.menu_feedback = null;
+        if (completion.result) |authentication| {
+            switch (authentication) {
+                .authenticated => |authenticated| {
+                    self.menu_feedback = if (authenticated.repaired_entries == 0)
+                        try std.fmt.allocPrint(
+                            alloc,
+                            "Authenticated MCP server '{s}'; reconnecting…",
+                            .{completion.server_name},
+                        )
+                    else
+                        try std.fmt.allocPrint(
+                            alloc,
+                            "Authenticated '{s}'; repaired {d} credential entries; reconnecting…",
+                            .{ completion.server_name, authenticated.repaired_entries },
+                        );
+                    return true;
+                },
+                .issuer_mismatch => {
+                    self.menu_feedback = try std.fmt.allocPrint(
+                        alloc,
+                        "MCP authentication for '{s}' rejected an issuer mismatch.",
+                        .{completion.server_name},
+                    );
+                },
+            }
+        } else |err| {
+            self.menu_feedback = try std.fmt.allocPrint(
+                alloc,
+                "MCP authentication for '{s}' failed: {s}",
+                .{ completion.server_name, @errorName(err) },
+            );
+        }
+        self.menu = mcp_menu_state.reduce(
+            self.menu,
+            .{ .effect_failed = generation },
+        ).state;
+        return false;
+    }
+
+    fn cancelPendingMenuOperation(self: *State, reason: []const u8) void {
+        self.lock.lockUncancelable(io_mod.getIo());
+        const pending = self.pending_menu_operation;
+        self.pending_menu_operation = null;
+        if (pending) |task| task.cancel_requested.store(true, .release);
+        self.lock.unlock(io_mod.getIo());
+        if (pending) |task| {
+            debug_trace.logf(
+                "mcp",
+                "discarding pending menu operation generation={d} reason={s}",
+                .{ task.request.generation, reason },
+            );
+            task.deinit();
+        }
+    }
 
     pub fn installInitial(self: *State, runtime: ?*mcp_runtime.McpRuntime) void {
         std.debug.assert(self.runtime == null);
@@ -509,6 +1453,36 @@ pub const State = struct {
         server_name: []const u8,
         opener: host.UrlOpener,
     ) !mcp_command_provider.AuthenticationStart {
+        return self.startAuthenticationWithOrigin(
+            alloc,
+            server_name,
+            opener,
+            .command,
+        );
+    }
+
+    pub fn startMenuAuthentication(
+        self: *State,
+        alloc: Allocator,
+        server_name: []const u8,
+        opener: host.UrlOpener,
+        generation: u64,
+    ) !mcp_command_provider.AuthenticationStart {
+        return self.startAuthenticationWithOrigin(
+            alloc,
+            server_name,
+            opener,
+            .{ .menu = generation },
+        );
+    }
+
+    fn startAuthenticationWithOrigin(
+        self: *State,
+        alloc: Allocator,
+        server_name: []const u8,
+        opener: host.UrlOpener,
+        presentation_origin: PresentationOrigin,
+    ) !mcp_command_provider.AuthenticationStart {
         const pending = try alloc.create(PendingAuthentication);
         var pending_owned = true;
         errdefer if (pending_owned) alloc.destroy(pending);
@@ -541,6 +1515,7 @@ pub const State = struct {
             .server_name = owned_name,
             .lease = .{ .runtime = runtime },
             .opener = opener,
+            .presentation_origin = presentation_origin,
         };
         pending_owned = false;
         name_owned = false;
@@ -575,6 +1550,7 @@ pub const State = struct {
         self.lock.unlock(io_mod.getIo());
 
         pending.join();
+        self.last_authentication_completion_origin = pending.presentation_origin;
         const result = pending.result.?;
         pending.result = null;
         const server_name = pending.server_name;
@@ -584,6 +1560,10 @@ pub const State = struct {
             .server_name = server_name,
             .result = result,
         };
+    }
+
+    pub fn authenticationCompletionOrigin(self: *const State) PresentationOrigin {
+        return self.last_authentication_completion_origin;
     }
 
     pub fn authenticationPending(self: *State, server_name: []const u8) bool {
@@ -627,7 +1607,7 @@ pub const State = struct {
         registry: tool_dispatch.Registry,
         captured_at_ms: u64,
     ) !void {
-        return self.beginReloadWithSpawner(
+        return self.beginReloadWithOriginAndSpawner(
             alloc,
             workspace_root,
             elicitation_capabilities,
@@ -635,6 +1615,31 @@ pub const State = struct {
             preview_workspace_authority,
             registry,
             captured_at_ms,
+            .command,
+            spawnPendingReload,
+        );
+    }
+
+    pub fn beginMenuReload(
+        self: *State,
+        alloc: Allocator,
+        workspace_root: []const u8,
+        elicitation_capabilities: elicitation.Capabilities,
+        loader: mcp_runtime.LoadRuntimeFn,
+        preview_workspace_authority: mcp_runtime.PreviewNativeWorkspaceAuthorityFn,
+        registry: tool_dispatch.Registry,
+        captured_at_ms: u64,
+        generation: u64,
+    ) !void {
+        return self.beginReloadWithOriginAndSpawner(
+            alloc,
+            workspace_root,
+            elicitation_capabilities,
+            loader,
+            preview_workspace_authority,
+            registry,
+            captured_at_ms,
+            .{ .menu = generation },
             spawnPendingReload,
         );
     }
@@ -648,6 +1653,31 @@ pub const State = struct {
         preview_workspace_authority: mcp_runtime.PreviewNativeWorkspaceAuthorityFn,
         registry: tool_dispatch.Registry,
         captured_at_ms: u64,
+        spawn_reload: SpawnPendingReloadFn,
+    ) !void {
+        return self.beginReloadWithOriginAndSpawner(
+            alloc,
+            workspace_root,
+            elicitation_capabilities,
+            loader,
+            preview_workspace_authority,
+            registry,
+            captured_at_ms,
+            .command,
+            spawn_reload,
+        );
+    }
+
+    fn beginReloadWithOriginAndSpawner(
+        self: *State,
+        alloc: Allocator,
+        workspace_root: []const u8,
+        elicitation_capabilities: elicitation.Capabilities,
+        loader: mcp_runtime.LoadRuntimeFn,
+        preview_workspace_authority: mcp_runtime.PreviewNativeWorkspaceAuthorityFn,
+        registry: tool_dispatch.Registry,
+        captured_at_ms: u64,
+        presentation_origin: PresentationOrigin,
         spawn_reload: SpawnPendingReloadFn,
     ) !void {
         self.cancelPendingReload();
@@ -666,6 +1696,7 @@ pub const State = struct {
             .preview_workspace_authority = preview_workspace_authority,
             .registry = registry,
             .captured_at_ms = captured_at_ms,
+            .presentation_origin = presentation_origin,
         };
         self.lock.lockUncancelable(io_mod.getIo());
         std.debug.assert(self.pending_reload == null);
@@ -698,7 +1729,7 @@ pub const State = struct {
         captured_at_ms: u64,
         rebuild: bool,
     ) !void {
-        return self.beginAuthorityReductionWithSpawner(
+        return self.beginAuthorityReductionWithOriginAndSpawner(
             alloc,
             workspace_root,
             elicitation_capabilities,
@@ -706,6 +1737,31 @@ pub const State = struct {
             registry,
             captured_at_ms,
             rebuild,
+            .command,
+            spawnPendingReload,
+        );
+    }
+
+    pub fn beginMenuAuthorityReduction(
+        self: *State,
+        alloc: Allocator,
+        workspace_root: []const u8,
+        elicitation_capabilities: elicitation.Capabilities,
+        loader: mcp_runtime.LoadRuntimeFn,
+        registry: tool_dispatch.Registry,
+        captured_at_ms: u64,
+        rebuild: bool,
+        generation: u64,
+    ) !void {
+        return self.beginAuthorityReductionWithOriginAndSpawner(
+            alloc,
+            workspace_root,
+            elicitation_capabilities,
+            loader,
+            registry,
+            captured_at_ms,
+            rebuild,
+            .{ .menu = generation },
             spawnPendingReload,
         );
     }
@@ -721,6 +1777,31 @@ pub const State = struct {
         rebuild: bool,
         spawn_reload: SpawnPendingReloadFn,
     ) !void {
+        return self.beginAuthorityReductionWithOriginAndSpawner(
+            alloc,
+            workspace_root,
+            elicitation_capabilities,
+            loader,
+            registry,
+            captured_at_ms,
+            rebuild,
+            .command,
+            spawn_reload,
+        );
+    }
+
+    fn beginAuthorityReductionWithOriginAndSpawner(
+        self: *State,
+        alloc: Allocator,
+        workspace_root: []const u8,
+        elicitation_capabilities: elicitation.Capabilities,
+        loader: mcp_runtime.LoadRuntimeFn,
+        registry: tool_dispatch.Registry,
+        captured_at_ms: u64,
+        rebuild: bool,
+        presentation_origin: PresentationOrigin,
+        spawn_reload: SpawnPendingReloadFn,
+    ) !void {
         const pending = try alloc.create(PendingReload);
         const owned_workspace_root = alloc.dupe(u8, workspace_root) catch |err| {
             alloc.destroy(pending);
@@ -734,6 +1815,7 @@ pub const State = struct {
             .loader = loader,
             .registry = registry,
             .captured_at_ms = captured_at_ms,
+            .presentation_origin = presentation_origin,
             .policy = .authority_reducing,
             .rebuild = rebuild,
         };
@@ -794,6 +1876,7 @@ pub const State = struct {
         self.lock.unlock(io_mod.getIo());
 
         pending.join();
+        self.last_reload_completion_origin = pending.presentation_origin;
         const result = pending.result.?;
         pending.result = null;
         pending.alloc.free(pending.workspace_root);
@@ -803,6 +1886,10 @@ pub const State = struct {
             .failed => |err| .{ .failed = err },
             .cancelled => null,
         };
+    }
+
+    pub fn reloadCompletionOrigin(self: *const State) PresentationOrigin {
+        return self.last_reload_completion_origin;
     }
 
     fn cancelPendingReload(self: *State) void {
@@ -1013,11 +2100,13 @@ pub const State = struct {
     pub fn deinit(self: *State, alloc: Allocator) void {
         self.cancelPendingAuthentication("shutdown");
         self.cancelPendingReload();
+        self.cancelPendingMenuOperation("shutdown");
         self.lock.lockUncancelable(io_mod.getIo());
         const previous = self.runtime;
         self.runtime = null;
         self.lock.unlock(io_mod.getIo());
         if (previous) |runtime| destroyRuntime(alloc, runtime);
+        self.clearMenuOwned(alloc);
         self.* = .{};
     }
 };
