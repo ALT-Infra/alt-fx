@@ -236,7 +236,6 @@ fn validationMessage(
     };
     return alloc.dupe(u8, message);
 }
-
 fn executionFailure(
     alloc: Allocator,
     domain: []const u8,
