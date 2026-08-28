@@ -8593,7 +8593,7 @@ describe.skipIf(!tmuxAvailable())("transcript scrollback release", () => {
         expect(phaseOneHistory).toContain("• BLOCK_BULLET");
         expect(phaseOneHistory).toContain("✓ BLOCK_TASK_COMPLETE");
         expect(phaseOneHistory).toContain("│ QUOTE_BLOCK_FIRST");
-        expect(phaseOneHistory).toContain("┌ zig ");
+        expect(phaseOneHistory).toContain("─ zig ─");
         expect(phaseOneHistory).toContain("┬");
         expect(phaseOneHistory).toContain("┼");
         expect(phaseOneHistory).toContain("┴");
