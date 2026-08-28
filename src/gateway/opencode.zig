@@ -1,7 +1,6 @@
 const std = @import("std");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const opencode_session = @import("../core/auth/opencode_session.zig");
-const opencode_models = @import("opencode_models.zig");
 const secret = @import("../core/auth/secret.zig");
 const stream_provider = @import("../core/agent/stream_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
@@ -53,7 +52,6 @@ fn validateModel(model: []const u8) !void {
     }
     const wire_model = route(model).wire_model;
     if (wire_model.len == 0) return error.InvalidOpenCodeModel;
-    if (!opencode_models.supportsChatCompletionsModel(model)) return error.UnsupportedOpenCodeModelProtocol;
 }
 
 pub fn buildRequest(
@@ -982,12 +980,6 @@ test "buildRequest rejects empty wire model and oversized model ids" {
         .provider_options = .{},
     };
     try std.testing.expectError(error.InvalidOpenCodeModel, buildRequest(std.testing.allocator, base));
-    try std.testing.expectError(error.UnsupportedOpenCodeModelProtocol, buildRequest(std.testing.allocator, .{
-        .model = "gpt-5.6-sol",
-        .messages = &messages,
-        .tool_choice = .none,
-        .provider_options = .{},
-    }));
     var oversized: [257]u8 = undefined;
     @memset(&oversized, 'a');
     try std.testing.expectError(error.InvalidOpenCodeModel, buildRequest(std.testing.allocator, .{

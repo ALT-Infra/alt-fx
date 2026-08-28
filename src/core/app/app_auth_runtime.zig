@@ -1203,23 +1203,10 @@ pub fn Runtime(comptime App: type) type {
 
         fn reconcileOpenCodeModelForPrompt(app: *App) !bool {
             if (comptime !provider_runtime.supported(App) or
-                !@hasDecl(App, "snapshotCachedModelIds") or
-                !@hasDecl(App, "fetchModelIds")) return true;
+                !@hasDecl(App, "snapshotCachedModelIds")) return true;
             if (provider_runtime.provider(app) != .opencode or io_mod.getenv("FX_MODEL") != null) return true;
             if (try app.snapshotCachedModelIds(app.alloc)) |model_ids_value| {
                 var model_ids = model_ids_value;
-                defer collections.freeStringList(app.alloc, &model_ids);
-                try reconcileOpenCodeModelIds(app, model_ids.items);
-            } else if (!opencode_models.supportsChatCompletionsModel(provider_runtime.model(app))) {
-                var model_ids = app.fetchModelIds() catch |err| {
-                    debug_trace.logf("provider", "OpenCode prompt catalog failed err={s}", .{@errorName(err)});
-                    try app.writeDomainNotice(.{
-                        .topic = "provider",
-                        .tone = .warning,
-                        .body = "Could not refresh the OpenCode model list. Try again.",
-                    }, true);
-                    return false;
-                };
                 defer collections.freeStringList(app.alloc, &model_ids);
                 try reconcileOpenCodeModelIds(app, model_ids.items);
             }

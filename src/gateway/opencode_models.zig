@@ -6,56 +6,39 @@ const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
 
-const max_models_per_surface: usize = 128;
+const max_models_per_surface: usize = 4096;
 const max_model_id_bytes: usize = 256;
 const max_catalog_bytes: usize = 1024 * 1024;
+// models.dev publishes one aggregate for every provider. Keep a generous
+// runaway-response guard so unrelated catalog growth cannot silently strand
+// newly published OpenCode models.
+const max_protocol_metadata_bytes: usize = 32 * 1024 * 1024;
 const fetch_timeout_ms: i64 = 30_000;
 const zen_models_endpoint = "https://opencode.ai/zen/v1/models";
 const go_models_endpoint = "https://opencode.ai/zen/go/v1/models";
+const protocol_metadata_endpoint = "https://models.dev/api.json";
 const e2e_zen_models_endpoint_env = "FX_E2E_OPENCODE_ZEN_MODELS_URL";
 const e2e_go_models_endpoint_env = "FX_E2E_OPENCODE_GO_MODELS_URL";
+const e2e_protocol_metadata_endpoint_env = "FX_E2E_OPENCODE_PROTOCOL_METADATA_URL";
 const go_model_prefix = "go/";
+const openai_compatible_sdk = "@ai-sdk/openai-compatible";
 
-// OpenCode's /models responses do not include each model's wire protocol. fx
-// currently implements OpenAI-compatible Chat Completions for this provider,
-// so intersect the live catalogs with the protocol mapping published in the
-// OpenCode source tree instead of advertising Responses, Messages, or Gemini
-// models through an incompatible encoder.
-const zen_chat_completion_models = [_][]const u8{
-    "deepseek-v4-pro",
-    "deepseek-v4-flash",
-    "minimax-m3",
-    "minimax-m2.7",
-    "minimax-m2.5",
-    "glm-5.2",
-    "glm-5.1",
-    "glm-5",
-    "kimi-k2.5",
-    "kimi-k2.6",
-    "kimi-k2.7-code",
-    "kimi-k3",
-    "big-pickle",
-    "x-preview-f-free",
-    "mimo-v2.5-free",
-    "hy3-free",
-    "nemotron-3-ultra-free",
-    "nemotron-3.5-lightning-free",
+const ProtocolOverride = struct {
+    npm: ?[]const u8 = null,
 };
 
-const go_chat_completion_models = [_][]const u8{
-    "glm-5.3",
-    "glm-5.2",
-    "glm-5.1",
-    "kimi-k3",
-    "kimi-k2.7-code",
-    "kimi-k2.6",
-    "deepseek-v4-pro",
-    "deepseek-v4-flash",
-    "deepseek-v4-flash-vision-exp",
-    "mimo-v2.5",
-    "mimo-v2.5-pro",
-    "hy3",
-    "ox-alpha-free",
+const ProtocolModel = struct {
+    provider: ?ProtocolOverride = null,
+};
+
+const ProtocolProvider = struct {
+    npm: []const u8,
+    models: std.json.ArrayHashMap(ProtocolModel),
+};
+
+const ProtocolMetadata = struct {
+    opencode: ProtocolProvider,
+    @"opencode-go": ProtocolProvider,
 };
 
 pub const model_catalog_provider = model_catalog.Provider{
@@ -110,18 +93,30 @@ fn fetchCatalogForProvider(
         .raw = .fromMilliseconds(fetch_timeout_ms),
     });
 
-    const zen_body = fetchModelsBody(alloc, zen_models_endpoint, e2e_zen_models_endpoint_env, cancel_flag, deadline) catch |err| {
+    const zen_body = fetchPublicBody(alloc, zen_models_endpoint, e2e_zen_models_endpoint_env, max_catalog_bytes, cancel_flag, deadline) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = catalogFetchFailure(err) };
     };
     defer alloc.free(zen_body);
-    const go_body = fetchModelsBody(alloc, go_models_endpoint, e2e_go_models_endpoint_env, cancel_flag, deadline) catch |err| {
+    const go_body = fetchPublicBody(alloc, go_models_endpoint, e2e_go_models_endpoint_env, max_catalog_bytes, cancel_flag, deadline) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = catalogFetchFailure(err) };
     };
     defer alloc.free(go_body);
+    const protocol_metadata_body = fetchPublicBody(
+        alloc,
+        protocol_metadata_endpoint,
+        e2e_protocol_metadata_endpoint_env,
+        max_protocol_metadata_bytes,
+        cancel_flag,
+        deadline,
+    ) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return .{ .failure = catalogFetchFailure(err) };
+    };
+    defer alloc.free(protocol_metadata_body);
 
-    const catalog = parseCatalog(alloc, zen_body, go_body) catch |err| {
+    const catalog = parseCatalog(alloc, zen_body, go_body, protocol_metadata_body) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = .{ .category = .malformed_response, .http_status = .ok } };
     };
@@ -130,13 +125,16 @@ fn fetchCatalogForProvider(
 
 fn catalogFetchFailure(err: anyerror) model_catalog.Failure {
     if (err == error.Cancelled) return .{ .category = .cancellation };
-    if (err == error.OpenCodeModelCatalogTooLarge) return .{ .category = .malformed_response };
+    if (err == error.OpenCodeModelCatalogTooLarge or err == error.OpenCodePublicResponseTooLarge) {
+        return .{ .category = .malformed_response };
+    }
     return .{ .category = .transport, .retryable = true };
 }
 
 const ModelsGetOperation = struct {
     alloc: std.mem.Allocator,
     url: []const u8,
+    max_body_bytes: usize,
 
     const Output = struct {
         status: std.http.Status,
@@ -150,31 +148,38 @@ const ModelsGetOperation = struct {
     pub fn run(self: *@This()) !Output {
         var client: std.http.Client = .{ .allocator = self.alloc, .io = io_mod.getIo() };
         defer client.deinit();
-        const body_buffer = try self.alloc.alloc(u8, max_catalog_bytes + 1);
-        defer self.alloc.free(body_buffer);
-        var response_writer = std.Io.Writer.fixed(body_buffer);
-        const response = client.fetch(.{
-            .location = .{ .url = self.url },
-            .method = .GET,
+        const uri = try std.Uri.parse(self.url);
+        var request = try client.request(.GET, uri, .{
             .headers = .{
                 .accept_encoding = .omit,
                 .user_agent = .{ .override = gateway_client.user_agent },
             },
-            .response_writer = &response_writer,
-        }) catch |err| switch (err) {
-            error.WriteFailed => return error.OpenCodeModelCatalogTooLarge,
+            .redirect_behavior = .unhandled,
+        });
+        defer request.deinit();
+        try request.sendBodiless();
+        if (request.connection) |connection| try connection.flush();
+        var response = try request.receiveHead(&.{});
+        var transfer_buffer: [16 * 1024]u8 = undefined;
+        const reader = response.reader(&transfer_buffer);
+        const body = reader.allocRemaining(
+            self.alloc,
+            .limited(self.max_body_bytes + 1),
+        ) catch |err| switch (err) {
+            error.StreamTooLong => return error.OpenCodePublicResponseTooLarge,
             else => return err,
         };
-        const body = response_writer.buffered();
-        if (body.len > max_catalog_bytes) return error.OpenCodeModelCatalogTooLarge;
-        return .{ .status = response.status, .body = try self.alloc.dupe(u8, body) };
+        errdefer self.alloc.free(body);
+        if (body.len > self.max_body_bytes) return error.OpenCodePublicResponseTooLarge;
+        return .{ .status = response.head.status, .body = body };
     }
 };
 
-fn fetchModelsBody(
+fn fetchPublicBody(
     alloc: std.mem.Allocator,
     default_url: []const u8,
     e2e_url_env: []const u8,
+    max_body_bytes: usize,
     cancel_flag: *std.atomic.Value(bool),
     deadline: std.Io.Clock.Timestamp,
 ) ![]u8 {
@@ -185,6 +190,7 @@ fn fetchModelsBody(
     var operation = ModelsGetOperation{
         .alloc = alloc,
         .url = request_url,
+        .max_body_bytes = max_body_bytes,
     };
     var output = try gateway_client.runBoundedHttpOperation(
         ModelsGetOperation.Output,
@@ -204,11 +210,19 @@ fn parseCatalog(
     alloc: std.mem.Allocator,
     zen_json: []const u8,
     go_json: []const u8,
+    protocol_metadata_json: []const u8,
 ) !std.ArrayList(model_catalog.ModelCatalogEntry) {
+    var protocol_metadata = try std.json.parseFromSlice(
+        ProtocolMetadata,
+        alloc,
+        protocol_metadata_json,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer protocol_metadata.deinit();
     var catalog: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
     errdefer model_catalog.freeModelCatalog(alloc, &catalog);
-    try appendSurface(alloc, &catalog, zen_json, "", &zen_chat_completion_models);
-    try appendSurface(alloc, &catalog, go_json, go_model_prefix, &go_chat_completion_models);
+    try appendSurface(alloc, &catalog, zen_json, "", protocol_metadata.value.opencode);
+    try appendSurface(alloc, &catalog, go_json, go_model_prefix, protocol_metadata.value.@"opencode-go");
     if (catalog.items.len == 0) return error.InvalidOpenCodeModelCatalog;
     for (catalog.items, 0..) |entry, index| {
         if (!std.mem.endsWith(u8, entry.id, "-free")) continue;
@@ -223,7 +237,7 @@ fn appendSurface(
     catalog: *std.ArrayList(model_catalog.ModelCatalogEntry),
     body: []const u8,
     id_prefix: []const u8,
-    supported_models: []const []const u8,
+    protocol_provider: ProtocolProvider,
 ) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
@@ -234,7 +248,7 @@ fn appendSurface(
         if (value != .object) continue;
         const raw_id = stringField(value.object, "id") orelse continue;
         if (raw_id.len == 0 or raw_id.len > max_model_id_bytes) continue;
-        if (!containsModel(supported_models, raw_id)) continue;
+        if (!supportsChatCompletions(protocol_provider, raw_id)) continue;
         if (findDuplicate(catalog.items, id_prefix, raw_id)) continue;
         if (catalog.items.len >= max_models_per_surface * 2) return error.OpenCodeModelCatalogTooLarge;
         const id = try std.fmt.allocPrint(alloc, "{s}{s}", .{ id_prefix, raw_id });
@@ -249,16 +263,17 @@ fn appendSurface(
     }
 }
 
-fn containsModel(supported_models: []const []const u8, raw_id: []const u8) bool {
-    for (supported_models) |supported| if (std.mem.eql(u8, supported, raw_id)) return true;
-    return false;
-}
-
-pub fn supportsChatCompletionsModel(model: []const u8) bool {
-    if (std.mem.startsWith(u8, model, go_model_prefix)) {
-        return containsModel(&go_chat_completion_models, model[go_model_prefix.len..]);
-    }
-    return containsModel(&zen_chat_completion_models, model);
+fn supportsChatCompletions(provider: ProtocolProvider, model_id: []const u8) bool {
+    const npm = if (provider.models.map.get(model_id)) |model|
+        if (model.provider) |model_provider|
+            model_provider.npm orelse provider.npm
+        else
+            provider.npm
+    else
+        // A live model can precede its detailed metadata. Provider defaults are
+        // authoritative for entries without a per-model transport override.
+        provider.npm;
+    return std.mem.eql(u8, npm, openai_compatible_sdk);
 }
 
 fn isFreeModel(model: []const u8) bool {
@@ -303,10 +318,13 @@ fn stringField(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     return value.string;
 }
 
+const compatible_protocol_metadata = "{\"opencode\":{\"npm\":\"@ai-sdk/openai-compatible\",\"models\":{}},\"opencode-go\":{\"npm\":\"@ai-sdk/openai-compatible\",\"models\":{}}}";
+
 test "parseCatalog merges both surfaces and keeps same-name models as distinct routes" {
     const zen = "{\"object\":\"list\",\"data\":[{\"id\":\"kimi-k3\",\"object\":\"model\"},{\"id\":\"glm-5\",\"object\":\"model\"},{\"id\":\"gpt-5.6-sol\",\"object\":\"model\"}]}";
     const go = "{\"object\":\"list\",\"data\":[{\"id\":\"kimi-k3\",\"object\":\"model\"},{\"id\":\"kimi-k3\",\"object\":\"model\"},{\"id\":\"deepseek-v4-flash\",\"object\":\"model\"},{\"id\":\"minimax-m3\",\"object\":\"model\"}]}";
-    var catalog = try parseCatalog(std.testing.allocator, zen, go);
+    const protocols = "{\"opencode\":{\"npm\":\"@ai-sdk/openai-compatible\",\"models\":{\"gpt-5.6-sol\":{\"provider\":{\"npm\":\"@ai-sdk/openai\"}}}},\"opencode-go\":{\"npm\":\"@ai-sdk/openai-compatible\",\"models\":{\"minimax-m3\":{\"provider\":{\"npm\":\"@ai-sdk/anthropic\"}}}}}";
+    var catalog = try parseCatalog(std.testing.allocator, zen, go, protocols);
     defer model_catalog.freeModelCatalog(std.testing.allocator, &catalog);
     try std.testing.expectEqual(@as(usize, 4), catalog.items.len);
     try std.testing.expectEqualStrings("kimi-k3", catalog.items[0].id);
@@ -322,18 +340,22 @@ test "parseCatalog merges both surfaces and keeps same-name models as distinct r
 test "parseCatalog hides live models that require unsupported OpenCode protocols" {
     const unsupported_zen = "{\"data\":[{\"id\":\"gpt-5.6-sol\"},{\"id\":\"claude-opus-5\"}]}";
     const unsupported_go = "{\"data\":[{\"id\":\"grok-4.5\"},{\"id\":\"minimax-m3\"}]}";
+    const protocols = "{\"opencode\":{\"npm\":\"@ai-sdk/openai-compatible\",\"models\":{\"gpt-5.6-sol\":{\"provider\":{\"npm\":\"@ai-sdk/openai\"}},\"claude-opus-5\":{\"provider\":{\"npm\":\"@ai-sdk/anthropic\"}}}},\"opencode-go\":{\"npm\":\"@ai-sdk/openai-compatible\",\"models\":{\"grok-4.5\":{\"provider\":{\"npm\":\"@ai-sdk/openai\"}},\"minimax-m3\":{\"provider\":{\"npm\":\"@ai-sdk/anthropic\"}}}}}";
     try std.testing.expectError(
         error.InvalidOpenCodeModelCatalog,
-        parseCatalog(std.testing.allocator, unsupported_zen, unsupported_go),
+        parseCatalog(std.testing.allocator, unsupported_zen, unsupported_go, protocols),
     );
 }
 
-test "protocol allowlist distinguishes Zen and Go model routes" {
-    try std.testing.expect(supportsChatCompletionsModel("big-pickle"));
-    try std.testing.expect(supportsChatCompletionsModel("go/kimi-k3"));
-    try std.testing.expect(!supportsChatCompletionsModel("gpt-5.6-sol"));
-    try std.testing.expect(!supportsChatCompletionsModel("go/minimax-m3"));
-    try std.testing.expect(!supportsChatCompletionsModel("go/"));
+test "new live OpenCode models inherit dynamic provider protocol defaults" {
+    const zen = "{\"data\":[{\"id\":\"future-zen-model\"}]}";
+    const go = "{\"data\":[{\"id\":\"glm-5.3-flash\"},{\"id\":\"future-go-model\"}]}";
+    var catalog = try parseCatalog(std.testing.allocator, zen, go, compatible_protocol_metadata);
+    defer model_catalog.freeModelCatalog(std.testing.allocator, &catalog);
+    try std.testing.expectEqual(@as(usize, 3), catalog.items.len);
+    try std.testing.expectEqualStrings("future-zen-model", catalog.items[0].id);
+    try std.testing.expectEqualStrings("go/glm-5.3-flash", catalog.items[1].id);
+    try std.testing.expectEqualStrings("go/future-go-model", catalog.items[2].id);
 }
 
 test "stale OpenCode selection stays on its surface and free tier" {
@@ -352,7 +374,7 @@ test "stale OpenCode selection stays on its surface and free tier" {
 test "OpenCode catalog puts explicit free models first" {
     const zen = "{\"data\":[{\"id\":\"deepseek-v4-pro\"},{\"id\":\"x-preview-f-free\"}]}";
     const go = "{\"data\":[{\"id\":\"glm-5.3\"},{\"id\":\"ox-alpha-free\"}]}";
-    var catalog = try parseCatalog(std.testing.allocator, zen, go);
+    var catalog = try parseCatalog(std.testing.allocator, zen, go, compatible_protocol_metadata);
     defer model_catalog.freeModelCatalog(std.testing.allocator, &catalog);
     try std.testing.expectEqualStrings("x-preview-f-free", catalog.items[0].id);
     try std.testing.expectEqualStrings("deepseek-v4-pro", catalog.items[1].id);
@@ -361,6 +383,7 @@ test "OpenCode catalog puts explicit free models first" {
 }
 
 test "parseCatalog rejects empty or malformed catalogs" {
-    try std.testing.expectError(error.InvalidOpenCodeModelCatalog, parseCatalog(std.testing.allocator, "{}", "{}"));
-    try std.testing.expectError(error.InvalidOpenCodeModelCatalog, parseCatalog(std.testing.allocator, "{\"data\":[]}", "{\"data\":[]}"));
+    try std.testing.expectError(error.InvalidOpenCodeModelCatalog, parseCatalog(std.testing.allocator, "{}", "{}", compatible_protocol_metadata));
+    try std.testing.expectError(error.InvalidOpenCodeModelCatalog, parseCatalog(std.testing.allocator, "{\"data\":[]}", "{\"data\":[]}", compatible_protocol_metadata));
+    try std.testing.expectError(error.MissingField, parseCatalog(std.testing.allocator, "{\"data\":[]}", "{\"data\":[]}", "{}"));
 }
