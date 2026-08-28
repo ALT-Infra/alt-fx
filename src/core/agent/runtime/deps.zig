@@ -180,6 +180,7 @@ pub const AgentRuntimeDeps = struct {
     /// Drains user guidance admitted to the active turn. Returned text is owned
     /// by `arena` and is non-authoritative context, never permission evidence.
     take_steering: ?*const fn (ctx: *anyopaque, arena: Allocator, turn_id: u64) anyerror![]const []const u8 = null,
+    release_agent_terminal_lease: *const fn (ctx: *anyopaque, session_id: []const u8) anyerror!void = terminalLeaseCleanupUnavailable,
     prepare_parent_turn_context: ?*const fn (ctx: *anyopaque, arena: Allocator) anyerror!?PreparedParentTurnContext = null,
     acknowledge_parent_turn_context: ?*const fn (ctx: *anyopaque, arena: Allocator, acknowledgements: []const ParentTurnDeliveryAck) void = null,
     append_runtime_context: *const fn (ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) anyerror!void,
@@ -232,3 +233,7 @@ pub const AgentRuntimeDeps = struct {
         return self.push_system_notice(self.ctx, text);
     }
 };
+
+fn terminalLeaseCleanupUnavailable(_: *anyopaque, _: []const u8) !void {
+    return error.TerminalLeaseCleanupUnavailable;
+}
