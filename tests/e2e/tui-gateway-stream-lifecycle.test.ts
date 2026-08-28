@@ -1649,8 +1649,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         .sort()
         .map((name) => readFileSync(join(framesRoot, "frames", name), "utf8"));
       const prefixLength = (grid: string): number => {
+        const rows = grid.split("\n");
         for (let count = renderedSentence.length; count > 0; count -= 1) {
-          if (grid.includes(renderedSentence.slice(0, count))) return count;
+          if (rows.some((row) => row.startsWith(`|  ${renderedSentence.slice(0, count)}`))) {
+            return count;
+          }
         }
         return 0;
       };
