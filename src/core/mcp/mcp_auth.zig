@@ -1036,6 +1036,14 @@ pub fn authorizeInteractive(
         return err;
     };
     defer listener.deinit(io_mod.getIo());
+    var ipv6_listener: ?std.Io.net.Server = null;
+    if (configured_port) |port| {
+        var ipv6_address = try std.Io.net.IpAddress.parse("::1", port);
+        ipv6_listener = ipv6_address.listen(io_mod.getIo(), .{}) catch {
+            return error.McpCallbackPortUnavailable;
+        };
+    }
+    defer if (ipv6_listener) |*value| value.deinit(io_mod.getIo());
     const redirect_uri = try callbackRedirectUri(
         alloc,
         configured_port,
@@ -1044,6 +1052,7 @@ pub fn authorizeInteractive(
     defer alloc.free(redirect_uri);
     var context = InteractiveAuthorizationContext{
         .listener = &listener,
+        .ipv6_listener = if (ipv6_listener) |*value| value else null,
         .open_ctx = options.open_ctx,
         .open_url = options.open_url,
         .cancellation = .{
@@ -1259,6 +1268,7 @@ fn requestAutomatedAuthorization(
 
 const InteractiveAuthorizationContext = struct {
     listener: *std.Io.net.Server,
+    ipv6_listener: ?*std.Io.net.Server,
     open_ctx: ?*anyopaque,
     open_url: OpenUrlFn,
     cancellation: operation_control.CancellationSources,
@@ -1275,25 +1285,37 @@ fn checkAuthorizationCancellation(
 
 fn waitForInteractiveCallback(
     listener: *std.Io.net.Server,
+    ipv6_listener: ?*std.Io.net.Server,
     cancellation: operation_control.CancellationSources,
-) !void {
-    var fds = [_]std.posix.pollfd{.{
+) !*std.Io.net.Server {
+    var fds = [_]std.posix.pollfd{ .{
         .fd = listener.socket.handle,
         .events = std.posix.POLL.IN,
         .revents = 0,
-    }};
+    }, undefined };
+    const listeners = [_]*std.Io.net.Server{ listener, ipv6_listener orelse listener };
+    const listener_count: usize = if (ipv6_listener == null) 1 else 2;
+    if (ipv6_listener) |value| {
+        fds[1] = .{
+            .fd = value.socket.handle,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        };
+    }
     var remaining_ms = interactive_callback_timeout_ms;
     while (remaining_ms > 0) {
         try checkAuthorizationCancellation(cancellation);
-        fds[0].revents = 0;
+        for (fds[0..listener_count]) |*fd| fd.revents = 0;
         const wait_ms = @min(remaining_ms, interactive_callback_poll_ms);
-        const ready = try std.posix.poll(&fds, wait_ms);
+        const ready = try std.posix.poll(fds[0..listener_count], wait_ms);
         if (ready > 0) {
-            if ((fds[0].revents & std.posix.POLL.IN) == 0) {
-                return error.McpAuthorizationCallbackTimedOut;
+            for (fds[0..listener_count], listeners[0..listener_count]) |fd, ready_listener| {
+                if ((fd.revents & std.posix.POLL.IN) != 0) {
+                    try checkAuthorizationCancellation(cancellation);
+                    return ready_listener;
+                }
             }
-            try checkAuthorizationCancellation(cancellation);
-            return;
+            return error.McpAuthorizationCallbackTimedOut;
         }
         remaining_ms -= wait_ms;
     }
@@ -1311,9 +1333,9 @@ fn requestInteractiveAuthorization(
     if (!try ctx.open_url(ctx.open_ctx, alloc, authorization_url)) {
         return error.McpAuthorizationBrowserOpenFailed;
     }
-    try waitForInteractiveCallback(ctx.listener, ctx.cancellation);
+    const listener = try waitForInteractiveCallback(ctx.listener, ctx.ipv6_listener, ctx.cancellation);
 
-    var stream = try ctx.listener.accept(io_mod.getIo());
+    var stream = try listener.accept(io_mod.getIo());
     defer stream.close(io_mod.getIo());
     setSocketTimeouts(stream.socket.handle, callback_io_timeout_seconds);
     var socket_buffer: [4096]u8 = undefined;
@@ -2517,6 +2539,34 @@ test "interactive callback rejects a pinned port already listening" {
     );
 }
 
+test "interactive callback rejects a pinned IPv6 port already listening" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    var address = try std.Io.net.IpAddress.parse("::1", 0);
+    var listener = address.listen(std.testing.io, .{ .reuse_address = true }) catch |err| switch (err) {
+        error.AddressFamilyUnsupported, error.AddressUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer listener.deinit(std.testing.io);
+    var cancelled = std.atomic.Value(bool).init(true);
+    const OpenUrl = struct {
+        fn run(_: ?*anyopaque, _: Allocator, _: []const u8) anyerror!bool {
+            return true;
+        }
+    };
+    try std.testing.expectError(
+        error.McpCallbackPortUnavailable,
+        authorizeInteractive(std.testing.allocator, .{
+            .endpoint = "http://127.0.0.1:8080",
+            .challenge = .{},
+            .config = .{ .callback_port = listener.socket.address.getPort() },
+            .open_url = OpenUrl.run,
+            .cancel_flag = &cancelled,
+        }),
+    );
+}
+
 test "interactive callback wait observes caller and lifecycle cancellation" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
         return error.SkipZigTest;
@@ -2541,7 +2591,7 @@ test "interactive callback wait observes caller and lifecycle cancellation" {
         const started_ms = io_mod.milliTimestamp();
         try std.testing.expectError(
             error.Cancelled,
-            waitForInteractiveCallback(&listener, .{
+            waitForInteractiveCallback(&listener, null, .{
                 .caller = &caller,
                 .runtime = &runtime,
             }),
