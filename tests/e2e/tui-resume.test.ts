@@ -694,10 +694,10 @@ function expectRenderedMarkdown(
 }
 
 function expectInferredTypeScriptCodeBlock(scrollback: string): void {
-  expect(scrollback).toContain("┌ ts");
+  expect(scrollback).toContain("─ ts ─");
   expect(scrollback).toContain("inferredHook = await");
   expect(scrollback).toContain("{ cleanup: true } as");
-  expect(scrollback).toContain("pSignal);");
+  expect(scrollback).toContain("nupSignal)");
 }
 
 function expectInferredTypeScriptColors(scrollback: string): void {
@@ -706,9 +706,9 @@ function expectInferredTypeScriptColors(scrollback: string): void {
 }
 
 function expectExpandedCodeProfiles(scrollback: string): void {
-  expect(scrollback).toContain("┌ json");
+  expect(scrollback).toContain("─ json ─");
   expect(scrollback).toContain('"json_ready"');
-  expect(scrollback).toContain("┌ python");
+  expect(scrollback).toContain("─ python ─");
   expect(scrollback).toContain("def render_ready");
 }
 
