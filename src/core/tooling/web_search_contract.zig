@@ -45,6 +45,7 @@ pub const Request = struct {
     allowed_domains: ?[]const []const u8 = null,
     blocked_domains: ?[]const []const u8 = null,
     session_id: ?[]const u8 = null,
+    turn_id: ?u64 = null,
 };
 
 pub const ProviderRequest = struct {
@@ -55,6 +56,7 @@ pub const ProviderRequest = struct {
     allowed_domains: ?[]const []const u8 = null,
     blocked_domains: ?[]const []const u8 = null,
     session_id: ?[]const u8 = null,
+    turn_id: ?u64 = null,
     max_uses: u8 = 8,
     max_results: u8 = 10,
     max_output_tokens: u32 = 4096,

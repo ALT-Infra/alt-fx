@@ -211,6 +211,7 @@ const tool_dispatch = @import("core/tooling/tool_dispatch.zig");
 const tool_set_contract = @import("core/tooling/tool_set.zig");
 const tool_mcp_runtime = @import("core/tooling/tool_mcp_runtime.zig");
 const tool_runtime = @import("core/tooling/tool_runtime.zig");
+const web_fetch_provider_runtime = @import("core/tooling/web_fetch_provider_runtime.zig");
 const web_fetch_runtime = @import("core/tooling/web_fetch_runtime.zig");
 const web_search_runtime = @import("core/tooling/web_search_runtime.zig");
 const parallel_session = @import("core/auth/parallel_session.zig");
@@ -670,6 +671,9 @@ const App = struct {
     permission_state: app_permission_runtime.State = .{},
     agent_step_limit: usize = default_max_agent_steps,
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
+    parallel_web_fetch_runtime: web_fetch_provider_runtime.Runtime = web_fetch_provider_runtime.Runtime.init(.{
+        .provider = if (host_profile.web_search) builtin_parallel.default_web_fetch_provider else null,
+    }),
     web_search_runtime: web_search_runtime.Runtime = web_search_runtime.Runtime.init(.{
         .provider = if (host_profile.web_search) builtin_providers.native.gateway.fx_search else null,
     }),
@@ -1022,6 +1026,7 @@ const App = struct {
         self.background.deinit(std.heap.c_allocator);
         self.worker.deinit(std.heap.c_allocator);
         self.web_fetch_runtime.deinit(self.alloc);
+        self.parallel_web_fetch_runtime.deinit();
         self.web_search_runtime.deinit();
         self.parallel_web_search_runtime.deinit();
         if (self.parallel_connection) |*connection| connection.deinit(self.alloc);
@@ -1600,6 +1605,12 @@ const App = struct {
             tool_context.web_search_backend = self.web_search_runtime.dispatchBackend();
             tool_context.web_search_runtime_ready = false;
         } else if (self.parallel_connection) |*connection| {
+            self.parallel_web_fetch_runtime.configure(.{
+                .api_key = connection.api_key,
+                .worker_model = prompt.model,
+                .usage = &self.session.usage,
+                .usage_allocator = self.alloc,
+            });
             self.parallel_web_search_runtime.configure(.{
                 .api_key = connection.api_key,
                 .worker_model = prompt.model,
@@ -1609,6 +1620,7 @@ const App = struct {
                 .usage_allocator = self.alloc,
             });
             tool_context.web_search_backend = self.parallel_web_search_runtime.dispatchBackend();
+            tool_context.web_fetch_backend = self.parallel_web_fetch_runtime.dispatchBackend();
             tool_context.web_search_runtime_ready = true;
         } else {
             tool_context.web_search_backend = null;

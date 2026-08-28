@@ -181,6 +181,7 @@ pub const Runtime = struct {
             .allowed_domains = input.allowed_domains,
             .blocked_domains = input.blocked_domains,
             .session_id = input.session_id,
+            .turn_id = input.turn_id,
             .max_uses = self.policy.max_uses,
             .max_results = self.policy.max_results,
             .max_output_tokens = self.policy.max_output_tokens,
@@ -284,7 +285,8 @@ fn executeForDispatch(
     const self: *Runtime = @ptrCast(@alignCast(raw_ctx));
     var progress_forwarder = ProgressForwarder{ .dispatch = ctx };
     var scoped_request = request;
-    scoped_request.session_id = ctx.web_search_session_id;
+    scoped_request.session_id = ctx.web_research_session_id;
+    scoped_request.turn_id = if (ctx.output_chunk_lifecycle_id) |id| id.turn_id else null;
     return self.executeWithProgress(
         ctx.allocator,
         scoped_request,

@@ -211,6 +211,7 @@ pub const Context = struct {
     permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
     auto_classifier: permission_auto_classifier.Classifier =
         permission_auto_classifier.Classifier.disabled(),
+    web_fetch_backend: ?tool_dispatch.WebFetchBackend = null,
     web_fetch_runtime: ?*web_fetch_runtime.Runtime = null,
     web_fetch_artifact_store: ?*web_fetch_artifacts.Store = null,
     web_fetch_artifact_error: ?anyerror = null,
@@ -886,7 +887,7 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .ephemeral_command_replay = ctx.ephemeral_command_replay,
         .terminal_client = ctx.terminal_client,
         .terminal_owner_session_id = ctx.lifecycle_scope.session_id,
-        .web_search_session_id = ctx.lifecycle_scope.session_id,
+        .web_research_session_id = ctx.lifecycle_scope.session_id,
         .terminal_transport_role = switch (ctx.lifecycle_scope.kind) {
             .interactive, .subagent => .interactive,
             .ask => .headless,
@@ -900,6 +901,7 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .command_timeout_ms = ctx.command_timeout_ms,
         .ask_question_ctx = if (ctx.interactive) ctx.worker else null,
         .ask_question_batch = if (ctx.interactive) requestQuestionBatchWithWorker else null,
+        .web_fetch_backend = ctx.web_fetch_backend,
         .web_fetch_runtime = ctx.web_fetch_runtime,
         .web_fetch_artifact_store = ctx.web_fetch_artifact_store,
         .web_fetch_artifact_error = ctx.web_fetch_artifact_error,

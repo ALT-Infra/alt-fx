@@ -5,12 +5,15 @@ const url_policy = @import("url_policy.zig");
 const Allocator = std.mem.Allocator;
 
 const whitespace = " \t\r\n";
+const max_objective_bytes: usize = 5000;
 
 pub const Input = struct {
     url: []u8,
+    objective: ?[]u8 = null,
 
     pub fn deinit(self: *Input, alloc: Allocator) void {
         alloc.free(self.url);
+        if (self.objective) |objective| alloc.free(objective);
         self.* = .{ .url = &.{} };
     }
 };
@@ -27,7 +30,8 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
 
     var it = parsed.value.object.iterator();
     while (it.next()) |entry| {
-        if (std.mem.eql(u8, entry.key_ptr.*, "url")) continue;
+        if (std.mem.eql(u8, entry.key_ptr.*, "url") or
+            std.mem.eql(u8, entry.key_ptr.*, "objective")) continue;
         return .{ .failure = try std.fmt.allocPrint(ctx.allocator, "web_fetch field \"{s}\" is not allowed", .{entry.key_ptr.*}) };
     }
 
@@ -37,13 +41,23 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
     if (url_value != .string) {
         return .{ .failure = try ctx.allocator.dupe(u8, "web_fetch field \"url\" must be a string") };
     }
+    const objective_value = parsed.value.object.get("objective");
+    if (objective_value != null and objective_value.? != .string and objective_value.? != .null) {
+        return .{ .failure = try ctx.allocator.dupe(u8, "web_fetch field \"objective\" must be a string or null") };
+    }
 
     const input = try ctx.allocator.create(Input);
     errdefer ctx.allocator.destroy(input);
     const url = try ctx.allocator.dupe(u8, url_value.string);
     errdefer ctx.allocator.free(url);
+    const objective = if (objective_value != null and objective_value.? == .string)
+        try ctx.allocator.dupe(u8, objective_value.?.string)
+    else
+        null;
+    errdefer if (objective) |value| ctx.allocator.free(value);
     input.* = .{
         .url = url,
+        .objective = objective,
     };
     errdefer input.deinit(ctx.allocator);
 
@@ -67,6 +81,21 @@ pub fn validate(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolIn
         const owned = try ctx.allocator.dupe(u8, normalized.retrieval_url);
         ctx.allocator.free(input.url);
         input.url = owned;
+    }
+
+    if (input.objective) |objective| {
+        const trimmed_objective = std.mem.trim(u8, objective, whitespace);
+        if (trimmed_objective.len > max_objective_bytes) {
+            return try ctx.allocator.dupe(u8, "web_fetch field \"objective\" must be at most 5000 bytes");
+        }
+        if (trimmed_objective.len == 0) {
+            ctx.allocator.free(objective);
+            input.objective = null;
+        } else if (!std.mem.eql(u8, objective, trimmed_objective)) {
+            const owned = try ctx.allocator.dupe(u8, trimmed_objective);
+            ctx.allocator.free(objective);
+            input.objective = owned;
+        }
     }
 
     return null;

@@ -83,6 +83,7 @@ const tool_runtime = @import("../tooling/tool_runtime.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const tool_specs = @import("../tooling/tool_specs.zig");
 const skill_invocation = @import("../skills/skill_invocation.zig");
+const web_fetch_provider_runtime = @import("../tooling/web_fetch_provider_runtime.zig");
 const web_fetch_runtime = @import("../tooling/web_fetch_runtime.zig");
 const web_search_runtime = @import("../tooling/web_search_runtime.zig");
 const types = @import("../shared/types.zig");
@@ -584,6 +585,7 @@ const AskContext = struct {
     web_search_progress_mutex: std.Io.Mutex = .init,
     step_count: usize = 0,
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
+    parallel_web_fetch_runtime: web_fetch_provider_runtime.Runtime,
     web_search_runtime: web_search_runtime.Runtime,
     parallel_web_search_runtime: web_search_runtime.Runtime,
     parallel_connection: ?parallel_session.Session,
@@ -612,6 +614,9 @@ const AskContext = struct {
             ),
             .web_search_runtime = web_search_runtime.Runtime.init(.{
                 .provider = cfg.provider_set.gateway.fx_search.?,
+            }),
+            .parallel_web_fetch_runtime = web_fetch_provider_runtime.Runtime.init(.{
+                .provider = builtin_parallel.default_web_fetch_provider,
             }),
             .parallel_web_search_runtime = web_search_runtime.Runtime.init(.{
                 .provider = builtin_parallel.default_web_search_provider,
@@ -735,6 +740,7 @@ const AskContext = struct {
             }
         }
         self.web_fetch_runtime.deinit(self.alloc);
+        self.parallel_web_fetch_runtime.deinit();
         self.web_search_runtime.deinit();
         self.parallel_web_search_runtime.deinit();
         if (self.parallel_connection) |*connection| connection.deinit(self.alloc);
@@ -966,6 +972,7 @@ const AskContext = struct {
         const provider_capabilities = self.cfg.provider_set.select(self.provider).capabilities;
         var web_search_runtime_ready = false;
         var web_search_backend: ?tool_dispatch.WebSearchBackend = null;
+        var web_fetch_backend: ?tool_dispatch.WebFetchBackend = null;
         if (provider_capabilities.fx_search) {
             self.web_search_runtime.configure(.{
                 .api_key = self.api_key,
@@ -979,6 +986,12 @@ const AskContext = struct {
             });
             web_search_backend = self.web_search_runtime.dispatchBackend();
         } else if (self.parallel_connection) |*connection| {
+            self.parallel_web_fetch_runtime.configure(.{
+                .api_key = connection.api_key,
+                .worker_model = self.model,
+                .usage = &self.session.usage,
+                .usage_allocator = self.alloc,
+            });
             self.parallel_web_search_runtime.configure(.{
                 .api_key = connection.api_key,
                 .worker_model = self.model,
@@ -989,6 +1002,7 @@ const AskContext = struct {
             });
             web_search_runtime_ready = true;
             web_search_backend = self.parallel_web_search_runtime.dispatchBackend();
+            web_fetch_backend = self.parallel_web_fetch_runtime.dispatchBackend();
         }
         var tc: tool_runtime.Context = .{
             .workspace_root = self.workspace_root,
@@ -1049,6 +1063,7 @@ const AskContext = struct {
                 null,
             .terminal_client = &self.terminal_client,
             .command_timeout_ms = self.command_timeout_ms,
+            .web_fetch_backend = web_fetch_backend,
             .web_fetch_runtime = &self.web_fetch_runtime,
             .web_fetch_artifact_store = self.session.webFetchArtifactStore(),
             .web_fetch_artifact_error = self.session.webFetchArtifactError(),

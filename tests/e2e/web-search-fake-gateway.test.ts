@@ -1118,9 +1118,10 @@ describe("web_search Gateway fixture", () => {
 
 
   test(
-    "opencode model without fx search borrows a configured local Parallel backend",
+    "opencode model completes a focused Parallel search and fetch research loop",
     async () => {
-      const SENTINEL = "PARALLEL_LOCAL_EXCERPT_SENTINEL";
+      const SEARCH_SENTINEL = "PARALLEL_LOCAL_EXCERPT_SENTINEL";
+      const EXTRACT_SENTINEL = "PARALLEL_LOCAL_FOCUSED_EXTRACT_SENTINEL";
       const opencodeApiKey = "opencode-local-search-key";
       const parallelApiKey = "parallel-e2e-key";
       let loginSettings: Record<string, unknown> = {};
@@ -1141,7 +1142,7 @@ describe("web_search Gateway fixture", () => {
           }
           if (url.pathname === "/chat") {
             const body = await request.text();
-            if (!body.includes("PARALLEL_LOCAL_EXCERPT_SENTINEL")) {
+            if (!body.includes(SEARCH_SENTINEL)) {
               return new Response(
                 `data: ${JSON.stringify({
                   id: "opencode-search-turn",
@@ -1154,6 +1155,34 @@ describe("web_search Gateway fixture", () => {
                         function: {
                           name: "web_search",
                           arguments: JSON.stringify({ query: "latest Zig release" }),
+                        },
+                      }],
+                    },
+                    finish_reason: null,
+                  }],
+                })}\n\n` +
+                  `data: ${JSON.stringify({
+                    choices: [{ delta: {}, finish_reason: "tool_calls" }],
+                  })}\n\ndata: [DONE]\n\n`,
+                { headers: { "content-type": "text/event-stream" } },
+              );
+            }
+            if (!body.includes(EXTRACT_SENTINEL)) {
+              return new Response(
+                `data: ${JSON.stringify({
+                  id: "opencode-fetch-turn",
+                  choices: [{
+                    delta: {
+                      tool_calls: [{
+                        index: 0,
+                        id: "opencode_fetch_1",
+                        type: "function",
+                        function: {
+                          name: "web_fetch",
+                          arguments: JSON.stringify({
+                            url: SOURCE_URL,
+                            objective: "Confirm the current Zig release date",
+                          }),
                         },
                       }],
                     },
@@ -1184,27 +1213,44 @@ describe("web_search Gateway fixture", () => {
           return new Response("not found", { status: 404 });
         },
       });
-      const parallelRequests: Array<{ authorization: string | null; body: string }> = [];
+      const parallelSearchRequests: Array<{ authorization: string | null; body: string }> = [];
+      const parallelExtractRequests: Array<{ authorization: string | null; body: string }> = [];
       const parallel = Bun.serve({
         hostname: "127.0.0.1",
         port: 0,
         async fetch(request) {
-          if (new URL(request.url).pathname !== "/search") {
-            return new Response("not found", { status: 404 });
+          const path = new URL(request.url).pathname;
+          if (path === "/search") {
+            parallelSearchRequests.push({
+              authorization: request.headers.get("x-api-key"),
+              body: await request.text(),
+            });
+            return Response.json({
+              search_id: "search_local_e2e_1",
+              results: [{
+                title: "Zig downloads",
+                url: SOURCE_URL,
+                publish_date: "2026-08-01",
+                excerpts: [SEARCH_SENTINEL],
+              }],
+            });
           }
-          parallelRequests.push({
-            authorization: request.headers.get("x-api-key"),
-            body: await request.text(),
-          });
-          return Response.json({
-            search_id: "search_local_e2e_1",
-            results: [{
-              title: "Zig downloads",
-              url: SOURCE_URL,
-              publish_date: "2026-08-01",
-              excerpts: [SENTINEL],
-            }],
-          });
+          if (path === "/extract") {
+            parallelExtractRequests.push({
+              authorization: request.headers.get("x-api-key"),
+              body: await request.text(),
+            });
+            return Response.json({
+              session_id: "parallel-task-session",
+              results: [{
+                title: "Zig downloads",
+                url: SOURCE_URL,
+                publish_date: "2026-08-01",
+                excerpts: [EXTRACT_SENTINEL],
+              }],
+            });
+          }
+          return new Response("not found", { status: 404 });
         },
       });
 
@@ -1242,6 +1288,7 @@ describe("web_search Gateway fixture", () => {
               OPENCODE_API_KEY: undefined,
               PARALLEL_API_KEY: parallelApiKey,
               FX_E2E_PARALLEL_SEARCH_URL: `http://127.0.0.1:${parallel.port}/search`,
+              FX_E2E_PARALLEL_EXTRACT_URL: `http://127.0.0.1:${parallel.port}/extract`,
               AI_GATEWAY_API_KEY: undefined,
               VERCEL_OIDC_TOKEN: undefined,
               FX_AUTO_UPGRADE: "0",
@@ -1253,17 +1300,30 @@ describe("web_search Gateway fixture", () => {
         expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
         const json = parseFxJson(result);
         expect(json.output).toContain("PARALLEL_LOCAL_SEARCH_COMPLETE");
-        expect(parallelRequests).toHaveLength(1);
-        expect(parallelRequests[0]!.authorization).toBe(parallelApiKey);
-        const parallelBody = JSON.parse(parallelRequests[0]!.body) as Record<string, unknown>;
-        expect(parallelBody["objective"]).toBe("latest Zig release");
-        expect(parallelBody["mode"]).toBe("fast");
-        expect(parallelBody["client_model"]).toBe(loginSettings.models
+        expect(parallelSearchRequests).toHaveLength(1);
+        expect(parallelExtractRequests).toHaveLength(1);
+        expect(parallelSearchRequests[0]!.authorization).toBe(parallelApiKey);
+        expect(parallelExtractRequests[0]!.authorization).toBe(parallelApiKey);
+        const searchBody = JSON.parse(parallelSearchRequests[0]!.body) as Record<string, unknown>;
+        const extractBody = JSON.parse(parallelExtractRequests[0]!.body) as Record<string, unknown>;
+        expect(searchBody["objective"]).toBe("latest Zig release");
+        expect(searchBody["mode"]).toBe("fast");
+        expect(searchBody["max_chars_total"]).toBeUndefined();
+        expect(searchBody["advanced_settings"]).toBeUndefined();
+        expect(searchBody["client_model"]).toBe(loginSettings.models
           ? (loginSettings.models as Record<string, string>)["opencode"]
           : undefined);
+        expect(extractBody["urls"]).toEqual([SOURCE_URL]);
+        expect(extractBody["objective"]).toBe("Confirm the current Zig release date");
+        expect(extractBody["max_chars_total"]).toBeUndefined();
+        expect(extractBody["advanced_settings"]).toBeUndefined();
+        expect(extractBody["session_id"]).toBe(searchBody["session_id"]);
         expect(json.tool_calls.some((call) =>
           call.name === "web_search" && call.status === "success" &&
           call.web_search?.searches === 1
+        )).toBe(true);
+        expect(json.tool_calls.some((call) =>
+          call.name === "web_fetch" && call.status === "success"
         )).toBe(true);
       } finally {
         opencode.stop(true);
