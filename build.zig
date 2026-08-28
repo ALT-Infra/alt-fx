@@ -165,7 +165,7 @@ pub fn build(b: *std.Build) void {
                 "session mode lookup distinguishes latest ALT and native conversations",
                 "definition manager requires a real Team and preserves edit intent",
                 "Team library never offers a primary-only preset",
-                "definition manager screen renders native Team library controls",
+                "surface footer measures the orchestration definition manager inline",
             },
         });
         const run_orchestration_host_tests = b.addRunArtifact(orchestration_host_tests);

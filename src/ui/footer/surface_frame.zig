@@ -17,6 +17,7 @@ const interaction_state = @import("interaction_state.zig");
 const picker_presentation = @import("picker_presentation.zig");
 const model_menu_presentation = @import("model_menu_presentation.zig");
 const skills_menu_presentation = @import("skills_menu_presentation.zig");
+const definition_manager_presentation = @import("definition_manager_presentation.zig");
 const help_menu_presentation = @import("help_menu_presentation.zig");
 const settings_menu_presentation = @import("settings_menu_presentation.zig");
 const mcp_menu_presentation = @import("mcp_menu_presentation.zig");
@@ -395,7 +396,8 @@ fn buildFooterSurfaceProjection(
     const show_help_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !modal_active and ctx.help_menu.active;
     const show_session_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !modal_active and ctx.session_menu.active;
     const show_models_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !show_session_menu and !modal_active and ctx.model_menu.active;
-    const show_inline_catalog = show_settings_menu or show_mcp_menu or show_help_menu or show_session_menu or show_models_menu;
+    const show_definition_manager = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !show_session_menu and !show_models_menu and !modal_active and ctx.definition_manager.active;
+    const show_inline_catalog = show_settings_menu or show_mcp_menu or show_help_menu or show_session_menu or show_models_menu or show_definition_manager;
     const show_skills_query = !viewer_active and !show_auth_picker and !show_inline_catalog and !modal_active and ctx.skills_menu.active;
     const stream_suppresses_file_query = ctx.stream.active and !ctx.queued_editor_active;
     const show_model_query = !viewer_active and !show_auth_picker and !show_inline_catalog and !show_skills_query and !modal_active and !ctx.stream.active and ctx.model_query_active;
@@ -481,6 +483,8 @@ fn buildFooterSurfaceProjection(
         .sessions
     else if (show_models_menu)
         .models
+    else if (show_definition_manager)
+        .definition_manager
     else if (show_slash_query)
         .slash
     else if (show_auth_picker)
@@ -549,6 +553,12 @@ fn buildFooterSurfaceProjection(
         banner_rows,
         mcp_menu_presentation.max_inline_rows,
     );
+    const definition_manager_row_budget = picker_presentation.inlinePickerRowBudgetCapped(
+        shell.layout.rows,
+        geometry.input_extra,
+        banner_rows,
+        resume_menu_presentation.max_inline_rows,
+    );
     const picker_rows: u16 = if (sizing_request) |request|
         if (request.file) |request_file|
             approval_ui.fileApprovalPickerRows(request_file)
@@ -605,6 +615,11 @@ fn buildFooterSurfaceProjection(
             ctx.model_menu,
             shell.layout.cols,
             models_picker_row_budget,
+        )
+    else if (show_definition_manager)
+        definition_manager_presentation.menuRowCount(
+            ctx.definition_manager,
+            definition_manager_row_budget,
         )
     else if (show_skills_query)
         skills_menu_presentation.inlineMenuRowCount(
@@ -1741,6 +1756,54 @@ test "surface footer measurement reserves six inline skill choices" {
     try std.testing.expect(measurement.show_picker);
     try std.testing.expectEqual(PickerKind.skills, measurement.picker_kind);
     try std.testing.expectEqual(@as(u16, 8), measurement.picker_rows);
+}
+
+test "surface footer measures the orchestration definition manager inline" {
+    const alloc = std.testing.allocator;
+    const definition_manager = @import("../../core/orchestration/definition_manager.zig");
+    var manager = definition_manager.State{ .active = true };
+    defer manager.deinit(alloc);
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var approval = ApprovalPrompt{};
+    defer approval.deinit(alloc);
+    var shell = surfaceTestShell(24, 80);
+    defer shell.deinit(alloc);
+    var ctx = surfaceTestContext(&input);
+    ctx.definition_manager = .{
+        .active = true,
+        .state = &manager,
+        .definition_kind = "Team",
+        .extension_name = "ALT",
+    };
+
+    {
+        var measurement = try measureSurfaceFooter(alloc, &shell, approval.projection(), ctx);
+        defer measurement.deinit(alloc);
+        try std.testing.expect(measurement.show_picker);
+        try std.testing.expectEqual(PickerKind.definition_manager, measurement.picker_kind);
+        try std.testing.expectEqual(@as(u16, 3), measurement.picker_rows);
+    }
+
+    const editor_rows = [_]render_input.DefinitionEditorRow{
+        .{ .label = "Name" },
+        .{ .label = "Provider" },
+        .{ .label = "Primary" },
+        .{ .label = "Peers" },
+        .{ .label = "Specialists" },
+        .{ .label = "Specialist access" },
+        .{ .label = "Save & start", .selected = true },
+    };
+    ctx.definition_manager.stage = .editor;
+    ctx.definition_manager.editor = .{
+        .active = true,
+        .title = "Team",
+        .subtitle = "Configure a primary plus at least one peer or specialist.",
+        .rows = &editor_rows,
+    };
+    var editor_measurement = try measureSurfaceFooter(alloc, &shell, approval.projection(), ctx);
+    defer editor_measurement.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 10), editor_measurement.picker_rows);
 }
 
 test "surface footer omits the picker for zero slash results" {

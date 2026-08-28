@@ -21,6 +21,7 @@ const interaction_state = @import("interaction_state.zig");
 const picker_presentation = @import("picker_presentation.zig");
 const model_menu_presentation = @import("model_menu_presentation.zig");
 const skills_menu_presentation = @import("skills_menu_presentation.zig");
+const definition_manager_presentation = @import("definition_manager_presentation.zig");
 const help_menu_presentation = @import("help_menu_presentation.zig");
 const settings_menu_presentation = @import("settings_menu_presentation.zig");
 const mcp_menu_presentation = @import("mcp_menu_presentation.zig");
@@ -938,6 +939,24 @@ pub fn composeFooterFrame(
                     &menu_row,
                 );
             }
+        } else if (input.picker_kind == .definition_manager and ctx.definition_manager.active) {
+            var menu_row_index: u16 = 0;
+            while (menu_row_index < input.picker_rows) : (menu_row_index += 1) {
+                var menu_row = try definition_manager_presentation.composeRow(
+                    alloc,
+                    ctx.definition_manager,
+                    menu_row_index,
+                    shell.layout.cols,
+                    input.picker_rows,
+                );
+                try pushFooterBandRow(
+                    alloc,
+                    &frame,
+                    plan,
+                    rows.picker_start + menu_row_index,
+                    &menu_row,
+                );
+            }
         } else if (input.picker_kind == .auth and ctx.auth_picker.active) {
             var auth_row_index: u16 = 0;
             while (auth_row_index < input.picker_rows) : (auth_row_index += 1) {
@@ -1087,6 +1106,8 @@ pub fn composeFooterFrame(
         try input_presentation.composeResumeMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
     else if (input.show_picker and input.picker_kind == .models)
         try input_presentation.composeModelsMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
+    else if (input.show_picker and input.picker_kind == .definition_manager)
+        try definition_manager_presentation.composeHintRow(alloc, ctx.definition_manager, shell.layout.cols)
     else if (input.show_picker and input.picker_kind == .slash and input.slash_menu_layout != null)
         try input_presentation.composeSlashMenuHintRow(alloc, shell.layout.cols)
     else blk: {
