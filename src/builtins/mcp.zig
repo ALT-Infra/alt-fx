@@ -2236,6 +2236,8 @@ test "remote config keeps a pinned OAuth callback port" {
 
 test "profile config rejects out-of-range OAuth callback ports" {
     const cases = [_][]const u8{
+        \\{"mcp":{"api":{"type":"http","url":"https://api.example.com/mcp","oauth":{"callback_port":null}}}}
+        ,
         \\{"mcp":{"api":{"type":"http","url":"https://api.example.com/mcp","oauth":{"callback_port":0}}}}
         ,
         \\{"mcp":{"api":{"type":"http","url":"https://api.example.com/mcp","oauth":{"callback_port":65536}}}}

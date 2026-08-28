@@ -1075,7 +1075,6 @@ fn parseProfileAuth(alloc: Allocator, object: std.json.ObjectMap) !?McpAuthConfi
 
 fn parseOptionalPort(object: std.json.ObjectMap, key: []const u8) !?u16 {
     const value = object.get(key) orelse return null;
-    if (value == .null) return null;
     if (value != .integer) return error.McpConfigInvalidOAuth;
     if (value.integer < 1 or value.integer > 65535) return error.McpConfigInvalidOAuth;
     return @intCast(value.integer);
