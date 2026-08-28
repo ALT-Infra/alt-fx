@@ -534,18 +534,19 @@ pub fn handlePrompt(
     });
     defer tool_projection.deinit(alloc);
 
-    var bounded_skills = try state.skills.buildBoundedSystemPromptSection(alloc, state.context_limits);
+    const owned_prompt = try alloc.dupe(
+        u8,
+        if (recovery_checkpoint) |checkpoint| checkpoint.user.text else prompt_text,
+    );
+    defer alloc.free(owned_prompt);
+
+    var bounded_skills = try state.skills.buildRoutedSystemPromptSection(alloc, owned_prompt, state.context_limits);
     defer bounded_skills.deinit(alloc);
     if (bounded_skills.notice) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
     if (bounded_skills.diagnostic_notice) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
     for (state.context_snapshot.notices) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
     const skills_section = bounded_skills.text;
 
-    const owned_prompt = try alloc.dupe(
-        u8,
-        if (recovery_checkpoint) |checkpoint| checkpoint.user.text else prompt_text,
-    );
-    defer alloc.free(owned_prompt);
     var explicit_skills = try skill_invocation.buildExplicitPromptSection(
         alloc,
         .{ .skills = state.skills.items, .diagnostics = state.skills.diagnostics },
@@ -691,8 +692,9 @@ pub fn runSubagentChild(
         },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(alloc);
-    var bounded_skills = state.skills.buildBoundedSystemPromptSection(
+    var bounded_skills = state.skills.buildRoutedSystemPromptSection(
         alloc,
+        message.content,
         state.context_limits,
     ) catch return error.OutOfMemory;
     defer bounded_skills.deinit(alloc);

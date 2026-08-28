@@ -413,7 +413,7 @@ const skill_description =
 const skill_search_description =
     "Search bounded metadata for installed skills by natural-language use case without loading skill instructions. When to use: a task may match an installed skill but its exact name is unknown. When NOT to use: an exact skill is already known, ordinary local inspection is sufficient, or the user asks to install a missing skill. After discovery, call skill with the returned exact name and location.";
 const capability_search_description =
-    "Search bounded installed-skill and configured-MCP metadata without loading skill bodies or MCP schemas. Set kind when the domain is known, set server to an exact configured MCP alias to search or list only that server, and follow next_cursors with the same query and filters. After discovery, call skill with an exact returned name and location, or mcp_select_tool with an exact returned MCP tool name.";
+    "Search bounded installed-skill and configured-MCP metadata without loading skill bodies or MCP schemas. For skills, search proactively when no clearly matching skill is already listed, then load an exact relevant result. For MCP, search only when the user names an external service or the task clearly requires live external data or action unavailable from local or built-in capabilities; a configured server alone is not enough. Set kind when known and server only to an exact configured alias. Set cursor to the exact literal first for the initial page. For continuation, copy only the exact next_cursors value from the prior page; never invent, transform, or wildcard a cursor. Select only one exact relevant MCP result with mcp_select_tool.";
 const capability_search_kinds = [_][]const u8{ "all", "skill", "mcp" };
 const install_skill_description =
     "Install a reusable skill from a supported source into fx managed skill storage. When to use: the user asks to install a skill or pastes a skills install command. When NOT to use: no installation is required, install packages, fetch unrelated repos, or modify project code.";
@@ -933,7 +933,7 @@ pub const capability_search = ToolSpec{
                 .{ .name = "kind", .json_type = .string, .shape = &.{ .enum_values = &capability_search_kinds }, .description = "Optional domain filter. Defaults to all." },
                 .{ .name = "server", .json_type = .string, .bounds = &.{ .min_length = 1 }, .description = "Optional exact configured MCP server alias. Excludes skills." },
                 .{ .name = "limit", .json_type = .integer, .bounds = &.{ .minimum = 1, .maximum = capability_retrieval.max_limit }, .description = "Maximum results per requested domain. Defaults to 5." },
-                .{ .name = "cursor", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = capability_retrieval.max_cursor_bytes }, .description = "Opaque continuation cursor returned by a prior search with the same query and filters." },
+                .{ .name = "cursor", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = capability_retrieval.max_cursor_bytes }, .description = "Use the exact literal first for the initial page. For continuation, copy the exact non-null next_cursors value from the prior page with the same query and filters. Never send start, 0, wildcard, empty, null, or another invented value." },
             },
             .additional_properties = false,
         },
@@ -1305,7 +1305,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "b59994b338a0e5c60949ccf5cc253ec21459cd40939b25147d67829adc84f6a7",
+        "b5224670c2b196048de6144e642d5f7bcc5417a0231329c335dae83bf847bac7",
         &actual_hex,
     );
 }

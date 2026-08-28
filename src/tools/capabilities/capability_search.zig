@@ -102,9 +102,15 @@ pub fn decode(
             return result;
         },
     };
-    const server = if (server_value) |value| try ctx.allocator.dupe(u8, value.string) else null;
+    const server = if (server_value) |value|
+        if (kind == .skill) null else try ctx.allocator.dupe(u8, value.string)
+    else
+        null;
     errdefer if (server) |owned| ctx.allocator.free(owned);
-    const cursor = if (cursor_value) |value| try ctx.allocator.dupe(u8, value.string) else null;
+    const cursor = if (cursor_value) |value|
+        if (std.mem.eql(u8, value.string, "first")) null else try ctx.allocator.dupe(u8, value.string)
+    else
+        null;
     errdefer if (cursor) |owned| ctx.allocator.free(owned);
     const input = try ctx.allocator.create(Input);
     errdefer ctx.allocator.destroy(input);
@@ -285,13 +291,18 @@ fn domainStateJson(
     state: []const u8,
     retryable: bool,
 ) Allocator.Error![]u8 {
+    const cursor_action = if (std.mem.eql(u8, state, "invalid_cursor"))
+        ",\"cursor_action\":\"Set cursor to the exact literal first for the initial page. For continuation, copy the exact non-null next_cursors value returned by the prior page; never invent, transform, or wildcard a cursor.\""
+    else
+        "";
     return std.fmt.allocPrint(
         alloc,
-        "{{\"{s}\":[],\"count\":0,\"total_matches\":0,\"more_available\":false,\"next_cursor\":null,\"state\":\"{s}\",\"retryable\":{s}}}",
+        "{{\"{s}\":[],\"count\":0,\"total_matches\":0,\"more_available\":false,\"next_cursor\":null,\"state\":\"{s}\",\"retryable\":{s}{s}}}",
         .{
             if (domain == .skill) "skills" else "tools",
             state,
             if (retryable) "true" else "false",
+            cursor_action,
         },
     );
 }
@@ -335,11 +346,13 @@ fn combineProjected(
             skills_parsed.value.object.get("next_cursor"),
             mcp_parsed.value.object.get("next_cursor"),
             skills_parsed.value.object.get("state"),
+            skills_parsed.value.object.get("cursor_action"),
             if (include_authentication)
                 mcp_parsed.value.object.get("authentication_required")
             else
                 null,
             mcp_parsed.value.object.get("state"),
+            mcp_parsed.value.object.get("cursor_action"),
             mcp_parsed.value.object.get("error"),
             mcp_parsed.value.object.get("context_limit"),
         ) catch |err| switch (err) {
@@ -402,8 +415,10 @@ fn renderCombined(
     skill_next_cursor: ?std.json.Value,
     mcp_next_cursor: ?std.json.Value,
     skill_state: ?std.json.Value,
+    skill_cursor_action: ?std.json.Value,
     authentication_required: ?std.json.Value,
     mcp_state: ?std.json.Value,
+    mcp_cursor_action: ?std.json.Value,
     mcp_error: ?std.json.Value,
     mcp_context_limit: ?std.json.Value,
 ) ![]u8 {
@@ -438,12 +453,20 @@ fn renderCombined(
         try out.writer.writeAll(",\"skill_state\":");
         try std.json.Stringify.value(value, .{}, &out.writer);
     }
+    if (skill_cursor_action) |value| {
+        try out.writer.writeAll(",\"skill_cursor_action\":");
+        try std.json.Stringify.value(value, .{}, &out.writer);
+    }
     if (authentication_required) |value| {
         try out.writer.writeAll(",\"authentication_required\":");
         try std.json.Stringify.value(value, .{}, &out.writer);
     }
     if (mcp_state) |value| {
         try out.writer.writeAll(",\"mcp_state\":");
+        try std.json.Stringify.value(value, .{}, &out.writer);
+    }
+    if (mcp_cursor_action) |value| {
+        try out.writer.writeAll(",\"mcp_cursor_action\":");
         try std.json.Stringify.value(value, .{}, &out.writer);
     }
     if (mcp_error) |value| {
@@ -559,7 +582,7 @@ test "capability search decoder accepts scoped inventory and rejects ambiguous c
     const alloc = std.testing.allocator;
     const decoded = try decode(
         .{ .allocator = alloc },
-        "{\"kind\":\"mcp\",\"server\":\"datadog\",\"limit\":20}",
+        "{\"kind\":\"mcp\",\"server\":\"datadog\",\"limit\":20,\"cursor\":\"first\"}",
     );
     switch (decoded) {
         .failure => |message| {
@@ -573,6 +596,25 @@ test "capability search decoder accepts scoped inventory and rejects ambiguous c
             try std.testing.expectEqual(capability_retrieval.Kind.mcp, value.kind);
             try std.testing.expectEqualStrings("datadog", value.server.?);
             try std.testing.expectEqual(@as(usize, 20), value.limit);
+            try std.testing.expect(value.cursor == null);
+        },
+    }
+
+    const skill_scoped = try decode(
+        .{ .allocator = alloc },
+        "{\"query\":\"review monitoring names\",\"kind\":\"skill\",\"server\":\"datadog\",\"cursor\":\"first\"}",
+    );
+    switch (skill_scoped) {
+        .failure => |message| {
+            defer alloc.free(message);
+            return error.TestUnexpectedResult;
+        },
+        .input => |input| {
+            defer input.deinit(alloc);
+            const value = input.as(Input);
+            try std.testing.expectEqual(capability_retrieval.Kind.skill, value.kind);
+            try std.testing.expect(value.server == null);
+            try std.testing.expect(value.cursor == null);
         },
     }
 
@@ -590,6 +632,25 @@ test "capability search decoder accepts scoped inventory and rejects ambiguous c
             return error.TestUnexpectedResult;
         },
     }
+}
+
+test "capability search projects actionable invalid cursor recovery" {
+    const alloc = std.testing.allocator;
+    const skills = "{\"skills\":[],\"count\":0,\"total_matches\":0,\"more_available\":false,\"next_cursor\":null}";
+    const mcp = try domainStateJson(alloc, .mcp, "invalid_cursor", false);
+    defer alloc.free(mcp);
+    const output = try combineProjected(alloc, skills, mcp, 4096);
+    defer alloc.free(output);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, output, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(
+        "invalid_cursor",
+        parsed.value.object.get("mcp_state").?.string,
+    );
+    const action = parsed.value.object.get("mcp_cursor_action").?.string;
+    try std.testing.expect(std.mem.find(u8, action, "exact literal first") != null);
+    try std.testing.expect(std.mem.find(u8, action, "never invent") != null);
 }
 
 test "capability search presents exact server scope when query is empty" {

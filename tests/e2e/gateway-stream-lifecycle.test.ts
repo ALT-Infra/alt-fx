@@ -1718,7 +1718,11 @@ describe("gateway stream lifecycle", () => {
           if (locations.length !== 2) {
             throw new Error(`Expected two advertised ${skillName} locations, got ${JSON.stringify(locations)}`);
           }
-          [advertisedA, advertisedB] = locations;
+          if (!locations.includes(skillDirectoryA) || !locations.includes(skillDirectoryB)) {
+            throw new Error(`Expected both exact skill locations, got ${JSON.stringify(locations)}`);
+          }
+          advertisedA = skillDirectoryA;
+          advertisedB = skillDirectoryB;
           return fakeGatewayToolCall(searchCallId, "capability_search", {
             query: "managed exact duplicate workflow",
           });
@@ -1925,7 +1929,14 @@ describe("gateway stream lifecycle", () => {
 
     try {
       const result = await runFx(
-        ["ask", "--json", "--auto", "Exercise projected skill discovery."],
+        [
+          "--context-limit",
+          "skill_catalog_bytes=1024",
+          "ask",
+          "--json",
+          "--auto",
+          "Send an email message to a recipient.",
+        ],
         {
           cwd: root.workspace,
           env: {
@@ -1945,6 +1956,10 @@ describe("gateway stream lifecycle", () => {
         { name: "capability_search", status: "success" },
         { name: "skill", status: "success" },
       ]);
+      const initialSkills = taggedBlock(gateway.requests[0]!.body, "available_skills");
+      expect(initialSkills).toContain("<name>mail-helper</name>");
+      expect(initialSkills).toContain("<description>Send email messages.");
+      expect(initialSkills).not.toContain("<name>animation-vocabulary</name>");
       expect(projectedSearch?.skills[0]).toEqual({
         name: "mail-helper",
         description: "Send email messages. API_KEY=[redacted]",

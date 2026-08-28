@@ -1688,7 +1688,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .items = loaded_skills.skills,
         .diagnostics = loaded_skills.diagnostics,
     };
-    var bounded_skills = try skills_view.buildBoundedSystemPromptSection(alloc, ctx.context_limits);
+    var bounded_skills = try skills_view.buildRoutedSystemPromptSection(alloc, owned_prompt, ctx.context_limits);
     defer bounded_skills.deinit(alloc);
     if (bounded_skills.notice) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
     if (bounded_skills.diagnostic_notice) |notice| try pushContextNotice(@ptrCast(&ctx), notice);

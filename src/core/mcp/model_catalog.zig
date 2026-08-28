@@ -8,7 +8,7 @@ const Allocator = std.mem.Allocator;
 const max_prompt_bytes: usize = 4 * 1024;
 const header =
     "Configured MCP servers visible to this model turn are listed below.\n" ++
-    "Use capability_search with kind=mcp and an exact server alias when the target is known. Follow next_cursors instead of rephrasing a search. Then use mcp_select_tool with one exact MCP result. Do not guess tool names.\n" ++
+    "A listed server is not a reason to use MCP. Search MCP metadata only when the user names that service or the task clearly requires live external data or action unavailable from local, built-in, or skill-guided work. Use capability_search with kind=mcp and an exact server alias. Set cursor=first for the initial page; continue only by copying the exact next_cursors value. Never invent a cursor. Then select one exact relevant result with mcp_select_tool. Do not guess or preload tool schemas.\n" ++
     "<mcp_servers>\n";
 const footer = "</mcp_servers>\n";
 const empty_entry = "  <none />\n";
@@ -252,7 +252,7 @@ test "render exposes sorted server summaries without tool metadata" {
 
     try std.testing.expectEqualStrings(
         "Configured MCP servers visible to this model turn are listed below.\n" ++
-            "Use capability_search with kind=mcp and an exact server alias when the target is known. Follow next_cursors instead of rephrasing a search. Then use mcp_select_tool with one exact MCP result. Do not guess tool names.\n" ++
+            "A listed server is not a reason to use MCP. Search MCP metadata only when the user names that service or the task clearly requires live external data or action unavailable from local, built-in, or skill-guided work. Use capability_search with kind=mcp and an exact server alias. Set cursor=first for the initial page; continue only by copying the exact next_cursors value. Never invent a cursor. Then select one exact relevant result with mcp_select_tool. Do not guess or preload tool schemas.\n" ++
             "<mcp_servers>\n" ++
             "  <server name=\"alpha\" state=\"ready\" tools=\"2\" />\n" ++
             "  <server name=\"zeta\" state=\"authentication_required\" />\n" ++

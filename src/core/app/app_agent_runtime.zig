@@ -910,8 +910,9 @@ pub fn Runtime(comptime App: type) type {
                 try appendClaimedContextNotice(app, &preflight_context_notices.writer, notice);
             }
 
-            var bounded_skills = try app.skills.buildBoundedSystemPromptSection(
+            var bounded_skills = try app.skills.buildRoutedSystemPromptSection(
                 std.heap.c_allocator,
+                job.prompt,
                 if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
             );
             defer bounded_skills.deinit(std.heap.c_allocator);
@@ -1030,8 +1031,9 @@ pub fn Runtime(comptime App: type) type {
             ) catch
                 return error.OutOfMemory;
             defer child_projection.deinit(alloc);
-            var bounded_skills = app.skills.buildBoundedSystemPromptSection(
+            var bounded_skills = app.skills.buildRoutedSystemPromptSection(
                 alloc,
+                message.content,
                 if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
             ) catch return error.OutOfMemory;
             defer bounded_skills.deinit(alloc);
