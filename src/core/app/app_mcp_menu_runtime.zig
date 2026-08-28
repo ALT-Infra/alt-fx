@@ -73,7 +73,15 @@ pub fn Runtime(comptime App: type) type {
             defer attempt.deinit(app.alloc);
             const outcome = switch (attempt) {
                 .outcome => |value| value,
-                .failure => |failure| return failure.err,
+                .failure => |failure| {
+                    if (try handleIndeterminateTrustFailure(
+                        app,
+                        generation,
+                        action,
+                        failure.err,
+                    )) return;
+                    return failure.err;
+                },
             };
             try app.mcp.setMenuFeedback(app.alloc, "Updated project MCP trust; reconnecting…");
             app.mcp.returnMenuToServers();
@@ -95,4 +103,77 @@ pub fn Runtime(comptime App: type) type {
             }
         }
     };
+}
+
+fn actionReducesAuthority(action: mcp_menu_state.Action) bool {
+    return action == .trust_reject or action == .trust_reset;
+}
+
+fn handleIndeterminateTrustFailure(
+    app: anytype,
+    generation: u64,
+    action: mcp_menu_state.Action,
+    err: anyerror,
+) !bool {
+    if (err != error.SettingsCommitIndeterminate or !actionReducesAuthority(action)) return false;
+    try app.mcp.setMenuFeedback(
+        app.alloc,
+        "Project MCP choices may have been saved; live MCP authority was retired.",
+    );
+    app.mcp.returnMenuToServers();
+    app.beginMcpMenuAuthorityReduction(false, generation) catch |reduction_err| {
+        try app.mcp.recordMenuEffectFailure(app.alloc, generation, reduction_err);
+    };
+    return true;
+}
+
+test "only rejecting or resetting project MCP trust reduces authority" {
+    try std.testing.expect(actionReducesAuthority(.trust_reject));
+    try std.testing.expect(actionReducesAuthority(.trust_reset));
+    try std.testing.expect(!actionReducesAuthority(.trust_approve));
+    try std.testing.expect(!actionReducesAuthority(.trust_approve_all));
+}
+
+test "indeterminate trust rejection retires authority without rebuilding" {
+    const FakeMcp = struct {
+        feedback_set: bool = false,
+        returned_to_servers: bool = false,
+
+        fn setMenuFeedback(self: *@This(), _: std.mem.Allocator, text: []const u8) !void {
+            try std.testing.expectEqualStrings(
+                "Project MCP choices may have been saved; live MCP authority was retired.",
+                text,
+            );
+            self.feedback_set = true;
+        }
+
+        fn returnMenuToServers(self: *@This()) void {
+            self.returned_to_servers = true;
+        }
+
+        fn recordMenuEffectFailure(_: *@This(), _: std.mem.Allocator, _: u64, _: anyerror) !void {
+            return error.TestUnexpectedFailure;
+        }
+    };
+    const FakeApp = struct {
+        alloc: std.mem.Allocator,
+        mcp: FakeMcp = .{},
+        reduction_started: bool = false,
+
+        fn beginMcpMenuAuthorityReduction(self: *@This(), rebuild: bool, generation: u64) !void {
+            try std.testing.expect(!rebuild);
+            try std.testing.expectEqual(@as(u64, 41), generation);
+            self.reduction_started = true;
+        }
+    };
+    var app = FakeApp{ .alloc = std.testing.allocator };
+    try std.testing.expect(try handleIndeterminateTrustFailure(
+        &app,
+        41,
+        .trust_reject,
+        error.SettingsCommitIndeterminate,
+    ));
+    try std.testing.expect(app.mcp.feedback_set);
+    try std.testing.expect(app.mcp.returned_to_servers);
+    try std.testing.expect(app.reduction_started);
 }

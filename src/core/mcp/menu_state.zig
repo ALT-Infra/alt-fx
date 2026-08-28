@@ -1,4 +1,5 @@
 const std = @import("std");
+const text_utils = @import("../shared/text_utils.zig");
 
 pub const Section = enum {
     servers,
@@ -12,8 +13,12 @@ pub const Screen = enum {
     details,
     preview,
     add,
+    arguments,
+    info,
     confirm,
 };
+
+pub const max_query_bytes: usize = 128;
 
 pub const LoadState = enum {
     idle,
@@ -55,6 +60,7 @@ pub const ActionRequest = struct {
 pub const Effect = union(enum) {
     load_catalog: Request,
     load_preview: Request,
+    complete_argument: Request,
     action: ActionRequest,
     cancel: u64,
 };
@@ -73,13 +79,23 @@ pub const Event = union(enum) {
     cycle_section: i8,
     cycle_add_transport,
     move_add_field: struct { delta: i8, field_count: usize },
+    move_argument: struct { delta: i8, field_count: usize },
+    begin_filter,
+    append_filter_byte: u8,
+    delete_filter_byte,
+    clear_filter_text,
+    clear_filter,
     show_details,
     show_add,
+    show_arguments: usize,
+    show_info,
     show_confirmation: Action,
     begin_preview,
+    request_completion,
     request_action: Action,
     catalog_loaded: struct { generation: u64, item_count: usize },
     preview_loaded: u64,
+    completion_loaded: u64,
     action_succeeded: u64,
     effect_failed: u64,
     effect_cancelled: u64,
@@ -98,6 +114,14 @@ pub const State = struct {
     confirmation_action: ?Action = null,
     add_transport: AddTransport = .local,
     add_field_index: usize = 0,
+    argument_index: usize = 0,
+    filter_active: bool = false,
+    query_len: usize = 0,
+    query: [max_query_bytes]u8 = undefined,
+
+    pub fn queryText(self: *const State) []const u8 {
+        return self.query[0..self.query_len];
+    }
 };
 
 pub const Transition = struct {
@@ -131,7 +155,14 @@ pub fn reduce(current: State, event: Event) Transition {
         else blk: {
             next.screen = .browse;
             next.confirmation_action = null;
-            break :blk .{ .state = next };
+            next.argument_index = 0;
+            const pending = next.pending_generation;
+            next.pending_generation = null;
+            if (pending != null) next.load_state = .cancelled;
+            break :blk .{
+                .state = next,
+                .effect = if (pending) |generation| .{ .cancel = generation } else null,
+            };
         },
         .move => |move| blk: {
             if (!current.active or move.item_count == 0 or move.delta == 0) {
@@ -165,6 +196,8 @@ pub fn reduce(current: State, event: Event) Transition {
             next.screen = .browse;
             next.selected_index = 0;
             next.window_start = 0;
+            next.filter_active = false;
+            next.query_len = 0;
             if (next.section == .servers) {
                 next.selected_index = next.selected_server_index;
                 next.load_state = .ready;
@@ -177,6 +210,48 @@ pub fn reduce(current: State, event: Event) Transition {
                 next.add_transport = if (current.add_transport == .local) .http else .local;
                 next.add_field_index = 0;
             }
+            break :blk .{ .state = next };
+        },
+        .begin_filter => blk: {
+            if (current.active and current.screen == .browse and current.section != .servers) {
+                next.filter_active = true;
+                next.selected_index = 0;
+                next.window_start = 0;
+            }
+            break :blk .{ .state = next };
+        },
+        .append_filter_byte => |byte| blk: {
+            if (current.filter_active and current.query_len < max_query_bytes and
+                byte >= 0x20 and byte < 0x7f)
+            {
+                next.query[next.query_len] = byte;
+                next.query_len += 1;
+                next.selected_index = 0;
+                next.window_start = 0;
+            }
+            break :blk .{ .state = next };
+        },
+        .delete_filter_byte => blk: {
+            if (current.filter_active and current.query_len > 0) {
+                next.query_len -= 1;
+                next.selected_index = 0;
+                next.window_start = 0;
+            }
+            break :blk .{ .state = next };
+        },
+        .clear_filter_text => blk: {
+            if (current.filter_active) {
+                next.query_len = 0;
+                next.selected_index = 0;
+                next.window_start = 0;
+            }
+            break :blk .{ .state = next };
+        },
+        .clear_filter => blk: {
+            next.filter_active = false;
+            next.query_len = 0;
+            next.selected_index = 0;
+            next.window_start = 0;
             break :blk .{ .state = next };
         },
         .move_add_field => |move| blk: {
@@ -193,6 +268,20 @@ pub fn reduce(current: State, event: Event) Transition {
             }
             break :blk .{ .state = next };
         },
+        .move_argument => |move| blk: {
+            if (!current.active or current.screen != .arguments or move.field_count == 0 or move.delta == 0) {
+                break :blk .{ .state = next };
+            }
+            if (move.delta > 0) {
+                next.argument_index = (next.argument_index + 1) % move.field_count;
+            } else {
+                next.argument_index = if (next.argument_index == 0)
+                    move.field_count - 1
+                else
+                    next.argument_index - 1;
+            }
+            break :blk .{ .state = next };
+        },
         .show_details => blk: {
             if (current.active and current.section == .servers) next.screen = .details;
             break :blk .{ .state = next };
@@ -204,6 +293,18 @@ pub fn reduce(current: State, event: Event) Transition {
             }
             break :blk .{ .state = next };
         },
+        .show_arguments => |field_count| blk: {
+            if (current.active and current.section != .servers and field_count > 0) {
+                next.screen = .arguments;
+                next.filter_active = false;
+                next.argument_index = 0;
+            }
+            break :blk .{ .state = next };
+        },
+        .show_info => blk: {
+            if (current.active and current.section == .servers) next.screen = .info;
+            break :blk .{ .state = next };
+        },
         .show_confirmation => |action| blk: {
             if (current.active) {
                 next.screen = .confirm;
@@ -211,10 +312,15 @@ pub fn reduce(current: State, event: Event) Transition {
             }
             break :blk .{ .state = next };
         },
-        .begin_preview => if (!current.active or current.section == .servers)
+        .begin_preview => blk: {
+            if (!current.active or current.section == .servers) break :blk .{ .state = next };
+            next.filter_active = false;
+            break :blk beginEffect(&next, .load_preview);
+        },
+        .request_completion => if (!current.active or current.screen != .arguments)
             .{ .state = next }
         else
-            beginEffect(&next, .load_preview),
+            beginEffect(&next, .complete_argument),
         .request_action => |action| blk: {
             if (!current.active or (action == .insert_preview and current.screen != .preview)) {
                 break :blk .{ .state = next };
@@ -242,6 +348,12 @@ pub fn reduce(current: State, event: Event) Transition {
             next.screen = .preview;
             break :blk .{ .state = next };
         },
+        .completion_loaded => |generation| blk: {
+            if (current.pending_generation != generation) break :blk .{ .state = next };
+            next.pending_generation = null;
+            next.load_state = .ready;
+            break :blk .{ .state = next };
+        },
         .action_succeeded => |generation| blk: {
             if (current.pending_generation != generation) break :blk .{ .state = next };
             next.pending_generation = null;
@@ -264,6 +376,10 @@ pub fn reduce(current: State, event: Event) Transition {
     };
 }
 
+pub fn textMatchesQuery(text: []const u8, query: []const u8) bool {
+    return query.len == 0 or text_utils.containsIgnoreCase(text, query);
+}
+
 fn requiresConfirmation(action: Action) bool {
     return switch (action) {
         .logout, .remove, .trust_reject, .trust_approve_all, .trust_reset => true,
@@ -274,6 +390,7 @@ fn requiresConfirmation(action: Action) bool {
 const BeginEffect = union(enum) {
     load_catalog,
     load_preview,
+    complete_argument,
     action: Action,
 };
 
@@ -293,6 +410,12 @@ fn beginEffect(self: *State, effect: BeginEffect) Transition {
                 .selected_index = self.selected_index,
             } },
             .load_preview => .{ .load_preview = .{
+                .generation = generation,
+                .section = self.section,
+                .server_index = self.selected_server_index,
+                .selected_index = self.selected_index,
+            } },
+            .complete_argument => .{ .complete_argument = .{
                 .generation = generation,
                 .section = self.section,
                 .server_index = self.selected_server_index,
@@ -352,7 +475,7 @@ test "MCP menu section change describes one generated load effect" {
             try std.testing.expectEqual(@as(u64, 1), request.generation);
             try std.testing.expectEqual(Section.tools, request.section);
         },
-        .load_preview, .action, .cancel => return error.TestUnexpectedEffect,
+        .load_preview, .complete_argument, .action, .cancel => return error.TestUnexpectedEffect,
     }
 }
 
@@ -376,7 +499,7 @@ test "MCP menu close cancels only its pending generation" {
     try std.testing.expect(!transition.state.active);
     switch (transition.effect.?) {
         .cancel => |generation| try std.testing.expectEqual(@as(u64, 1), generation),
-        .load_catalog, .load_preview, .action => return error.TestUnexpectedEffect,
+        .load_catalog, .load_preview, .complete_argument, .action => return error.TestUnexpectedEffect,
     }
 }
 
@@ -389,7 +512,7 @@ test "MCP menu insert is available only from an explicit preview" {
     const transition = reduce(preview, .{ .request_action = .insert_preview });
     switch (transition.effect.?) {
         .action => |request| try std.testing.expectEqual(Action.insert_preview, request.action),
-        .load_catalog, .load_preview, .cancel => return error.TestUnexpectedEffect,
+        .load_catalog, .load_preview, .complete_argument, .cancel => return error.TestUnexpectedEffect,
     }
 }
 
@@ -399,7 +522,7 @@ test "MCP menu preview opens only after the matching preview result" {
     const loading = reduce(state, .begin_preview);
     switch (loading.effect.?) {
         .load_preview => |request| try std.testing.expectEqual(@as(u64, 1), request.generation),
-        .load_catalog, .action, .cancel => return error.TestUnexpectedEffect,
+        .load_catalog, .complete_argument, .action, .cancel => return error.TestUnexpectedEffect,
     }
     const completed = reduce(loading.state, .{ .preview_loaded = 1 });
     try std.testing.expectEqual(Screen.preview, completed.state.screen);
@@ -412,7 +535,7 @@ test "MCP menu destructive actions require a matching confirmation" {
     const requested = reduce(confirming, .{ .request_action = .remove });
     switch (requested.effect.?) {
         .action => |request| try std.testing.expectEqual(Action.remove, request.action),
-        .load_catalog, .load_preview, .cancel => return error.TestUnexpectedEffect,
+        .load_catalog, .load_preview, .complete_argument, .cancel => return error.TestUnexpectedEffect,
     }
 }
 
@@ -447,4 +570,47 @@ test "MCP menu preserves the selected server across catalog sections" {
     state = reduce(state, .{ .cycle_section = -1 }).state;
     try std.testing.expectEqual(Section.servers, state.section);
     try std.testing.expectEqual(@as(usize, 1), state.selected_index);
+}
+
+test "MCP menu filtering is bounded and resets navigation" {
+    var state = reduce(.{}, .{ .open = 1 }).state;
+    state = reduce(state, .{ .cycle_section = 1 }).state;
+    state = reduce(state, .begin_filter).state;
+    try std.testing.expect(state.filter_active);
+    for ("query") |byte| state = reduce(state, .{ .append_filter_byte = byte }).state;
+    try std.testing.expectEqualStrings("query", state.queryText());
+    state.selected_index = 4;
+    state.window_start = 3;
+    state = reduce(state, .delete_filter_byte).state;
+    try std.testing.expectEqualStrings("quer", state.queryText());
+    try std.testing.expectEqual(@as(usize, 0), state.selected_index);
+    state = reduce(state, .clear_filter).state;
+    try std.testing.expect(!state.filter_active);
+    try std.testing.expectEqual(@as(usize, 0), state.query_len);
+}
+
+test "MCP argument form completion keeps form state and can be cancelled" {
+    var state = reduce(.{}, .{ .open = 1 }).state;
+    state = reduce(state, .{ .cycle_section = 1 }).state;
+    state = reduce(state, .{ .catalog_loaded = .{ .generation = 1, .item_count = 1 } }).state;
+    state = reduce(state, .{ .show_arguments = 2 }).state;
+    try std.testing.expectEqual(Screen.arguments, state.screen);
+    state = reduce(state, .{ .move_argument = .{ .delta = 1, .field_count = 2 } }).state;
+    try std.testing.expectEqual(@as(usize, 1), state.argument_index);
+    const loading = reduce(state, .request_completion);
+    switch (loading.effect.?) {
+        .complete_argument => |request| try std.testing.expectEqual(@as(u64, 2), request.generation),
+        .load_catalog, .load_preview, .action, .cancel => return error.TestUnexpectedEffect,
+    }
+    const completed = reduce(loading.state, .{ .completion_loaded = 2 }).state;
+    try std.testing.expectEqual(Screen.arguments, completed.screen);
+    try std.testing.expectEqual(LoadState.ready, completed.load_state);
+
+    const loading_again = reduce(completed, .request_completion);
+    const backed = reduce(loading_again.state, .back);
+    try std.testing.expectEqual(Screen.browse, backed.state.screen);
+    switch (backed.effect.?) {
+        .cancel => |generation| try std.testing.expectEqual(@as(u64, 3), generation),
+        .load_catalog, .load_preview, .complete_argument, .action => return error.TestUnexpectedEffect,
+    }
 }

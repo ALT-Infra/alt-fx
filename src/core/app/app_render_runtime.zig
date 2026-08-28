@@ -719,6 +719,8 @@ pub fn Runtime(comptime App: type) type {
                         .add_target = view.add_form.target.items,
                         .add_arguments = view.add_form.arguments.items,
                         .add_draft = app.input_runtime.edit_state.input.items,
+                        .arguments = view.argument_fields,
+                        .argument_draft = app.input_runtime.edit_state.input.items,
                     };
                 } else .{},
                 .help_menu = render_input.helpMenuProjection(

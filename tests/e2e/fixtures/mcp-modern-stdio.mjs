@@ -331,6 +331,12 @@ function handle(message) {
           mimeType: "text/plain",
           annotations: { audience: ["assistant"], priority: 0.7 },
           _meta: { fixture: "template" },
+        }, {
+          uriTemplate: "custom://project/{project}/{path}",
+          name: "project-file-multi",
+          title: "Project file with project",
+          description: "Read a fixture path from a selected project",
+          mimeType: "text/plain",
         }],
         ttlMs: 60_000,
         cacheScope: "public",
@@ -419,6 +425,14 @@ function handle(message) {
               { name: "collision", title: "Collision prompt" },
               { name: "mrtr", title: "MRTR prompt" },
               { name: "stall", title: "Stalled prompt" },
+              {
+                name: "multi",
+                title: "Multi prompt",
+                arguments: [
+                  { name: "topic", required: true },
+                  { name: "tone", required: true },
+                ],
+              },
             ]
           : [{
               name: "review",

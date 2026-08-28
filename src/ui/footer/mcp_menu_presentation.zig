@@ -29,12 +29,17 @@ pub fn menuRowCount(projection: McpMenuProjection, _: u16, max_rows: u16) u16 {
             if (projection.state.add_transport == .local) @as(u16, 5) else @as(u16, 4),
             body_budget,
         ),
+        .arguments => @intCast(@min(
+            @max(projection.arguments.len, @as(usize, 1)),
+            body_budget,
+        )),
+        .info => @min(@as(u16, 2), body_budget),
         .confirm => 1,
     };
     return header_rows + body_rows;
 }
 
-pub fn visibleItemsForBudget(_: McpMenuProjection, row_budget: u16) u16 {
+pub fn visibleItemsForBudget(row_budget: u16) u16 {
     const header_rows: u16 = if (row_budget > 2) roomy_header_rows else 0;
     return @max(row_budget -| header_rows, 1);
 }
@@ -60,6 +65,26 @@ pub fn composeMcpMenuRow(
             2,
         );
     }
+    if (show_header and row_index == 1 and
+        projection.state.screen == .arguments and projection.state.load_state == .loading)
+    {
+        return composeTextRow(
+            alloc,
+            "Completing MCP argument…",
+            width,
+            ui_render.dim_style,
+            2,
+        );
+    }
+    if (show_header and row_index == 1 and projection.state.query_len > 0) {
+        var filter_buf: [160]u8 = undefined;
+        const filter = std.fmt.bufPrint(
+            &filter_buf,
+            "Filter: {s}",
+            .{projection.state.queryText()},
+        ) catch "Filter";
+        return composeTextRow(alloc, filter, width, ui_render.dim_style, 2);
+    }
     if (row_index < body_start) return empty;
     const body_index = row_index - body_start;
     return switch (projection.state.screen) {
@@ -67,6 +92,8 @@ pub fn composeMcpMenuRow(
         .details => composeDetailsRow(alloc, projection, body_index, width),
         .preview => composePreviewRow(alloc, projection.preview, body_index, width),
         .add => composeAddRow(alloc, projection, body_index, width),
+        .arguments => composeArgumentRow(alloc, projection, body_index, width),
+        .info => composeInfoRow(alloc, body_index, width),
         .confirm => composeTextRow(
             alloc,
             confirmationText(projection.state.confirmation_action),
@@ -75,6 +102,28 @@ pub fn composeMcpMenuRow(
             0,
         ),
     };
+}
+
+fn composeArgumentRow(
+    alloc: Allocator,
+    projection: McpMenuProjection,
+    row_index: u16,
+    width: u16,
+) !std.ArrayList(u8) {
+    if (row_index >= projection.arguments.len) return .empty;
+    const field = projection.arguments[row_index];
+    const selected = row_index == projection.state.argument_index;
+    var label_buf: [160]u8 = undefined;
+    const label = std.fmt.bufPrint(
+        &label_buf,
+        "{s}{s}{s}",
+        .{ if (selected) "> " else "", field.name, if (field.required) " *" else "" },
+    ) catch field.name;
+    const value = if (selected and projection.argument_draft.len > 0)
+        projection.argument_draft
+    else
+        field.value.items;
+    return composeFactRow(alloc, label, value, width);
 }
 
 fn confirmationText(action: ?mcp_menu_state.Action) []const u8 {
@@ -149,7 +198,9 @@ fn composeBrowseRow(
     const count = projection.itemCount();
     if (count == 0) {
         if (body_index > 0) return .empty;
-        const text = switch (projection.state.section) {
+        const text = if (projection.state.query_len > 0)
+            "No matching MCP items."
+        else switch (projection.state.section) {
             .servers => if (projection.configuration_issue_count == 0)
                 "No MCP servers configured."
             else
@@ -162,8 +213,12 @@ fn composeBrowseRow(
     }
 
     const visible = @max(@min(@as(usize, visible_rows), count), 1);
-    const max_start = count - visible;
-    const window_start = @min(projection.state.window_start, max_start);
+    const window_start = visibleWindowStart(
+        projection.state.window_start,
+        projection.state.selected_index,
+        count,
+        visible,
+    );
     const display_index = window_start + body_index;
     if (display_index >= count) return .empty;
     return switch (projection.state.section) {
@@ -173,13 +228,16 @@ fn composeBrowseRow(
             display_index == projection.state.selected_index,
             width,
         ),
-        .tools => composeCatalogRow(
-            alloc,
-            projection.tools[display_index],
-            "Tool",
-            display_index == projection.state.selected_index,
-            width,
-        ),
+        .tools => if (projection.toolAt(display_index)) |tool|
+            composeCatalogRow(
+                alloc,
+                tool,
+                "Tool",
+                display_index == projection.state.selected_index,
+                width,
+            )
+        else
+            .empty,
         .resources => if (projection.resourceAt(display_index)) |resource|
             composeCatalogRow(
                 alloc,
@@ -190,14 +248,40 @@ fn composeBrowseRow(
             )
         else
             .empty,
-        .prompts => composeCatalogRow(
-            alloc,
-            projection.prompts[display_index].title orelse projection.prompts[display_index].name,
-            projection.prompts[display_index].description orelse "Prompt",
-            display_index == projection.state.selected_index,
-            width,
-        ),
+        .prompts => if (projection.promptAt(display_index)) |prompt|
+            composeCatalogRow(
+                alloc,
+                prompt.title orelse prompt.name,
+                prompt.description orelse "Prompt",
+                display_index == projection.state.selected_index,
+                width,
+            )
+        else
+            .empty,
     };
+}
+
+fn composeInfoRow(alloc: Allocator, row_index: u16, width: u16) !std.ArrayList(u8) {
+    return switch (row_index) {
+        0 => composeFactRow(alloc, "Profile config", "~/.fx/mcp.json", width),
+        1 => composeFactRow(alloc, "Project config", "<workspace>/.mcp.json", width),
+        else => .empty,
+    };
+}
+
+fn visibleWindowStart(
+    requested_start: usize,
+    selected_index: usize,
+    item_count: usize,
+    visible_count: usize,
+) usize {
+    if (item_count == 0) return 0;
+    const visible = @max(@min(visible_count, item_count), 1);
+    const selected = @min(selected_index, item_count - 1);
+    var start = @min(requested_start, item_count - visible);
+    if (selected < start) start = selected;
+    if (selected >= start + visible) start = selected - visible + 1;
+    return @min(start, item_count - visible);
 }
 
 fn composeCatalogRow(
@@ -491,4 +575,30 @@ test "MCP menu catalog text cannot inject terminal control sequences" {
     defer row.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, row.items, "\x1b]0;owned") == null);
     try std.testing.expect(std.mem.find(u8, row.items, "\\x1b") != null);
+}
+
+test "MCP menu keeps selection visible when the terminal has one body row" {
+    const tools = [_][]const u8{
+        "tool-0",
+        "tool-1",
+        "tool-2",
+        "tool-3",
+        "tool-4",
+        "tool-5",
+    };
+    const projection: McpMenuProjection = .{
+        .state = .{
+            .active = true,
+            .section = .tools,
+            .selected_index = 5,
+            .window_start = 0,
+            .load_state = .ready,
+        },
+        .tools = &tools,
+    };
+    const rows = menuRowCount(projection, 40, 3);
+    try std.testing.expectEqual(@as(u16, 3), rows);
+    var row = try composeMcpMenuRow(std.testing.allocator, projection, 2, 40, rows);
+    defer row.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, row.items, "tool-5") != null);
 }

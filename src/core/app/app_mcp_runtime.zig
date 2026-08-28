@@ -12,6 +12,7 @@ const mcp_health = @import("../mcp/health.zig");
 const mcp_menu_state = @import("../mcp/menu_state.zig");
 const mcp_model_catalog = @import("../mcp/model_catalog.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
+const completion_feature = @import("../mcp/features/completion.zig");
 const context_limits = @import("../config/context_limits.zig");
 const tool_projection = @import("../tooling/tool_projection.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
@@ -291,13 +292,151 @@ pub const MenuResourceCatalog = struct {
         return self.resources.items.len + self.templates.items.len;
     }
 
-    fn item(self: MenuResourceCatalog, index: usize) ?*const mcp_runtime.ResourceSummary {
-        if (index < self.resources.items.len) return &self.resources.items[index];
-        const template_index = index - self.resources.items.len;
-        if (template_index < self.templates.items.len) return &self.templates.items[template_index];
+    fn filteredItem(
+        self: MenuResourceCatalog,
+        index: usize,
+        query: []const u8,
+    ) ?*const mcp_runtime.ResourceSummary {
+        var matched: usize = 0;
+        for (self.resources.items) |*item_value| {
+            if (!menuResourceMatches(item_value.*, query)) continue;
+            if (matched == index) return item_value;
+            matched += 1;
+        }
+        for (self.templates.items) |*item_value| {
+            if (!menuResourceMatches(item_value.*, query)) continue;
+            if (matched == index) return item_value;
+            matched += 1;
+        }
         return null;
     }
 };
+
+fn menuResourceMatches(item: mcp_runtime.ResourceSummary, query: []const u8) bool {
+    return mcp_menu_state.textMatchesQuery(item.uri, query) or
+        mcp_menu_state.textMatchesQuery(item.name, query) or
+        (item.title != null and mcp_menu_state.textMatchesQuery(item.title.?, query)) or
+        (item.description != null and mcp_menu_state.textMatchesQuery(item.description.?, query));
+}
+
+fn menuPromptMatches(item: mcp_runtime.PromptSummary, query: []const u8) bool {
+    return mcp_menu_state.textMatchesQuery(item.name, query) or
+        (item.title != null and mcp_menu_state.textMatchesQuery(item.title.?, query)) or
+        (item.description != null and mcp_menu_state.textMatchesQuery(item.description.?, query));
+}
+
+fn appendMenuArgumentField(
+    alloc: Allocator,
+    fields: *std.ArrayList(MenuArgumentField),
+    name: []const u8,
+    required: bool,
+) !void {
+    for (fields.items) |field| {
+        if (std.mem.eql(u8, field.name, name)) return;
+    }
+    const owned_name = try alloc.dupe(u8, name);
+    errdefer alloc.free(owned_name);
+    try fields.append(alloc, .{ .name = owned_name, .required = required });
+}
+
+fn appendTemplateArgumentFields(
+    alloc: Allocator,
+    fields: *std.ArrayList(MenuArgumentField),
+    uri_template: []const u8,
+) !void {
+    var remaining = uri_template;
+    while (std.mem.findScalar(u8, remaining, '{')) |open| {
+        const after_open = remaining[open + 1 ..];
+        const relative_close = std.mem.findScalar(u8, after_open, '}') orelse
+            return error.McpResourceTemplateInvalid;
+        const expression = after_open[0..relative_close];
+        var variables = std.mem.splitScalar(u8, expression, ',');
+        while (variables.next()) |raw_variable| {
+            var variable = raw_variable;
+            if (variable.len > 0 and std.mem.findScalar(u8, "+#./;?&", variable[0]) != null) {
+                variable = variable[1..];
+            }
+            const modifier = std.mem.indexOfAny(u8, variable, ":*") orelse variable.len;
+            const name = variable[0..modifier];
+            if (name.len > 0) try appendMenuArgumentField(alloc, fields, name, true);
+        }
+        remaining = after_open[relative_close + 1 ..];
+    }
+}
+
+fn expandResourceTemplate(
+    alloc: Allocator,
+    uri_template: []const u8,
+    arguments: []const OwnedMenuArgument,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    var remaining = uri_template;
+    while (std.mem.findScalar(u8, remaining, '{')) |open| {
+        try out.writer.writeAll(remaining[0..open]);
+        const after_open = remaining[open + 1 ..];
+        const relative_close = std.mem.findScalar(u8, after_open, '}') orelse
+            return error.McpResourceTemplateInvalid;
+        const expression = after_open[0..relative_close];
+        if (expression.len == 0) return error.McpResourceTemplateInvalid;
+        const operator = if (std.mem.findScalar(u8, "+#./;?&", expression[0]) != null)
+            expression[0]
+        else
+            @as(u8, 0);
+        const variables_text = if (operator == 0) expression else expression[1..];
+        const prefix: []const u8 = switch (operator) {
+            '#' => "#",
+            '.' => ".",
+            '/' => "/",
+            ';' => ";",
+            '?' => "?",
+            '&' => "&",
+            else => "",
+        };
+        const separator: []const u8 = switch (operator) {
+            '.' => ".",
+            '/' => "/",
+            ';' => ";",
+            '?', '&' => "&",
+            else => ",",
+        };
+        try out.writer.writeAll(prefix);
+        var variables = std.mem.splitScalar(u8, variables_text, ',');
+        var variable_index: usize = 0;
+        while (variables.next()) |raw_variable| : (variable_index += 1) {
+            const modifier = std.mem.indexOfAny(u8, raw_variable, ":*") orelse raw_variable.len;
+            const name = raw_variable[0..modifier];
+            const value = for (arguments) |argument| {
+                if (std.mem.eql(u8, argument.name, name)) break argument.value;
+            } else return error.McpResourceTemplateArgumentMissing;
+            if (variable_index > 0) try out.writer.writeAll(separator);
+            if (operator == ';' or operator == '?' or operator == '&') {
+                try writeTemplateValue(&out.writer, name, false);
+                try out.writer.writeByte('=');
+            }
+            try writeTemplateValue(&out.writer, value, operator == '+' or operator == '#');
+        }
+        remaining = after_open[relative_close + 1 ..];
+    }
+    try out.writer.writeAll(remaining);
+    return out.toOwnedSlice();
+}
+
+fn writeTemplateValue(writer: *std.Io.Writer, value: []const u8, allow_reserved: bool) !void {
+    const hex = "0123456789ABCDEF";
+    for (value) |byte| {
+        if (std.ascii.isAlphanumeric(byte) or
+            std.mem.findScalar(u8, "-._~", byte) != null or
+            (allow_reserved and std.mem.findScalar(u8, ":/?#[]@!$&'()*+,;=", byte) != null))
+        {
+            try writer.writeByte(byte);
+        } else {
+            try writer.writeByte('%');
+            try writer.writeByte(hex[byte >> 4]);
+            try writer.writeByte(hex[byte & 0x0f]);
+        }
+    }
+}
 
 const MenuPreview = struct {
     display: []u8,
@@ -315,6 +454,7 @@ const MenuOperationResult = union(enum) {
     resources: MenuResourceCatalog,
     prompts: mcp_runtime.PromptCatalogResult,
     preview: MenuPreview,
+    completion: MenuArgumentCompletion,
     action: MenuActionResult,
     failed: anyerror,
     cancelled,
@@ -328,9 +468,20 @@ const MenuOperationResult = union(enum) {
             .resources => |*catalog| catalog.deinit(alloc),
             .prompts => |*catalog| catalog.deinit(alloc),
             .preview => |*preview| preview.deinit(alloc),
+            .completion => |*completion| completion.deinit(alloc),
             .action => |*action| action.deinit(alloc),
             .failed, .cancelled => {},
         }
+        self.* = undefined;
+    }
+};
+
+const MenuArgumentCompletion = struct {
+    field_index: usize,
+    value: []u8,
+
+    fn deinit(self: *MenuArgumentCompletion, alloc: Allocator) void {
+        alloc.free(self.value);
         self.* = undefined;
     }
 };
@@ -345,12 +496,46 @@ const MenuActionResult = struct {
     }
 };
 
-const MenuOperationKind = enum { catalog, preview, action };
+const MenuOperationKind = enum { catalog, preview, completion, action };
 
 const MenuOperation = struct {
     kind: MenuOperationKind,
     request: mcp_menu_state.Request,
 };
+
+const OwnedMenuArgument = struct {
+    name: []u8,
+    value: []u8,
+
+    fn deinit(self: *OwnedMenuArgument, alloc: Allocator) void {
+        alloc.free(self.name);
+        alloc.free(self.value);
+        self.* = undefined;
+    }
+};
+
+fn cloneMenuArguments(
+    alloc: Allocator,
+    fields: []const MenuArgumentField,
+) ![]OwnedMenuArgument {
+    if (fields.len == 0) return &.{};
+    const arguments = try alloc.alloc(OwnedMenuArgument, fields.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (arguments[0..initialized]) |*argument| argument.deinit(alloc);
+        alloc.free(arguments);
+    }
+    for (fields, 0..) |field, index| {
+        const name = try alloc.dupe(u8, field.name);
+        errdefer alloc.free(name);
+        arguments[index] = .{
+            .name = name,
+            .value = try alloc.dupe(u8, field.value.items),
+        };
+        initialized += 1;
+    }
+    return arguments;
+}
 
 const PendingMenuOperation = struct {
     alloc: Allocator,
@@ -361,7 +546,8 @@ const PendingMenuOperation = struct {
     limits: context_limits.Values,
     server_name: ?[]u8 = null,
     identity: ?[]u8 = null,
-    argument_name: ?[]u8 = null,
+    arguments: []OwnedMenuArgument = &.{},
+    argument_index: usize = 0,
     resource_template: bool = false,
     action: ?mcp_menu_state.Action = null,
     cancel_requested: std.atomic.Value(bool) = .init(false),
@@ -421,10 +607,52 @@ const PendingMenuOperation = struct {
                 .resources => .{ .preview = try self.previewResource() },
                 .prompts => .{ .preview = try self.previewPrompt() },
             },
+            .completion => .{ .completion = try self.completeArgument() },
             .action => switch (self.action orelse return error.McpMenuInvalidOperation) {
                 .logout => .{ .action = try self.logoutServer() },
                 else => error.McpMenuInvalidOperation,
             },
+        };
+    }
+
+    fn completeArgument(self: *PendingMenuOperation) !MenuArgumentCompletion {
+        if (self.argument_index >= self.arguments.len) return error.McpMenuInvalidField;
+        const current = self.arguments[self.argument_index];
+        const context_count = self.arguments.len - 1;
+        const context = try self.alloc.alloc(completion_feature.Argument, context_count);
+        defer self.alloc.free(context);
+        var context_index: usize = 0;
+        for (self.arguments, 0..) |argument, index| {
+            if (index == self.argument_index) continue;
+            context[context_index] = .{ .name = argument.name, .value = argument.value };
+            context_index += 1;
+        }
+        var completion = switch (self.request.section) {
+            .resources => try self.lease.runtime.completeResourceTemplateArgument(
+                self.alloc,
+                self.server_name orelse return error.McpServerNotFound,
+                self.identity orelse return error.McpResourceNotFound,
+                .{ .name = current.name, .value = current.value },
+                context,
+                &self.cancel_requested,
+                .unrestricted,
+            ),
+            .prompts => try self.lease.runtime.completePromptArgument(
+                self.alloc,
+                self.server_name orelse return error.McpServerNotFound,
+                self.identity orelse return error.McpPromptNotFound,
+                .{ .name = current.name, .value = current.value },
+                context,
+                &self.cancel_requested,
+                .unrestricted,
+            ),
+            .servers, .tools => return error.McpMenuInvalidOperation,
+        };
+        defer completion.deinit(self.alloc);
+        if (completion.values.len == 0) return error.McpCompletionEmpty;
+        return .{
+            .field_index = self.argument_index,
+            .value = try self.alloc.dupe(u8, completion.values[0]),
         };
     }
 
@@ -468,35 +696,10 @@ const PendingMenuOperation = struct {
         const server_name = self.server_name orelse return error.McpServerNotFound;
         const identity = self.identity orelse return error.McpResourceNotFound;
         if (self.resource_template) {
-            const open = std.mem.findScalar(u8, identity, '{') orelse
-                return makeMenuPreview(
-                    self.alloc,
-                    "MCP resource template · no variable found\n\n",
-                    identity,
-                );
-            const relative_close = std.mem.findScalar(u8, identity[open + 1 ..], '}') orelse
-                return error.McpResourceTemplateInvalid;
-            const close = open + 1 + relative_close;
-            const variable_name = identity[open + 1 .. close];
-            var completion = try self.lease.runtime.completeResourceTemplateArgument(
+            const resolved = try expandResourceTemplate(
                 self.alloc,
-                server_name,
                 identity,
-                .{ .name = variable_name, .value = "" },
-                &.{},
-                &self.cancel_requested,
-                .unrestricted,
-            );
-            defer completion.deinit(self.alloc);
-            const value = if (completion.values.len > 0) completion.values[0] else return makeMenuPreview(
-                self.alloc,
-                "MCP resource template · no completions available\n\n",
-                identity,
-            );
-            const resolved = try std.mem.concat(
-                self.alloc,
-                u8,
-                &.{ identity[0..open], value, identity[close + 1 ..] },
+                self.arguments,
             );
             defer self.alloc.free(resolved);
             return self.readResourcePreview(server_name, resolved);
@@ -535,37 +738,24 @@ const PendingMenuOperation = struct {
     }
 
     fn previewPrompt(self: *PendingMenuOperation) !MenuPreview {
-        var arguments_json: []u8 = try self.alloc.dupe(u8, "{}");
-        defer self.alloc.free(arguments_json);
-        if (self.argument_name) |argument_name| {
-            var completion = try self.lease.runtime.completePromptArgument(
-                self.alloc,
-                self.server_name orelse return error.McpServerNotFound,
-                self.identity orelse return error.McpPromptNotFound,
-                .{ .name = argument_name, .value = "" },
-                &.{},
-                &self.cancel_requested,
-                .unrestricted,
-            );
-            defer completion.deinit(self.alloc);
-            if (completion.values.len > 0) {
-                var json: std.Io.Writer.Allocating = .init(self.alloc);
-                defer json.deinit();
-                try json.writer.writeByte('{');
-                try std.json.Stringify.value(argument_name, .{}, &json.writer);
-                try json.writer.writeByte(':');
-                try std.json.Stringify.value(completion.values[0], .{}, &json.writer);
-                try json.writer.writeByte('}');
-                const next_arguments_json = try json.toOwnedSlice();
-                self.alloc.free(arguments_json);
-                arguments_json = next_arguments_json;
-            }
+        var json: std.Io.Writer.Allocating = .init(self.alloc);
+        defer json.deinit();
+        try json.writer.writeByte('{');
+        var written: usize = 0;
+        for (self.arguments) |argument| {
+            if (argument.value.len == 0) continue;
+            if (written > 0) try json.writer.writeByte(',');
+            try std.json.Stringify.value(argument.name, .{}, &json.writer);
+            try json.writer.writeByte(':');
+            try std.json.Stringify.value(argument.value, .{}, &json.writer);
+            written += 1;
         }
+        try json.writer.writeByte('}');
         var result = try self.lease.runtime.getPrompt(
             self.alloc,
             self.server_name orelse return error.McpServerNotFound,
             self.identity orelse return error.McpPromptNotFound,
-            arguments_json,
+            json.written(),
             .{ .cancel_flag = &self.cancel_requested, .access = .unrestricted },
         );
         defer result.deinit(self.alloc);
@@ -600,7 +790,8 @@ const PendingMenuOperation = struct {
         if (self.result) |*result| result.deinit(self.alloc);
         if (self.server_name) |value| self.alloc.free(value);
         if (self.identity) |value| self.alloc.free(value);
-        if (self.argument_name) |value| self.alloc.free(value);
+        for (self.arguments) |*argument| argument.deinit(self.alloc);
+        if (self.arguments.len > 0) self.alloc.free(self.arguments);
         types.freePermissionRuleSlice(self.alloc, self.permission_rules.rules);
         self.lease.deinit();
         self.alloc.destroy(self);
@@ -669,6 +860,43 @@ pub const MenuAddForm = struct {
     }
 };
 
+pub const MenuArgumentField = struct {
+    name: []u8,
+    required: bool,
+    value: std.ArrayList(u8) = .empty,
+
+    fn deinit(self: *MenuArgumentField, alloc: Allocator) void {
+        alloc.free(self.name);
+        self.value.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+const MenuArgumentForm = struct {
+    fields: []MenuArgumentField = &.{},
+
+    fn deinit(self: *MenuArgumentForm, alloc: Allocator) void {
+        for (self.fields) |*field| field.deinit(alloc);
+        if (self.fields.len > 0) alloc.free(self.fields);
+        self.* = .{};
+    }
+
+    fn set(self: *MenuArgumentForm, alloc: Allocator, field_index: usize, bytes: []const u8) !void {
+        if (field_index >= self.fields.len) return error.McpMenuInvalidField;
+        const field = &self.fields[field_index].value;
+        try field.ensureTotalCapacity(alloc, bytes.len);
+        field.clearRetainingCapacity();
+        field.appendSliceAssumeCapacity(bytes);
+    }
+
+    fn allRequiredPresent(self: *const MenuArgumentForm) bool {
+        for (self.fields) |field| {
+            if (field.required and field.value.items.len == 0) return false;
+        }
+        return true;
+    }
+};
+
 pub const MenuCompletionEffect = union(enum) {
     none,
     repaint,
@@ -706,6 +934,7 @@ pub const State = struct {
     menu_preview: ?MenuPreview = null,
     menu_feedback: ?[]u8 = null,
     menu_add_form: MenuAddForm = .{},
+    menu_argument_form: MenuArgumentForm = .{},
 
     pub const MenuView = struct {
         state: mcp_menu_state.State,
@@ -717,6 +946,7 @@ pub const State = struct {
         insert: ?[]const u8,
         feedback: ?[]const u8,
         add_form: *const MenuAddForm,
+        argument_fields: []const MenuArgumentField,
     };
 
     pub fn menuView(self: *const State) MenuView {
@@ -730,6 +960,7 @@ pub const State = struct {
             .insert = if (self.menu_preview) |preview| preview.insert else null,
             .feedback = self.menu_feedback,
             .add_form = &self.menu_add_form,
+            .argument_fields = self.menu_argument_form.fields,
         };
     }
 
@@ -760,7 +991,7 @@ pub const State = struct {
         const transition = mcp_menu_state.reduce(self.menu, .close);
         if (transition.effect) |effect| switch (effect) {
             .cancel => self.cancelPendingMenuOperation("menu_closed"),
-            .load_catalog, .load_preview, .action => {},
+            .load_catalog, .load_preview, .complete_argument, .action => {},
         };
         self.clearMenuOwned(alloc);
         self.menu = .{};
@@ -783,6 +1014,7 @@ pub const State = struct {
         if (self.menu_feedback) |feedback| alloc.free(feedback);
         self.menu_feedback = null;
         self.menu_add_form.deinit(alloc);
+        self.menu_argument_form.deinit(alloc);
     }
 
     pub fn setMenuAddField(
@@ -804,12 +1036,77 @@ pub const State = struct {
         self.menu_feedback = owned;
     }
 
+    pub fn prepareMenuArguments(self: *State, alloc: Allocator) !bool {
+        var fields: std.ArrayList(MenuArgumentField) = .empty;
+        defer fields.deinit(alloc);
+        errdefer for (fields.items) |*field| field.deinit(alloc);
+        switch (self.menu.section) {
+            .servers, .tools => return false,
+            .resources => {
+                const catalog = self.menu_resources orelse return false;
+                const item = catalog.filteredItem(
+                    self.menu.selected_index,
+                    self.menu.queryText(),
+                ) orelse return false;
+                if (!item.is_template) return false;
+                try appendTemplateArgumentFields(alloc, &fields, item.uri);
+            },
+            .prompts => {
+                const prompt = self.selectedMenuPrompt() orelse return false;
+                for (prompt.arguments) |argument| {
+                    try appendMenuArgumentField(
+                        alloc,
+                        &fields,
+                        argument.name,
+                        argument.required,
+                    );
+                }
+            },
+        }
+        if (fields.items.len == 0) return false;
+        const owned = try fields.toOwnedSlice(alloc);
+        self.menu_argument_form.deinit(alloc);
+        self.menu_argument_form.fields = owned;
+        self.menu = mcp_menu_state.reduce(
+            self.menu,
+            .{ .show_arguments = owned.len },
+        ).state;
+        return true;
+    }
+
+    pub fn setMenuArgumentField(
+        self: *State,
+        alloc: Allocator,
+        field_index: usize,
+        value: []const u8,
+    ) !void {
+        try self.menu_argument_form.set(alloc, field_index, value);
+    }
+
+    pub fn menuArgumentsValid(self: *const State) bool {
+        return self.menu_argument_form.allRequiredPresent();
+    }
+
+    fn selectedMenuPrompt(self: *const State) ?*const mcp_runtime.PromptSummary {
+        const catalog = self.menu_prompts orelse return null;
+        var matched: usize = 0;
+        const query = self.menu.queryText();
+        for (catalog.items) |*item| {
+            if (!menuPromptMatches(item.*, query)) continue;
+            if (matched == self.menu.selected_index) return item;
+            matched += 1;
+        }
+        return null;
+    }
+
     pub fn returnMenuToServers(self: *State) void {
         self.menu.section = .servers;
         self.menu.screen = .browse;
         self.menu.selected_index = self.menu.selected_server_index;
         self.menu.window_start = 0;
         self.menu.confirmation_action = null;
+        self.menu.filter_active = false;
+        self.menu.query_len = 0;
     }
 
     pub fn beginMenuEffect(
@@ -823,6 +1120,10 @@ pub const State = struct {
         const operation: MenuOperation = switch (effect) {
             .load_catalog => |request| .{ .kind = MenuOperationKind.catalog, .request = request },
             .load_preview => |request| .{ .kind = MenuOperationKind.preview, .request = request },
+            .complete_argument => |request| .{
+                .kind = MenuOperationKind.completion,
+                .request = request,
+            },
             .action => |request| action_operation: {
                 if (request.action != .logout) return error.McpMenuInvalidOperation;
                 action = request.action;
@@ -839,6 +1140,8 @@ pub const State = struct {
             .cancel => return error.McpMenuInvalidOperation,
         };
         self.cancelPendingMenuOperation("superseded");
+        if (self.menu_feedback) |feedback| alloc.free(feedback);
+        self.menu_feedback = null;
 
         if (operation.kind == .catalog and
             (operation.request.section == .resources or operation.request.section == .prompts))
@@ -867,12 +1170,13 @@ pub const State = struct {
 
         var server_name: ?[]u8 = null;
         var identity: ?[]u8 = null;
-        var argument_name: ?[]u8 = null;
+        var arguments: []OwnedMenuArgument = &.{};
         var resource_template = false;
         errdefer {
             if (server_name) |value| alloc.free(value);
             if (identity) |value| alloc.free(value);
-            if (argument_name) |value| alloc.free(value);
+            for (arguments) |*argument| argument.deinit(alloc);
+            if (arguments.len > 0) alloc.free(arguments);
         }
         if (operation.kind == .action or
             operation.request.section == .resources or
@@ -885,30 +1189,44 @@ pub const State = struct {
                 health.servers[operation.request.server_index].configured_name,
             );
         }
-        if (operation.kind == .preview) switch (operation.request.section) {
+        if (operation.kind == .preview or operation.kind == .completion) switch (operation.request.section) {
             .servers => return error.McpMenuInvalidOperation,
             .tools => {
                 const tools = self.menu_tools orelse return error.McpToolNotFound;
-                if (operation.request.selected_index >= tools.len) return error.McpToolNotFound;
-                identity = try alloc.dupe(u8, tools[operation.request.selected_index]);
+                const query = self.menu.queryText();
+                var matched: usize = 0;
+                const selected = for (tools) |tool| {
+                    if (!mcp_menu_state.textMatchesQuery(tool, query)) continue;
+                    if (matched == operation.request.selected_index) break tool;
+                    matched += 1;
+                } else return error.McpToolNotFound;
+                identity = try alloc.dupe(u8, selected);
             },
             .resources => {
                 const catalog = self.menu_resources orelse return error.McpResourceNotFound;
-                const item = catalog.item(operation.request.selected_index) orelse
+                const item = catalog.filteredItem(
+                    operation.request.selected_index,
+                    self.menu.queryText(),
+                ) orelse
                     return error.McpResourceNotFound;
                 identity = try alloc.dupe(u8, item.uri);
                 resource_template = item.is_template;
             },
             .prompts => {
                 const catalog = self.menu_prompts orelse return error.McpPromptNotFound;
-                if (operation.request.selected_index >= catalog.items.len) return error.McpPromptNotFound;
-                const prompt = catalog.items[operation.request.selected_index];
+                const query = self.menu.queryText();
+                var matched: usize = 0;
+                const prompt = for (catalog.items) |item| {
+                    if (!menuPromptMatches(item, query)) continue;
+                    if (matched == operation.request.selected_index) break item;
+                    matched += 1;
+                } else return error.McpPromptNotFound;
                 identity = try alloc.dupe(u8, prompt.name);
-                if (prompt.arguments.len > 0) {
-                    argument_name = try alloc.dupe(u8, prompt.arguments[0].name);
-                }
             },
         };
+        if (operation.kind == .preview or operation.kind == .completion) {
+            arguments = try cloneMenuArguments(alloc, self.menu_argument_form.fields);
+        }
 
         const pending = try alloc.create(PendingMenuOperation);
         pending.* = .{
@@ -920,7 +1238,8 @@ pub const State = struct {
             .limits = limits,
             .server_name = server_name,
             .identity = identity,
-            .argument_name = argument_name,
+            .arguments = arguments,
+            .argument_index = self.menu.argument_index,
             .resource_template = resource_template,
             .action = action,
         };
@@ -928,7 +1247,7 @@ pub const State = struct {
         rules_owned = false;
         server_name = null;
         identity = null;
-        argument_name = null;
+        arguments = &.{};
 
         self.lock.lockUncancelable(io_mod.getIo());
         std.debug.assert(self.pending_menu_operation == null);
@@ -998,7 +1317,14 @@ pub const State = struct {
         pending.result = null;
         pending.deinit();
         defer result.deinit(alloc);
-        if (!self.menu.active or self.menu.pending_generation != request.generation) return .none;
+        if (!self.menu.active or self.menu.pending_generation != request.generation) {
+            debug_trace.logf(
+                "mcp",
+                "discarding menu completion generation={d} active={s} pending_generation={any}",
+                .{ request.generation, if (self.menu.active) "true" else "false", self.menu.pending_generation },
+            );
+            return .none;
+        }
 
         if (self.menu_feedback) |feedback| alloc.free(feedback);
         self.menu_feedback = null;
@@ -1044,6 +1370,17 @@ pub const State = struct {
                     .{ .preview_loaded = request.generation },
                 ).state;
             },
+            .completion => |completion| {
+                try self.menu_argument_form.set(
+                    alloc,
+                    completion.field_index,
+                    completion.value,
+                );
+                self.menu = mcp_menu_state.reduce(
+                    self.menu,
+                    .{ .completion_loaded = request.generation },
+                ).state;
+            },
             .action => |action_result| {
                 self.menu_feedback = action_result.feedback;
                 const needs_reload = action_result.reload;
@@ -1063,6 +1400,7 @@ pub const State = struct {
                         switch (kind) {
                             .catalog => "catalog",
                             .preview => "preview",
+                            .completion => "completion",
                             .action => "action",
                         },
                         @errorName(err),
@@ -1230,6 +1568,10 @@ pub const State = struct {
             );
             task.deinit();
         }
+    }
+
+    pub fn cancelMenuOperation(self: *State) void {
+        self.cancelPendingMenuOperation("menu_back");
     }
 
     pub fn installInitial(self: *State, runtime: ?*mcp_runtime.McpRuntime) void {
@@ -2145,6 +2487,42 @@ fn destroyRuntime(alloc: Allocator, runtime: *mcp_runtime.McpRuntime) void {
     runtime.retireAndWait();
     runtime.deinit();
     alloc.destroy(runtime);
+}
+
+test "MCP menu expands every resource template argument" {
+    const alloc = std.testing.allocator;
+    var fields: std.ArrayList(MenuArgumentField) = .empty;
+    defer {
+        for (fields.items) |*field| field.deinit(alloc);
+        fields.deinit(alloc);
+    }
+    try appendTemplateArgumentFields(
+        alloc,
+        &fields,
+        "custom://project/{project}/{path}{?lang,mode}",
+    );
+    try std.testing.expectEqual(@as(usize, 4), fields.items.len);
+    try std.testing.expectEqualStrings("project", fields.items[0].name);
+    try std.testing.expectEqualStrings("path", fields.items[1].name);
+    try std.testing.expectEqualStrings("lang", fields.items[2].name);
+    try std.testing.expectEqualStrings("mode", fields.items[3].name);
+
+    const arguments = [_]OwnedMenuArgument{
+        .{ .name = @constCast("project"), .value = @constCast("alpha team") },
+        .{ .name = @constCast("path"), .value = @constCast("src/lib") },
+        .{ .name = @constCast("lang"), .value = @constCast("en") },
+        .{ .name = @constCast("mode"), .value = @constCast("fast") },
+    };
+    const expanded = try expandResourceTemplate(
+        alloc,
+        "custom://project/{project}/{path}{?lang,mode}",
+        &arguments,
+    );
+    defer alloc.free(expanded);
+    try std.testing.expectEqualStrings(
+        "custom://project/alpha%20team/src%2Flib?lang=en&mode=fast",
+        expanded,
+    );
 }
 
 const TestReloadMode = enum {

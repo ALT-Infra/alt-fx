@@ -4,6 +4,7 @@ const approval_prompt = @import("../../core/permissions/approval_prompt.zig");
 const auth_runtime = @import("../../core/auth/auth_runtime.zig");
 const activity_status = @import("../../core/output/activity_status.zig");
 const model_cache_runtime = @import("../../core/app/model_cache_runtime.zig");
+const app_mcp_runtime = @import("../../core/app/app_mcp_runtime.zig");
 const mcp_health = @import("../../core/mcp/health.zig");
 const mcp_menu_state = @import("../../core/mcp/menu_state.zig");
 const mcp_runtime = @import("../../core/mcp/mcp_runtime.zig");
@@ -82,13 +83,19 @@ pub const McpMenuProjection = struct {
     add_target: []const u8 = "",
     add_arguments: []const u8 = "",
     add_draft: []const u8 = "",
+    arguments: []const app_mcp_runtime.MenuArgumentField = &.{},
+    argument_draft: []const u8 = "",
 
     pub fn itemCount(self: McpMenuProjection) usize {
         return switch (self.state.section) {
             .servers => self.servers.len,
-            .tools => self.tools.len,
-            .resources => self.resources.len + self.resource_templates.len,
-            .prompts => self.prompts.len,
+            .tools => countMatchingTools(self.tools, self.state.queryText()),
+            .resources => countMatchingResources(
+                self.resources,
+                self.resource_templates,
+                self.state.queryText(),
+            ),
+            .prompts => countMatchingPrompts(self.prompts, self.state.queryText()),
         };
     }
 
@@ -98,12 +105,83 @@ pub const McpMenuProjection = struct {
     }
 
     pub fn resourceAt(self: McpMenuProjection, index: usize) ?*const mcp_runtime.ResourceSummary {
-        if (index < self.resources.len) return &self.resources[index];
-        const template_index = index - self.resources.len;
-        if (template_index < self.resource_templates.len) return &self.resource_templates[template_index];
+        var matched: usize = 0;
+        const query = self.state.queryText();
+        for (self.resources) |*item| {
+            if (!resourceMatches(item.*, query)) continue;
+            if (matched == index) return item;
+            matched += 1;
+        }
+        for (self.resource_templates) |*item| {
+            if (!resourceMatches(item.*, query)) continue;
+            if (matched == index) return item;
+            matched += 1;
+        }
+        return null;
+    }
+
+    pub fn toolAt(self: McpMenuProjection, index: usize) ?[]const u8 {
+        var matched: usize = 0;
+        const query = self.state.queryText();
+        for (self.tools) |item| {
+            if (!matches(item, query)) continue;
+            if (matched == index) return item;
+            matched += 1;
+        }
+        return null;
+    }
+
+    pub fn promptAt(self: McpMenuProjection, index: usize) ?*const mcp_runtime.PromptSummary {
+        var matched: usize = 0;
+        const query = self.state.queryText();
+        for (self.prompts) |*item| {
+            if (!promptMatches(item.*, query)) continue;
+            if (matched == index) return item;
+            matched += 1;
+        }
         return null;
     }
 };
+
+fn matches(text: []const u8, query: []const u8) bool {
+    return mcp_menu_state.textMatchesQuery(text, query);
+}
+
+fn countMatchingTools(items: []const []const u8, query: []const u8) usize {
+    var count: usize = 0;
+    for (items) |item| count += @intFromBool(matches(item, query));
+    return count;
+}
+
+fn resourceMatches(item: mcp_runtime.ResourceSummary, query: []const u8) bool {
+    return matches(item.uri, query) or
+        matches(item.name, query) or
+        (item.title != null and matches(item.title.?, query)) or
+        (item.description != null and matches(item.description.?, query));
+}
+
+fn countMatchingResources(
+    resources: []const mcp_runtime.ResourceSummary,
+    templates: []const mcp_runtime.ResourceSummary,
+    query: []const u8,
+) usize {
+    var count: usize = 0;
+    for (resources) |item| count += @intFromBool(resourceMatches(item, query));
+    for (templates) |item| count += @intFromBool(resourceMatches(item, query));
+    return count;
+}
+
+fn promptMatches(item: mcp_runtime.PromptSummary, query: []const u8) bool {
+    return matches(item.name, query) or
+        (item.title != null and matches(item.title.?, query)) or
+        (item.description != null and matches(item.description.?, query));
+}
+
+fn countMatchingPrompts(items: []const mcp_runtime.PromptSummary, query: []const u8) usize {
+    var count: usize = 0;
+    for (items) |item| count += @intFromBool(promptMatches(item, query));
+    return count;
+}
 
 pub const SessionMenuProjection = struct {
     active: bool = false,

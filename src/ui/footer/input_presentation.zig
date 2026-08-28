@@ -540,18 +540,28 @@ pub fn composeMcpMenuHintRow(
     }
 
     const root_variants = [_][]const u8{
-        "↑↓ Navigate     Tab Section     Enter Inspect     A Add     R Reload     Esc Close",
-        "↑↓ Move  Tab Section  Enter  A Add  R Reload  Esc",
-        "Tab Enter A R Esc",
+        "↑↓ Navigate  Tab Section  Enter Inspect  A Add  R Reload  C Config  P Approve all  Z Reset  Esc Close",
+        "↑↓ Move  Tab Section  Enter  A Add  R Reload  C Config  P All  Z Reset  Esc",
+        "Tab Enter A R C P Z Esc",
     };
-    const nested_variants = [_][]const u8{
-        "↑↓ Navigate     Tab Section     Enter Open     I Insert     Esc Back",
-        "↑↓ Move  Tab Section  Enter  I Insert  Esc",
-        "Tab Enter I Esc",
+    const catalog_variants = [_][]const u8{
+        "↑↓ Navigate     Tab Section     Enter Open     / Filter     Esc Back",
+        "↑↓ Move  Tab Section  Enter  / Filter  Esc",
+        "Tab Enter / Esc",
+    };
+    const preview_variants = [_][]const u8{
+        "I Insert     Esc Back",
+        "I Insert  Esc",
+        "I Esc",
     };
     const add_variants = [_][]const u8{
         "Type field     Enter Next/Save     Tab Transport     Esc Cancel",
         "Type  Enter Next/Save  Tab Transport  Esc",
+        "Enter Tab Esc",
+    };
+    const argument_variants = [_][]const u8{
+        "Type value  Enter Next/Preview  Tab Complete  Esc Cancel",
+        "Type  Enter Next  Tab Complete  Esc",
         "Enter Tab Esc",
     };
     const details_variants = [_][]const u8{
@@ -564,10 +574,17 @@ pub fn composeMcpMenuHintRow(
         "Enter Confirm  Esc",
         "Enter Esc",
     };
+    const info_variants = [_][]const u8{
+        "Esc Back",
+        "Esc",
+        "Esc",
+    };
     const variants = switch (state.screen) {
-        .browse => if (state.section == .servers) root_variants else nested_variants,
-        .preview => nested_variants,
+        .browse => if (state.section == .servers) root_variants else catalog_variants,
+        .preview => preview_variants,
         .add => add_variants,
+        .arguments => argument_variants,
+        .info => info_variants,
         .details => details_variants,
         .confirm => confirm_variants,
     };

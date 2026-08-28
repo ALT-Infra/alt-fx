@@ -465,7 +465,16 @@ describe.skipIf(SKIP)("tui: extra slash commands", () => {
         expect(menu).toContain("[Servers]");
         expect(menu).toContain("No MCP servers configured.");
         expect(menu).toContain("A Add");
+        expect(menu).toContain("C Config");
+        expect(menu).toContain("P All");
+        expect(menu).toContain("Z Reset");
         expect(menu).not.toContain("MCP: no servers configured");
+
+        await session.sendKeys("C");
+        const info = await session.waitForText("~/.fx/mcp.json", 5_000);
+        expect(info).toContain("<workspace>/.mcp.json");
+        await session.sendKeys("Escape");
+        await session.waitForText("No MCP servers configured.", 5_000);
 
         await session.sendKeys("Right");
         await session.waitForText("No MCP tools available.", 5_000);
@@ -546,6 +555,13 @@ describe.skipIf(SKIP)("tui: extra slash commands", () => {
         await session.sendKeys("Right");
         const tools = await session.waitForText("mcp_fixture_echo", 10_000);
         expect(tools).toContain("[Tools]");
+        await session.sendKeys("/");
+        for (const character of "echox") {
+          await session.sendKeys(character);
+        }
+        await session.waitForText("Filter: echox", 5_000);
+        await session.sendKeys("BSpace");
+        await session.waitForText("Filter: echo", 5_000);
         await session.sendKeys("Enter");
         const toolPreview = await session.waitForText("untrusted metadata", 10_000);
         expect(toolPreview).toContain("mcp_fixture_echo");
@@ -559,24 +575,70 @@ describe.skipIf(SKIP)("tui: extra slash commands", () => {
         await session.sendKeys("Right");
         const prompts = await session.waitForText("Review prompt", 10_000);
         expect(prompts).toContain("[Prompts]");
+        for (let index = 0; index < 2; index += 1) {
+          await session.sendKeys("Down");
+        }
+        await session.sendKeys("Enter");
+        await session.waitForText("topic *", 5_000);
+        await session.sendKeys("Tab");
+        await session.waitForPane(() =>
+          (readFileSync(wireLogPath, "utf8").match(/completion\/complete/g) ?? []).length >= 1,
+        10_000);
+        await session.waitForPane(
+          (pane) => pane.includes("alpha") && !pane.includes("Completing MCP argument"),
+          5_000,
+        );
+        await session.sendKeys("Enter");
+        await session.waitForText("> tone *", 5_000);
+        await session.sendKeys("Tab");
+        await session.waitForPane(() =>
+          (readFileSync(wireLogPath, "utf8").match(/completion\/complete/g) ?? []).length >= 2,
+        10_000);
+        await session.waitForPane(
+          (pane) => pane.includes("> tone *") && !pane.includes("Completing MCP argument"),
+          5_000,
+        );
         await session.sendKeys("Enter");
         const promptPreview = await session.waitForText("PROMPT_TEXT:", 10_000);
         expect(promptPreview).toContain("untrusted content");
+        expect(readFileSync(wireLogPath, "utf8")).toContain(
+          '"arguments":{"topic":"alpha","tone":"alpha"}',
+        );
         await session.sendKeys("Escape");
-        await session.waitForText("Review prompt", 5_000);
+        await session.waitForText("Multi prompt", 5_000);
         await session.sendKeys("Left");
         await session.waitForText("custom://alpha", 10_000);
 
-        for (let index = 0; index < 4; index += 1) {
+        for (let index = 0; index < 5; index += 1) {
           await session.sendKeys("Down");
         }
 
+        await session.sendKeys("Enter");
+        await session.waitForText("project *", 5_000);
+        await session.sendKeys("Tab");
+        await session.waitForPane(() =>
+          (readFileSync(wireLogPath, "utf8").match(/completion\/complete/g) ?? []).length >= 3,
+        10_000);
+        await session.waitForPane(
+          (pane) => pane.includes("alpha") && !pane.includes("Completing MCP argument"),
+          5_000,
+        );
+        await session.sendKeys("Enter");
+        await session.waitForText("> path *", 5_000);
+        await session.sendKeys("Tab");
+        await session.waitForPane(() =>
+          (readFileSync(wireLogPath, "utf8").match(/completion\/complete/g) ?? []).length >= 4,
+        10_000);
+        await session.waitForPane(
+          (pane) => pane.includes("> path *") && !pane.includes("Completing MCP argument"),
+          5_000,
+        );
         await session.sendKeys("Enter");
         const preview = await session.waitForText("RESOURCE_TEXT:", 10_000);
         expect(preview).toContain("untrusted content");
         const wire = readFileSync(wireLogPath, "utf8");
         expect(wire).toContain('"method":"completion/complete"');
-        expect(wire).toContain('"uri":"custom://project/alpha"');
+        expect(wire).toContain('"uri":"custom://project/alpha/alpha"');
 
         await session.sendKeys("Escape");
         await session.waitForText("custom://alpha", 5_000);
