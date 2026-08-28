@@ -89,7 +89,7 @@ export PARALLEL_API_KEY=<your-parallel-api-key>
 fx login parallel
 ```
 
-`fx login parallel` imports `PARALLEL_API_KEY` into a private copy at `~/.fx/parallel-auth.json`; the session is stored at that path and `fx logout parallel` removes it. Searches default to the low-latency `fast` mode; the model may pass focused `search_queries` (at most five) and request `advanced` depth for genuinely multi-hop research. Each result keeps Parallel's LLM-optimized excerpt and publish date, and searches never send your API key anywhere except Parallel.
+`fx login parallel` imports `PARALLEL_API_KEY` into a private copy at `~/.fx/parallel-auth.json`; the session is stored at that path and `fx logout parallel` removes it. Searches default to the low-latency `fast` mode; the model may pass focused `search_queries` (at most five) and request `advanced` depth for genuinely multi-hop research. Parallel sizes its LLM-optimized excerpts for the objective and active model instead of receiving a fixed character budget from fx. When a result is a promising lead, `web_fetch` can send Parallel a focused objective for relevant excerpts or omit the objective to request the complete page. Related search and fetch calls share one task-scoped Parallel session. Searches and extracts never send your API key anywhere except Parallel.
 
 To use an AI Gateway API key instead:
 

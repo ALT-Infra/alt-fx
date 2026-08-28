@@ -2,13 +2,17 @@ const std = @import("std");
 
 const gateway_client = @import("../gateway/client.zig");
 const io_mod = @import("../core/shared/io.zig");
+const web_fetch_contract = @import("../core/tooling/web_fetch_contract.zig");
+const web_fetch_provider = @import("../core/tooling/web_fetch_provider.zig");
 const web_search_contract = @import("../core/tooling/web_search_contract.zig");
 const web_search_policy = @import("../core/tooling/web_search_policy.zig");
 const web_search_provider = @import("../core/tooling/web_search_provider.zig");
 
 const Allocator = std.mem.Allocator;
 const default_search_url = "https://api.parallel.ai/v1/search";
+const default_extract_url = "https://api.parallel.ai/v1/extract";
 const e2e_search_url_env = "FX_E2E_PARALLEL_SEARCH_URL";
+const e2e_extract_url_env = "FX_E2E_PARALLEL_EXTRACT_URL";
 const max_response_bytes: usize = 2 * 1024 * 1024;
 const backend_id = web_search_contract.SearchBackendId{ .value = "parallel_direct_search" };
 const backend_order = [_]web_search_contract.SearchBackendId{backend_id};
@@ -23,7 +27,7 @@ const backend_policies = [_]web_search_policy.BackendPolicy{.{
         .terminal_incomplete = true,
         .timeout = true,
         .cancellation = true,
-        .result_bounds = .pass_through,
+        .result_bounds = .post_filter,
     },
 }};
 
@@ -36,6 +40,10 @@ pub const default_web_search_provider = web_search_provider.Provider{
     .policy = default_web_search_policy,
     .preferred_backends_fn = preferredBackends,
     .execute_fn = executeProvider,
+};
+
+pub const default_web_fetch_provider = web_fetch_provider.Provider{
+    .execute_fn = executeFetchProvider,
 };
 
 fn preferredBackends(_: ?*anyopaque) !?[]const web_search_contract.SearchBackendId {
@@ -57,7 +65,7 @@ fn executeProvider(
     const payload = try buildPayload(alloc, inputs.worker_model, request);
     defer alloc.free(payload);
     const url = try searchUrl();
-    var operation = SearchOperation{
+    var operation = ParallelOperation{
         .alloc = alloc,
         .url = url,
         .api_key = inputs.api_key,
@@ -74,7 +82,7 @@ fn executeProvider(
         &operation,
     );
     defer http.deinit(alloc);
-    try statusError(http.status);
+    try searchStatusError(http.status);
 
     var response = try parseResponse(alloc, http.body, request.max_results);
     errdefer response.deinit(alloc);
@@ -109,28 +117,19 @@ fn buildPayload(alloc: Allocator, client_model: []const u8, request: web_search_
     }
     try out.writer.writeAll("],\"mode\":");
     try std.json.Stringify.value(@tagName(request.mode orelse .fast), .{}, &out.writer);
-    try out.writer.print(",\"max_chars_total\":{d}", .{request.max_output_chars});
     if (client_model.len > 0) {
         try out.writer.writeAll(",\"client_model\":");
         try std.json.Stringify.value(client_model, .{}, &out.writer);
     }
-    if (request.session_id) |session_id| {
-        if (session_id.len > 0 and session_id.len <= 1000) {
-            try out.writer.writeAll(",\"session_id\":");
-            try std.json.Stringify.value(session_id, .{}, &out.writer);
-        }
-    }
+    try writeResearchSessionId(alloc, &out.writer, request.session_id, request.turn_id);
     if (hasValues(request.allowed_domains) or hasValues(request.blocked_domains)) {
-        try out.writer.print(",\"advanced_settings\":{{\"max_results\":{d},\"source_policy\":{{", .{request.max_results});
+        try out.writer.writeAll(",\"advanced_settings\":{\"source_policy\":{");
         if (hasValues(request.allowed_domains)) {
             try writeStrings(&out.writer, "include_domains", request.allowed_domains.?);
         } else {
             try writeStrings(&out.writer, "exclude_domains", request.blocked_domains.?);
         }
         try out.writer.writeAll("}}");
-    } else {
-        try out.writer.print(",\"advanced_settings\":{{\"max_results\":{d}", .{request.max_results});
-        try out.writer.writeByte('}');
     }
     try out.writer.writeByte('}');
     return try out.toOwnedSlice();
@@ -146,6 +145,93 @@ fn writeStrings(writer: *std.Io.Writer, name: []const u8, values: []const []cons
     try writer.writeByte(']');
 }
 
+fn writeResearchSessionId(alloc: Allocator, writer: *std.Io.Writer, session_id: ?[]const u8, turn_id: ?u64) !void {
+    var owned: std.Io.Writer.Allocating = .init(alloc);
+    defer owned.deinit();
+
+    if (turn_id) |turn| {
+        if (session_id) |session| {
+            const suffix_reserve = 32;
+            if (session.len > 0 and session.len <= 1000 - suffix_reserve) {
+                try owned.writer.print("{s}:turn:{d}", .{ session, turn });
+            } else {
+                try owned.writer.print("fx-turn:{d}", .{turn});
+            }
+        } else {
+            try owned.writer.print("fx-turn:{d}", .{turn});
+        }
+    } else if (session_id) |session| {
+        if (session.len == 0 or session.len > 1000) return;
+        try owned.writer.writeAll(session);
+    } else {
+        return;
+    }
+
+    try writer.writeAll(",\"session_id\":");
+    try std.json.Stringify.value(owned.written(), .{}, writer);
+}
+
+fn executeFetchProvider(
+    _: ?*anyopaque,
+    alloc: Allocator,
+    inputs: web_fetch_provider.Inputs,
+    request: web_fetch_contract.Request,
+) !web_fetch_contract.Response {
+    if (inputs.api_key.len == 0) return error.MissingParallelApiKey;
+    const cancel_flag = request.cancel_flag orelse return error.MissingParallelCancelFlag;
+    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+
+    const payload = try buildExtractPayload(alloc, inputs.worker_model, request);
+    defer alloc.free(payload);
+    const url = try extractUrl();
+    var operation = ParallelOperation{
+        .alloc = alloc,
+        .url = url,
+        .api_key = inputs.api_key,
+        .payload = payload,
+    };
+    var http = try gateway_client.runBoundedHttpOperation(
+        HttpResult,
+        alloc,
+        cancel_flag,
+        std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+            .clock = .awake,
+            .raw = .fromMilliseconds(request.timeout_ms),
+        }),
+        &operation,
+    );
+    defer http.deinit(alloc);
+    try extractStatusError(http.status);
+    return parseExtractResponse(alloc, http.body, request.objective != null);
+}
+
+fn buildExtractPayload(alloc: Allocator, client_model: []const u8, request: web_fetch_contract.Request) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try out.writer.writeAll("{\"urls\":[");
+    try std.json.Stringify.value(request.url, .{}, &out.writer);
+    try out.writer.writeByte(']');
+    if (request.objective) |objective| {
+        try out.writer.writeAll(",\"objective\":");
+        try std.json.Stringify.value(objective, .{}, &out.writer);
+    } else {
+        try out.writer.writeAll(",\"advanced_settings\":{\"full_content\":true}");
+    }
+    if (client_model.len > 0) {
+        try out.writer.writeAll(",\"client_model\":");
+        try std.json.Stringify.value(client_model, .{}, &out.writer);
+    }
+    try writeResearchSessionId(alloc, &out.writer, request.session_id, request.turn_id);
+    try out.writer.writeByte('}');
+    return out.toOwnedSlice();
+}
+
+fn extractUrl() ![]const u8 {
+    const override = io_mod.getenv(e2e_extract_url_env) orelse return default_extract_url;
+    if (!gateway_client.isLoopbackHttpUrl(override)) return error.InvalidE2EParallelExtractUrl;
+    return override;
+}
+
 const HttpResult = struct {
     status: std.http.Status,
     body: []u8,
@@ -156,7 +242,7 @@ const HttpResult = struct {
     }
 };
 
-const SearchOperation = struct {
+const ParallelOperation = struct {
     alloc: Allocator,
     url: []const u8,
     api_key: []const u8,
@@ -190,14 +276,14 @@ const SearchOperation = struct {
         var transfer_buffer: [16 * 1024]u8 = undefined;
         const reader = response.reader(&transfer_buffer);
         const body = reader.allocRemaining(self.alloc, .limited(max_response_bytes)) catch |err| switch (err) {
-            error.StreamTooLong => return error.ParallelSearchResponseTooLarge,
+            error.StreamTooLong => return error.ParallelResponseTooLarge,
             else => return err,
         };
         return .{ .status = response.head.status, .body = body };
     }
 };
 
-fn statusError(status: std.http.Status) !void {
+fn searchStatusError(status: std.http.Status) !void {
     return switch (status) {
         .ok => {},
         .unauthorized, .forbidden => error.InvalidParallelApiKey,
@@ -205,6 +291,66 @@ fn statusError(status: std.http.Status) !void {
         .too_many_requests => error.ParallelRateLimited,
         else => error.ParallelSearchRequestFailed,
     };
+}
+
+fn extractStatusError(status: std.http.Status) !void {
+    return switch (status) {
+        .ok => {},
+        .unauthorized, .forbidden => error.InvalidParallelApiKey,
+        .payment_required => error.ParallelPaymentRequired,
+        .too_many_requests => error.ParallelRateLimited,
+        else => error.ParallelExtractRequestFailed,
+    };
+}
+
+fn parseExtractResponse(alloc: Allocator, body: []const u8, focused: bool) !web_fetch_contract.Response {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidParallelExtractResponse;
+    const results_value = parsed.value.object.get("results") orelse return error.InvalidParallelExtractResponse;
+    if (results_value != .array or results_value.array.items.len == 0) return error.ParallelExtractReturnedNoContent;
+
+    const result = results_value.array.items[0];
+    if (result != .object) return error.InvalidParallelExtractResponse;
+    const url_value = result.object.get("url") orelse return error.InvalidParallelExtractResponse;
+    if (url_value != .string or !isSafeCitationUrl(url_value.string)) return error.InvalidParallelExtractResponse;
+
+    const final_url = try alloc.dupe(u8, url_value.string);
+    errdefer alloc.free(final_url);
+    const title = try optionalOwnedString(alloc, result.object.get("title"));
+    errdefer if (title) |value| alloc.free(value);
+    const publish_date = try optionalOwnedString(alloc, result.object.get("publish_date"));
+    errdefer if (publish_date) |value| alloc.free(value);
+
+    const mode: web_fetch_contract.ContentMode = if (focused) .focused else .full;
+    const content = if (focused)
+        (try joinedExcerpts(alloc, result.object.get("excerpts"))) orelse return error.ParallelExtractReturnedNoContent
+    else full: {
+        if (result.object.get("full_content")) |full_content| {
+            if (full_content == .string and full_content.string.len > 0) {
+                break :full try alloc.dupe(u8, full_content.string);
+            }
+        }
+        break :full (try joinedExcerpts(alloc, result.object.get("excerpts"))) orelse
+            return error.ParallelExtractReturnedNoContent;
+    };
+    errdefer alloc.free(content);
+
+    const session_id = try optionalOwnedString(alloc, parsed.value.object.get("session_id"));
+    return .{
+        .final_url = final_url,
+        .title = title,
+        .publish_date = publish_date,
+        .content = content,
+        .mode = mode,
+        .session_id = session_id,
+    };
+}
+
+fn optionalOwnedString(alloc: Allocator, maybe_value: ?std.json.Value) !?[]u8 {
+    const value = maybe_value orelse return null;
+    if (value != .string or value.string.len == 0) return null;
+    return try alloc.dupe(u8, value.string);
 }
 
 fn parseResponse(alloc: Allocator, body: []const u8, max_results: u8) !web_search_contract.ProviderResponse {
@@ -320,6 +466,65 @@ test "Parallel payload uses fast default and preserves optimization context" {
     try std.testing.expect(std.mem.find(u8, payload, "\"client_model\":\"go/kimi-k3\"") != null);
     try std.testing.expect(std.mem.find(u8, payload, "\"session_id\":\"session-1\"") != null);
     try std.testing.expect(std.mem.find(u8, payload, "\"include_domains\":[\"ziglang.org\"]") != null);
+    try std.testing.expect(std.mem.find(u8, payload, "max_chars_total") == null);
+    try std.testing.expect(std.mem.find(u8, payload, "max_results") == null);
+}
+
+test "Parallel search leaves result sizing dynamic and scopes related calls to a turn" {
+    var cancelled = std.atomic.Value(bool).init(false);
+    const payload = try buildPayload(std.testing.allocator, "deepseek-v4-flash", .{
+        .backend = backend_id,
+        .query = "Find current Zig release information",
+        .session_id = "fx-session",
+        .turn_id = 42,
+        .cancel_flag = &cancelled,
+    });
+    defer std.testing.allocator.free(payload);
+    try std.testing.expect(std.mem.find(u8, payload, "\"session_id\":\"fx-session:turn:42\"") != null);
+    try std.testing.expect(std.mem.find(u8, payload, "max_chars_total") == null);
+    try std.testing.expect(std.mem.find(u8, payload, "advanced_settings") == null);
+}
+
+test "Parallel extract uses focused excerpts by default and full content explicitly" {
+    var cancelled = std.atomic.Value(bool).init(false);
+    const focused = try buildExtractPayload(std.testing.allocator, "deepseek-v4-flash", .{
+        .url = "https://example.com/article",
+        .objective = "Find the release date",
+        .session_id = "fx-session",
+        .turn_id = 42,
+        .cancel_flag = &cancelled,
+    });
+    defer std.testing.allocator.free(focused);
+    try std.testing.expect(std.mem.find(u8, focused, "\"objective\":\"Find the release date\"") != null);
+    try std.testing.expect(std.mem.find(u8, focused, "full_content") == null);
+    try std.testing.expect(std.mem.find(u8, focused, "max_chars_total") == null);
+    try std.testing.expect(std.mem.find(u8, focused, "\"session_id\":\"fx-session:turn:42\"") != null);
+
+    const full = try buildExtractPayload(std.testing.allocator, "deepseek-v4-flash", .{
+        .url = "https://example.com/article",
+        .cancel_flag = &cancelled,
+    });
+    defer std.testing.allocator.free(full);
+    try std.testing.expect(std.mem.find(u8, full, "\"advanced_settings\":{\"full_content\":true}") != null);
+    try std.testing.expect(std.mem.find(u8, full, "\"objective\"") == null);
+}
+
+test "Parallel extract response selects focused excerpts or explicit full content" {
+    const body =
+        "{\"session_id\":\"fx-session:turn:42\",\"results\":[{" ++
+        "\"url\":\"https://example.com/article\",\"title\":\"Article\"," ++
+        "\"publish_date\":\"2026-08-27\",\"excerpts\":[\"Focused fact.\"]," ++
+        "\"full_content\":\"Whole article.\"}],\"errors\":[],\"warnings\":null}";
+    var focused = try parseExtractResponse(std.testing.allocator, body, true);
+    defer focused.deinit(std.testing.allocator);
+    try std.testing.expectEqual(web_fetch_contract.ContentMode.focused, focused.mode);
+    try std.testing.expectEqualStrings("Focused fact.", focused.content);
+    try std.testing.expectEqualStrings("fx-session:turn:42", focused.session_id.?);
+
+    var full = try parseExtractResponse(std.testing.allocator, body, false);
+    defer full.deinit(std.testing.allocator);
+    try std.testing.expectEqual(web_fetch_contract.ContentMode.full, full.mode);
+    try std.testing.expectEqualStrings("Whole article.", full.content);
 }
 
 test "Parallel response retains dense excerpts and source metadata" {
@@ -339,7 +544,8 @@ test "Parallel response retains dense excerpts and source metadata" {
 }
 
 test "Parallel HTTP status failures remain actionable" {
-    try std.testing.expectError(error.InvalidParallelApiKey, statusError(.unauthorized));
-    try std.testing.expectError(error.ParallelPaymentRequired, statusError(.payment_required));
-    try std.testing.expectError(error.ParallelRateLimited, statusError(.too_many_requests));
+    try std.testing.expectError(error.InvalidParallelApiKey, searchStatusError(.unauthorized));
+    try std.testing.expectError(error.ParallelPaymentRequired, searchStatusError(.payment_required));
+    try std.testing.expectError(error.ParallelRateLimited, searchStatusError(.too_many_requests));
+    try std.testing.expectError(error.ParallelExtractRequestFailed, extractStatusError(.internal_server_error));
 }

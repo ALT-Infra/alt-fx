@@ -17,6 +17,7 @@ const command_runner = @import("../execution/command_runner.zig");
 const managed_execution = @import("../execution/managed_execution.zig");
 const subagent_tool_provider = @import("../subagent/tool_provider.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const web_fetch_contract = @import("web_fetch_contract.zig");
 const web_fetch_runtime = @import("web_fetch_runtime.zig");
 const web_fetch_artifacts = @import("../session/web_fetch_artifacts.zig");
 const model_tool_schema = @import("model_tool_schema.zig");
@@ -73,6 +74,25 @@ pub const ToolCapabilities = struct {
 
 pub const WebSearchProgressFn = *const fn (*anyopaque, []const u8, core_types.WebSearchProgress) void;
 pub const WebFetchProgressFn = *const fn (*anyopaque, []const u8, core_types.WebFetchProgress) void;
+
+pub const WebFetchBackendFn = *const fn (
+    *anyopaque,
+    DispatchContext,
+    web_fetch_contract.Request,
+) anyerror!web_fetch_contract.Response;
+
+pub const WebFetchBackend = struct {
+    ctx: *anyopaque,
+    execute_fn: WebFetchBackendFn,
+
+    pub fn execute(
+        self: WebFetchBackend,
+        ctx: DispatchContext,
+        request: web_fetch_contract.Request,
+    ) !web_fetch_contract.Response {
+        return self.execute_fn(self.ctx, ctx, request);
+    }
+};
 
 pub const WebSearchBackendFn = *const fn (
     *anyopaque,
@@ -273,11 +293,12 @@ pub const DispatchContext = struct {
     ask_question_ctx: ?*anyopaque = null,
     ask_question_batch: ?AskQuestionBatchFn = null,
     tool_capabilities: ToolCapabilities = .{},
+    web_fetch_backend: ?WebFetchBackend = null,
     web_fetch_runtime: ?*web_fetch_runtime.Runtime = null,
     web_fetch_artifact_store: ?*web_fetch_artifacts.Store = null,
     web_fetch_artifact_error: ?anyerror = null,
     web_search_backend: ?WebSearchBackend = null,
-    web_search_session_id: ?[]const u8 = null,
+    web_research_session_id: ?[]const u8 = null,
     tool_call_id: []const u8 = "",
     tool_call_name: []const u8 = "",
     web_search_progress_ctx: ?*anyopaque = null,

@@ -334,6 +334,15 @@ pub fn Runtime(comptime App: type) type {
                     ctx.web_search_runtime_ready = false;
                 } else if (comptime @hasField(App, "parallel_web_search_runtime") and @hasField(App, "parallel_connection")) {
                     if (app.parallel_connection) |*connection| {
+                        if (comptime @hasField(App, "parallel_web_fetch_runtime")) {
+                            app.parallel_web_fetch_runtime.configure(.{
+                                .api_key = connection.api_key,
+                                .worker_model = provider_runtime.model(app),
+                                .usage = &app.session.usage,
+                                .usage_allocator = app.alloc,
+                            });
+                            ctx.web_fetch_backend = app.parallel_web_fetch_runtime.dispatchBackend();
+                        }
                         app.parallel_web_search_runtime.configure(.{
                             .api_key = connection.api_key,
                             .worker_model = provider_runtime.model(app),

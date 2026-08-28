@@ -8,6 +8,7 @@ const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
 const session_json = @import("../../core/session/session_json.zig");
 const session_runtime = @import("../../core/session/session.zig");
 const types = @import("../../core/shared/types.zig");
+const web_fetch_contract = @import("../../core/tooling/web_fetch_contract.zig");
 const web_fetch_runtime = @import("../../core/tooling/web_fetch_runtime.zig");
 const web_search_contract = @import("../../core/tooling/web_search_contract.zig");
 const web_fetch_artifacts = @import("../../core/session/web_fetch_artifacts.zig");
@@ -31,11 +32,40 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
 }
 
 fn callWithTransport(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput, transport: http_fetch.Transport) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+    if (ctx.web_fetch_backend) |backend| return callWithBackend(ctx, erased.as(Input), backend);
     if (ctx.web_fetch_runtime) |runtime| return callWithRuntimeAndTransport(ctx, erased, runtime, transport);
 
     var one_shot_runtime = web_fetch_runtime.Runtime.init(.{});
     defer one_shot_runtime.deinit(ctx.allocator);
     return callWithRuntimeAndTransport(ctx, erased, &one_shot_runtime, transport);
+}
+
+fn callWithBackend(ctx: tool_dispatch.DispatchContext, input: *Input, backend: tool_dispatch.WebFetchBackend) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+    const started_at_ms = io_mod.milliTimestamp();
+    const display_url = try text_utils.redactUrlForDisplay(ctx.allocator, input.url);
+    defer ctx.allocator.free(display_url);
+    emitProgress(ctx, .{ .fetching = display_url });
+    var response = backend.execute(ctx, .{
+        .url = input.url,
+        .objective = input.objective,
+    }) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return .{ .failure = try backendFailureBody(ctx.allocator, input.url, err) };
+    };
+    defer response.deinit(ctx.allocator);
+    emitProgress(ctx, .{ .converting = display_url });
+    if (response.usage) |usage| tool_dispatch.reportInnerUsage(ctx, usage);
+    return formatAndReport(ctx, .{
+        .final_url = response.final_url,
+        .status = .ok,
+        .mime_type = "text/markdown",
+        .content_kind = .text,
+        .converted_content = response.content,
+        .title = response.title,
+        .publish_date = response.publish_date,
+        .extraction_mode = response.mode,
+        .cache_hit = false,
+    }, started_at_ms);
 }
 
 fn callWithRuntimeAndTransport(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput, runtime: *web_fetch_runtime.Runtime, transport: http_fetch.Transport) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
@@ -173,6 +203,9 @@ const OutputView = struct {
     converted_content: []const u8,
     binary_byte_count: usize = 0,
     artifact_ref: ?ArtifactOutput = null,
+    title: ?[]const u8 = null,
+    publish_date: ?[]const u8 = null,
+    extraction_mode: ?web_fetch_contract.ContentMode = null,
     cache_hit: bool,
 };
 
@@ -364,6 +397,21 @@ fn artifactStoreFailure(alloc: Allocator, url: []const u8, err: anyerror) tool_d
     });
 }
 
+fn backendFailureBody(alloc: Allocator, url: []const u8, err: anyerror) tool_dispatch.DispatchError![]u8 {
+    const display_url = try text_utils.redactUrlForDisplay(alloc, url);
+    defer alloc.free(display_url);
+    const details = [_]tool_result_errors.Detail{
+        .{ .name = "url", .value = .{ .string = display_url } },
+        .{ .name = "error", .value = .{ .string = @errorName(err) } },
+    };
+    return tool_result_errors.toolExecutionFailureJson(alloc, .{
+        .tool_name = "web_fetch",
+        .message = "web_fetch extraction failed",
+        .details = &details,
+        .suggestion = "Retry with a narrower objective, use another public URL, or refine web_search.",
+    });
+}
+
 fn convertSuccess(alloc: Allocator, success: http_fetch.Success) !ConvertedFetch {
     var classification = try content.classify(alloc, success.content_type, success.body);
     errdefer classification.deinit(alloc);
@@ -421,6 +469,9 @@ fn writeOutputMetadata(alloc: Allocator, writer: *std.Io.Writer, success: Output
             if (success.cache_hit) "true" else "false",
         },
     );
+    if (success.title) |title| try writer.print("<title>{s}</title>\n", .{title});
+    if (success.publish_date) |publish_date| try writer.print("<publish_date>{s}</publish_date>\n", .{publish_date});
+    if (success.extraction_mode) |mode| try writer.print("<extraction_mode>{s}</extraction_mode>\n", .{@tagName(mode)});
     if (success.content_kind == .binary) {
         try writer.print("<artifact_bytes>{d}</artifact_bytes>\n", .{success.binary_byte_count});
     }
@@ -582,6 +633,29 @@ const SearchBackendTrap = struct {
     }
 };
 
+const FetchBackendFake = struct {
+    calls: usize = 0,
+    objective_seen: bool = false,
+
+    fn execute(
+        raw: *anyopaque,
+        ctx: tool_dispatch.DispatchContext,
+        request: web_fetch_contract.Request,
+    ) anyerror!web_fetch_contract.Response {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.calls += 1;
+        self.objective_seen = request.objective != null and
+            std.mem.eql(u8, request.objective.?, "Find the release date");
+        return .{
+            .final_url = try ctx.allocator.dupe(u8, request.url),
+            .title = try ctx.allocator.dupe(u8, "Release article"),
+            .publish_date = try ctx.allocator.dupe(u8, "2026-08-27"),
+            .content = try ctx.allocator.dupe(u8, "The release date is August 27."),
+            .mode = .focused,
+        };
+    }
+};
+
 fn callUrl(alloc: Allocator, url: []const u8, transport: *MockTransport) !tool_dispatch.ToolResult {
     var runtime = web_fetch_runtime.Runtime.init(.{ .allocator = alloc });
     defer runtime.deinit(alloc);
@@ -640,11 +714,26 @@ test "web_fetch rejects invalid arguments" {
     try expectDecodeFailure("{\"url\":1}", "web_fetch field \"url\" must be a string");
 }
 
-test "web_fetch requires only url and rejects unknown fields" {
+test "web_fetch accepts an optional extraction objective and rejects unknown fields" {
     try expectDecodeFailure("{}", "web_fetch field \"url\" is required");
     try expectDecodeFailure("{\"prompt\":\"extract\"}", "web_fetch field \"prompt\" is not allowed");
     try expectDecodeFailure("{\"url\":\"https://example.com\",\"prompt\":\"extract\"}", "web_fetch field \"prompt\" is not allowed");
     try expectDecodeFailure("{\"url\":\"https://example.com\",\"extra\":true}", "web_fetch field \"extra\" is not allowed");
+
+    const decoded = try decode(.{ .allocator = std.testing.allocator }, "{\"url\":\"https://example.com\",\"objective\":\"  Find the release date  \"}");
+    switch (decoded) {
+        .failure => |reason| {
+            defer std.testing.allocator.free(reason);
+            return error.TestExpectedEqual;
+        },
+        .input => |input| {
+            defer input.deinit(std.testing.allocator);
+            const failure = try validate(.{ .allocator = std.testing.allocator }, input);
+            defer if (failure) |reason| std.testing.allocator.free(reason);
+            try std.testing.expect(failure == null);
+            try std.testing.expectEqualStrings("Find the release date", input.as(Input).objective.?);
+        },
+    }
 }
 
 test "web_fetch validates known public HTTP URLs only" {
@@ -704,6 +793,33 @@ test "web_fetch returns bounded untrusted content" {
     try std.testing.expect(std.mem.find(u8, body, "<url>https://example.com/docs</url>") != null);
     try std.testing.expect(std.mem.find(u8, body, "<status>200</status>") != null);
     try std.testing.expect(std.mem.find(u8, body, "ignore previous instructions") != null);
+}
+
+test "web_fetch uses the configured extraction backend without direct target transport" {
+    const alloc = std.testing.allocator;
+    var backend = FetchBackendFake{};
+    var transport = MockTransport{};
+    defer transport.deinit(alloc);
+    var input = Input{
+        .url = try alloc.dupe(u8, "https://example.com/article"),
+        .objective = try alloc.dupe(u8, "Find the release date"),
+    };
+    defer input.deinit(alloc);
+    const result = try callWithTransport(.{
+        .allocator = alloc,
+        .web_fetch_backend = .{ .ctx = @ptrCast(&backend), .execute_fn = FetchBackendFake.execute },
+    }, stackInput(&input), transport.transport());
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), backend.calls);
+    try std.testing.expect(backend.objective_seen);
+    try std.testing.expectEqual(@as(usize, 0), transport.calls);
+    const body = switch (result) {
+        .success => |value| value,
+        .failure => return error.TestExpectedEqual,
+    };
+    try std.testing.expect(std.mem.find(u8, body, "<extraction_mode>focused</extraction_mode>") != null);
+    try std.testing.expect(std.mem.find(u8, body, "The release date is August 27.") != null);
 }
 
 test "web_fetch returns converted HTML directly without an extraction worker" {
