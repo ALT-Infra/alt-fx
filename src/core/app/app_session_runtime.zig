@@ -1091,6 +1091,36 @@ pub const Persistence = struct {
     resume_handoff_intent: ResumeHandoffIntent = .none,
     pending_live_session_policy: ?BackgroundSessionPolicy = null,
 
+    /// Fieldwise initialization avoids retaining undefined optional payloads
+    /// in a static release-binary template.
+    pub fn initInto(storage: *Persistence) void {
+        comptime {
+            if (std.meta.fields(Persistence).len != 19) {
+                @compileError("update Persistence.initInto for the changed field set");
+            }
+        }
+        storage.* = undefined;
+        storage.write_mutex = .init;
+        storage.store = null;
+        storage.writable = null;
+        storage.subagent_host = null;
+        storage.workspace_preferences = null;
+        storage.session_preferences = null;
+        storage.js_host_store = .{};
+        storage.js_host_session = null;
+        storage.process_model_override = null;
+        storage.session_picker = .{};
+        storage.session_picker_load = .{};
+        storage.session_picker_current_cache = .{};
+        storage.session_picker_all_cache = .{};
+        storage.degraded_warning_emitted = false;
+        storage.pending_cancelled_command = null;
+        storage.image_snapshot_temp_dir = null;
+        storage.resume_view_admission = null;
+        storage.resume_handoff_intent = .none;
+        storage.pending_live_session_policy = null;
+    }
+
     pub fn deinit(self: *Persistence, alloc: Allocator) void {
         if (self.pending_live_session_policy) |policy| {
             debug_trace.logf(
@@ -1116,9 +1146,24 @@ pub const Persistence = struct {
         self.session_picker_load.deinit();
         self.session_picker_current_cache.deinit();
         self.session_picker_all_cache.deinit();
-        self.* = .{};
+        self.* = undefined;
     }
 };
+
+test "persistence in-place initialization preserves empty ownership" {
+    var persistence: Persistence = undefined;
+    Persistence.initInto(&persistence);
+    defer persistence.deinit(std.testing.allocator);
+
+    try std.testing.expect(persistence.store == null);
+    try std.testing.expect(persistence.writable == null);
+    try std.testing.expect(persistence.subagent_host == null);
+    try std.testing.expect(!persistence.session_picker.active);
+    try std.testing.expect(persistence.session_picker_load.task == null);
+    try std.testing.expect(!persistence.session_picker_current_cache.ready);
+    try std.testing.expect(!persistence.session_picker_all_cache.ready);
+    try std.testing.expect(persistence.resume_handoff_intent == .none);
+}
 
 pub fn Runtime(comptime App: type) type {
     return struct {

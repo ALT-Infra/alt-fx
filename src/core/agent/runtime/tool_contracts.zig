@@ -96,6 +96,22 @@ pub const ToolExecutionResult = struct {
     command_replay_capture: ?*command_replay_store.Capture = null,
 };
 
+pub inline fn failToolExecutionResult(err: anytype) @TypeOf(err)!ToolExecutionResult {
+    return @errorCast(failToolExecutionResultDynamic(err));
+}
+
+noinline fn failToolExecutionResultDynamic(err: anyerror) anyerror!ToolExecutionResult {
+    return err;
+}
+
+test "tool result failure writer preserves exact error type and identity" {
+    const failure = failToolExecutionResult(error.LiveToolAuthorityUnavailable);
+    try std.testing.expect(
+        @TypeOf(failure) == error{LiveToolAuthorityUnavailable}!ToolExecutionResult,
+    );
+    try std.testing.expectError(error.LiveToolAuthorityUnavailable, failure);
+}
+
 pub fn unavailableHostToolResult(alloc: Allocator) Allocator.Error!ToolExecutionResult {
     return .{
         .status = .failure,
