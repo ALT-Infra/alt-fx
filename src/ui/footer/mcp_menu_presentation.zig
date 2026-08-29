@@ -13,7 +13,7 @@ const McpMenuProjection = render_input.McpMenuProjection;
 const roomy_header_rows: u16 = 2;
 pub const max_inline_rows: u16 = 12;
 
-pub fn menuRowCount(projection: McpMenuProjection, _: u16, max_rows: u16) u16 {
+pub fn menuRowCount(projection: McpMenuProjection, width: u16, max_rows: u16) u16 {
     if (!projection.state.active or max_rows == 0) return 0;
     const header_rows: u16 = if (max_rows > 2) roomy_header_rows else 0;
     const body_budget = max_rows - header_rows;
@@ -24,7 +24,7 @@ pub fn menuRowCount(projection: McpMenuProjection, _: u16, max_rows: u16) u16 {
             body_budget,
         )),
         .details => @min(@as(u16, 7), body_budget),
-        .preview => @min(previewRowCount(projection.preview), body_budget),
+        .preview => @min(previewVisualRowCount(projection.preview, width), body_budget),
         .add => @min(
             if (projection.state.add_transport == .local) @as(u16, 5) else @as(u16, 4),
             body_budget,
@@ -90,7 +90,13 @@ pub fn composeMcpMenuRow(
     return switch (projection.state.screen) {
         .browse => composeBrowseRow(alloc, projection, body_index, width, row_count - body_start),
         .details => composeDetailsRow(alloc, projection, body_index, width),
-        .preview => composePreviewRow(alloc, projection.preview, body_index, width),
+        .preview => composePreviewRow(
+            alloc,
+            projection,
+            body_index,
+            width,
+            row_count - body_start,
+        ),
         .add => composeAddRow(alloc, projection, body_index, width),
         .arguments => composeArgumentRow(alloc, projection, body_index, width),
         .info => composeInfoRow(alloc, body_index, width),
@@ -424,26 +430,67 @@ fn formatOptionalCount(buf: []u8, value: ?usize) []const u8 {
 
 fn composePreviewRow(
     alloc: Allocator,
-    preview: ?[]const u8,
+    projection: McpMenuProjection,
     row_index: u16,
     width: u16,
+    visible_rows: u16,
 ) !std.ArrayList(u8) {
-    const text = preview orelse "Loading MCP content…";
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    var index: u16 = 0;
-    while (lines.next()) |line| : (index += 1) {
-        if (index == row_index) return composeTextRow(alloc, line, width, ui_render.dim_style, 2);
-    }
-    return .empty;
+    const text = projection.preview orelse "Loading MCP content…";
+    const total_rows = previewVisualRowCount(projection.preview, width);
+    const max_start = total_rows -| @min(visible_rows, total_rows);
+    const window_start: u16 = @intCast(@min(projection.state.window_start, max_start));
+    const line = previewVisualRow(text, window_start +| row_index, width) orelse return .empty;
+    return composeTextRow(alloc, line, width, ui_render.dim_style, 2);
 }
 
-fn previewRowCount(preview: ?[]const u8) u16 {
+pub fn previewVisualRowCount(preview: ?[]const u8, width: u16) u16 {
     const text = preview orelse return 1;
-    var count: u16 = 1;
-    for (text) |byte| if (byte == '\n') {
-        count +|= 1;
-    };
+    const content_width: usize = width -| 2;
+    if (content_width == 0) return 1;
+    var count: u16 = 0;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) {
+            count +|= 1;
+            continue;
+        }
+        var remaining = line;
+        while (remaining.len > 0) {
+            const chunk = previewChunk(remaining, content_width);
+            count +|= 1;
+            remaining = remaining[chunk.len..];
+        }
+    }
     return count;
+}
+
+fn previewVisualRow(text: []const u8, target_row: u16, width: u16) ?[]const u8 {
+    const content_width: usize = width -| 2;
+    if (content_width == 0) return "";
+    var visual_row: u16 = 0;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) {
+            if (visual_row == target_row) return "";
+            visual_row +|= 1;
+            continue;
+        }
+        var remaining = line;
+        while (remaining.len > 0) {
+            const chunk = previewChunk(remaining, content_width);
+            if (visual_row == target_row) return chunk;
+            visual_row +|= 1;
+            remaining = remaining[chunk.len..];
+        }
+    }
+    return null;
+}
+
+fn previewChunk(remaining: []const u8, content_width: usize) []const u8 {
+    const chunk = display_width.prefixByWidth(remaining, content_width);
+    if (chunk.len > 0) return chunk;
+    const sequence_len = std.unicode.utf8ByteSequenceLength(remaining[0]) catch 1;
+    return remaining[0..@min(sequence_len, remaining.len)];
 }
 
 fn composeAddRow(
@@ -601,4 +648,65 @@ test "MCP menu keeps selection visible when the terminal has one body row" {
     var row = try composeMcpMenuRow(std.testing.allocator, projection, 2, 40, rows);
     defer row.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, row.items, "tool-5") != null);
+}
+
+test "MCP preview wraps one long logical line across terminal rows" {
+    const projection: McpMenuProjection = .{
+        .state = .{
+            .active = true,
+            .section = .tools,
+            .screen = .preview,
+            .load_state = .ready,
+        },
+        .preview = "0123456789abcdefghijkl",
+    };
+    const rows = menuRowCount(projection, 12, 10);
+    try std.testing.expectEqual(@as(u16, 5), rows);
+
+    var first = try composeMcpMenuRow(std.testing.allocator, projection, 2, 12, rows);
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, first.items, "0123456789") != null);
+    try std.testing.expect(std.mem.find(u8, first.items, "…") == null);
+
+    var second = try composeMcpMenuRow(std.testing.allocator, projection, 3, 12, rows);
+    defer second.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, second.items, "abcdefghij") != null);
+
+    var third = try composeMcpMenuRow(std.testing.allocator, projection, 4, 12, rows);
+    defer third.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, third.items, "kl") != null);
+}
+
+test "MCP preview renders from its vertical window offset" {
+    const projection: McpMenuProjection = .{
+        .state = .{
+            .active = true,
+            .section = .tools,
+            .screen = .preview,
+            .window_start = 2,
+            .load_state = .ready,
+        },
+        .preview = "0000000000111111111122222222223333333333",
+    };
+    const rows = menuRowCount(projection, 12, 4);
+    try std.testing.expectEqual(@as(u16, 4), rows);
+    var first = try composeMcpMenuRow(std.testing.allocator, projection, 2, 12, rows);
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, first.items, "2222222222") != null);
+}
+
+test "MCP preview row count matches wide-character wrapping" {
+    const projection: McpMenuProjection = .{
+        .state = .{
+            .active = true,
+            .section = .tools,
+            .screen = .preview,
+            .load_state = .ready,
+        },
+        .preview = "界界界界",
+    };
+    try std.testing.expectEqual(
+        @as(u16, 6),
+        menuRowCount(projection, 5, 10),
+    );
 }

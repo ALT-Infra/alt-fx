@@ -2004,6 +2004,16 @@ pub fn Runtime(comptime App: type) type {
         fn moveMcpMenu(app: *App, delta: i8) bool {
             if (!mcpMenuActive(app)) return false;
             const projection = mcpMenuProjection(app);
+            if (projection.state.screen == .preview) {
+                _ = applyMcpMenuEvent(app, .{ .scroll_preview = .{
+                    .delta = delta,
+                    .row_count = mcp_menu_presentation.previewVisualRowCount(
+                        projection.preview,
+                        app.shell.layout.cols,
+                    ),
+                } });
+                return true;
+            }
             _ = applyMcpMenuEvent(app, .{ .move = .{
                 .delta = delta,
                 .item_count = projection.itemCount(),

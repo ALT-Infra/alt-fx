@@ -550,9 +550,9 @@ pub fn composeMcpMenuHintRow(
         "Tab Enter / Esc",
     };
     const preview_variants = [_][]const u8{
-        "I Insert     Esc Back",
-        "I Insert  Esc",
-        "I Esc",
+        "↑↓ Scroll     I Insert     Esc Back",
+        "↑↓ Scroll  I Insert  Esc",
+        "↑↓ I Esc",
     };
     const add_variants = [_][]const u8{
         "Type field     Enter Next/Save     Tab Transport     Esc Cancel",

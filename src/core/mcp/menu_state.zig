@@ -76,6 +76,7 @@ pub const Event = union(enum) {
     close,
     back,
     move: Move,
+    scroll_preview: struct { delta: i8, row_count: usize },
     cycle_section: i8,
     cycle_add_transport,
     move_add_field: struct { delta: i8, field_count: usize },
@@ -179,6 +180,17 @@ pub fn reduce(current: State, event: Event) Transition {
             clampSelection(&next, move.item_count, move.visible_count);
             if (next.section == .servers and next.screen == .browse) {
                 next.selected_server_index = next.selected_index;
+            }
+            break :blk .{ .state = next };
+        },
+        .scroll_preview => |scroll| blk: {
+            if (!current.active or current.screen != .preview or scroll.row_count == 0 or scroll.delta == 0) {
+                break :blk .{ .state = next };
+            }
+            if (scroll.delta > 0) {
+                next.window_start = @min(next.window_start +| 1, scroll.row_count - 1);
+            } else {
+                next.window_start -|= 1;
             }
             break :blk .{ .state = next };
         },
@@ -346,6 +358,7 @@ pub fn reduce(current: State, event: Event) Transition {
             next.pending_generation = null;
             next.load_state = .ready;
             next.screen = .preview;
+            next.window_start = 0;
             break :blk .{ .state = next };
         },
         .completion_loaded => |generation| blk: {
@@ -613,4 +626,16 @@ test "MCP argument form completion keeps form state and can be cancelled" {
         .cancel => |generation| try std.testing.expectEqual(@as(u64, 3), generation),
         .load_catalog, .load_preview, .complete_argument, .action => return error.TestUnexpectedEffect,
     }
+}
+
+test "MCP preview scrolling stays within its visual rows" {
+    var state = reduce(.{}, .{ .open = 1 }).state;
+    state.screen = .preview;
+    state = reduce(state, .{ .scroll_preview = .{ .delta = 1, .row_count = 3 } }).state;
+    try std.testing.expectEqual(@as(usize, 1), state.window_start);
+    state = reduce(state, .{ .scroll_preview = .{ .delta = 1, .row_count = 3 } }).state;
+    state = reduce(state, .{ .scroll_preview = .{ .delta = 1, .row_count = 3 } }).state;
+    try std.testing.expectEqual(@as(usize, 2), state.window_start);
+    state = reduce(state, .{ .scroll_preview = .{ .delta = -1, .row_count = 3 } }).state;
+    try std.testing.expectEqual(@as(usize, 1), state.window_start);
 }
