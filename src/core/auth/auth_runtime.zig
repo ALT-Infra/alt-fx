@@ -851,7 +851,7 @@ pub const Runtime = struct {
         self.clearTeamSelection(alloc);
         self.team_query.deinit(alloc);
         if (self.selected_credential) |*credential| credential.deinit(alloc);
-        self.* = undefined;
+        self.* = .{};
     }
 
     /// Borrows the current credential until this runtime replaces or releases it.
