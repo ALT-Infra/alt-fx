@@ -11,6 +11,7 @@ const login_flow = @import("../auth/login_flow.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
 const grok_oauth = @import("../auth/grok_oauth.zig");
 const opencode_session = @import("../auth/opencode_session.zig");
+const cline_session = @import("../auth/cline_session.zig");
 const parallel_session = @import("../auth/parallel_session.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
 const auth_transition = @import("../auth/auth_transition.zig");
@@ -20,6 +21,7 @@ const provider_runtime = @import("provider_runtime.zig");
 const types = @import("../shared/types.zig");
 const collections = @import("../shared/collections.zig");
 const opencode_models = @import("../../gateway/opencode_models.zig");
+const cline_models = @import("../../gateway/cline_models.zig");
 
 fn oauthAuthEnabled(comptime App: type) bool {
     return runtime_profile.allows(App, .native_auth) or
@@ -154,7 +156,7 @@ pub fn Runtime(comptime App: type) type {
                     try writeAuthNotice(app, .{
                         .topic = "auth",
                         .tone = .warning,
-                        .body = "Usage: /logout [vercel|codex|grok|opencode|parallel]",
+                        .body = "Usage: /logout [vercel|codex|grok|opencode|cline|parallel]",
                     });
                     return;
                 };
@@ -219,6 +221,48 @@ pub fn Runtime(comptime App: type) type {
                     .deleted => .{ .topic = "auth", .tone = .neutral, .body = "Signed out of Codex." },
                     .missing => .{ .topic = "auth", .tone = .neutral, .body = "No Codex login session found." },
                     .deleted_not_durable => .{ .topic = "auth", .tone = .warning, .body = "Signed out of Codex, but could not confirm the profile directory update." },
+                });
+                return;
+            }
+            if (logout_provider == .opencode) {
+                const outcome = opencode_session.logout() catch {
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .@"error",
+                        .body = "Could not durably sign out of OpenCode. The current source is unchanged.",
+                    });
+                    return;
+                };
+                const changed = if (comptime @hasDecl(@TypeOf(app.auth), "reconcileAfterOpenCodeLogout"))
+                    try app.auth.reconcileAfterOpenCodeLogout(app.alloc)
+                else
+                    false;
+                applyCredentialChange(app, changed);
+                try writeAuthNotice(app, switch (outcome) {
+                    .deleted => .{ .topic = "auth", .tone = .neutral, .body = "Signed out of OpenCode." },
+                    .missing => .{ .topic = "auth", .tone = .neutral, .body = "No OpenCode login session found." },
+                    .deleted_not_durable => .{ .topic = "auth", .tone = .warning, .body = "Signed out of OpenCode, but could not confirm the profile directory update." },
+                });
+                return;
+            }
+            if (logout_provider == .cline) {
+                const outcome = cline_session.logout() catch {
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .@"error",
+                        .body = "Could not durably sign out of Cline. The current source is unchanged.",
+                    });
+                    return;
+                };
+                const changed = if (comptime @hasDecl(@TypeOf(app.auth), "reconcileAfterClineLogout"))
+                    try app.auth.reconcileAfterClineLogout(app.alloc)
+                else
+                    false;
+                applyCredentialChange(app, changed);
+                try writeAuthNotice(app, switch (outcome) {
+                    .deleted => .{ .topic = "auth", .tone = .neutral, .body = "Signed out of Cline." },
+                    .missing => .{ .topic = "auth", .tone = .neutral, .body = "No Cline login session found." },
+                    .deleted_not_durable => .{ .topic = "auth", .tone = .warning, .body = "Signed out of Cline, but could not confirm the profile directory update." },
                 });
                 return;
             }
@@ -302,6 +346,7 @@ pub fn Runtime(comptime App: type) type {
                     .chatgpt_login => try beginChatGptSignIn(app),
                     .grok_login => try beginGrokSignIn(app),
                     .opencode_login => try beginOpenCodeSignIn(app),
+                    .cline_login => try beginClineSignIn(app),
                     .setup => {
                         if (comptime !runtime_profile.allows(App, .native_auth)) {
                             try app.writeDomainNotice(.{
@@ -739,6 +784,44 @@ pub fn Runtime(comptime App: type) type {
             try switchProvider(app, .opencode, false, .post_oauth);
         }
 
+        fn beginClineSignIn(app: *App) anyerror!void {
+            if (comptime provider_runtime.supported(App)) {
+                const decision = decideProviderSwitch(.{
+                    .current = provider_runtime.provider(app),
+                    .target = .cline,
+                    .target_credential_ready = false,
+                    .intent = .post_oauth,
+                    .stream_active = app.stream.active,
+                    .queued_prompts = app.worker.queuedPromptCount(),
+                });
+                if (decision == .busy) {
+                    try app.writeDomainNotice(.{
+                        .topic = "auth",
+                        .tone = .warning,
+                        .body = "Cline sign-in is unavailable until active and queued work finishes.",
+                    }, true);
+                    return;
+                }
+            }
+            const key = io_mod.getenv("CLINE_API_KEY") orelse {
+                try app.writeDomainNotice(.{
+                    .topic = "auth",
+                    .tone = .warning,
+                    .body = "Set CLINE_API_KEY to your Cline API key, then choose Sign in with Cline again.",
+                }, true);
+                return;
+            };
+            var session = cline_session.Session{ .api_key = try app.alloc.dupe(u8, key) };
+            defer session.deinit(app.alloc);
+            cline_session.saveNewSession(app.alloc, session) catch |err| {
+                debug_trace.logf("auth", "Cline login failed err={s}", .{@errorName(err)});
+                try writeLoginError(app, .cline_api_key, err);
+                return;
+            };
+            try app.auth.refreshSourceInventory(app.alloc);
+            try switchProvider(app, .cline, false, .post_oauth);
+        }
+
         fn beginCodexSignInForProviderSwitch(app: *App) !void {
             try app.flushBeforeBlockingExternalWork();
             const started = app.auth.openChatGptSignInPickerForProviderSwitch(app.alloc);
@@ -864,6 +947,10 @@ pub fn Runtime(comptime App: type) type {
                     try beginOpenCodeSignIn(app);
                     return;
                 }
+                if (target == .cline and allow_login) {
+                    try beginClineSignIn(app);
+                    return;
+                }
                 try app.writeDomainNotice(.{
                     .topic = "provider",
                     .tone = .warning,
@@ -875,6 +962,8 @@ pub fn Runtime(comptime App: type) type {
                         "Run fx login grok, then try switching again."
                     else if (target == .opencode)
                         "Set OPENCODE_API_KEY and run fx login opencode, then try switching again."
+                    else if (target == .cline)
+                        "Set CLINE_API_KEY and run fx login cline, then try switching again."
                     else
                         credentials.missing_interactive_credential_message,
                 }, true);
@@ -1165,20 +1254,25 @@ pub fn Runtime(comptime App: type) type {
             }
             if (!try ensurePromptCredential(app)) return false;
             if (!try preparePromptCredential(app)) return false;
-            return reconcileOpenCodeModelForPrompt(app);
+            return reconcileDynamicModelForPrompt(app);
         }
 
-        fn reconcileOpenCodeModelIds(app: *App, model_ids: []const []u8) !void {
-            if (provider_runtime.provider(app) != .opencode or io_mod.getenv("FX_MODEL") != null) return;
+        fn reconcileDynamicModelIds(app: *App, model_ids: []const []u8) !void {
+            const provider = provider_runtime.provider(app);
+            if ((provider != .opencode and provider != .cline) or io_mod.getenv("FX_MODEL") != null) return;
 
             const current = provider_runtime.model(app);
-            const replacement = opencode_models.selectAvailableModel(model_ids, current) orelse return;
+            const replacement = switch (provider) {
+                .opencode => opencode_models.selectAvailableModel(model_ids, current),
+                .cline => cline_models.selectAvailableModel(model_ids, current),
+                else => unreachable,
+            } orelse return;
             if (std.mem.eql(u8, replacement, current)) return;
 
             try provider_runtime.replaceModel(app, replacement);
             try app.worker.syncQueuedPromptModel(std.heap.c_allocator, replacement);
             var persistence = app.persistRuntimePreferences(.{
-                .provider = .opencode,
+                .provider = provider,
                 .model = replacement,
             });
             defer persistence.deinit(app.alloc);
@@ -1187,7 +1281,12 @@ pub fn Runtime(comptime App: type) type {
                 .topic = "provider",
                 .tone = if (saved) .neutral else .warning,
                 .body = if (saved)
-                    "The saved OpenCode model is unavailable. Switched to a supported model."
+                    if (provider == .cline)
+                        "The saved Cline model is unavailable. Switched to a current free or ClinePass model."
+                    else
+                        "The saved OpenCode model is unavailable. Switched to a supported model."
+                else if (provider == .cline)
+                    "The saved Cline model is unavailable. Switched for this run, but could not save the selection."
                 else
                     "The saved OpenCode model is unavailable. Switched for this run, but could not save the selection.",
             }, true);
@@ -1198,17 +1297,18 @@ pub fn Runtime(comptime App: type) type {
                 !@hasDecl(App, "snapshotCachedModelIds")) return;
             var model_ids = (try app.snapshotCachedModelIds(app.alloc)) orelse return;
             defer collections.freeStringList(app.alloc, &model_ids);
-            try reconcileOpenCodeModelIds(app, model_ids.items);
+            try reconcileDynamicModelIds(app, model_ids.items);
         }
 
-        fn reconcileOpenCodeModelForPrompt(app: *App) !bool {
+        fn reconcileDynamicModelForPrompt(app: *App) !bool {
             if (comptime !provider_runtime.supported(App) or
                 !@hasDecl(App, "snapshotCachedModelIds")) return true;
-            if (provider_runtime.provider(app) != .opencode or io_mod.getenv("FX_MODEL") != null) return true;
+            const provider = provider_runtime.provider(app);
+            if ((provider != .opencode and provider != .cline) or io_mod.getenv("FX_MODEL") != null) return true;
             if (try app.snapshotCachedModelIds(app.alloc)) |model_ids_value| {
                 var model_ids = model_ids_value;
                 defer collections.freeStringList(app.alloc, &model_ids);
-                try reconcileOpenCodeModelIds(app, model_ids.items);
+                try reconcileDynamicModelIds(app, model_ids.items);
             }
             return true;
         }
@@ -1320,6 +1420,8 @@ pub fn Runtime(comptime App: type) type {
                 }
             else if (source == .opencode_api_key)
                 .{ .topic = "auth", .tone = .@"error", .body = "OpenCode sign-in failed. Check OPENCODE_API_KEY; the current credential is unchanged." }
+            else if (source == .cline_api_key)
+                .{ .topic = "auth", .tone = .@"error", .body = "Cline sign-in failed. Check CLINE_API_KEY; the current credential is unchanged." }
             else switch (err) {
                 error.ClientIdMissing => .{ .topic = "auth", .tone = .@"error", .body = "fx login is not configured yet. The current credential is unchanged." },
                 error.AccessDenied => .{ .topic = "auth", .tone = .@"error", .body = "Vercel sign-in was denied. The current credential is unchanged." },
@@ -1511,7 +1613,7 @@ test "interactive subscription sign-in rejects active and queued work before OAu
             switch (provider) {
                 .codex => try Runtime(BusySignInApp).beginChatGptSignIn(&app),
                 .grok => try Runtime(BusySignInApp).beginGrokSignIn(&app),
-                .gateway, .opencode => unreachable,
+                .gateway, .opencode, .cline => unreachable,
             }
 
             try std.testing.expectEqual(@as(usize, 0), app.auth.start_count);

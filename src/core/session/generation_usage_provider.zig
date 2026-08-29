@@ -86,6 +86,7 @@ pub const Set = struct {
     codex: ?Provider = null,
     grok: ?Provider = null,
     opencode: ?Provider = null,
+    cline: ?Provider = null,
 
     pub fn gatewayOnly(provider: Provider) Set {
         return .{ .gateway = provider };
@@ -97,6 +98,7 @@ pub const Set = struct {
             .codex => self.codex,
             .grok => self.grok,
             .opencode => self.opencode,
+            .cline => self.cline,
         };
     }
 };

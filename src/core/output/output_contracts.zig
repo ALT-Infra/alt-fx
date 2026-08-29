@@ -380,6 +380,10 @@ fn openCodeProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
     return auth.opencode_connected or auth.active_source == .opencode_api_key;
 }
 
+fn clineProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
+    return auth.cline_connected or auth.active_source == .cline_api_key;
+}
+
 fn writeConnectedProvidersText(writer: *std.Io.Writer, auth: auth_runtime.StatusSnapshot) !void {
     var wrote_provider = false;
     if (gatewayProviderConnected(auth)) {
@@ -399,6 +403,11 @@ fn writeConnectedProvidersText(writer: *std.Io.Writer, auth: auth_runtime.Status
     if (openCodeProviderConnected(auth)) {
         if (wrote_provider) try writer.writeAll(", OpenCode");
         if (!wrote_provider) try writer.writeAll("OpenCode");
+        wrote_provider = true;
+    }
+    if (clineProviderConnected(auth)) {
+        if (wrote_provider) try writer.writeAll(", Cline");
+        if (!wrote_provider) try writer.writeAll("Cline");
         wrote_provider = true;
     }
     if (!wrote_provider) try writer.writeAll("none");
@@ -639,6 +648,11 @@ pub const StatusSnapshot = struct {
                 try std.json.Stringify.value("opencode", .{}, writer);
                 wrote_provider = true;
             }
+            if (clineProviderConnected(self.auth)) {
+                if (wrote_provider) try writer.writeByte(',');
+                try std.json.Stringify.value("cline", .{}, writer);
+                wrote_provider = true;
+            }
             try writer.writeByte(']');
         }
         try writer.print(",\"auth_refreshable\":{}", .{self.auth.refreshable()});
@@ -868,6 +882,7 @@ pub const ModelListSnapshot = struct {
             .codex => provider_catalog.label(.codex),
             .grok => provider_catalog.label(.grok),
             .opencode => provider_catalog.label(.opencode),
+            .cline => provider_catalog.label(.cline),
         };
     }
 

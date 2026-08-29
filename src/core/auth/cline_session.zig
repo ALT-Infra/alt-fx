@@ -3,9 +3,9 @@ const api_key_session = @import("api_key_session.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 
 const spec = api_key_session.StoreSpec{
-    .auth_file_name = profile_paths.opencode_auth_file_name,
-    .mutation_lock_file_name = "opencode-auth.lock",
-    .provider_name = "OpenCode",
+    .auth_file_name = profile_paths.cline_auth_file_name,
+    .mutation_lock_file_name = "cline-auth.lock",
+    .provider_name = "Cline",
 };
 
 pub const Session = api_key_session.Session;

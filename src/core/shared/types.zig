@@ -95,6 +95,7 @@ pub const CredentialSource = enum {
     chatgpt_subscription,
     grok_subscription,
     opencode_api_key,
+    cline_api_key,
 };
 
 pub fn parseCredentialSource(text: []const u8) ?CredentialSource {

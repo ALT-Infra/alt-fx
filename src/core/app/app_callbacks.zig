@@ -939,7 +939,7 @@ pub fn Bindings(comptime App: type) type {
                 try gateway_error_format.formatHttpErrorMessage(std.heap.c_allocator, status, detail);
             defer std.heap.c_allocator.free(message);
             const label = if (auth_failure) |failure|
-                if (failure.source == .opencode_api_key)
+                if (failure.source == .opencode_api_key or failure.source == .cline_api_key)
                     try std.fmt.allocPrint(
                         std.heap.c_allocator,
                         "⚠ {s} · Choose a free model with /model, or sign in again.",
@@ -2194,6 +2194,26 @@ test "OpenCode unauthorized status suggests a free model or signing in again" {
     try std.testing.expect(app.worker.events.items[0] == .api_status_text);
     try std.testing.expectEqualStrings(
         "⚠ OpenCode rejected the API key or selected model access · HTTP 401 · Choose a free model with /model, or sign in again.",
+        app.worker.events.items[0].api_status_text,
+    );
+}
+
+test "Cline unauthorized status suggests a free model or signing in again" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+
+    const deps = Bindings(FakeApp).agentRuntimeDeps(&app);
+    try deps.push_http_error(
+        deps.ctx,
+        .unauthorized,
+        "provider detail must not be shown",
+        .cline_api_key,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), app.worker.events.items.len);
+    try std.testing.expect(app.worker.events.items[0] == .api_status_text);
+    try std.testing.expectEqualStrings(
+        "⚠ Cline rejected the API key or selected model access · HTTP 401 · Choose a free model with /model, or sign in again.",
         app.worker.events.items[0].api_status_text,
     );
 }

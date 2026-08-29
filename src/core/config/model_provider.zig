@@ -6,6 +6,7 @@ pub const ProviderId = enum {
     codex,
     grok,
     opencode,
+    cline,
 };
 
 pub const ProviderSelection = struct {
@@ -18,6 +19,7 @@ pub fn parse(value: []const u8) ?ProviderId {
     if (std.ascii.eqlIgnoreCase(value, "codex")) return .codex;
     if (std.ascii.eqlIgnoreCase(value, "grok")) return .grok;
     if (std.ascii.eqlIgnoreCase(value, "opencode")) return .opencode;
+    if (std.ascii.eqlIgnoreCase(value, "cline")) return .cline;
     return null;
 }
 
@@ -27,6 +29,7 @@ pub fn requiredCredentialSource(provider: ProviderId) ?types.CredentialSource {
         .codex => .chatgpt_subscription,
         .grok => .grok_subscription,
         .opencode => .opencode_api_key,
+        .cline => .cline_api_key,
     };
 }
 
@@ -34,8 +37,8 @@ pub fn authorizesCredential(provider: ProviderId, source: ?types.CredentialSourc
     const selected = source orelse return false;
     if (requiredCredentialSource(provider)) |required| return selected == required;
     return switch (provider) {
-        .gateway => selected != .chatgpt_subscription and selected != .grok_subscription and selected != .opencode_api_key,
-        .codex, .grok, .opencode => unreachable,
+        .gateway => selected != .chatgpt_subscription and selected != .grok_subscription and selected != .opencode_api_key and selected != .cline_api_key,
+        .codex, .grok, .opencode, .cline => unreachable,
     };
 }
 
@@ -51,6 +54,8 @@ test "explicit providers authorize only their own credential origins" {
     try std.testing.expect(!authorizesCredential(.gateway, .grok_subscription));
     try std.testing.expect(authorizesCredential(.opencode, .opencode_api_key));
     try std.testing.expect(!authorizesCredential(.gateway, .opencode_api_key));
+    try std.testing.expect(authorizesCredential(.cline, .cline_api_key));
+    try std.testing.expect(!authorizesCredential(.gateway, .cline_api_key));
     try std.testing.expectEqual(types.CredentialSource.opencode_api_key, requiredCredentialSource(.opencode).?);
     try std.testing.expect(requiredCredentialSource(.gateway) == null);
 }
@@ -60,6 +65,7 @@ test "provider parsing exposes every provider" {
     try std.testing.expectEqual(ProviderId.codex, parse("CODEX").?);
     try std.testing.expectEqual(ProviderId.grok, parse("GROK").?);
     try std.testing.expectEqual(ProviderId.opencode, parse("OpenCode").?);
+    try std.testing.expectEqual(ProviderId.cline, parse("Cline").?);
     try std.testing.expect(parse("openai-codex") == null);
     try std.testing.expect(parse("") == null);
 }

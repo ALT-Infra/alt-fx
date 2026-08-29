@@ -743,6 +743,53 @@ function startFakeOpenCode() {
   };
 }
 
+function startFakeCline() {
+  const apiKey = "cline-e2e-api-key";
+  const requests: Array<{
+    path: string;
+    authorization: string | null;
+    body: string | null;
+  }> = [];
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      const url = new URL(request.url);
+      const body = request.method === "POST" ? await request.text() : null;
+      requests.push({
+        path: url.pathname,
+        authorization: request.headers.get("authorization"),
+        body,
+      });
+      if (url.pathname === "/models") {
+        return Response.json({
+          free: [{ id: "cline-free/future-free" }],
+          clinePass: [{ id: "cline-pass/future-pass" }],
+        });
+      }
+      if (url.pathname === "/chat") {
+        return new Response(
+          'data: {"id":"cline-generation","choices":[{"delta":{"content":"CLINE_DIRECT_RESPONSE"},"finish_reason":null}]}\n\n' +
+            'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":2}}\n\n' +
+            "data: [DONE]\n\n",
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      }
+      return new Response("not found", { status: 404 });
+    },
+  });
+  const baseUrl = `http://127.0.0.1:${server.port}`;
+  return {
+    apiKey,
+    requests,
+    env: {
+      FX_E2E_CLINE_MODELS_URL: `${baseUrl}/models`,
+      FX_E2E_CLINE_CHAT_URL: `${baseUrl}/chat`,
+    },
+    stop() { server.stop(true); },
+  };
+}
+
 async function runGrokLoginWithBrowser(
   env: Record<string, string | undefined>,
   authorizationCode?: string,
@@ -2547,6 +2594,90 @@ test("OpenCode CLI login filters protocols, routes its key directly, and logs ou
     expect(missing.stderr).toContain("fx login opencode");
   } finally {
     opencode.stop();
+  }
+});
+
+test("Cline CLI login discovers and runs live free and ClinePass models", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-cline-cli-login-"));
+  gateway = startFakeGateway([]);
+  const cline = startFakeCline();
+  try {
+    const commonEnv = {
+      HOME: home,
+      AI_GATEWAY_API_KEY: "gateway-cline-sentinel",
+      VERCEL_OIDC_TOKEN: undefined,
+      FX_DISABLE_KEYCHAIN: "1",
+      FX_SKIP_ONBOARDING: "1",
+      FX_AUTO_UPGRADE: "0",
+      FX_MODEL: undefined,
+      FX_GATEWAY_BASE_URL: gateway.baseUrl,
+      FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+      ...cline.env,
+    };
+    const loginEnv = { ...commonEnv, CLINE_API_KEY: cline.apiKey };
+    const login = await runFx(["login", "cline"], {
+      env: loginEnv,
+      timeoutMs: TIMEOUT,
+    });
+    expect(login.code, `stdout: ${login.stdout}\nstderr: ${login.stderr}`).toBe(0);
+    expect(login.stdout).toContain("Signed in with Cline.");
+    const parallelLogin = await runFx(["login", "parallel"], {
+      env: { ...commonEnv, PARALLEL_API_KEY: "cline-parallel-e2e-key" },
+      timeoutMs: TIMEOUT,
+    });
+    expect(parallelLogin.code, `stdout: ${parallelLogin.stdout}\nstderr: ${parallelLogin.stderr}`).toBe(0);
+
+    const authPath = join(home, ".fx", "cline-auth.json");
+    expect(existsSync(authPath)).toBe(true);
+    expect(statSync(authPath).mode & 0o077).toBe(0);
+    const settingsPath = join(home, ".fx", "settings.json");
+    const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+    expect(settings.provider).toBe("cline");
+    expect(settings.models.cline).toBe("cline-free/future-free");
+
+    const storedEnv = { ...commonEnv, CLINE_API_KEY: undefined };
+    const models = await runFx(["models", "--json"], { env: storedEnv, timeoutMs: TIMEOUT });
+    expect(models.code, `stdout: ${models.stdout}\nstderr: ${models.stderr}`).toBe(0);
+    const modelIds = (JSON.parse(models.stdout) as { models: Array<{ id: string }> }).models
+      .map((model) => model.id);
+    expect(modelIds).toEqual(["cline-free/future-free", "cline-pass/future-pass"]);
+
+    for (const model of modelIds) {
+      const ask = await runFx(["ask", "--json", "--auto", "--no-save", "Answer directly."], {
+        env: { ...storedEnv, FX_MODEL: model },
+        timeoutMs: TIMEOUT,
+      });
+      expect(ask.code, `stdout: ${ask.stdout}\nstderr: ${ask.stderr}`).toBe(0);
+      expect(ask.stdout).toContain("CLINE_DIRECT_RESPONSE");
+    }
+
+    const chatRequests = cline.requests.filter((request) => request.path === "/chat");
+    expect(chatRequests).toHaveLength(2);
+    expect(chatRequests.map((request) => JSON.parse(request.body ?? "{}").model)).toEqual(modelIds);
+    for (const request of chatRequests) {
+      expect(request.authorization).toBe(`Bearer ${cline.apiKey}`);
+      const toolNames = JSON.parse(request.body ?? "{}").tools
+        .map((tool: { function?: { name?: string } }) => tool.function?.name);
+      expect(toolNames).toContain("web_search");
+      expect(toolNames).toContain("web_fetch");
+    }
+    for (const request of [...gateway.requests, ...gateway.modelRequests]) {
+      expect(request.headers.get("authorization")).not.toBe(`Bearer ${cline.apiKey}`);
+    }
+
+    const logout = await runFx(["logout", "cline"], { env: loginEnv, timeoutMs: TIMEOUT });
+    expect(logout.code, `stdout: ${logout.stdout}\nstderr: ${logout.stderr}`).toBe(0);
+    expect(logout.stdout).toContain("Signed out of Cline.");
+    expect(existsSync(authPath)).toBe(false);
+
+    const missing = await runFx(["ask", "--json", "--no-save", "Still Cline?"], {
+      env: loginEnv,
+      timeoutMs: TIMEOUT,
+    });
+    expect(missing.code).toBe(1);
+    expect(missing.stderr).toContain("fx login cline");
+  } finally {
+    cline.stop();
   }
 });
 

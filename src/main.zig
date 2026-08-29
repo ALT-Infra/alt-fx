@@ -318,9 +318,20 @@ fn orchestrationModelId(
             std.fmt.allocPrint(alloc, "go/{s}", .{name})
         else
             error.InvalidOpenCodeRoute,
+        .cline => std.fmt.allocPrint(alloc, "{s}/{s}", .{ route, name }),
         .gateway => std.fmt.allocPrint(alloc, "{s}/{s}", .{ route, name }),
         .codex, .grok => error.OrchestrationProviderNotUnified,
     };
+}
+
+test "ALT preserves complete Cline model identities" {
+    const free = try orchestrationModelId(std.testing.allocator, .cline, "z-ai", "glm-5.3-flash");
+    defer std.testing.allocator.free(free);
+    try std.testing.expectEqualStrings("z-ai/glm-5.3-flash", free);
+
+    const cline_pass = try orchestrationModelId(std.testing.allocator, .cline, "cline-pass", "kimi-k3");
+    defer std.testing.allocator.free(cline_pass);
+    try std.testing.expectEqualStrings("cline-pass/kimi-k3", cline_pass);
 }
 
 fn validOrchestrationModelComponent(value: []const u8) bool {
@@ -5158,6 +5169,8 @@ test {
     _ = @import("core/auth/grok_session.zig");
     _ = @import("core/auth/grok_oauth.zig");
     _ = @import("core/auth/opencode_session.zig");
+    _ = @import("core/auth/cline_session.zig");
+    _ = @import("core/auth/api_key_session.zig");
     _ = @import("core/auth/parallel_session.zig");
     _ = @import("builtins/parallel.zig");
     _ = @import("gateway/xai_grok_models.zig");
@@ -5165,6 +5178,8 @@ test {
     _ = @import("gateway/xai_grok_permission_reviewer.zig");
     _ = @import("gateway/opencode_models.zig");
     _ = @import("gateway/opencode.zig");
+    _ = @import("gateway/cline_models.zig");
+    _ = @import("gateway/cline.zig");
     _ = credentials;
     _ = @import("core/auth/oauth.zig");
     _ = @import("core/auth/oauth_session.zig");

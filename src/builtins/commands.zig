@@ -91,13 +91,13 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .login,
         .token = "login",
-        .usage = "login [vercel|codex|grok|opencode|parallel]",
+        .usage = "login [vercel|codex|grok|opencode|cline|parallel]",
         .summary = "Sign in to Vercel or a selected provider",
     },
     .{
         .kind = .logout,
         .token = "logout",
-        .usage = "logout [vercel|codex|grok|opencode|parallel]",
+        .usage = "logout [vercel|codex|grok|opencode|cline|parallel]",
         .summary = "Sign out of Vercel or a selected provider session",
     },
     .{
@@ -160,7 +160,7 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .provider,
         .token = "provider",
-        .usage = "provider <gateway|codex|grok|opencode>",
+        .usage = "provider <gateway|codex|grok|opencode|cline>",
         .summary = "Choose the model provider used by fx",
     },
     .{
@@ -315,9 +315,9 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .replay, .usage = "replay <tape>" },
     } },
     .{ .entries = &.{
-        .{ .kind = .login, .usage = "login [vercel|codex|grok|opencode|parallel]" },
-        .{ .kind = .logout, .usage = "logout [vercel|codex|grok|opencode|parallel]" },
-        .{ .kind = .provider, .usage = "provider <gateway|codex|grok|opencode>" },
+        .{ .kind = .login, .usage = "login [vercel|codex|grok|opencode|cline|parallel]" },
+        .{ .kind = .logout, .usage = "logout [vercel|codex|grok|opencode|cline|parallel]" },
+        .{ .kind = .provider, .usage = "provider <gateway|codex|grok|opencode|cline>" },
         .{ .kind = .setup, .usage = "setup" },
         .{ .kind = .teams, .usage = "teams" },
         .{ .kind = .credits, .usage = "credits|balance" },
@@ -444,7 +444,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .continue_recovery, .command = "/continue", .help_entry = "/continue", .completion_description = "continue a paused model response", .presentation_category = .session, .requires_prompt_credential = true },
     .{ .kind = .rename_session, .command = "/rename", .help_entry = "/rename <title>", .completion_description = "rename the current session", .presentation_category = .session, .has_args = true, .accepts_payload = true },
     .{ .kind = .login, .command = "/login", .help_entry = "/login", .completion_description = "choose a provider sign-in method", .presentation_category = .account },
-    .{ .kind = .logout, .command = "/logout", .help_entry = "/logout [vercel|codex|grok|opencode|parallel]", .completion_description = "disconnect an account or tool", .presentation_category = .account, .has_args = true, .accepts_payload = true },
+    .{ .kind = .logout, .command = "/logout", .help_entry = "/logout [vercel|codex|grok|opencode|cline|parallel]", .completion_description = "disconnect an account or tool", .presentation_category = .account, .has_args = true, .accepts_payload = true },
     .{ .kind = .setup, .command = "/setup", .help_entry = "/setup", .completion_description = "manage accounts and AI Gateway access", .presentation_category = .account },
     .{ .kind = .stats, .command = "/stats", .help_entry = "/stats", .completion_description = "show token and turn statistics", .presentation_category = .account },
     .{ .kind = .usage, .command = "/usage", .aliases = &.{"/cost"}, .help_entry = "/usage (/cost)", .completion_description = "show local fx tokens, models, and spend", .presentation_category = .account },

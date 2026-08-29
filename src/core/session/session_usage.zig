@@ -3273,6 +3273,7 @@ fn exactUsageOrigin(provider: model_provider.ProviderId) []const u8 {
         .codex => "exact/codex",
         .grok => "exact/grok",
         .opencode => "exact/opencode",
+        .cline => "exact/cline",
     };
 }
 

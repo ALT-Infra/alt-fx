@@ -32,6 +32,7 @@ const credential_source_order = [_]credentials.Source{
     .chatgpt_subscription,
     .grok_subscription,
     .opencode_api_key,
+    .cline_api_key,
 };
 
 const SourceProbeFn = *const fn (?*anyopaque, Allocator, credentials.Source) anyerror!bool;
@@ -71,8 +72,8 @@ pub const FailureSnapshot = struct {
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
 
-        if (self.source == .opencode_api_key and self.reason == .http_unauthorized) {
-            try out.writer.writeAll("OpenCode rejected the API key or selected model access");
+        if ((self.source == .opencode_api_key or self.source == .cline_api_key) and self.reason == .http_unauthorized) {
+            try out.writer.print("{s} rejected the API key or selected model access", .{if (self.source == .cline_api_key) "Cline" else "OpenCode"});
         } else {
             try out.writer.print("{s} {s}", .{
                 credentials.sourceLabel(self.source),
@@ -161,6 +162,7 @@ pub const AcquisitionAction = enum {
     chatgpt_login,
     grok_login,
     opencode_login,
+    cline_login,
     setup,
     change_team,
     switch_credential,
@@ -413,7 +415,7 @@ pub const PickerView = struct {
             else
                 4,
             .connections => connectionChoiceCount(),
-            .provider => if (comptime host_target.is_wasm) 2 else 4,
+            .provider => if (comptime host_target.is_wasm) 2 else 5,
             .sign_in, .api_key => 0,
             .change_team => blk: {
                 var count: usize = 0;
@@ -448,6 +450,7 @@ pub const PickerView = struct {
                 1 => .{ .provider = .codex },
                 2 => if (comptime host_target.is_wasm) null else .{ .provider = .grok },
                 3 => if (comptime host_target.is_wasm) null else .{ .provider = .opencode },
+                4 => if (comptime host_target.is_wasm) null else .{ .provider = .cline },
                 else => null,
             },
             .sign_in, .api_key => null,
@@ -493,6 +496,7 @@ pub const PickerView = struct {
                 .chatgpt_login => "Sign in with Codex",
                 .grok_login => "Sign in with Grok",
                 .opencode_login => "Sign in with OpenCode",
+                .cline_login => "Sign in with Cline",
                 .setup => if (self.include_skip) "Add an API key" else "API key",
                 .change_team => "Change team",
                 .switch_credential => "Switch credential",
@@ -513,6 +517,7 @@ pub const PickerView = struct {
                 .chatgpt_login => if (self.available_sources.contains(.chatgpt_subscription)) "connected" else "",
                 .grok_login => if (self.available_sources.contains(.grok_subscription)) "connected" else "",
                 .opencode_login => if (self.available_sources.contains(.opencode_api_key)) "connected" else "",
+                .cline_login => if (self.available_sources.contains(.cline_api_key)) "connected" else "",
                 .setup, .switch_credential, .switch_provider => "",
                 .automatic => "use the first available source",
                 .change_team => if (self.fx_login_session_available) "choose a team" else "sign in first",
@@ -526,7 +531,8 @@ pub const PickerView = struct {
             .action => |action| (action != .change_team or self.fx_login_session_available) and
                 (action != .chatgpt_login or !host_target.is_wasm) and
                 (action != .grok_login or !host_target.is_wasm) and
-                (action != .opencode_login or !host_target.is_wasm),
+                (action != .opencode_login or !host_target.is_wasm) and
+                (action != .cline_login or !host_target.is_wasm),
             .provider, .source, .team => true,
         };
     }
@@ -540,7 +546,7 @@ pub const PickerView = struct {
 };
 
 fn connectionChoiceCount() usize {
-    return if (comptime host_target.is_wasm) 2 else 5;
+    return if (comptime host_target.is_wasm) 2 else 6;
 }
 
 fn connectionChoiceAt(index: usize) ?Choice {
@@ -556,7 +562,8 @@ fn connectionChoiceAt(index: usize) ?Choice {
         1 => .{ .action = .chatgpt_login },
         2 => .{ .action = .grok_login },
         3 => .{ .action = .opencode_login },
-        4 => .{ .action = .setup },
+        4 => .{ .action = .cline_login },
+        5 => .{ .action = .setup },
         else => null,
     };
 }
@@ -592,6 +599,7 @@ pub const StatusSnapshot = struct {
     chatgpt_connected: bool = false,
     grok_connected: bool = false,
     opencode_connected: bool = false,
+    cline_connected: bool = false,
     /// The active credential is past its refresh deadline. Distinct from `refreshable`,
     /// which answers whether this source type can refresh at all.
     expired: bool = false,
@@ -669,6 +677,14 @@ pub fn loadStatusSnapshotForProvider(
         error.OutOfMemory => return err,
         else => false,
     };
+    const cline_connected = credentials.sourceExists(
+        alloc,
+        secret_store,
+        .cline_api_key,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => false,
+    };
     // Resolves in `.stored` mode: a diagnostic must not refresh, because refreshing
     // rewrites the session file and performs network I/O. It reports the expired state
     // instead of repairing it.
@@ -698,7 +714,7 @@ pub fn loadStatusSnapshotForProvider(
     };
     const resolved_source = if (resolution.credential) |credential| credential.source else null;
     var gateway_connected = resolved_source != null and model_provider.authorizesCredential(.gateway, resolved_source);
-    const gateway_probe_required = provider == .codex or provider == .grok or provider == .opencode or
+    const gateway_probe_required = provider == .codex or provider == .grok or provider == .opencode or provider == .cline or
         (resolved_source != null and !model_provider.authorizesCredential(.gateway, resolved_source));
     if (gateway_probe_required) {
         for ([_]credentials.Source{ .vercel_oidc_token, .ai_gateway_api_key, .fx_login, .stored_key }) |source| {
@@ -725,6 +741,7 @@ pub fn loadStatusSnapshotForProvider(
             .chatgpt_connected = chatgpt_connected,
             .grok_connected = grok_connected,
             .opencode_connected = opencode_connected,
+            .cline_connected = cline_connected,
             .expired = expired,
         };
     }
@@ -738,6 +755,7 @@ pub fn loadStatusSnapshotForProvider(
         .chatgpt_connected = chatgpt_connected,
         .grok_connected = grok_connected,
         .opencode_connected = opencode_connected,
+        .cline_connected = cline_connected,
     };
 }
 
@@ -932,11 +950,13 @@ pub const Runtime = struct {
         const chatgpt_connected = self.source_inventory.contains(.chatgpt_subscription);
         const grok_connected = self.source_inventory.contains(.grok_subscription);
         const opencode_connected = self.source_inventory.contains(.opencode_api_key);
+        const cline_connected = self.source_inventory.contains(.cline_api_key);
         const credential = self.selected_credential orelse return .{
             .gateway_connected = gateway_connected,
             .chatgpt_connected = chatgpt_connected,
             .grok_connected = grok_connected,
             .opencode_connected = opencode_connected,
+            .cline_connected = cline_connected,
         };
         return .{
             .active_source = credential.source,
@@ -945,6 +965,7 @@ pub const Runtime = struct {
             .chatgpt_connected = chatgpt_connected,
             .grok_connected = grok_connected,
             .opencode_connected = opencode_connected,
+            .cline_connected = cline_connected,
             .expired = credential.needsRefreshAt(now_ms),
         };
     }
@@ -1480,7 +1501,7 @@ pub const Runtime = struct {
             .sign_in, .api_key => unreachable,
             .connections => switch (selected) {
                 .action => |action| switch (action) {
-                    .login, .chatgpt_login, .grok_login, .opencode_login => self.closePicker(alloc),
+                    .login, .chatgpt_login, .grok_login, .opencode_login, .cline_login => self.closePicker(alloc),
                     .setup => {},
                     .connections,
                     .change_team,
@@ -1512,7 +1533,7 @@ pub const Runtime = struct {
                     .setup => {},
                     // Only reachable from the switch screen, never the root.
                     .automatic => unreachable,
-                    .login, .chatgpt_login, .grok_login, .opencode_login => self.closePicker(alloc),
+                    .login, .chatgpt_login, .grok_login, .opencode_login, .cline_login => self.closePicker(alloc),
                 },
                 .team => unreachable,
             },
@@ -1712,6 +1733,18 @@ pub const Runtime = struct {
     pub fn reconcileAfterOpenCodeLogout(self: *Self, alloc: Allocator) !bool {
         const was_available = self.source_inventory.contains(.opencode_api_key);
         const was_active = self.credentialSource() == .opencode_api_key;
+        if (was_active) {
+            if (self.selected_credential) |*credential| credential.deinit(alloc);
+            self.selected_credential = null;
+            self.credential_refresh_failure_source = null;
+        }
+        try self.refreshSourceInventory(alloc);
+        return was_active or was_available;
+    }
+
+    pub fn reconcileAfterClineLogout(self: *Self, alloc: Allocator) !bool {
+        const was_available = self.source_inventory.contains(.cline_api_key);
+        const was_active = self.credentialSource() == .cline_api_key;
         if (was_active) {
             if (self.selected_credential) |*credential| credential.deinit(alloc);
             self.selected_credential = null;

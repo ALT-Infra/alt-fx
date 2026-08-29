@@ -645,6 +645,9 @@ fn fetchCredits(
     if (input.credential_source == .opencode_api_key) {
         return creditsErrorSnapshot(alloc, "AI Gateway credits are unavailable for an OpenCode API key.");
     }
+    if (input.credential_source == .cline_api_key) {
+        return creditsErrorSnapshot(alloc, "AI Gateway credits are unavailable for a Cline API key.");
+    }
     return fetchCreditsWithFetch(
         alloc,
         input.credential,

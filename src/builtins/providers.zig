@@ -8,6 +8,8 @@ const xai_grok_models = @import("../gateway/xai_grok_models.zig");
 const xai_grok_permission_reviewer = @import("../gateway/xai_grok_permission_reviewer.zig");
 const opencode = @import("../gateway/opencode.zig");
 const opencode_models = @import("../gateway/opencode_models.zig");
+const cline = @import("../gateway/cline.zig");
+const cline_models = @import("../gateway/cline_models.zig");
 const provider_catalog = @import("../core/auth/provider_catalog.zig");
 
 pub const native = provider_set.Set{
@@ -33,5 +35,11 @@ pub const native = provider_set.Set{
         .agent_stream = opencode.agent_stream_provider,
         .cli_model_catalog = opencode_models.cli_model_catalog_provider,
         .model_catalog = opencode_models.model_catalog_provider,
+    },
+    .cline = .{
+        .presentation = provider_catalog.find(.cline),
+        .agent_stream = cline.agent_stream_provider,
+        .cli_model_catalog = cline_models.cli_model_catalog_provider,
+        .model_catalog = cline_models.model_catalog_provider,
     },
 };

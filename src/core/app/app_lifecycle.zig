@@ -1116,6 +1116,7 @@ fn configuredProviderSelection(
         .codex => return error.CodexModelNotSelected,
         .grok => return error.GrokModelNotSelected,
         .opencode => return error.OpenCodeModelNotSelected,
+        .cline => return error.ClineModelNotSelected,
     };
     return .{ .provider = provider, .model = model };
 }
