@@ -1022,6 +1022,137 @@ fn callbackRedirectUri(alloc: Allocator, configured_port: ?u16, bound_port: u16)
     return std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/callback", .{bound_port});
 }
 
+const CallbackSocketCreation = struct {
+    flags: u32,
+    needs_cloexec_fallback: bool,
+};
+
+fn callbackSocketCreation(comptime os_tag: std.Target.Os.Tag) CallbackSocketCreation {
+    const needs_fallback = os_tag.isDarwin() or os_tag == .haiku;
+    return .{
+        .flags = std.posix.SOCK.STREAM |
+            if (needs_fallback) 0 else std.posix.SOCK.CLOEXEC,
+        .needs_cloexec_fallback = needs_fallback,
+    };
+}
+
+fn listenPinnedCallback(address: std.Io.net.IpAddress) std.Io.net.IpAddress.ListenError!std.Io.net.Server {
+    const posix = std.posix;
+    const SocketAddress = extern union {
+        any: posix.sockaddr,
+        ip4: posix.sockaddr.in,
+        ip6: posix.sockaddr.in6,
+    };
+    const AddressDetails = struct {
+        family: posix.sa_family_t,
+        len: posix.socklen_t,
+    };
+
+    var socket_address: SocketAddress = undefined;
+    const details: AddressDetails = switch (address) {
+        .ip4 => |value| values: {
+            socket_address.ip4 = .{
+                .port = std.mem.nativeToBig(u16, value.port),
+                .addr = @bitCast(value.bytes),
+            };
+            break :values .{ .family = posix.AF.INET, .len = @sizeOf(posix.sockaddr.in) };
+        },
+        .ip6 => |value| values: {
+            socket_address.ip6 = .{
+                .port = std.mem.nativeToBig(u16, value.port),
+                .flowinfo = value.flow,
+                .addr = value.bytes,
+                .scope_id = value.interface.index,
+            };
+            break :values .{ .family = posix.AF.INET6, .len = @sizeOf(posix.sockaddr.in6) };
+        },
+    };
+    const socket_creation = comptime callbackSocketCreation(builtin.os.tag);
+
+    const socket_fd = while (true) {
+        const rc = posix.system.socket(details.family, socket_creation.flags, 0);
+        switch (posix.errno(rc)) {
+            .SUCCESS => break @as(posix.socket_t, @intCast(rc)),
+            .INTR => continue,
+            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+            .INVAL => return error.ProtocolUnsupportedBySystem,
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .NFILE => return error.SystemFdQuotaExceeded,
+            .NOBUFS, .NOMEM => return error.SystemResources,
+            .PROTONOSUPPORT => return error.ProtocolUnsupportedByAddressFamily,
+            .PROTOTYPE => return error.SocketModeUnsupported,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    };
+    const socket: std.Io.net.Socket = .{ .handle = socket_fd, .address = address };
+    errdefer socket.close(io_mod.getIo());
+
+    if (comptime socket_creation.needs_cloexec_fallback) {
+        while (true) switch (posix.errno(posix.system.fcntl(
+            socket_fd,
+            posix.F.SETFD,
+            @as(usize, posix.FD_CLOEXEC),
+        ))) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => |err| return posix.unexpectedErrno(err),
+        };
+    }
+
+    // Zig's reuse_address also enables SO_REUSEPORT on POSIX. Pinned OAuth
+    // callbacks need TIME_WAIT reuse without allowing concurrent listeners.
+    const reuse_address: u32 = 1;
+    const reuse_bytes = std.mem.asBytes(&reuse_address);
+    while (true) switch (posix.errno(posix.system.setsockopt(
+        socket_fd,
+        posix.SOL.SOCKET,
+        posix.SO.REUSEADDR,
+        reuse_bytes.ptr,
+        @intCast(reuse_bytes.len),
+    ))) {
+        .SUCCESS => break,
+        .INTR => continue,
+        .NOPROTOOPT => return error.OptionUnsupported,
+        else => |err| return posix.unexpectedErrno(err),
+    };
+
+    while (true) switch (posix.errno(posix.system.bind(
+        socket_fd,
+        &socket_address.any,
+        details.len,
+    ))) {
+        .SUCCESS => break,
+        .INTR => continue,
+        .ADDRINUSE => return error.AddressInUse,
+        .ADDRNOTAVAIL => return error.AddressUnavailable,
+        .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+        .NOBUFS, .NOMEM => return error.SystemResources,
+        else => |err| return posix.unexpectedErrno(err),
+    };
+
+    while (true) switch (posix.errno(posix.system.listen(
+        socket_fd,
+        std.Io.net.default_kernel_backlog,
+    ))) {
+        .SUCCESS => break,
+        .INTR => continue,
+        .ADDRINUSE => return error.AddressInUse,
+        else => |err| return posix.unexpectedErrno(err),
+    };
+
+    return .{
+        .socket = socket,
+        .options = if (std.Io.net.Server.AcceptOptions != void) .{
+            .mode = .stream,
+            .protocol = .tcp,
+        },
+    };
+}
+
+fn isUnavailableIpv6CallbackError(err: std.Io.net.IpAddress.ListenError) bool {
+    return err == error.AddressFamilyUnsupported or err == error.AddressUnavailable;
+}
+
 pub fn authorizeInteractive(
     alloc: Allocator,
     options: InteractiveAuthorizationOptions,
@@ -1031,15 +1162,16 @@ pub fn authorizeInteractive(
     }
     const configured_port = options.config.callback_port;
     var address = try std.Io.net.IpAddress.parse("127.0.0.1", configured_port orelse 0);
-    var listener = address.listen(io_mod.getIo(), .{ .reuse_address = configured_port == null }) catch |err| {
-        if (configured_port != null) return error.McpCallbackPortUnavailable;
-        return err;
-    };
+    var listener = if (configured_port != null)
+        listenPinnedCallback(address) catch return error.McpCallbackPortUnavailable
+    else
+        try address.listen(io_mod.getIo(), .{ .reuse_address = true });
     defer listener.deinit(io_mod.getIo());
     var ipv6_listener: ?std.Io.net.Server = null;
     if (configured_port) |port| {
-        var ipv6_address = try std.Io.net.IpAddress.parse("::1", port);
-        ipv6_listener = ipv6_address.listen(io_mod.getIo(), .{}) catch {
+        const ipv6_address = try std.Io.net.IpAddress.parse("::1", port);
+        ipv6_listener = listenPinnedCallback(ipv6_address) catch |err| fallback: {
+            if (isUnavailableIpv6CallbackError(err)) break :fallback null;
             return error.McpCallbackPortUnavailable;
         };
     }
@@ -2565,6 +2697,70 @@ test "interactive callback rejects a pinned IPv6 port already listening" {
             .cancel_flag = &cancelled,
         }),
     );
+}
+
+test "interactive callback immediately reuses a completed pinned port" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try address.listen(std.testing.io, .{ .reuse_address = true });
+    var listener_open = true;
+    defer if (listener_open) listener.deinit(std.testing.io);
+    const port = listener.socket.address.getPort();
+
+    address.setPort(port);
+    var client = try address.connect(std.testing.io, .{ .mode = .stream });
+    var client_open = true;
+    defer if (client_open) client.close(std.testing.io);
+    var accepted = try listener.accept(std.testing.io);
+    var accepted_open = true;
+    defer if (accepted_open) accepted.close(std.testing.io);
+    accepted.close(std.testing.io);
+    accepted_open = false;
+    var socket_buffer: [1]u8 = undefined;
+    var reader = client.reader(std.testing.io, &socket_buffer);
+    try std.testing.expectError(error.EndOfStream, reader.interface.takeByte());
+    client.close(std.testing.io);
+    client_open = false;
+    listener.deinit(std.testing.io);
+    listener_open = false;
+
+    var cancelled = std.atomic.Value(bool).init(true);
+    const OpenUrl = struct {
+        fn run(_: ?*anyopaque, _: Allocator, _: []const u8) anyerror!bool {
+            return true;
+        }
+    };
+    try std.testing.expectError(
+        error.Cancelled,
+        authorizeInteractive(std.testing.allocator, .{
+            .endpoint = "http://127.0.0.1:8080",
+            .challenge = .{},
+            .config = .{ .callback_port = port },
+            .open_url = OpenUrl.run,
+            .cancel_flag = &cancelled,
+        }),
+    );
+}
+
+test "interactive callback treats unavailable IPv6 as optional" {
+    try std.testing.expect(isUnavailableIpv6CallbackError(error.AddressFamilyUnsupported));
+    try std.testing.expect(isUnavailableIpv6CallbackError(error.AddressUnavailable));
+    try std.testing.expect(!isUnavailableIpv6CallbackError(error.AddressInUse));
+    try std.testing.expect(!isUnavailableIpv6CallbackError(error.SystemResources));
+}
+
+test "pinned callback sockets create close-on-exec atomically where supported" {
+    const linux = callbackSocketCreation(.linux);
+    try std.testing.expect((linux.flags & std.posix.SOCK.CLOEXEC) != 0);
+    try std.testing.expect(!linux.needs_cloexec_fallback);
+
+    inline for (.{ .macos, .haiku }) |os_tag| {
+        const fallback = callbackSocketCreation(os_tag);
+        try std.testing.expectEqual(std.posix.SOCK.STREAM, fallback.flags);
+        try std.testing.expect(fallback.needs_cloexec_fallback);
+    }
 }
 
 test "interactive callback wait observes caller and lifecycle cancellation" {
