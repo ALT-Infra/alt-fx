@@ -135,7 +135,7 @@ fn executeRequest(
         return error.OAuthRequestFailed;
     }
     return .{
-        .disposition = if (status == 200) .accepted else .rejected,
+        .disposition = oauth_transport.dispositionForHttpStatus(status),
         .body = try alloc.dupe(u8, response_buffer[0..@intCast(response_len)]),
     };
 }

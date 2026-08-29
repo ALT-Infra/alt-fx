@@ -844,7 +844,11 @@ const OAuthHttpOperation = struct {
         if (body.len > oauth_response_max_bytes) return error.OAuthResponseTooLarge;
 
         return .{
-            .disposition = if (result.status == .ok) .accepted else .rejected,
+            // Fetch's `Response.ok` contract—and the OAuth endpoints we
+            // proxy—treat the complete 2xx class as successful. In
+            // particular, Cline's registration exchange is allowed to return
+            // 201 rather than exactly 200.
+            .disposition = oauth_transport.dispositionForHttpStatus(@intFromEnum(result.status)),
             .body = try self.alloc.dupe(u8, body),
         };
     }

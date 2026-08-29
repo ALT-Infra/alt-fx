@@ -865,11 +865,12 @@ function startFakeCline(options: { hasPlan?: boolean } = {}) {
         });
       }
       if (url.pathname === "/token") {
+        // Real WorkOS CLI-auth success responses carry only these two fields.
+        // Adding token_type/expires_in here would let fx's generic OAuth
+        // parser pass and conceal the Cline login regression again.
         return Response.json({
           access_token: "workos-access",
           refresh_token: "workos-refresh",
-          token_type: "Bearer",
-          expires_in: 3600,
         });
       }
       if (url.pathname === "/register") {
@@ -1726,6 +1727,7 @@ tmuxTest(
     await session.sendKeys("Down");
     await session.sendKeys("Down");
     await session.sendKeys("Down");
+    await session.sendKeys("Down");
     await session.sendKeys("Enter");
     const apiKey = await session.waitForText("Paste your AI Gateway API key", TIMEOUT);
     expect(apiKey).toContain("Saves to");
@@ -1908,6 +1910,7 @@ profileStoredKeyTmuxTest(
     await session.waitForText("Connections", TIMEOUT);
     await session.sendKeys("Enter");
     await session.waitForText("AI Gateway API key", TIMEOUT);
+    await session.sendKeys("Down");
     await session.sendKeys("Down");
     await session.sendKeys("Down");
     await session.sendKeys("Down");

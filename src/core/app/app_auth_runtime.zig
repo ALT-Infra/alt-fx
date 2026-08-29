@@ -838,7 +838,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
                     .tone = .warning,
-                    .body = "Set OPENCODE_API_KEY to your opencode.ai key, then choose Sign in with OpenCode again.",
+                    .body = "Set OPENCODE_API_KEY to your opencode.ai key, then choose Add OpenCode API key again.",
                 }, true);
                 return;
             };
@@ -1564,6 +1564,10 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn writeLoginError(app: *App, source: credentials.Source, err: anyerror) !void {
+            if (source == .cline_account) {
+                try writeClineAccountLoginError(app, err);
+                return;
+            }
             const notice: types.SemanticNotice = if (source == .chatgpt_subscription)
                 switch (err) {
                     error.ChatGptAuthorizationFailed => .{ .topic = "auth", .tone = .@"error", .body = "Codex sign-in was denied. The current credential is unchanged." },
@@ -1587,6 +1591,39 @@ pub fn Runtime(comptime App: type) type {
                 else => .{ .topic = "auth", .tone = .@"error", .body = "Vercel sign-in failed. The current credential is unchanged." },
             };
             try writeAuthNotice(app, notice);
+        }
+
+        /// Cline account sign-in failures previously fell through to the
+        /// Vercel fallback, which misdirected users toward CLINE_API_KEY even
+        /// after the browser approval step had visibly succeeded. Name the
+        /// failed phase and the internal error instead.
+        fn writeClineAccountLoginError(app: *App, err: anyerror) !void {
+            if (err == error.ExpiredToken or err == error.LoginTimedOut) {
+                try writeAuthNotice(app, .{
+                    .topic = "auth",
+                    .tone = .warning,
+                    .body = "Cline sign-in expired. The current credential is unchanged; run /login to try again.",
+                });
+                return;
+            }
+            const body = try std.fmt.allocPrint(
+                app.alloc,
+                "Cline sign-in failed during {s} ({s}). The current credential is unchanged.",
+                .{ clineFailurePhase(err), @errorName(err) },
+            );
+            defer app.alloc.free(body);
+            try writeAuthNotice(app, .{ .topic = "auth", .tone = .@"error", .body = body });
+        }
+
+        fn clineFailurePhase(err: anyerror) []const u8 {
+            return switch (err) {
+                error.ClineDeviceAuthorizationFailed => "device authorization",
+                error.AccessDenied => "browser authorization",
+                error.OAuthRequestFailed, error.InvalidClient => "WorkOS token polling",
+                error.ClineTokenRegistrationFailed, error.ClineRefreshTokenMissing => "Cline registration",
+                error.InvalidClineOAuthResponse, error.InvalidOAuthResponse => "token response parsing",
+                else => "sign-in",
+            };
         }
 
         fn writeAuthNotice(app: *App, notice: types.SemanticNotice) !void {
@@ -1779,6 +1816,55 @@ test "interactive subscription sign-in rejects active and queued work before OAu
             try std.testing.expectEqual(@as(usize, 1), app.notice_count);
         }
     }
+}
+
+const ClineLoginErrorApp = struct {
+    pub const host_profile = runtime_profile.native;
+
+    alloc: std.mem.Allocator = std.testing.allocator,
+    shell: struct { render_requests: TestRenderRequests = .{} } = .{},
+    last_body: ?[]u8 = null,
+
+    fn deinit(self: *ClineLoginErrorApp) void {
+        if (self.last_body) |body| self.alloc.free(body);
+    }
+
+    fn writeDomainNotice(self: *ClineLoginErrorApp, notice: types.SemanticNotice, _: bool) !void {
+        if (self.last_body) |body| self.alloc.free(body);
+        self.last_body = try self.alloc.dupe(u8, notice.body);
+    }
+
+    fn flushBeforeBlockingExternalWork(_: *ClineLoginErrorApp) !void {}
+};
+
+test "Cline account login failures name Cline and the failed phase, not Vercel" {
+    const cases = [_]anyerror{
+        error.ClineDeviceAuthorizationFailed,
+        error.InvalidOAuthResponse,
+        error.OAuthRequestFailed,
+        error.ClineTokenRegistrationFailed,
+        error.ClineRefreshTokenMissing,
+    };
+    for (cases) |case_err| {
+        var app: ClineLoginErrorApp = .{};
+        defer app.deinit();
+        try Runtime(ClineLoginErrorApp).writeLoginError(&app, .cline_account, case_err);
+        const body = app.last_body.?;
+        try std.testing.expect(std.mem.indexOf(u8, body, "Cline sign-in failed") != null);
+        try std.testing.expect(std.mem.indexOf(u8, body, @errorName(case_err)) != null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "Vercel") == null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "CLINE_API_KEY") == null);
+    }
+
+    var app: ClineLoginErrorApp = .{};
+    defer app.deinit();
+    try Runtime(ClineLoginErrorApp).writeLoginError(&app, .cline_account, error.InvalidOAuthResponse);
+    try std.testing.expect(std.mem.indexOf(u8, app.last_body.?, "token response parsing") != null);
+
+    var expired: ClineLoginErrorApp = .{};
+    defer expired.deinit();
+    try Runtime(ClineLoginErrorApp).writeLoginError(&expired, .cline_account, error.LoginTimedOut);
+    try std.testing.expect(std.mem.indexOf(u8, expired.last_body.?, "Cline sign-in expired") != null);
 }
 
 const TestTeam = struct {

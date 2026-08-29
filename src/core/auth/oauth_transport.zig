@@ -24,6 +24,10 @@ pub const Disposition = enum {
     rejected,
 };
 
+pub fn dispositionForHttpStatus(status: u16) Disposition {
+    return if (status >= 200 and status < 300) .accepted else .rejected;
+}
+
 pub const Response = struct {
     disposition: Disposition,
     /// Owned bytes allocated with the allocator passed to `Provider.execute`.
@@ -83,4 +87,13 @@ test "response transfers owned bytes exactly once" {
     response.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), response.body.len);
     try std.testing.expectEqualStrings("secret", body);
+}
+
+test "OAuth transport accepts the complete HTTP success class" {
+    try std.testing.expectEqual(Disposition.rejected, dispositionForHttpStatus(199));
+    try std.testing.expectEqual(Disposition.accepted, dispositionForHttpStatus(200));
+    try std.testing.expectEqual(Disposition.accepted, dispositionForHttpStatus(201));
+    try std.testing.expectEqual(Disposition.accepted, dispositionForHttpStatus(204));
+    try std.testing.expectEqual(Disposition.accepted, dispositionForHttpStatus(299));
+    try std.testing.expectEqual(Disposition.rejected, dispositionForHttpStatus(300));
 }
