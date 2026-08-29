@@ -744,7 +744,7 @@ function startFakeOpenCode() {
   };
 }
 
-function startFakeCline(options: { hasPlan?: boolean } = {}) {
+function startFakeCline() {
   const apiKey = "cline-e2e-api-key";
   const accountToken = "cline-e2e-account-token";
   const refreshedAccountToken = "cline-e2e-refreshed-account-token";
@@ -769,9 +769,6 @@ function startFakeCline(options: { hasPlan?: boolean } = {}) {
           free: [{ id: "cline-free/future-free" }],
           clinePass: [{ id: "cline-pass/future-pass" }],
         });
-      }
-      if (url.pathname === "/plan") {
-        return Response.json({ success: true, data: options.hasPlan === false ? null : { id: "cline-pass-e2e" } });
       }
       if (url.pathname === "/device") {
         return Response.json({
@@ -833,7 +830,6 @@ function startFakeCline(options: { hasPlan?: boolean } = {}) {
     requests,
     env: {
       FX_E2E_CLINE_MODELS_URL: `${baseUrl}/models`,
-      FX_E2E_CLINE_PLAN_URL: `${baseUrl}/plan`,
       FX_E2E_CLINE_CHAT_URL: `${baseUrl}/chat`,
       FX_E2E_CLINE_DEVICE_AUTH_URL: `${baseUrl}/device`,
       FX_E2E_CLINE_DEVICE_TOKEN_URL: `${baseUrl}/token`,
@@ -2743,10 +2739,10 @@ test("Cline CLI login discovers and runs live free and ClinePass models", async 
   }
 });
 
-test("Cline account login needs no API key and hides ClinePass without a plan", async () => {
+test("Cline account login exposes free and ClinePass routes without an invented plan probe", async () => {
   home = mkdtempSync(join(tmpdir(), "fx-cline-account-login-"));
   gateway = startFakeGateway([]);
-  const cline = startFakeCline({ hasPlan: false });
+  const cline = startFakeCline();
   try {
     const env = {
       HOME: home,
@@ -2780,11 +2776,10 @@ test("Cline account login needs no API key and hides ClinePass without a plan", 
     const models = await runFx(["models", "--json"], { env, timeoutMs: TIMEOUT });
     expect(models.code, `stdout: ${models.stdout}\nstderr: ${models.stderr}`).toBe(0);
     const ids = (JSON.parse(models.stdout) as { models: Array<{ id: string }> }).models.map((model) => model.id);
-    expect(ids).toEqual(["cline-free/future-free"]);
+    expect(ids).toEqual(["cline-free/future-free", "cline-pass/future-pass"]);
     const refreshRequests = cline.requests.filter((request) => request.path === "/refresh");
     expect(refreshRequests).toHaveLength(1);
-    const planRequest = cline.requests.filter((request) => request.path === "/plan").at(-1)!;
-    expect(planRequest.authorization).toBe(`Bearer ${cline.refreshedAccountToken}`);
+    expect(cline.requests.filter((request) => request.path === "/plan")).toHaveLength(0);
 
     const ask = await runFx(["ask", "--json", "--auto", "--no-save", "Answer directly."], {
       env,
