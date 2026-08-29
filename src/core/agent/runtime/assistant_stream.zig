@@ -1366,28 +1366,12 @@ test "streamed definition list retains source and clears before a tool" {
 test "streamed presentation preserves ANSI OSC 8 code fence and table spans" {
     if (ansi_span_fixture_enabled()) return assert_frozen_ansi_span_fixture();
 
-    const alloc = std.testing.allocator;
-    var environ = try std.process.Environ.createMap(std.testing.environ, alloc);
-    defer environ.deinit();
-    try environ.put(ansi_span_fixture_env, "1");
-
-    const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
-    defer alloc.free(cwd);
-    const result = try std.process.run(alloc, std.testing.io, .{
-        .argv = &.{ "zig", "test", "-lc", "-Mroot=src/main.zig", "--test-filter", ansi_span_test_name },
-        .cwd = .{ .path = cwd },
-        .environ_map = &environ,
-        .stdout_limit = .limited(64 * 1024),
-        .stderr_limit = .limited(64 * 1024),
-    });
-    defer alloc.free(result.stdout);
-    defer alloc.free(result.stderr);
-
-    switch (result.term) {
-        .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
-        else => return error.TestExpectedEqual,
-    }
-    try std.testing.expect(std.mem.find(u8, result.stderr, ansi_span_test_name) != null);
+    // The frozen fixture previously ran through a nested `zig test` spawn so
+    // the assertion executed in a fresh process. That invocation can no longer
+    // compile standalone because src/main.zig imports the build-provided
+    // `build_options` module, so run the frozen assertion in-process instead;
+    // the fixture path itself is unchanged.
+    try assert_frozen_ansi_span_fixture();
 }
 
 test "streamed footnotes retain raw source and flush before a tool" {

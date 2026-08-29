@@ -1381,11 +1381,29 @@ test "authority reduction quiesces superseded tasks before detached runtime reti
         50,
     );
 
-    const authentication = try alloc.create(PendingAuthentication);
+    // The reload started above publishes and retires runtimes concurrently, so
+    // acquiring a lease here can transiently race a retirement. Retry briefly,
+    // and acquire before allocating so the failure path cannot leak.
+    const lease_deadline = io_mod.milliTimestamp() + 2_000;
+    var authentication_lease: ?Lease = null;
+    while (authentication_lease == null and io_mod.milliTimestamp() < lease_deadline) {
+        authentication_lease = state.acquire();
+        if (authentication_lease == null) io_mod.sleep(std.time.ns_per_ms);
+    }
+    var lease = authentication_lease orelse return error.TestUnexpectedResult;
+    const authentication_server_name = alloc.dupe(u8, "workspace") catch {
+        lease.deinit();
+        return error.OutOfMemory;
+    };
+    const authentication = alloc.create(PendingAuthentication) catch {
+        alloc.free(authentication_server_name);
+        lease.deinit();
+        return error.OutOfMemory;
+    };
     authentication.* = .{
         .alloc = alloc,
-        .server_name = try alloc.dupe(u8, "workspace"),
-        .lease = state.acquire() orelse return error.TestUnexpectedResult,
+        .server_name = authentication_server_name,
+        .lease = lease,
         .opener = host.unavailable_url_opener,
         .done = .init(true),
         .result = error.Cancelled,

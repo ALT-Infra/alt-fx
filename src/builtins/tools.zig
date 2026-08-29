@@ -1398,11 +1398,15 @@ test "terminal tool schema derives closed action branches and exact write states
             try std.testing.expectEqualStrings(field_name, property.name);
             if (std.mem.eql(u8, field_name, "action")) {
                 try std.testing.expect(property.nullable == null);
-                try std.testing.expectEqualSlices(
-                    []const u8,
-                    &.{@tagName(action)},
-                    schemaEnumValues(property),
-                );
+                // std.meta.eql (used by expectEqualSlices for []const u8
+                // elements) compares slice pointers, so equal tag names from
+                // different comptime objects would fail. Compare contents.
+                const expected_values = [_][]const u8{@tagName(action)};
+                const values = schemaEnumValues(property);
+                try std.testing.expectEqual(expected_values.len, values.len);
+                for (expected_values, values) |expected_value, value| {
+                    try std.testing.expectEqualStrings(expected_value, value);
+                }
                 continue;
             }
             try std.testing.expectEqual(

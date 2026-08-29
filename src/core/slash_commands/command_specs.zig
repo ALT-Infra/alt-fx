@@ -1569,6 +1569,27 @@ fn testTopLevelHelpText(alloc: Allocator) ![]u8 {
     return builtin_commands.renderTopLevelHelp(alloc, top_level_help_default_width, "9.8.7");
 }
 
+/// Collapses whitespace runs to single spaces so assertions can match
+/// content that the help renderer wraps across lines at narrower widths.
+fn flattenWhitespaceForTest(alloc: Allocator, text: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+
+    var pending_space = false;
+    for (text) |byte| {
+        if (byte == ' ' or byte == '\n' or byte == '\t' or byte == '\r') {
+            pending_space = out.writer.end > 0;
+            continue;
+        }
+        if (pending_space) {
+            try out.writer.writeByte(' ');
+            pending_space = false;
+        }
+        try out.writer.writeByte(byte);
+    }
+    return try out.toOwnedSlice();
+}
+
 fn stripAnsiForTest(alloc: Allocator, text: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -1611,44 +1632,50 @@ test "rendered top-level help is a complete CLI navigation page" {
     const text = try testTopLevelHelpText(std.testing.allocator);
     defer std.testing.allocator.free(text);
 
+    // Descriptions wrap once the usage column outgrows the default width, so
+    // content assertions match a whitespace-flattened copy while layout
+    // assertions keep the raw rendering.
+    const flat = try flattenWhitespaceForTest(std.testing.allocator, text);
+    defer std.testing.allocator.free(flat);
+
     try std.testing.expect(std.mem.startsWith(u8, text, "𝒇x v9.8.7\nFast, native coding agent for the terminal."));
-    try std.testing.expect(std.mem.find(u8, text, "𝒇x starts an interactive session by default.") != null);
-    try std.testing.expect(std.mem.find(u8, text, "fx <command> [...flags] [...args]") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Commands:") != null);
-    try std.testing.expect(std.mem.find(u8, text, "ask <prompt>") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Run one noninteractive request") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Draft or publish a GitHub issue") != null);
-    try std.testing.expect(std.mem.find(u8, text, "credits|balance") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Show the AI Gateway credit") != null);
-    try std.testing.expect(std.mem.find(u8, text, "balance") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Flags:") != null);
-    try std.testing.expect(std.mem.find(u8, text, "--context-limit <spec>") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Set name=bytes|off; repeatable") != null);
-    try std.testing.expect(std.mem.find(u8, text, "--add-dir <path>") != null);
+    try std.testing.expect(std.mem.find(u8, flat, "𝒇x starts an interactive session by default.") != null);
+    try std.testing.expect(std.mem.find(u8, flat, "fx <command> [...flags] [...args]") != null);
+    try std.testing.expect(std.mem.find(u8, flat, "Commands:") != null);
+    try std.testing.expect(std.mem.find(u8, flat, "ask <prompt>") != null);
+    try std.testing.expect(std.mem.find(u8, flat, "Run one noninteractive request") != null);
+    try std.testing.expect(std.mem.find(u8, flat, "Draft or publish a GitHub issue") != null);
+    try std.testing.expect(std.mem.find(u8, flat, "credits|balance") != null);
+    try std.testing.expect(std.mem.find(u8, flat, "Show the AI Gateway credit") != null);
+    try std.testing.expect(std.mem.find(u8, flat, "balance") != null);
+    try std.testing.expect(std.mem.find(u8, flat, "Flags:") != null);
+    try std.testing.expect(std.mem.find(u8, flat, "--context-limit <spec>") != null);
+    try std.testing.expect(std.mem.find(u8, flat, "Set name=bytes|off; repeatable") != null);
+    try std.testing.expect(std.mem.find(u8, flat, "--add-dir <path>") != null);
     try std.testing.expect(std.mem.find(u8, text, "-c, --continue") != null);
     try std.testing.expect(std.mem.find(u8, text, "-r") != null);
     try std.testing.expect(std.mem.find(u8, text, "-c, -r, --continue") == null);
-    try std.testing.expect(std.mem.find(u8, text, "--resume [last|<id>]") != null);
-    try std.testing.expect(std.mem.find(u8, text, "--resume-last") != null);
-    try std.testing.expect(std.mem.find(u8, text, "-v, --version") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Must appear before the command. Accepted names:") == null);
-    try std.testing.expect(std.mem.find(u8, text, "skill_description_bytes, skill_catalog_bytes") == null);
-    try std.testing.expect(std.mem.find(u8, text, "FX_EXPERIMENTAL_WORKSPACE_ACCESS=1") == null);
-    try std.testing.expect(std.mem.find(u8, text, "Supported for interactive, resume, ask, ACP, PR, and issue launches") == null);
-    try std.testing.expect(std.mem.find(u8, text, "Examples:") != null);
-    try std.testing.expect(std.mem.find(u8, text, "fx ask \"Explain the changes in this repository\"") != null);
-    try std.testing.expect(std.mem.find(u8, text, "fx session resume last") != null);
-    try std.testing.expect(std.mem.find(u8, text, "session resume [last|id]") != null);
-    try std.testing.expect(std.mem.find(u8, text, "fx status --json") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Run `/help` inside an interactive session for slash commands.") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Learn more about 𝒇x:  https://fx.sh/docs") != null);
-    try std.testing.expect(std.mem.find(u8, text, "\nReport a problem:     run `/feedback` inside 𝒇x\n") != null);
+    try std.testing.expect(std.mem.find(u8, flat, "--resume [last|<id>]") != null);
+    try std.testing.expect(std.mem.find(u8, flat, "--resume-last") != null);
+    try std.testing.expect(std.mem.find(u8, flat, "-v, --version") != null);
+    try std.testing.expect(std.mem.find(u8, flat, "Must appear before the command. Accepted names:") == null);
+    try std.testing.expect(std.mem.find(u8, flat, "skill_description_bytes, skill_catalog_bytes") == null);
+    try std.testing.expect(std.mem.find(u8, flat, "FX_EXPERIMENTAL_WORKSPACE_ACCESS=1") == null);
+    try std.testing.expect(std.mem.find(u8, flat, "Supported for interactive, resume, ask, ACP, PR, and issue launches") == null);
+    try std.testing.expect(std.mem.find(u8, flat, "Examples:") != null);
+    try std.testing.expect(std.mem.find(u8, flat, "fx ask \"Explain the changes in this repository\"") != null);
+    try std.testing.expect(std.mem.find(u8, flat, "fx session resume last") != null);
+    try std.testing.expect(std.mem.find(u8, flat, "session resume [last|id]") != null);
+    try std.testing.expect(std.mem.find(u8, flat, "fx status --json") != null);
+    try std.testing.expect(std.mem.find(u8, flat, "Run `/help` inside an interactive session for slash commands.") != null);
+    try std.testing.expect(std.mem.find(u8, flat, "Learn more about 𝒇x: https://fx.sh/docs") != null);
+    try std.testing.expect(std.mem.find(u8, flat, "Report a problem: run `/feedback` inside 𝒇x") != null);
     try std.testing.expect(std.mem.find(u8, text, "\n\n\nRun `fx <command> --help`") == null);
     try std.testing.expect(std.mem.find(u8, text, "Start:") == null);
     try std.testing.expect(std.mem.find(u8, text, "  Work      ") == null);
     try std.testing.expect(std.mem.find(u8, text, "More:") == null);
-    try std.testing.expect(std.mem.find(u8, text, "resume [last|<id>] [--record]") == null);
-    try std.testing.expect(std.mem.find(u8, text, "session migrate <id>|--id <id>") == null);
+    try std.testing.expect(std.mem.find(u8, flat, "resume [last|<id>] [--record]") == null);
+    try std.testing.expect(std.mem.find(u8, flat, "session migrate <id>|--id <id>") == null);
 }
 
 test "terminal top-level help adds styling without changing visible content" {

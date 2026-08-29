@@ -42,6 +42,7 @@ const session_summary_codec = @import("../session/session_summary_codec.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
 const subagent_authority = @import("../subagent/authority.zig");
 const subagent_resume_admission = @import("../subagent/resume_admission.zig");
+const subagent_domain = @import("../subagent/domain.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const builtin_tools = @import("../../builtins/tools.zig");
 const types = @import("../shared/types.zig");
@@ -937,8 +938,12 @@ const SessionPickerLoad = struct {
 fn resumePageLimitForRows(rows: u16) usize {
     // Fill the resume screen: terminal rows minus the composer/divider/hint
     // chrome (4), the menu header (1), the top gap (1), and a trailing
-    // "Load more" row (1). Floored so short terminals still page usefully.
-    return @max(@as(usize, rows -| 7), session_store.default_resume_page_limit);
+    // "Load more" row (1). Floored so short terminals still page usefully,
+    // and capped so tall terminals stay within the store page contract.
+    return @min(
+        @max(@as(usize, rows -| 7), session_store.default_resume_page_limit),
+        subagent_domain.max_page_limit,
+    );
 }
 
 fn tryListResumableIndexPageForScope(

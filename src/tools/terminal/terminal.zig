@@ -2376,8 +2376,11 @@ test "terminal start canonicalizes interactive command representations" {
         },
     };
 
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
     for (cases) |case| {
-        const request = try startRequest(std.testing.allocator, &case.input, "/tmp", &.{}, null);
+        const request = try startRequest(arena_state.allocator(), &case.input, "/tmp", &.{}, null);
         try request.validate();
         switch (request) {
             .start => |start| {

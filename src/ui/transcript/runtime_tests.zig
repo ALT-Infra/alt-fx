@@ -13213,7 +13213,9 @@ test "updateRawBytesEntry updates modal entry in place after intervening append"
 
 test "tool status raw entry updates after command output appends" {
     const alloc = std.testing.allocator;
-    var runtime = TranscriptRuntime{};
+    var runtime = TranscriptRuntime{
+        .layout = .{ .rows = 24, .cols = 80, .content_bottom = 21, .divider_top_row = 22, .input_row = 23, .divider_bottom_row = 24, .hint_row = 22 },
+    };
     defer runtime.deinit(alloc);
     var metrics = Metrics{};
 
@@ -13231,8 +13233,19 @@ test "tool status raw entry updates after command output appends" {
     var source = try runtime.prepareTranscriptSource(alloc, null);
     defer source.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, source.bytes, "Ran npm test") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source.bytes, "│ ok") != null);
     try std.testing.expect(std.mem.indexOf(u8, source.bytes, "Running npm test") == null);
+    // The compact source hides command output rows by design; the retained
+    // block still renders them for the full transcript.
+    try std.testing.expect(std.mem.indexOf(u8, source.bytes, "│ ok") == null);
+    try std.testing.expectEqual(@as(usize, 1), runtime.command_output_blocks.items.len);
+    var projection = try command_output_runtime.renderCompactCommandOutput(
+        alloc,
+        runtime.command_output_blocks.items[0],
+        runtime.command_output_render,
+        80,
+    );
+    defer projection.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, projection.bytes.items, "│ ok") != null);
 }
 
 test "advanceCursor row advance matches visualRowsForLine - 1 for wrap-exact content" {

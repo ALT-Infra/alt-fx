@@ -1624,30 +1624,69 @@ test "explicit captured profiles execute exact shells without synthetic stderr" 
     try std.testing.expect(std.mem.find(u8, clean.output, "profile-stdout") != null);
     try std.testing.expect(std.mem.find(u8, clean.output, "profile-stderr") != null);
 
+    // The user-profile invocations must observe only the shell's own output,
+    // so run them against a controlled quiet HOME instead of the developer's
+    // real startup files (which may legitimately print their own noise).
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    const quiet_home = try io_mod.dirRealpathAlloc(arena, tmp.dir, "home");
+    const quiet_home_wrapped = try shellQuote(arena, quiet_home);
+
+    const BashWrapper = struct {
+        fn write(dir: std.Io.Dir, arena_: Allocator, home: []const u8, shell_name: []const u8) ![]u8 {
+            const wrapper_dir = "wrapper";
+            dir.createDirPath(io_mod.getIo(), wrapper_dir) catch |err| switch (err) {
+                error.PathAlreadyExists => {},
+                else => return err,
+            };
+            const wrapper_path = try std.fs.path.join(arena_, &.{ "wrapper", shell_name });
+            var file = try dir.createFile(
+                io_mod.getIo(),
+                wrapper_path,
+                .{ .truncate = true },
+            );
+            defer file.close(io_mod.getIo());
+            const source = try std.fmt.allocPrint(
+                arena_,
+                "#!/bin/sh\nexport HOME={s}\nexport ZDOTDIR={s}\nunset BASH_ENV ENV\nexec /bin/{s} \"$@\"\n",
+                .{ home, home, shell_name },
+            );
+            try file.writeStreamingAll(io_mod.getIo(), source);
+            try file.setPermissions(
+                io_mod.getIo(),
+                std.Io.File.Permissions.fromMode(0o700),
+            );
+            return try io_mod.dirRealpathAlloc(arena_, dir, wrapper_path);
+        }
+    };
+    const bash_wrapper = try BashWrapper.write(tmp.dir, arena, quiet_home_wrapped, "bash");
     const user = try executeCommandInEnvironment(
         cfg,
         arena,
         command,
         "/tmp",
-        .{ .user = shell_path },
+        .{ .user = bash_wrapper },
     );
     try std.testing.expectEqualStrings(
         "exit_code=0\n<stdout>\nprofile-stdout\n</stdout>\n<stderr>\nprofile-stderr\n</stderr>\n",
         user.output,
     );
-    if (std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{})) {
-        const zsh_user = try executeCommandInEnvironment(
-            cfg,
-            arena,
-            command,
-            "/tmp",
-            .{ .user = "/bin/zsh" },
-        );
-        try std.testing.expectEqualStrings(
-            "exit_code=0\n<stdout>\nprofile-stdout\n</stdout>\n<stderr>\nprofile-stderr\n</stderr>\n",
-            zsh_user.output,
-        );
-    } else |_| {}
+
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
+        return error.SkipZigTest;
+    const zsh_wrapper = try BashWrapper.write(tmp.dir, arena, quiet_home_wrapped, "zsh");
+    const zsh_user = try executeCommandInEnvironment(
+        cfg,
+        arena,
+        command,
+        "/tmp",
+        .{ .user = zsh_wrapper },
+    );
+    try std.testing.expectEqualStrings(
+        "exit_code=0\n<stdout>\nprofile-stdout\n</stdout>\n<stderr>\nprofile-stderr\n</stderr>\n",
+        zsh_user.output,
+    );
 }
 
 test "zsh user profile reports natural SIGTERM after alias-safe startup" {
