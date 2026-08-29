@@ -477,26 +477,35 @@ class MacosSigningWorkflowTests(unittest.TestCase):
 
         self.assertIn("build-macos-x86_64:", release)
         self.assertIn("runs-on: macos-15-intel", release)
-        self.assertEqual(1, release.count("environment: apple-signing"))
+        self.assertIn("sign-macos-arm64:", release)
+        self.assertEqual(2, release.count("environment: apple-signing"))
         self.assertIn("scripts/sign-and-notarize-macos.sh zig-out/bin/fx", release)
-        self.assertIn("sign-stable-release:", pgso)
-        self.assertIn("needs: aggregate", pgso)
-        self.assertEqual(1, pgso.count("environment: apple-signing"))
+        self.assertNotIn("sign-stable-release:", pgso)
+        self.assertNotIn("package_release", pgso)
+        self.assertNotIn("environment: apple-signing", pgso)
         self.assertIn(
             "scripts/sign-and-notarize-macos.sh "
             '"$RUNNER_TEMP/fx-pgso-aggregate/candidate/fx"',
-            pgso,
+            release,
         )
-        self.assertIn("if: inputs.package_release", pgso)
         arm64_caller = release.split("  build-macos-arm64:\n", 1)[1].split(
-            "\n  release:\n", 1
+            "\n  sign-macos-arm64:\n", 1
         )[0]
         self.assertNotIn("secrets:", arm64_caller)
+        self.assertNotIn("package_release", arm64_caller)
+        sign_release = release.split("  sign-macos-arm64:\n", 1)[1].split(
+            "\n  release:\n", 1
+        )[0]
+        self.assertIn("needs: [check-version, build-macos-arm64]", sign_release)
+        self.assertIn("environment: apple-signing", sign_release)
+        self.assertIn(
+            "needs: [check-version, build-linux, build-macos-x86_64, sign-macos-arm64]",
+            release,
+        )
         workflow_call = pgso.split("  workflow_dispatch:\n", 1)[0]
         aggregate = pgso.split("  aggregate:\n", 1)[1].split(
-            "\n  sign-stable-release:\n", 1
+            "\n  sign-macos-arm64:\n", 1
         )[0]
-        sign_release = pgso.split("  sign-stable-release:\n", 1)[1]
         self.assertIn(
             "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
             sign_release,
@@ -520,7 +529,9 @@ class MacosSigningWorkflowTests(unittest.TestCase):
             self.assertIn(secret_reference, sign_release)
             self.assertNotIn(secret_name, workflow_call)
             self.assertNotIn(secret_name, aggregate)
+            self.assertNotIn(secret_name, pgso)
             self.assertNotIn(secret_name, dev_release)
+        self.assertNotIn("sign-and-notarize-macos", pgso)
         self.assertNotIn("sign-and-notarize-macos", dev_release)
 
     def test_pgso_release_chain_pins_every_external_action(self) -> None:
