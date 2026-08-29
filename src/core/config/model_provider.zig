@@ -28,17 +28,19 @@ pub fn requiredCredentialSource(provider: ProviderId) ?types.CredentialSource {
         .gateway => null,
         .codex => .chatgpt_subscription,
         .grok => .grok_subscription,
-        .opencode => .opencode_api_key,
-        .cline => .cline_api_key,
+        .opencode => .opencode_anonymous,
+        .cline => .cline_account,
     };
 }
 
 pub fn authorizesCredential(provider: ProviderId, source: ?types.CredentialSource) bool {
     const selected = source orelse return false;
-    if (requiredCredentialSource(provider)) |required| return selected == required;
     return switch (provider) {
-        .gateway => selected != .chatgpt_subscription and selected != .grok_subscription and selected != .opencode_api_key and selected != .cline_api_key,
-        .codex, .grok, .opencode, .cline => unreachable,
+        .gateway => selected != .chatgpt_subscription and selected != .grok_subscription and selected != .opencode_anonymous and selected != .opencode_api_key and selected != .cline_account and selected != .cline_api_key,
+        .codex => selected == .chatgpt_subscription,
+        .grok => selected == .grok_subscription,
+        .opencode => selected == .opencode_anonymous or selected == .opencode_api_key,
+        .cline => selected == .cline_account or selected == .cline_api_key,
     };
 }
 
@@ -53,10 +55,12 @@ test "explicit providers authorize only their own credential origins" {
     try std.testing.expect(!authorizesCredential(.grok, .chatgpt_subscription));
     try std.testing.expect(!authorizesCredential(.gateway, .grok_subscription));
     try std.testing.expect(authorizesCredential(.opencode, .opencode_api_key));
+    try std.testing.expect(authorizesCredential(.opencode, .opencode_anonymous));
     try std.testing.expect(!authorizesCredential(.gateway, .opencode_api_key));
     try std.testing.expect(authorizesCredential(.cline, .cline_api_key));
+    try std.testing.expect(authorizesCredential(.cline, .cline_account));
     try std.testing.expect(!authorizesCredential(.gateway, .cline_api_key));
-    try std.testing.expectEqual(types.CredentialSource.opencode_api_key, requiredCredentialSource(.opencode).?);
+    try std.testing.expectEqual(types.CredentialSource.opencode_anonymous, requiredCredentialSource(.opencode).?);
     try std.testing.expect(requiredCredentialSource(.gateway) == null);
 }
 

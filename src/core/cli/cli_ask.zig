@@ -1516,6 +1516,8 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
 
     var owned_resumed_model: ?[]u8 = null;
     defer if (owned_resumed_model) |model| alloc.free(model);
+    var owned_authorized_model: ?[]u8 = null;
+    defer if (owned_authorized_model) |model| alloc.free(model);
     var ctx = AskContext.init(alloc, cfg, options.deps, startup.workspace_root);
     defer ctx.deinit();
     if (options.save_session) {
@@ -1622,6 +1624,8 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         credential.gatewayTeam(),
         credential.accountId(),
     );
+    owned_authorized_model = try reconcileProviderModelAuthorization(&ctx);
+    if (owned_authorized_model) |model| ctx.model = model;
     if (comptime @import("builtin").os.tag != .wasi) {
         if (ctx.cfg.provider_set.select(ctx.provider).deferred_usage != null) {
             ctx.session.usage.replaceProviderReconciliationCredential(
@@ -1878,6 +1882,26 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     var result = try takePromptRunResult(&ctx, alloc);
     finalizeFreshAuthSession(&ctx, &result);
     return result;
+}
+
+fn reconcileProviderModelAuthorization(ctx: *AskContext) !?[]u8 {
+    if (ctx.provider != .opencode or ctx.credential_source != .opencode_anonymous) return null;
+    const catalog_provider = ctx.cfg.provider_set.select(.opencode).model_catalog orelse
+        return error.OpenCodeModelCatalogUnavailable;
+    const result = try catalog_provider.fetch(ctx.alloc, .{
+        .access = ctx.model_catalog_access,
+        .endpoint = ctx.cfg.gateway_models_path,
+        .cancel_flag = ctx.cancelFlag(),
+        .view = .full,
+    });
+    var catalog = switch (result) {
+        .catalog => |catalog| catalog,
+        .failure => |failure| return failure.asError(),
+    };
+    defer model_catalog.freeModelCatalog(ctx.alloc, &catalog);
+    for (catalog.items) |entry| if (std.mem.eql(u8, entry.id, ctx.model)) return null;
+    if (catalog.items.len == 0) return error.OpenCodeAnonymousCatalogEmpty;
+    return @as(?[]u8, try ctx.alloc.dupe(u8, catalog.items[0].id));
 }
 
 fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {

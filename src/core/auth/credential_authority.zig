@@ -25,11 +25,13 @@ pub fn derive(
         .ai_gateway_api_key,
         .fx_login,
         .stored_key,
+        .opencode_anonymous,
         .opencode_api_key,
         .cline_api_key,
         => hash.update("\x00slot\x00"),
         .chatgpt_subscription,
         .grok_subscription,
+        .cline_account,
         => {
             const account = account_id orelse return null;
             if (account.len == 0) return null;

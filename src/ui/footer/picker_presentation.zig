@@ -556,6 +556,8 @@ fn composeSignInPickerRow(
             "   Sign in with Codex"
         else if (source == .grok_subscription)
             "   Sign in with Grok"
+        else if (source == .cline_account)
+            "   Sign in with Cline"
         else
             "   Sign in with Vercel",
         1, 4 => "",
@@ -567,6 +569,8 @@ fn composeSignInPickerRow(
             "   Open the Codex authorization page"
         else if (source == .grok_subscription)
             "   Open the Grok authorization page"
+        else if (source == .cline_account)
+            "   Open the Cline device authorization page"
         else
             "   Open the Vercel device authorization page",
         3 => if (snapshot.user_code.len == 0)
@@ -2481,6 +2485,35 @@ test "Codex sign-in stage renders a bounded clickable authorization action" {
     try std.testing.expect(std.mem.find(u8, row.items, url) != null);
     try std.testing.expect(std.mem.find(u8, row.items, "\x1b]8;;\x1b\\") != null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 40);
+}
+
+test "Cline device sign-in identifies Cline and preserves its user code" {
+    const alloc = std.testing.allocator;
+    const view = auth_runtime.PickerView{
+        .active = true,
+        .available_sources = .empty,
+        .selected_choice = null,
+        .active_source = null,
+        .include_skip = false,
+        .stage = .sign_in,
+        .sign_in_source = .cline_account,
+        .sign_in = .{
+            .state = .polling,
+            .verification_uri = "https://authkit.cline.bot/device",
+            .user_code = "TEST-CLINE",
+        },
+    };
+    var screen: std.ArrayList(u8) = .empty;
+    defer screen.deinit(alloc);
+    for (0..authPickerRowCount(view)) |row_index| {
+        var row = try composeAuthPickerRow(alloc, view, @intCast(row_index), authPickerRowCount(view), 100);
+        defer row.deinit(alloc);
+        try screen.appendSlice(alloc, row.items);
+        try screen.append(alloc, '\n');
+    }
+    try std.testing.expect(std.mem.find(u8, screen.items, "Sign in with Cline") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "Code   TEST-CLINE") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "Sign in with Vercel") == null);
 }
 
 fn composeAuthPickerTestGrid(

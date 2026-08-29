@@ -29,6 +29,10 @@ const ProtocolOverride = struct {
 
 const ProtocolModel = struct {
     provider: ?ProtocolOverride = null,
+    cost: ?struct {
+        input: f64,
+        output: f64,
+    } = null,
 };
 
 const ProtocolProvider = struct {
@@ -82,7 +86,8 @@ fn fetchCatalogForProvider(
     alloc: std.mem.Allocator,
     input: model_catalog.FetchInput,
 ) std.mem.Allocator.Error!model_catalog.ProviderResult {
-    if (input.access.credentialSource() != .opencode_api_key) {
+    const authenticated = input.access.credentialSource() == .opencode_api_key;
+    if (input.access.credentialSource() != null and !authenticated) {
         return .{ .failure = .{ .category = .authentication, .http_status = .unauthorized } };
     }
 
@@ -116,7 +121,7 @@ fn fetchCatalogForProvider(
     };
     defer alloc.free(protocol_metadata_body);
 
-    const catalog = parseCatalog(alloc, zen_body, go_body, protocol_metadata_body) catch |err| {
+    const catalog = parseCatalog(alloc, zen_body, go_body, protocol_metadata_body, authenticated) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = .{ .category = .malformed_response, .http_status = .ok } };
     };
@@ -211,6 +216,7 @@ fn parseCatalog(
     zen_json: []const u8,
     go_json: []const u8,
     protocol_metadata_json: []const u8,
+    authenticated: bool,
 ) !std.ArrayList(model_catalog.ModelCatalogEntry) {
     var protocol_metadata = try std.json.parseFromSlice(
         ProtocolMetadata,
@@ -221,8 +227,10 @@ fn parseCatalog(
     defer protocol_metadata.deinit();
     var catalog: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
     errdefer model_catalog.freeModelCatalog(alloc, &catalog);
-    try appendSurface(alloc, &catalog, zen_json, "", protocol_metadata.value.opencode);
-    try appendSurface(alloc, &catalog, go_json, go_model_prefix, protocol_metadata.value.@"opencode-go");
+    try appendSurface(alloc, &catalog, zen_json, "", protocol_metadata.value.opencode, !authenticated);
+    if (authenticated) {
+        try appendSurface(alloc, &catalog, go_json, go_model_prefix, protocol_metadata.value.@"opencode-go", false);
+    }
     if (catalog.items.len == 0) return error.InvalidOpenCodeModelCatalog;
     for (catalog.items, 0..) |entry, index| {
         if (!std.mem.endsWith(u8, entry.id, "-free")) continue;
@@ -238,6 +246,7 @@ fn appendSurface(
     body: []const u8,
     id_prefix: []const u8,
     protocol_provider: ProtocolProvider,
+    free_only: bool,
 ) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
@@ -249,6 +258,7 @@ fn appendSurface(
         const raw_id = stringField(value.object, "id") orelse continue;
         if (raw_id.len == 0 or raw_id.len > max_model_id_bytes) continue;
         if (!supportsChatCompletions(protocol_provider, raw_id)) continue;
+        if (free_only and !availableWithoutKey(protocol_provider, raw_id)) continue;
         if (findDuplicate(catalog.items, id_prefix, raw_id)) continue;
         if (catalog.items.len >= max_models_per_surface * 2) return error.OpenCodeModelCatalogTooLarge;
         const id = try std.fmt.allocPrint(alloc, "{s}{s}", .{ id_prefix, raw_id });
@@ -261,6 +271,15 @@ fn appendSurface(
             .has_tool_use = true,
         });
     }
+}
+
+fn availableWithoutKey(provider: ProtocolProvider, model_id: []const u8) bool {
+    if (provider.models.map.get(model_id)) |model| {
+        if (model.cost) |cost| return cost.input == 0 and cost.output == 0;
+    }
+    // OpenCode marks newly launched free models in their live IDs before the
+    // richer models.dev record necessarily catches up.
+    return std.mem.endsWith(u8, model_id, "-free");
 }
 
 fn supportsChatCompletions(provider: ProtocolProvider, model_id: []const u8) bool {
@@ -277,7 +296,7 @@ fn supportsChatCompletions(provider: ProtocolProvider, model_id: []const u8) boo
 }
 
 fn isFreeModel(model: []const u8) bool {
-    return std.mem.endsWith(u8, model, "-free") or std.mem.eql(u8, model, "big-pickle");
+    return std.mem.endsWith(u8, model, "-free");
 }
 
 fn isGoModel(model: []const u8) bool {
@@ -324,7 +343,7 @@ test "parseCatalog merges both surfaces and keeps same-name models as distinct r
     const zen = "{\"object\":\"list\",\"data\":[{\"id\":\"kimi-k3\",\"object\":\"model\"},{\"id\":\"glm-5\",\"object\":\"model\"},{\"id\":\"gpt-5.6-sol\",\"object\":\"model\"}]}";
     const go = "{\"object\":\"list\",\"data\":[{\"id\":\"kimi-k3\",\"object\":\"model\"},{\"id\":\"kimi-k3\",\"object\":\"model\"},{\"id\":\"deepseek-v4-flash\",\"object\":\"model\"},{\"id\":\"minimax-m3\",\"object\":\"model\"}]}";
     const protocols = "{\"opencode\":{\"npm\":\"@ai-sdk/openai-compatible\",\"models\":{\"gpt-5.6-sol\":{\"provider\":{\"npm\":\"@ai-sdk/openai\"}}}},\"opencode-go\":{\"npm\":\"@ai-sdk/openai-compatible\",\"models\":{\"minimax-m3\":{\"provider\":{\"npm\":\"@ai-sdk/anthropic\"}}}}}";
-    var catalog = try parseCatalog(std.testing.allocator, zen, go, protocols);
+    var catalog = try parseCatalog(std.testing.allocator, zen, go, protocols, true);
     defer model_catalog.freeModelCatalog(std.testing.allocator, &catalog);
     try std.testing.expectEqual(@as(usize, 4), catalog.items.len);
     try std.testing.expectEqualStrings("kimi-k3", catalog.items[0].id);
@@ -343,14 +362,14 @@ test "parseCatalog hides live models that require unsupported OpenCode protocols
     const protocols = "{\"opencode\":{\"npm\":\"@ai-sdk/openai-compatible\",\"models\":{\"gpt-5.6-sol\":{\"provider\":{\"npm\":\"@ai-sdk/openai\"}},\"claude-opus-5\":{\"provider\":{\"npm\":\"@ai-sdk/anthropic\"}}}},\"opencode-go\":{\"npm\":\"@ai-sdk/openai-compatible\",\"models\":{\"grok-4.5\":{\"provider\":{\"npm\":\"@ai-sdk/openai\"}},\"minimax-m3\":{\"provider\":{\"npm\":\"@ai-sdk/anthropic\"}}}}}";
     try std.testing.expectError(
         error.InvalidOpenCodeModelCatalog,
-        parseCatalog(std.testing.allocator, unsupported_zen, unsupported_go, protocols),
+        parseCatalog(std.testing.allocator, unsupported_zen, unsupported_go, protocols, true),
     );
 }
 
 test "new live OpenCode models inherit dynamic provider protocol defaults" {
     const zen = "{\"data\":[{\"id\":\"future-zen-model\"}]}";
     const go = "{\"data\":[{\"id\":\"glm-5.3-flash\"},{\"id\":\"future-go-model\"}]}";
-    var catalog = try parseCatalog(std.testing.allocator, zen, go, compatible_protocol_metadata);
+    var catalog = try parseCatalog(std.testing.allocator, zen, go, compatible_protocol_metadata, true);
     defer model_catalog.freeModelCatalog(std.testing.allocator, &catalog);
     try std.testing.expectEqual(@as(usize, 3), catalog.items.len);
     try std.testing.expectEqualStrings("future-zen-model", catalog.items[0].id);
@@ -374,7 +393,7 @@ test "stale OpenCode selection stays on its surface and free tier" {
 test "OpenCode catalog puts explicit free models first" {
     const zen = "{\"data\":[{\"id\":\"deepseek-v4-pro\"},{\"id\":\"x-preview-f-free\"}]}";
     const go = "{\"data\":[{\"id\":\"glm-5.3\"},{\"id\":\"ox-alpha-free\"}]}";
-    var catalog = try parseCatalog(std.testing.allocator, zen, go, compatible_protocol_metadata);
+    var catalog = try parseCatalog(std.testing.allocator, zen, go, compatible_protocol_metadata, true);
     defer model_catalog.freeModelCatalog(std.testing.allocator, &catalog);
     try std.testing.expectEqualStrings("x-preview-f-free", catalog.items[0].id);
     try std.testing.expectEqualStrings("deepseek-v4-pro", catalog.items[1].id);
@@ -383,7 +402,18 @@ test "OpenCode catalog puts explicit free models first" {
 }
 
 test "parseCatalog rejects empty or malformed catalogs" {
-    try std.testing.expectError(error.InvalidOpenCodeModelCatalog, parseCatalog(std.testing.allocator, "{}", "{}", compatible_protocol_metadata));
-    try std.testing.expectError(error.InvalidOpenCodeModelCatalog, parseCatalog(std.testing.allocator, "{\"data\":[]}", "{\"data\":[]}", compatible_protocol_metadata));
-    try std.testing.expectError(error.MissingField, parseCatalog(std.testing.allocator, "{\"data\":[]}", "{\"data\":[]}", "{}"));
+    try std.testing.expectError(error.InvalidOpenCodeModelCatalog, parseCatalog(std.testing.allocator, "{}", "{}", compatible_protocol_metadata, true));
+    try std.testing.expectError(error.InvalidOpenCodeModelCatalog, parseCatalog(std.testing.allocator, "{\"data\":[]}", "{\"data\":[]}", compatible_protocol_metadata, true));
+    try std.testing.expectError(error.MissingField, parseCatalog(std.testing.allocator, "{\"data\":[]}", "{\"data\":[]}", "{}", true));
+}
+
+test "anonymous OpenCode catalog exposes only free Zen chat-completions models" {
+    const zen = "{\"data\":[{\"id\":\"paid-model\"},{\"id\":\"future-model-free\"},{\"id\":\"big-pickle\"}]}";
+    const go = "{\"data\":[{\"id\":\"go-model-free\"}]}";
+    const protocols = "{\"opencode\":{\"npm\":\"@ai-sdk/openai-compatible\",\"models\":{\"big-pickle\":{\"cost\":{\"input\":0,\"output\":0}},\"paid-model\":{\"cost\":{\"input\":1,\"output\":2}}}},\"opencode-go\":{\"npm\":\"@ai-sdk/openai-compatible\",\"models\":{}}}";
+    var catalog = try parseCatalog(std.testing.allocator, zen, go, protocols, false);
+    defer model_catalog.freeModelCatalog(std.testing.allocator, &catalog);
+    try std.testing.expectEqual(@as(usize, 2), catalog.items.len);
+    try std.testing.expectEqualStrings("future-model-free", catalog.items[0].id);
+    try std.testing.expectEqualStrings("big-pickle", catalog.items[1].id);
 }

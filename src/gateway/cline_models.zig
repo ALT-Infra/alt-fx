@@ -5,7 +5,9 @@ const io_mod = @import("../core/shared/io.zig");
 const gateway_client = @import("client.zig");
 
 const catalog_endpoint = "https://api.cline.bot/api/v1/ai/cline/recommended-models";
+const plan_endpoint = "https://api.cline.bot/api/v1/users/me/plan";
 const e2e_catalog_endpoint_env = "FX_E2E_CLINE_MODELS_URL";
+const e2e_plan_endpoint_env = "FX_E2E_CLINE_PLAN_URL";
 const max_catalog_bytes: usize = 2 * 1024 * 1024;
 const max_models: usize = 4096;
 const max_model_id_bytes: usize = 256;
@@ -63,7 +65,11 @@ fn fetchCatalogForProvider(
         return .{ .failure = catalogFetchFailure(err) };
     };
     defer alloc.free(body);
-    const catalog = parseCatalog(alloc, body) catch |err| {
+    const include_cline_pass = if (input.access.authorizationCredential()) |credential|
+        fetchPlanEntitlement(alloc, credential, cancel_flag, deadline) catch false
+    else
+        false;
+    const catalog = parseCatalog(alloc, body, include_cline_pass) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = .{ .category = .malformed_response, .http_status = .ok } };
     };
@@ -148,6 +154,7 @@ fn fetchPublicBody(
 fn parseCatalog(
     alloc: std.mem.Allocator,
     body: []const u8,
+    include_cline_pass: bool,
 ) !std.ArrayList(model_catalog.ModelCatalogEntry) {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
@@ -156,10 +163,76 @@ fn parseCatalog(
     var catalog: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
     errdefer model_catalog.freeModelCatalog(alloc, &catalog);
     if (parsed.value.object.get("free")) |free| try appendTier(alloc, &catalog, free);
-    if (parsed.value.object.get("clinePass")) |cline_pass| try appendTier(alloc, &catalog, cline_pass);
+    if (include_cline_pass) if (parsed.value.object.get("clinePass")) |cline_pass| try appendTier(alloc, &catalog, cline_pass);
     if (catalog.items.len == 0) return error.InvalidClineModelCatalog;
     return catalog;
 }
+
+fn fetchPlanEntitlement(
+    alloc: std.mem.Allocator,
+    credential: []const u8,
+    cancel_flag: *std.atomic.Value(bool),
+    deadline: std.Io.Clock.Timestamp,
+) !bool {
+    const request_url = if (io_mod.getenv(e2e_plan_endpoint_env)) |override| blk: {
+        if (!gateway_client.isLoopbackHttpUrl(override)) return error.InvalidE2EClineEndpoint;
+        break :blk override;
+    } else plan_endpoint;
+    const authorization = try std.fmt.allocPrint(alloc, "Bearer {s}", .{credential});
+    defer alloc.free(authorization);
+    var operation = PlanGetOperation{ .alloc = alloc, .url = request_url, .authorization = authorization };
+    var output = try gateway_client.runBoundedHttpOperation(
+        PlanGetOperation.Output,
+        alloc,
+        cancel_flag,
+        deadline,
+        &operation,
+    );
+    defer output.deinit(alloc);
+    if (output.status != .ok) return false;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, output.body, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    if (parsed.value.object.get("success")) |success| if (success != .bool or !success.bool) return false;
+    const data = parsed.value.object.get("data") orelse return false;
+    return data != .null;
+}
+
+const PlanGetOperation = struct {
+    alloc: std.mem.Allocator,
+    url: []const u8,
+    authorization: []const u8,
+
+    const Output = struct {
+        status: std.http.Status,
+        body: []u8,
+
+        pub fn deinit(self: *Output, alloc: std.mem.Allocator) void {
+            alloc.free(self.body);
+        }
+    };
+
+    pub fn run(self: *@This()) !Output {
+        var client: std.http.Client = .{ .allocator = self.alloc, .io = io_mod.getIo() };
+        defer client.deinit();
+        const uri = try std.Uri.parse(self.url);
+        var request = try client.request(.GET, uri, .{
+            .headers = .{
+                .authorization = .{ .override = self.authorization },
+                .accept_encoding = .omit,
+                .user_agent = .{ .override = gateway_client.user_agent },
+            },
+            .redirect_behavior = .unhandled,
+        });
+        defer request.deinit();
+        try request.sendBodiless();
+        if (request.connection) |connection| try connection.flush();
+        var response = try request.receiveHead(&.{});
+        var transfer: [16 * 1024]u8 = undefined;
+        const body = try response.reader(&transfer).allocRemaining(self.alloc, .limited(64 * 1024));
+        return .{ .status = response.head.status, .body = body };
+    }
+};
 
 fn appendTier(
     alloc: std.mem.Allocator,
@@ -215,7 +288,7 @@ test "Cline catalog exposes live free and ClinePass tiers without frozen IDs" {
     const fixture =
         "{\"free\":[{\"id\":\"future/free-model\"},{\"id\":\"shared/model\"}]," ++
         "\"clinePass\":[{\"id\":\"cline-pass/future-model\"},{\"id\":\"shared/model\"}]}";
-    var catalog = try parseCatalog(std.testing.allocator, fixture);
+    var catalog = try parseCatalog(std.testing.allocator, fixture, true);
     defer model_catalog.freeModelCatalog(std.testing.allocator, &catalog);
     try std.testing.expectEqual(@as(usize, 3), catalog.items.len);
     try std.testing.expectEqualStrings("future/free-model", catalog.items[0].id);
@@ -231,11 +304,11 @@ test "Cline model fallback prefers the live feed order" {
 }
 
 test "Cline catalog tolerates either requested tier being temporarily absent" {
-    var free_only = try parseCatalog(std.testing.allocator, "{\"free\":[{\"id\":\"free/new\"}]}");
+    var free_only = try parseCatalog(std.testing.allocator, "{\"free\":[{\"id\":\"free/new\"}]}", false);
     defer model_catalog.freeModelCatalog(std.testing.allocator, &free_only);
     try std.testing.expectEqual(@as(usize, 1), free_only.items.len);
 
-    var pass_only = try parseCatalog(std.testing.allocator, "{\"clinePass\":[{\"id\":\"cline-pass/new\"}]}");
+    var pass_only = try parseCatalog(std.testing.allocator, "{\"clinePass\":[{\"id\":\"cline-pass/new\"}]}", true);
     defer model_catalog.freeModelCatalog(std.testing.allocator, &pass_only);
     try std.testing.expectEqual(@as(usize, 1), pass_only.items.len);
 }

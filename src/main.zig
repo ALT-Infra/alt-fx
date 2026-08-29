@@ -5320,6 +5320,8 @@ test {
     _ = @import("core/auth/grok_oauth.zig");
     _ = @import("core/auth/opencode_session.zig");
     _ = @import("core/auth/cline_session.zig");
+    _ = @import("core/auth/cline_account_session.zig");
+    _ = @import("core/auth/cline_oauth.zig");
     _ = @import("core/auth/api_key_session.zig");
     _ = @import("core/auth/parallel_session.zig");
     _ = @import("builtins/parallel.zig");

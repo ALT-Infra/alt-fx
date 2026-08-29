@@ -4,6 +4,7 @@ const chatgpt_oauth = @import("chatgpt_oauth.zig");
 const chatgpt_session = @import("chatgpt_session.zig");
 const grok_oauth = @import("grok_oauth.zig");
 const grok_session = @import("grok_session.zig");
+const cline_oauth = @import("cline_oauth.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
@@ -52,6 +53,7 @@ pub const CatalogAuthenticatedSource = enum {
     chatgpt_subscription,
     grok_subscription,
     opencode_api_key,
+    cline_account,
     cline_api_key,
 
     fn credentialSource(self: CatalogAuthenticatedSource) Source {
@@ -63,6 +65,7 @@ pub const CatalogAuthenticatedSource = enum {
             .chatgpt_subscription => .chatgpt_subscription,
             .grok_subscription => .grok_subscription,
             .opencode_api_key => .opencode_api_key,
+            .cline_account => .cline_account,
             .cline_api_key => .cline_api_key,
         };
     }
@@ -198,6 +201,7 @@ pub fn catalogAccessForCredentialAndAccount(
     account_id: ?[]const u8,
 ) CatalogAccess {
     const selected_source = source orelse return .{ .public_only = .no_credential };
+    if (selected_source == .opencode_anonymous) return .{ .public_only = .no_credential };
     const authenticated_source: CatalogAuthenticatedSource = switch (selected_source) {
         .vercel_oidc_token => .vercel_oidc_token,
         .ai_gateway_api_key => .ai_gateway_api_key,
@@ -205,7 +209,9 @@ pub fn catalogAccessForCredentialAndAccount(
         .chatgpt_subscription => .chatgpt_subscription,
         .grok_subscription => .grok_subscription,
         .opencode_api_key => .opencode_api_key,
+        .cline_account => .cline_account,
         .cline_api_key => .cline_api_key,
+        .opencode_anonymous => unreachable,
         .fx_login => blk: {
             const team = team_context orelse
                 return .{ .public_only = .fx_login_team_required };
@@ -219,7 +225,7 @@ pub fn catalogAccessForCredentialAndAccount(
             .source = authenticated_source,
             .credential = credential,
             .team_context = if (model_provider.authorizesCredential(.gateway, selected_source)) team_context else null,
-            .account_id = if (authenticated_source == .grok_subscription) account_id else null,
+            .account_id = if (authenticated_source == .grok_subscription or authenticated_source == .cline_account) account_id else null,
         },
     };
 }
@@ -242,8 +248,8 @@ pub const missing_grok_credential_message = "fx needs a Grok subscription login 
 pub const missing_grok_interactive_credential_message = "Grok needs a subscription login. Run /login, open Connections, then choose Grok subscription.";
 pub const missing_opencode_credential_message = "fx needs an OpenCode API key for this model. Set OPENCODE_API_KEY and run fx login opencode.";
 pub const missing_opencode_interactive_credential_message = "OpenCode needs an API key. Set OPENCODE_API_KEY, then run /login, open Connections, and choose OpenCode API key.";
-pub const missing_cline_credential_message = "fx needs a Cline API key for this model. Set CLINE_API_KEY and run fx login cline.";
-pub const missing_cline_interactive_credential_message = "Cline needs an API key. Set CLINE_API_KEY, then run /login, open Connections, and choose Cline API key.";
+pub const missing_cline_credential_message = "fx needs a Cline account for this model. Run fx login cline.";
+pub const missing_cline_interactive_credential_message = "Cline needs an account sign-in. Run /login, open Connections, and choose Sign in with Cline.";
 pub const unreadable_store_message = "fx could not read the stored API key from " ++ stored_key_backend_label ++ ". A key may be saved but unreadable. Set FX_TRACE_LOG for the failing step, or set AI_GATEWAY_API_KEY.";
 
 test "public credential guidance spells fx lowercase" {
@@ -270,6 +276,14 @@ pub fn missingCredentialMessage(required_source: ?Source, surface: MissingHelpSu
         .opencode_api_key => switch (surface) {
             .cli => missing_opencode_credential_message,
             .interactive => missing_opencode_interactive_credential_message,
+        },
+        .opencode_anonymous => switch (surface) {
+            .cli => "fx could not prepare anonymous OpenCode free-model access.",
+            .interactive => "OpenCode free-model access could not be prepared.",
+        },
+        .cline_account => switch (surface) {
+            .cli => missing_cline_credential_message,
+            .interactive => missing_cline_interactive_credential_message,
         },
         .cline_api_key => switch (surface) {
             .cli => missing_cline_credential_message,
@@ -389,12 +403,23 @@ pub fn resolveForProvider(
             return .{ .credential = credential };
         },
         .opencode => {
-            const credential = try loadSource(alloc, transport, secret_store, .opencode_api_key);
-            return .{ .credential = credential };
+            if (try loadSource(alloc, transport, secret_store, .opencode_api_key)) |credential| {
+                return .{ .credential = credential };
+            }
+            return .{ .credential = .{
+                .token = try alloc.dupe(u8, ""),
+                .source = .opencode_anonymous,
+            } };
         },
         .cline => {
-            const credential = try loadSource(alloc, transport, secret_store, .cline_api_key);
-            return .{ .credential = credential };
+            const account = switch (mode) {
+                .stored => try loadClineAccountCredential(alloc, transport, .stored),
+                .refresh_if_needed => try loadClineAccountCredential(alloc, transport, .if_needed),
+            };
+            if (account) |credential| {
+                return .{ .credential = credential };
+            }
+            return .{ .credential = try loadSource(alloc, transport, secret_store, .cline_api_key) };
         },
         .gateway => {},
     }
@@ -513,6 +538,14 @@ fn loadPreferredSource(
             .stored => loadStoredGrokCredential(alloc),
             .refresh_if_needed => loadGrokCredential(alloc, transport, .if_needed),
         },
+        .cline_account => switch (mode) {
+            .stored => loadClineAccountCredential(alloc, transport, .stored),
+            .refresh_if_needed => loadClineAccountCredential(alloc, transport, .if_needed),
+        },
+        .opencode_anonymous => .{
+            .token = try alloc.dupe(u8, ""),
+            .source = .opencode_anonymous,
+        },
         else => loadSource(alloc, transport, secret_store, source),
     };
 }
@@ -530,7 +563,9 @@ pub fn loadSource(
         .stored_key => loadStoredKeyCredential(alloc, secret_store),
         .chatgpt_subscription => loadChatGptCredential(alloc, transport, .if_needed),
         .grok_subscription => loadGrokCredential(alloc, transport, .if_needed),
+        .opencode_anonymous => .{ .token = try alloc.dupe(u8, ""), .source = source },
         .opencode_api_key => loadOpenCodeApiKeyCredential(alloc),
+        .cline_account => loadClineAccountCredential(alloc, transport, .if_needed),
         .cline_api_key => loadClineApiKeyCredential(alloc),
     };
 }
@@ -557,7 +592,9 @@ pub fn sourceExists(
         },
         .chatgpt_subscription => chatgpt_oauth.sourceExists(alloc),
         .grok_subscription => grok_oauth.sourceExists(alloc),
+        .opencode_anonymous => false,
         .opencode_api_key => try openCodeFileKeyExists(alloc),
+        .cline_account => cline_oauth.sourceExists(alloc),
         .cline_api_key => try clineFileKeyExists(alloc),
         .stored_key => blk: {
             if (secret_store.isDisabled()) break :blk false;
@@ -659,6 +696,25 @@ fn loadClineApiKeyCredential(alloc: std.mem.Allocator) !?Credential {
     return .{ .token = try alloc.dupe(u8, stored.api_key), .source = .cline_api_key };
 }
 
+fn loadClineAccountCredential(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    mode: cline_oauth.RefreshMode,
+) !?Credential {
+    var access = (try cline_oauth.loadAccess(alloc, transport, mode)) orelse return null;
+    defer access.deinit(alloc);
+    const token = access.access_token;
+    access.access_token = &.{};
+    const account_id = access.account_id;
+    access.account_id = &.{};
+    return .{
+        .token = token,
+        .source = .cline_account,
+        .account_id = account_id,
+        .refresh_after_ms = access.refresh_after_ms,
+    };
+}
+
 fn loadChatGptCredential(
     alloc: std.mem.Allocator,
     transport: oauth_transport.Provider,
@@ -756,6 +812,13 @@ pub fn refreshGrokCredential(
     return loadGrokCredential(alloc, transport, .force);
 }
 
+pub fn refreshClineAccountCredential(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+) !?Credential {
+    return loadClineAccountCredential(alloc, transport, .force);
+}
+
 fn refreshFxLoginCredentialLocked(
     alloc: std.mem.Allocator,
     transport: oauth_transport.Provider,
@@ -848,13 +911,15 @@ pub fn sourceLabel(source: Source) []const u8 {
         .stored_key => "stored API key (" ++ stored_key_backend_label ++ ")",
         .chatgpt_subscription => "Codex subscription",
         .grok_subscription => "Grok subscription",
+        .opencode_anonymous => "OpenCode free access",
         .opencode_api_key => "OpenCode API key",
+        .cline_account => "Cline account",
         .cline_api_key => "Cline API key",
     };
 }
 
 pub fn sourceRefreshable(source: Source) bool {
-    return source == .fx_login or source == .chatgpt_subscription or source == .grok_subscription;
+    return source == .fx_login or source == .chatgpt_subscription or source == .grok_subscription or source == .cline_account;
 }
 
 test "stored key label discloses the backend that answered" {

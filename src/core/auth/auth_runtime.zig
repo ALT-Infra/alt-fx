@@ -4,6 +4,7 @@ const auth_transition = @import("auth_transition.zig");
 const credentials = @import("credentials.zig");
 const chatgpt_oauth = @import("chatgpt_oauth.zig");
 const grok_oauth = @import("grok_oauth.zig");
+const cline_oauth = @import("cline_oauth.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const login_flow = @import("login_flow.zig");
@@ -34,6 +35,7 @@ const credential_source_order = [_]credentials.Source{
     .chatgpt_subscription,
     .grok_subscription,
     .opencode_api_key,
+    .cline_account,
     .cline_api_key,
 };
 
@@ -168,6 +170,10 @@ fn loadCredentialForRefresh(
         .grok_subscription => switch (mode) {
             .if_needed => credentials.loadSource(alloc, transport, host.unavailable_secret_store, source),
             .force => credentials.refreshGrokCredential(alloc, transport),
+        },
+        .cline_account => switch (mode) {
+            .if_needed => (try credentials.loadSource(alloc, transport, host.unavailable_secret_store, source)) orelse return null,
+            .force => (try credentials.refreshClineAccountCredential(alloc, transport)) orelse return null,
         },
         else => null,
     };
@@ -732,7 +738,7 @@ pub const PickerView = struct {
                 .login => "Sign in with Vercel",
                 .chatgpt_login => "Sign in with Codex",
                 .grok_login => "Sign in with Grok",
-                .opencode_login => "Sign in with OpenCode",
+                .opencode_login => "Add OpenCode API key",
                 .cline_login => "Sign in with Cline",
                 .setup => if (self.include_skip) "Add an API key" else "API key",
                 .change_team => "Change team",
@@ -754,7 +760,7 @@ pub const PickerView = struct {
                 .chatgpt_login => if (self.available_sources.contains(.chatgpt_subscription)) "connected" else "",
                 .grok_login => if (self.available_sources.contains(.grok_subscription)) "connected" else "",
                 .opencode_login => if (self.available_sources.contains(.opencode_api_key)) "connected" else "",
-                .cline_login => if (self.available_sources.contains(.cline_api_key)) "connected" else "",
+                .cline_login => if (self.available_sources.contains(.cline_account) or self.available_sources.contains(.cline_api_key)) "connected" else "",
                 .setup, .switch_credential, .switch_provider => "",
                 .automatic => "use the first available source",
                 .change_team => if (self.fx_login_session_available) "choose a team" else "sign in first",
@@ -921,7 +927,15 @@ pub fn loadStatusSnapshotForProvider(
         error.OutOfMemory => return err,
         else => false,
     };
-    const cline_connected = credentials.sourceExists(
+    const cline_account_connected = credentials.sourceExists(
+        alloc,
+        secret_store,
+        .cline_account,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => false,
+    };
+    const cline_key_connected = credentials.sourceExists(
         alloc,
         secret_store,
         .cline_api_key,
@@ -929,6 +943,7 @@ pub fn loadStatusSnapshotForProvider(
         error.OutOfMemory => return err,
         else => false,
     };
+    const cline_connected = cline_account_connected or cline_key_connected;
     // Resolves in `.stored` mode: a diagnostic must not refresh, because refreshing
     // rewrites the session file and performs network I/O. It reports the expired state
     // instead of repairing it.
@@ -1207,7 +1222,7 @@ pub const Runtime = struct {
         const chatgpt_connected = self.source_inventory.contains(.chatgpt_subscription);
         const grok_connected = self.source_inventory.contains(.grok_subscription);
         const opencode_connected = self.source_inventory.contains(.opencode_api_key);
-        const cline_connected = self.source_inventory.contains(.cline_api_key);
+        const cline_connected = self.source_inventory.contains(.cline_account) or self.source_inventory.contains(.cline_api_key);
         const credential = self.selected_credential orelse return .{
             .gateway_connected = gateway_connected,
             .chatgpt_connected = chatgpt_connected,
@@ -1543,6 +1558,16 @@ pub const Runtime = struct {
         return self.openSignInPickerWithParent(alloc, false, .grok_subscription);
     }
 
+    pub fn openClineSignInPickerFromRoot(self: *Self, alloc: Allocator) !bool {
+        if (comptime host_target.is_wasm) return error.ClineOAuthUnavailable;
+        return self.openSignInPickerWithParent(alloc, true, .cline_account);
+    }
+
+    pub fn openClineSignInPickerForProviderSwitch(self: *Self, alloc: Allocator) !bool {
+        if (comptime host_target.is_wasm) return error.ClineOAuthUnavailable;
+        return self.openSignInPickerWithParent(alloc, false, .cline_account);
+    }
+
     fn openSignInPickerWithParent(
         self: *Self,
         alloc: Allocator,
@@ -1554,6 +1579,7 @@ pub const Runtime = struct {
             .fx_login => try self.sign_in_flow.start(alloc, self.oauth_transport),
             .chatgpt_subscription => try chatgpt_oauth.startSignIn(&self.sign_in_flow, alloc, self.oauth_transport),
             .grok_subscription => try grok_oauth.startSignIn(&self.sign_in_flow, alloc, self.oauth_transport),
+            .cline_account => try cline_oauth.startSignIn(&self.sign_in_flow, alloc, self.oauth_transport),
             else => return error.InvalidSignInSource,
         };
         if (!started) return false;
@@ -1755,6 +1781,7 @@ pub const Runtime = struct {
                 self.picker_selection = .{ .action = switch (self.sign_in_source) {
                     .chatgpt_subscription => .chatgpt_login,
                     .grok_subscription => .grok_login,
+                    .cline_account => .cline_login,
                     else => .login,
                 } };
                 return true;
@@ -1788,6 +1815,8 @@ pub const Runtime = struct {
                 .chatgpt_login
             else if (self.sign_in_source == .grok_subscription)
                 .grok_login
+            else if (self.sign_in_source == .cline_account)
+                .cline_login
             else
                 .login,
             .api_key => .setup,
@@ -2081,8 +2110,8 @@ pub const Runtime = struct {
     }
 
     pub fn reconcileAfterClineLogout(self: *Self, alloc: Allocator) !bool {
-        const was_available = self.source_inventory.contains(.cline_api_key);
-        const was_active = self.credentialSource() == .cline_api_key;
+        const was_available = self.source_inventory.contains(.cline_account) or self.source_inventory.contains(.cline_api_key);
+        const was_active = self.credentialSource() == .cline_account or self.credentialSource() == .cline_api_key;
         if (was_active) {
             if (self.selected_credential) |*credential| credential.deinit(alloc);
             self.selected_credential = null;

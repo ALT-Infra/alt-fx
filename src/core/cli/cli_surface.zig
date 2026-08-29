@@ -5,6 +5,7 @@ const app_lifecycle = @import("../app/app_lifecycle.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
 const grok_oauth = @import("../auth/grok_oauth.zig");
+const cline_oauth = @import("../auth/cline_oauth.zig");
 const opencode_session = @import("../auth/opencode_session.zig");
 const cline_session = @import("../auth/cline_session.zig");
 const parallel_session = @import("../auth/parallel_session.zig");
@@ -1051,17 +1052,25 @@ fn runNonInteractiveWithDeps(
                     try writeStdout(deps, "Signed in with OpenCode.\n");
                 },
                 .cline => {
-                    const key = io_mod.getenv("CLINE_API_KEY") orelse {
-                        try writeStderr(deps, "fx login: set CLINE_API_KEY to your Cline API key first\n");
-                        return .handled_failure;
-                    };
-                    var session = cline_session.Session{ .api_key = try alloc.dupe(u8, key) };
-                    defer session.deinit(alloc);
-                    cline_session.saveNewSession(alloc, session) catch |err| {
-                        debug_trace.logf("auth", "Cline login failed err={s}", .{@errorName(err)});
-                        try writeStderr(deps, "fx login: failed to store the Cline API key\n");
-                        return .handled_failure;
-                    };
+                    if (io_mod.getenv("CLINE_API_KEY")) |key| {
+                        var session = cline_session.Session{ .api_key = try alloc.dupe(u8, key) };
+                        defer session.deinit(alloc);
+                        cline_session.saveNewSession(alloc, session) catch |err| {
+                            debug_trace.logf("auth", "Cline API-key login failed err={s}", .{@errorName(err)});
+                            try writeStderr(deps, "fx login: failed to store the Cline API key\n");
+                            return .handled_failure;
+                        };
+                    } else {
+                        cline_oauth.runLogin(
+                            alloc,
+                            cfg.gateway_provider.oauth_transport,
+                            cfg.url_opener,
+                        ) catch |err| {
+                            debug_trace.logf("auth", "Cline account login failed err={s}", .{@errorName(err)});
+                            try writeStderr(deps, "fx login: failed to sign in with Cline\n");
+                            return .handled_failure;
+                        };
+                    }
                     if (!try activateProviderSelection(alloc, cfg, deps, .cline, .provider_login)) {
                         return .handled_failure;
                     }
@@ -1161,24 +1170,24 @@ fn runNonInteractiveWithDeps(
                 };
             }
             if (login_provider == .cline) {
-                const outcome = cline_session.logout() catch {
+                const account_outcome = cline_oauth.logout() catch {
                     try writeStderr(deps, "fx logout: failed to durably remove saved Cline login\n");
                     return .handled_failure;
                 };
-                return switch (outcome) {
-                    .deleted => result: {
-                        try writeStdout(deps, "Signed out of Cline.\n");
-                        break :result .handled_success;
-                    },
-                    .missing => result: {
-                        try writeStdout(deps, "No Cline login session found.\n");
-                        break :result .handled_success;
-                    },
-                    .deleted_not_durable => result: {
-                        try writeStderr(deps, "fx logout: failed to durably remove saved Cline login\n");
-                        break :result .handled_failure;
-                    },
+                const key_outcome = cline_session.logout() catch {
+                    try writeStderr(deps, "fx logout: failed to durably remove saved Cline API key\n");
+                    return .handled_failure;
                 };
+                if (account_outcome == .deleted_not_durable or key_outcome == .deleted_not_durable) {
+                    try writeStderr(deps, "fx logout: failed to durably remove saved Cline login\n");
+                    return .handled_failure;
+                }
+                if (account_outcome == .missing and key_outcome == .missing) {
+                    try writeStdout(deps, "No Cline login session found.\n");
+                } else {
+                    try writeStdout(deps, "Signed out of Cline.\n");
+                }
+                return .handled_success;
             }
             const result = login_flow.logout(alloc, cfg.gateway_provider.oauth_transport) catch |err| switch (err) {
                 error.SessionDeleteFailed => {
@@ -1342,6 +1351,9 @@ fn runNonInteractiveWithDeps(
                 return .handled_failure;
             };
 
+            // Listing models is an online operation. Resolve credentials with the real
+            // transport so an expired account session can be refreshed before its
+            // provider-specific entitlements are queried.
             var startup = try deps.load_startup_state(
                 alloc,
                 cfg.gateway_provider.oauth_transport,
