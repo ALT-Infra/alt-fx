@@ -371,7 +371,9 @@ pub fn executeToolCallAuthorized(
         if (!containsName(authority.tools, request.call.name) and
             !containsName(authority.integrations, request.call.name))
         {
-            return error.LiveToolAuthorityUnavailable;
+            return tool_contracts.failToolExecutionResult(
+                error.LiveToolAuthorityUnavailable,
+            );
         }
         execution_ctx.permission_mode = authority.permission_mode;
         execution_ctx.permission_grants = authority.grants;

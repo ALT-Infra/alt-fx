@@ -1268,13 +1268,13 @@ pub fn Runtime(comptime App: type) type {
             else
                 .{};
             ctx.help_menu = .{};
-            ctx.settings_menu = .{};
+            ctx.settings_menu.active = false;
             ctx.model_menu = if (comptime @hasField(App, "model_cache"))
                 render_input.modelMenuProjection(&app.model_cache)
             else
                 .{};
             ctx.session_menu = .{};
-            ctx.statusline_menu = .{};
+            ctx.statusline_menu.active = false;
             ctx.usage_menu = .{};
             ctx.workspace_menu = .{};
             ctx.upgrade_status = "";

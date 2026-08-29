@@ -308,6 +308,20 @@ pub const PromptRunResult = struct {
     }
 };
 
+inline fn failPromptRunResult(err: anytype) @TypeOf(err)!PromptRunResult {
+    return @errorCast(failPromptRunResultDynamic(err));
+}
+
+noinline fn failPromptRunResultDynamic(err: anyerror) anyerror!PromptRunResult {
+    return err;
+}
+
+test "prompt result failure writer preserves exact error type and identity" {
+    const failure = failPromptRunResult(error.NoPendingRecovery);
+    try std.testing.expect(@TypeOf(failure) == error{NoPendingRecovery}!PromptRunResult);
+    try std.testing.expectError(error.NoPendingRecovery, failure);
+}
+
 /// Resume selector parsed from fx ask --resume.
 const ResumeTarget = session_store.ResumeTarget;
 
@@ -1519,9 +1533,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     var recovery_checkpoint: ?session_codec.RecoveryCheckpoint = null;
     defer if (recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
     if (options.continue_recovery) {
-        const writable = if (ctx.writable) |*value| value else return error.RecoverySessionUnavailable;
+        const writable = if (ctx.writable) |*value| value else return failPromptRunResult(error.RecoverySessionUnavailable);
         const checkpoint = writable.state.recovery_checkpoint orelse
-            return error.NoPendingRecovery;
+            return failPromptRunResult(error.NoPendingRecovery);
         recovery_checkpoint = try checkpoint.dupe(alloc);
         alloc.free(owned_prompt);
         owned_prompt = try alloc.dupe(u8, recovery_checkpoint.?.user.text);
@@ -1596,7 +1610,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             usize,
             restored_image_bounds.next_id,
             current_images.len - 1,
-        ) catch return error.ImageIdOverflow;
+        ) catch return failPromptRunResult(error.ImageIdOverflow);
         for (current_images, 0..) |*image, index| image.id = restored_image_bounds.next_id + index;
         try ctx.captureImageAttachments(current_images);
         try ctx.checkCancellation();
@@ -1669,7 +1683,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             try ctx.writeStderr("fx ask: ");
             try ctx.writeStderr(failure);
             try ctx.writeStderr("\n");
-            return error.McpRequiredServerUnavailable;
+            return failPromptRunResult(error.McpRequiredServerUnavailable);
         }
     }
     const session_child_capability = if (ctx.writable) |*writable|
@@ -2242,6 +2256,22 @@ fn requestToolPermissionOutcomeWithRequest(raw_ctx: *anyopaque, arena: Allocator
     );
 }
 
+inline fn failPermissionOutcome(err: anytype) @TypeOf(err)!command_admission.PermissionOutcome {
+    return @errorCast(failPermissionOutcomeDynamic(err));
+}
+
+noinline fn failPermissionOutcomeDynamic(err: anyerror) anyerror!command_admission.PermissionOutcome {
+    return err;
+}
+
+test "permission outcome failure writer preserves exact error type and identity" {
+    const failure = failPermissionOutcome(error.NonInteractivePermissionRequired);
+    try std.testing.expect(
+        @TypeOf(failure) == error{NonInteractivePermissionRequired}!command_admission.PermissionOutcome,
+    );
+    try std.testing.expectError(error.NonInteractivePermissionRequired, failure);
+}
+
 fn finishCliPermissionOutcome(
     ctx: *AskContext,
     tool_ctx: tool_runtime.Context,
@@ -2282,7 +2312,7 @@ fn finishCliPermissionOutcome(
         "Permission required",
         null,
     );
-    return error.NonInteractivePermissionRequired;
+    return failPermissionOutcome(error.NonInteractivePermissionRequired);
 }
 
 const TestReviewTurn = struct {
