@@ -2964,6 +2964,23 @@ pub fn formatExecutionReplayContext(
     return out.toOwnedSlice() catch return error.OutOfMemory;
 }
 
+test "turn summary alone does not create model execution replay context" {
+    const execution = ExecutionMemory{ .turn_summary = .{
+        .started_at_ms = 100,
+        .completed_at_ms = 250,
+        .thinking_duration_ms = 40,
+        .turn_duration_ms = 150,
+        .token_progress = .{ .input_tokens = 12, .output_tokens = 34 },
+    } };
+
+    const context = try formatExecutionReplayContext(
+        std.testing.allocator,
+        execution,
+    );
+    defer if (context) |value| std.testing.allocator.free(value);
+    try std.testing.expect(context == null);
+}
+
 pub fn formatInterruptedHistoryContext(alloc: Allocator, entry: InterruptedHistoryTurn) ![]u8 {
     _ = entry;
     return alloc.dupe(u8, interrupted_turn_context);

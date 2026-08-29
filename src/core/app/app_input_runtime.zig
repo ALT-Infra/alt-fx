@@ -3782,8 +3782,8 @@ fn readTraceFileForTest(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
 
 fn activateFullTranscriptForRoutingTest(app: *RoutingFakeApp) void {
     app.terminal.alternate_screen_owner = .full_transcript;
-    app.terminal.alternate_mouse_tracking_active = true;
-    app.shell.full_transcript = .{ .depth = .review, .follow_tail = true };
+    app.terminal.alternate_mouse_tracking_active = false;
+    app.shell.full_transcript = .{ .depth = .full, .follow_tail = true };
 }
 
 fn appendRoutingSessionPickerSummary(
@@ -9464,7 +9464,7 @@ test "app_input_runtime inline scroll actions do not open the transcript viewer"
     }
 }
 
-test "app_input_runtime ctrl-o toggles transcript viewer while arrows switch detail" {
+test "app_input_runtime ctrl-o toggles full transcript while arrows preserve detail" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -9481,12 +9481,12 @@ test "app_input_runtime ctrl-o toggles transcript viewer while arrows switch det
         app.shell.render_requests.clearReason(.modal);
         try Runtime(RoutingFakeApp).handleByte(&app, 15, 4096, 100);
         try std.testing.expect(app.terminal.fullTranscriptScreenActive());
-        try std.testing.expect(app.terminal.alternate_mouse_tracking_active);
+        try std.testing.expect(!app.terminal.alternate_mouse_tracking_active);
         try std.testing.expect(app.shell.fullTranscriptActive());
         try std.testing.expect(app.shell.full_transcript.follow_tail);
         try std.testing.expect(app.shell.render_requests.hasReason(.modal));
         try std.testing.expectEqual(
-            transcript_presentation.Depth.review,
+            transcript_presentation.Depth.full,
             app.shell.transcriptPresentationDepth(),
         );
 
@@ -9499,7 +9499,7 @@ test "app_input_runtime ctrl-o toggles transcript viewer while arrows switch det
 
         try feedRoutingBytes(&app, "\x1b[D");
         try std.testing.expectEqual(
-            transcript_presentation.Depth.review,
+            transcript_presentation.Depth.full,
             app.shell.transcriptPresentationDepth(),
         );
 
@@ -9510,7 +9510,7 @@ test "app_input_runtime ctrl-o toggles transcript viewer while arrows switch det
 
         try feedRoutingBytes(&app, "\x1b[111;5u");
         try std.testing.expect(app.terminal.fullTranscriptScreenActive());
-        try std.testing.expect(app.terminal.alternate_mouse_tracking_active);
+        try std.testing.expect(!app.terminal.alternate_mouse_tracking_active);
         try std.testing.expect(app.shell.fullTranscriptActive());
 
         app.shell.render_requests.clearReason(.footer);
@@ -9520,7 +9520,7 @@ test "app_input_runtime ctrl-o toggles transcript viewer while arrows switch det
         try std.testing.expectEqualStrings("ab", app.input_runtime.edit_state.input.items);
         try std.testing.expectEqual(@as(usize, 2), app.input_runtime.edit_state.cursor);
         try std.testing.expectEqual(
-            transcript_presentation.Depth.review,
+            transcript_presentation.Depth.full,
             app.shell.transcriptPresentationDepth(),
         );
         try feedRoutingBytes(&app, "\x1b[C");
@@ -9592,10 +9592,10 @@ test "app_input_runtime ctrl-o toggles transcript viewer while arrows switch det
     defer alloc.free(bytes);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, bytes, "\x1b[?1049h"));
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, bytes, "\x1b[?1049l"));
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, bytes, "\x1b[?1000h"));
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, bytes, "\x1b[?1006h"));
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, bytes, "\x1b[?1000l"));
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, bytes, "\x1b[?1006l"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, bytes, "\x1b[?1000h"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, bytes, "\x1b[?1006h"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, bytes, "\x1b[?1000l"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, bytes, "\x1b[?1006l"));
 }
 
 test "app_input_runtime skills catalog owns ctrl-o without opening another screen" {
@@ -9656,7 +9656,7 @@ test "app_input_runtime full transcript rejects ctrl-x manager entry without los
     try std.testing.expectEqualStrings("ab", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(usize, 2), app.input_runtime.edit_state.cursor);
     try std.testing.expectEqual(
-        transcript_presentation.Depth.review,
+        transcript_presentation.Depth.full,
         app.shell.transcriptPresentationDepth(),
     );
 
@@ -9669,7 +9669,7 @@ test "app_input_runtime full transcript rejects ctrl-x manager entry without los
     try std.testing.expect(app.terminal.fullTranscriptScreenActive());
 }
 
-test "app_input_runtime full transcript page and wheel keys scroll the projection" {
+test "app_input_runtime full transcript page wheel and alternate-scroll keys scroll the projection" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -9691,11 +9691,16 @@ test "app_input_runtime full transcript page and wheel keys scroll the projectio
     try feedRoutingBytes(&app, "\x1b[<65;1;1M");
     try std.testing.expectEqual(@as(u32, 20), app.shell.full_transcript.scroll_rows);
 
+    try feedRoutingBytes(&app, "\x1b[A");
+    try std.testing.expectEqual(@as(u32, 17), app.shell.full_transcript.scroll_rows);
+    try feedRoutingBytes(&app, "\x1b[B");
+    try std.testing.expectEqual(@as(u32, 20), app.shell.full_transcript.scroll_rows);
+
     try std.testing.expect(app.terminal.fullTranscriptScreenActive());
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
 }
 
-test "app_input_runtime ctrl-o opens review and closes active transcript from each encoding" {
+test "app_input_runtime ctrl-o opens full detail and closes it from each encoding" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -9710,7 +9715,7 @@ test "app_input_runtime ctrl-o opens review and closes active transcript from ea
         try feedRoutingBytes(&app, "\x1b[111;5u");
 
         try std.testing.expect(app.terminal.fullTranscriptScreenActive());
-        try std.testing.expect(app.terminal.alternate_mouse_tracking_active);
+        try std.testing.expect(!app.terminal.alternate_mouse_tracking_active);
         try std.testing.expect(app.shell.fullTranscriptActive());
     }
 

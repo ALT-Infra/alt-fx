@@ -94,6 +94,30 @@ test "processQueuedPrompt normal final completion propagates normalized history 
     try expectBodyNotContains(&gateway, 0, "<turn_aborted>");
 }
 
+test "processQueuedPrompt propagates completed summary with durable history" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{
+        .content = "complete",
+        .usage = .{ .input_tokens = 12, .output_tokens = 34 },
+    }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    const propagated_summary = types.historyTurnSummary(
+        hooks.history_turns.items[0],
+    ) orelse return error.TestExpectedTurnSummary;
+    try std.testing.expectEqual(
+        hooks.finish_summary.?,
+        propagated_summary,
+    );
+}
+
 test "processQueuedPrompt pauses missing finish without synthesizing output" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{.{ .omit_finish = true }};
@@ -231,6 +255,10 @@ test "processQueuedPrompt preserves finish precedence over malformed argument re
                 @as(usize, 0),
                 hooks.history_turns.items[0].assistant.execution.tool_steps.len,
             );
+            const propagated_summary = types.historyTurnSummary(
+                hooks.history_turns.items[0],
+            ) orelse return error.TestExpectedTurnSummary;
+            try std.testing.expectEqual(hooks.finish_summary.?, propagated_summary);
         } else {
             try std.testing.expectEqual(@as(usize, 0), hooks.history_turns.items.len);
         }
@@ -382,6 +410,10 @@ test "processQueuedPrompt step limit pushes configured notice and finish event" 
     try std.testing.expect(textContains(&hooks, "custom limit"));
     try std.testing.expectEqualStrings("custom limit", hooks.history_assistant_text.?);
     try std.testing.expectEqualStrings("custom limit", hooks.finish_assistant_text.?);
+    const propagated_summary = types.historyTurnSummary(
+        hooks.history_turns.items[0],
+    ) orelse return error.TestExpectedTurnSummary;
+    try std.testing.expectEqual(hooks.finish_summary.?, propagated_summary);
     try std.testing.expect(hooks.finalized_disposition == null);
 }
 

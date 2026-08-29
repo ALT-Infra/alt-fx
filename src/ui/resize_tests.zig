@@ -3766,7 +3766,7 @@ test "completed replay tool entries fit a constrained terminal" {
     try expectGridContains(&h, "TOOL_REPLAY_FINISHED");
     try std.testing.expect(h.shell.last_visible_transcript_last_row <= h.shell.layout.rows);
 
-    try std.testing.expect(try h.shell.setTranscriptPresentationDepth(h.alloc, .review));
+    try std.testing.expect(try h.shell.setTranscriptPresentationDepth(h.alloc, .full));
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
@@ -4302,7 +4302,7 @@ test "runtime decomposition preserves command output state and replaceable paint
     try std.testing.expect(h.shell.replaceable_last_line);
     try std.testing.expectEqual(status_id, h.shell.replaceableEntryId().?);
 
-    try std.testing.expect(try h.shell.setTranscriptPresentationDepth(h.alloc, .review));
+    try std.testing.expect(try h.shell.setTranscriptPresentationDepth(h.alloc, .full));
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
@@ -4373,7 +4373,7 @@ fn checkQueuedPromptAdmissionPreservesCommittedHistory(resize_before_cancel: boo
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    try std.testing.expect(try h.shell.setTranscriptPresentationDepth(alloc, .review));
+    try std.testing.expect(try h.shell.setTranscriptPresentationDepth(alloc, .full));
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
@@ -4495,7 +4495,7 @@ test "long context notice survives full transcript growth and later compact resi
     try expectGridContains(&h, "compact marker");
     try expectGridNotContains(&h, "xxxxxxxx");
 
-    try std.testing.expect(try h.shell.setTranscriptPresentationDepth(alloc, .review));
+    try std.testing.expect(try h.shell.setTranscriptPresentationDepth(alloc, .full));
     h.frame_redraw = true;
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
@@ -4587,7 +4587,7 @@ test "folded command output survives canonical resize repaint" {
         true,
     );
     try std.testing.expect(
-        try h.shell.setTranscriptPresentationDepth(alloc, .review),
+        try h.shell.setTranscriptPresentationDepth(alloc, .full),
     );
     try h.shell.writeTranscript(
         alloc,

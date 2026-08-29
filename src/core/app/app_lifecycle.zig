@@ -757,7 +757,7 @@ pub fn transitionFullTranscriptForApproval(
     if (!fullTranscriptStateIsActive(state)) return .inactive;
 
     if (approval_screen_active and fullTranscriptStateOwnsAlternateScreen(state)) {
-        try handoffFullTranscriptToApproval(alloc, terminal, shell);
+        try handoffFullTranscriptToApproval(alloc, terminal, shell, metrics);
         return .handed_off;
     }
 
@@ -903,7 +903,7 @@ pub fn openFullTranscript(
         return error.AlternateScreenAlreadyOwned;
     }
 
-    try setFullTranscriptProjection(alloc, shell, .review);
+    try setFullTranscriptProjection(alloc, shell, .full);
     errdefer {
         if (terminal.fullTranscriptScreenActive()) {
             leaveFullTranscriptScreen(terminal, shell, metrics) catch {};
@@ -912,7 +912,6 @@ pub fn openFullTranscript(
     }
 
     try enterFullTranscriptScreen(terminal, shell, metrics);
-    try setFullTranscriptScreenMouseTracking(terminal, shell, metrics, true);
 }
 
 pub fn closeFullTranscript(
@@ -951,10 +950,12 @@ pub fn handoffFullTranscriptToApproval(
     alloc: Allocator,
     terminal: *TerminalState,
     shell: *TranscriptRuntime,
+    metrics: *Metrics,
 ) !void {
     if (!fullTranscriptStateOwnsAlternateScreen(fullTranscriptLifecycleState(terminal, shell))) {
         return error.FullTranscriptScreenNotActive;
     }
+    try setFullTranscriptScreenMouseTracking(terminal, shell, metrics, true);
     const from = shell.transcriptPresentationDepth();
     try setFullTranscriptProjection(alloc, shell, .inline_mode);
     debug_trace.logf(
@@ -962,7 +963,6 @@ pub fn handoffFullTranscriptToApproval(
         "depth_transition from={s} to=inline route=root trigger=approval_handoff",
         .{switch (from) {
             .inline_mode => "inline",
-            .review => "review",
             .full => "full",
         }},
     );
@@ -1469,7 +1469,7 @@ test "approval hands its alternate screen to subagent manager without buffer swa
     try std.testing.expectEqual(@as(u64, 53), failed_terminal.alternate_frame_layout.layout_id);
 }
 
-test "full transcript alternate screen lifecycle restores the shadow terminal once" {
+test "full transcript alternate screen preserves native selection and restores the shadow terminal once" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1498,8 +1498,7 @@ test "full transcript alternate screen lifecycle restores the shadow terminal on
     try enterFullTranscriptScreen(&terminal, &shell, &metrics);
     try std.testing.expectEqual(@as(u64, 0), terminal.alternate_frame_layout.layout_id);
     try enterFullTranscriptScreen(&terminal, &shell, &metrics);
-    try setFullTranscriptScreenMouseTracking(&terminal, &shell, &metrics, true);
-    try setFullTranscriptScreenMouseTracking(&terminal, &shell, &metrics, true);
+    try std.testing.expect(!terminal.alternate_mouse_tracking_active);
     terminal.alternate_frame_layout.layout_id = 42;
     try leaveFullTranscriptScreen(&terminal, &shell, &metrics);
     try std.testing.expectEqual(@as(u64, 0), terminal.alternate_frame_layout.layout_id);
@@ -1513,10 +1512,10 @@ test "full transcript alternate screen lifecycle restores the shadow terminal on
 
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1049h"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1049l"));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1000h"));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1006h"));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1000l"));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1006l"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, bytes, "\x1b[?1000h"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, bytes, "\x1b[?1006h"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, bytes, "\x1b[?1000l"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, bytes, "\x1b[?1006l"));
     try std.testing.expect(!terminal.fullTranscriptScreenActive());
     try std.testing.expect(!terminal.alternate_mouse_tracking_active);
 }
@@ -1606,7 +1605,7 @@ test "full transcript handoff to approval reuses the alternate screen" {
     try writeLifecycleTerminalBytes(&shell, &metrics, "viewer");
     try std.testing.expect(shell.fullTranscriptActive());
     terminal.alternate_frame_layout.layout_id = 43;
-    try handoffFullTranscriptToApproval(alloc, &terminal, &shell);
+    try handoffFullTranscriptToApproval(alloc, &terminal, &shell, &metrics);
     try std.testing.expectEqual(@as(u64, 0), terminal.alternate_frame_layout.layout_id);
     try std.testing.expect(terminal.fileApprovalScreenActive());
     try std.testing.expect(!shell.fullTranscriptActive());
@@ -1664,9 +1663,9 @@ test "full transcript transitions own terminal and projection together" {
     );
     try std.testing.expect(terminal.fullTranscriptScreenActive());
     try std.testing.expect(shell.fullTranscriptActive());
-    try std.testing.expect(terminal.alternate_mouse_tracking_active);
+    try std.testing.expect(!terminal.alternate_mouse_tracking_active);
 
-    try handoffFullTranscriptToApproval(alloc, &terminal, &shell);
+    try handoffFullTranscriptToApproval(alloc, &terminal, &shell, &metrics);
     try std.testing.expectEqual(
         FullTranscriptLifecycleState.inactive,
         fullTranscriptLifecycleState(&terminal, &shell),
@@ -1681,7 +1680,7 @@ test "full transcript transitions own terminal and projection together" {
     try openFullTranscript(alloc, &terminal, &shell, &metrics);
     try std.testing.expect(terminal.fullTranscriptScreenActive());
     try std.testing.expect(shell.fullTranscriptActive());
-    try std.testing.expect(terminal.alternate_mouse_tracking_active);
+    try std.testing.expect(!terminal.alternate_mouse_tracking_active);
     shell.render_requests.clearReason(.footer);
     try closeFullTranscript(alloc, &terminal, &shell, &metrics);
     try closeFullTranscript(alloc, &terminal, &shell, &metrics);
@@ -1719,10 +1718,10 @@ test "full transcript transitions own terminal and projection together" {
 
     try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, bytes, "\x1b[?1049h"));
     try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, bytes, "\x1b[?1049l"));
-    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, bytes, "\x1b[?1000h"));
-    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, bytes, "\x1b[?1006h"));
-    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, bytes, "\x1b[?1000l"));
-    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, bytes, "\x1b[?1006l"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1000h"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1006h"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1000l"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1006l"));
 }
 
 test "full transcript drift recovery is explicit and scoped to lifecycle" {
@@ -1785,7 +1784,7 @@ test "full transcript drift recovery is explicit and scoped to lifecycle" {
         .layout = terminal_only_shell.layout,
     };
     defer projection_only_shell.deinit(alloc);
-    try setFullTranscriptProjection(alloc, &projection_only_shell, .review);
+    try setFullTranscriptProjection(alloc, &projection_only_shell, .full);
 
     var projection_only = TerminalState{};
     try std.testing.expectEqual(

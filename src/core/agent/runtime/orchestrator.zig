@@ -4914,15 +4914,17 @@ fn processQueuedPromptLoop(
                 return;
             }
             const finish_execution = try runtime_execution_memory.buildExecutionMemory(arena, within_turn_suffix.items);
-            const turn: HistoryTurn = .{ .assistant = .{
+            const completed_summary = summary_accumulator.finish();
+            var turn: HistoryTurn = .{ .assistant = .{
                 .user = .{ .text = job.prompt, .images = job.images },
                 .assistant = @constCast(assistant_text),
                 .execution = finish_execution,
             } };
+            types.setHistoryTurnSummary(&turn, completed_summary);
             try deps.propagate_history_turn(deps.ctx, turn);
             try finalization.finish(.failed, .length_limited, .{
                 .turn = try types.dupeHistoryTurn(std.heap.c_allocator, turn),
-                .summary = summary_accumulator.finish(),
+                .summary = completed_summary,
             });
             finish_trace.finish("provider_length");
             return;
@@ -7763,15 +7765,17 @@ fn finishFailedTurnWithNotice(
         arena,
         current_turn_messages,
     );
-    const turn: HistoryTurn = .{ .assistant = .{
+    const completed_summary = summary_accumulator.finish();
+    var turn: HistoryTurn = .{ .assistant = .{
         .user = .{ .text = job.prompt, .images = job.images },
         .assistant = @constCast(notice),
         .execution = execution_memory,
     } };
+    types.setHistoryTurnSummary(&turn, completed_summary);
     try deps.propagate_history_turn(deps.ctx, turn);
     try finalization.finish(.failed, null, .{
         .turn = try types.dupeHistoryTurn(std.heap.c_allocator, turn),
-        .summary = summary_accumulator.finish(),
+        .summary = completed_summary,
     });
     finish_trace.finish(trace_outcome);
 }
@@ -7848,7 +7852,8 @@ fn finishCommonBackgroundTerminal(
         arena,
         current_turn_messages,
     );
-    const turn: HistoryTurn = .{ .background_command = .{
+    const completed_summary = summary_accumulator.finish();
+    var turn: HistoryTurn = .{ .background_command = .{
         .user = .{ .text = job.prompt, .images = job.images },
         .assistant = @constCast(assistant_text),
         .execution = execution_memory,
@@ -7857,11 +7862,12 @@ fn finishCommonBackgroundTerminal(
         .url = if (background.url) |url| @constCast(url) else null,
         .background_record_id = background.background_record_id,
     } };
+    types.setHistoryTurnSummary(&turn, completed_summary);
     const finished = try types.dupeFinishedPrompt(
         std.heap.c_allocator,
         .{
             .turn = turn,
-            .summary = summary_accumulator.finish(),
+            .summary = completed_summary,
         },
     );
 
