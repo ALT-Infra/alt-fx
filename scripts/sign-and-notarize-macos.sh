@@ -61,6 +61,7 @@ printf '%s' "${APPLE_NOTARY_KEY_P8_BASE64}" \
     -T /usr/bin/security
 "${security_bin}" set-key-partition-list \
     -S apple-tool:,apple:,codesign: \
+    -t private \
     -k "${keychain_password}" \
     "${signing_keychain}" >/dev/null
 
