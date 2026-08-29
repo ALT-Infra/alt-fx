@@ -147,6 +147,54 @@ pub fn pollDeviceTokenBounded(
     cancel_flag: *std.atomic.Value(bool),
     deadline: std.Io.Clock.Timestamp,
 ) !PollResult {
+    return pollDeviceTokenBoundedParsing(
+        alloc,
+        transport,
+        metadata,
+        client_id,
+        device_code,
+        cancel_flag,
+        deadline,
+        parseTokenSet,
+    );
+}
+
+/// WorkOS AuthKit CLI-auth device flow. The documented successful
+/// `/user_management/authenticate` response carries `access_token` and
+/// `refresh_token` only: expiry is encoded in the access-token JWT's `exp`
+/// claim and `token_type` is not part of the contract. Callers exchange both
+/// tokens for a provider session immediately, so nothing else is required.
+pub fn pollWorkosDeviceTokenBounded(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    metadata: Metadata,
+    client_id: []const u8,
+    device_code: []const u8,
+    cancel_flag: *std.atomic.Value(bool),
+    deadline: std.Io.Clock.Timestamp,
+) !PollResult {
+    return pollDeviceTokenBoundedParsing(
+        alloc,
+        transport,
+        metadata,
+        client_id,
+        device_code,
+        cancel_flag,
+        deadline,
+        parseWorkosTokenSet,
+    );
+}
+
+fn pollDeviceTokenBoundedParsing(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    metadata: Metadata,
+    client_id: []const u8,
+    device_code: []const u8,
+    cancel_flag: *std.atomic.Value(bool),
+    deadline: std.Io.Clock.Timestamp,
+    comptime parse_success: *const fn (Allocator, []const u8) anyerror!TokenSet,
+) !PollResult {
     var form: FormBody = .{};
     var writer: std.Io.Writer.Allocating = .init(alloc);
     defer writer.deinit();
@@ -170,7 +218,7 @@ pub fn pollDeviceTokenBounded(
         return err;
     };
     defer secret.zeroAndFree(alloc, bytes);
-    return .{ .success = try parseTokenSet(alloc, bytes) };
+    return .{ .success = try parse_success(alloc, bytes) };
 }
 
 pub fn refreshToken(
@@ -294,6 +342,37 @@ pub fn parseTokenSet(alloc: Allocator, bytes: []const u8) !TokenSet {
     };
 }
 
+/// Parses a WorkOS AuthKit CLI-auth token response. Unlike the generic
+/// `parseTokenSet`, this accepts the documented WorkOS contract exactly:
+/// `access_token` and `refresh_token` are required, `token_type` defaults to
+/// `Bearer` when absent, and `expires_in` is not required because the caller
+/// exchanges the tokens for a provider session that carries its own expiry.
+pub fn parseWorkosTokenSet(alloc: Allocator, bytes: []const u8) !TokenSet {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return OAuthError.InvalidOAuthResponse;
+    const object = parsed.value.object;
+    const token_type = if (try dupeOptionalString(alloc, object, "token_type")) |value|
+        value
+    else
+        try alloc.dupe(u8, "Bearer");
+    errdefer alloc.free(token_type);
+    if (!std.ascii.eqlIgnoreCase(token_type, "Bearer")) return OAuthError.InvalidOAuthResponse;
+    const access_token = try dupeRequiredString(alloc, object, "access_token");
+    errdefer secret.zeroAndFree(alloc, access_token);
+    const refresh_token = try dupeRequiredString(alloc, object, "refresh_token");
+    errdefer secret.zeroAndFree(alloc, refresh_token);
+    return .{
+        .access_token = access_token,
+        .refresh_token = refresh_token,
+        // This token is exchanged immediately for the Cline session below;
+        // WorkOS publishes its lifetime in the JWT rather than this response.
+        .expires_in = 0,
+        .scope = try alloc.dupe(u8, ""),
+        .token_type = token_type,
+    };
+}
+
 fn fetchJson(
     alloc: Allocator,
     transport: oauth_transport.Provider,
@@ -399,6 +478,14 @@ fn check_token_set_allocation_failures(alloc: Allocator) !void {
     var token = try parseTokenSet(
         alloc,
         "{\"access_token\":\"access\",\"refresh_token\":\"refresh\",\"expires_in\":3600,\"scope\":\"openid offline_access\",\"token_type\":\"Bearer\"}",
+    );
+    defer token.deinit(alloc);
+}
+
+fn check_workos_token_set_allocation_failures(alloc: Allocator) !void {
+    var token = try parseWorkosTokenSet(
+        alloc,
+        "{\"access_token\":\"access\",\"refresh_token\":\"refresh\"}",
     );
     defer token.deinit(alloc);
 }
@@ -564,10 +651,40 @@ test "oauth parses token set" {
     try std.testing.expectEqual(@as(i64, 3600), token.expires_in);
 }
 
+test "oauth parses WorkOS token set per the documented contract" {
+    var token = try parseWorkosTokenSet(
+        std.testing.allocator,
+        "{\"access_token\":\"access\",\"refresh_token\":\"refresh\"}",
+    );
+    defer token.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("access", token.access_token);
+    try std.testing.expectEqualStrings("refresh", token.refresh_token.?);
+    try std.testing.expectEqualStrings("Bearer", token.token_type);
+    try std.testing.expectEqual(@as(i64, 0), token.expires_in);
+    try std.testing.expectEqualStrings("", token.scope);
+}
+
+test "oauth WorkOS token parser rejects incomplete or malformed responses" {
+    try std.testing.expectError(
+        OAuthError.InvalidOAuthResponse,
+        parseWorkosTokenSet(std.testing.allocator, "{\"refresh_token\":\"refresh\"}"),
+    );
+    try std.testing.expectError(
+        OAuthError.InvalidOAuthResponse,
+        parseWorkosTokenSet(std.testing.allocator, "{\"access_token\":\"access\"}"),
+    );
+    try std.testing.expectError(
+        OAuthError.InvalidOAuthResponse,
+        parseWorkosTokenSet(std.testing.allocator, "{\"access_token\":\"access\",\"refresh_token\":\"refresh\",\"token_type\":\"Basic\"}"),
+    );
+    try std.testing.expectError(OAuthError.InvalidOAuthResponse, parseWorkosTokenSet(std.testing.allocator, "[]"));
+}
+
 test "oauth parsers clean up allocation failures" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, check_metadata_allocation_failures, .{});
     try std.testing.checkAllAllocationFailures(std.testing.allocator, check_device_authorization_allocation_failures, .{});
     try std.testing.checkAllAllocationFailures(std.testing.allocator, check_token_set_allocation_failures, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_workos_token_set_allocation_failures, .{});
 }
 
 test "oauth expiry timestamps reject invalid durations" {

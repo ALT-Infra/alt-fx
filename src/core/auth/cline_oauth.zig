@@ -53,9 +53,34 @@ pub fn startSignIn(
         .ctx = context,
         .deinit_ctx = deinitContext,
         .oauth_transport = transport,
+        .poll = .{ .poll_device_token = pollWorkosDeviceToken },
         .complete = completeSignIn,
         .save = saveSignIn,
     });
+}
+
+/// WorkOS's device token response does not match the generic OAuth contract
+/// that the default poller assumes, so Cline's flow polls with the WorkOS
+/// parser instead (see pollWorkosDeviceTokenBounded).
+fn pollWorkosDeviceToken(
+    _: ?*anyopaque,
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    metadata: oauth.Metadata,
+    device_client_id: []const u8,
+    device_code: []const u8,
+    cancel_flag: *std.atomic.Value(bool),
+    deadline: std.Io.Clock.Timestamp,
+) !oauth.PollResult {
+    return oauth.pollWorkosDeviceTokenBounded(
+        alloc,
+        transport,
+        metadata,
+        device_client_id,
+        device_code,
+        cancel_flag,
+        deadline,
+    );
 }
 
 fn deinitContext(raw: ?*anyopaque, alloc: Allocator) void {

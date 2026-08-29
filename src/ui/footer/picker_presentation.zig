@@ -63,7 +63,7 @@ pub fn authPickerRowCount(view: auth_runtime.PickerView) u16 {
         };
     }
     if (view.stage == .api_key) return 4;
-    if (view.stage == .root and view.include_skip) return 19;
+    if (view.stage == .root and view.include_skip) return 20;
     if (isSetupListStage(view.stage)) return @intCast(2 + @max(view.choiceCount(), 1));
     return @intCast(1 + @max(view.choiceCount(), 1));
 }
@@ -355,13 +355,13 @@ const onboarding_note = "   ⚠︎ Note: fx is experimental and defaults to auto
 const onboarding_note_link = onboarding_note ++ " \x1b]8;id=fx-onboarding;https://fx.sh/docs/stability\x1b\\\x1b[4mLearn more\x1b[24m\x1b]8;;\x1b\\";
 
 fn onboardingProjectedRowIndex(view: auth_runtime.PickerView, row_index: u16, row_count: u16) u16 {
-    if (row_count >= 19) return row_index;
+    if (row_count >= 20) return row_index;
 
     const selected_row: u16 = 8 + @as(u16, @intCast(view.selectedIndex()));
-    const priority = [_]u16{ selected_row, 12, 9, 10, 11, 8, 16, 7, 13, 5, 0, 2, 3, 6, 14, 15, 1, 4, 17, 18 };
+    const priority = [_]u16{ selected_row, 13, 9, 10, 11, 12, 8, 17, 7, 14, 5, 0, 2, 3, 6, 15, 16, 1, 4, 18, 19 };
 
     var projected_index: u16 = 0;
-    for (0..19) |source_row| {
+    for (0..20) |source_row| {
         for (priority[0..@min(row_count, priority.len)]) |included_row| {
             if (source_row != included_row) continue;
             if (projected_index == row_index) return @intCast(source_row);
@@ -369,7 +369,7 @@ fn onboardingProjectedRowIndex(view: auth_runtime.PickerView, row_index: u16, ro
             break;
         }
     }
-    return 18;
+    return 19;
 }
 
 fn composeOnboardingPickerRow(
@@ -390,6 +390,7 @@ fn composeOnboardingPickerRow(
         10 => 2,
         11 => 3,
         12 => 4,
+        13 => 5,
         else => null,
     };
     if (maybe_choice_index) |choice_index| {
@@ -417,10 +418,10 @@ fn composeOnboardingPickerRow(
         5 => "   You can change this anytime with /setup.",
         6 => "",
         7 => "   Get started",
-        13 => if (display_width.visibleWidthIgnoringAnsi(onboarding_note_link) <= width) onboarding_note_link else onboarding_note,
-        14, 15 => "",
-        16 => "   Esc to set up later · Explore all commands with /help",
-        17, 18 => "",
+        14 => if (display_width.visibleWidthIgnoringAnsi(onboarding_note_link) <= width) onboarding_note_link else onboarding_note,
+        15, 16 => "",
+        17 => "   Esc to set up later · Explore all commands with /help",
+        18, 19 => "",
         else => "",
     };
     try row_text.appendClipped(alloc, &row, label, width);
@@ -661,6 +662,13 @@ pub fn authPickerReservedRows(view: auth_runtime.PickerView, terminal_rows: u16,
         const available_rows = terminal_rows -| (5 +| input_extra +| banner_rows);
         const max_rows = input_presentation.max_model_picker_rows + 1;
         return @min(authPickerRowCount(view), @min(max_rows, @max(available_rows, 1)));
+    }
+    // Setup list screens are short menus (Connections, provider, team, and
+    // credential screens), so show every row when the terminal has the space
+    // instead of clipping them to the compact model-picker budget.
+    if (isSetupListStage(view.stage)) {
+        const available_rows = terminal_rows -| (5 +| input_extra +| banner_rows);
+        return @min(authPickerRowCount(view), @max(available_rows, 1));
     }
     return @min(authPickerRowCount(view), activeListPickerReservedRows(terminal_rows, input_extra, banner_rows));
 }
@@ -1902,7 +1910,7 @@ test "auth onboarding composes the welcome copy and setup choices" {
         .include_skip = true,
     };
 
-    try std.testing.expectEqual(@as(u16, 19), authPickerRowCount(view));
+    try std.testing.expectEqual(@as(u16, 20), authPickerRowCount(view));
     var screen: std.ArrayList(u8) = .empty;
     defer screen.deinit(alloc);
     for (0..authPickerRowCount(view)) |row_index| {
@@ -1918,7 +1926,7 @@ test "auth onboarding composes the welcome copy and setup choices" {
     try std.testing.expect(std.mem.find(u8, screen.items, "⚠︎ Note: fx is experimental and defaults to auto mode. \x1b]8;id=fx-onboarding;https://fx.sh/docs/stability\x1b\\\x1b[4mLearn more\x1b[24m\x1b]8;;\x1b\\") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Learn more: https://") == null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Sign in with Vercel") != null);
-    try std.testing.expect(std.mem.find(u8, screen.items, "Sign in with OpenCode") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "Add OpenCode API key") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Add an API key") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Esc to set up later · Explore all commands with /help") != null);
 
@@ -1944,13 +1952,17 @@ test "auth onboarding composes the welcome copy and setup choices" {
 
     var opencode_row = try composeAuthPickerRow(alloc, view, 11, authPickerRowCount(view), 100);
     defer opencode_row.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, opencode_row.items, "Sign in with OpenCode") != null);
+    try std.testing.expect(std.mem.find(u8, opencode_row.items, "Add OpenCode API key") != null);
 
-    var unselected_row = try composeAuthPickerRow(alloc, view, 12, authPickerRowCount(view), 100);
+    var cline_row = try composeAuthPickerRow(alloc, view, 12, authPickerRowCount(view), 100);
+    defer cline_row.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, cline_row.items, "Sign in with Cline") != null);
+
+    var unselected_row = try composeAuthPickerRow(alloc, view, 13, authPickerRowCount(view), 100);
     defer unselected_row.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, unselected_row.items, "Add an API key") != null);
 
-    var narrow_note = try composeAuthPickerRow(alloc, view, 13, authPickerRowCount(view), 58);
+    var narrow_note = try composeAuthPickerRow(alloc, view, 14, authPickerRowCount(view), 58);
     defer narrow_note.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, narrow_note.items, "https://fx.sh/docs/stability") == null);
 
@@ -2081,7 +2093,7 @@ test "auth picker renders the staged switch and disabled team screens" {
         .stage = .provider,
     };
     const provider_rows = authPickerRowCount(provider_view);
-    try std.testing.expectEqual(@as(u16, 5), provider_rows);
+    try std.testing.expectEqual(@as(u16, 7), provider_rows);
     var provider_header = try composeAuthPickerRow(alloc, provider_view, 0, provider_rows, 80);
     defer provider_header.deinit(alloc);
     try std.testing.expect(std.mem.startsWith(u8, provider_header.items, ui_render.dim_style));

@@ -2743,14 +2743,15 @@ test "auth onboarding picker exposes the setup paths" {
 
     const picker = runtime.pickerView();
     try std.testing.expect(picker.include_skip);
-    try std.testing.expectEqual(@as(usize, 5), picker.choiceCount());
+    try std.testing.expectEqual(@as(usize, 6), picker.choiceCount());
     try std.testing.expect((Choice{ .action = .login }).eql(picker.choiceAt(0).?));
     try std.testing.expect((Choice{ .action = .chatgpt_login }).eql(picker.choiceAt(1).?));
     try std.testing.expect((Choice{ .action = .grok_login }).eql(picker.choiceAt(2).?));
     try std.testing.expect((Choice{ .action = .opencode_login }).eql(picker.choiceAt(3).?));
-    try std.testing.expect((Choice{ .action = .setup }).eql(picker.choiceAt(4).?));
-    try std.testing.expectEqualStrings("Add an API key", picker.choiceLabel(picker.choiceAt(4).?));
-    try std.testing.expect(picker.choiceAt(5) == null);
+    try std.testing.expect((Choice{ .action = .cline_login }).eql(picker.choiceAt(4).?));
+    try std.testing.expect((Choice{ .action = .setup }).eql(picker.choiceAt(5).?));
+    try std.testing.expectEqualStrings("Add an API key", picker.choiceLabel(picker.choiceAt(5).?));
+    try std.testing.expect(picker.choiceAt(6) == null);
 }
 
 test "clearing a remembered choice re-resolves even when no login was active" {
@@ -2977,7 +2978,7 @@ test "api key save from setup returns to the selected Connections row" {
     runtime.openPicker(alloc);
     try std.testing.expect(runtime.takePickerChoice(alloc) == null);
     try std.testing.expectEqual(PickerStage.connections, runtime.pickerView().stage);
-    for (0..4) |_| try std.testing.expect(runtime.movePicker(1));
+    for (0..5) |_| try std.testing.expect(runtime.movePicker(1));
     try std.testing.expect((Choice{ .action = .setup }).eql(runtime.takePickerChoice(alloc).?));
 
     runtime.openApiKeyPickerFromRoot(alloc);
@@ -2992,7 +2993,7 @@ test "api key save from setup returns to the selected Connections row" {
     const picker = runtime.pickerView();
     try std.testing.expectEqual(PickerStage.connections, picker.stage);
     try std.testing.expect((Choice{ .action = .setup }).eql(picker.selected_choice.?));
-    try std.testing.expect(picker.choiceIsSelected(picker.choiceAt(4).?));
+    try std.testing.expect(picker.choiceIsSelected(picker.choiceAt(5).?));
 }
 
 test "auth runtime saves and reloads through its injected secret store" {
