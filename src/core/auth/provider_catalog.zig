@@ -55,6 +55,15 @@ pub const entries = [_]Entry{
         .subscription = false,
         .catalog_scope = .unified,
     },
+    .{
+        .id = .cline,
+        .slug = "cline",
+        .name = "Cline",
+        .route_name = "Cline",
+        .description = "Free and ClinePass models through the Cline API",
+        .subscription = false,
+        .catalog_scope = .unified,
+    },
 };
 
 pub fn parse(value: []const u8) ?model_provider.ProviderId {
@@ -80,6 +89,7 @@ test "auth provider catalog uses the model provider identity and explicit aliase
     try std.testing.expectEqual(model_provider.ProviderId.codex, parse("codex").?);
     try std.testing.expectEqual(model_provider.ProviderId.grok, parse("grok").?);
     try std.testing.expectEqual(model_provider.ProviderId.opencode, parse("opencode").?);
+    try std.testing.expectEqual(model_provider.ProviderId.cline, parse("cline").?);
     try std.testing.expect(parse("zen") == null);
     try std.testing.expect(parse("openai-codex") == null);
     try std.testing.expect(parse("chatgpt") == null);
@@ -87,8 +97,10 @@ test "auth provider catalog uses the model provider identity and explicit aliase
     try std.testing.expect(find(.codex).subscription);
     try std.testing.expect(find(.grok).subscription);
     try std.testing.expect(!find(.opencode).subscription);
+    try std.testing.expect(!find(.cline).subscription);
     try std.testing.expectEqual(CatalogScope.unified, find(.gateway).catalog_scope);
     try std.testing.expectEqual(CatalogScope.unified, find(.opencode).catalog_scope);
+    try std.testing.expectEqual(CatalogScope.unified, find(.cline).catalog_scope);
     try std.testing.expectEqual(CatalogScope.provider_native, find(.codex).catalog_scope);
     try std.testing.expectEqual(CatalogScope.provider_native, find(.grok).catalog_scope);
 }

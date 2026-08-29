@@ -951,7 +951,7 @@ pub fn Bindings(comptime App: type) type {
                             .fx_login => "Run /login to repair this source.",
                             .chatgpt_subscription => "Reconnect Codex through /login to repair this source.",
                             .grok_subscription => "Reconnect Grok through /login to repair this source.",
-                            .opencode_api_key => "Choose a free model with /model, or sign in again.",
+                            .opencode_api_key, .cline_api_key => "Choose a free model with /model, or sign in again.",
                             .vercel_oidc_token, .ai_gateway_api_key, .stored_key => "Run /setup to repair this source.",
                         },
                     },
@@ -2231,6 +2231,26 @@ test "OpenCode unauthorized status suggests a free model or signing in again" {
     try std.testing.expect(app.worker.events.items[0] == .api_status_text);
     try std.testing.expectEqualStrings(
         "⚠ OpenCode rejected the API key or selected model access · HTTP 401 · Choose a free model with /model, or sign in again.",
+        app.worker.events.items[0].api_status_text,
+    );
+}
+
+test "Cline unauthorized status suggests a free model or signing in again" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+
+    const deps = Bindings(FakeApp).agentRuntimeDeps(&app);
+    try deps.push_http_error(
+        deps.ctx,
+        .unauthorized,
+        "provider detail must not be shown",
+        .cline_api_key,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), app.worker.events.items.len);
+    try std.testing.expect(app.worker.events.items[0] == .api_status_text);
+    try std.testing.expectEqualStrings(
+        "⚠ Cline rejected the API key or selected model access · HTTP 401 · Choose a free model with /model, or sign in again.",
         app.worker.events.items[0].api_status_text,
     );
 }

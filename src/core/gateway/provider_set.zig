@@ -64,6 +64,7 @@ pub const Set = struct {
     codex: Bundle,
     grok: Bundle,
     opencode: Bundle,
+    cline: Bundle,
 
     pub fn select(self: Set, provider: model_provider.ProviderId) Bundle {
         return switch (provider) {
@@ -71,6 +72,7 @@ pub const Set = struct {
             .codex => self.codex,
             .grok => self.grok,
             .opencode => self.opencode,
+            .cline => self.cline,
         };
     }
 
@@ -93,6 +95,7 @@ pub const Set = struct {
             .codex = self.codex.deferred_usage,
             .grok = self.grok.deferred_usage,
             .opencode = self.opencode.deferred_usage,
+            .cline = self.cline.deferred_usage,
         };
     }
 };
@@ -103,6 +106,7 @@ pub fn gateway_only(gateway: Bundle) Set {
         .codex = .{},
         .grok = .{},
         .opencode = .{},
+        .cline = .{},
     };
 }
 
@@ -111,6 +115,7 @@ test "provider set selects each provider's complete route" {
     var codex_tag: u8 = 0;
     var grok_tag: u8 = 0;
     var opencode_tag: u8 = 0;
+    var cline_tag: u8 = 0;
 
     const Fake = struct {
         fn cli_catalog(
@@ -182,7 +187,15 @@ test "provider set selects each provider's complete route" {
         .cli_model_catalog = .{ .context = &opencode_tag, .fetch_fn = Fake.cli_catalog },
         .model_catalog = .{ .context = &opencode_tag, .fetch_fn = Fake.model_catalog_fetch },
     };
-    var providers = Set{ .gateway = gateway, .codex = codex, .grok = grok, .opencode = opencode };
+    const cline = Bundle{
+        .agent_stream = stream_provider.Provider{
+            .context = &cline_tag,
+            .stream_fn = stream_provider.unavailable_provider.stream_fn,
+        },
+        .cli_model_catalog = .{ .context = &cline_tag, .fetch_fn = Fake.cli_catalog },
+        .model_catalog = .{ .context = &cline_tag, .fetch_fn = Fake.model_catalog_fetch },
+    };
+    var providers = Set{ .gateway = gateway, .codex = codex, .grok = grok, .opencode = opencode, .cline = cline };
 
     try std.testing.expect(providers.select(.gateway).agent_stream.?.context.? == @as(*anyopaque, @ptrCast(&gateway_tag)));
     try std.testing.expect(providers.select(.gateway).capabilities.fx_search);
@@ -196,6 +209,7 @@ test "provider set selects each provider's complete route" {
     try std.testing.expect(providers.select(.codex).model_catalog.?.context.? == @as(*anyopaque, @ptrCast(&codex_tag)));
     try std.testing.expect(providers.select(.grok).permission_reviewer.?.context.? == @as(*anyopaque, @ptrCast(&grok_tag)));
     try std.testing.expect(providers.select(.opencode).model_catalog.?.context.? == @as(*anyopaque, @ptrCast(&opencode_tag)));
+    try std.testing.expect(providers.select(.cline).model_catalog.?.context.? == @as(*anyopaque, @ptrCast(&cline_tag)));
     try std.testing.expect(providers.select(.codex).agent_stream_or_unavailable().context.? == @as(*anyopaque, @ptrCast(&codex_tag)));
 
     providers.codex.model_catalog = null;

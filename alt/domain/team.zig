@@ -35,7 +35,10 @@ pub const Team = struct {
     pub fn validate(self: Team) ValidationError!void {
         if (self.schema != 2) return error.UnsupportedSchema;
         if (empty(self.id) or empty(self.name) or empty(self.provider_id)) return error.EmptyIdentity;
-        if (!equal(self.provider_id, "opencode") and !equal(self.provider_id, "vercel")) {
+        if (!equal(self.provider_id, "opencode") and
+            !equal(self.provider_id, "vercel") and
+            !equal(self.provider_id, "cline"))
+        {
             return error.UnsupportedProvider;
         }
         for (self.digest) |byte| {
@@ -298,6 +301,12 @@ test "all Team peers are mutually consultable and specialist authority is direct
     try std.testing.expect(value.arePeers("researcher", "coder"));
     try std.testing.expect(value.canUseSpecialist("coder", "vision-reader"));
     try std.testing.expect(!value.canUseSpecialist("researcher", "vision-reader"));
+}
+
+test "Cline is a valid unified ALT Team provider" {
+    var value = fixture();
+    value.provider_id = "cline";
+    try value.validate();
 }
 
 test "different model aliases cannot resolve to one catalog model" {

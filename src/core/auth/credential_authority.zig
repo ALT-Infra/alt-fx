@@ -26,6 +26,7 @@ pub fn derive(
         .fx_login,
         .stored_key,
         .opencode_api_key,
+        .cline_api_key,
         => hash.update("\x00slot\x00"),
         .chatgpt_subscription,
         .grok_subscription,

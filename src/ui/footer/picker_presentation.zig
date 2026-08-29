@@ -83,7 +83,7 @@ fn setupChoiceLabel(view: auth_runtime.PickerView, choice: auth_runtime.Choice) 
                 .switch_provider => "Model provider",
                 .change_team => "Vercel team",
                 .switch_credential => "Credential source",
-                .login, .chatgpt_login, .grok_login, .opencode_login, .setup, .automatic => "",
+                .login, .chatgpt_login, .grok_login, .opencode_login, .cline_login, .setup, .automatic => "",
             },
             .provider, .source, .team => "",
         },
@@ -93,6 +93,7 @@ fn setupChoiceLabel(view: auth_runtime.PickerView, choice: auth_runtime.Choice) 
                 .chatgpt_login => "Codex subscription",
                 .grok_login => "Grok subscription",
                 .opencode_login => "OpenCode API key",
+                .cline_login => "Cline API key",
                 .setup => "AI Gateway API key",
                 .connections, .change_team, .switch_credential, .switch_provider, .automatic => "",
             },
@@ -119,7 +120,7 @@ fn setupChoiceValue(view: auth_runtime.PickerView, choice: auth_runtime.Choice) 
                     view.activeSourceLabel()
                 else
                     "not connected",
-                .login, .chatgpt_login, .grok_login, .opencode_login, .setup, .automatic => "",
+                .login, .chatgpt_login, .grok_login, .opencode_login, .cline_login, .setup, .automatic => "",
             },
             .provider, .source, .team => "",
         },
@@ -129,6 +130,7 @@ fn setupChoiceValue(view: auth_runtime.PickerView, choice: auth_runtime.Choice) 
                 .chatgpt_login => if (view.available_sources.contains(.chatgpt_subscription)) "connected" else "not connected",
                 .grok_login => if (view.available_sources.contains(.grok_subscription)) "connected" else "not connected",
                 .opencode_login => if (view.available_sources.contains(.opencode_api_key)) "connected" else "not connected",
+                .cline_login => if (view.available_sources.contains(.cline_api_key)) "connected" else "not connected",
                 .setup => if (view.available_sources.contains(.stored_key))
                     "stored"
                 else if (view.available_sources.contains(.ai_gateway_api_key))

@@ -6,6 +6,7 @@ const auth_runtime = @import("../auth/auth_runtime.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
 const grok_oauth = @import("../auth/grok_oauth.zig");
 const opencode_session = @import("../auth/opencode_session.zig");
+const cline_session = @import("../auth/cline_session.zig");
 const parallel_session = @import("../auth/parallel_session.zig");
 const acp_runner = @import("acp_runner.zig");
 const cli_ask = @import("cli_ask.zig");
@@ -700,6 +701,7 @@ fn activateProviderSelection(
             .codex => "Codex is already selected.\n",
             .grok => "Grok is already selected.\n",
             .opencode => "OpenCode is already selected.\n",
+            .cline => "Cline is already selected.\n",
         });
         return true;
     }
@@ -745,6 +747,7 @@ fn activateProviderSelection(
                 .codex => "Codex credential is unavailable",
                 .grok => "Grok credential is unavailable",
                 .opencode => "OpenCode credential is unavailable",
+                .cline => "Cline credential is unavailable",
                 .gateway => "configure a Gateway credential first",
             },
         );
@@ -755,6 +758,7 @@ fn activateProviderSelection(
             .codex => "Codex model catalog is unavailable",
             .grok => "Grok model catalog is unavailable",
             .opencode => "OpenCode model catalog is unavailable",
+            .cline => "Cline model catalog is unavailable",
             .gateway => "Gateway model catalog is unavailable",
         });
         return false;
@@ -820,6 +824,7 @@ fn activateProviderSelection(
         .codex => try writeStdout(deps, "Signed in with Codex.\n"),
         .grok => try writeStdout(deps, "Signed in with Grok.\n"),
         .opencode => try writeStdout(deps, "Signed in with OpenCode.\n"),
+        .cline => try writeStdout(deps, "Signed in with Cline.\n"),
         .gateway => unreachable,
     };
     if (caller == .provider_command) {
@@ -828,6 +833,7 @@ fn activateProviderSelection(
             .codex => "Provider set to Codex.\n",
             .grok => "Provider set to Grok.\n",
             .opencode => "Provider set to OpenCode.\n",
+            .cline => "Provider set to Cline.\n",
         });
     }
     return true;
@@ -961,7 +967,7 @@ fn runNonInteractiveWithDeps(
                 return .handled_success;
             }
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx login [vercel|codex|grok|opencode|parallel]\n");
+                try writeStderr(deps, "usage: fx login [vercel|codex|grok|opencode|cline|parallel]\n");
                 return .handled_failure;
             };
             // Preserve the original `fx login` behavior for scripts and users.
@@ -1044,6 +1050,23 @@ fn runNonInteractiveWithDeps(
                     }
                     try writeStdout(deps, "Signed in with OpenCode.\n");
                 },
+                .cline => {
+                    const key = io_mod.getenv("CLINE_API_KEY") orelse {
+                        try writeStderr(deps, "fx login: set CLINE_API_KEY to your Cline API key first\n");
+                        return .handled_failure;
+                    };
+                    var session = cline_session.Session{ .api_key = try alloc.dupe(u8, key) };
+                    defer session.deinit(alloc);
+                    cline_session.saveNewSession(alloc, session) catch |err| {
+                        debug_trace.logf("auth", "Cline login failed err={s}", .{@errorName(err)});
+                        try writeStderr(deps, "fx login: failed to store the Cline API key\n");
+                        return .handled_failure;
+                    };
+                    if (!try activateProviderSelection(alloc, cfg, deps, .cline, .provider_login)) {
+                        return .handled_failure;
+                    }
+                    try writeStdout(deps, "Signed in with Cline.\n");
+                },
             }
             return .handled_success;
         },
@@ -1069,7 +1092,7 @@ fn runNonInteractiveWithDeps(
                 };
             }
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx logout [vercel|codex|grok|opencode|parallel]\n");
+                try writeStderr(deps, "usage: fx logout [vercel|codex|grok|opencode|cline|parallel]\n");
                 return .handled_failure;
             };
             // Preserve the original `fx logout` behavior for scripts and users.
@@ -1133,6 +1156,26 @@ fn runNonInteractiveWithDeps(
                     },
                     .deleted_not_durable => result: {
                         try writeStderr(deps, "fx logout: failed to durably remove saved OpenCode login\n");
+                        break :result .handled_failure;
+                    },
+                };
+            }
+            if (login_provider == .cline) {
+                const outcome = cline_session.logout() catch {
+                    try writeStderr(deps, "fx logout: failed to durably remove saved Cline login\n");
+                    return .handled_failure;
+                };
+                return switch (outcome) {
+                    .deleted => result: {
+                        try writeStdout(deps, "Signed out of Cline.\n");
+                        break :result .handled_success;
+                    },
+                    .missing => result: {
+                        try writeStdout(deps, "No Cline login session found.\n");
+                        break :result .handled_success;
+                    },
+                    .deleted_not_durable => result: {
+                        try writeStderr(deps, "fx logout: failed to durably remove saved Cline login\n");
                         break :result .handled_failure;
                     },
                 };
@@ -1214,11 +1257,11 @@ fn runNonInteractiveWithDeps(
         },
         .provider => |rest| {
             if (rest.len != 1) {
-                try writeStderr(deps, "usage: fx provider <gateway|codex|grok|opencode>\n");
+                try writeStderr(deps, "usage: fx provider <gateway|codex|grok|opencode|cline>\n");
                 return .handled_failure;
             }
             const target = model_provider.parse(rest[0]) orelse {
-                try writeStderr(deps, "fx provider: expected gateway, codex, grok, or opencode\n");
+                try writeStderr(deps, "fx provider: expected gateway, codex, grok, opencode, or cline\n");
                 return .handled_failure;
             };
             return if (try activateProviderSelection(alloc, cfg, deps, target, .provider_command, null))
@@ -1316,6 +1359,7 @@ fn runNonInteractiveWithDeps(
                     .codex => "fx models: Codex model catalog is unavailable\n",
                     .grok => "fx models: Grok model catalog is unavailable\n",
                     .opencode => "fx models: OpenCode model catalog is unavailable\n",
+                    .cline => "fx models: Cline model catalog is unavailable\n",
                 });
                 return .handled_failure;
             };

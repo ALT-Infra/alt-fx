@@ -182,7 +182,11 @@ pub const Editor = struct {
     }
 
     fn submitProvider(self: *Editor) !host.DefinitionEditorOutcome {
-        const provider = if (self.selected == 0) "opencode" else "vercel";
+        const provider = switch (self.selected) {
+            0 => "opencode",
+            1 => "cline",
+            else => "vercel",
+        };
         try self.setTeamString("provider_id", provider);
         self.screen = .overview;
         self.selected = 1;
@@ -324,6 +328,7 @@ pub const Editor = struct {
     fn projectProvider(self: *Editor) void {
         const current = self.teamString("provider_id");
         self.addRow("OpenCode", "Zen and Go", std.mem.eql(u8, current, "opencode"), false);
+        self.addRow("Cline", "free and ClinePass", std.mem.eql(u8, current, "cline"), false);
         self.addRow("Vercel AI Gateway", "unified model catalog", std.mem.eql(u8, current, "vercel"), false);
     }
 
@@ -768,6 +773,7 @@ fn previousScreen(previous: PreviousScreen) Screen {
 
 fn providerLabel(provider: []const u8) []const u8 {
     if (std.mem.eql(u8, provider, "opencode")) return "OpenCode";
+    if (std.mem.eql(u8, provider, "cline")) return "Cline";
     if (std.mem.eql(u8, provider, "vercel")) return "Vercel AI Gateway";
     return provider;
 }
@@ -779,7 +785,7 @@ fn teamValidationMessage(err: anyerror) []const u8 {
         error.DuplicateCatalogModel, error.DuplicateModelOwner => "Every Team role must use a distinct model.",
         error.EmptyModel => "Choose a model for every Team role.",
         error.InvalidIdentifier, error.DuplicateAssignment => "This Team contains an invalid internal identity.",
-        error.UnsupportedProvider => "Choose OpenCode or Vercel AI Gateway.",
+        error.UnsupportedProvider => "Choose OpenCode, Cline, or Vercel AI Gateway.",
         else => "This Team is incomplete. Review every role, model, and specialist assignment.",
     };
 }

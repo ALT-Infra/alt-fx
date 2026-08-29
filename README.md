@@ -72,7 +72,15 @@ fx login opencode
 fx
 ```
 
-The provider-specific login commands select that provider and a model from its live catalog. Inside fx, open `/setup`, use **Connections** to manage sign-ins, and choose **Model provider** to move between Gateway, Codex, Grok, and OpenCode. `/model` lists the active provider's supported fetched models. Use `/logout codex`, `/logout grok`, or `/logout opencode` to remove that saved provider session without affecting the others; choosing it again from **Connections** starts sign-in.
+Or use Cline's free and ClinePass model catalog with a Cline API key:
+
+```bash
+export CLINE_API_KEY=<your-cline-api-key>
+fx login cline
+fx
+```
+
+The provider-specific login commands select that provider and a model from its live catalog. Inside fx, open `/setup`, use **Connections** to manage sign-ins, and choose **Model provider** to move between Gateway, Codex, Grok, OpenCode, and Cline. `/model` lists the active provider's supported fetched models. Use `/logout codex`, `/logout grok`, `/logout opencode`, or `/logout cline` to remove that saved provider session without affecting the others; choosing it again from **Connections** starts sign-in.
 
 The OpenAI Codex route uses ChatGPT subscription access directly and never sends its OAuth token to Vercel AI Gateway. The session is stored privately at `~/.fx/chatgpt-auth.json` and refreshed when needed. On supported Codex models, `/fast` requests OpenAI's priority service tier and consumes ChatGPT credits at the higher Fast mode rate.
 
@@ -80,9 +88,11 @@ The Grok route uses subscription access directly at xAI and never sends its OAut
 
 `fx login opencode` imports `OPENCODE_API_KEY` into a private copy at `~/.fx/opencode-auth.json`; later commands use that saved copy, so `fx logout opencode` remains effective even while the environment variable is exported. The OpenCode route sends the saved key only to OpenCode. fx discovers availability from OpenCode's live Zen and Go catalogs and uses the live provider metadata maintained by OpenCode's models.dev project to select models served through OpenAI-compatible Chat Completions. New compatible models therefore appear without an fx release, while models explicitly assigned to OpenAI Responses, Anthropic Messages, or Gemini protocols remain hidden until fx supports those transports. Go model IDs use the `go/<model-id>` prefix in fx.
 
+`fx login cline` imports `CLINE_API_KEY` into a private copy at `~/.fx/cline-auth.json`; `fx logout cline` removes it. The key is sent only to Cline's API. fx reads the current free and ClinePass tiers directly from Cline's live recommended-models feed, preserves the tier when replacing a retired saved model, and sends both tiers through Cline's OpenAI-compatible Chat Completions endpoint. The list is not compiled into fx, so Cline can add or retire models without requiring an fx release.
+
 ### Web search through Parallel
 
-Gateway, Codex, and Grok models search through their own native routes. Models without native search (OpenCode) borrow [Parallel](https://parallel.ai/) when it is configured, so `web_search` stays available everywhere:
+Gateway, Codex, and Grok models search through their own native routes. Models without native search (including OpenCode and Cline) borrow [Parallel](https://parallel.ai/) when it is configured, so `web_search` stays available everywhere:
 
 ```bash
 export PARALLEL_API_KEY=<your-parallel-api-key>
