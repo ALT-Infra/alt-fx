@@ -85,7 +85,12 @@ if args and args[0] == "set-key-partition-list":
         for line in event_log.read_text(encoding="utf-8").splitlines()
         if line.startswith("security import ")
     )
-    if "-s" in args or " -t cert " in f" {{import_event}} ":
+    partition_args = f" {{' '.join(args)}} "
+    if (
+        "-s" in args
+        or " -t private " not in partition_args
+        or " -t cert " in f" {{import_event}} "
+    ):
         print("error: The specified item could not be found in the keychain.", file=sys.stderr)
         raise SystemExit(1)
 if args and args[0] == "find-identity":
@@ -253,6 +258,12 @@ else:
             self.assertIn(" -f pkcs12 ", f" {import_event} ")
             self.assertIn(" -T /usr/bin/codesign ", f" {import_event} ")
             self.assertIn(" -T /usr/bin/security ", f" {import_event} ")
+            partition_event = next(
+                line
+                for line in event_log.read_text(encoding="utf-8").splitlines()
+                if line.startswith("security set-key-partition-list ")
+            )
+            self.assertIn(" -t private ", f" {partition_event} ")
 
     def test_rejects_notarization_log_issues_and_cleans_credentials(self) -> None:
         self.assertTrue(SCRIPT_PATH.is_file(), "macOS signing helper is missing")
