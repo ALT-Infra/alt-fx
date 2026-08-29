@@ -79,16 +79,27 @@ args = sys.argv[1:]
 event_log = pathlib.Path(os.environ["FX_SIGNING_TEST_LOG"])
 with event_log.open("a") as log:
     log.write("security " + " ".join(args) + "\\n")
+if args and args[0] == os.environ.get("FX_SIGNING_TEST_SECURITY_FAIL_COMMAND"):
+    print("injected security failure", file=sys.stderr)
+    raise SystemExit(1)
 if args and args[0] == "set-key-partition-list":
     import_event = next(
         line
         for line in event_log.read_text(encoding="utf-8").splitlines()
         if line.startswith("security import ")
     )
-    partition_args = f" {{' '.join(args)}} "
+    partition_list = args[args.index("-S") + 1] if "-S" in args else ""
+    key_type = args[args.index("-t") + 1] if "-t" in args else ""
+    search_list_configured = any(
+        line.startswith("security list-keychains -d user -s ")
+        for line in event_log.read_text(encoding="utf-8").splitlines()
+    )
     if (
         "-s" in args
-        or " -t private " not in partition_args
+        or partition_list != "apple-tool:,apple:"
+        or key_type != "private"
+        or "-l" in args
+        or not search_list_configured
         or " -t cert " in f" {{import_event}} "
     ):
         print("error: The specified item could not be found in the keychain.", file=sys.stderr)
@@ -109,6 +120,9 @@ import sys
 args = sys.argv[1:]
 with pathlib.Path(os.environ["FX_SIGNING_TEST_LOG"]).open("a") as log:
     log.write("codesign " + " ".join(args) + "\\n")
+if os.environ.get("FX_SIGNING_TEST_CODESIGN_FAIL_STAGE") == "sign" and "--force" in args:
+    print("injected codesign failure", file=sys.stderr)
+    raise SystemExit(1)
 if "--force" in args:
     binary = pathlib.Path(args[-1])
     binary.write_bytes(binary.read_bytes() + b"signed\\n")
@@ -146,6 +160,9 @@ import sys
 args = sys.argv[1:]
 with pathlib.Path(os.environ["FX_SIGNING_TEST_LOG"]).open("a") as log:
     log.write("xcrun " + " ".join(args[:2]) + "\\n")
+if len(args) > 1 and args[1] == os.environ.get("FX_SIGNING_TEST_XCRUN_FAIL_COMMAND"):
+    print("injected xcrun failure", file=sys.stderr)
+    raise SystemExit(1)
 if args[:2] == ["notarytool", "submit"]:
     status = os.environ.get("FX_SIGNING_TEST_SUBMISSION_STATUS", "Accepted")
     print(json.dumps({{"id": "test-submission", "status": status}}))
@@ -263,7 +280,68 @@ else:
                 for line in event_log.read_text(encoding="utf-8").splitlines()
                 if line.startswith("security set-key-partition-list ")
             )
-            self.assertIn(" -t private ", f" {partition_event} ")
+            partition_args = partition_event.split()[2:]
+            self.assertEqual(
+                "apple-tool:,apple:",
+                partition_args[partition_args.index("-S") + 1],
+            )
+            self.assertEqual(
+                "private",
+                partition_args[partition_args.index("-t") + 1],
+            )
+            self.assertNotIn("-l", partition_args)
+            self.assertNotIn("-s", partition_args)
+            self.assertNotIn("codesign:", partition_args)
+            events = event_log.read_text(encoding="utf-8").splitlines()
+            search_index = next(
+                index
+                for index, line in enumerate(events)
+                if line.startswith("security list-keychains -d user -s ")
+            )
+            partition_index = events.index(partition_event)
+            self.assertLess(search_index, partition_index)
+
+    def test_reports_failing_signing_stage_without_printing_secrets(self) -> None:
+        self.assertTrue(SCRIPT_PATH.is_file(), "macOS signing helper is missing")
+        cases = (
+            (
+                {"FX_SIGNING_TEST_SECURITY_FAIL_COMMAND": "import"},
+                "PKCS#12 import",
+            ),
+            (
+                {"FX_SIGNING_TEST_SECURITY_FAIL_COMMAND": "list-keychains"},
+                "keychain search configuration",
+            ),
+            (
+                {"FX_SIGNING_TEST_SECURITY_FAIL_COMMAND": "set-key-partition-list"},
+                "private-key ACL configuration",
+            ),
+            (
+                {"FX_SIGNING_TEST_SECURITY_FAIL_COMMAND": "find-identity"},
+                "signing identity lookup",
+            ),
+            (
+                {"FX_SIGNING_TEST_CODESIGN_FAIL_STAGE": "sign"},
+                "code signing",
+            ),
+            (
+                {"FX_SIGNING_TEST_XCRUN_FAIL_COMMAND": "submit"},
+                "notarization submission",
+            ),
+        )
+        for extra_env, stage in cases:
+            with self.subTest(stage=stage):
+                with tempfile.TemporaryDirectory(
+                    prefix="fx-macos-signing-test-"
+                ) as tmp:
+                    root = pathlib.Path(tmp)
+                    result, _, _, _ = self.run_script(root, extra_env)
+
+                    output = result.stdout + result.stderr
+                    self.assertNotEqual(0, result.returncode, output)
+                    self.assertIn(f"Apple signing failed during {stage}", output)
+                    self.assertNotIn("p12-password", output)
+                    self.assertNotIn("p8-private-material", output)
 
     def test_rejects_notarization_log_issues_and_cleans_credentials(self) -> None:
         self.assertTrue(SCRIPT_PATH.is_file(), "macOS signing helper is missing")
