@@ -418,7 +418,9 @@ fn loadedCatalogStatusText(state: model_cache_runtime.ModelMenuCatalogState) ?[]
             .stored_key => "Gateway catalog: authenticated with the stored API key.",
             .chatgpt_subscription => "Codex catalog: authenticated with a subscription.",
             .grok_subscription => "Grok catalog: authenticated with a subscription.",
+            .opencode_anonymous => "OpenCode catalog: anonymous free Zen models.",
             .opencode_api_key => "OpenCode catalog: authenticated with an API key.",
+            .cline_account => "Cline catalog: authenticated with your Cline account.",
             .cline_api_key => "Cline catalog: live free and ClinePass models.",
         };
     }

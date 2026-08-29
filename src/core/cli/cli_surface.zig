@@ -6,6 +6,7 @@ const background_record_liveness = @import("../background/background_record_live
 const background_store = @import("../background/background_store.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
 const grok_oauth = @import("../auth/grok_oauth.zig");
+const cline_oauth = @import("../auth/cline_oauth.zig");
 const opencode_session = @import("../auth/opencode_session.zig");
 const cline_session = @import("../auth/cline_session.zig");
 const parallel_session = @import("../auth/parallel_session.zig");
@@ -335,7 +336,6 @@ const WorkflowOptions = struct {
 
 const WriteFn = *const fn (?*anyopaque, []const u8) anyerror!void;
 const LoadStartupStateFn = *const fn (Allocator, oauth_transport.Provider, host.SecretStore, []const u8, usize) anyerror!app_lifecycle.StartupState;
-const LoadCatalogStartupStateFn = *const fn (Allocator, host.SecretStore, []const u8, usize) anyerror!app_lifecycle.StartupState;
 const LoadStartupStateWithoutCredentialsFn = *const fn (Allocator, []const u8, usize) anyerror!app_lifecycle.StartupState;
 const LoadStartupStatusFn = *const fn (Allocator, host.SecretStore, []const u8, usize) anyerror!app_lifecycle.StartupStatus;
 const GetenvFn = *const fn (?*anyopaque, []const u8) ?[]const u8;
@@ -352,7 +352,6 @@ const RunDeps = struct {
     write_stdout: WriteFn = writeRealStdout,
     write_stderr: WriteFn = writeRealStderr,
     load_startup_state: LoadStartupStateFn = app_lifecycle.loadStartupState,
-    load_catalog_startup_state: LoadCatalogStartupStateFn = app_lifecycle.loadCatalogStartupState,
     load_startup_state_without_credentials: LoadStartupStateWithoutCredentialsFn = app_lifecycle.loadStartupStateWithoutCredentials,
     load_startup_status: LoadStartupStatusFn = app_lifecycle.loadStartupStatus,
     getenv: GetenvFn = getenvDefault,
@@ -1036,17 +1035,25 @@ fn runNonInteractiveWithDeps(
                     try writeStdout(deps, "Signed in with OpenCode.\n");
                 },
                 .cline => {
-                    const key = io_mod.getenv("CLINE_API_KEY") orelse {
-                        try writeStderr(deps, "fx login: set CLINE_API_KEY to your Cline API key first\n");
-                        return .handled_failure;
-                    };
-                    var session = cline_session.Session{ .api_key = try alloc.dupe(u8, key) };
-                    defer session.deinit(alloc);
-                    cline_session.saveNewSession(alloc, session) catch |err| {
-                        debug_trace.logf("auth", "Cline login failed err={s}", .{@errorName(err)});
-                        try writeStderr(deps, "fx login: failed to store the Cline API key\n");
-                        return .handled_failure;
-                    };
+                    if (io_mod.getenv("CLINE_API_KEY")) |key| {
+                        var session = cline_session.Session{ .api_key = try alloc.dupe(u8, key) };
+                        defer session.deinit(alloc);
+                        cline_session.saveNewSession(alloc, session) catch |err| {
+                            debug_trace.logf("auth", "Cline API-key login failed err={s}", .{@errorName(err)});
+                            try writeStderr(deps, "fx login: failed to store the Cline API key\n");
+                            return .handled_failure;
+                        };
+                    } else {
+                        cline_oauth.runLogin(
+                            alloc,
+                            cfg.gateway_provider.oauth_transport,
+                            cfg.url_opener,
+                        ) catch |err| {
+                            debug_trace.logf("auth", "Cline account login failed err={s}", .{@errorName(err)});
+                            try writeStderr(deps, "fx login: failed to sign in with Cline\n");
+                            return .handled_failure;
+                        };
+                    }
                     if (!try activateProviderSelection(alloc, cfg, deps, .cline, .provider_login)) {
                         return .handled_failure;
                     }
@@ -1146,24 +1153,24 @@ fn runNonInteractiveWithDeps(
                 };
             }
             if (login_provider == .cline) {
-                const outcome = cline_session.logout() catch {
+                const account_outcome = cline_oauth.logout() catch {
                     try writeStderr(deps, "fx logout: failed to durably remove saved Cline login\n");
                     return .handled_failure;
                 };
-                return switch (outcome) {
-                    .deleted => result: {
-                        try writeStdout(deps, "Signed out of Cline.\n");
-                        break :result .handled_success;
-                    },
-                    .missing => result: {
-                        try writeStdout(deps, "No Cline login session found.\n");
-                        break :result .handled_success;
-                    },
-                    .deleted_not_durable => result: {
-                        try writeStderr(deps, "fx logout: failed to durably remove saved Cline login\n");
-                        break :result .handled_failure;
-                    },
+                const key_outcome = cline_session.logout() catch {
+                    try writeStderr(deps, "fx logout: failed to durably remove saved Cline API key\n");
+                    return .handled_failure;
                 };
+                if (account_outcome == .deleted_not_durable or key_outcome == .deleted_not_durable) {
+                    try writeStderr(deps, "fx logout: failed to durably remove saved Cline login\n");
+                    return .handled_failure;
+                }
+                if (account_outcome == .missing and key_outcome == .missing) {
+                    try writeStdout(deps, "No Cline login session found.\n");
+                } else {
+                    try writeStdout(deps, "Signed out of Cline.\n");
+                }
+                return .handled_success;
             }
             const result = login_flow.logout(alloc, cfg.gateway_provider.oauth_transport) catch |err| switch (err) {
                 error.SessionDeleteFailed => {
@@ -1291,8 +1298,12 @@ fn runNonInteractiveWithDeps(
                 return .handled_failure;
             };
 
-            var startup = try deps.load_catalog_startup_state(
+            // Listing models is an online operation. Resolve credentials with the real
+            // transport so an expired account session can be refreshed before its
+            // provider-specific entitlements are queried.
+            var startup = try deps.load_startup_state(
                 alloc,
+                cfg.gateway_provider.oauth_transport,
                 cfg.secret_store,
                 cfg.default_model,
                 cfg.default_agent_step_limit,
@@ -5517,8 +5528,7 @@ test "runIfRequested model fetch failure is handled" {
     cfg.provider_set.gateway.cli_model_catalog = probe.provider();
 
     var deps = capture.deps();
-    deps.load_startup_state = failingStartupState;
-    deps.load_catalog_startup_state = stubLoadCatalogStartupState;
+    deps.load_startup_state = stubLoadStartupState;
 
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("models")}, cfg, deps);
     try std.testing.expectEqual(RunResult.handled_failure, result);
@@ -5536,7 +5546,7 @@ test "runIfRequested model fetch failure preserves json output" {
     cfg.provider_set.gateway.cli_model_catalog = probe.provider();
 
     var deps = capture.deps();
-    deps.load_catalog_startup_state = stubLoadCatalogStartupState;
+    deps.load_startup_state = stubLoadStartupState;
 
     const result = try runIfRequestedWithDeps(
         std.testing.allocator,
@@ -5560,7 +5570,7 @@ test "runIfRequested model provider cancellation is handled" {
     cfg.provider_set.gateway.cli_model_catalog = probe.provider();
 
     var deps = capture.deps();
-    deps.load_catalog_startup_state = stubLoadCatalogStartupState;
+    deps.load_startup_state = stubLoadStartupState;
 
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("models")}, cfg, deps);
     try std.testing.expectEqual(RunResult.handled_failure, result);
@@ -5578,7 +5588,7 @@ test "runIfRequested models passes startup team to fetch seam" {
     cfg.provider_set.gateway.cli_model_catalog = probe.provider();
 
     var deps = capture.deps();
-    deps.load_catalog_startup_state = stubLoadCatalogStartupState;
+    deps.load_startup_state = stubLoadStartupState;
 
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("models"), @constCast("--json") }, cfg, deps);
     try std.testing.expectEqual(RunResult.handled_success, result);
@@ -6070,15 +6080,6 @@ fn failingStartupStateWithoutCredentials(
     _: usize,
 ) !app_lifecycle.StartupState {
     return error.StartupShouldNotRun;
-}
-
-fn stubLoadCatalogStartupState(
-    alloc: Allocator,
-    secret_store: host.SecretStore,
-    default_model: []const u8,
-    default_agent_step_limit: usize,
-) !app_lifecycle.StartupState {
-    return stubLoadStartupState(alloc, oauth_transport.unavailable_provider, secret_store, default_model, default_agent_step_limit);
 }
 
 fn stubLoadStartupStatus(

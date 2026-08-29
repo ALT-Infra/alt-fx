@@ -8,6 +8,7 @@ pub const chatgpt_auth_file_name = "chatgpt-auth.json";
 pub const grok_auth_file_name = "grok-auth.json";
 pub const opencode_auth_file_name = "opencode-auth.json";
 pub const cline_auth_file_name = "cline-auth.json";
+pub const cline_account_auth_file_name = "cline-account-auth.json";
 pub const parallel_auth_file_name = "parallel-auth.json";
 pub const api_key_file_name = "api-key";
 pub const sessions_dir_name = "sessions";

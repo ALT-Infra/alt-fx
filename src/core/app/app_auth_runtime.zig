@@ -10,6 +10,7 @@ const auth_runtime = @import("../auth/auth_runtime.zig");
 const login_flow = @import("../auth/login_flow.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
 const grok_oauth = @import("../auth/grok_oauth.zig");
+const cline_oauth = @import("../auth/cline_oauth.zig");
 const opencode_session = @import("../auth/opencode_session.zig");
 const cline_session = @import("../auth/cline_session.zig");
 const parallel_session = @import("../auth/parallel_session.zig");
@@ -246,11 +247,19 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
             if (logout_provider == .cline) {
-                const outcome = cline_session.logout() catch {
+                const account_outcome = cline_oauth.logout() catch {
                     try writeAuthNotice(app, .{
                         .topic = "auth",
                         .tone = .@"error",
                         .body = "Could not durably sign out of Cline. The current source is unchanged.",
+                    });
+                    return;
+                };
+                const key_outcome = cline_session.logout() catch {
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .@"error",
+                        .body = "Removed the Cline account session, but could not remove the saved Cline API key.",
                     });
                     return;
                 };
@@ -259,11 +268,14 @@ pub fn Runtime(comptime App: type) type {
                 else
                     false;
                 applyCredentialChange(app, changed);
-                try writeAuthNotice(app, switch (outcome) {
-                    .deleted => .{ .topic = "auth", .tone = .neutral, .body = "Signed out of Cline." },
-                    .missing => .{ .topic = "auth", .tone = .neutral, .body = "No Cline login session found." },
-                    .deleted_not_durable => .{ .topic = "auth", .tone = .warning, .body = "Signed out of Cline, but could not confirm the profile directory update." },
-                });
+                const deleted = account_outcome != .missing or key_outcome != .missing;
+                const durable = account_outcome != .deleted_not_durable and key_outcome != .deleted_not_durable;
+                try writeAuthNotice(app, if (!deleted)
+                    .{ .topic = "auth", .tone = .neutral, .body = "No Cline login session found." }
+                else if (!durable)
+                    .{ .topic = "auth", .tone = .warning, .body = "Signed out of Cline, but could not confirm the profile directory update." }
+                else
+                    .{ .topic = "auth", .tone = .neutral, .body = "Signed out of Cline." });
                 return;
             }
             const result = login_flow.logout(app.alloc, app.auth.oauthTransport()) catch |err| switch (err) {
@@ -475,6 +487,10 @@ pub fn Runtime(comptime App: type) type {
                             try finishSubscriptionSignIn(app, .grok);
                             return;
                         },
+                        .cline => {
+                            try finishSubscriptionSignIn(app, .cline);
+                            return;
+                        },
                     }
                 },
             }
@@ -500,10 +516,12 @@ pub fn Runtime(comptime App: type) type {
                         try writeAuthNotice(app, .{
                             .topic = "auth",
                             .tone = .@"error",
-                            .body = if (provider == .codex)
-                                "Signed in, but the Codex subscription credential could not be loaded."
-                            else
-                                "Signed in, but the Grok subscription credential could not be loaded.",
+                            .body = switch (provider) {
+                                .codex => "Signed in, but the Codex subscription credential could not be loaded.",
+                                .grok => "Signed in, but the Grok subscription credential could not be loaded.",
+                                .cline => "Signed in, but the Cline account credential could not be loaded.",
+                                else => unreachable,
+                            },
                         });
                         return;
                     }
@@ -511,10 +529,12 @@ pub fn Runtime(comptime App: type) type {
                     try writeAuthNotice(app, .{
                         .topic = "auth",
                         .tone = .neutral,
-                        .body = if (provider == .codex)
-                            "Signed in with Codex."
-                        else
-                            "Signed in with Grok.",
+                        .body = switch (provider) {
+                            .codex => "Signed in with Codex.",
+                            .grok => "Signed in with Grok.",
+                            .cline => "Signed in with Cline.",
+                            else => unreachable,
+                        },
                     });
                 },
             }
@@ -803,23 +823,29 @@ pub fn Runtime(comptime App: type) type {
                     return;
                 }
             }
-            const key = io_mod.getenv("CLINE_API_KEY") orelse {
-                try app.writeDomainNotice(.{
-                    .topic = "auth",
-                    .tone = .warning,
-                    .body = "Set CLINE_API_KEY to your Cline API key, then choose Sign in with Cline again.",
-                }, true);
-                return;
-            };
-            var session = cline_session.Session{ .api_key = try app.alloc.dupe(u8, key) };
-            defer session.deinit(app.alloc);
-            cline_session.saveNewSession(app.alloc, session) catch |err| {
+            try app.flushBeforeBlockingExternalWork();
+            const started = app.auth.openClineSignInPickerFromRoot(app.alloc);
+            if (started catch |err| {
                 debug_trace.logf("auth", "Cline login failed err={s}", .{@errorName(err)});
-                try writeLoginError(app, .cline_api_key, err);
+                try writeLoginError(app, .cline_account, err);
                 return;
-            };
-            try app.auth.refreshSourceInventory(app.alloc);
-            try switchProvider(app, .cline, false, .post_oauth);
+            }) {
+                app.shell.render_requests.request(.footer);
+                if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) try openSignInBrowser(app);
+            }
+        }
+
+        fn beginClineSignInForProviderSwitch(app: *App) !void {
+            try app.flushBeforeBlockingExternalWork();
+            const started = app.auth.openClineSignInPickerForProviderSwitch(app.alloc);
+            if (started catch |err| {
+                debug_trace.logf("auth", "Cline login failed err={s}", .{@errorName(err)});
+                try writeLoginError(app, .cline_account, err);
+                return;
+            }) {
+                app.shell.render_requests.request(.footer);
+                if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) try openSignInBrowser(app);
+            }
         }
 
         fn beginCodexSignInForProviderSwitch(app: *App) !void {
@@ -948,7 +974,7 @@ pub fn Runtime(comptime App: type) type {
                     return;
                 }
                 if (target == .cline and allow_login) {
-                    try beginClineSignIn(app);
+                    try beginClineSignInForProviderSwitch(app);
                     return;
                 }
                 try app.writeDomainNotice(.{

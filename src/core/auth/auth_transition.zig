@@ -39,7 +39,7 @@ pub const LogoutFacts = struct {
 
 pub fn decideLogoutProvider(facts: LogoutFacts) model_provider.ProviderId {
     if (facts.requested) |provider| return provider;
-    if (facts.selected == .cline or facts.active_source == .cline_api_key) return .cline;
+    if (facts.selected == .cline or facts.active_source == .cline_account or facts.active_source == .cline_api_key) return .cline;
     if (facts.selected == .opencode or facts.active_source == .opencode_api_key) return .opencode;
     if (facts.selected == .grok or facts.active_source == .grok_subscription) return .grok;
     if (facts.selected == .codex or facts.active_source == .chatgpt_subscription) return .codex;
@@ -82,7 +82,7 @@ pub fn signInCompletion(
         .cline => if (provider_routing_supported)
             .{ .switch_provider = .cline }
         else
-            .{ .activate_source = .cline_api_key },
+            .{ .activate_source = .cline_account },
     };
 }
 

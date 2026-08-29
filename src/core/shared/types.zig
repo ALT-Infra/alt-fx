@@ -94,7 +94,9 @@ pub const CredentialSource = enum {
     stored_key,
     chatgpt_subscription,
     grok_subscription,
+    opencode_anonymous,
     opencode_api_key,
+    cline_account,
     cline_api_key,
 };
 

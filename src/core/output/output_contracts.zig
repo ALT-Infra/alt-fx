@@ -381,7 +381,7 @@ fn openCodeProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
 }
 
 fn clineProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
-    return auth.cline_connected or auth.active_source == .cline_api_key;
+    return auth.cline_connected or auth.active_source == .cline_account or auth.active_source == .cline_api_key;
 }
 
 fn writeConnectedProvidersText(writer: *std.Io.Writer, auth: auth_runtime.StatusSnapshot) !void {

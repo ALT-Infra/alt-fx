@@ -17,6 +17,8 @@ fn route(model: []const u8) chat_completions.Route {
 
 const spec = chat_completions.Spec{
     .credential_source = .opencode_api_key,
+    .alternate_credential_source = .opencode_anonymous,
+    .allow_anonymous = true,
     .provider_name = "OpenCode",
     .e2e_endpoint_env = "FX_E2E_OPENCODE_CHAT_URL",
     .resolve_route = route,

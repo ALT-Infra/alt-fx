@@ -708,6 +708,7 @@ function startFakeOpenCode() {
             npm: "@ai-sdk/openai-compatible",
             models: {
               "gpt-5.6-sol": { provider: { npm: "@ai-sdk/openai" } },
+              "big-pickle": { cost: { input: 0, output: 0 } },
             },
           },
           "opencode-go": {
@@ -743,8 +744,10 @@ function startFakeOpenCode() {
   };
 }
 
-function startFakeCline() {
+function startFakeCline(options: { hasPlan?: boolean } = {}) {
   const apiKey = "cline-e2e-api-key";
+  const accountToken = "cline-e2e-account-token";
+  const refreshedAccountToken = "cline-e2e-refreshed-account-token";
   const requests: Array<{
     path: string;
     authorization: string | null;
@@ -767,6 +770,49 @@ function startFakeCline() {
           clinePass: [{ id: "cline-pass/future-pass" }],
         });
       }
+      if (url.pathname === "/plan") {
+        return Response.json({ success: true, data: options.hasPlan === false ? null : { id: "cline-pass-e2e" } });
+      }
+      if (url.pathname === "/device") {
+        return Response.json({
+          device_code: "cline-device-code",
+          user_code: "CLINE-CODE",
+          verification_uri: `${baseUrl}/verify`,
+          expires_in: 300,
+          interval: 1,
+        });
+      }
+      if (url.pathname === "/token") {
+        return Response.json({
+          access_token: "workos-access",
+          refresh_token: "workos-refresh",
+          token_type: "Bearer",
+          expires_in: 3600,
+        });
+      }
+      if (url.pathname === "/register") {
+        return Response.json({
+          success: true,
+          data: {
+            accessToken: accountToken,
+            refreshToken: "cline-account-refresh",
+            tokenType: "Bearer",
+            expiresAt: "2030-01-01T00:00:00.000Z",
+            userInfo: { clineUserId: "cline-user-e2e" },
+          },
+        });
+      }
+      if (url.pathname === "/refresh") {
+        return Response.json({
+          success: true,
+          data: {
+            accessToken: refreshedAccountToken,
+            tokenType: "Bearer",
+            expiresAt: "2031-01-01T00:00:00.000Z",
+            userInfo: { clineUserId: "cline-user-e2e" },
+          },
+        });
+      }
       if (url.pathname === "/chat") {
         return new Response(
           'data: {"id":"cline-generation","choices":[{"delta":{"content":"CLINE_DIRECT_RESPONSE"},"finish_reason":null}]}\n\n' +
@@ -781,10 +827,17 @@ function startFakeCline() {
   const baseUrl = `http://127.0.0.1:${server.port}`;
   return {
     apiKey,
+    accountToken,
+    refreshedAccountToken,
     requests,
     env: {
       FX_E2E_CLINE_MODELS_URL: `${baseUrl}/models`,
+      FX_E2E_CLINE_PLAN_URL: `${baseUrl}/plan`,
       FX_E2E_CLINE_CHAT_URL: `${baseUrl}/chat`,
+      FX_E2E_CLINE_DEVICE_AUTH_URL: `${baseUrl}/device`,
+      FX_E2E_CLINE_DEVICE_TOKEN_URL: `${baseUrl}/token`,
+      FX_E2E_CLINE_REGISTER_URL: `${baseUrl}/register`,
+      FX_E2E_CLINE_REFRESH_URL: `${baseUrl}/refresh`,
     },
     stop() { server.stop(true); },
   };
@@ -2586,12 +2639,18 @@ test("OpenCode CLI login filters protocols, routes its key directly, and logs ou
     expect(logout.stdout).toContain("Signed out of OpenCode.");
     expect(existsSync(authPath)).toBe(false);
 
-    const missing = await runFx(["ask", "--json", "--no-save", "Still OpenCode?"], {
+    settings.models.opencode = "go/kimi-k3";
+    writeFileSync(settingsPath, `${JSON.stringify(settings)}\n`, { mode: 0o600 });
+
+    const anonymous = await runFx(["ask", "--json", "--auto", "--no-save", "Still OpenCode?"], {
       env: loginEnv,
       timeoutMs: TIMEOUT,
     });
-    expect(missing.code).toBe(1);
-    expect(missing.stderr).toContain("fx login opencode");
+    expect(anonymous.code, `stdout: ${anonymous.stdout}\nstderr: ${anonymous.stderr}`).toBe(0);
+    expect(anonymous.stdout).toContain("OPENCODE_DIRECT_RESPONSE");
+    const anonymousChat = opencode.requests.filter((request) => request.path === "/chat").at(-1)!;
+    expect(anonymousChat.authorization).toBeNull();
+    expect(JSON.parse(anonymousChat.body ?? "{}").model).toBe("big-pickle");
   } finally {
     opencode.stop();
   }
@@ -2676,6 +2735,75 @@ test("Cline CLI login discovers and runs live free and ClinePass models", async 
     });
     expect(missing.code).toBe(1);
     expect(missing.stderr).toContain("fx login cline");
+  } finally {
+    cline.stop();
+  }
+});
+
+test("Cline account login needs no API key and hides ClinePass without a plan", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-cline-account-login-"));
+  gateway = startFakeGateway([]);
+  const cline = startFakeCline({ hasPlan: false });
+  try {
+    const env = {
+      HOME: home,
+      CLINE_API_KEY: undefined,
+      AI_GATEWAY_API_KEY: "gateway-cline-account-sentinel",
+      VERCEL_OIDC_TOKEN: undefined,
+      FX_DISABLE_KEYCHAIN: "1",
+      FX_SKIP_ONBOARDING: "1",
+      FX_AUTO_UPGRADE: "0",
+      FX_NO_OPEN_BROWSER: "1",
+      FX_MODEL: undefined,
+      FX_GATEWAY_BASE_URL: gateway.baseUrl,
+      FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+      ...cline.env,
+    };
+    const login = await runFx(["login", "cline"], { env, timeoutMs: TIMEOUT });
+    expect(login.code, `stdout: ${login.stdout}\nstderr: ${login.stderr}`).toBe(0);
+    expect(login.stdout).toContain("Code: CLINE-CODE");
+    expect(login.stdout).toContain("Signed in with Cline.");
+
+    const authPath = join(home, ".fx", "cline-account-auth.json");
+    expect(existsSync(authPath)).toBe(true);
+    expect(statSync(authPath).mode & 0o077).toBe(0);
+
+    // The explicit online catalog command must refresh an expired account
+    // session before asking Cline which paid entitlements are available.
+    const expiredSession = JSON.parse(readFileSync(authPath, "utf8"));
+    expiredSession.expires_at_ms = 1;
+    writeFileSync(authPath, `${JSON.stringify(expiredSession)}\n`, { mode: 0o600 });
+
+    const models = await runFx(["models", "--json"], { env, timeoutMs: TIMEOUT });
+    expect(models.code, `stdout: ${models.stdout}\nstderr: ${models.stderr}`).toBe(0);
+    const ids = (JSON.parse(models.stdout) as { models: Array<{ id: string }> }).models.map((model) => model.id);
+    expect(ids).toEqual(["cline-free/future-free"]);
+    const refreshRequests = cline.requests.filter((request) => request.path === "/refresh");
+    expect(refreshRequests).toHaveLength(1);
+    const planRequest = cline.requests.filter((request) => request.path === "/plan").at(-1)!;
+    expect(planRequest.authorization).toBe(`Bearer ${cline.refreshedAccountToken}`);
+
+    const ask = await runFx(["ask", "--json", "--auto", "--no-save", "Answer directly."], {
+      env,
+      timeoutMs: TIMEOUT,
+    });
+    expect(ask.code, `stdout: ${ask.stdout}\nstderr: ${ask.stderr}`).toBe(0);
+    const chat = cline.requests.filter((request) => request.path === "/chat").at(-1)!;
+    expect(chat.authorization).toBe(`Bearer ${cline.refreshedAccountToken}`);
+    const register = cline.requests.find((request) => request.path === "/register")!;
+    expect(JSON.parse(register.body ?? "{}")).toEqual({
+      accessToken: "workos-access",
+      refreshToken: "workos-refresh",
+    });
+    const refresh = refreshRequests[0]!;
+    expect(JSON.parse(refresh.body ?? "{}")).toEqual({
+      refreshToken: "cline-account-refresh",
+      grantType: "refresh_token",
+    });
+
+    const logout = await runFx(["logout", "cline"], { env, timeoutMs: TIMEOUT });
+    expect(logout.code).toBe(0);
+    expect(existsSync(authPath)).toBe(false);
   } finally {
     cline.stop();
   }

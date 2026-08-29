@@ -34,6 +34,7 @@ fn usesMaxCompletionTokens(model: []const u8) bool {
 
 const spec = chat_completions.Spec{
     .credential_source = .cline_api_key,
+    .alternate_credential_source = .cline_account,
     .provider_name = "Cline",
     .e2e_endpoint_env = "FX_E2E_CLINE_CHAT_URL",
     .resolve_route = route,
