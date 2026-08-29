@@ -90,12 +90,16 @@ if args and args[0] == "set-key-partition-list":
     )
     partition_list = args[args.index("-S") + 1] if "-S" in args else ""
     key_type = args[args.index("-t") + 1] if "-t" in args else ""
-    key_label = args[args.index("-l") + 1] if "-l" in args else ""
+    search_list_configured = any(
+        line.startswith("security list-keychains -d user -s ")
+        for line in event_log.read_text(encoding="utf-8").splitlines()
+    )
     if (
         "-s" in args
         or partition_list != "apple-tool:,apple:"
         or key_type != "private"
-        or key_label != {SIGNING_IDENTITY!r}
+        or "-l" in args
+        or not search_list_configured
         or " -t cert " in f" {{import_event}} "
     ):
         print("error: The specified item could not be found in the keychain.", file=sys.stderr)
@@ -285,9 +289,17 @@ else:
                 "private",
                 partition_args[partition_args.index("-t") + 1],
             )
-            self.assertIn(f" -l {SIGNING_IDENTITY} ", f" {partition_event} ")
+            self.assertNotIn("-l", partition_args)
             self.assertNotIn("-s", partition_args)
             self.assertNotIn("codesign:", partition_args)
+            events = event_log.read_text(encoding="utf-8").splitlines()
+            search_index = next(
+                index
+                for index, line in enumerate(events)
+                if line.startswith("security list-keychains -d user -s ")
+            )
+            partition_index = events.index(partition_event)
+            self.assertLess(search_index, partition_index)
 
     def test_reports_failing_signing_stage_without_printing_secrets(self) -> None:
         self.assertTrue(SCRIPT_PATH.is_file(), "macOS signing helper is missing")
@@ -295,6 +307,10 @@ else:
             (
                 {"FX_SIGNING_TEST_SECURITY_FAIL_COMMAND": "import"},
                 "PKCS#12 import",
+            ),
+            (
+                {"FX_SIGNING_TEST_SECURITY_FAIL_COMMAND": "list-keychains"},
+                "keychain search configuration",
             ),
             (
                 {"FX_SIGNING_TEST_SECURITY_FAIL_COMMAND": "set-key-partition-list"},

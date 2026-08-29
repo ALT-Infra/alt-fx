@@ -66,13 +66,8 @@ if ! "${security_bin}" import "${certificate_path}" \
     -T /usr/bin/security; then
     fail_stage "PKCS#12 import"
 fi
-if ! "${security_bin}" set-key-partition-list \
-    -S apple-tool:,apple: \
-    -t private \
-    -l "${signing_identity}" \
-    -k "${keychain_password}" \
-    "${signing_keychain}" >/dev/null; then
-    fail_stage "private-key ACL configuration"
+if ! "${security_bin}" list-keychains -d user -s "${signing_keychain}"; then
+    fail_stage "keychain search configuration"
 fi
 
 if ! signing_identities="$(
@@ -83,6 +78,14 @@ fi
 if [[ "${signing_identities}" != *"${signing_identity}"* ]]; then
     echo "Developer ID signing identity is unavailable" >&2
     exit 1
+fi
+
+if ! "${security_bin}" set-key-partition-list \
+    -S apple-tool:,apple: \
+    -t private \
+    -k "${keychain_password}" \
+    "${signing_keychain}" >/dev/null; then
+    fail_stage "private-key ACL configuration"
 fi
 
 if ! "${codesign_bin}" \
