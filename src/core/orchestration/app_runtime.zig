@@ -666,6 +666,8 @@ test "extension failure becomes a notice instead of escaping the host event loop
     };
     const FakeWorker = struct {
         fn pushEvent(_: *@This(), _: std.mem.Allocator, _: anytype) !void {}
+
+        fn requestCancel(_: *@This()) void {}
     };
     const FakeApp = struct {
         const Tone = enum { neutral, warning, @"error" };
@@ -754,6 +756,8 @@ test "active native subagent work refuses orchestration before extension creatio
     };
     const FakeWorker = struct {
         fn pushEvent(_: *@This(), _: std.mem.Allocator, _: anytype) !void {}
+
+        fn requestCancel(_: *@This()) void {}
     };
     const FakeApp = struct {
         const Tone = enum { neutral, warning, @"error" };
@@ -846,6 +850,8 @@ test "unsettled native subagent recovery fails orchestration admission closed" {
     };
     const FakeWorker = struct {
         fn pushEvent(_: *@This(), _: std.mem.Allocator, _: anytype) !void {}
+
+        fn requestCancel(_: *@This()) void {}
     };
     const FakeApp = struct {
         const Tone = enum { neutral, warning, @"error" };
