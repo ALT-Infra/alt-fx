@@ -403,12 +403,48 @@ pub fn buildHintLine(
     width: u16,
     out: []u8,
 ) []const u8 {
+    return buildHintLineWithIdentity(
+        stream_active,
+        awaiting_permission,
+        has_api_key,
+        model,
+        permission_mode,
+        queued_count,
+        active_label,
+        fast_mode,
+        model_supports_fast,
+        effort,
+        model_supports_effort,
+        statusline,
+        null,
+        width,
+        out,
+    );
+}
+
+pub fn buildHintLineWithIdentity(
+    stream_active: bool,
+    awaiting_permission: bool,
+    has_api_key: bool,
+    model: []const u8,
+    permission_mode: types.PermissionMode,
+    queued_count: usize,
+    active_label: ?[]const u8,
+    fast_mode: bool,
+    model_supports_fast: bool,
+    effort: types.ReasoningEffort,
+    model_supports_effort: bool,
+    statusline: StatuslineItems,
+    identity_label: ?[]const u8,
+    width: u16,
+    out: []u8,
+) []const u8 {
     _ = active_label;
 
     var model_buf: [96]u8 = undefined;
     const model_label = compactModelLabel(model, &model_buf);
     var permission_buf: [64]u8 = undefined;
-    const permission_label = permissionModeStatusLabel(permission_mode, &permission_buf);
+    const permission_label = identity_label orelse permissionModeStatusLabel(permission_mode, &permission_buf);
 
     var end: usize = 0;
     if (!awaiting_permission and !has_api_key) {
@@ -949,6 +985,28 @@ test "buildHintLine hides effort when it is auto" {
     var buf: [128]u8 = undefined;
     const line = buildHintLine(false, false, true, "anthropic/claude-opus-4.7", .ask, 0, null, false, .auto, true, .{}, 80, &buf);
     try std.testing.expectEqualStrings("ask · opus 4.7", line);
+}
+
+test "buildHintLine substitutes an orchestration entry identity" {
+    var buf: [128]u8 = undefined;
+    const line = buildHintLineWithIdentity(
+        false,
+        false,
+        true,
+        "cline-pass/glm-5.3-flash",
+        .auto,
+        0,
+        null,
+        false,
+        false,
+        .auto,
+        false,
+        .{},
+        "primary",
+        80,
+        &buf,
+    );
+    try std.testing.expectEqualStrings("primary · glm-5.3-flash", line);
 }
 
 test "buildHintLine hides effort for models without effort support" {

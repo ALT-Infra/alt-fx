@@ -17,6 +17,7 @@ const max_tool_identity_bytes: usize = 1024;
 const max_tool_arguments_bytes: usize = 4 * 1024 * 1024;
 const transfer_buffer_bytes: usize = 256 * 1024;
 const connect_timeout_ms: i64 = 30_000;
+const max_extra_request_headers: usize = 16;
 
 pub const Route = struct {
     endpoint: []const u8,
@@ -35,6 +36,9 @@ pub const Spec = struct {
     resolve_route: ResolveRouteFn,
     uses_max_completion_tokens: ?ModelPredicateFn = null,
     non_retryable_limit_markers: []const []const u8 = &.{},
+    extra_headers: []const std.http.Header = &.{},
+    user_agent: ?[]const u8 = null,
+    session_header_name: ?[]const u8 = null,
 };
 
 pub fn provider(spec: *const Spec) stream_provider.Provider {
@@ -365,6 +369,8 @@ const OpenRequestOperation = struct {
     client: *std.http.Client,
     uri: std.Uri,
     auth_header: ?[]const u8,
+    user_agent: []const u8,
+    extra_headers: []const std.http.Header,
 
     pub fn run(self: *@This()) !OpenedRequest {
         return .{ .request = try self.client.request(.POST, self.uri, .{
@@ -372,11 +378,9 @@ const OpenRequestOperation = struct {
                 .content_type = .{ .override = "application/json" },
                 .authorization = if (self.auth_header) |value| .{ .override = value } else .omit,
                 .accept_encoding = .omit,
-                .user_agent = .{ .override = gateway_client.user_agent },
+                .user_agent = .{ .override = self.user_agent },
             },
-            .extra_headers = &[_]std.http.Header{
-                .{ .name = "accept", .value = "text/event-stream" },
-            },
+            .extra_headers = self.extra_headers,
             .keep_alive = false,
             .redirect_behavior = .unhandled,
         }) };
@@ -405,10 +409,29 @@ fn streamCompletionCore(
 
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
     defer client.deinit();
+    if (spec.extra_headers.len > max_extra_request_headers) {
+        return error.OpenAICompatibleRequestHeadersTooLarge;
+    }
+    var extra_headers_buf: [max_extra_request_headers + 2]std.http.Header = undefined;
+    var extra_header_count: usize = 0;
+    extra_headers_buf[extra_header_count] = .{ .name = "accept", .value = "text/event-stream" };
+    extra_header_count += 1;
+    for (spec.extra_headers) |header| {
+        extra_headers_buf[extra_header_count] = header;
+        extra_header_count += 1;
+    }
+    if (spec.session_header_name) |name| {
+        if (request.session_id) |session_id| {
+            extra_headers_buf[extra_header_count] = .{ .name = name, .value = session_id };
+            extra_header_count += 1;
+        }
+    }
     var open_operation = OpenRequestOperation{
         .client = &client,
         .uri = uri,
         .auth_header = auth_header,
+        .user_agent = spec.user_agent orelse gateway_client.user_agent,
+        .extra_headers = extra_headers_buf[0..extra_header_count],
     };
     var connect_deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
         .clock = .awake,

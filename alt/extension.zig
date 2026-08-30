@@ -49,11 +49,19 @@ pub fn inspectDefinition(
     defer team.deinit();
     const id = try allocator.dupe(u8, team.value.id);
     errdefer allocator.free(id);
+    const entry_model = team.value.model(team.value.primary.model_id) orelse
+        return error.UnknownModel;
+    const entry_role_label = try allocator.dupe(u8, "primary");
+    errdefer allocator.free(entry_role_label);
+    const entry_model_label = try allocator.dupe(u8, entry_model.name);
+    errdefer allocator.free(entry_model_label);
     return .{
         .id = id,
         .revision = team.value.revision,
         .digest = team.value.digest,
         .name = try allocator.dupe(u8, team.value.name),
+        .entry_role_label = entry_role_label,
+        .entry_model_label = entry_model_label,
     };
 }
 
@@ -203,4 +211,19 @@ test "Team editor template receives an opaque identity and revisions remain vali
     defer next.deinit();
     try std.testing.expectEqual(@as(u32, 2), next.value.revision);
     try std.testing.expectEqualStrings("team-0123456789abcdef01234567", next.value.id);
+}
+
+test "definition metadata exposes the pinned primary identity to the host" {
+    const alloc = std.testing.allocator;
+    const definition =
+        "{\"schema\":2,\"id\":\"team-footer\",\"revision\":1,\"name\":\"Footer Team\",\"provider_id\":\"cline\",\"models\":[" ++
+        "{\"id\":\"primary-model\",\"route\":\"cline-pass\",\"name\":\"glm-5.3-flash\"}," ++
+        "{\"id\":\"specialist-model\",\"route\":\"cline-pass\",\"name\":\"kimi-k3\"}]," ++
+        "\"primary\":{\"id\":\"primary\",\"model_id\":\"primary-model\",\"definition\":\"Own.\",\"specialists\":[\"specialist\"]}," ++
+        "\"peers\":[],\"specialists\":[{\"id\":\"specialist\",\"model_id\":\"specialist-model\",\"definition\":\"Inspect.\"}]}";
+
+    var metadata = try inspectDefinition(alloc, definition);
+    defer metadata.deinit(alloc);
+    try std.testing.expectEqualStrings("primary", metadata.entry_role_label.?);
+    try std.testing.expectEqualStrings("glm-5.3-flash", metadata.entry_model_label.?);
 }

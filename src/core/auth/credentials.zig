@@ -696,6 +696,20 @@ fn loadClineApiKeyCredential(alloc: std.mem.Allocator) !?Credential {
     return .{ .token = try alloc.dupe(u8, stored.api_key), .source = .cline_api_key };
 }
 
+const cline_workos_token_prefix = "workos:";
+
+fn formatClineAccountApiKey(alloc: std.mem.Allocator, access_token: []const u8) ![]u8 {
+    if (access_token.len >= cline_workos_token_prefix.len and
+        std.ascii.eqlIgnoreCase(
+            access_token[0..cline_workos_token_prefix.len],
+            cline_workos_token_prefix,
+        ))
+    {
+        return alloc.dupe(u8, access_token);
+    }
+    return std.fmt.allocPrint(alloc, "{s}{s}", .{ cline_workos_token_prefix, access_token });
+}
+
 fn loadClineAccountCredential(
     alloc: std.mem.Allocator,
     transport: oauth_transport.Provider,
@@ -703,8 +717,12 @@ fn loadClineAccountCredential(
 ) !?Credential {
     var access = (try cline_oauth.loadAccess(alloc, transport, mode)) orelse return null;
     defer access.deinit(alloc);
-    const token = access.access_token;
-    access.access_token = &.{};
+    // Cline's inference API distinguishes account OAuth credentials from API
+    // keys with this wire prefix. Keep the stored/refreshed WorkOS JWT raw;
+    // only format the short-lived runtime credential that becomes the Bearer
+    // value, matching Cline's own formatProviderOAuthApiKey contract.
+    const token = try formatClineAccountApiKey(alloc, access.access_token);
+    errdefer secret.zeroAndFree(alloc, token);
     const account_id = access.account_id;
     access.account_id = &.{};
     return .{
@@ -1518,4 +1536,15 @@ test "a disabled store still reports why the fx login was silent" {
     try std.testing.expect(resolution.credential == null);
     try std.testing.expectEqual(FxLoginReadStatus.unavailable, resolution.fx_login_status);
     try std.testing.expectEqual(StoredKeyReadStatus.not_attempted, resolution.stored_key_status);
+}
+
+test "Cline account API keys carry exactly one WorkOS wire prefix" {
+    const alloc = std.testing.allocator;
+    const raw = try formatClineAccountApiKey(alloc, "jwt-token");
+    defer secret.zeroAndFree(alloc, raw);
+    try std.testing.expectEqualStrings("workos:jwt-token", raw);
+
+    const already_formatted = try formatClineAccountApiKey(alloc, "WORKOS:jwt-token");
+    defer secret.zeroAndFree(alloc, already_formatted);
+    try std.testing.expectEqualStrings("WORKOS:jwt-token", already_formatted);
 }

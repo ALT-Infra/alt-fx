@@ -834,6 +834,16 @@ function startFakeCline() {
     path: string;
     authorization: string | null;
     body: string | null;
+    userAgent: string | null;
+    clientType: string | null;
+    clientVersion: string | null;
+    coreVersion: string | null;
+    taskId: string | null;
+    referer: string | null;
+    title: string | null;
+    isMultiroot: string | null;
+    platform: string | null;
+    platformVersion: string | null;
   }> = [];
   const server = Bun.serve({
     hostname: "127.0.0.1",
@@ -845,6 +855,16 @@ function startFakeCline() {
         path: url.pathname,
         authorization: request.headers.get("authorization"),
         body,
+        userAgent: request.headers.get("user-agent"),
+        clientType: request.headers.get("x-client-type"),
+        clientVersion: request.headers.get("x-client-version"),
+        coreVersion: request.headers.get("x-core-version"),
+        taskId: request.headers.get("x-task-id"),
+        referer: request.headers.get("http-referer"),
+        title: request.headers.get("x-title"),
+        isMultiroot: request.headers.get("x-is-multiroot"),
+        platform: request.headers.get("x-platform"),
+        platformVersion: request.headers.get("x-platform-version"),
       });
       if (url.pathname === "/models") {
         return Response.json({
@@ -3088,13 +3108,35 @@ test("Cline account login exposes free and ClinePass routes without an invented 
     });
     expect(ask.code, `stdout: ${ask.stdout}\nstderr: ${ask.stderr}`).toBe(0);
     const chat = cline.requests.filter((request) => request.path === "/chat").at(-1)!;
-    expect(chat.authorization).toBe(`Bearer ${cline.refreshedAccountToken}`);
+    expect(chat.authorization).toBe(`Bearer workos:${cline.refreshedAccountToken}`);
+    expect(chat.clientType).toBe("fx");
+    expect(chat.clientVersion).not.toBeNull();
+    expect(chat.userAgent).toBe(`Cline/${chat.clientVersion}`);
+    expect(chat.coreVersion).toBe(chat.clientVersion);
+    // --no-save intentionally has no session identity. Interactive and ALT
+    // runs carry their fx session ID in this provider header.
+    expect(chat.taskId).toBeNull();
+    expect(chat.referer).toBe("https://cline.bot");
+    expect(chat.title).toBe("Cline");
+    expect(chat.isMultiroot).toBe("false");
+    expect(chat.platform).toBe("cli");
+    expect(chat.platformVersion).toBe(chat.clientVersion);
     const register = cline.requests.find((request) => request.path === "/register")!;
+    expect(register.userAgent).toStartWith("fx/");
+    expect(register.clientType).toBeNull();
+    expect(register.clientVersion).toBeNull();
+    expect(register.coreVersion).toBeNull();
+    expect(register.taskId).toBeNull();
     expect(JSON.parse(register.body ?? "{}")).toEqual({
       accessToken: "workos-access",
       refreshToken: "workos-refresh",
     });
     const refresh = refreshRequests[0]!;
+    expect(refresh.userAgent).toStartWith("fx/");
+    expect(refresh.clientType).toBeNull();
+    expect(refresh.clientVersion).toBeNull();
+    expect(refresh.coreVersion).toBeNull();
+    expect(refresh.taskId).toBeNull();
     expect(JSON.parse(refresh.body ?? "{}")).toEqual({
       refreshToken: "cline-account-refresh",
       grantType: "refresh_token",

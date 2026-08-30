@@ -600,6 +600,9 @@ pub fn Runtime(comptime App: type) type {
                 input_completion_runtime.CompletionRuntime(App).visibleInlineCompletion(app);
 
             const visible_model = pending_model orelse provider_runtime.model(app);
+            const orchestration_role = orchestrationFooterRole(app);
+            const orchestration_model = orchestrationFooterModel(app);
+            const status_model = orchestration_model orelse visible_model;
             const visible_capabilities = model_capabilities.resolveForApp(App, app, visible_model);
             const active_capabilities_pending = pending_model == null and app.isModelCacheLoading();
             const model_supports_fast = visible_capabilities.supports_fast_mode;
@@ -644,7 +647,8 @@ pub fn Runtime(comptime App: type) type {
                 .completed_assistant_presentation_tail = app.pacer.hasCompletedAssistantPresentationTail(),
                 .writing_response = app.pacer.hasPending(),
                 .has_api_key = app.auth.credentialSource() != null,
-                .model = visible_model,
+                .model = status_model,
+                .identity_label = orchestration_role,
                 .pending_images = app.pending_images.items,
                 .permission_mode = if (comptime @hasField(App, "permission_engine"))
                     app.permission_engine.mode
@@ -670,7 +674,7 @@ pub fn Runtime(comptime App: type) type {
                 .queued_editor_active = queued_cards.editor_active,
                 .fast_indicator_active = fast_indicator_active,
                 .effort = visible_effort,
-                .model_supports_effort = model_supports_effort,
+                .model_supports_effort = if (orchestration_model == null) model_supports_effort else false,
                 .ctrl_c_pending = app.input_runtime.gestures.ctrlCExitArmed(),
                 .shimmer_pos = shimmer_pos,
                 .now_ms = now_ms,
@@ -1956,6 +1960,16 @@ pub fn Runtime(comptime App: type) type {
         fn orchestrationDefinitionManagerActive(app: *const App) bool {
             if (comptime !@hasDecl(App, "orchestrationDefinitionManagerActive")) return false;
             return app.orchestrationDefinitionManagerActive();
+        }
+
+        fn orchestrationFooterRole(app: *const App) ?[]const u8 {
+            if (comptime !@hasDecl(App, "orchestrationFooterRole")) return null;
+            return app.orchestrationFooterRole();
+        }
+
+        fn orchestrationFooterModel(app: *const App) ?[]const u8 {
+            if (comptime !@hasDecl(App, "orchestrationFooterModel")) return null;
+            return app.orchestrationFooterModel();
         }
 
         fn helpMenuActive(app: *const App) bool {
