@@ -2,7 +2,6 @@ const std = @import("std");
 const builtin_skills = @import("../../builtins/skills.zig");
 const context_limits = @import("../../core/config/context_limits.zig");
 const lexical_relevance = @import("../../core/shared/lexical_relevance.zig");
-const text_utils = @import("../../core/shared/text_utils.zig");
 const result_store = @import("../../core/session/result_store.zig");
 const capability_retrieval = @import("../../core/tooling/capability_retrieval.zig");
 const skill_runtime = @import("../../core/skills/skill_runtime.zig");
@@ -60,22 +59,6 @@ pub fn call(
         ) },
     };
     return .{ .success = model_output };
-}
-
-pub fn search(
-    ctx: tool_dispatch.DispatchContext,
-    query: *const lexical_relevance.PreparedQuery,
-    max_bytes: usize,
-) ![]u8 {
-    return searchRequest(
-        ctx,
-        .{
-            .query = query,
-            .kind = .skill,
-            .limit = legacy_result_limit,
-        },
-        max_bytes,
-    );
 }
 
 pub fn searchRequest(
@@ -139,8 +122,8 @@ fn renderProjectedSearch(
     const identity_scratch = identity_scratch_state.allocator();
     var document_count: usize = 0;
     for (skills) |*skill| {
-        if (!try identityProjectionSafe(identity_scratch, skill.name) or
-            !try identityProjectionSafe(identity_scratch, skill.path))
+        if (!try tool_result_limits.modelProjectionPreservesText(identity_scratch, skill.name) or
+            !try tool_result_limits.modelProjectionPreservesText(identity_scratch, skill.path))
         {
             continue;
         }
@@ -248,14 +231,6 @@ fn renderRawSearch(
     try std.json.Stringify.value(next_cursor, .{}, &out.writer);
     try out.writer.writeByte('}');
     return try out.toOwnedSlice();
-}
-
-fn identityProjectionSafe(alloc: Allocator, identity: []const u8) !bool {
-    const sanitized = try text_utils.sanitizeModelText(alloc, identity);
-    const masked = text_utils.maskSecrets(alloc, sanitized) catch |err| switch (err) {
-        error.OutOfMemory, error.WriteFailed => return error.OutOfMemory,
-    };
-    return std.mem.eql(u8, identity, masked);
 }
 
 fn checkProjection(

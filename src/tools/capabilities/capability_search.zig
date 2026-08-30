@@ -36,8 +36,6 @@ const Input = struct {
 const ProjectionCheck = union(enum) {
     valid,
     invalid,
-    skill_identity_changed: usize,
-    mcp_identity_changed: usize,
     authentication_identity_changed,
 };
 
@@ -391,8 +389,6 @@ fn combineProjected(
                 return error.CapabilitySearchResultLimitTooSmall;
             },
             .authentication_identity_changed => include_authentication = false,
-            .skill_identity_changed,
-            .mcp_identity_changed,
             .invalid,
             => {
                 alloc.free(projected);
@@ -502,14 +498,14 @@ fn checkProjection(
         return .invalid;
     }
 
-    for (projected_skills.array.items, skills, 0..) |projected_skill, skill, index| {
+    for (projected_skills.array.items, skills) |projected_skill, skill| {
         if (!objectStringFieldsEqual(projected_skill, skill, "name", "location")) {
-            return .{ .skill_identity_changed = index };
+            return .invalid;
         }
     }
-    for (projected_mcp.array.items, mcp_tools, 0..) |projected_tool, tool, index| {
+    for (projected_mcp.array.items, mcp_tools) |projected_tool, tool| {
         if (!objectStringFieldsEqual(projected_tool, tool, "name", "server")) {
-            return .{ .mcp_identity_changed = index };
+            return .invalid;
         }
     }
     if (authentication_required) |expected| {

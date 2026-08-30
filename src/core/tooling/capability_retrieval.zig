@@ -81,10 +81,7 @@ pub const Document = struct {
 
 pub const Match = struct {
     document_index: usize,
-    exact_identity: bool,
-    score: f64,
-    primary_hits: usize,
-    secondary_hits: usize,
+    clear_match: bool,
 };
 
 pub const Page = struct {
@@ -130,8 +127,8 @@ const Ranked = struct {
     document_index: usize,
     exact_identity: bool,
     score: f64,
-    primary_hits: usize,
-    secondary_hits: usize,
+    primary_hits: u8,
+    secondary_hits: u8,
 };
 
 const CorpusStats = struct {
@@ -174,9 +171,12 @@ pub fn retrieve(
     }
 
     for (documents, 0..) |document, document_index| {
-        const exact_identity = containsAnyIdentity(request.query.raw, document.identities);
-        var primary_hits: usize = 0;
-        var secondary_hits: usize = 0;
+        const exact_identity = lexical_relevance.containsCompleteIdentity(
+            request.query.raw,
+            &document.identities,
+        );
+        var primary_hits: u8 = 0;
+        var secondary_hits: u8 = 0;
         var score: f64 = 0;
         const primary_length = primaryLength(document);
         const secondary_length = secondaryLength(document);
@@ -232,10 +232,7 @@ pub fn retrieve(
     for (ranked[start_offset..end], 0..) |match, index| {
         page_matches[index] = .{
             .document_index = match.document_index,
-            .exact_identity = match.exact_identity,
-            .score = match.score,
-            .primary_hits = match.primary_hits,
-            .secondary_hits = match.secondary_hits,
+            .clear_match = match.exact_identity or match.primary_hits + match.secondary_hits >= 2,
         };
     }
     return .{
@@ -347,30 +344,6 @@ fn termFrequency(text: []const u8, token: []const u8) usize {
         start = end - 1;
     }
     return count;
-}
-
-fn containsAnyIdentity(query: []const u8, identities: [2][]const u8) bool {
-    for (identities) |identity| {
-        if (containsIdentity(query, identity)) return true;
-    }
-    return false;
-}
-
-fn containsIdentity(query: []const u8, identity: []const u8) bool {
-    if (identity.len == 0 or identity.len > query.len) return false;
-    var start: usize = 0;
-    while (start <= query.len - identity.len) : (start += 1) {
-        const end = start + identity.len;
-        if (!std.ascii.eqlIgnoreCase(query[start..end], identity)) continue;
-        if (start > 0 and isIdentityByte(query[start - 1])) continue;
-        if (end < query.len and isIdentityByte(query[end])) continue;
-        return true;
-    }
-    return false;
-}
-
-fn isIdentityByte(byte: u8) bool {
-    return std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-';
 }
 
 fn lessInventory(

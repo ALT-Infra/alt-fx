@@ -1458,7 +1458,7 @@ fn orderSkillsForPrompt(alloc: Allocator, skills: []const Skill, prompt: []const
     @memset(selected, false);
     var write_index: usize = 0;
     for (page.matches) |match| {
-        if (!match.exact_identity and match.primary_hits + match.secondary_hits < 2) continue;
+        if (!match.clear_match) continue;
         ordered[write_index] = skills[match.document_index];
         selected[match.document_index] = true;
         write_index += 1;

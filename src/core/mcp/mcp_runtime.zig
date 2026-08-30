@@ -6258,8 +6258,8 @@ pub const McpRuntime = struct {
                 for (server.tool_catalog.tools.items) |*tool| {
                     if (!operation_access.allows(.{ .tool = tool.prefixed_name })) continue;
                     if (permissions.rulesDenyAllTargetsForPermission(permission_rules, tool.prefixed_name)) continue;
-                    if (!try searchIdentityProjectionSafe(identity_scratch, server.config.name) or
-                        !try searchIdentityProjectionSafe(identity_scratch, tool.prefixed_name))
+                    if (!try tool_result_limits.modelProjectionPreservesText(identity_scratch, server.config.name) or
+                        !try tool_result_limits.modelProjectionPreservesText(identity_scratch, tool.prefixed_name))
                     {
                         continue;
                     }
@@ -11741,14 +11741,6 @@ fn renderSearchResult(
     }
     try out.writer.writeByte('}');
     return try out.toOwnedSlice();
-}
-
-fn searchIdentityProjectionSafe(alloc: Allocator, identity: []const u8) !bool {
-    const sanitized = try text_utils.sanitizeModelText(alloc, identity);
-    const masked = text_utils.maskSecrets(alloc, sanitized) catch |err| switch (err) {
-        error.OutOfMemory, error.WriteFailed => return error.OutOfMemory,
-    };
-    return std.mem.eql(u8, identity, masked);
 }
 
 fn renderSearchNotice(

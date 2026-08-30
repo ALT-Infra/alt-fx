@@ -156,7 +156,7 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
-fn containsCompleteIdentity(raw: []const u8, identities: []const []const u8) bool {
+pub fn containsCompleteIdentity(raw: []const u8, identities: []const []const u8) bool {
     for (raw, 0..) |_, start| {
         for (identities) |identity| {
             if (identity.len == 0 or identity.len > raw.len - start) continue;
