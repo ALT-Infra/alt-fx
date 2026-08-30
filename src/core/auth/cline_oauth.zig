@@ -127,23 +127,46 @@ fn completeSignIn(
 ) !login_flow.SignInCompletion {
     const context: *LoginContext = @ptrCast(@alignCast(raw.?));
     const workos_refresh = token.refresh_token orelse return error.ClineRefreshTokenMissing;
+    const response_body = try registerSessionTokens(
+        alloc,
+        context.transport,
+        token.access_token,
+        workos_refresh,
+    );
+    defer alloc.free(response_body);
+    return .{ .cline = try parseClineSession(alloc, response_body, null) };
+}
+
+/// Registers a WorkOS token pair with Cline's API so the issued account
+/// session is accepted by the inference and account surfaces. Cline rotates
+/// the underlying session server-side, and a refreshed token is rejected
+/// until it is re-registered; login and refresh both go through here.
+/// Returns the owned response body on success.
+fn registerSessionTokens(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    access_token: []const u8,
+    refresh_token: []const u8,
+) ![]u8 {
     var payload: std.Io.Writer.Allocating = .init(alloc);
     defer payload.deinit();
     try payload.writer.writeAll("{\"accessToken\":");
-    try std.json.Stringify.value(token.access_token, .{}, &payload.writer);
+    try std.json.Stringify.value(access_token, .{}, &payload.writer);
     try payload.writer.writeAll(",\"refreshToken\":");
-    try std.json.Stringify.value(workos_refresh, .{}, &payload.writer);
+    try std.json.Stringify.value(refresh_token, .{}, &payload.writer);
     try payload.writer.writeByte('}');
     const endpoint = try configuredEndpoint(alloc, e2e_register_url_env, register_url);
     defer alloc.free(endpoint);
-    var response = try context.transport.execute(alloc, .{
+    var response = try transport.execute(alloc, .{
         .method = .post_json,
         .url = endpoint,
         .payload = payload.written(),
     });
     defer response.deinit(alloc);
     if (response.disposition != .accepted) return error.ClineTokenRegistrationFailed;
-    return .{ .cline = try parseClineSession(alloc, response.body, null) };
+    const body = response.body;
+    response.body = &.{};
+    return body;
 }
 
 fn saveSignIn(_: ?*anyopaque, alloc: Allocator, completion: login_flow.SignInCompletion) !void {
@@ -212,7 +235,21 @@ fn refreshSession(
     });
     defer response.deinit(alloc);
     if (response.disposition != .accepted) return error.ClineTokenRefreshFailed;
-    var replacement = try parseClineSession(alloc, response.body, session);
+    var refreshed = try parseClineSession(alloc, response.body, session);
+    defer refreshed.deinit(alloc);
+    if (!std.mem.eql(u8, refreshed.account_id, session.account_id)) return error.ClineAccountChanged;
+    // A refreshed WorkOS token is not yet honored by Cline's inference and
+    // account surfaces until the new pair is re-registered, which rotates the
+    // server-side session. Skipping this leaves the stored credential
+    // permanently "re-authenticate"-rejected after the first refresh.
+    const registered_body = try registerSessionTokens(
+        alloc,
+        transport,
+        refreshed.access_token,
+        refreshed.refresh_token,
+    );
+    defer alloc.free(registered_body);
+    var replacement = try parseClineSession(alloc, registered_body, &refreshed);
     errdefer replacement.deinit(alloc);
     if (!std.mem.eql(u8, replacement.account_id, session.account_id)) return error.ClineAccountChanged;
     try mutation.save(alloc, replacement);
