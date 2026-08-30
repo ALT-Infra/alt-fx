@@ -3544,6 +3544,19 @@ fn processQueuedPromptLoop(
             else
                 .native_images;
             const vision_mode = vision_policy.mode;
+            debug_trace.eventf(
+                "agent",
+                "vision_policy",
+                step_ctx,
+                "model={s} image_support={s} route={s} mode={s} pending_images={d}",
+                .{
+                    gateway_model,
+                    @tagName(request_capabilities.image_input_support),
+                    @tagName(vision_policy.route),
+                    @tagName(vision_mode),
+                    pending_image_ids.len,
+                },
+            );
             const recovery_source_messages = try appendReadFailureRecoveryContext(
                 overlay_arena,
                 gateway_messages.items,
