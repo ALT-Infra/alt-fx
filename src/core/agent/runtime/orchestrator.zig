@@ -25,7 +25,6 @@ const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
 const tooling_tool_admission = @import("../../tooling/tool_admission.zig");
 const tool_args = @import("../../tooling/tool_args.zig");
 const hooks = @import("../../hooks/hooks.zig");
-const command_contract = @import("../../execution/command_contract.zig");
 const command_environment = @import("../../execution/command_environment.zig");
 const terminal_contracts = @import("../../terminal/contracts.zig");
 const context_contract = @import("../../workspace/context_contract.zig");
@@ -7295,7 +7294,7 @@ fn processQueuedPromptLoop(
                 }
                 continue;
             }
-            if (execution.prepared_result_memory != null or
+            if (execution.tool_result_memory_prepared or
                 execution.deferred_tool_completion != null)
             {
                 return error.InvalidPreparedToolExecutionResult;
@@ -7312,8 +7311,6 @@ fn processQueuedPromptLoop(
             runtime_parallel_execution.reportInnerToolUsage(deps, tool_call.name, execution);
             if (execution.diff_entry) |payload| {
                 try deps.push_diff_block(deps.ctx, payload);
-            } else if (execution.display_output) |display| {
-                try deps.push_text(deps.ctx, .{ .operational = display });
             }
             var replay_handed_off = execution.command_replay_capture == null;
             defer if (!replay_handed_off) {
@@ -7428,37 +7425,21 @@ fn processQueuedPromptLoop(
                 else
                     "";
                 stop_state.terminal_materializing = true;
-                if (execution.background_command) |background| {
-                    try finishCommonBackgroundTerminal(
-                        deps,
-                        finalization,
-                        arena,
-                        job,
-                        within_turn_suffix.items,
-                        &summary_accumulator,
-                        assistant_text,
-                        background,
-                        &finish_trace,
-                    );
-                    debug_trace.eventf("tool", "after_tool_execution", step_ctx, "call_id={s} name={s} result_kind=background model_output_bytes={d}", .{ tool_call.id, tool_call.name, safe_tool_output.len });
-                    debug_trace.eventf("tool", "execution_result", step_ctx, "call_id={s} name={s} result_kind=background model_output_bytes={d}", .{ tool_call.id, tool_call.name, safe_tool_output.len });
-                } else {
-                    try finishCommonAssistantTerminal(
-                        deps,
-                        finalization,
-                        arena,
-                        job,
-                        within_turn_suffix.items,
-                        &summary_accumulator,
-                        assistant_text,
-                        .completed,
-                        null,
-                        &finish_trace,
-                        "tool",
-                    );
-                    debug_trace.eventf("tool", "after_tool_execution", step_ctx, "call_id={s} name={s} result_kind=finish_turn model_output_bytes={d}", .{ tool_call.id, tool_call.name, safe_tool_output.len });
-                    debug_trace.eventf("tool", "execution_result", step_ctx, "call_id={s} name={s} result_kind=finish_turn model_output_bytes={d}", .{ tool_call.id, tool_call.name, safe_tool_output.len });
-                }
+                try finishCommonAssistantTerminal(
+                    deps,
+                    finalization,
+                    arena,
+                    job,
+                    within_turn_suffix.items,
+                    &summary_accumulator,
+                    assistant_text,
+                    .completed,
+                    null,
+                    &finish_trace,
+                    "tool",
+                );
+                debug_trace.eventf("tool", "after_tool_execution", step_ctx, "call_id={s} name={s} result_kind=finish_turn model_output_bytes={d}", .{ tool_call.id, tool_call.name, safe_tool_output.len });
+                debug_trace.eventf("tool", "execution_result", step_ctx, "call_id={s} name={s} result_kind=finish_turn model_output_bytes={d}", .{ tool_call.id, tool_call.name, safe_tool_output.len });
                 return;
             }
 
@@ -7836,49 +7817,6 @@ fn finishCommonAssistantTerminalWithExecution(
         finish_trace,
         trace_outcome,
     );
-}
-
-fn finishCommonBackgroundTerminal(
-    deps: *const AgentRuntimeDeps,
-    finalization: *TurnFinalizationGuard,
-    arena: Allocator,
-    job: QueuedPrompt,
-    current_turn_messages: []const ChatMessage,
-    summary_accumulator: *runtime_telemetry.TurnSummaryAccumulator,
-    assistant_text: []const u8,
-    background: command_contract.BackgroundCommand,
-    finish_trace: *PromptFinishTrace,
-) !void {
-    const execution_memory = try runtime_execution_memory.buildExecutionMemory(
-        arena,
-        current_turn_messages,
-    );
-    const completed_summary = summary_accumulator.finish();
-    var turn: HistoryTurn = .{ .background_command = .{
-        .user = .{ .text = job.prompt, .images = job.images },
-        .assistant = @constCast(assistant_text),
-        .execution = execution_memory,
-        .log_path = @constCast(background.log_path),
-        .expect_url = background.expect_url,
-        .url = if (background.url) |url| @constCast(url) else null,
-        .background_record_id = background.background_record_id,
-    } };
-    types.setHistoryTurnSummary(&turn, completed_summary);
-    const finished = try types.dupeFinishedPrompt(
-        std.heap.c_allocator,
-        .{
-            .turn = turn,
-            .summary = completed_summary,
-        },
-    );
-
-    var propagation_error: ?anyerror = null;
-    deps.propagate_history_turn(deps.ctx, turn) catch |err| {
-        propagation_error = err;
-    };
-    try finalization.finish(.completed, null, finished);
-    finish_trace.finish("background");
-    if (propagation_error) |err| return err;
 }
 
 pub fn copyLatestStopPartial(
