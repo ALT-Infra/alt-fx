@@ -2655,6 +2655,8 @@ test "built-in vision dispatch uses supplied runtime provider" {
 
     var fixture = Fixture{};
     const vision_registry = tool_dispatch.Registry{ .tools = &.{vision} };
+    var status_detail: ?[]u8 = null;
+    defer if (status_detail) |detail| std.testing.allocator.free(detail);
     var result = try tool_dispatch.dispatchAuthorizedToolCall(.{
         .allocator = std.testing.allocator,
         .vision_provider = .{
@@ -2665,7 +2667,7 @@ test "built-in vision dispatch uses supplied runtime provider" {
         .id = "vision_1",
         .name = "vision",
         .arguments_json = "{\"image_ids\":[7,9],\"focus\":\"read status\"}",
-    });
+    }, &status_detail);
     defer result.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(.success, result.status);
