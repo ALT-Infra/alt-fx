@@ -1672,8 +1672,30 @@ pub const Runtime = struct {
         alloc: Allocator,
         provider: model_provider.ProviderId,
     ) !?bool {
+        if (model_provider.authorizesCredential(provider, self.credentialSource())) return false;
+        if (provider == .opencode) {
+            if (try self.selectSourceWithLoader(
+                alloc,
+                .opencode_api_key,
+                self,
+                loadRuntimeCredentialSource,
+            )) |changed| return changed;
+        }
+        if (provider == .cline) {
+            if (try self.selectSourceWithLoader(
+                alloc,
+                .cline_account,
+                self,
+                loadRuntimeCredentialSource,
+            )) |changed| return changed;
+            if (try self.selectSourceWithLoader(
+                alloc,
+                .cline_api_key,
+                self,
+                loadRuntimeCredentialSource,
+            )) |changed| return changed;
+        }
         if (model_provider.requiredCredentialSource(provider)) |required_source| {
-            if (self.credentialSource() == required_source) return false;
             return self.selectSourceWithLoader(
                 alloc,
                 required_source,
@@ -2455,6 +2477,30 @@ test "auth runtime explicitly selects the requested credential source" {
     try std.testing.expect((try runtime.selectSourceWithLoader(alloc, .fx_login, null, Loader.load)).?);
     try std.testing.expectEqual(credentials.Source.fx_login, runtime.credentialSource().?);
     try std.testing.expectEqualStrings("fx_login", runtime.apiKey().?);
+}
+
+test "provider selection preserves an already-authorized routed credential" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        provider: model_provider.ProviderId,
+        source: credentials.Source,
+    }{
+        .{ .provider = .opencode, .source = .opencode_api_key },
+        .{ .provider = .cline, .source = .cline_account },
+        .{ .provider = .cline, .source = .cline_api_key },
+    };
+
+    for (cases) |case| {
+        var runtime: Runtime = .{};
+        defer runtime.deinit(alloc);
+        var credential = try makeTestCredential(alloc, "provider-token", case.source, null, null);
+        defer credential.deinit(alloc);
+        _ = runtime.adoptCredential(alloc, &credential);
+
+        try std.testing.expect(!(try runtime.selectForProvider(alloc, case.provider)).?);
+        try std.testing.expectEqual(case.source, runtime.credentialSource().?);
+        try std.testing.expectEqualStrings("provider-token", runtime.apiKey().?);
+    }
 }
 
 test "auth runtime failed selection preserves the active credential" {

@@ -5,6 +5,7 @@ const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
+const models_dev = @import("models_dev.zig");
 
 const max_models_per_surface: usize = 4096;
 const max_model_id_bytes: usize = 256;
@@ -33,6 +34,8 @@ const ProtocolModel = struct {
         input: f64,
         output: f64,
     } = null,
+    reasoning: bool = false,
+    reasoning_options: ?std.json.Value = null,
 };
 
 const ProtocolProvider = struct {
@@ -261,6 +264,12 @@ fn appendSurface(
         if (free_only and !availableWithoutKey(protocol_provider, raw_id)) continue;
         if (findDuplicate(catalog.items, id_prefix, raw_id)) continue;
         if (catalog.items.len >= max_models_per_surface * 2) return error.OpenCodeModelCatalogTooLarge;
+        const protocol_model = protocol_provider.models.map.get(raw_id);
+        var reasoning = if (protocol_model) |model|
+            try models_dev.parseReasoningFields(alloc, model.reasoning, model.reasoning_options)
+        else
+            models_dev.ReasoningMetadata{};
+        defer reasoning.deinit(alloc);
         const id = try std.fmt.allocPrint(alloc, "{s}{s}", .{ id_prefix, raw_id });
         errdefer alloc.free(id);
         const model_type = try alloc.dupe(u8, "language");
@@ -269,7 +278,10 @@ fn appendSurface(
             .id = id,
             .model_type = model_type,
             .has_tool_use = true,
+            .has_reasoning = reasoning.has_reasoning,
+            .reasoning_efforts = reasoning.efforts,
         });
+        reasoning.efforts = .empty;
     }
 }
 
@@ -375,6 +387,21 @@ test "new live OpenCode models inherit dynamic provider protocol defaults" {
     try std.testing.expectEqualStrings("future-zen-model", catalog.items[0].id);
     try std.testing.expectEqualStrings("go/glm-5.3-flash", catalog.items[1].id);
     try std.testing.expectEqualStrings("go/future-go-model", catalog.items[2].id);
+}
+
+test "OpenCode catalog preserves source-declared reasoning efforts" {
+    const zen = "{\"data\":[{\"id\":\"future-zen-model\"}]}";
+    const go = "{\"data\":[{\"id\":\"future-go-model\"}]}";
+    const protocols = "{\"opencode\":{\"npm\":\"@ai-sdk/openai-compatible\",\"models\":{\"future-zen-model\":{\"reasoning\":true,\"reasoning_options\":[{\"type\":\"effort\",\"values\":[\"low\",\"high\"]}]}}},\"opencode-go\":{\"npm\":\"@ai-sdk/openai-compatible\",\"models\":{\"future-go-model\":{\"reasoning_options\":[{\"type\":\"effort\",\"values\":[\"max\"]}]}}}}";
+    var catalog = try parseCatalog(std.testing.allocator, zen, go, protocols, true);
+    defer model_catalog.freeModelCatalog(std.testing.allocator, &catalog);
+
+    try std.testing.expectEqual(@as(usize, 2), catalog.items.len);
+    try std.testing.expect(catalog.items[0].has_reasoning);
+    try std.testing.expectEqual(@as(usize, 2), catalog.items[0].reasoning_efforts.items.len);
+    try std.testing.expectEqualStrings("low", catalog.items[0].reasoning_efforts.items[0].label());
+    try std.testing.expectEqualStrings("high", catalog.items[0].reasoning_efforts.items[1].label());
+    try std.testing.expectEqualStrings("max", catalog.items[1].reasoning_efforts.items[0].label());
 }
 
 test "stale OpenCode selection stays on its surface and free tier" {

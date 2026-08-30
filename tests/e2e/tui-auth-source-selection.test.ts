@@ -715,6 +715,10 @@ function startFakeOpenCode() {
             npm: "@ai-sdk/openai-compatible",
             models: {
               "minimax-m3": { provider: { npm: "@ai-sdk/anthropic" } },
+              "kimi-k3": {
+                reasoning: true,
+                reasoning_options: [{ type: "effort", values: ["max"] }],
+              },
             },
           },
         });
@@ -790,6 +794,21 @@ function startFakeCline() {
           clinePass: [{ id: "cline-pass/future-pass" }],
         });
       }
+      if (url.pathname === "/protocols") {
+        return Response.json({
+          openrouter: {
+            models: {
+              "vendor/future-free": {
+                reasoning: true,
+                reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+              },
+              "cline-pass/future-pass": {
+                reasoning_options: [{ type: "effort", values: ["max"] }],
+              },
+            },
+          },
+        });
+      }
       if (url.pathname === "/device") {
         return Response.json({
           device_code: "cline-device-code",
@@ -850,6 +869,7 @@ function startFakeCline() {
     requests,
     env: {
       FX_E2E_CLINE_MODELS_URL: `${baseUrl}/models`,
+      FX_E2E_CLINE_PROTOCOL_METADATA_URL: `${baseUrl}/protocols`,
       FX_E2E_CLINE_CHAT_URL: `${baseUrl}/chat`,
       FX_E2E_CLINE_DEVICE_AUTH_URL: `${baseUrl}/device`,
       FX_E2E_CLINE_DEVICE_TOKEN_URL: `${baseUrl}/token`,
@@ -2653,12 +2673,25 @@ test("OpenCode CLI login filters protocols, routes its key directly, and logs ou
       expect(request.headers.get("authorization")).not.toBe(`Bearer ${opencode.apiKey}`);
     }
 
+    settings.models.opencode = "go/kimi-k3";
+    settings.effort = "max";
+    writeFileSync(settingsPath, `${JSON.stringify(settings)}\n`, { mode: 0o600 });
+    const reasoned = await runFx(["ask", "--json", "--auto", "--no-save", "Use the selected effort."], {
+      env: storedEnv,
+      timeoutMs: TIMEOUT,
+    });
+    expect(reasoned.code, `stdout: ${reasoned.stdout}\nstderr: ${reasoned.stderr}`).toBe(0);
+    const reasonedChat = opencode.requests.filter((request) => request.path === "/chat").at(-1)!;
+    expect(JSON.parse(reasonedChat.body ?? "{}")).toMatchObject({
+      model: "kimi-k3",
+      reasoning_effort: "max",
+    });
+
     const logout = await runFx(["logout", "opencode"], { env: loginEnv, timeoutMs: TIMEOUT });
     expect(logout.code, `stdout: ${logout.stdout}\nstderr: ${logout.stderr}`).toBe(0);
     expect(logout.stdout).toContain("Signed out of OpenCode.");
     expect(existsSync(authPath)).toBe(false);
 
-    settings.models.opencode = "go/kimi-k3";
     writeFileSync(settingsPath, `${JSON.stringify(settings)}\n`, { mode: 0o600 });
 
     const anonymous = await runFx(["ask", "--json", "--auto", "--no-save", "Still OpenCode?"], {
@@ -2670,10 +2703,152 @@ test("OpenCode CLI login filters protocols, routes its key directly, and logs ou
     const anonymousChat = opencode.requests.filter((request) => request.path === "/chat").at(-1)!;
     expect(anonymousChat.authorization).toBeNull();
     expect(JSON.parse(anonymousChat.body ?? "{}").model).toBe("big-pickle");
+    expect(JSON.parse(anonymousChat.body ?? "{}").reasoning_effort).toBeUndefined();
   } finally {
     opencode.stop();
   }
 });
+
+tmuxTest(
+  "OpenCode model picker uses source-declared reasoning efforts",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-opencode-effort-picker-"));
+    stderrPath = join(home, "stderr.log");
+    const fxDir = join(home, ".fx");
+    mkdirSync(fxDir, { recursive: true, mode: 0o700 });
+    writeFileSync(
+      join(fxDir, "settings.json"),
+      `${JSON.stringify({ provider: "opencode", models: { opencode: "big-pickle" } })}\n`,
+      { mode: 0o600 },
+    );
+    gateway = startFakeGateway([]);
+    const opencode = startFakeOpenCode();
+    try {
+      const commonEnv = {
+        HOME: home,
+        AI_GATEWAY_API_KEY: "gateway-opencode-picker-sentinel",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_SKIP_ONBOARDING: "1",
+        FX_AUTO_UPGRADE: "0",
+        FX_MODEL: undefined,
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        ...opencode.env,
+      };
+      const login = await runFx(["login", "opencode"], {
+        env: { ...commonEnv, OPENCODE_API_KEY: opencode.apiKey },
+        timeoutMs: TIMEOUT,
+      });
+      expect(login.code, `stdout: ${login.stdout}\nstderr: ${login.stderr}`).toBe(0);
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        FX_MODEL: undefined,
+        OPENCODE_API_KEY: undefined,
+        ...opencode.env,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("/model");
+      await session.waitForText("go/kimi-k3", TIMEOUT);
+      await session.sendLiteralText("go/kimi-k3");
+      await session.sendKeys("Enter");
+      await session.waitForPane(
+        (pane) => pane.includes("/model go/kimi-k3") && pane.includes("default") && pane.includes("max"),
+        TIMEOUT,
+      );
+      await session.sendKeys("Down");
+      await session.sendKeys("Enter");
+      await session.waitForText("Switched to go/kimi-k3", TIMEOUT);
+      const selected = JSON.parse(readFileSync(join(fxDir, "settings.json"), "utf8")) as {
+        effort?: string;
+        models?: { opencode?: string };
+      };
+      expect(selected.models?.opencode).toBe("go/kimi-k3");
+      expect(selected.effort).toBe("max");
+      await session.sendText("Use the selected effort.");
+      await session.waitForText("OPENCODE_DIRECT_RESPONSE", TIMEOUT);
+
+      const chat = opencode.requests.filter((request) => request.path === "/chat").at(-1)!;
+      const body = JSON.parse(chat.body ?? "{}") as { model?: string; reasoning_effort?: string };
+      expect(body.model).toBe("kimi-k3");
+      expect(body.reasoning_effort).toBe("max");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      opencode.stop();
+    }
+  },
+  60_000,
+);
+
+tmuxTest(
+  "Cline model picker uses source-declared reasoning efforts",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-cline-effort-picker-"));
+    stderrPath = join(home, "stderr.log");
+    const fxDir = join(home, ".fx");
+    mkdirSync(fxDir, { recursive: true, mode: 0o700 });
+    writeFileSync(
+      join(fxDir, "settings.json"),
+      `${JSON.stringify({ provider: "cline", models: { cline: "cline-free/future-free" } })}\n`,
+      { mode: 0o600 },
+    );
+    gateway = startFakeGateway([]);
+    const cline = startFakeCline();
+    try {
+      const commonEnv = {
+        HOME: home,
+        AI_GATEWAY_API_KEY: "gateway-cline-picker-sentinel",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_SKIP_ONBOARDING: "1",
+        FX_AUTO_UPGRADE: "0",
+        FX_MODEL: undefined,
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        ...cline.env,
+      };
+      const login = await runFx(["login", "cline"], {
+        env: { ...commonEnv, CLINE_API_KEY: cline.apiKey },
+        timeoutMs: TIMEOUT,
+      });
+      expect(login.code, `stdout: ${login.stdout}\nstderr: ${login.stderr}`).toBe(0);
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        FX_MODEL: undefined,
+        CLINE_API_KEY: undefined,
+        ...cline.env,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("/model");
+      await session.waitForText("cline-pass/future-pass", TIMEOUT);
+      await session.sendLiteralText("cline-pass/future-pass");
+      await session.sendKeys("Enter");
+      await session.waitForPane(
+        (pane) => pane.includes("/model cline-pass/future-pass") && pane.includes("default") && pane.includes("max"),
+        TIMEOUT,
+      );
+      await session.sendKeys("Down");
+      await session.sendKeys("Enter");
+      await session.waitForText("Switched to cline-pass/future-pass", TIMEOUT);
+      const selected = JSON.parse(readFileSync(join(fxDir, "settings.json"), "utf8")) as {
+        effort?: string;
+        models?: { cline?: string };
+      };
+      expect(selected.models?.cline).toBe("cline-pass/future-pass");
+      expect(selected.effort).toBe("max");
+      await session.sendText("Use the selected effort.");
+      await session.waitForText("CLINE_DIRECT_RESPONSE", TIMEOUT);
+
+      const chat = cline.requests.filter((request) => request.path === "/chat").at(-1)!;
+      const body = JSON.parse(chat.body ?? "{}") as { model?: string; reasoning_effort?: string };
+      expect(body.model).toBe("cline-pass/future-pass");
+      expect(body.reasoning_effort).toBe("max");
+      expect(chat.authorization).toBe(`Bearer ${cline.apiKey}`);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      cline.stop();
+    }
+  },
+  60_000,
+);
 
 test("Cline CLI login discovers and runs live free and ClinePass models", async () => {
   home = mkdtempSync(join(tmpdir(), "fx-cline-cli-login-"));
@@ -2721,6 +2896,9 @@ test("Cline CLI login discovers and runs live free and ClinePass models", async 
     expect(modelIds).toEqual(["cline-free/future-free", "cline-pass/future-pass"]);
 
     for (const model of modelIds) {
+      settings.models.cline = model;
+      settings.effort = model.startsWith("cline-pass/") ? "max" : "high";
+      writeFileSync(settingsPath, `${JSON.stringify(settings)}\n`, { mode: 0o600 });
       const ask = await runFx(["ask", "--json", "--auto", "--no-save", "Answer directly."], {
         env: { ...storedEnv, FX_MODEL: model },
         timeoutMs: TIMEOUT,
@@ -2732,6 +2910,7 @@ test("Cline CLI login discovers and runs live free and ClinePass models", async 
     const chatRequests = cline.requests.filter((request) => request.path === "/chat");
     expect(chatRequests).toHaveLength(2);
     expect(chatRequests.map((request) => JSON.parse(request.body ?? "{}").model)).toEqual(modelIds);
+    expect(chatRequests.map((request) => JSON.parse(request.body ?? "{}").reasoning_effort)).toEqual(["high", "max"]);
     for (const request of chatRequests) {
       expect(request.authorization).toBe(`Bearer ${cline.apiKey}`);
       const toolNames = JSON.parse(request.body ?? "{}").tools
