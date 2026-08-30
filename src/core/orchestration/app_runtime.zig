@@ -413,27 +413,27 @@ pub fn cancelActiveTurn(
         return false;
     const engine = app.orchestration.engine orelse return false;
     const user = try app.orchestration.canonical_turns.cloneCombinedUserTurn(
-        app.alloc,
+        std.heap.c_allocator,
         source_turn_id,
         app.orchestration.instruction_source_turn_ids.items,
     );
-    defer types.freeUserTurn(app.alloc, user);
-    defer releaseCanonicalCustody(Host, app.alloc, &app.orchestration);
+    var owns_user = true;
+    defer if (owns_user) types.freeUserTurn(std.heap.c_allocator, user);
     const App = @TypeOf(app.*);
+    app.worker.requestCancel();
     engine.dispatch(
         .cancel_requested,
         intentSink(Host, Extension, App, app),
     ) catch |err| {
         try writeFailure(Extension, app, err);
     };
-    try app.worker.pushEvent(std.heap.c_allocator, .{
-        .finish_prompt = .{ .turn = .{ .interrupted = .{
-            .user = .{
-                .text = user.text,
-                .images = user.images,
-            },
-        } } },
-    });
+    if (comptime @hasDecl(App, "interruptOrchestrationTurn")) {
+        try app.interruptOrchestrationTurn(user);
+        owns_user = false;
+    } else {
+        return error.OrchestrationIntentNotConnected;
+    }
+    releaseCanonicalCustody(Host, app.alloc, &app.orchestration);
     return true;
 }
 

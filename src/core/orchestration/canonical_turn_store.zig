@@ -67,6 +67,42 @@ pub const Store = struct {
         return false;
     }
 
+    /// Captures one text-only instruction consumed from fx's native steering
+    /// queue. It derives custody from the active root turn while stripping all
+    /// model, history, skill, and attachment input that steering did not carry.
+    pub fn captureTextInstruction(
+        self: *Store,
+        alloc: std.mem.Allocator,
+        root_source_turn_id: u64,
+        text: []const u8,
+    ) !Capture {
+        const root = self.find(root_source_turn_id) orelse
+            return error.UnknownSourceTurn;
+        var prompt = try worker_runtime.dupeQueuedPrompt(alloc, root.prompt);
+        errdefer worker_runtime.freeQueuedPrompt(alloc, prompt);
+
+        const instruction = try alloc.dupe(u8, text);
+        var owns_instruction = true;
+        errdefer if (owns_instruction) alloc.free(instruction);
+        alloc.free(prompt.prompt);
+        prompt.prompt = instruction;
+        owns_instruction = false;
+        types.freeImageAttachmentSlice(alloc, prompt.images);
+        prompt.images = &.{};
+        types.freeImageAttachmentSlice(alloc, prompt.authorized_image_catalog);
+        prompt.authorized_image_catalog = &.{};
+        stripHistoryAndRecovery(alloc, &prompt);
+        worker_runtime.freeSkillBindings(alloc, prompt.skill_bindings);
+        prompt.skill_bindings = &.{};
+        worker_runtime.freeSkillDisplaySpans(alloc, prompt.skill_display_spans);
+        prompt.skill_display_spans = &.{};
+        prompt.context_snapshot.deinit(alloc);
+        prompt.context_snapshot = context_contract.GatheredContextSnapshot{};
+        prompt.steer_target_turn_id = null;
+        prompt.executor = .native_agent;
+        return self.captureOwned(alloc, prompt);
+    }
+
     pub fn borrow(
         self: *const Store,
         source_turn_id: u64,
