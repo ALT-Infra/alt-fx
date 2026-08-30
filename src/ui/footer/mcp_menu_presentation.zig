@@ -785,13 +785,7 @@ fn expectMcpMenuVtContains(
         try grid.rowTextTrimmed(row_number, &frame);
     }
     for (needles) |needle| {
-        if (std.mem.find(u8, frame.items, needle) == null) {
-            std.debug.print(
-                "MCP VT frame did not contain '{s}':\n{s}\n",
-                .{ needle, frame.items },
-            );
-            return error.TestExpectedGridText;
-        }
+        try std.testing.expect(std.mem.find(u8, frame.items, needle) != null);
     }
 }
 
