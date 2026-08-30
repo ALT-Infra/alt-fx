@@ -87,10 +87,10 @@ pub fn Runtime(comptime App: type) type {
             app.mcp.returnMenuToServers();
             switch (outcome) {
                 .unchanged => {
-                    app.mcp.menu = mcp_menu_state.reduce(
-                        app.mcp.menu,
+                    _ = mcp_menu_state.apply(
+                        &app.mcp.menu,
                         .{ .action_succeeded = generation },
-                    ).state;
+                    );
                 },
                 .committed => |committed| if (committed.authority_reduced)
                     app.beginMcpMenuAuthorityReduction(true, generation) catch |err| {

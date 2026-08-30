@@ -125,34 +125,36 @@ pub const State = struct {
     }
 };
 
-pub const Transition = struct {
+const Transition = struct {
     state: State,
     effect: ?Effect = null,
 };
 
-pub fn reduce(current: State, event: Event) Transition {
-    var next = current;
+fn reduce(current: State, event: Event) Transition {
+    var state = current;
+    const effect = apply(&state, event);
+    return .{ .state = state, .effect = effect };
+}
+
+pub fn apply(next: *State, event: Event) ?Effect {
     return switch (event) {
         .open => |server_count| blk: {
-            next = .{
+            next.* = .{
                 .active = true,
                 .load_state = .ready,
             };
-            clampSelection(&next, server_count, server_count);
-            break :blk .{ .state = next };
+            clampSelection(next, server_count, server_count);
+            break :blk null;
         },
         .close => blk: {
-            const pending = current.pending_generation;
-            next = .{};
-            break :blk .{
-                .state = next,
-                .effect = if (pending) |generation| .{ .cancel = generation } else null,
-            };
+            const pending = next.pending_generation;
+            next.* = .{};
+            break :blk if (pending) |generation| .{ .cancel = generation } else null;
         },
-        .back => if (!current.active)
-            .{ .state = current }
-        else if (current.screen == .browse)
-            reduce(current, .close)
+        .back => if (!next.active)
+            null
+        else if (next.screen == .browse)
+            apply(next, .close)
         else blk: {
             next.screen = .browse;
             next.confirmation_action = null;
@@ -160,14 +162,11 @@ pub fn reduce(current: State, event: Event) Transition {
             const pending = next.pending_generation;
             next.pending_generation = null;
             if (pending != null) next.load_state = .cancelled;
-            break :blk .{
-                .state = next,
-                .effect = if (pending) |generation| .{ .cancel = generation } else null,
-            };
+            break :blk if (pending) |generation| .{ .cancel = generation } else null;
         },
         .move => |move| blk: {
-            if (!current.active or move.item_count == 0 or move.delta == 0) {
-                break :blk .{ .state = next };
+            if (!next.active or move.item_count == 0 or move.delta == 0) {
+                break :blk null;
             }
             if (move.delta > 0) {
                 next.selected_index = (next.selected_index + 1) % move.item_count;
@@ -177,27 +176,27 @@ pub fn reduce(current: State, event: Event) Transition {
                 else
                     next.selected_index - 1;
             }
-            clampSelection(&next, move.item_count, move.visible_count);
+            clampSelection(next, move.item_count, move.visible_count);
             if (next.section == .servers and next.screen == .browse) {
                 next.selected_server_index = next.selected_index;
             }
-            break :blk .{ .state = next };
+            break :blk null;
         },
         .scroll_preview => |scroll| blk: {
-            if (!current.active or current.screen != .preview or scroll.row_count == 0 or scroll.delta == 0) {
-                break :blk .{ .state = next };
+            if (!next.active or next.screen != .preview or scroll.row_count == 0 or scroll.delta == 0) {
+                break :blk null;
             }
             if (scroll.delta > 0) {
                 next.window_start = @min(next.window_start +| 1, scroll.row_count - 1);
             } else {
                 next.window_start -|= 1;
             }
-            break :blk .{ .state = next };
+            break :blk null;
         },
         .cycle_section => |delta| blk: {
-            if (!current.active or delta == 0) break :blk .{ .state = next };
+            if (!next.active or delta == 0) break :blk null;
             const count = @typeInfo(Section).@"enum".fields.len;
-            const current_index: usize = @intFromEnum(current.section);
+            const current_index: usize = @intFromEnum(next.section);
             const section_index = if (delta > 0)
                 (current_index + 1) % count
             else if (current_index == 0)
@@ -213,27 +212,27 @@ pub fn reduce(current: State, event: Event) Transition {
             if (next.section == .servers) {
                 next.selected_index = next.selected_server_index;
                 next.load_state = .ready;
-                break :blk .{ .state = next };
+                break :blk null;
             }
-            break :blk beginEffect(&next, .load_catalog);
+            break :blk beginEffect(next, .load_catalog);
         },
         .cycle_add_transport => blk: {
-            if (current.active and current.screen == .add) {
-                next.add_transport = if (current.add_transport == .local) .http else .local;
+            if (next.active and next.screen == .add) {
+                next.add_transport = if (next.add_transport == .local) .http else .local;
                 next.add_field_index = 0;
             }
-            break :blk .{ .state = next };
+            break :blk null;
         },
         .begin_filter => blk: {
-            if (current.active and current.screen == .browse and current.section != .servers) {
+            if (next.active and next.screen == .browse and next.section != .servers) {
                 next.filter_active = true;
                 next.selected_index = 0;
                 next.window_start = 0;
             }
-            break :blk .{ .state = next };
+            break :blk null;
         },
         .append_filter_byte => |byte| blk: {
-            if (current.filter_active and current.query_len < max_query_bytes and
+            if (next.filter_active and next.query_len < max_query_bytes and
                 byte >= 0x20 and byte < 0x7f)
             {
                 next.query[next.query_len] = byte;
@@ -241,34 +240,34 @@ pub fn reduce(current: State, event: Event) Transition {
                 next.selected_index = 0;
                 next.window_start = 0;
             }
-            break :blk .{ .state = next };
+            break :blk null;
         },
         .delete_filter_byte => blk: {
-            if (current.filter_active and current.query_len > 0) {
+            if (next.filter_active and next.query_len > 0) {
                 next.query_len -= 1;
                 next.selected_index = 0;
                 next.window_start = 0;
             }
-            break :blk .{ .state = next };
+            break :blk null;
         },
         .clear_filter_text => blk: {
-            if (current.filter_active) {
+            if (next.filter_active) {
                 next.query_len = 0;
                 next.selected_index = 0;
                 next.window_start = 0;
             }
-            break :blk .{ .state = next };
+            break :blk null;
         },
         .clear_filter => blk: {
             next.filter_active = false;
             next.query_len = 0;
             next.selected_index = 0;
             next.window_start = 0;
-            break :blk .{ .state = next };
+            break :blk null;
         },
         .move_add_field => |move| blk: {
-            if (!current.active or current.screen != .add or move.field_count == 0 or move.delta == 0) {
-                break :blk .{ .state = next };
+            if (!next.active or next.screen != .add or move.field_count == 0 or move.delta == 0) {
+                break :blk null;
             }
             if (move.delta > 0) {
                 next.add_field_index = (next.add_field_index + 1) % move.field_count;
@@ -278,11 +277,11 @@ pub fn reduce(current: State, event: Event) Transition {
                 else
                     next.add_field_index - 1;
             }
-            break :blk .{ .state = next };
+            break :blk null;
         },
         .move_argument => |move| blk: {
-            if (!current.active or current.screen != .arguments or move.field_count == 0 or move.delta == 0) {
-                break :blk .{ .state = next };
+            if (!next.active or next.screen != .arguments or move.field_count == 0 or move.delta == 0) {
+                break :blk null;
             }
             if (move.delta > 0) {
                 next.argument_index = (next.argument_index + 1) % move.field_count;
@@ -292,99 +291,99 @@ pub fn reduce(current: State, event: Event) Transition {
                 else
                     next.argument_index - 1;
             }
-            break :blk .{ .state = next };
+            break :blk null;
         },
         .show_details => blk: {
-            if (current.active and current.section == .servers) next.screen = .details;
-            break :blk .{ .state = next };
+            if (next.active and next.section == .servers) next.screen = .details;
+            break :blk null;
         },
         .show_add => blk: {
-            if (current.active) {
+            if (next.active) {
                 next.screen = .add;
                 next.add_field_index = 0;
             }
-            break :blk .{ .state = next };
+            break :blk null;
         },
         .show_arguments => |field_count| blk: {
-            if (current.active and current.section != .servers and field_count > 0) {
+            if (next.active and next.section != .servers and field_count > 0) {
                 next.screen = .arguments;
                 next.filter_active = false;
                 next.argument_index = 0;
             }
-            break :blk .{ .state = next };
+            break :blk null;
         },
         .show_info => blk: {
-            if (current.active and current.section == .servers) next.screen = .info;
-            break :blk .{ .state = next };
+            if (next.active and next.section == .servers) next.screen = .info;
+            break :blk null;
         },
         .show_confirmation => |action| blk: {
-            if (current.active) {
+            if (next.active) {
                 next.screen = .confirm;
                 next.confirmation_action = action;
             }
-            break :blk .{ .state = next };
+            break :blk null;
         },
         .begin_preview => blk: {
-            if (!current.active or current.section == .servers) break :blk .{ .state = next };
+            if (!next.active or next.section == .servers) break :blk null;
             next.filter_active = false;
-            break :blk beginEffect(&next, .load_preview);
+            break :blk beginEffect(next, .load_preview);
         },
-        .request_completion => if (!current.active or current.screen != .arguments)
-            .{ .state = next }
+        .request_completion => if (!next.active or next.screen != .arguments)
+            null
         else
-            beginEffect(&next, .complete_argument),
+            beginEffect(next, .complete_argument),
         .request_action => |action| blk: {
-            if (!current.active or (action == .insert_preview and current.screen != .preview)) {
-                break :blk .{ .state = next };
+            if (!next.active or (action == .insert_preview and next.screen != .preview)) {
+                break :blk null;
             }
             if (requiresConfirmation(action) and
-                (current.screen != .confirm or current.confirmation_action != action))
+                (next.screen != .confirm or next.confirmation_action != action))
             {
-                break :blk .{ .state = next };
+                break :blk null;
             }
-            break :blk beginEffect(&next, .{ .action = action });
+            break :blk beginEffect(next, .{ .action = action });
         },
         .catalog_loaded => |loaded| blk: {
-            if (current.pending_generation != loaded.generation) break :blk .{ .state = next };
+            if (next.pending_generation != loaded.generation) break :blk null;
             next.pending_generation = null;
             next.load_state = .ready;
             next.confirmation_action = null;
-            clampSelection(&next, loaded.item_count, loaded.item_count);
+            clampSelection(next, loaded.item_count, loaded.item_count);
             next.screen = .browse;
-            break :blk .{ .state = next };
+            break :blk null;
         },
         .preview_loaded => |generation| blk: {
-            if (current.pending_generation != generation) break :blk .{ .state = next };
+            if (next.pending_generation != generation) break :blk null;
             next.pending_generation = null;
             next.load_state = .ready;
             next.screen = .preview;
             next.window_start = 0;
-            break :blk .{ .state = next };
+            break :blk null;
         },
         .completion_loaded => |generation| blk: {
-            if (current.pending_generation != generation) break :blk .{ .state = next };
+            if (next.pending_generation != generation) break :blk null;
             next.pending_generation = null;
             next.load_state = .ready;
-            break :blk .{ .state = next };
+            break :blk null;
         },
         .action_succeeded => |generation| blk: {
-            if (current.pending_generation != generation) break :blk .{ .state = next };
+            if (next.pending_generation != generation) break :blk null;
             next.pending_generation = null;
             next.load_state = .ready;
             next.confirmation_action = null;
-            break :blk .{ .state = next };
+            break :blk null;
         },
         .effect_failed => |generation| blk: {
-            if (current.pending_generation != generation) break :blk .{ .state = next };
+            if (next.pending_generation != generation) break :blk null;
             next.pending_generation = null;
             next.load_state = .failed;
-            break :blk .{ .state = next };
+            break :blk null;
         },
         .effect_cancelled => |generation| blk: {
-            if (current.pending_generation != generation) break :blk .{ .state = next };
+            if (next.pending_generation != generation) break :blk null;
             next.pending_generation = null;
             next.load_state = .cancelled;
-            break :blk .{ .state = next };
+            break :blk null;
         },
     };
 }
@@ -407,39 +406,36 @@ const BeginEffect = union(enum) {
     action: Action,
 };
 
-fn beginEffect(self: *State, effect: BeginEffect) Transition {
+fn beginEffect(self: *State, effect: BeginEffect) Effect {
     const generation = self.next_generation;
     self.next_generation +%= 1;
     if (self.next_generation == 0) self.next_generation = 1;
     self.pending_generation = generation;
     self.load_state = .loading;
-    return .{
-        .state = self.*,
-        .effect = switch (effect) {
-            .load_catalog => .{ .load_catalog = .{
-                .generation = generation,
-                .section = self.section,
-                .server_index = self.selected_server_index,
-                .selected_index = self.selected_index,
-            } },
-            .load_preview => .{ .load_preview = .{
-                .generation = generation,
-                .section = self.section,
-                .server_index = self.selected_server_index,
-                .selected_index = self.selected_index,
-            } },
-            .complete_argument => .{ .complete_argument = .{
-                .generation = generation,
-                .section = self.section,
-                .server_index = self.selected_server_index,
-                .selected_index = self.selected_index,
-            } },
-            .action => |action| .{ .action = .{
-                .generation = generation,
-                .action = action,
-                .selected_index = self.selected_index,
-            } },
-        },
+    return switch (effect) {
+        .load_catalog => .{ .load_catalog = .{
+            .generation = generation,
+            .section = self.section,
+            .server_index = self.selected_server_index,
+            .selected_index = self.selected_index,
+        } },
+        .load_preview => .{ .load_preview = .{
+            .generation = generation,
+            .section = self.section,
+            .server_index = self.selected_server_index,
+            .selected_index = self.selected_index,
+        } },
+        .complete_argument => .{ .complete_argument = .{
+            .generation = generation,
+            .section = self.section,
+            .server_index = self.selected_server_index,
+            .selected_index = self.selected_index,
+        } },
+        .action => |action| .{ .action = .{
+            .generation = generation,
+            .action = action,
+            .selected_index = self.selected_index,
+        } },
     };
 }
 

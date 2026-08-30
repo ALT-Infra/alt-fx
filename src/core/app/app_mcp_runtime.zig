@@ -660,19 +660,20 @@ const PendingMenuOperation = struct {
         const server_name = self.server_name orelse return error.McpServerNotFound;
         const result = try self.lease.runtime.logoutServer(server_name);
         const feedback = if (!result.removed)
-            try std.fmt.allocPrint(
+            try allocMenuText(
                 self.alloc,
-                "No stored MCP credentials found for '{s}'.",
-                .{server_name},
+                &.{ "No stored MCP credentials found for '", server_name, "'." },
             )
         else if (result.revocation_failed)
-            try std.fmt.allocPrint(
+            try allocMenuText(
                 self.alloc,
-                "Logged out of '{s}' locally; remote revocation failed.",
-                .{server_name},
+                &.{ "Logged out of '", server_name, "' locally; remote revocation failed." },
             )
         else
-            try std.fmt.allocPrint(self.alloc, "Logged out of MCP server '{s}'.", .{server_name});
+            try allocMenuText(
+                self.alloc,
+                &.{ "Logged out of MCP server '", server_name, "'." },
+            );
         return .{ .feedback = feedback, .reload = result.removed and !result.local_only };
     }
 
@@ -806,6 +807,21 @@ fn spawnPendingMenuOperation(pending: *PendingMenuOperation) !std.Thread {
 fn boundedOwnedSlice(alloc: Allocator, bytes: []const u8, max_bytes: usize) ![]u8 {
     const bounded = text_utils.utf8PrefixByBytes(bytes, @min(bytes.len, max_bytes));
     return alloc.dupe(u8, bounded);
+}
+
+noinline fn allocMenuText(alloc: Allocator, parts: []const []const u8) Allocator.Error![]u8 {
+    var total_bytes: usize = 0;
+    for (parts) |part| {
+        total_bytes = std.math.add(usize, total_bytes, part.len) catch
+            return error.OutOfMemory;
+    }
+    const text = try alloc.alloc(u8, total_bytes);
+    var offset: usize = 0;
+    for (parts) |part| {
+        @memcpy(text[offset..][0..part.len], part);
+        offset += part.len;
+    }
+    return text;
 }
 
 fn makeMenuPreview(alloc: Allocator, heading: []const u8, raw: []const u8) !MenuPreview {
@@ -973,7 +989,8 @@ pub const State = struct {
         } else try emptyHealthSnapshot(alloc, captured_at_ms);
         errdefer snapshot.deinit(alloc);
         self.menu_health = snapshot;
-        self.menu = mcp_menu_state.reduce(.{}, .{ .open = snapshot.servers.len }).state;
+        self.menu = .{};
+        _ = mcp_menu_state.apply(&self.menu, .{ .open = snapshot.servers.len });
     }
 
     fn emptyHealthSnapshot(alloc: Allocator, captured_at_ms: u64) !mcp_health.Snapshot {
@@ -988,8 +1005,7 @@ pub const State = struct {
     }
 
     pub fn closeMenu(self: *State, alloc: Allocator) void {
-        const transition = mcp_menu_state.reduce(self.menu, .close);
-        if (transition.effect) |effect| switch (effect) {
+        if (mcp_menu_state.apply(&self.menu, .close)) |effect| switch (effect) {
             .cancel => self.cancelPendingMenuOperation("menu_closed"),
             .load_catalog, .load_preview, .complete_argument, .action => {},
         };
@@ -1067,10 +1083,7 @@ pub const State = struct {
         const owned = try fields.toOwnedSlice(alloc);
         self.menu_argument_form.deinit(alloc);
         self.menu_argument_form.fields = owned;
-        self.menu = mcp_menu_state.reduce(
-            self.menu,
-            .{ .show_arguments = owned.len },
-        ).state;
+        _ = mcp_menu_state.apply(&self.menu, .{ .show_arguments = owned.len });
         return true;
     }
 
@@ -1291,13 +1304,13 @@ pub const State = struct {
         }
         if (self.menu_feedback) |feedback| alloc.free(feedback);
         self.menu_feedback = null;
-        self.menu = mcp_menu_state.reduce(self.menu, .{ .catalog_loaded = .{
+        _ = mcp_menu_state.apply(&self.menu, .{ .catalog_loaded = .{
             .generation = request.generation,
             .item_count = 0,
-        } }).state;
+        } });
     }
 
-    pub fn collectMenuCompletion(self: *State, alloc: Allocator) !MenuCompletionEffect {
+    pub noinline fn collectMenuCompletion(self: *State, alloc: Allocator) !MenuCompletionEffect {
         self.lock.lockUncancelable(io_mod.getIo());
         const pending = self.pending_menu_operation orelse {
             self.lock.unlock(io_mod.getIo());
@@ -1336,39 +1349,39 @@ pub const State = struct {
                 }
                 self.menu_tools = items;
                 result = .cancelled;
-                self.menu = mcp_menu_state.reduce(self.menu, .{ .catalog_loaded = .{
+                _ = mcp_menu_state.apply(&self.menu, .{ .catalog_loaded = .{
                     .generation = request.generation,
                     .item_count = items.len,
-                } }).state;
+                } });
             },
             .resources => |catalog| {
                 if (self.menu_resources) |*previous| previous.deinit(alloc);
                 const count = catalog.count();
                 self.menu_resources = catalog;
                 result = .cancelled;
-                self.menu = mcp_menu_state.reduce(self.menu, .{ .catalog_loaded = .{
+                _ = mcp_menu_state.apply(&self.menu, .{ .catalog_loaded = .{
                     .generation = request.generation,
                     .item_count = count,
-                } }).state;
+                } });
             },
             .prompts => |catalog| {
                 if (self.menu_prompts) |*previous| previous.deinit(alloc);
                 const count = catalog.items.len;
                 self.menu_prompts = catalog;
                 result = .cancelled;
-                self.menu = mcp_menu_state.reduce(self.menu, .{ .catalog_loaded = .{
+                _ = mcp_menu_state.apply(&self.menu, .{ .catalog_loaded = .{
                     .generation = request.generation,
                     .item_count = count,
-                } }).state;
+                } });
             },
             .preview => |preview| {
                 if (self.menu_preview) |*previous| previous.deinit(alloc);
                 self.menu_preview = preview;
                 result = .cancelled;
-                self.menu = mcp_menu_state.reduce(
-                    self.menu,
+                _ = mcp_menu_state.apply(
+                    &self.menu,
                     .{ .preview_loaded = request.generation },
-                ).state;
+                );
             },
             .completion => |completion| {
                 try self.menu_argument_form.set(
@@ -1376,10 +1389,10 @@ pub const State = struct {
                     completion.field_index,
                     completion.value,
                 );
-                self.menu = mcp_menu_state.reduce(
-                    self.menu,
+                _ = mcp_menu_state.apply(
+                    &self.menu,
                     .{ .completion_loaded = request.generation },
-                ).state;
+                );
             },
             .action => |action_result| {
                 self.menu_feedback = action_result.feedback;
@@ -1387,35 +1400,36 @@ pub const State = struct {
                 result = .cancelled;
                 self.returnMenuToServers();
                 if (needs_reload) return .{ .reload = request.generation };
-                self.menu = mcp_menu_state.reduce(
-                    self.menu,
+                _ = mcp_menu_state.apply(
+                    &self.menu,
                     .{ .action_succeeded = request.generation },
-                ).state;
+                );
             },
             .failed => |err| {
-                self.menu_feedback = try std.fmt.allocPrint(
+                self.menu_feedback = try allocMenuText(
                     alloc,
-                    "MCP {s} failed: {s}",
-                    .{
+                    &.{
+                        "MCP ",
                         switch (kind) {
                             .catalog => "catalog",
                             .preview => "preview",
                             .completion => "completion",
                             .action => "action",
                         },
+                        " failed: ",
                         @errorName(err),
                     },
                 );
-                self.menu = mcp_menu_state.reduce(
-                    self.menu,
+                _ = mcp_menu_state.apply(
+                    &self.menu,
                     .{ .effect_failed = request.generation },
-                ).state;
+                );
             },
             .cancelled => {
-                self.menu = mcp_menu_state.reduce(
-                    self.menu,
+                _ = mcp_menu_state.apply(
+                    &self.menu,
                     .{ .effect_cancelled = request.generation },
-                ).state;
+                );
             },
         }
         return .repaint;
@@ -1429,15 +1443,11 @@ pub const State = struct {
     ) !void {
         if (!self.menu.active or self.menu.pending_generation != generation) return;
         if (self.menu_feedback) |feedback| alloc.free(feedback);
-        self.menu_feedback = try std.fmt.allocPrint(
+        self.menu_feedback = try allocMenuText(
             alloc,
-            "MCP operation failed: {s}",
-            .{@errorName(err)},
+            &.{ "MCP operation failed: ", @errorName(err) },
         );
-        self.menu = mcp_menu_state.reduce(
-            self.menu,
-            .{ .effect_failed = generation },
-        ).state;
+        _ = mcp_menu_state.apply(&self.menu, .{ .effect_failed = generation });
     }
 
     pub fn applyMenuReloadCompletion(
@@ -1467,28 +1477,19 @@ pub const State = struct {
                     "MCP reload failed; the previous runtime remains active.",
                 ),
             },
-            .failed => |err| try std.fmt.allocPrint(
+            .failed => |err| try allocMenuText(
                 alloc,
-                "MCP reload failed: {s}",
-                .{@errorName(err)},
+                &.{ "MCP reload failed: ", @errorName(err) },
             ),
         };
-        self.menu = switch (completion.*) {
+        const completion_event: mcp_menu_state.Event = switch (completion.*) {
             .outcome => |outcome| switch (outcome) {
-                .published => mcp_menu_state.reduce(
-                    self.menu,
-                    .{ .action_succeeded = generation },
-                ).state,
-                .retained_required_failure => mcp_menu_state.reduce(
-                    self.menu,
-                    .{ .effect_failed = generation },
-                ).state,
+                .published => .{ .action_succeeded = generation },
+                .retained_required_failure => .{ .effect_failed = generation },
             },
-            .failed => mcp_menu_state.reduce(
-                self.menu,
-                .{ .effect_failed = generation },
-            ).state,
+            .failed => .{ .effect_failed = generation },
         };
+        _ = mcp_menu_state.apply(&self.menu, completion_event);
 
         var snapshot = if (self.acquire()) |lease_value| snapshot: {
             var lease = lease_value;
@@ -1519,10 +1520,13 @@ pub const State = struct {
             switch (authentication) {
                 .authenticated => |authenticated| {
                     self.menu_feedback = if (authenticated.repaired_entries == 0)
-                        try std.fmt.allocPrint(
+                        try allocMenuText(
                             alloc,
-                            "Authenticated MCP server '{s}'; reconnecting…",
-                            .{completion.server_name},
+                            &.{
+                                "Authenticated MCP server '",
+                                completion.server_name,
+                                "'; reconnecting…",
+                            },
                         )
                     else
                         try std.fmt.allocPrint(
@@ -1533,24 +1537,28 @@ pub const State = struct {
                     return true;
                 },
                 .issuer_mismatch => {
-                    self.menu_feedback = try std.fmt.allocPrint(
+                    self.menu_feedback = try allocMenuText(
                         alloc,
-                        "MCP authentication for '{s}' rejected an issuer mismatch.",
-                        .{completion.server_name},
+                        &.{
+                            "MCP authentication for '",
+                            completion.server_name,
+                            "' rejected an issuer mismatch.",
+                        },
                     );
                 },
             }
         } else |err| {
-            self.menu_feedback = try std.fmt.allocPrint(
+            self.menu_feedback = try allocMenuText(
                 alloc,
-                "MCP authentication for '{s}' failed: {s}",
-                .{ completion.server_name, @errorName(err) },
+                &.{
+                    "MCP authentication for '",
+                    completion.server_name,
+                    "' failed: ",
+                    @errorName(err),
+                },
             );
         }
-        self.menu = mcp_menu_state.reduce(
-            self.menu,
-            .{ .effect_failed = generation },
-        ).state;
+        _ = mcp_menu_state.apply(&self.menu, .{ .effect_failed = generation });
         return false;
     }
 
@@ -2523,6 +2531,149 @@ test "MCP menu expands every resource template argument" {
         "custom://project/alpha%20team/src%2Flib?lang=en&mode=fast",
         expanded,
     );
+}
+
+test "MCP menu failures preserve exact menu-owned feedback" {
+    const alloc = std.testing.allocator;
+
+    var effect_state = State{
+        .menu = .{
+            .active = true,
+            .load_state = .loading,
+            .pending_generation = 7,
+        },
+    };
+    defer effect_state.deinit(alloc);
+    try effect_state.recordMenuEffectFailure(
+        alloc,
+        7,
+        error.McpServerNotFound,
+    );
+    try std.testing.expectEqualStrings(
+        "MCP operation failed: McpServerNotFound",
+        effect_state.menu_feedback.?,
+    );
+    try std.testing.expectEqual(mcp_menu_state.LoadState.failed, effect_state.menu.load_state);
+
+    var reload_state = State{
+        .menu = .{
+            .active = true,
+            .load_state = .loading,
+            .pending_generation = 11,
+        },
+    };
+    defer reload_state.deinit(alloc);
+    const reload_completion = ReloadCompletion{ .failed = error.TestReloadFailed };
+    try reload_state.applyMenuReloadCompletion(
+        alloc,
+        11,
+        &reload_completion,
+        0,
+    );
+    try std.testing.expectEqualStrings(
+        "MCP reload failed: TestReloadFailed",
+        reload_state.menu_feedback.?,
+    );
+    try std.testing.expectEqual(mcp_menu_state.LoadState.failed, reload_state.menu.load_state);
+
+    var unavailable_names = [_][]u8{
+        @constCast("alpha"),
+        @constCast("beta"),
+    };
+    var degraded_state = State{
+        .menu = .{
+            .active = true,
+            .load_state = .loading,
+            .pending_generation = 12,
+        },
+    };
+    defer degraded_state.deinit(alloc);
+    const degraded_completion = ReloadCompletion{ .outcome = .{ .published = .{
+        .generation = 4,
+        .health = .degraded,
+        .configured_server_count = 3,
+        .unavailable_server_names = &unavailable_names,
+    } } };
+    try degraded_state.applyMenuReloadCompletion(
+        alloc,
+        12,
+        &degraded_completion,
+        0,
+    );
+    try std.testing.expectEqualStrings(
+        "MCP reloaded with 2 unavailable servers.",
+        degraded_state.menu_feedback.?,
+    );
+
+    var authentication_state = State{
+        .menu = .{
+            .active = true,
+            .load_state = .loading,
+            .pending_generation = 13,
+        },
+    };
+    defer authentication_state.deinit(alloc);
+    const authentication_completion = AuthenticationCompletion{
+        .server_name = @constCast("fixture"),
+        .result = error.TestAuthenticationFailed,
+    };
+    try std.testing.expect(!try authentication_state.applyMenuAuthenticationCompletion(
+        alloc,
+        13,
+        &authentication_completion,
+    ));
+    try std.testing.expectEqualStrings(
+        "MCP authentication for 'fixture' failed: TestAuthenticationFailed",
+        authentication_state.menu_feedback.?,
+    );
+    try std.testing.expectEqual(
+        mcp_menu_state.LoadState.failed,
+        authentication_state.menu.load_state,
+    );
+
+    var repaired_state = State{
+        .menu = .{
+            .active = true,
+            .load_state = .loading,
+            .pending_generation = 17,
+        },
+    };
+    defer repaired_state.deinit(alloc);
+    const repaired_completion = AuthenticationCompletion{
+        .server_name = @constCast("fixture"),
+        .result = .{ .authenticated = .{ .repaired_entries = 2 } },
+    };
+    try std.testing.expect(try repaired_state.applyMenuAuthenticationCompletion(
+        alloc,
+        17,
+        &repaired_completion,
+    ));
+    try std.testing.expectEqualStrings(
+        "Authenticated 'fixture'; repaired 2 credential entries; reconnecting…",
+        repaired_state.menu_feedback.?,
+    );
+}
+
+test "MCP menu repeated lifecycle releases drafts and feedback" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+
+    for (0..1000) |cycle| {
+        try state.openMenu(alloc, cycle);
+        try state.setMenuAddField(alloc, 0, "fixture");
+        try state.setMenuAddField(alloc, 1, "/usr/bin/env");
+        try state.setMenuAddField(alloc, 2, "node fixture.mjs");
+        try state.setMenuFeedback(alloc, "Saved MCP server; reconnecting…");
+        state.closeMenu(alloc);
+
+        const view = state.menuView();
+        try std.testing.expect(!view.state.active);
+        try std.testing.expectEqual(@as(usize, 0), view.add_form.name.items.len);
+        try std.testing.expectEqual(@as(usize, 0), view.add_form.target.items.len);
+        try std.testing.expectEqual(@as(usize, 0), view.add_form.arguments.items.len);
+        try std.testing.expect(view.feedback == null);
+    }
 }
 
 const TestReloadMode = enum {

@@ -2,10 +2,12 @@ const std = @import("std");
 const display_width = @import("../../core/shared/display_width.zig");
 const mcp_health = @import("../../core/mcp/health.zig");
 const mcp_menu_state = @import("../../core/mcp/menu_state.zig");
+const app_mcp_runtime = @import("../../core/app/app_mcp_runtime.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
 const render_input = @import("render_input.zig");
 const row_text = @import("row_text.zig");
 const ui_render = @import("../render.zig");
+const vt_emulator = @import("../../core/terminal/engine.zig");
 
 const Allocator = std.mem.Allocator;
 const McpMenuProjection = render_input.McpMenuProjection;
@@ -44,7 +46,7 @@ pub fn visibleItemsForBudget(row_budget: u16) u16 {
     return @max(row_budget -| header_rows, 1);
 }
 
-pub fn composeMcpMenuRow(
+pub noinline fn composeMcpMenuRow(
     alloc: Allocator,
     projection: McpMenuProjection,
     row_index: u16,
@@ -740,5 +742,221 @@ test "MCP preview row count matches wide-character wrapping" {
     try std.testing.expectEqual(
         @as(u16, 6),
         menuRowCount(projection, 5, 10),
+    );
+}
+
+fn expectMcpMenuVtContains(
+    alloc: Allocator,
+    projection: McpMenuProjection,
+    width: u16,
+    row_budget: u16,
+    needles: []const []const u8,
+) !void {
+    const rows = menuRowCount(projection, width, row_budget);
+    try std.testing.expect(rows > 0);
+    var grid = try vt_emulator.Grid.init(alloc, width, rows);
+    defer grid.deinit();
+
+    var row_index: u16 = 0;
+    while (row_index < rows) : (row_index += 1) {
+        var row = try composeMcpMenuRow(
+            alloc,
+            projection,
+            row_index,
+            width,
+            rows,
+        );
+        defer row.deinit(alloc);
+        var cursor_buf: [32]u8 = undefined;
+        const cursor = try std.fmt.bufPrint(
+            &cursor_buf,
+            "\x1b[{d};1H",
+            .{row_index + 1},
+        );
+        try grid.feed(cursor);
+        try grid.feed(row.items);
+    }
+
+    var frame: std.ArrayList(u8) = .empty;
+    defer frame.deinit(alloc);
+    var row_number: u16 = 1;
+    while (row_number <= rows) : (row_number += 1) {
+        if (row_number > 1) try frame.append(alloc, '\n');
+        try grid.rowTextTrimmed(row_number, &frame);
+    }
+    for (needles) |needle| {
+        if (std.mem.find(u8, frame.items, needle) == null) {
+            std.debug.print(
+                "MCP VT frame did not contain '{s}':\n{s}\n",
+                .{ needle, frame.items },
+            );
+            return error.TestExpectedGridText;
+        }
+    }
+}
+
+test "MCP menu every screen and section renders through the VT" {
+    const alloc = std.testing.allocator;
+    const width: u16 = 100;
+    const server = mcp_health.ServerSnapshot{
+        .configured_name = @constCast("fixture"),
+        .negotiated_name = @constCast("Fixture MCP"),
+        .negotiated_version = @constCast("1.0"),
+        .source = .profile,
+        .scope = .profile,
+        .required = false,
+        .transport = .stdio,
+        .protocol_version = @constCast("2025-06-18"),
+        .connection = .ready,
+        .authentication = .authenticated,
+        .counts = .{
+            .tools = 2,
+            .resources = 3,
+            .resource_templates = 1,
+            .prompts = 4,
+        },
+        .cache_freshness = .fresh,
+        .subscription = .active,
+        .runtime_generation = 3,
+        .catalog_generation = 4,
+        .retry_attempt = 0,
+        .retry_in_ms = null,
+        .last_successful_discovery_ms = 10,
+        .failure = null,
+    };
+    const servers = [_]mcp_health.ServerSnapshot{server};
+    const tools = [_][]const u8{"mcp_fixture_echo"};
+    const arguments = [_]app_mcp_runtime.MenuArgumentField{.{
+        .name = @constCast("topic"),
+        .required = true,
+    }};
+
+    var projection: McpMenuProjection = .{
+        .state = .{ .active = true, .load_state = .ready },
+        .servers = &servers,
+        .tools = &tools,
+    };
+    try expectMcpMenuVtContains(
+        alloc,
+        projection,
+        width,
+        max_inline_rows,
+        &.{ "MCP 1", "[Servers]", "fixture", "Ready", "stdio · Profile" },
+    );
+
+    projection.state.screen = .details;
+    try expectMcpMenuVtContains(
+        alloc,
+        projection,
+        width,
+        max_inline_rows,
+        &.{ "Server", "fixture", "Protocol", "2025-06-18", "Capabilities", "tools=2" },
+    );
+
+    projection.state = .{
+        .active = true,
+        .section = .tools,
+        .load_state = .ready,
+    };
+    try expectMcpMenuVtContains(
+        alloc,
+        projection,
+        width,
+        max_inline_rows,
+        &.{ "[Tools]", "mcp_fixture_echo", "Tool" },
+    );
+
+    projection.state.section = .resources;
+    try expectMcpMenuVtContains(
+        alloc,
+        projection,
+        width,
+        max_inline_rows,
+        &.{ "[Resources]", "No MCP resources available." },
+    );
+
+    projection.state.section = .prompts;
+    try expectMcpMenuVtContains(
+        alloc,
+        projection,
+        width,
+        max_inline_rows,
+        &.{ "[Prompts]", "No MCP prompts available." },
+    );
+
+    projection.state = .{
+        .active = true,
+        .section = .resources,
+        .screen = .preview,
+        .load_state = .ready,
+    };
+    projection.preview = "MCP resource · untrusted content\n\nRESOURCE_TEXT: preserve this preview";
+    try expectMcpMenuVtContains(
+        alloc,
+        projection,
+        32,
+        6,
+        &.{ "[Resources]", "MCP resource", "untrusted", "content", "RESOURCE_TEXT: preserve this" },
+    );
+
+    projection.state = .{
+        .active = true,
+        .screen = .add,
+        .load_state = .ready,
+    };
+    projection.preview = null;
+    projection.add_draft = "fixture";
+    projection.add_target = "/usr/bin/env";
+    projection.add_arguments = "node fixture.mjs";
+    try expectMcpMenuVtContains(
+        alloc,
+        projection,
+        width,
+        max_inline_rows,
+        &.{ "Transport", "Local", "> Name", "fixture", "Command", "Arguments", "Scope", "Profile" },
+    );
+
+    projection.state = .{
+        .active = true,
+        .section = .prompts,
+        .screen = .arguments,
+        .load_state = .ready,
+    };
+    projection.arguments = &arguments;
+    projection.argument_draft = "alpha";
+    try expectMcpMenuVtContains(
+        alloc,
+        projection,
+        width,
+        max_inline_rows,
+        &.{ "[Prompts]", "> topic *", "alpha" },
+    );
+
+    projection.state = .{
+        .active = true,
+        .screen = .info,
+        .load_state = .ready,
+    };
+    projection.arguments = &.{};
+    try expectMcpMenuVtContains(
+        alloc,
+        projection,
+        width,
+        max_inline_rows,
+        &.{ "Profile config", "~/.fx/mcp.json", "Project config", "<workspace>/.mcp.json" },
+    );
+
+    projection.state = .{
+        .active = true,
+        .screen = .confirm,
+        .load_state = .ready,
+        .confirmation_action = .remove,
+    };
+    try expectMcpMenuVtContains(
+        alloc,
+        projection,
+        width,
+        max_inline_rows,
+        &.{"Remove this profile MCP server? Press Enter to confirm."},
     );
 }

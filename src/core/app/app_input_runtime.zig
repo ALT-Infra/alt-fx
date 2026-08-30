@@ -1963,10 +1963,9 @@ pub fn Runtime(comptime App: type) type {
 
         fn applyMcpMenuEvent(app: *App, event: mcp_menu_state.Event) ?mcp_menu_state.Effect {
             if (comptime @hasField(App, "mcp")) {
-                const transition = mcp_menu_state.reduce(app.mcp.menu, event);
-                app.mcp.menu = transition.state;
+                const effect = mcp_menu_state.apply(&app.mcp.menu, event);
                 app.shell.render_requests.request(.footer);
-                return transition.effect;
+                return effect;
             }
             return null;
         }
