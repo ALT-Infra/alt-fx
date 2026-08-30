@@ -524,6 +524,7 @@ describe.skipIf(SKIP)("tui: extra slash commands", () => {
               environment: {
                 FX_MCP_MODE: "features",
                 FX_MCP_WIRE_LOG: wireLogPath,
+                FX_MCP_CATALOG_DELAY_MS: "25",
               },
             },
           },
@@ -569,12 +570,16 @@ describe.skipIf(SKIP)("tui: extra slash commands", () => {
         await session.waitForText("mcp_fixture_echo", 5_000);
 
         await session.sendKeys("Right");
-        const resources = await session.waitForText("custom://alpha", 10_000);
+        const resources = await session.waitForText("[Resources]", 10_000);
         expect(resources).toContain("[Resources]");
+        expect(resources).toContain("custom://alpha");
+        expect(resources).not.toContain("Loading MCP catalog");
 
         await session.sendKeys("Right");
-        const prompts = await session.waitForText("Review prompt", 10_000);
+        const prompts = await session.waitForText("[Prompts]", 10_000);
         expect(prompts).toContain("[Prompts]");
+        expect(prompts).toContain("Review prompt");
+        expect(prompts).not.toContain("Loading MCP catalog");
         for (let index = 0; index < 2; index += 1) {
           await session.sendKeys("Down");
         }

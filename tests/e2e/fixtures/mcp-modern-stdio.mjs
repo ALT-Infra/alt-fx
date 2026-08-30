@@ -19,6 +19,10 @@ const resourcesSubscribe = process.env.FX_MCP_RESOURCES_SUBSCRIBE !== "0";
 const resourceTtlMs = process.env.FX_MCP_RESOURCE_TTL_MS === undefined
   ? null
   : Number(process.env.FX_MCP_RESOURCE_TTL_MS);
+const catalogDelayMs = Math.max(
+  0,
+  Number(process.env.FX_MCP_CATALOG_DELAY_MS ?? "0") || 0,
+);
 const elicitationUrl = process.env.FX_MCP_ELICITATION_URL ?? "https://example.test/connect";
 const collidingChoices = [
   { const: "Skip", title: "Skip" },
@@ -49,6 +53,14 @@ if (stallRecovery) setInterval(() => {}, 1000);
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
+}
+
+function sendCatalogResponse(message) {
+  if (catalogDelayMs === 0) {
+    send(message);
+    return;
+  }
+  setTimeout(() => send(message), catalogDelayMs);
 }
 
 function log(message) {
@@ -283,7 +295,7 @@ function handle(message) {
   }
   if (message.method === "resources/list") {
     const secondPage = message.params?.cursor === "";
-    send({
+    sendCatalogResponse({
       jsonrpc: "2.0",
       id: message.id,
       result: {
@@ -318,7 +330,7 @@ function handle(message) {
     return;
   }
   if (message.method === "resources/templates/list") {
-    send({
+    sendCatalogResponse({
       jsonrpc: "2.0",
       id: message.id,
       result: {
@@ -415,7 +427,7 @@ function handle(message) {
   }
   if (message.method === "prompts/list") {
     const secondPage = message.params?.cursor === "";
-    send({
+    sendCatalogResponse({
       jsonrpc: "2.0",
       id: message.id,
       result: {

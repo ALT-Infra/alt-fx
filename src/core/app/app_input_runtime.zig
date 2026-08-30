@@ -1962,10 +1962,14 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn applyMcpMenuEvent(app: *App, event: mcp_menu_state.Event) ?mcp_menu_state.Effect {
+            const effect = applyMcpMenuEventDeferred(app, event);
+            app.shell.render_requests.request(.footer);
+            return effect;
+        }
+
+        fn applyMcpMenuEventDeferred(app: *App, event: mcp_menu_state.Event) ?mcp_menu_state.Effect {
             if (comptime @hasField(App, "mcp")) {
-                const effect = mcp_menu_state.apply(&app.mcp.menu, event);
-                app.shell.render_requests.request(.footer);
-                return effect;
+                return mcp_menu_state.apply(&app.mcp.menu, event);
             }
             return null;
         }
@@ -2025,9 +2029,13 @@ pub fn Runtime(comptime App: type) type {
 
         fn cycleMcpMenuSection(app: *App, delta: i8) !bool {
             if (!mcpMenuActive(app)) return false;
-            if (applyMcpMenuEvent(app, .{ .cycle_section = delta })) |effect| {
+            if (applyMcpMenuEventDeferred(app, .{ .cycle_section = delta })) |effect| {
                 try startMcpMenuEffect(app, effect);
             }
+            if (comptime @hasField(App, "mcp")) {
+                if (app.mcp.menu.load_state == .loading) return true;
+            }
+            app.shell.render_requests.request(.footer);
             return true;
         }
 

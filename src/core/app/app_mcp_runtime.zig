@@ -497,6 +497,7 @@ const MenuActionResult = struct {
 };
 
 const MenuOperationKind = enum { catalog, preview, completion, action };
+const menu_catalog_loading_grace_ms: i64 = 200;
 
 const MenuOperation = struct {
     kind: MenuOperationKind,
@@ -550,6 +551,8 @@ const PendingMenuOperation = struct {
     argument_index: usize = 0,
     resource_template: bool = false,
     action: ?mcp_menu_state.Action = null,
+    started_at_ms: i64,
+    catalog_loading_visible: bool = false,
     cancel_requested: std.atomic.Value(bool) = .init(false),
     done: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
@@ -1255,6 +1258,7 @@ pub const State = struct {
             .argument_index = self.menu.argument_index,
             .resource_template = resource_template,
             .action = action,
+            .started_at_ms = io_mod.milliTimestamp(),
         };
         lease_owned = false;
         rules_owned = false;
@@ -1317,8 +1321,14 @@ pub const State = struct {
             return .none;
         };
         if (!pending.done.load(.acquire)) {
+            const now_ms = io_mod.milliTimestamp();
+            const reveal_loading = pending.kind == .catalog and
+                !pending.catalog_loading_visible and
+                now_ms >= pending.started_at_ms and
+                now_ms - pending.started_at_ms >= menu_catalog_loading_grace_ms;
+            if (reveal_loading) pending.catalog_loading_visible = true;
             self.lock.unlock(io_mod.getIo());
-            return .none;
+            return if (reveal_loading) .repaint else .none;
         }
         self.pending_menu_operation = null;
         self.lock.unlock(io_mod.getIo());
