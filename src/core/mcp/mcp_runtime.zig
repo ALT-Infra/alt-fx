@@ -726,7 +726,7 @@ fn fetchResources(self: *McpRuntime, server: *McpServer, deadline: std.Io.Clock.
     defer if (cursor) |value| self.alloc.free(value);
     var producing_identity: ?feature_cache.Digest = null;
     while (true) {
-        var exchange = try requestFeatureCatalogPage(
+        var exchange = try request_feature_catalog_page(
             self,
             server,
             .resources,
@@ -752,7 +752,7 @@ fn fetchResourceTemplates(self: *McpRuntime, server: *McpServer, deadline: std.I
     defer if (cursor) |value| self.alloc.free(value);
     var producing_identity: ?feature_cache.Digest = null;
     while (true) {
-        var exchange = try requestFeatureCatalogPage(
+        var exchange = try request_feature_catalog_page(
             self,
             server,
             .resource_templates,
@@ -778,7 +778,7 @@ fn fetchPrompts(self: *McpRuntime, server: *McpServer, deadline: std.Io.Clock.Ti
     defer if (cursor) |value| self.alloc.free(value);
     var producing_identity: ?feature_cache.Digest = null;
     while (true) {
-        var exchange = try requestFeatureCatalogPage(
+        var exchange = try request_feature_catalog_page(
             self,
             server,
             .prompts,
@@ -844,7 +844,7 @@ const FeatureCatalogPageResponse = struct {
     received_at_ms: u64,
 };
 
-fn requestFeatureCatalogPage(
+fn request_feature_catalog_page(
     self: *McpRuntime,
     server: *McpServer,
     kind: FeatureCatalogKind,
@@ -8638,6 +8638,63 @@ fn replaceOwnedCursor(
     cursor.* = replacement;
 }
 
+const ToolCatalogPages = struct {
+    const CursorReplacement = enum {
+        preserve_until_owned,
+        release_before_alloc,
+    };
+
+    builder: tools_feature.CatalogBuilder,
+    cursor: ?[]u8 = null,
+
+    fn init(alloc: Allocator, protocol: tools_feature.Protocol) ToolCatalogPages {
+        return .{
+            .builder = tools_feature.CatalogBuilder.init(alloc, protocol),
+        };
+    }
+
+    fn deinit(self: *ToolCatalogPages, alloc: Allocator) void {
+        self.builder.deinit(alloc);
+        if (self.cursor) |value| alloc.free(value);
+        self.* = undefined;
+    }
+
+    fn append_response(
+        self: *ToolCatalogPages,
+        alloc: Allocator,
+        response: []const u8,
+        received_at_ms: u64,
+        cursor_replacement: CursorReplacement,
+    ) !bool {
+        var page = try tools_feature.parseListPage(
+            alloc,
+            response,
+            self.builder.protocol,
+            .{},
+        );
+        defer page.deinit(alloc);
+        switch (cursor_replacement) {
+            .preserve_until_owned => try replaceOwnedCursor(alloc, &self.cursor, page.next_cursor),
+            .release_before_alloc => {
+                if (self.cursor) |value| {
+                    alloc.free(value);
+                    self.cursor = null;
+                }
+                self.cursor = if (page.next_cursor) |value|
+                    try alloc.dupe(u8, value)
+                else
+                    null;
+            },
+        }
+        try self.builder.appendPage(alloc, &page, received_at_ms, .{});
+        return self.cursor == null;
+    }
+
+    fn finish(self: *ToolCatalogPages, alloc: Allocator) !tools_feature.Catalog {
+        return self.builder.finish(alloc);
+    }
+};
+
 fn fetchStdioToolCatalog(
     self: *McpRuntime,
     server: *McpServer,
@@ -8645,56 +8702,17 @@ fn fetchStdioToolCatalog(
     cancel_flag: ?*std.atomic.Value(bool),
     access: tool_mcp_runtime.Access,
 ) !tools_feature.Catalog {
-    const alloc = self.alloc;
     const dispatcher = server.dispatcher orelse return error.McpConnectionClosed;
-    var builder = tools_feature.CatalogBuilder.init(
-        alloc,
-        featureProtocol(server.stdio_protocol),
+    const fetched = try fetch_tool_catalog_pages(
+        self.alloc,
+        self,
+        server,
+        .{ .stdio = dispatcher },
+        deadline,
+        cancel_flag,
+        access,
     );
-    defer builder.deinit(alloc);
-    var cursor: ?[]u8 = null;
-    defer if (cursor) |value| alloc.free(value);
-    while (true) {
-        try reauthorizeOperation(
-            self,
-            access,
-            .{ .tool_server = server.config.name },
-        );
-        const request_id = try dispatcher.reserveRequestId();
-        const request = try buildToolsListRequest(alloc, request_id, server.stdio_protocol, cursor);
-        defer alloc.free(request);
-        var guard = ServerAccessPrecommit{
-            .runtime = self,
-            .target = .{ .tool_server = server.config.name },
-            .access = access,
-        };
-        var precommit = guard.transport();
-        const response = try dispatcher.request(
-            alloc,
-            request_id,
-            request,
-            mcp_discovery_response_frame_cap_bytes,
-            .{
-                .timeout_ms = server.config.operation_timeout_ms,
-                .deadline = deadline,
-                .cancel_flag = cancel_flag,
-                .lifecycle_cancel_flag = lifecycleCancelFlag(server),
-                .precommit = &precommit,
-            },
-        );
-        const received_at_ms = clockMillis();
-        defer alloc.free(response);
-        var page = try tools_feature.parseListPage(
-            alloc,
-            response,
-            featureProtocol(server.stdio_protocol),
-            .{},
-        );
-        defer page.deinit(alloc);
-        try replaceOwnedCursor(alloc, &cursor, page.next_cursor);
-        try builder.appendPage(alloc, &page, received_at_ms, .{});
-        if (cursor == null) return builder.finish(alloc);
-    }
+    return fetched.catalog;
 }
 
 const HttpRequestIds = union(enum) {
@@ -8713,6 +8731,169 @@ const HttpRequestIds = union(enum) {
         };
     }
 };
+
+const ToolCatalogTransport = union(enum) {
+    stdio: *stdio_dispatcher.StdioDispatcher,
+    modern_http: *HttpRequestIds,
+    legacy_http: *legacy_streamable_http.Client,
+    legacy_sse: *legacy_http_sse.Client,
+
+    fn protocol(self: ToolCatalogTransport, server: *const McpServer) StdioProtocol {
+        return switch (self) {
+            .stdio => server.stdio_protocol,
+            .modern_http => .modern,
+            .legacy_http, .legacy_sse => .legacy,
+        };
+    }
+
+    fn next_request_id(self: *ToolCatalogTransport, server: *McpServer) !u64 {
+        return switch (self.*) {
+            .stdio => |dispatcher| dispatcher.reserveRequestId(),
+            .modern_http => |request_ids| request_ids.next(),
+            .legacy_http, .legacy_sse => reserveHttpRequestId(server),
+        };
+    }
+
+    fn request_page(
+        self: ToolCatalogTransport,
+        alloc: Allocator,
+        runtime: *McpRuntime,
+        server: *McpServer,
+        request_id: u64,
+        request: []const u8,
+        deadline: std.Io.Clock.Timestamp,
+        cancel_flag: ?*std.atomic.Value(bool),
+        access: tool_mcp_runtime.Access,
+        precommit: *mcp_contract.TransportPrecommit,
+    ) !FeatureResponse {
+        return switch (self) {
+            .stdio => |dispatcher| .{ .body = try dispatcher.request(
+                alloc,
+                request_id,
+                request,
+                mcp_discovery_response_frame_cap_bytes,
+                .{
+                    .timeout_ms = server.config.operation_timeout_ms,
+                    .deadline = deadline,
+                    .cancel_flag = cancel_flag,
+                    .lifecycle_cancel_flag = lifecycleCancelFlag(server),
+                    .precommit = precommit,
+                },
+            ) },
+            .modern_http => {
+                var auth_identity: feature_cache.Digest = undefined;
+                const response = try authenticatedPost(alloc, alloc, server, .{
+                    .url = try server.config.remoteUrl(),
+                    .request_body = request,
+                    .max_response_bytes = mcp_discovery_response_frame_cap_bytes,
+                    .max_event_bytes = mcp_discovery_response_frame_cap_bytes,
+                    .precommit = precommit,
+                    .control = .{
+                        .deadline = deadline,
+                        .cancel_flag = cancel_flag,
+                        .lifecycle_cancel_flag = lifecycleCancelFlag(server),
+                    },
+                }, .{
+                    .runtime = runtime,
+                    .access = access,
+                    .target = .{ .tool_server = server.config.name },
+                }, .safe, &auth_identity);
+                if (response.www_authenticate) |value| alloc.free(value);
+                return .{
+                    .body = response.body,
+                    .auth_identity = auth_identity,
+                };
+            },
+            .legacy_http => |client| .{ .body = try client.request(alloc, .{
+                .request_id = request_id,
+                .request_body = request,
+                .max_response_bytes = mcp_discovery_response_frame_cap_bytes,
+                .max_event_bytes = mcp_discovery_response_frame_cap_bytes,
+                .precommit = precommit,
+                .control = .{
+                    .deadline = deadline,
+                    .cancel_flag = cancel_flag,
+                    .lifecycle_cancel_flag = lifecycleCancelFlag(server),
+                },
+            }) },
+            .legacy_sse => |client| .{ .body = try client.request(
+                alloc,
+                request_id,
+                request,
+                mcp_discovery_response_frame_cap_bytes,
+                .{
+                    .deadline = deadline,
+                    .cancel_flag = cancel_flag,
+                    .lifecycle_cancel_flag = lifecycleCancelFlag(server),
+                    .precommit = precommit,
+                },
+            ) },
+        };
+    }
+};
+
+fn fetch_tool_catalog_pages(
+    alloc: Allocator,
+    runtime: *McpRuntime,
+    server: *McpServer,
+    initial_transport: ToolCatalogTransport,
+    deadline: std.Io.Clock.Timestamp,
+    cancel_flag: ?*std.atomic.Value(bool),
+    access: tool_mcp_runtime.Access,
+) !FetchedToolCatalog {
+    var transport = initial_transport;
+    const protocol = transport.protocol(server);
+    var pages = ToolCatalogPages.init(alloc, featureProtocol(protocol));
+    defer pages.deinit(alloc);
+    var producing_identity: ?feature_cache.Digest = null;
+    while (true) {
+        try reauthorizeOperation(
+            runtime,
+            access,
+            .{ .tool_server = server.config.name },
+        );
+        const request_id = try transport.next_request_id(server);
+        const request = try buildToolsListRequest(alloc, request_id, protocol, pages.cursor);
+        defer alloc.free(request);
+        var guard = ServerAccessPrecommit{
+            .runtime = runtime,
+            .target = .{ .tool_server = server.config.name },
+            .access = access,
+        };
+        var precommit = guard.transport();
+        var response = try transport.request_page(
+            alloc,
+            runtime,
+            server,
+            request_id,
+            request,
+            deadline,
+            cancel_flag,
+            access,
+            &precommit,
+        );
+        const received_at_ms = clockMillis();
+        defer response.deinit(alloc);
+        if (response.auth_identity) |page_identity| {
+            if (producing_identity) |identity| {
+                if (!std.mem.eql(u8, &identity, &page_identity)) {
+                    return error.McpAuthIdentityChangedDuringPagination;
+                }
+            } else {
+                producing_identity = page_identity;
+            }
+        }
+        if (try pages.append_response(
+            alloc,
+            response.body,
+            received_at_ms,
+            .preserve_until_owned,
+        )) return .{
+            .catalog = try pages.finish(alloc),
+            .auth_identity = producing_identity,
+        };
+    }
+}
 
 fn fetchModernHttpToolCatalogWithIds(
     alloc: Allocator,
@@ -8760,61 +8941,15 @@ fn fetchModernHttpToolCatalogAttempt(
     cancel_flag: ?*std.atomic.Value(bool),
     access: tool_mcp_runtime.Access,
 ) !FetchedToolCatalog {
-    var builder = tools_feature.CatalogBuilder.init(alloc, .modern);
-    defer builder.deinit(alloc);
-    var cursor: ?[]u8 = null;
-    defer if (cursor) |value| alloc.free(value);
-    var producing_identity: ?feature_cache.Digest = null;
-    while (true) {
-        try reauthorizeOperation(
-            runtime,
-            access,
-            .{ .tool_server = server.config.name },
-        );
-        const request_id = try request_ids.next();
-        const request = try buildToolsListRequest(alloc, request_id, .modern, cursor);
-        defer alloc.free(request);
-        var guard = ServerAccessPrecommit{
-            .runtime = runtime,
-            .target = .{ .tool_server = server.config.name },
-            .access = access,
-        };
-        var precommit = guard.transport();
-        var page_identity: feature_cache.Digest = undefined;
-        var response = try authenticatedPost(alloc, alloc, server, .{
-            .url = try server.config.remoteUrl(),
-            .request_body = request,
-            .max_response_bytes = mcp_discovery_response_frame_cap_bytes,
-            .max_event_bytes = mcp_discovery_response_frame_cap_bytes,
-            .precommit = &precommit,
-            .control = .{
-                .deadline = deadline,
-                .cancel_flag = cancel_flag,
-                .lifecycle_cancel_flag = lifecycleCancelFlag(server),
-            },
-        }, .{
-            .runtime = runtime,
-            .access = access,
-            .target = .{ .tool_server = server.config.name },
-        }, .safe, &page_identity);
-        const received_at_ms = clockMillis();
-        defer response.deinit(alloc);
-        if (producing_identity) |identity| {
-            if (!std.mem.eql(u8, &identity, &page_identity)) {
-                return error.McpAuthIdentityChangedDuringPagination;
-            }
-        } else {
-            producing_identity = page_identity;
-        }
-        var page = try tools_feature.parseListPage(alloc, response.body, .modern, .{});
-        defer page.deinit(alloc);
-        try replaceOwnedCursor(alloc, &cursor, page.next_cursor);
-        try builder.appendPage(alloc, &page, received_at_ms, .{});
-        if (cursor == null) return .{
-            .catalog = try builder.finish(alloc),
-            .auth_identity = producing_identity,
-        };
-    }
+    return fetch_tool_catalog_pages(
+        alloc,
+        runtime,
+        server,
+        .{ .modern_http = request_ids },
+        deadline,
+        cancel_flag,
+        access,
+    );
 }
 
 fn fetchModernHttpToolCatalog(
@@ -8844,45 +8979,16 @@ fn fetchLegacyHttpToolCatalog(
     cancel_flag: ?*std.atomic.Value(bool),
     access: tool_mcp_runtime.Access,
 ) !tools_feature.Catalog {
-    var builder = tools_feature.CatalogBuilder.init(alloc, .legacy);
-    defer builder.deinit(alloc);
-    var cursor: ?[]u8 = null;
-    defer if (cursor) |value| alloc.free(value);
-    while (true) {
-        try reauthorizeOperation(
-            server.runtime.?,
-            access,
-            .{ .tool_server = server.config.name },
-        );
-        const request_id = try reserveHttpRequestId(server);
-        const request = try buildToolsListRequest(alloc, request_id, .legacy, cursor);
-        defer alloc.free(request);
-        var guard = ServerAccessPrecommit{
-            .runtime = server.runtime.?,
-            .target = .{ .tool_server = server.config.name },
-            .access = access,
-        };
-        var precommit = guard.transport();
-        const response = try client.request(alloc, .{
-            .request_id = request_id,
-            .request_body = request,
-            .max_response_bytes = mcp_discovery_response_frame_cap_bytes,
-            .max_event_bytes = mcp_discovery_response_frame_cap_bytes,
-            .precommit = &precommit,
-            .control = .{
-                .deadline = deadline,
-                .cancel_flag = cancel_flag,
-                .lifecycle_cancel_flag = lifecycleCancelFlag(server),
-            },
-        });
-        const received_at_ms = clockMillis();
-        defer alloc.free(response);
-        var page = try tools_feature.parseListPage(alloc, response, .legacy, .{});
-        defer page.deinit(alloc);
-        try replaceOwnedCursor(alloc, &cursor, page.next_cursor);
-        try builder.appendPage(alloc, &page, received_at_ms, .{});
-        if (cursor == null) return builder.finish(alloc);
-    }
+    const fetched = try fetch_tool_catalog_pages(
+        alloc,
+        server.runtime.?,
+        server,
+        .{ .legacy_http = client },
+        deadline,
+        cancel_flag,
+        access,
+    );
+    return fetched.catalog;
 }
 
 fn fetchLegacySseToolCatalog(
@@ -8893,45 +8999,16 @@ fn fetchLegacySseToolCatalog(
     cancel_flag: ?*std.atomic.Value(bool),
     access: tool_mcp_runtime.Access,
 ) !tools_feature.Catalog {
-    var builder = tools_feature.CatalogBuilder.init(alloc, .legacy);
-    defer builder.deinit(alloc);
-    var cursor: ?[]u8 = null;
-    defer if (cursor) |value| alloc.free(value);
-    while (true) {
-        try reauthorizeOperation(
-            server.runtime.?,
-            access,
-            .{ .tool_server = server.config.name },
-        );
-        const request_id = try reserveHttpRequestId(server);
-        const request = try buildToolsListRequest(alloc, request_id, .legacy, cursor);
-        defer alloc.free(request);
-        var guard = ServerAccessPrecommit{
-            .runtime = server.runtime.?,
-            .target = .{ .tool_server = server.config.name },
-            .access = access,
-        };
-        var precommit = guard.transport();
-        const response = try client.request(
-            alloc,
-            request_id,
-            request,
-            mcp_discovery_response_frame_cap_bytes,
-            .{
-                .deadline = deadline,
-                .cancel_flag = cancel_flag,
-                .lifecycle_cancel_flag = lifecycleCancelFlag(server),
-                .precommit = &precommit,
-            },
-        );
-        const received_at_ms = clockMillis();
-        defer alloc.free(response);
-        var page = try tools_feature.parseListPage(alloc, response, .legacy, .{});
-        defer page.deinit(alloc);
-        try replaceOwnedCursor(alloc, &cursor, page.next_cursor);
-        try builder.appendPage(alloc, &page, received_at_ms, .{});
-        if (cursor == null) return builder.finish(alloc);
-    }
+    const fetched = try fetch_tool_catalog_pages(
+        alloc,
+        server.runtime.?,
+        server,
+        .{ .legacy_sse = client },
+        deadline,
+        cancel_flag,
+        access,
+    );
+    return fetched.catalog;
 }
 
 fn renderAuthenticationRequired(
@@ -10571,13 +10648,11 @@ fn discoverServerTools(
     control: ConnectionControl,
 ) !void {
     const dispatcher = server.dispatcher orelse return error.McpConnectionClosed;
-    var builder = tools_feature.CatalogBuilder.init(alloc, featureProtocol(protocol));
-    defer builder.deinit(alloc);
-    var cursor: ?[]u8 = null;
-    defer if (cursor) |value| alloc.free(value);
+    var pages = ToolCatalogPages.init(alloc, featureProtocol(protocol));
+    defer pages.deinit(alloc);
     while (true) {
         const request_id = try dispatcher.reserveRequestId();
-        const tools_request = try buildToolsListRequest(alloc, request_id, protocol, cursor);
+        const tools_request = try buildToolsListRequest(alloc, request_id, protocol, pages.cursor);
         defer alloc.free(tools_request);
         const tools_response = dispatcher.request(
             alloc,
@@ -10600,14 +10675,14 @@ fn discoverServerTools(
         };
         const received_at_ms = clockMillis();
         defer alloc.free(tools_response);
-        var page = try tools_feature.parseListPage(alloc, tools_response, featureProtocol(protocol), .{});
-        defer page.deinit(alloc);
-        if (cursor) |value| alloc.free(value);
-        cursor = if (page.next_cursor) |value| try alloc.dupe(u8, value) else null;
-        try builder.appendPage(alloc, &page, received_at_ms, .{});
-        if (cursor == null) break;
+        if (try pages.append_response(
+            alloc,
+            tools_response,
+            received_at_ms,
+            .release_before_alloc,
+        )) break;
     }
-    var catalog = try builder.finish(alloc);
+    var catalog = try pages.finish(alloc);
     defer catalog.deinit(alloc);
     try storeProtocolTools(alloc, server, tool_registry, catalog, used_tool_names, protocol, null);
     try startToolSubscription(alloc, server, control);
@@ -12816,15 +12891,13 @@ fn connectServerLegacyHttp(
         return err;
     };
 
-    var builder = tools_feature.CatalogBuilder.init(alloc, .legacy);
-    defer builder.deinit(alloc);
-    var cursor: ?[]u8 = null;
-    defer if (cursor) |value| alloc.free(value);
+    var pages = ToolCatalogPages.init(alloc, .legacy);
+    defer pages.deinit(alloc);
     while (true) {
         const tools_id = next_request_id.*;
         next_request_id.* = std.math.add(u64, tools_id, 1) catch
             return error.McpRequestIdExhausted;
-        const tools_request = try buildToolsListRequest(alloc, tools_id, .legacy, cursor);
+        const tools_request = try buildToolsListRequest(alloc, tools_id, .legacy, pages.cursor);
         defer alloc.free(tools_request);
         const tools_response = initialized.client.request(alloc, .{
             .request_id = tools_id,
@@ -12853,14 +12926,14 @@ fn connectServerLegacyHttp(
         };
         const received_at_ms = clockMillis();
         defer alloc.free(tools_response);
-        var page = try tools_feature.parseListPage(alloc, tools_response, .legacy, .{});
-        defer page.deinit(alloc);
-        if (cursor) |value| alloc.free(value);
-        cursor = if (page.next_cursor) |value| try alloc.dupe(u8, value) else null;
-        try builder.appendPage(alloc, &page, received_at_ms, .{});
-        if (cursor == null) break;
+        if (try pages.append_response(
+            alloc,
+            tools_response,
+            received_at_ms,
+            .release_before_alloc,
+        )) break;
     }
-    var catalog = try builder.finish(alloc);
+    var catalog = try pages.finish(alloc);
     defer catalog.deinit(alloc);
     try storeProtocolTools(alloc, server, tool_registry, catalog, used_tool_names, .legacy, null);
 
@@ -14230,15 +14303,13 @@ fn connectServerSse(
         return err;
     };
 
-    var builder = tools_feature.CatalogBuilder.init(alloc, .legacy);
-    defer builder.deinit(alloc);
-    var cursor: ?[]u8 = null;
-    defer if (cursor) |value| alloc.free(value);
+    var pages = ToolCatalogPages.init(alloc, .legacy);
+    defer pages.deinit(alloc);
     while (true) {
         const tools_id = next_request_id;
         next_request_id = std.math.add(u64, tools_id, 1) catch
             return error.McpRequestIdExhausted;
-        const tools_request = try buildToolsListRequest(alloc, tools_id, .legacy, cursor);
+        const tools_request = try buildToolsListRequest(alloc, tools_id, .legacy, pages.cursor);
         defer alloc.free(tools_request);
         const tools_response = client.request(
             alloc,
@@ -14267,14 +14338,14 @@ fn connectServerSse(
         };
         const received_at_ms = clockMillis();
         defer alloc.free(tools_response);
-        var page = try tools_feature.parseListPage(alloc, tools_response, .legacy, .{});
-        defer page.deinit(alloc);
-        if (cursor) |value| alloc.free(value);
-        cursor = if (page.next_cursor) |value| try alloc.dupe(u8, value) else null;
-        try builder.appendPage(alloc, &page, received_at_ms, .{});
-        if (cursor == null) break;
+        if (try pages.append_response(
+            alloc,
+            tools_response,
+            received_at_ms,
+            .release_before_alloc,
+        )) break;
     }
-    var catalog = try builder.finish(alloc);
+    var catalog = try pages.finish(alloc);
     defer catalog.deinit(alloc);
     try storeProtocolTools(alloc, server, tool_registry, catalog, used_tool_names, .legacy, null);
 
