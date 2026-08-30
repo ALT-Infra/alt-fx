@@ -5359,6 +5359,7 @@ test {
     _ = @import("gateway/xai_grok_models.zig");
     _ = @import("gateway/xai_grok.zig");
     _ = @import("gateway/xai_grok_permission_reviewer.zig");
+    _ = @import("gateway/models_dev.zig");
     _ = @import("gateway/opencode_models.zig");
     _ = @import("gateway/opencode.zig");
     _ = @import("gateway/cline_models.zig");

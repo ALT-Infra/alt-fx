@@ -3,9 +3,11 @@ const model_catalog = @import("../core/gateway/model_catalog.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
 const gateway_client = @import("client.zig");
+const models_dev = @import("models_dev.zig");
 
 const catalog_endpoint = "https://api.cline.bot/api/v1/ai/cline/recommended-models";
 const e2e_catalog_endpoint_env = "FX_E2E_CLINE_MODELS_URL";
+const e2e_protocol_metadata_endpoint_env = "FX_E2E_CLINE_PROTOCOL_METADATA_URL";
 const max_catalog_bytes: usize = 2 * 1024 * 1024;
 const max_models: usize = 4096;
 const max_model_id_bytes: usize = 256;
@@ -63,13 +65,29 @@ fn fetchCatalogForProvider(
         return .{ .failure = catalogFetchFailure(err) };
     };
     defer alloc.free(body);
+    const protocol_metadata_body: ?[]u8 = blk: {
+        const fetched = models_dev.fetchBody(
+            alloc,
+            e2e_protocol_metadata_endpoint_env,
+            cancel_flag,
+            deadline,
+        ) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            if (err == error.Cancelled) {
+                return .{ .failure = .{ .category = .cancellation } };
+            }
+            break :blk null;
+        };
+        break :blk fetched;
+    };
+    defer if (protocol_metadata_body) |metadata_body| alloc.free(metadata_body);
     // Cline publishes the free and ClinePass routes in one public catalog.
     // Authentication—not `/users/me/plan`—is the boundary for exposing the
     // metered routes. A signed-in account may use ClinePass, account balance,
     // or another server-side entitlement, and the chat endpoint remains the
     // authority that admits and charges the selected route.
     const include_cline_pass = input.access.authorizationCredential() != null;
-    const catalog = parseCatalog(alloc, body, include_cline_pass) catch |err| {
+    const catalog = parseCatalog(alloc, body, protocol_metadata_body, include_cline_pass) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = .{ .category = .malformed_response, .http_status = .ok } };
     };
@@ -154,16 +172,35 @@ fn fetchPublicBody(
 fn parseCatalog(
     alloc: std.mem.Allocator,
     body: []const u8,
+    protocol_metadata_json: ?[]const u8,
     include_cline_pass: bool,
 ) !std.ArrayList(model_catalog.ModelCatalogEntry) {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidClineModelCatalog;
 
+    var parsed_protocol_metadata: ?std.json.Parsed(std.json.Value) = null;
+    if (protocol_metadata_json) |metadata_json| {
+        parsed_protocol_metadata = std.json.parseFromSlice(
+            std.json.Value,
+            alloc,
+            metadata_json,
+            .{},
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => null,
+        };
+    }
+    defer if (parsed_protocol_metadata) |*metadata| metadata.deinit();
+    const protocol_models = if (parsed_protocol_metadata) |*metadata|
+        models_dev.providerModels(metadata.value, "openrouter")
+    else
+        null;
+
     var catalog: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
     errdefer model_catalog.freeModelCatalog(alloc, &catalog);
-    if (parsed.value.object.get("free")) |free| try appendTier(alloc, &catalog, free);
-    if (include_cline_pass) if (parsed.value.object.get("clinePass")) |cline_pass| try appendTier(alloc, &catalog, cline_pass);
+    if (parsed.value.object.get("free")) |free| try appendTier(alloc, &catalog, free, protocol_models);
+    if (include_cline_pass) if (parsed.value.object.get("clinePass")) |cline_pass| try appendTier(alloc, &catalog, cline_pass, protocol_models);
     if (catalog.items.len == 0) return error.InvalidClineModelCatalog;
     return catalog;
 }
@@ -172,6 +209,7 @@ fn appendTier(
     alloc: std.mem.Allocator,
     catalog: *std.ArrayList(model_catalog.ModelCatalogEntry),
     tier: std.json.Value,
+    protocol_models: ?std.json.ObjectMap,
 ) !void {
     if (tier != .array) return error.InvalidClineModelCatalog;
     for (tier.array.items) |value| {
@@ -179,6 +217,12 @@ fn appendTier(
         const id = stringField(value.object, "id") orelse continue;
         if (!validModelId(id) or containsModel(catalog.items, id)) continue;
         if (catalog.items.len >= max_models) return error.ClineModelCatalogTooLarge;
+        const protocol_model = if (protocol_models) |models|
+            models_dev.findExactOrUniqueSlugModel(models, id)
+        else
+            null;
+        var reasoning = try models_dev.parseReasoningMetadata(alloc, protocol_model);
+        defer reasoning.deinit(alloc);
         const owned_id = try alloc.dupe(u8, id);
         errdefer alloc.free(owned_id);
         const model_type = try alloc.dupe(u8, "language");
@@ -187,7 +231,10 @@ fn appendTier(
             .id = owned_id,
             .model_type = model_type,
             .has_tool_use = true,
+            .has_reasoning = reasoning.has_reasoning,
+            .reasoning_efforts = reasoning.efforts,
         });
+        reasoning.efforts = .empty;
     }
 }
 
@@ -222,12 +269,21 @@ test "Cline catalog exposes live free and ClinePass tiers without frozen IDs" {
     const fixture =
         "{\"free\":[{\"id\":\"future/free-model\"},{\"id\":\"shared/model\"}]," ++
         "\"clinePass\":[{\"id\":\"cline-pass/future-model\"},{\"id\":\"shared/model\"}]}";
-    var catalog = try parseCatalog(std.testing.allocator, fixture, true);
+    const protocols =
+        \\{"openrouter":{"models":{
+        \\  "vendor/free-model":{"reasoning_options":[{"type":"effort","values":["low","high"]}]},
+        \\  "cline-pass/future-model":{"reasoning":true,"reasoning_options":[{"type":"effort","values":["max"]}]}
+        \\}}}
+    ;
+    var catalog = try parseCatalog(std.testing.allocator, fixture, protocols, true);
     defer model_catalog.freeModelCatalog(std.testing.allocator, &catalog);
     try std.testing.expectEqual(@as(usize, 3), catalog.items.len);
     try std.testing.expectEqualStrings("future/free-model", catalog.items[0].id);
     try std.testing.expectEqualStrings("cline-pass/future-model", catalog.items[2].id);
     for (catalog.items) |entry| try std.testing.expect(entry.has_tool_use);
+    try std.testing.expectEqualStrings("low", catalog.items[0].reasoning_efforts.items[0].label());
+    try std.testing.expectEqualStrings("high", catalog.items[0].reasoning_efforts.items[1].label());
+    try std.testing.expectEqualStrings("max", catalog.items[2].reasoning_efforts.items[0].label());
 }
 
 test "Cline model fallback prefers the live feed order" {
@@ -238,11 +294,24 @@ test "Cline model fallback prefers the live feed order" {
 }
 
 test "Cline catalog tolerates either requested tier being temporarily absent" {
-    var free_only = try parseCatalog(std.testing.allocator, "{\"free\":[{\"id\":\"free/new\"}]}", false);
+    var free_only = try parseCatalog(std.testing.allocator, "{\"free\":[{\"id\":\"free/new\"}]}", null, false);
     defer model_catalog.freeModelCatalog(std.testing.allocator, &free_only);
     try std.testing.expectEqual(@as(usize, 1), free_only.items.len);
 
-    var pass_only = try parseCatalog(std.testing.allocator, "{\"clinePass\":[{\"id\":\"cline-pass/new\"}]}", true);
+    var pass_only = try parseCatalog(std.testing.allocator, "{\"clinePass\":[{\"id\":\"cline-pass/new\"}]}", null, true);
     defer model_catalog.freeModelCatalog(std.testing.allocator, &pass_only);
     try std.testing.expectEqual(@as(usize, 1), pass_only.items.len);
+}
+
+test "Cline catalog keeps models when reasoning metadata is unavailable or malformed" {
+    const fixture = "{\"free\":[{\"id\":\"cline-free/new\"}]}";
+    var unavailable = try parseCatalog(std.testing.allocator, fixture, null, false);
+    defer model_catalog.freeModelCatalog(std.testing.allocator, &unavailable);
+    try std.testing.expectEqual(@as(usize, 1), unavailable.items.len);
+    try std.testing.expectEqual(@as(usize, 0), unavailable.items[0].reasoning_efforts.items.len);
+
+    var malformed = try parseCatalog(std.testing.allocator, fixture, "not json", false);
+    defer model_catalog.freeModelCatalog(std.testing.allocator, &malformed);
+    try std.testing.expectEqual(@as(usize, 1), malformed.items.len);
+    try std.testing.expectEqual(@as(usize, 0), malformed.items[0].reasoning_efforts.items.len);
 }
