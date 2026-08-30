@@ -5203,7 +5203,11 @@ fn processQueuedPromptLoop(
                         .{
                             .tool_name = "vision",
                             .message = runtime_vision_contracts.native_route_unavailable_message,
-                            .suggestion = "Continue without Vision.",
+                            .suggestion = if (request_capabilities.image_input_support == .native or
+                                (request_capabilities.image_input_support == .unknown and job.provider != .gateway))
+                                "Continue using the model's native image input without Vision."
+                            else
+                                "Continue without Vision.",
                         },
                     ),
                     .kind = .route_unavailable,
