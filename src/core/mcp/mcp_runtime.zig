@@ -726,28 +726,21 @@ fn fetchResources(self: *McpRuntime, server: *McpServer, deadline: std.Io.Clock.
     defer if (cursor) |value| self.alloc.free(value);
     var producing_identity: ?feature_cache.Digest = null;
     while (true) {
-        try reauthorizeOperation(
+        var exchange = try requestFeatureCatalogPage(
             self,
+            server,
+            .resources,
+            cursor,
+            deadline,
+            cancel_flag,
             access,
-            .{ .feature_server = server.config.name },
         );
-        const request_id = try nextFeatureRequestId(server);
-        const request = try resources_feature.buildListRequest(self.alloc, request_id, serverFeatureProtocol(server), cursor, writeModernRequestMetadata);
-        defer self.alloc.free(request);
-        var guard = ServerAccessPrecommit{
-            .runtime = self,
-            .target = .{ .feature_server = server.config.name },
-            .access = access,
-        };
-        var precommit = guard.transport();
-        var response = try sendFeatureRequest(self, server, request_id, request, deadline, cancel_flag, access, &precommit, null);
-        const received_at_ms = clockMillis();
-        defer response.deinit(self.alloc);
-        try acceptPageIdentity(&producing_identity, response.auth_identity);
-        var page = try resources_feature.parseResourcePage(self.alloc, response.body, serverFeatureProtocol(server), .{});
+        defer exchange.response.deinit(self.alloc);
+        try acceptPageIdentity(&producing_identity, exchange.response.auth_identity);
+        var page = try resources_feature.parseResourcePage(self.alloc, exchange.response.body, serverFeatureProtocol(server), .{});
         defer page.deinit(self.alloc);
         try replaceOwnedCursor(self.alloc, &cursor, page.next_cursor);
-        try builder.appendPage(self.alloc, &page, received_at_ms, .{});
+        try builder.appendPage(self.alloc, &page, exchange.received_at_ms, .{});
         if (cursor == null) return .{ .catalog = try builder.finish(self.alloc), .auth_identity = producing_identity };
     }
 }
@@ -759,28 +752,21 @@ fn fetchResourceTemplates(self: *McpRuntime, server: *McpServer, deadline: std.I
     defer if (cursor) |value| self.alloc.free(value);
     var producing_identity: ?feature_cache.Digest = null;
     while (true) {
-        try reauthorizeOperation(
+        var exchange = try requestFeatureCatalogPage(
             self,
+            server,
+            .resource_templates,
+            cursor,
+            deadline,
+            cancel_flag,
             access,
-            .{ .feature_server = server.config.name },
         );
-        const request_id = try nextFeatureRequestId(server);
-        const request = try resources_feature.buildTemplatesListRequest(self.alloc, request_id, serverFeatureProtocol(server), cursor, writeModernRequestMetadata);
-        defer self.alloc.free(request);
-        var guard = ServerAccessPrecommit{
-            .runtime = self,
-            .target = .{ .feature_server = server.config.name },
-            .access = access,
-        };
-        var precommit = guard.transport();
-        var response = try sendFeatureRequest(self, server, request_id, request, deadline, cancel_flag, access, &precommit, null);
-        const received_at_ms = clockMillis();
-        defer response.deinit(self.alloc);
-        try acceptPageIdentity(&producing_identity, response.auth_identity);
-        var page = try resources_feature.parseTemplatePage(self.alloc, response.body, serverFeatureProtocol(server), .{});
+        defer exchange.response.deinit(self.alloc);
+        try acceptPageIdentity(&producing_identity, exchange.response.auth_identity);
+        var page = try resources_feature.parseTemplatePage(self.alloc, exchange.response.body, serverFeatureProtocol(server), .{});
         defer page.deinit(self.alloc);
         try replaceOwnedCursor(self.alloc, &cursor, page.next_cursor);
-        try builder.appendPage(self.alloc, &page, received_at_ms, .{});
+        try builder.appendPage(self.alloc, &page, exchange.received_at_ms, .{});
         if (cursor == null) return .{ .catalog = try builder.finish(self.alloc), .auth_identity = producing_identity };
     }
 }
@@ -792,28 +778,21 @@ fn fetchPrompts(self: *McpRuntime, server: *McpServer, deadline: std.Io.Clock.Ti
     defer if (cursor) |value| self.alloc.free(value);
     var producing_identity: ?feature_cache.Digest = null;
     while (true) {
-        try reauthorizeOperation(
+        var exchange = try requestFeatureCatalogPage(
             self,
+            server,
+            .prompts,
+            cursor,
+            deadline,
+            cancel_flag,
             access,
-            .{ .feature_server = server.config.name },
         );
-        const request_id = try nextFeatureRequestId(server);
-        const request = try prompts_feature.buildListRequest(self.alloc, request_id, serverFeatureProtocol(server), cursor, writeModernRequestMetadata);
-        defer self.alloc.free(request);
-        var guard = ServerAccessPrecommit{
-            .runtime = self,
-            .target = .{ .feature_server = server.config.name },
-            .access = access,
-        };
-        var precommit = guard.transport();
-        var response = try sendFeatureRequest(self, server, request_id, request, deadline, cancel_flag, access, &precommit, null);
-        const received_at_ms = clockMillis();
-        defer response.deinit(self.alloc);
-        try acceptPageIdentity(&producing_identity, response.auth_identity);
-        var page = try prompts_feature.parseListPage(self.alloc, response.body, serverFeatureProtocol(server), .{});
+        defer exchange.response.deinit(self.alloc);
+        try acceptPageIdentity(&producing_identity, exchange.response.auth_identity);
+        var page = try prompts_feature.parseListPage(self.alloc, exchange.response.body, serverFeatureProtocol(server), .{});
         defer page.deinit(self.alloc);
         try replaceOwnedCursor(self.alloc, &cursor, page.next_cursor);
-        try builder.appendPage(self.alloc, &page, received_at_ms, .{});
+        try builder.appendPage(self.alloc, &page, exchange.received_at_ms, .{});
         if (cursor == null) return .{ .catalog = try builder.finish(self.alloc), .auth_identity = producing_identity };
     }
 }
@@ -859,6 +838,73 @@ const FeatureResponse = struct {
         self.* = undefined;
     }
 };
+
+const FeatureCatalogPageResponse = struct {
+    response: FeatureResponse,
+    received_at_ms: u64,
+};
+
+fn requestFeatureCatalogPage(
+    self: *McpRuntime,
+    server: *McpServer,
+    kind: FeatureCatalogKind,
+    cursor: ?[]const u8,
+    deadline: std.Io.Clock.Timestamp,
+    cancel_flag: ?*std.atomic.Value(bool),
+    access: tool_mcp_runtime.Access,
+) !FeatureCatalogPageResponse {
+    try reauthorizeOperation(
+        self,
+        access,
+        .{ .feature_server = server.config.name },
+    );
+    const request_id = try nextFeatureRequestId(server);
+    const protocol = serverFeatureProtocol(server);
+    const request = switch (kind) {
+        .resources => try resources_feature.buildListRequest(
+            self.alloc,
+            request_id,
+            protocol,
+            cursor,
+            writeModernRequestMetadata,
+        ),
+        .resource_templates => try resources_feature.buildTemplatesListRequest(
+            self.alloc,
+            request_id,
+            protocol,
+            cursor,
+            writeModernRequestMetadata,
+        ),
+        .prompts => try prompts_feature.buildListRequest(
+            self.alloc,
+            request_id,
+            protocol,
+            cursor,
+            writeModernRequestMetadata,
+        ),
+    };
+    defer self.alloc.free(request);
+    var guard = ServerAccessPrecommit{
+        .runtime = self,
+        .target = .{ .feature_server = server.config.name },
+        .access = access,
+    };
+    var precommit = guard.transport();
+    return .{
+        .response = try sendFeatureRequest(
+            self,
+            server,
+            request_id,
+            request,
+            deadline,
+            cancel_flag,
+            access,
+            &precommit,
+            null,
+        ),
+        .received_at_ms = clockMillis(),
+    };
+}
 
 const LegacyElicitationSpec = struct {
     responder: ?tool_mcp_runtime.InputResponder,
