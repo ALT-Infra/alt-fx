@@ -307,6 +307,7 @@ pub const RenderContext = struct {
     writing_response: bool = false,
     has_api_key: bool,
     model: []const u8,
+    identity_label: ?[]const u8 = null,
     pending_images: []const types.ImageAttachment = &.{},
     composer_visible: bool = true,
     permission_mode: types.PermissionMode = .ask,

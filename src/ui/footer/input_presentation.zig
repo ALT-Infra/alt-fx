@@ -404,7 +404,7 @@ pub fn composeHintRow(
         null;
     var hint_buf: [max_status_line_len]u8 = undefined;
     var hint_with_subagents_buf: [max_status_line_len + 128]u8 = undefined;
-    const base_hint_line = ui_render.buildHintLine(
+    const base_hint_line = ui_render.buildHintLineWithIdentity(
         ctx.stream.active,
         approval_active,
         ctx.has_api_key or (ctx.auth_picker.active and ctx.auth_picker.include_skip),
@@ -417,6 +417,7 @@ pub fn composeHintRow(
         ctx.effort,
         ctx.model_supports_effort,
         ctx.statusline,
+        ctx.identity_label,
         width,
         &hint_buf,
     );

@@ -30,10 +30,17 @@ pub const DefinitionMetadata = struct {
     revision: u32,
     digest: [64]u8,
     name: []u8,
+    /// Optional extension-owned identity for the active footer. The host does
+    /// not interpret these values; it only substitutes them for its dormant
+    /// native permission/model identity while orchestration is active.
+    entry_role_label: ?[]u8 = null,
+    entry_model_label: ?[]u8 = null,
 
     pub fn deinit(self: *DefinitionMetadata, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
         allocator.free(self.name);
+        if (self.entry_role_label) |label| allocator.free(label);
+        if (self.entry_model_label) |label| allocator.free(label);
         self.* = undefined;
     }
 };

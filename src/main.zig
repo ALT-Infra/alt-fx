@@ -1369,6 +1369,20 @@ const App = struct {
         return SessionAppRuntime.activeSessionId(self) orelse "";
     }
 
+    pub fn orchestrationFooterRole(self: *const App) ?[]const u8 {
+        if (comptime !build_options.orchestration_enabled) return null;
+        if (!self.orchestration.active) return null;
+        const metadata = self.orchestration.definition_metadata orelse return null;
+        return metadata.entry_role_label;
+    }
+
+    pub fn orchestrationFooterModel(self: *const App) ?[]const u8 {
+        if (comptime !build_options.orchestration_enabled) return null;
+        if (!self.orchestration.active) return null;
+        const metadata = self.orchestration.definition_metadata orelse return null;
+        return metadata.entry_model_label;
+    }
+
     pub fn restoreOrchestrationForSession(self: *App, session_id: []const u8) !void {
         if (comptime !build_options.orchestration_enabled) return;
         try OrchestrationDefinitionAppRuntime.restoreForSession(self, session_id);

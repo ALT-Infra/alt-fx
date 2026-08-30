@@ -1,7 +1,19 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const chat_completions = @import("openai_chat_completions.zig");
 
 const endpoint = "https://api.cline.bot/api/v1/chat/completions";
+const client_version = build_options.app_version;
+const request_headers = [_]std.http.Header{
+    .{ .name = "HTTP-Referer", .value = "https://cline.bot" },
+    .{ .name = "X-Title", .value = "Cline" },
+    .{ .name = "X-IS-MULTIROOT", .value = "false" },
+    .{ .name = "X-CLIENT-TYPE", .value = "fx" },
+    .{ .name = "X-CLIENT-VERSION", .value = client_version },
+    .{ .name = "X-PLATFORM", .value = "cli" },
+    .{ .name = "X-PLATFORM-VERSION", .value = client_version },
+    .{ .name = "X-CORE-VERSION", .value = client_version },
+};
 
 fn route(model: []const u8) chat_completions.Route {
     return .{ .endpoint = endpoint, .wire_model = model };
@@ -39,6 +51,9 @@ const spec = chat_completions.Spec{
     .e2e_endpoint_env = "FX_E2E_CLINE_CHAT_URL",
     .resolve_route = route,
     .uses_max_completion_tokens = usesMaxCompletionTokens,
+    .extra_headers = &request_headers,
+    .user_agent = "Cline/" ++ client_version,
+    .session_header_name = "X-Task-ID",
 };
 
 pub const agent_stream_provider = chat_completions.provider(&spec);
