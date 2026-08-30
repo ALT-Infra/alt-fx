@@ -488,6 +488,20 @@ pub fn Runtime(comptime host: type) type {
                 session.current_agent_id,
                 "",
             ));
+            // The first accepted run proves that the user's turn crossed the
+            // host boundary. Later leader runs already have a visible cause
+            // (handoff, Team return, steering, or protocol recovery), so do
+            // not repeat a generic activity line for those continuations.
+            if (session.current_turn == 1) {
+                try self.emitRoleActivity(
+                    sink,
+                    session.current_agent_id,
+                    if (std.mem.eql(u8, session.current_agent_id, self.team.primary.id))
+                        "primary working"
+                    else
+                        "leader working",
+                );
+            }
         }
 
         fn completeAgentRun(
@@ -1315,6 +1329,11 @@ pub fn Runtime(comptime host: type) type {
                     .{evidence.written()},
                 );
                 defer self.allocator.free(correction);
+                try self.emitRoleActivity(
+                    sink,
+                    frame.agent_id,
+                    "correcting consultation response format",
+                );
                 try self.startConsultationRun(frame_index, correction, sink);
                 return;
             }
@@ -1662,6 +1681,11 @@ pub fn Runtime(comptime host: type) type {
                 .{evidence.written()},
             );
             defer self.allocator.free(correction);
+            try self.emitRoleActivity(
+                sink,
+                agent_id,
+                "correcting response format",
+            );
             try self.startAgentRun(
                 agent_id,
                 .{ .leader = .{ .agent_id = agent_id } },
@@ -1910,6 +1934,26 @@ pub fn Runtime(comptime host: type) type {
             defer self.allocator.free(text);
             try sink.emit(.{ .notice = .{
                 .tone = tone,
+                .text = text,
+            } });
+        }
+
+        fn emitRoleActivity(
+            self: *Self,
+            sink: host.IntentSink,
+            role_id: []const u8,
+            action: []const u8,
+        ) !void {
+            const model = try self.modelLabel(role_id);
+            defer self.allocator.free(model);
+            const text = try std.fmt.allocPrint(
+                self.allocator,
+                "{s} · {s}.",
+                .{ model, action },
+            );
+            defer self.allocator.free(text);
+            try sink.emit(.{ .notice = .{
+                .tone = .info,
                 .text = text,
             } });
         }
@@ -2368,6 +2412,9 @@ test "one user turn can hand leadership to a peer and publish that peer answer" 
         answer_agent_len: usize = 0,
         handoff_notice: [128]u8 = undefined,
         handoff_notice_len: usize = 0,
+        leader_activity: [1][128]u8 = undefined,
+        leader_activity_lens: [1]usize = .{0},
+        leader_activity_count: usize = 0,
 
         fn copyInto(destination: []u8, source: []const u8) usize {
             const len = @min(destination.len, source.len);
@@ -2422,6 +2469,15 @@ test "one user turn can hand leadership to a peer and publish that peer answer" 
                     if (std.mem.find(u8, notice.text, "leadership handed off") != null) {
                         self.handoff_notice_len = copyInto(&self.handoff_notice, notice.text);
                     }
+                    if (std.mem.endsWith(u8, notice.text, "working.")) {
+                        const index = self.leader_activity_count;
+                        if (index >= self.leader_activity.len) return error.TooManyLeaderActivities;
+                        self.leader_activity_lens[index] = copyInto(
+                            &self.leader_activity[index],
+                            notice.text,
+                        );
+                        self.leader_activity_count += 1;
+                    }
                 },
                 .mode_entered, .mode_left, .cancel_agent_run, .turn_failed => {},
             }
@@ -2445,6 +2501,10 @@ test "one user turn can hand leadership to a peer and publish that peer answer" 
 
         fn traceRun(self: *@This(), index: usize) []const u8 {
             return self.trace_runs[index][0..self.trace_run_lens[index]];
+        }
+
+        fn leaderActivity(self: *@This(), index: usize) []const u8 {
+            return self.leader_activity[index][0..self.leader_activity_lens[index]];
         }
     };
 
@@ -2476,6 +2536,10 @@ test "one user turn can hand leadership to a peer and publish that peer answer" 
     const primary_run_id = try std.testing.allocator.dupe(u8, capture.runId(0));
     defer std.testing.allocator.free(primary_run_id);
     try runtime.dispatch(.{ .agent_run_started = .{ .run_id = primary_run_id } }, sink);
+    try std.testing.expectEqualStrings(
+        "free/deepseek-code · primary working.",
+        capture.leaderActivity(0),
+    );
     try runtime.dispatch(.{ .agent_run_completed = .{
         .run_id = primary_run_id,
         .output = "{\"kind\":\"handoff\",\"peer_id\":\"researcher\",\"reason\":\"Evidence is the deliverable\"}",
@@ -2493,6 +2557,7 @@ test "one user turn can hand leadership to a peer and publish that peer answer" 
     const peer_run_id = try std.testing.allocator.dupe(u8, capture.runId(1));
     defer std.testing.allocator.free(peer_run_id);
     try runtime.dispatch(.{ .agent_run_started = .{ .run_id = peer_run_id } }, sink);
+    try std.testing.expectEqual(@as(usize, 1), capture.leader_activity_count);
     try runtime.dispatch(.{ .agent_run_completed = .{
         .run_id = peer_run_id,
         .output = "{\"kind\":\"answer\",\"answer\":\"The audited answer.\"}",
@@ -3198,6 +3263,7 @@ test "invalid model control output fails visibly without escaping dispatch" {
         rejected_trace: bool = false,
         correction_requested: bool = false,
         correction_preserved_evidence: bool = false,
+        correction_notice: bool = false,
         turn_failed: bool = false,
 
         fn emit(context: *anyopaque, intent: test_host.Intent) !void {
@@ -3215,7 +3281,15 @@ test "invalid model control output fails visibly without escaping dispatch" {
                         .projected => {},
                     }
                 },
-                .notice => |notice| self.failed_notice = notice.tone == .failure,
+                .notice => |notice| {
+                    self.failed_notice = self.failed_notice or notice.tone == .failure;
+                    self.correction_notice = self.correction_notice or
+                        std.mem.eql(
+                            u8,
+                            notice.text,
+                            "free/deepseek-code · correcting response format.",
+                        );
+                },
                 .trace => |record| {
                     self.rejected_trace = self.rejected_trace or
                         std.mem.eql(u8, record.event, "agent_protocol_rejected");
@@ -3261,6 +3335,7 @@ test "invalid model control output fails visibly without escaping dispatch" {
     }
     try std.testing.expect(capture.correction_requested);
     try std.testing.expect(capture.correction_preserved_evidence);
+    try std.testing.expect(capture.correction_notice);
     try std.testing.expect(capture.failed_notice);
     try std.testing.expect(capture.rejected_trace);
     try std.testing.expect(capture.turn_failed);
