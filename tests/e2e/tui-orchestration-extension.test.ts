@@ -19,6 +19,7 @@ const SKIP = !ENABLED || !tmuxAvailable();
 const TIMEOUT = 30_000;
 const STEERING_MARKER = "CRUCIBLE_ALT_STEERING_DONE_D4C7";
 const STEERING_FOLLOWUP_MARKER = "CRUCIBLE_ALT_STEERING_MEMORY_8A21";
+const QUEUE_FIRST_MARKER = "CRUCIBLE_ALT_QUEUE_FIRST_17C9";
 const CORRECTION_MARKER = "CRUCIBLE_ALT_CORRECTION_DONE_31B9";
 const CONTINUITY_MARKER = "CRUCIBLE_ALT_CONTEXT_SURFACE_DONE_5E72";
 const CONTINUITY_FILE_SENTINEL = "EXACT_PRE_CONSULTATION_TOOL_EVIDENCE_C82D";
@@ -92,6 +93,11 @@ async function enterSeededAlt(active: TmuxSession) {
   await active.waitForComposer(5_000);
 }
 
+async function sendSteering(active: TmuxSession, text: string) {
+  await active.sendLiteral(text);
+  await active.sendLiteral("\x1b[13;5u");
+}
+
 async function waitForFileText(
   path: string,
   expected: string,
@@ -127,6 +133,7 @@ function startHeldOpenCodeSteeringServer() {
   const encoder = new TextEncoder();
   const requestBodies: string[] = [];
   let heldTimer: ReturnType<typeof setInterval> | null = null;
+  let heldController: ReadableStreamDefaultController<Uint8Array> | null = null;
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
@@ -138,6 +145,7 @@ function startHeldOpenCodeSteeringServer() {
         return new Response(
           new ReadableStream<Uint8Array>({
             start(controller) {
+              heldController = controller;
               const keepAlive = () => controller.enqueue(encoder.encode(": held\n\n"));
               keepAlive();
               heldTimer = setInterval(keepAlive, 50);
@@ -145,6 +153,7 @@ function startHeldOpenCodeSteeringServer() {
             cancel() {
               if (heldTimer) clearInterval(heldTimer);
               heldTimer = null;
+              heldController = null;
             },
           }),
           { headers: { "content-type": "text/event-stream" } },
@@ -173,6 +182,26 @@ function startHeldOpenCodeSteeringServer() {
   return {
     requestBodies,
     chatUrl: `http://127.0.0.1:${server.port}/chat`,
+    releaseFirst(answer: string) {
+      const controller = heldController;
+      if (!controller) throw new Error("held response is no longer active");
+      if (heldTimer) clearInterval(heldTimer);
+      heldTimer = null;
+      const terminal = JSON.stringify({ kind: "answer", answer });
+      controller.enqueue(encoder.encode(
+        `data: ${JSON.stringify({
+          id: "alt-queue-first",
+          choices: [{ delta: { content: terminal }, finish_reason: null }],
+        })}\n\n` +
+          `data: ${JSON.stringify({
+            choices: [{ delta: {}, finish_reason: "stop" }],
+            usage: { prompt_tokens: 10, completion_tokens: 4 },
+          })}\n\n` +
+          "data: [DONE]\n\n",
+      ));
+      controller.close();
+      heldController = null;
+    },
     stop() {
       if (heldTimer) clearInterval(heldTimer);
       heldTimer = null;
@@ -858,6 +887,70 @@ describe.skipIf(SKIP)("tui: orchestration extension host", () => {
   );
 
   test(
+    "ordinary ALT input waits in the native fx queue",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-orchestration-queue-"));
+      const home = join(root, "home");
+      const fxHome = join(home, ".fx");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const tracePath = join(root, "causal.trace.log");
+      mkdirSync(fxHome, { recursive: true, mode: 0o700 });
+      mkdirSync(workspace);
+      seedAltEngineeringTeam(home);
+      writeFileSync(
+        join(fxHome, "opencode-auth.json"),
+        `${JSON.stringify({ schema_version: 1, api_key: "opencode-queue-fixture" })}\n`,
+        { mode: 0o600 },
+      );
+      tempDirs.push(root);
+      const provider = startHeldOpenCodeSteeringServer();
+
+      try {
+        session = await TmuxSession.create({
+          cwd: workspace,
+          stderrPath,
+          env: {
+            HOME: home,
+            FX_AUTO_UPGRADE: "0",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_E2E_OPENCODE_CHAT_URL: provider.chatUrl,
+            FX_SKIP_ONBOARDING: "1",
+            FX_TRACE_LOG: tracePath,
+            FX_TRACE_SCOPES: "orchestration,agent,provider,worker,input",
+            OPENCODE_API_KEY: undefined,
+          },
+        });
+        await session.waitForComposer(10_000);
+        await enterSeededAlt(session);
+        await session.sendText("FIRST ALT TURN HELD BY THE PROVIDER");
+        await waitForFileText(tracePath, "event=agent_run_started", 10_000);
+        expect(provider.requestBodies).toHaveLength(1);
+
+        await session.sendText("SECOND ALT TURN MUST WAIT IN FIFO");
+        await Bun.sleep(300);
+        expect(provider.requestBodies).toHaveLength(1);
+
+        provider.releaseFirst(QUEUE_FIRST_MARKER);
+        await session.waitForText(QUEUE_FIRST_MARKER, 10_000);
+        await session.waitForText(STEERING_MARKER, 10_000);
+        await session.waitForComposer(10_000);
+        expect(provider.requestBodies).toHaveLength(2);
+        expect(provider.requestBodies[1]).toContain("SECOND ALT TURN MUST WAIT IN FIFO");
+        expect(session.paneStatus()).toEqual({ dead: false, status: null });
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(5_000)).toBe(true);
+        session = null;
+      } finally {
+        provider.stop();
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "an active ALT turn accepts a canonical instruction and replaces its held run",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-orchestration-steering-"));
@@ -902,7 +995,7 @@ describe.skipIf(SKIP)("tui: orchestration extension host", () => {
         await session.sendText("ROOT ALT REQUEST THAT MUST REMAIN CANONICAL");
         await waitForFileText(tracePath, "event=agent_run_started", 10_000);
 
-        await session.sendText(
+        await sendSteering(session,
           `IN-SESSION STEERING: replace the held work and answer with ${STEERING_MARKER}`,
         );
         const trace = await waitForFileText(

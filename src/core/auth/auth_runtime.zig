@@ -251,6 +251,8 @@ fn requestedSource(
         .gateway => preferred,
         .codex => .chatgpt_subscription,
         .grok => .grok_subscription,
+        .opencode => .opencode_api_key,
+        .cline => .cline_account,
     };
 }
 

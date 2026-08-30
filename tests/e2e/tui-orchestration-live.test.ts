@@ -28,6 +28,11 @@ const STEERING_ANSWER_MARKER = "CRUCIBLE_ALT_LIVE_STEERING_6E93";
 let session: TmuxSession | null = null;
 const tempDirs: string[] = [];
 
+async function sendSteering(active: TmuxSession, text: string) {
+  await active.sendLiteral(text);
+  await active.sendLiteral("\x1b[13;5u");
+}
+
 async function waitForTerminalTrace(
   path: string,
   timeoutMs: number,
@@ -509,7 +514,7 @@ describe.skipIf(SKIP)("tui: live ALT Crucible", () => {
           15_000,
         );
         expect(firstTrace.match(/event=session_created/g)?.length).toBe(1);
-        await session.sendText(
+        await sendSteering(session,
           `Replace the work in progress. Do not call tools, peers, or specialists. Answer now with exactly ${STEERING_ANSWER_MARKER} and no other text.`,
         );
 

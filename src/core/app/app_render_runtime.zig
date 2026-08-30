@@ -207,7 +207,7 @@ fn buildPendingCardProjection(
     const pending = app.submission.pending orelse return null;
     switch (pending.phase) {
         .awaiting_frame, .awaiting_adoption => {},
-        .adopted, .queued, .absorbed => return null,
+        .adopted, .queued => return null,
     }
 
     const spans = pending.draft.skill_display_spans;

@@ -91,10 +91,19 @@ pub const SteeringBoundaryResult = union(enum) {
     interrupt,
 };
 
+/// Selects who supplies the assistant work for a prompt after the ordinary fx
+/// worker admits and presents the turn. Extensions may replace agent strategy,
+/// but they do not replace queueing, cancellation, presentation, or history.
+pub const PromptExecutor = enum {
+    native_agent,
+    extension,
+};
+
 pub const QueuedPrompt = struct {
     turn_id: u64 = 0,
     /// Runtime-derived delivery state. The worker retains ownership in every state.
     delivery: PromptDelivery = .ordinary,
+    executor: PromptExecutor = .native_agent,
     prompt: []u8,
     images: []types.ImageAttachment,
     authorized_image_catalog: []types.ImageAttachment = &.{},
@@ -632,6 +641,12 @@ pub const WorkerRuntime = struct {
     queued_context_compaction: ?ContextCompactionTask = null,
     active_context_compaction: bool = false,
     worker_events: std.ArrayList(WorkerEvent) = .empty,
+    /// A dequeued root turn waiting for an optional execution extension. The
+    /// worker remains the active turn owner while the event-loop thread takes
+    /// the request and eventually supplies one ordinary finished prompt.
+    extension_turn_request: ?QueuedPrompt = null,
+    extension_turn_result: ?types.FinishedPrompt = null,
+    extension_turn_id: u64 = 0,
     worker_processing: bool = false,
     active_turn_id: u64 = 0,
     active_tool_calls: std.StringHashMapUnmanaged(void) = .empty,
@@ -691,6 +706,8 @@ pub const WorkerRuntime = struct {
 
         for (self.worker_events.items) |event| freeWorkerEvent(alloc, event);
         self.worker_events.deinit(alloc);
+        if (self.extension_turn_request) |request| freeQueuedPrompt(alloc, request);
+        if (self.extension_turn_result) |result| types.freeFinishedPrompt(alloc, result);
     }
 
     pub fn requestStop(self: *WorkerRuntime) void {
@@ -774,22 +791,6 @@ pub const WorkerRuntime = struct {
 
     pub fn isCancelRequested(self: *const WorkerRuntime) bool {
         return self.worker_cancel_requested.load(.seq_cst);
-    }
-
-    /// Clears the cancellation latch after a live-session transition when the
-    /// next turn is owned by an external host rather than this worker's prompt
-    /// queue. Ordinary queued turns clear the same latch in
-    /// `takeNextPromptLocked`; isolated orchestration has no such dequeue.
-    pub fn resetIdleCancellation(self: *WorkerRuntime) !void {
-        self.worker_mutex.lockUncancelable(io_mod.getIo());
-        defer self.worker_mutex.unlock(io_mod.getIo());
-        if (self.worker_processing or self.queued_prompt_count != 0) {
-            return error.WorkerBusy;
-        }
-        self.worker_cancel_requested.store(false, .seq_cst);
-        self.worker_recovery_pause_requested.store(false, .seq_cst);
-        self.worker_connectivity_wait_active.store(false, .seq_cst);
-        self.recovery_continuation_ready = false;
     }
 
     pub fn isConnectivityWaitActive(self: *const WorkerRuntime) bool {
@@ -1698,6 +1699,74 @@ pub const WorkerRuntime = struct {
         self.active_tool_calls.deinit(alloc);
         self.active_tool_calls = .empty;
         self.active_tool_allocator = null;
+    }
+
+    /// Blocks the worker that owns the active root turn until the event-loop
+    /// extension supplies its terminal result. The request is an independent
+    /// snapshot so the caller retains its normal queued-prompt ownership.
+    pub fn executeExtensionTurn(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        prompt: QueuedPrompt,
+    ) !types.FinishedPrompt {
+        const request = try dupeQueuedPrompt(alloc, prompt);
+        var owns_request = true;
+        errdefer if (owns_request) freeQueuedPrompt(alloc, request);
+
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (self.worker_stop_requested) return error.WorkerStopped;
+        if (!self.worker_processing or
+            self.active_turn_id != prompt.turn_id or
+            self.extension_turn_id != 0 or
+            self.extension_turn_request != null or
+            self.extension_turn_result != null)
+        {
+            return error.ExtensionTurnUnavailable;
+        }
+        self.extension_turn_id = prompt.turn_id;
+        self.extension_turn_request = request;
+        owns_request = false;
+        self.worker_cond.broadcast(io_mod.getIo());
+
+        while (self.extension_turn_result == null and !self.worker_stop_requested) {
+            self.worker_cond.wait(io_mod.getIo(), &self.worker_mutex) catch
+                return error.ExtensionTurnWaitFailed;
+        }
+        if (self.extension_turn_result == null) return error.WorkerStopped;
+        const result = self.extension_turn_result.?;
+        self.extension_turn_result = null;
+        self.extension_turn_id = 0;
+        return result;
+    }
+
+    /// Transfers a pending extension request to the event-loop thread.
+    pub fn takeExtensionTurnRequest(self: *WorkerRuntime) ?QueuedPrompt {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        const request = self.extension_turn_request orelse return null;
+        self.extension_turn_request = null;
+        return request;
+    }
+
+    /// Transfers one terminal result back to the worker that owns `turn_id`.
+    /// `result` remains caller-owned when validation fails.
+    pub fn completeExtensionTurn(
+        self: *WorkerRuntime,
+        turn_id: u64,
+        result: types.FinishedPrompt,
+    ) !void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (!self.worker_processing or
+            self.active_turn_id != turn_id or
+            self.extension_turn_id != turn_id or
+            self.extension_turn_result != null)
+        {
+            return error.ExtensionTurnUnavailable;
+        }
+        self.extension_turn_result = result;
+        self.worker_cond.broadcast(io_mod.getIo());
     }
 
     pub fn waitUntilIdle(self: *WorkerRuntime) void {
@@ -2867,6 +2936,8 @@ pub fn dupeQueuedPrompt(
 
     return .{
         .turn_id = source.turn_id,
+        .delivery = source.delivery,
+        .executor = source.executor,
         .prompt = prompt,
         .images = images,
         .authorized_image_catalog = authorized_image_catalog,
@@ -2888,6 +2959,7 @@ pub fn dupeQueuedPrompt(
         .snapshot_file_ownerships = snapshot_file_ownerships,
         .recovery_checkpoint = recovery_checkpoint,
         .recovery_source_already_presented = source.recovery_source_already_presented,
+        .user_prompt_already_presented = source.user_prompt_already_presented,
     };
 }
 
@@ -4422,21 +4494,6 @@ test "takeEventBatch snapshots cancellation with detached events" {
     try std.testing.expect(batch.events.items[0] == .assistant_presentation);
     try std.testing.expect(batch.events.items[0].assistant_presentation == .text);
     try std.testing.expectEqual(@as(usize, 0), runtime.worker_events.items.len);
-}
-
-test "resetIdleCancellation admits external host events after a session transition" {
-    const alloc = std.testing.allocator;
-    var runtime = WorkerRuntime{};
-    defer runtime.deinit(alloc);
-
-    runtime.requestCancel();
-    try std.testing.expect(runtime.isCancelRequested());
-    try runtime.resetIdleCancellation();
-    try std.testing.expect(!runtime.isCancelRequested());
-
-    try runtime.beginIsolatedProcessing(7);
-    defer runtime.finishProcessing();
-    try std.testing.expectError(error.WorkerBusy, runtime.resetIdleCancellation());
 }
 
 test "state snapshot reports completion queued after event batch detach" {

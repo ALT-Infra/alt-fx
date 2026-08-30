@@ -1420,56 +1420,33 @@ const App = struct {
     pub fn nativeSubagentWorkActive(self: *App) !bool {
         if (comptime !build_options.orchestration_enabled) return false;
         const host_runtime = SessionAppRuntime.subagentHost(self) orelse return false;
-        _ = try host_runtime.reconcileAfterRestart(io_mod.milliTimestamp());
-        switch (host_runtime.recoveryState()) {
-            .pending, .scheduled, .running, .deferred => return error.NativeSubagentRecoveryUnsettled,
-            .complete => {},
+        host_runtime.requestBackgroundRecovery(io_mod.milliTimestamp()) catch {
+            return error.NativeSubagentRecoveryUnsettled;
+        };
+        if (host_runtime.recoveryState() != .complete) {
+            return error.NativeSubagentRecoveryUnsettled;
         }
 
-        var cursor: ?[]u8 = null;
-        defer if (cursor) |owned| self.alloc.free(owned);
-        while (true) {
-            var result = try host_runtime.manager.snapshot(self.alloc, .{
-                .root_id = host_runtime.root_id,
-                .cursor = cursor,
-                .limit = subagent_domain.max_page_limit,
-            });
-            defer result.deinit(self.alloc);
-
-            var next_cursor: ?[]u8 = null;
-            switch (result) {
-                .failure => return error.NativeSubagentSnapshotUnavailable,
-                .snapshot => |snapshot| {
-                    for (snapshot.nodes) |node| {
-                        if (host_runtime.owner.externalBusy(node.child_id)) return true;
-                        switch (node.state) {
-                            .queued, .running, .awaiting_approval => return true,
-                            .idle,
-                            .interrupted,
-                            .completed,
-                            .failed,
-                            .cancelled,
-                            .archived,
-                            => {},
-                        }
-                    }
-                    if (snapshot.next_cursor) |next| {
-                        next_cursor = try self.alloc.dupe(u8, next);
-                    }
-                },
+        var lock = try host_runtime.managed.state_store.acquireLock(self.alloc);
+        defer lock.release();
+        var registry = try host_runtime.managed.state_store.load(self.alloc);
+        defer registry.deinit(self.alloc);
+        for (registry.children) |child| {
+            switch (child.phase) {
+                .running, .awaiting_approval => return true,
+                .idle, .interrupted, .finished => {},
             }
-
-            if (cursor) |owned| self.alloc.free(owned);
-            cursor = next_cursor;
-            if (cursor == null) return false;
         }
+        return false;
     }
 
     pub fn orchestrationModeEntered(self: *App) void {
+        _ = self;
         if (comptime !build_options.orchestration_enabled) return;
     }
 
     pub fn orchestrationModeLeft(self: *App) void {
+        _ = self;
         if (comptime !build_options.orchestration_enabled) return;
     }
 
@@ -1668,8 +1645,9 @@ const App = struct {
         var skills_prompt_section: []u8 = &.{};
         var explicit_skills_prompt_section: []u8 = &.{};
         if (request.visible_input == .canonical_turn) {
-            var bounded = try self.skills.buildBoundedSystemPromptSection(
+            var bounded = try self.skills.buildRoutedSystemPromptSection(
                 self.alloc,
+                prompt.prompt,
                 self.context_limits,
             );
             defer bounded.deinit(self.alloc);
@@ -1893,11 +1871,97 @@ const App = struct {
 
     pub fn drainOrchestrationAgentEvents(self: *App) !void {
         if (comptime !build_options.orchestration_enabled) return;
+        try self.startPendingOrchestrationTurn();
+        if (self.orchestration.active_source_turn_id != null) {
+            if (self.worker.isCancelRequested()) {
+                _ = try self.cancelActiveOrchestrationTurn();
+            } else {
+                try self.drainOrchestrationSteering();
+            }
+        }
         try orchestration_app_runtime.drainRunEvents(
             orchestration_host,
             orchestration_extension,
             self,
         );
+    }
+
+    fn startPendingOrchestrationTurn(self: *App) !void {
+        const prompt = self.worker.takeExtensionTurnRequest() orelse return;
+        var owns_prompt = true;
+        defer if (owns_prompt) worker_runtime.freeQueuedPrompt(std.heap.c_allocator, prompt);
+
+        const fallback_user = try types.dupeUserTurn(
+            std.heap.c_allocator,
+            .{ .text = prompt.prompt, .images = prompt.images },
+        );
+        var owns_fallback_user = true;
+        defer if (owns_fallback_user) types.freeUserTurn(std.heap.c_allocator, fallback_user);
+
+        if (!self.orchestration.active or prompt.executor != .extension) {
+            const finished = types.FinishedPrompt{ .turn = .{ .interrupted = .{
+                .user = fallback_user,
+                .terminal_reason = .failed,
+            } } };
+            try self.worker.completeExtensionTurn(prompt.turn_id, finished);
+            owns_fallback_user = false;
+            return;
+        }
+
+        const captured = try orchestration_app_runtime.captureCanonicalTurn(
+            orchestration_host,
+            &self.orchestration,
+            std.heap.c_allocator,
+            prompt,
+        );
+        owns_prompt = false;
+        if (!orchestration_app_runtime.dispatchCanonicalTurn(
+            orchestration_host,
+            orchestration_extension,
+            self,
+            captured,
+            prompt.prompt,
+        )) {
+            const finished = types.FinishedPrompt{ .turn = .{ .interrupted = .{
+                .user = fallback_user,
+                .terminal_reason = .failed,
+            } } };
+            try self.worker.completeExtensionTurn(prompt.turn_id, finished);
+            owns_fallback_user = false;
+        }
+    }
+
+    fn drainOrchestrationSteering(self: *App) !void {
+        const source_turn_id = self.orchestration.active_source_turn_id orelse return;
+        const active_turn_id = self.worker.activeTurnId();
+        if (active_turn_id == 0) return;
+        const boundary = try self.worker.takeSteeringBoundary(
+            std.heap.c_allocator,
+            active_turn_id,
+            .model,
+        );
+        const messages = switch (boundary) {
+            .continue_turn => |msgs| msgs,
+            .none, .handoff, .interrupt => return,
+        };
+        defer {
+            for (messages) |message| std.heap.c_allocator.free(message);
+            if (messages.len > 0) std.heap.c_allocator.free(messages);
+        }
+        for (messages) |message| {
+            const captured = try self.orchestration.canonical_turns.captureTextInstruction(
+                std.heap.c_allocator,
+                source_turn_id,
+                message,
+            );
+            if (!orchestration_app_runtime.dispatchCanonicalInstruction(
+                orchestration_host,
+                orchestration_extension,
+                self,
+                captured,
+                message,
+            )) return;
+        }
     }
 
     pub fn publishOrchestrationAnswer(
@@ -1909,28 +1973,23 @@ const App = struct {
         const source_turn_id = self.orchestration.active_source_turn_id orelse
             return error.OrchestrationSourceTurnUnavailable;
         const user = try self.orchestration.canonical_turns.cloneCombinedUserTurn(
-            self.alloc,
+            std.heap.c_allocator,
             source_turn_id,
             self.orchestration.instruction_source_turn_ids.items,
         );
-        defer types.freeUserTurn(self.alloc, user);
-        defer orchestration_app_runtime.releaseCanonicalCustody(
+        errdefer types.freeUserTurn(std.heap.c_allocator, user);
+        const answer = try std.heap.c_allocator.dupe(u8, text);
+        errdefer std.heap.c_allocator.free(answer);
+        const finished = types.FinishedPrompt{ .turn = .{ .assistant = .{
+            .user = user,
+            .assistant = answer,
+        } } };
+        try self.worker.completeExtensionTurn(self.worker.activeTurnId(), finished);
+        orchestration_app_runtime.releaseCanonicalCustody(
             orchestration_host,
             self.alloc,
             &self.orchestration,
         );
-        try self.worker.pushEvent(std.heap.c_allocator, .{
-            .assistant_presentation = .{ .text = @constCast(text) },
-        });
-        try self.worker.pushEvent(std.heap.c_allocator, .{
-            .finish_prompt = .{ .turn = .{ .assistant = .{
-                .user = .{
-                    .text = user.text,
-                    .images = user.images,
-                },
-                .assistant = @constCast(text),
-            } } },
-        });
     }
 
     pub fn failOrchestrationTurn(self: *App) !void {
@@ -1938,25 +1997,29 @@ const App = struct {
         const source_turn_id = self.orchestration.active_source_turn_id orelse
             return error.OrchestrationSourceTurnUnavailable;
         const user = try self.orchestration.canonical_turns.cloneCombinedUserTurn(
-            self.alloc,
+            std.heap.c_allocator,
             source_turn_id,
             self.orchestration.instruction_source_turn_ids.items,
         );
-        defer types.freeUserTurn(self.alloc, user);
-        defer orchestration_app_runtime.releaseCanonicalCustody(
+        errdefer types.freeUserTurn(std.heap.c_allocator, user);
+        const finished = types.FinishedPrompt{ .turn = .{ .interrupted = .{
+            .user = user,
+            .terminal_reason = .failed,
+        } } };
+        try self.worker.completeExtensionTurn(self.worker.activeTurnId(), finished);
+        orchestration_app_runtime.releaseCanonicalCustody(
             orchestration_host,
             self.alloc,
             &self.orchestration,
         );
-        try self.worker.pushEvent(std.heap.c_allocator, .{
-            .finish_prompt = .{ .turn = .{ .interrupted = .{
-                .user = .{
-                    .text = user.text,
-                    .images = user.images,
-                },
-                .terminal_reason = .failed,
-            } } },
-        });
+    }
+
+    pub fn interruptOrchestrationTurn(self: *App, user: types.UserTurn) !void {
+        if (comptime !build_options.orchestration_enabled) return;
+        const finished = types.FinishedPrompt{ .turn = .{ .interrupted = .{
+            .user = user,
+        } } };
+        try self.worker.completeExtensionTurn(self.worker.activeTurnId(), finished);
     }
 
     pub fn traceOrchestrationFailure(_: *App, extension_id: []const u8, err: anyerror) void {
@@ -2116,7 +2179,7 @@ const App = struct {
             draft.skill_display_spans,
         );
         defer if (skill_tokens.len > 0) self.alloc.free(skill_tokens);
-        const outcome = try self.snapshotAndQueuePrompt(
+        _ = try self.snapshotAndQueuePrompt(
             draft.prompt,
             skill_tokens,
             null,
@@ -2125,13 +2188,6 @@ const App = struct {
             draft.turn_id,
             true,
         );
-        if (outcome == .absorbed_by_orchestration) {
-            // The canonical turn never enters the native worker queue, so no
-            // begin_presented_prompt event will complete this submission.
-            // Mark it absorbed; the submit runtime ends the lifecycle with
-            // presented-snapshot semantics and releases the turn start hold.
-            InputSubmitRuntime.markPendingSubmissionAbsorbed(self);
-        }
         WorkerAppRuntime.syncState(
             self,
             app_callbacks.Bindings(App).worker_tool_lifecycle_presenter(self),
@@ -2295,9 +2351,6 @@ const App = struct {
             false,
         );
         errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
-        if (try self.dispatchOrchestrationPrompt(queued, prompt, false)) |outcome| {
-            return outcome == .accepted;
-        }
         try self.worker.admitInteractivePrompt(std.heap.c_allocator, queued);
         HerdrAppRuntime.reportWorking(self);
         return true;
@@ -2327,15 +2380,7 @@ const App = struct {
         return true;
     }
 
-    const PromptQueueOutcome = enum {
-        enqueued,
-        absorbed_by_orchestration,
-    };
-
-    const OrchestrationDispatchOutcome = enum {
-        accepted,
-        rejected,
-    };
+    const PromptQueueOutcome = enum { enqueued };
 
     fn snapshotAndQueuePrompt(
         self: *App,
@@ -2356,76 +2401,10 @@ const App = struct {
             turn_id,
             user_prompt_already_presented,
         );
-        var owns_queued = true;
-        errdefer if (owns_queued) worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
-        if (try self.dispatchOrchestrationPrompt(
-            queued,
-            prompt,
-            user_prompt_already_presented,
-        )) |outcome| {
-            owns_queued = false;
-            return switch (outcome) {
-                .accepted => .absorbed_by_orchestration,
-                .rejected => error.OrchestrationDispatchRejected,
-            };
-        }
+        errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
         try self.worker.enqueuePrompt(std.heap.c_allocator, queued);
         HerdrAppRuntime.reportWorking(self);
         return .enqueued;
-    }
-
-    /// Returns null when the native worker still owns admission. A non-null
-    /// result means orchestration consumed the prompt regardless of whether
-    /// extension dispatch was accepted.
-    fn dispatchOrchestrationPrompt(
-        self: *App,
-        prompt: worker_runtime.QueuedPrompt,
-        source_text: []const u8,
-        user_prompt_already_presented: bool,
-    ) !?OrchestrationDispatchOutcome {
-        if (comptime !build_options.orchestration_enabled) return null;
-        if (!self.orchestration.active or prompt.recovery_checkpoint != null) return null;
-
-        const steering = self.orchestration.active_source_turn_id != null;
-        const captured = try orchestration_app_runtime.captureCanonicalTurn(
-            orchestration_host,
-            &self.orchestration,
-            std.heap.c_allocator,
-            prompt,
-        );
-        const accepted = if (steering)
-            orchestration_app_runtime.dispatchCanonicalInstruction(
-                orchestration_host,
-                orchestration_extension,
-                self,
-                captured,
-                source_text,
-            )
-        else
-            orchestration_app_runtime.dispatchCanonicalTurn(
-                orchestration_host,
-                orchestration_extension,
-                self,
-                captured,
-                source_text,
-            );
-        if (accepted and !user_prompt_already_presented) {
-            self.worker.pushEvent(std.heap.c_allocator, .{
-                .begin_prompt_with_skill_bindings = .{
-                    .prompt = .{
-                        .text = prompt.prompt,
-                        .images = prompt.images,
-                    },
-                    .skill_bindings = prompt.skill_bindings,
-                    .skill_display_spans = prompt.skill_display_spans,
-                },
-            }) catch |err| debug_trace.logf(
-                "orchestration",
-                "canonical {s} presentation deferred error={s}",
-                .{ if (steering) "instruction" else "user", @errorName(err) },
-            );
-        }
-        return if (accepted) .accepted else .rejected;
     }
 
     // Caller owns the returned prompt until worker admission succeeds.
@@ -2544,6 +2523,7 @@ const App = struct {
 
         return .{
             .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else turn_id,
+            .executor = if (orchestration_turn) .extension else .native_agent,
             .prompt = prompt_copy,
             .images = images_copy,
             .authorized_image_catalog = authorized_image_catalog,
@@ -3330,12 +3310,7 @@ const App = struct {
 
     pub fn processQueuedWork(self: *App, work: WorkItem) !void {
         const result = switch (work) {
-            .prompt => |job| AgentAppRuntime.processQueuedPrompt(
-                self,
-                job,
-                builtin_gateway.retry_count,
-                builtin_gateway.defaultChatUrl(),
-            ),
+            .prompt => |job| self.processQueuedPrompt(job),
             .compact_context => |task| AgentAppRuntime.processContextCompaction(
                 self,
                 task,
@@ -3343,6 +3318,48 @@ const App = struct {
             ),
         };
         result catch |err| {
+            if (err == error.TurnFinalizationDeliveryFailed) return;
+            return err;
+        };
+    }
+
+    fn processQueuedPrompt(self: *App, job: QueuedPrompt) !void {
+        if (comptime build_options.orchestration_enabled) {
+            if (job.executor == .extension) {
+                var snapshot_ownership = worker_runtime.ActivePromptSnapshotOwnership.init(job.images);
+                self.worker.beginActivePromptSnapshots(&snapshot_ownership);
+                defer self.worker.endActivePromptSnapshots(&snapshot_ownership);
+                self.worker.active_context_snapshot = &job.context_snapshot;
+                defer self.worker.active_context_snapshot = null;
+                self.worker.setActiveAgentTurnSettings(job.agent_settings);
+                defer self.worker.clearActiveAgentTurnSettings();
+
+                var finished = try self.worker.executeExtensionTurn(
+                    std.heap.c_allocator,
+                    job,
+                );
+                defer types.freeFinishedPrompt(std.heap.c_allocator, finished);
+                if (finished.turn == .assistant) {
+                    try self.worker.pushEvent(std.heap.c_allocator, .{
+                        .assistant_presentation = .{
+                            .text = finished.turn.assistant.assistant,
+                        },
+                    });
+                }
+                finished.snapshot_file_ownership =
+                    try self.worker.handoffActivePromptSnapshots(std.heap.c_allocator);
+                try self.worker.pushEvent(std.heap.c_allocator, .{
+                    .finish_prompt = finished,
+                });
+                return;
+            }
+        }
+        AgentAppRuntime.processQueuedPrompt(
+            self,
+            job,
+            builtin_gateway.retry_count,
+            builtin_gateway.defaultChatUrl(),
+        ) catch |err| {
             if (err == error.TurnFinalizationDeliveryFailed) return;
             return err;
         };

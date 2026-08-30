@@ -193,9 +193,6 @@ pub fn Runtime(
             {
                 return error.OrchestrationBindingMismatch;
             }
-            // Native session resume leaves cancellation latched until its next
-            // queued prompt. This restored session is hosted externally.
-            try app.worker.resetIdleCancellation();
             try orchestration_app_runtime.installDefinition(
                 Host,
                 Extension,
@@ -248,9 +245,6 @@ pub fn Runtime(
 
             orchestration_app_runtime.deinit(Host, app.alloc, &app.orchestration);
             try app.newSession();
-            // A native prompt clears this session-transition latch when it is
-            // dequeued. Isolated orchestration has no root queue dequeue.
-            try app.worker.resetIdleCancellation();
             const session_id = SessionRuntime.activeSessionId(app) orelse
                 return error.SessionStoreUnavailable;
             const session_store = app.session_persistence.store orelse

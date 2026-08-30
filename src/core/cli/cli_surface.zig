@@ -1046,7 +1046,7 @@ fn runNonInteractiveWithDeps(
                         try writeStderr(deps, "fx login: failed to store the OpenCode API key\n");
                         return .handled_failure;
                     };
-                    if (!try activateProviderSelection(alloc, cfg, deps, .opencode, .provider_login)) {
+                    if (!try activateProviderSelection(alloc, cfg, deps, .opencode, .provider_login, null)) {
                         return .handled_failure;
                     }
                     try writeStdout(deps, "Signed in with OpenCode.\n");
@@ -1071,7 +1071,7 @@ fn runNonInteractiveWithDeps(
                             return .handled_failure;
                         };
                     }
-                    if (!try activateProviderSelection(alloc, cfg, deps, .cline, .provider_login)) {
+                    if (!try activateProviderSelection(alloc, cfg, deps, .cline, .provider_login, null)) {
                         return .handled_failure;
                     }
                     try writeStdout(deps, "Signed in with Cline.\n");

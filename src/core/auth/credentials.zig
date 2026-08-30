@@ -11,12 +11,15 @@ const io_mod = @import("../shared/io.zig");
 const model_provider = @import("../config/model_provider.zig");
 const oauth = @import("oauth.zig");
 const oauth_session = @import("oauth_session.zig");
+const session_presence = @import("session_presence.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const opencode_session = @import("opencode_session.zig");
 const cline_session = @import("cline_session.zig");
 const secret = @import("secret.zig");
 const types = @import("../shared/types.zig");
+
+const max_auth_file_bytes: usize = 64 * 1024;
 
 pub const Source = types.CredentialSource;
 
@@ -634,6 +637,19 @@ pub fn sourcePresence(
             secret_store.presence(),
         .chatgpt_subscription => chatgpt_session.presence(),
         .grok_subscription => grok_session.presence(),
+        .opencode_anonymous => .missing,
+        .opencode_api_key => session_presence.profileFile(
+            profile_paths.opencode_auth_file_name,
+            max_auth_file_bytes,
+        ),
+        .cline_account => session_presence.profileFile(
+            profile_paths.cline_account_auth_file_name,
+            max_auth_file_bytes,
+        ),
+        .cline_api_key => session_presence.profileFile(
+            profile_paths.cline_auth_file_name,
+            max_auth_file_bytes,
+        ),
     };
 }
 
