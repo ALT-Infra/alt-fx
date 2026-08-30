@@ -458,7 +458,7 @@ pub fn previewVisualRowCount(preview: ?[]const u8, width: u16) u16 {
         while (remaining.len > 0) {
             const chunk = previewChunk(remaining, content_width);
             count +|= 1;
-            remaining = remaining[chunk.len..];
+            remaining = display_width.trimBreakWhitespace(remaining[chunk.len..]);
         }
     }
     return count;
@@ -480,7 +480,7 @@ fn previewVisualRow(text: []const u8, target_row: u16, width: u16) ?[]const u8 {
             const chunk = previewChunk(remaining, content_width);
             if (visual_row == target_row) return chunk;
             visual_row +|= 1;
-            remaining = remaining[chunk.len..];
+            remaining = display_width.trimBreakWhitespace(remaining[chunk.len..]);
         }
     }
     return null;
@@ -488,7 +488,23 @@ fn previewVisualRow(text: []const u8, target_row: u16, width: u16) ?[]const u8 {
 
 fn previewChunk(remaining: []const u8, content_width: usize) []const u8 {
     const chunk = display_width.prefixByWidth(remaining, content_width);
+    if (chunk.len == remaining.len) return chunk;
+
+    var last_break: ?usize = null;
+    var saw_content = false;
+    var index: usize = 0;
+    while (index < chunk.len) {
+        const unit = display_width.displayUnitAt(chunk, index);
+        if (chunk[index] == ' ' or chunk[index] == '\t') {
+            if (saw_content) last_break = index;
+        } else {
+            saw_content = true;
+        }
+        index += unit.byte_len;
+    }
+    if (last_break) |break_index| return remaining[0..break_index];
     if (chunk.len > 0) return chunk;
+
     const sequence_len = std.unicode.utf8ByteSequenceLength(remaining[0]) catch 1;
     return remaining[0..@min(sequence_len, remaining.len)];
 }
@@ -675,6 +691,22 @@ test "MCP preview wraps one long logical line across terminal rows" {
     var third = try composeMcpMenuRow(std.testing.allocator, projection, 4, 12, rows);
     defer third.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, third.items, "kl") != null);
+}
+
+test "MCP preview keeps fitting words intact across visual rows" {
+    const text = "alpha documentation beta";
+    try std.testing.expectEqualStrings(
+        "alpha",
+        previewVisualRow(text, 0, 16).?,
+    );
+    try std.testing.expectEqualStrings(
+        "documentation",
+        previewVisualRow(text, 1, 16).?,
+    );
+    try std.testing.expectEqualStrings(
+        "beta",
+        previewVisualRow(text, 2, 16).?,
+    );
 }
 
 test "MCP preview renders from its vertical window offset" {
