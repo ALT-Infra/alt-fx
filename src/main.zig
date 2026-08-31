@@ -160,7 +160,9 @@ const mcp_command_provider = @import("core/mcp/command_provider.zig");
 const mcp_runtime_mod = @import("core/mcp/mcp_runtime.zig");
 const mcp_model_catalog = @import("core/mcp/model_catalog.zig");
 const mcp_access_policy = @import("core/mcp/access_policy.zig");
+const mcp_menu_state = @import("core/mcp/menu_state.zig");
 const app_mcp_runtime = @import("core/app/app_mcp_runtime.zig");
+const app_mcp_menu_runtime = @import("core/app/app_mcp_menu_runtime.zig");
 const skill_commands = @import("core/skills/skill_commands.zig");
 const skill_runtime = @import("core/skills/skill_runtime.zig");
 const skill_invocation = @import("core/skills/skill_invocation.zig");
@@ -1670,8 +1672,9 @@ const App = struct {
         var skills_prompt_section: []u8 = &.{};
         var explicit_skills_prompt_section: []u8 = &.{};
         if (request.visible_input == .canonical_turn) {
-            var bounded = try self.skills.buildBoundedSystemPromptSection(
+            var bounded = try self.skills.buildRoutedSystemPromptSection(
                 self.alloc,
+                prompt.prompt,
                 self.context_limits,
             );
             defer bounded.deinit(self.alloc);
@@ -2608,6 +2611,19 @@ const App = struct {
         );
     }
 
+    pub fn beginMcpMenuReload(self: *App, generation: u64) !void {
+        return self.mcp.beginMenuReload(
+            self.alloc,
+            self.workspace_root,
+            .{ .form = true, .url = true },
+            if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
+            builtin_mcp.previewNativeWorkspaceAuthority,
+            self.toolRegistry(),
+            @intCast(@max(io_mod.milliTimestamp(), 0)),
+            generation,
+        );
+    }
+
     pub fn beginMcpAuthorityReduction(self: *App, rebuild: bool) !void {
         return self.mcp.beginAuthorityReduction(
             self.alloc,
@@ -2617,6 +2633,26 @@ const App = struct {
             self.toolRegistry(),
             @intCast(@max(io_mod.milliTimestamp(), 0)),
             rebuild,
+        ) catch |err| {
+            self.mcp.retireAuthoritySynchronously(self.alloc);
+            return err;
+        };
+    }
+
+    pub fn beginMcpMenuAuthorityReduction(
+        self: *App,
+        rebuild: bool,
+        generation: u64,
+    ) !void {
+        return self.mcp.beginMenuAuthorityReduction(
+            self.alloc,
+            self.workspace_root,
+            .{ .form = true, .url = true },
+            if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
+            self.toolRegistry(),
+            @intCast(@max(io_mod.milliTimestamp(), 0)),
+            rebuild,
+            generation,
         ) catch |err| {
             self.mcp.retireAuthoritySynchronously(self.alloc);
             return err;
@@ -2634,10 +2670,43 @@ const App = struct {
         );
     }
 
+    pub fn beginMcpMenuAuthentication(self: *App, generation: u64) !void {
+        const server_name = self.mcp.selectedMenuServerName() orelse
+            return error.McpServerNotFound;
+        const started = try self.mcp.startMenuAuthentication(
+            self.alloc,
+            server_name,
+            self.urlOpener(),
+            generation,
+        );
+        if (started == .busy) return error.McpAuthenticationBusy;
+    }
+
     pub fn takeMcpAuthenticationCompletion(
         self: *App,
     ) !?app_mcp_runtime.AuthenticationCompletion {
         return self.mcp.takeAuthenticationCompletion();
+    }
+
+    pub fn mcpAuthenticationCompletionOrigin(self: *const App) app_mcp_runtime.PresentationOrigin {
+        return self.mcp.authenticationCompletionOrigin();
+    }
+
+    pub fn applyMcpMenuAuthenticationCompletion(
+        self: *App,
+        generation: u64,
+        completion: *const app_mcp_runtime.AuthenticationCompletion,
+    ) !void {
+        if (try self.mcp.applyMenuAuthenticationCompletion(
+            self.alloc,
+            generation,
+            completion,
+        )) {
+            self.beginMcpMenuReload(generation) catch |err| {
+                try self.mcp.recordMenuEffectFailure(self.alloc, generation, err);
+            };
+        }
+        self.shell.render_requests.request(.footer);
     }
 
     pub fn mcpAuthenticationPending(
@@ -2649,6 +2718,24 @@ const App = struct {
 
     pub fn takeMcpReloadCompletion(self: *App) !?app_mcp_runtime.ReloadCompletion {
         return self.mcp.takeReloadCompletion();
+    }
+
+    pub fn mcpReloadCompletionOrigin(self: *const App) app_mcp_runtime.PresentationOrigin {
+        return self.mcp.reloadCompletionOrigin();
+    }
+
+    pub fn applyMcpMenuReloadCompletion(
+        self: *App,
+        generation: u64,
+        completion: *const app_mcp_runtime.ReloadCompletion,
+    ) !void {
+        try self.mcp.applyMenuReloadCompletion(
+            self.alloc,
+            generation,
+            completion,
+            @intCast(@max(io_mod.milliTimestamp(), 0)),
+        );
+        self.shell.render_requests.request(.footer);
     }
 
     pub fn startMcpDiscovery(self: *App) void {
@@ -2726,8 +2813,8 @@ const App = struct {
         return self.mcp.callTool(arena, name, arguments_json, max_tool_result_bytes, options);
     }
 
-    pub fn searchMcpTools(self: *App, arena: Allocator, query: *const tool_mcp_runtime.PreparedQuery, limit: usize, permission_rules: types.PermissionRuleSet, access: tool_mcp_runtime.Access) !tool_mcp_runtime.SearchResult {
-        return self.mcp.searchTools(arena, query, limit, permission_rules, self.context_limits, access);
+    pub fn searchMcpTools(self: *App, arena: Allocator, request: tool_mcp_runtime.SearchRequest, permission_rules: types.PermissionRuleSet, access: tool_mcp_runtime.Access) !tool_mcp_runtime.SearchResult {
+        return self.mcp.searchTools(arena, request, permission_rules, self.context_limits, access);
     }
 
     pub fn mcpToolSchemaJson(self: *App, arena: Allocator, name: []const u8, permission_rules: types.PermissionRuleSet, access: tool_mcp_runtime.Access) !?tool_mcp_runtime.ToolSchemaResult {
@@ -2736,6 +2823,54 @@ const App = struct {
 
     pub fn listMcpServersAndTools(self: *App, alloc: Allocator) ![]u8 {
         return self.mcp.renderHealth(alloc);
+    }
+
+    pub fn openMcpMenu(self: *App) !void {
+        try self.mcp.openMenu(
+            self.alloc,
+            @intCast(@max(io_mod.milliTimestamp(), 0)),
+        );
+    }
+
+    pub fn closeMcpMenu(self: *App) void {
+        self.mcp.closeMenu(self.alloc);
+    }
+
+    pub fn beginMcpMenuEffect(self: *App, effect: mcp_menu_state.Effect) !void {
+        return self.mcp.beginMenuEffect(
+            self.alloc,
+            effect,
+            self.permission_engine.rules,
+            self.context_limits,
+        );
+    }
+
+    pub fn recordMcpMenuEffectFailure(
+        self: *App,
+        generation: u64,
+        err: anyerror,
+    ) !void {
+        return self.mcp.recordMenuEffectFailure(self.alloc, generation, err);
+    }
+
+    pub fn saveMcpMenuAdd(
+        self: *App,
+        generation: u64,
+        transport: mcp_menu_state.AddTransport,
+    ) !void {
+        return app_mcp_menu_runtime.Runtime(App).saveAdd(self, generation, transport);
+    }
+
+    pub fn removeMcpMenuServer(self: *App, generation: u64) !void {
+        return app_mcp_menu_runtime.Runtime(App).removeServer(self, generation);
+    }
+
+    pub fn applyMcpMenuTrustAction(
+        self: *App,
+        generation: u64,
+        action: mcp_menu_state.Action,
+    ) !void {
+        return app_mcp_menu_runtime.Runtime(App).applyTrustAction(self, generation, action);
     }
 
     pub fn summarizeMcpServers(self: *App, alloc: Allocator) ![]u8 {
@@ -3853,6 +3988,16 @@ const App = struct {
         }
         if (try app_commands.Handlers(App).collectUsageDashboardFacts(self)) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
+        }
+        switch (try self.mcp.collectMenuCompletion(self.alloc)) {
+            .none => {},
+            .repaint => RenderAppRuntime.requestActiveSurfaceFrame(self, .footer),
+            .reload => |generation| {
+                self.beginMcpMenuReload(generation) catch |err| {
+                    try self.mcp.recordMenuEffectFailure(self.alloc, generation, err);
+                };
+                RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
+            },
         }
         try app_commands.Handlers(App).collectMcpAuthenticationFacts(self);
         try app_commands.Handlers(App).collectMcpReloadFacts(self);
