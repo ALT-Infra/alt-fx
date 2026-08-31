@@ -16,7 +16,7 @@ const encoder = new TextEncoder();
 const requestDecoder = new TextDecoder();
 const stderrDecoder = new TextDecoder();
 const POST_TOOL_DECISION_PROMPT =
-  "Before choosing the next action, identify the concrete unmet requirement. If one remains, use only the tool needed for it. If none remains, respond normally.";
+  "Continue the original task. If any requirement remains, perform the next necessary action now; do not reply with a progress update. Give the final response only after the original task is complete.";
 const catalog = {
   object: "list",
   data: [{ id: "test/workspace-model", type: "language", released: 1, tags: ["tool-use"], context_window: 128000, max_tokens: 8192 }],
