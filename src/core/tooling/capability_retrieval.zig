@@ -11,6 +11,8 @@ pub const max_cursor_bytes: usize = 160;
 const primary_weight: f64 = 3.0;
 const k1: f64 = 1.2;
 const b: f64 = 0.75;
+const min_secondary_evidence_token_bytes: usize = 4;
+const rare_short_token_catalog_divisor: usize = 32;
 
 pub const Kind = enum {
     all,
@@ -30,12 +32,18 @@ pub const Domain = enum {
     mcp,
 };
 
+pub const RelevancePolicy = enum {
+    compatible,
+    intent,
+};
+
 pub const Request = struct {
     query: *const lexical_relevance.PreparedQuery,
     kind: Kind = .all,
     server: ?[]const u8 = null,
     limit: usize = default_limit,
     cursor: ?[]const u8 = null,
+    relevance_policy: RelevancePolicy = .compatible,
 
     pub fn validate(self: Request) ValidationError!void {
         if (self.limit == 0 or self.limit > max_limit) return error.InvalidLimit;
@@ -174,6 +182,9 @@ pub fn retrieve(
         const exact_identity = lexical_relevance.containsCompleteIdentity(
             request.query.raw,
             &document.identities,
+        ) or lexical_relevance.containsCompleteIdentity(
+            request.query.raw,
+            document.primary[0..1],
         );
         var primary_hits: u8 = 0;
         var secondary_hits: u8 = 0;
@@ -184,7 +195,15 @@ pub fn retrieve(
             const primary_tf = primaryTermFrequency(document, token);
             const secondary_tf = secondaryTermFrequency(document, token);
             if (primary_tf > 0) primary_hits += 1;
-            if (secondary_tf > 0) secondary_hits += 1;
+            if (secondary_tf > 0 and secondaryTokenProvidesEvidence(
+                token,
+                document_frequencies[token_index],
+                documents.len,
+                request.relevance_policy,
+                request.server != null,
+            )) {
+                secondary_hits += 1;
+            }
             if (primary_tf == 0 and secondary_tf == 0) continue;
 
             const idf = inverseDocumentFrequency(
@@ -204,9 +223,13 @@ pub fn retrieve(
         }
 
         const inventory = request.query.raw.len == 0;
-        if (!inventory and !exact_identity and primary_hits == 0 and secondary_hits < 2) {
-            continue;
-        }
+        const clear_match = clearMatch(
+            query_tokens.len,
+            exact_identity,
+            primary_hits,
+            secondary_hits,
+        );
+        if (!inventory and !clear_match) continue;
         ranked[ranked_count] = .{
             .document_index = document_index,
             .exact_identity = exact_identity,
@@ -232,7 +255,12 @@ pub fn retrieve(
     for (ranked[start_offset..end], 0..) |match, index| {
         page_matches[index] = .{
             .document_index = match.document_index,
-            .clear_match = match.exact_identity or match.primary_hits + match.secondary_hits >= 2,
+            .clear_match = clearMatch(
+                query_tokens.len,
+                match.exact_identity,
+                match.primary_hits,
+                match.secondary_hits,
+            ),
         };
     }
     return .{
@@ -302,6 +330,32 @@ fn secondaryTermFrequency(document: Document, token: []const u8) usize {
     var count: usize = 0;
     for (document.secondary) |field| count +|= termFrequency(field, token);
     return count;
+}
+
+fn secondaryTokenProvidesEvidence(
+    token: []const u8,
+    document_frequency: usize,
+    document_count: usize,
+    relevance_policy: RelevancePolicy,
+    server_scoped: bool,
+) bool {
+    if (token.len < min_secondary_evidence_token_bytes) {
+        return document_frequency <= document_count / rare_short_token_catalog_divisor;
+    }
+    return relevance_policy == .compatible or
+        server_scoped or
+        document_frequency < document_count;
+}
+
+fn clearMatch(
+    query_token_count: usize,
+    exact_identity: bool,
+    primary_hits: u8,
+    secondary_hits: u8,
+) bool {
+    return exact_identity or
+        (query_token_count == 1 and primary_hits > 0) or
+        primary_hits + secondary_hits >= 2;
 }
 
 fn primaryLength(document: Document) usize {
@@ -403,6 +457,7 @@ fn requestHash(request: Request, domain: Domain) u64 {
     var hash = std.hash.Wyhash.init(0x7265717565737421);
     updateHashField(&hash, request.query.raw);
     hash.update(&.{@intFromEnum(domain)});
+    hash.update(&.{@intFromEnum(request.relevance_policy)});
     if (request.server) |server| updateHashField(&hash, server);
     return hash.final();
 }
@@ -520,6 +575,127 @@ test "corpus relevance prefers identities and rejects one weak generic hit" {
     try std.testing.expectEqual(@as(usize, 1), page.total_matches);
     try std.testing.expectEqual(@as(usize, 1), page.matches.len);
     try std.testing.expectEqual(@as(usize, 1), page.matches[0].document_index);
+}
+
+test "relevance rejects isolated generic primary and short secondary evidence" {
+    const documents = [_]Document{
+        .{
+            .identities = .{ "strategy-website", "" },
+            .stable_key = "skill:strategy-website",
+            .primary = .{ "strategy-website", "", "", "" },
+            .secondary = .{
+                "Website content, conversion optimization, and call-to-action guidance. Triggers on landing-page requests.",
+                "",
+                "",
+            },
+        },
+        .{
+            .identities = .{ "mcp_context7_query-docs", "" },
+            .stable_key = "mcp:context7:query-docs",
+            .primary = .{ "context7", "query-docs", "", "" },
+            .secondary = .{ "Call this tool on every documentation request.", "", "" },
+        },
+    };
+    const queries = [_][]const u8{
+        "query production monitoring alerts and open incidents datadog pagerduty grafana sentry status page",
+        "incident management on-call alerts",
+    };
+    for (queries) |raw_query| {
+        const query = try lexical_relevance.prepare(raw_query);
+        var page = try retrieve(
+            std.testing.allocator,
+            .{ .query = &query },
+            .skill,
+            &documents,
+        );
+        defer page.deinit(std.testing.allocator);
+
+        try std.testing.expectEqual(@as(usize, 0), page.total_matches);
+        try std.testing.expectEqual(@as(usize, 0), page.matches.len);
+    }
+}
+
+test "exact server identity bypasses the two-hit relevance floor" {
+    const query = try lexical_relevance.prepare("datadog");
+    const documents = [_]Document{
+        .{
+            .identities = .{ "mcp_context7_query-docs", "" },
+            .stable_key = "mcp:context7:query-docs",
+            .primary = .{ "context7", "query-docs", "", "" },
+        },
+        .{
+            .identities = .{ "mcp_datadog_list-monitors", "" },
+            .stable_key = "mcp:datadog:list-monitors",
+            .primary = .{ "datadog", "list-monitors", "", "" },
+        },
+    };
+    var page = try retrieve(
+        std.testing.allocator,
+        .{ .query = &query, .kind = .mcp },
+        .mcp,
+        &documents,
+    );
+    defer page.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), page.total_matches);
+    try std.testing.expectEqual(@as(usize, 1), page.matches.len);
+    try std.testing.expectEqual(@as(usize, 1), page.matches[0].document_index);
+}
+
+test "rare short technical terms remain secondary evidence" {
+    const query = try lexical_relevance.prepare("aws deployment");
+    var documents: [rare_short_token_catalog_divisor]Document = undefined;
+    for (&documents, 0..) |*document, index| {
+        document.* = .{
+            .identities = .{ "generic-helper", "" },
+            .stable_key = if (index == 0) "skill:cloud-helper" else "skill:generic-helper",
+            .primary = .{ if (index == 0) "cloud-helper" else "generic-helper", "", "", "" },
+            .secondary = .{
+                if (index == 0) "AWS deployment guidance" else "General workflow guidance",
+                "",
+                "",
+            },
+        };
+    }
+    var page = try retrieve(
+        std.testing.allocator,
+        .{ .query = &query, .kind = .skill },
+        .skill,
+        &documents,
+    );
+    defer page.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), page.total_matches);
+    try std.testing.expectEqual(@as(usize, 1), page.matches.len);
+    try std.testing.expectEqual(@as(usize, 0), page.matches[0].document_index);
+}
+
+test "intent relevance rejects corpus-wide procedural description terms" {
+    const query = try lexical_relevance.prepare("query list production monitors");
+    const documents = [_]Document{
+        .{
+            .identities = .{ "mcp_context7_query-docs", "" },
+            .stable_key = "mcp:context7:query-docs",
+            .primary = .{ "context7", "query-docs", "", "" },
+            .secondary = .{ "Query and list documentation", "", "" },
+        },
+        .{
+            .identities = .{ "mcp_context7_resolve-library-id", "" },
+            .stable_key = "mcp:context7:resolve-library-id",
+            .primary = .{ "context7", "resolve-library-id", "", "" },
+            .secondary = .{ "Query and list documentation", "", "" },
+        },
+    };
+    var page = try retrieve(
+        std.testing.allocator,
+        .{ .query = &query, .kind = .mcp, .relevance_policy = .intent },
+        .mcp,
+        &documents,
+    );
+    defer page.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), page.total_matches);
+    try std.testing.expectEqual(@as(usize, 0), page.matches.len);
 }
 
 test "inventory cursor partitions twenty eight tools without gaps" {

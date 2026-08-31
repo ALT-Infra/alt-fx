@@ -1447,7 +1447,12 @@ fn orderSkillsForPrompt(alloc: Allocator, skills: []const Skill, prompt: []const
     }
     var page = try capability_retrieval.retrieve(
         alloc,
-        .{ .query = &query, .kind = .skill, .limit = capability_retrieval.max_limit },
+        .{
+            .query = &query,
+            .kind = .skill,
+            .limit = capability_retrieval.max_limit,
+            .relevance_policy = .intent,
+        },
         .skill,
         documents,
     );

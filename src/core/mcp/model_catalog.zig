@@ -8,7 +8,7 @@ const Allocator = std.mem.Allocator;
 const max_prompt_bytes: usize = 4 * 1024;
 const header =
     "Configured MCP servers visible to this model turn are listed below.\n" ++
-    "A listed server is not a reason to use MCP. Search MCP metadata only when the user names that service or the task clearly requires live external data or action unavailable from local, built-in, or skill-guided work. Use capability_search with kind=mcp and an exact server alias. Set cursor=first for the initial page; continue only by copying the exact next_cursors value. Never invent a cursor. Then select one exact relevant result with mcp_select_tool. Do not guess or preload tool schemas.\n" ++
+    "A listed server is not a reason to use MCP. Use capability_search only when the task clearly needs a capability not already available locally. Pass the natural-language task and an optional exact server alias; the runtime owns routing and catalog traversal. Then select one exact relevant MCP result with mcp_select_tool. Do not guess identities, preload schemas, or repeat a no-match search.\n" ++
     "<mcp_servers>\n";
 const footer = "</mcp_servers>\n";
 const empty_entry = "  <none />\n";
@@ -252,7 +252,7 @@ test "render exposes sorted server summaries without tool metadata" {
 
     try std.testing.expectEqualStrings(
         "Configured MCP servers visible to this model turn are listed below.\n" ++
-            "A listed server is not a reason to use MCP. Search MCP metadata only when the user names that service or the task clearly requires live external data or action unavailable from local, built-in, or skill-guided work. Use capability_search with kind=mcp and an exact server alias. Set cursor=first for the initial page; continue only by copying the exact next_cursors value. Never invent a cursor. Then select one exact relevant result with mcp_select_tool. Do not guess or preload tool schemas.\n" ++
+            "A listed server is not a reason to use MCP. Use capability_search only when the task clearly needs a capability not already available locally. Pass the natural-language task and an optional exact server alias; the runtime owns routing and catalog traversal. Then select one exact relevant MCP result with mcp_select_tool. Do not guess identities, preload schemas, or repeat a no-match search.\n" ++
             "<mcp_servers>\n" ++
             "  <server name=\"alpha\" state=\"ready\" tools=\"2\" />\n" ++
             "  <server name=\"zeta\" state=\"authentication_required\" />\n" ++
