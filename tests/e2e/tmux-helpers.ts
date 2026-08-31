@@ -16,7 +16,7 @@ let sessionCounter = 0;
 
 export const FAKE_GATEWAY_MODEL = "openai/gpt-5";
 export const POST_TOOL_DECISION_PROMPT =
-  "Before choosing the next action, identify the concrete unmet requirement. If one remains, use only the tool needed for it. If none remains, respond normally.";
+  "Continue the original task. If any requirement remains, perform the next necessary action now; do not reply with a progress update. Give the final response only after the original task is complete.";
 const TMUX_CAPTURE_MAX_BUFFER = 32 * 1024 * 1024;
 const TMUX_HEX_CHUNK_BYTES = 256;
 const COMPOSER_LINE = /^[ \t]*(?:┃|❯|>)(?:[ \t]|$)/;

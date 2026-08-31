@@ -3956,7 +3956,7 @@ test "processQueuedPrompt denied registered run command compatibility never reac
 
 test "processQueuedPrompt legacy auto denial retains lifecycle source" {
     const alloc = std.testing.allocator;
-    const decision_prompt = "Before choosing the next action, identify the concrete unmet requirement. If one remains, use only the tool needed for it. If none remains, respond normally.";
+    const decision_prompt = "Continue the original task. If any requirement remains, perform the next necessary action now; do not reply with a progress update. Give the final response only after the original task is complete.";
     const calls = [_]ToolCall{toolCall("call_1", "write_file", "{\"path\":\"a\",\"content\":\"x\"}")};
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &calls },
@@ -4306,9 +4306,9 @@ test "batched permission feedback follows every tool result before the next gate
     try std.testing.expect(std.mem.find(u8, results[1].output, "untrusted_assistant_tool_evidence") == null);
 }
 
-test "completed tool batch appends one neutral decision prompt to the next provider request" {
+test "completed tool batch appends one action-oriented decision prompt to the next provider request" {
     const alloc = std.testing.allocator;
-    const decision_prompt = "Before choosing the next action, identify the concrete unmet requirement. If one remains, use only the tool needed for it. If none remains, respond normally.";
+    const decision_prompt = "Continue the original task. If any requirement remains, perform the next necessary action now; do not reply with a progress update. Give the final response only after the original task is complete.";
     const calls = [_]ToolCall{
         toolCall("call_first", "terminal", "{\"action\":\"exec\",\"command\":\"printf first\"}"),
         toolCall("call_second", "terminal", "{\"action\":\"exec\",\"command\":\"printf second\"}"),
@@ -4359,9 +4359,9 @@ test "completed tool batch appends one neutral decision prompt to the next provi
     try std.testing.expect(std.mem.find(u8, turn.assistant, decision_prompt) == null);
 }
 
-test "post-tool provider retry retains exactly one neutral decision prompt" {
+test "post-tool provider retry retains exactly one action-oriented decision prompt" {
     const alloc = std.testing.allocator;
-    const decision_prompt = "Before choosing the next action, identify the concrete unmet requirement. If one remains, use only the tool needed for it. If none remains, respond normally.";
+    const decision_prompt = "Continue the original task. If any requirement remains, perform the next necessary action now; do not reply with a progress update. Give the final response only after the original task is complete.";
     const calls = [_]ToolCall{
         toolCall("call_retry", "terminal", "{\"action\":\"exec\",\"command\":\"printf retry\"}"),
     };

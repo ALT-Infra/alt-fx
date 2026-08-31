@@ -68,7 +68,7 @@ const CredentialRefreshMode = runtime_deps.CredentialRefreshMode;
 
 const http_error_detail_max_bytes: usize = 4096;
 const post_tool_decision_prompt =
-    "Before choosing the next action, identify the concrete unmet requirement. If one remains, use only the tool needed for it. If none remains, respond normally.";
+    "Continue the original task. If any requirement remains, perform the next necessary action now; do not reply with a progress update. Give the final response only after the original task is complete.";
 const repeated_terminal_validation_notice =
     "Repeated terminal validation failures stopped the tool loop. The invalid terminal calls were not executed and produced no terminal effect.";
 const repeated_malformed_arguments_notice =
@@ -107,7 +107,10 @@ test "append_post_tool_decision_prompt appends one no-cache user message only wh
     defer alloc.free(projected);
     try std.testing.expectEqual(@as(usize, 2), projected.len);
     try std.testing.expectEqual(types.ChatRole.user, projected[1].role);
-    try std.testing.expectEqualStrings(post_tool_decision_prompt, projected[1].content.?);
+    try std.testing.expectEqualStrings(
+        "Continue the original task. If any requirement remains, perform the next necessary action now; do not reply with a progress update. Give the final response only after the original task is complete.",
+        projected[1].content.?,
+    );
     try std.testing.expectEqual(types.ChatCachePolicy.no_cache, projected[1].cache_policy);
 }
 

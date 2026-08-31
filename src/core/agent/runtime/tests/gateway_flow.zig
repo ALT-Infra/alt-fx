@@ -649,7 +649,7 @@ test "processQueuedPrompt post-Vision decision prompt leaves the selected-model 
         &gateway,
         2,
         .user,
-        "Before choosing the next action, identify the concrete unmet requirement.",
+        "Continue the original task. If any requirement remains, perform the next necessary action now; do not reply with a progress update. Give the final response only after the original task is complete.",
     );
     try std.testing.expectEqual(@as(?std.http.Status, null), hooks.http_status);
     try std.testing.expectEqualStrings("Recovered final answer", hooks.finish_assistant_text.?);
@@ -3387,7 +3387,7 @@ test "processQueuedPrompt keeps supplied system prompt components in stable orde
         };
         try expectBodyContainsInOrder(&gateway, request_index, &order);
     }
-    try expectGatewayPromptTailText(&gateway, 1, .user, "Before choosing the next action, identify the concrete unmet requirement.");
+    try expectGatewayPromptTailText(&gateway, 1, .user, "Continue the original task. If any requirement remains, perform the next necessary action now; do not reply with a progress update. Give the final response only after the original task is complete.");
 
     try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
     const persisted = hooks.history_turns.items[0].assistant;
@@ -3446,7 +3446,7 @@ test "processQueuedPrompt refreshes runtime overlay each step and preserves turn
     try expectGatewayPromptRoles(&gateway, 1, &second_request_roles);
     const second_request_order = [_][]const u8{ "runtime overlay step two", "user prompt", "Checking.", "\"value\":\"ok\"" };
     try expectBodyContainsInOrder(&gateway, 1, &second_request_order);
-    try expectGatewayPromptTailText(&gateway, 1, .user, "Before choosing the next action, identify the concrete unmet requirement.");
+    try expectGatewayPromptTailText(&gateway, 1, .user, "Continue the original task. If any requirement remains, perform the next necessary action now; do not reply with a progress update. Give the final response only after the original task is complete.");
 }
 
 test "processQueuedPrompt refreshes and acknowledges parent deliveries for each tool step" {
@@ -3677,7 +3677,7 @@ test "processQueuedPrompt projects history exactly once into each gateway reques
         try expectGatewayPromptTextCount(&gateway, i, "past assistant unique history needle", 1);
         try expectGatewayPromptTextCount(&gateway, i, "user prompt", 1);
     }
-    try expectGatewayPromptTailText(&gateway, 1, .user, "Before choosing the next action, identify the concrete unmet requirement.");
+    try expectGatewayPromptTailText(&gateway, 1, .user, "Continue the original task. If any requirement remains, perform the next necessary action now; do not reply with a progress update. Give the final response only after the original task is complete.");
 }
 
 test "processQueuedPrompt keeps completed history before the final current user prompt" {
@@ -3821,7 +3821,7 @@ test "processQueuedPrompt preserves a confirmed provider tool result across reco
         &gateway,
         1,
         .user,
-        "Before choosing the next action, identify the concrete unmet requirement.",
+        "Continue the original task. If any requirement remains, perform the next necessary action now; do not reply with a progress update. Give the final response only after the original task is complete.",
     );
     const execution = hooks.history_turns.items[0].assistant.execution;
     try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
@@ -3871,7 +3871,7 @@ test "processQueuedPrompt preserves a confirmed provider tool result across reco
         &restored_gateway,
         0,
         .user,
-        "Before choosing the next action, identify the concrete unmet requirement.",
+        "Continue the original task. If any requirement remains, perform the next necessary action now; do not reply with a progress update. Give the final response only after the original task is complete.",
     );
 }
 
@@ -3958,7 +3958,7 @@ test "processQueuedPrompt pauses uncertain tool recovery with an inspection acti
 
 test "processQueuedPrompt suppresses a repeated confirmed provider tool identity" {
     const alloc = std.testing.allocator;
-    const decision_prompt = "Before choosing the next action, identify the concrete unmet requirement. If one remains, use only the tool needed for it. If none remains, respond normally.";
+    const decision_prompt = "Continue the original task. If any requirement remains, perform the next necessary action now; do not reply with a progress update. Give the final response only after the original task is complete.";
     const calls = [_]ToolCall{.{
         .id = "provider_search_repeat",
         .name = "perplexity_search",
@@ -4650,7 +4650,7 @@ test "processQueuedPrompt fails closed without stable credential authority" {
 
 test "processQueuedPrompt counts only failed provider attempts across tool followups" {
     const alloc = std.testing.allocator;
-    const decision_prompt = "Before choosing the next action, identify the concrete unmet requirement. If one remains, use only the tool needed for it. If none remains, respond normally.";
+    const decision_prompt = "Continue the original task. If any requirement remains, perform the next necessary action now; do not reply with a progress update. Give the final response only after the original task is complete.";
     const first_calls = [_]ToolCall{
         toolCall("call_first", "read_file", "{\"path\":\"first.txt\"}"),
     };
