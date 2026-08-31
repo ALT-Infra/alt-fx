@@ -20,6 +20,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import {
+  canonicalSubagentIdForStore,
   classifierEvidenceFromRequest,
   fakeGatewayPermissionDecision,
   heldFakeGatewayFinalText,
@@ -3051,7 +3052,7 @@ describe("effect-aware command permissions", () => {
             toolResultText(body, "persistent_create_1"),
           ) as { child_id: string; status: string };
           expect(created.status.length).toBeGreaterThan(0);
-          childId = created.child_id;
+          childId = canonicalSubagentIdForStore(created.child_id);
           return firstRequest.then(async () => {
             await waitForSubagentIdle(root, childId);
             return subagentInspectCall("persistent_inspect_1", childId);
@@ -3301,7 +3302,7 @@ describe("effect-aware command permissions", () => {
             toolResultText(body, rootCreateCallId),
           ) as { child_id: string; status: string };
           expect(created.status.length).toBeGreaterThan(0);
-          childId = created.child_id;
+          childId = canonicalSubagentIdForStore(created.child_id);
           approval = await waitForPendingSubagentApproval(root, childId);
           expect(subagentState(root, childId)).toBe("awaiting_approval");
           await approvalUiObserved;
@@ -3435,7 +3436,7 @@ describe("effect-aware command permissions", () => {
             status: string;
           };
           expect(created.status.length).toBeGreaterThan(0);
-          childId = created.child_id;
+          childId = canonicalSubagentIdForStore(created.child_id);
           return finalText("INTERACTIVE_AUTO_APPROVAL_PARENT_CREATED");
         }
         if (userText.includes(rootPrompt)) {
