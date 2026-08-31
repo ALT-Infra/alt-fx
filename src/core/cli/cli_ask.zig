@@ -394,7 +394,7 @@ const LoadSkillsFn = *const fn (
     []const u8,
     skill_contract.RootPolicy,
 ) app_runtime_setup.LoadSkillsError!app_runtime_setup.LoadedSkills;
-const ProcessQueuedPromptFn = *const fn (*const agent_runtime.AgentRuntimeDeps, ?agent_runtime.SemanticPresentationSink, agent_runtime.LifecycleContext, agent_runtime.Config, worker_runtime.QueuedPrompt) anyerror!void;
+const ProcessQueuedPromptFn = *const fn (*agent_runtime.Agent, *const agent_runtime.AgentRuntimeDeps, ?agent_runtime.SemanticPresentationSink, agent_runtime.LifecycleContext, agent_runtime.Config, worker_runtime.QueuedPrompt) anyerror!void;
 const DiscardPristineSessionFn = *const fn (?*anyopaque, *AskContext, *session_store.LoadedWritableSession) session_store.PristineDiscardDisposition;
 const PersistYoloAcknowledgmentFn = *const fn (Allocator) config_runtime.CommitAttempt;
 
@@ -1716,7 +1716,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     const root_user_intent_context = try auto_classifier_context.buildCanonicalRootUserContext(
         alloc,
         owned_prompt,
-        ctx.session.history.items,
+        ctx.session.agent.history.items,
     );
     defer alloc.free(root_user_intent_context);
     ctx.active_turn_id = if (recovery_checkpoint) |checkpoint|
@@ -1754,7 +1754,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     else
         false;
     ctx.retain_external_root_user_turn = current_prompt_is_root_authority;
-    options.deps.process_queued_prompt(&deps, semantic_presentation, ctx.lifecycleContext(), .{
+    options.deps.process_queued_prompt(&ctx.session.agent, &deps, semantic_presentation, ctx.lifecycleContext(), .{
         .system_prompt = cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = cfg.prompt_policy.modelPromptOverlay(ctx.model),
         .skills_prompt_section = skills_section,
@@ -3675,8 +3675,8 @@ fn testInitializeSessionStoresOneOffDenied(_: *AskContext) !void {
     return error.OneOffSessionNotResumable;
 }
 
-fn processQueuedPromptDefault(deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, lifecycle: agent_runtime.LifecycleContext, config: agent_runtime.Config, job: worker_runtime.QueuedPrompt) !void {
-    return agent_runtime.processQueuedPrompt(deps, semantic_presentation, lifecycle, config, job);
+fn processQueuedPromptDefault(agent: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, lifecycle: agent_runtime.LifecycleContext, config: agent_runtime.Config, job: worker_runtime.QueuedPrompt) !void {
+    return agent_runtime.processAgentPrompt(agent, deps, semantic_presentation, lifecycle, config, job);
 }
 
 fn discardPristineSessionDefault(
@@ -3918,14 +3918,14 @@ fn testPushAssistantText(deps: *const agent_runtime.AgentRuntimeDeps, text: []co
     try deps.push_text(deps.ctx, .{ .assistant_rendered = text });
 }
 
-fn testProcessQueuedPrompt(deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, lifecycle: agent_runtime.LifecycleContext, _: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
+fn testProcessQueuedPrompt(_: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, lifecycle: agent_runtime.LifecycleContext, _: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
     try std.testing.expect(semantic_presentation == null);
     try std.testing.expectEqual(hooks.ScopeKind.ask, lifecycle.scope.kind);
     try std.testing.expectEqualStrings("/tmp/fx-test", lifecycle.scope.workspace_root);
     try testPushAssistantText(deps, "assistant text");
 }
 
-fn testProcessQueuedPromptRecoveryLifecycle(deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, lifecycle: agent_runtime.LifecycleContext, _: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
+fn testProcessQueuedPromptRecoveryLifecycle(_: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, lifecycle: agent_runtime.LifecycleContext, _: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
     try std.testing.expect(semantic_presentation == null);
     try std.testing.expectEqual(hooks.ScopeKind.ask, lifecycle.scope.kind);
     try deps.push_route_recovery_status(deps.ctx, .{
@@ -3939,7 +3939,7 @@ fn testProcessQueuedPromptRecoveryLifecycle(deps: *const agent_runtime.AgentRunt
     try testPushAssistantText(deps, "assistant text");
 }
 
-fn testProcessQueuedPromptRetryAdmissionFailure(deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
+fn testProcessQueuedPromptRetryAdmissionFailure(_: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
     try std.testing.expect(semantic_presentation == null);
     try deps.push_route_recovery_status(deps.ctx, .{
         .kind = .auto_retry,
@@ -3956,14 +3956,14 @@ fn testProcessQueuedPromptRetryAdmissionFailure(deps: *const agent_runtime.Agent
     return error.TestProviderSerializationFailed;
 }
 
-fn testProcessQueuedPromptPartialThenReadFailed(deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
+fn testProcessQueuedPromptPartialThenReadFailed(_: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
     try std.testing.expect(semantic_presentation == null);
     try testPushAssistantText(deps, "partial ");
     try testPushAssistantText(deps, "résumé");
     return error.ReadFailed;
 }
 
-fn testProcessQueuedPromptRepeatsSkillDiagnostic(deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, lifecycle: agent_runtime.LifecycleContext, cfg: agent_runtime.Config, job: worker_runtime.QueuedPrompt) !void {
+fn testProcessQueuedPromptRepeatsSkillDiagnostic(agent: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, lifecycle: agent_runtime.LifecycleContext, cfg: agent_runtime.Config, job: worker_runtime.QueuedPrompt) !void {
     const diagnostics = [_]skill_runtime.SkillDiagnostic{.{
         .path = "/tmp/bad-skill/SKILL.md",
         .source = .workspace_shared,
@@ -3974,10 +3974,10 @@ fn testProcessQueuedPromptRepeatsSkillDiagnostic(deps: *const agent_runtime.Agen
     defer notice.deinit();
     try skill_runtime.writeDiagnosticSummary(std.testing.allocator, &notice.writer, &diagnostics);
     try deps.push_context_notice.?(deps.ctx, notice.written());
-    try testProcessQueuedPrompt(deps, semantic_presentation, lifecycle, cfg, job);
+    try testProcessQueuedPrompt(agent, deps, semantic_presentation, lifecycle, cfg, job);
 }
 
-fn testProcessQueuedPromptChecksTimeout(deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
+fn testProcessQueuedPromptChecksTimeout(_: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
     try std.testing.expect(semantic_presentation == null);
     const ctx: *AskContext = @ptrCast(@alignCast(deps.ctx));
     try std.testing.expectEqual(@as(?usize, std.time.ms_per_s), ctx.command_timeout_ms);
@@ -3996,7 +3996,7 @@ fn testProcessQueuedPromptChecksTimeout(deps: *const agent_runtime.AgentRuntimeD
     try testPushAssistantText(deps, "assistant text");
 }
 
-fn testProcessQueuedPromptChecksExecOnlyTerminal(deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, cfg: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
+fn testProcessQueuedPromptChecksExecOnlyTerminal(_: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, cfg: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
     try std.testing.expect(semantic_presentation == null);
     try std.testing.expect(cfg.session_child_capability == null);
     try std.testing.expect(cfg.ephemeral_command_replay != null);
@@ -4023,7 +4023,7 @@ fn testProcessQueuedPromptChecksExecOnlyTerminal(deps: *const agent_runtime.Agen
     try testPushAssistantText(deps, "assistant text");
 }
 
-fn testProcessQueuedPromptChecksFullTerminal(deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, cfg: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
+fn testProcessQueuedPromptChecksFullTerminal(_: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, cfg: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
     try std.testing.expect(semantic_presentation == null);
     try std.testing.expect(cfg.session_child_capability != null);
     try std.testing.expect(tool_projection_mod.containsName(cfg.advertised_tool_names, "shell"));
@@ -4034,7 +4034,7 @@ fn testProcessQueuedPromptChecksFullTerminal(deps: *const agent_runtime.AgentRun
     try testPushAssistantText(deps, "assistant text");
 }
 
-fn testProcessQueuedPromptChecksInjectedToolSet(deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, cfg: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
+fn testProcessQueuedPromptChecksInjectedToolSet(_: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, cfg: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
     try std.testing.expect(semantic_presentation == null);
     try std.testing.expect(tool_projection_mod.containsName(cfg.advertised_tool_names, "read_file"));
     try std.testing.expect(!tool_projection_mod.containsName(cfg.advertised_tool_names, "run_command"));
@@ -4046,7 +4046,7 @@ fn testProcessQueuedPromptChecksInjectedToolSet(deps: *const agent_runtime.Agent
     try testPushAssistantText(deps, "assistant text");
 }
 
-fn testProcessQueuedPromptHttp413(deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
+fn testProcessQueuedPromptHttp413(_: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
     try std.testing.expect(semantic_presentation == null);
     try deps.push_http_error(
         deps.ctx,
@@ -4056,7 +4056,7 @@ fn testProcessQueuedPromptHttp413(deps: *const agent_runtime.AgentRuntimeDeps, s
     );
 }
 
-fn testProcessQueuedPromptRestrictedProvider(deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
+fn testProcessQueuedPromptRestrictedProvider(_: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
     try std.testing.expect(semantic_presentation == null);
     try deps.push_http_error(
         deps.ctx,
@@ -4066,7 +4066,7 @@ fn testProcessQueuedPromptRestrictedProvider(deps: *const agent_runtime.AgentRun
     );
 }
 
-fn testProcessQueuedPromptUnauthorized(deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, job: worker_runtime.QueuedPrompt) !void {
+fn testProcessQueuedPromptUnauthorized(_: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, job: worker_runtime.QueuedPrompt) !void {
     try std.testing.expect(semantic_presentation == null);
     try deps.push_http_error(
         deps.ctx,
@@ -4076,15 +4076,15 @@ fn testProcessQueuedPromptUnauthorized(deps: *const agent_runtime.AgentRuntimeDe
     );
 }
 
-fn testProcessQueuedPromptUnauthorizedThenHistory(deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, lifecycle: agent_runtime.LifecycleContext, cfg: agent_runtime.Config, job: worker_runtime.QueuedPrompt) !void {
-    try testProcessQueuedPromptUnauthorized(deps, semantic_presentation, lifecycle, cfg, job);
+fn testProcessQueuedPromptUnauthorizedThenHistory(agent: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, lifecycle: agent_runtime.LifecycleContext, cfg: agent_runtime.Config, job: worker_runtime.QueuedPrompt) !void {
+    try testProcessQueuedPromptUnauthorized(agent, deps, semantic_presentation, lifecycle, cfg, job);
     const ctx: *AskContext = @ptrCast(@alignCast(deps.ctx));
     const turn = try session_runtime.makeAssistantTurn(ctx.alloc, job.prompt, "retained response");
     defer types.freeHistoryTurn(ctx.alloc, turn);
     try deps.propagate_history_turn(deps.ctx, turn);
 }
 
-fn testProcessQueuedPromptToolThenUnauthorized(deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, lifecycle: agent_runtime.LifecycleContext, cfg: agent_runtime.Config, job: worker_runtime.QueuedPrompt) !void {
+fn testProcessQueuedPromptToolThenUnauthorized(agent: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, lifecycle: agent_runtime.LifecycleContext, cfg: agent_runtime.Config, job: worker_runtime.QueuedPrompt) !void {
     try deps.push_tool_lifecycle(deps.ctx, .{
         .authoritative_started = .{
             .id = .{ .turn_id = job.turn_id, .call_id = "read_1" },
@@ -4093,11 +4093,11 @@ fn testProcessQueuedPromptToolThenUnauthorized(deps: *const agent_runtime.AgentR
             .activity_kind = .read,
         },
     });
-    try testProcessQueuedPromptUnauthorized(deps, semantic_presentation, lifecycle, cfg, job);
+    try testProcessQueuedPromptUnauthorized(agent, deps, semantic_presentation, lifecycle, cfg, job);
 }
 
-fn testProcessQueuedPromptUnauthorizedThenError(deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, lifecycle: agent_runtime.LifecycleContext, cfg: agent_runtime.Config, job: worker_runtime.QueuedPrompt) !void {
-    try testProcessQueuedPromptUnauthorized(deps, semantic_presentation, lifecycle, cfg, job);
+fn testProcessQueuedPromptUnauthorizedThenError(agent: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, lifecycle: agent_runtime.LifecycleContext, cfg: agent_runtime.Config, job: worker_runtime.QueuedPrompt) !void {
+    try testProcessQueuedPromptUnauthorized(agent, deps, semantic_presentation, lifecycle, cfg, job);
     return error.InjectedPromptFailure;
 }
 
@@ -4130,12 +4130,13 @@ fn testCountImagePreflightStartup(alloc: Allocator, transport: oauth_transport.P
     return testPresentKeyStartup(alloc, transport, secret_store, default_model, default_agent_step_limit);
 }
 
-fn testCountImagePreflightProcess(deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, lifecycle: agent_runtime.LifecycleContext, cfg: agent_runtime.Config, job: worker_runtime.QueuedPrompt) !void {
+fn testCountImagePreflightProcess(agent: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, lifecycle: agent_runtime.LifecycleContext, cfg: agent_runtime.Config, job: worker_runtime.QueuedPrompt) !void {
     test_image_preflight_process_calls += 1;
-    try testProcessQueuedPrompt(deps, semantic_presentation, lifecycle, cfg, job);
+    try testProcessQueuedPrompt(agent, deps, semantic_presentation, lifecycle, cfg, job);
 }
 
 fn testProcessQueuedPromptChecksImageAuthority(
+    agent: *agent_runtime.Agent,
     deps: *const agent_runtime.AgentRuntimeDeps,
     semantic_presentation: ?agent_runtime.SemanticPresentationSink,
     lifecycle: agent_runtime.LifecycleContext,
@@ -4147,12 +4148,13 @@ fn testProcessQueuedPromptChecksImageAuthority(
     try std.testing.expectEqual(@as(usize, 1), job.authorized_image_catalog.len);
     try std.testing.expectEqual(@as(usize, 1), job.authorized_image_catalog[0].id);
     try std.testing.expectEqualStrings(job.images[0].path, job.authorized_image_catalog[0].path);
-    try testProcessQueuedPrompt(deps, semantic_presentation, lifecycle, cfg, job);
+    try testProcessQueuedPrompt(agent, deps, semantic_presentation, lifecycle, cfg, job);
 }
 
 var test_no_save_snapshot_path: ?[]u8 = null;
 
 fn testProcessQueuedPromptCapturesNoSaveSnapshot(
+    agent: *agent_runtime.Agent,
     deps: *const agent_runtime.AgentRuntimeDeps,
     semantic_presentation: ?agent_runtime.SemanticPresentationSink,
     lifecycle: agent_runtime.LifecycleContext,
@@ -4165,6 +4167,7 @@ fn testProcessQueuedPromptCapturesNoSaveSnapshot(
         job.images[0].snapshot_path.?,
     );
     try testProcessQueuedPromptChecksImageAuthority(
+        agent,
         deps,
         semantic_presentation,
         lifecycle,
@@ -4341,7 +4344,7 @@ const TestContextRegistryFixture = struct {
         try messages.append(alloc, .{ .role = .system, .content = test_registry_transient_context });
     }
 
-    fn process(deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, job: worker_runtime.QueuedPrompt) !void {
+    fn process(_: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, job: worker_runtime.QueuedPrompt) !void {
         process_calls += 1;
         try std.testing.expect(semantic_presentation == null);
         try std.testing.expectEqual(expected_gather_calls, gather_calls);
@@ -5481,6 +5484,7 @@ fn testPreviousSigintHandler(_: std.posix.SIG) callconv(.c) void {
 }
 
 fn testProcessQueuedPromptRaisesSigintAndSucceeds(
+    agent: *agent_runtime.Agent,
     deps: *const agent_runtime.AgentRuntimeDeps,
     semantic_presentation: ?agent_runtime.SemanticPresentationSink,
     lifecycle: agent_runtime.LifecycleContext,
@@ -5491,6 +5495,7 @@ fn testProcessQueuedPromptRaisesSigintAndSucceeds(
         _ = std.c.raise(std.posix.SIG.INT);
     }
     try testProcessQueuedPrompt(
+        agent,
         deps,
         semantic_presentation,
         lifecycle,
@@ -5573,6 +5578,7 @@ fn testLoadMcpRuntimeWithCancellation(_: Allocator, _: []const u8, _: mcp_elicit
 }
 
 fn testProcessQueuedPromptAfterStartupCancellation(
+    agent: *agent_runtime.Agent,
     deps: *const agent_runtime.AgentRuntimeDeps,
     semantic_presentation: ?agent_runtime.SemanticPresentationSink,
     lifecycle: agent_runtime.LifecycleContext,
@@ -5581,6 +5587,7 @@ fn testProcessQueuedPromptAfterStartupCancellation(
 ) !void {
     test_startup_cancellation_process_calls += 1;
     try testProcessQueuedPrompt(
+        agent,
         deps,
         semantic_presentation,
         lifecycle,
