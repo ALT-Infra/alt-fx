@@ -5,23 +5,20 @@ const host = @import("host.zig");
 const io_mod = @import("../shared/io.zig");
 const secret = @import("../auth/secret.zig");
 
-const MacSecurity = struct {
-    const err_sec_success: i32 = 0;
-    const err_sec_item_not_found: i32 = -25300;
+const err_sec_success: i32 = 0;
+const err_sec_item_not_found: i32 = -25300;
+const security_framework_path = "/System/Library/Frameworks/Security.framework/Security";
 
-    extern "c" fn SecKeychainFindGenericPassword(
-        keychain_or_array: ?*const anyopaque,
-        service_name_length: u32,
-        service_name: [*]const u8,
-        account_name_length: u32,
-        account_name: [*]const u8,
-        password_length: ?*u32,
-        password_data: ?*?*anyopaque,
-        item_ref: ?*?*anyopaque,
-    ) i32;
-
-    extern "c" fn CFRelease(value: *const anyopaque) void;
-};
+const FindGenericPasswordFn = *const fn (
+    keychain_or_array: ?*const anyopaque,
+    service_name_length: u32,
+    service_name: [*]const u8,
+    account_name_length: u32,
+    account_name: [*]const u8,
+    password_length: ?*u32,
+    password_data: ?*?*anyopaque,
+    item_ref: ?*?*anyopaque,
+) callconv(.c) i32;
 
 pub const service_name = "FX_AI_GATEWAY_API_KEY";
 const mcp_credentials_service_name = "FX_MCP_OAUTH_CREDENTIALS_V1";
@@ -163,8 +160,19 @@ pub fn contains() Error!host.SecretStorePresence {
         return error.KeychainReadFailed;
     const account_len = std.math.cast(u32, account.len) orelse
         return error.KeychainReadFailed;
-    var item: ?*anyopaque = null;
-    const status = MacSecurity.SecKeychainFindGenericPassword(
+    var security = std.DynLib.open(security_framework_path) catch |err| {
+        debug_trace.logf("keychain", "presence failed step=open err={s}", .{@errorName(err)});
+        return error.KeychainReadFailed;
+    };
+    defer security.close();
+    const find_generic_password = security.lookup(
+        FindGenericPasswordFn,
+        "SecKeychainFindGenericPassword",
+    ) orelse {
+        debug_trace.logf("keychain", "presence failed step=lookup", .{});
+        return error.KeychainReadFailed;
+    };
+    const status = find_generic_password(
         null,
         service_len,
         service_name.ptr,
@@ -172,11 +180,10 @@ pub fn contains() Error!host.SecretStorePresence {
         account.ptr,
         null,
         null,
-        &item,
+        null,
     );
-    if (item) |owned| MacSecurity.CFRelease(owned);
-    if (status == MacSecurity.err_sec_success) return .present;
-    if (status == MacSecurity.err_sec_item_not_found) return .missing;
+    if (status == err_sec_success) return .present;
+    if (status == err_sec_item_not_found) return .missing;
     debug_trace.logf("keychain", "presence failed status={d}", .{status});
     return error.KeychainReadFailed;
 }
