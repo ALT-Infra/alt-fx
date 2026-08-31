@@ -812,6 +812,9 @@ test "installed full transcript never publishes a stale closed page" {
     defer runtime.deinit(std.testing.allocator);
 
     try std.testing.expect(runtime.installedFullTranscriptPageProjection() == null);
+    runtime.full_transcript_prepared_page_visible = true;
+    try std.testing.expect(runtime.installedFullTranscriptPageProjection() != null);
+    runtime.full_transcript_prepared_page_visible = false;
     runtime.command_output_display.open_command_block = 0;
     try std.testing.expect(runtime.installedFullTranscriptPageProjection() != null);
     runtime.full_transcript_content_revision = 48;
@@ -9261,9 +9264,9 @@ pub const TranscriptRuntime = struct {
         if (!full_transcript_page.sameSurface(desired, page.source.request)) {
             return null;
         }
-        if (self.full_transcript_page_load.busy() and
-            (self.command_output_display.open_command_block != null or
-                self.full_transcript_prepared_page_visible))
+        if (self.full_transcript_prepared_page_visible or
+            (self.full_transcript_page_load.busy() and
+                self.command_output_display.open_command_block != null))
         {
             return &page.projection;
         }
