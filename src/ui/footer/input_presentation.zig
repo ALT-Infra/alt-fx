@@ -305,23 +305,6 @@ fn slashRawAnchor(input_items: []const u8, prefix: []const u8) ?usize {
     return leading_ws + slash_anchor;
 }
 
-fn modelPickerAnchor(ctx: RenderContext) usize {
-    // The effort and fast stages would otherwise anchor past the completed
-    // model id, pushing their option rows toward the middle of wide
-    // terminals. Pinning them to the model query column keeps every stage
-    // of the /model picker left-aligned like the model stage.
-    if (ctx.model_picker_stage == .model) return ctx.model_completion_anchor;
-    const items = ctx.input.edit_state.input.items;
-    const prefix = "/model ";
-    var trim_start: usize = 0;
-    while (trim_start < items.len and
-        (items[trim_start] == ' ' or items[trim_start] == '\t' or items[trim_start] == '\r' or items[trim_start] == '\n')) : (trim_start += 1)
-    {}
-    if (items.len < trim_start + prefix.len) return ctx.model_completion_anchor;
-    if (!std.ascii.eqlIgnoreCase(items[trim_start .. trim_start + prefix.len], prefix)) return ctx.model_completion_anchor;
-    return trim_start + prefix.len;
-}
-
 pub fn measureRawInputGeometry(
     ctx: RenderContext,
     terminal_cols: u16,
@@ -363,7 +346,7 @@ pub fn measureRawInputGeometryPrepared(
     const raw_anchor: ?usize = if (ctx.queued_editor_active)
         null
     else if (show_model_query)
-        modelPickerAnchor(ctx)
+        ctx.model_completion_anchor
     else if (show_file_query)
         ctx.file_completion_anchor
     else
@@ -387,7 +370,10 @@ pub fn measureRawInputGeometryPrepared(
     else
         0;
     const show_slash_query = slash_query_active and slash_completion_count > 0;
-    const picker_start_col = if (show_model_query or show_file_query or show_slash_query)
+    // Model picker rows (model, effort, and fast stages) render flush left
+    // like the rest of the footer instead of following the query token,
+    // which indents the options oddly once a long model id is present.
+    const picker_start_col = if (!show_model_query and (show_file_query or show_slash_query))
         visual_layout.projectedAnchorColumn(summary, terminal_cols)
     else
         @as(u16, 1);
@@ -1330,10 +1316,9 @@ test "footer tabs are modeled spaces and anchors use modeled columns" {
     var ctx = testRenderContext(&input);
     ctx.model_query_active = true;
     ctx.model_completion_anchor = 1;
-    // The tab consumes 6 cells, leaving 4 on row 0; "/model" (6 cells) word
-    // wraps whole onto row 1, so the anchor projects to column 3.
+    // Model picker rows render flush left regardless of the query anchor.
     const geometry = measureRawInputGeometry(ctx, 10, 20, true, false, true, false);
-    try std.testing.expectEqual(@as(u16, 3), geometry.picker_start_col);
+    try std.testing.expectEqual(@as(u16, 1), geometry.picker_start_col);
 }
 
 test "footer raw geometry windows capped input around the cursor" {
@@ -1438,7 +1423,7 @@ test "footer model and file anchors on earlier soft rows project to cursor row s
     var ctx = testRenderContext(&input);
     ctx.model_query_active = true;
     ctx.model_completion_anchor = 1;
-    try std.testing.expectEqual(@as(u16, 3), measureRawInputGeometry(ctx, 5, 20, true, false, true, false).picker_start_col);
+    try std.testing.expectEqual(@as(u16, 1), measureRawInputGeometry(ctx, 5, 20, true, false, true, false).picker_start_col);
 
     ctx.model_query_active = false;
     ctx.file_query_active = true;
@@ -1446,7 +1431,7 @@ test "footer model and file anchors on earlier soft rows project to cursor row s
     try std.testing.expectEqual(@as(u16, 3), measureRawInputGeometry(ctx, 5, 20, true, false, false, true).picker_start_col);
 }
 
-test "footer effort and fast stages anchor at the model query column" {
+test "footer model picker stages render their option rows flush left" {
     const alloc = std.testing.allocator;
     var input = InputRuntime{};
     defer input.deinit(alloc);
@@ -1457,19 +1442,13 @@ test "footer effort and fast stages anchor at the model query column" {
     ctx.model_query_active = true;
     ctx.model_completion_anchor = text.len;
     ctx.model_picker_stage = .effort;
-    // "❯ " prefix (2 cells) + "/model " (7 cells) + 1.
-    try std.testing.expectEqual(@as(u16, 10), measureRawInputGeometry(ctx, 80, 20, true, false, true, false).picker_start_col);
+    try std.testing.expectEqual(@as(u16, 1), measureRawInputGeometry(ctx, 80, 20, true, false, true, false).picker_start_col);
 
     ctx.model_picker_stage = .fast;
-    try std.testing.expectEqual(@as(u16, 10), measureRawInputGeometry(ctx, 80, 20, true, false, true, false).picker_start_col);
+    try std.testing.expectEqual(@as(u16, 1), measureRawInputGeometry(ctx, 80, 20, true, false, true, false).picker_start_col);
 
     ctx.model_picker_stage = .model;
-    ctx.model_completion_anchor = "/model ".len;
-    try std.testing.expectEqual(@as(u16, 10), measureRawInputGeometry(ctx, 80, 20, true, false, true, false).picker_start_col);
-
-    ctx.model_picker_stage = .effort;
-    ctx.model_completion_anchor = 3;
-    try std.testing.expectEqual(@as(u16, 10), measureRawInputGeometry(ctx, 80, 20, true, false, true, false).picker_start_col);
+    try std.testing.expectEqual(@as(u16, 1), measureRawInputGeometry(ctx, 80, 20, true, false, true, false).picker_start_col);
 }
 
 test "footer slash anchor contract handles top level and argument completions" {
