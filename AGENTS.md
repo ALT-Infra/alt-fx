@@ -297,10 +297,11 @@ cd tests/e2e && bun test tui-resize.test.ts
 
 Set `FX_DEBUG_RECORD=1` to create an automatic private tape under
 `~/.fx/recordings/`. Set `FX_DEBUG_RECORD_SILENT_BANNER=1` as well when the
-developer-only recording notice must stay hidden during a screen share. Use
-`FX_RECORD=<path>` when a test or investigation needs an exact destination.
-Recording dumps every byte fx writes and every resize into a framed binary
-tape. Replay the tape through the built-in virtual terminal:
+developer-only recording notice must stay out of the inline transcript during
+a screen share. The notice remains available in the Ctrl+O full transcript.
+Use `FX_RECORD=<path>` when a test or investigation needs an exact destination.
+Recording dumps every byte fx writes and every resize into a framed binary tape.
+Replay the tape through the built-in virtual terminal:
 
 ```bash
 FX_DEBUG_RECORD=1 ./zig-out/bin/fx

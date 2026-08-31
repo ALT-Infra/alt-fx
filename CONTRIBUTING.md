@@ -384,9 +384,10 @@ test("my scenario", async () => {
 
 For bugs reported by a user, have them run the built binary with an exact
 `FX_RECORD=<path>`, or use `FX_DEBUG_RECORD=1` for an automatic private tape.
-`FX_DEBUG_RECORD_SILENT_BANNER=1` hides the developer-only startup notice
-without disabling capture. Drop the tape in `tests/e2e/tapes/<name>.fxtape`
-and assert against the built replay command:
+`FX_DEBUG_RECORD_SILENT_BANNER=1` hides the developer-only startup notice from
+the inline transcript without disabling capture; Ctrl+O still shows it. Drop
+the tape in `tests/e2e/tapes/<name>.fxtape` and assert against the built replay
+command:
 
 ```bash
 ./zig-out/bin/fx replay tests/e2e/tapes/my-bug.fxtape --golden tests/e2e/tapes/my-bug.txt

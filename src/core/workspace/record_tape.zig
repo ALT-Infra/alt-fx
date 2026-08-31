@@ -23,7 +23,7 @@ const State = struct {
     enabled: bool = false,
     failed: bool = false,
     record_stdin: bool = false,
-    show_startup_notice: bool = false,
+    show_inline_notice: bool = false,
     file: ?std.Io.File = null,
     path: ?[]u8 = null,
     path_alloc: ?Allocator = null,
@@ -51,7 +51,7 @@ const StartupPolicy = struct {
     destination: StartupDestination,
     record_stdin: bool,
     strict_start: bool,
-    show_startup_notice: bool,
+    show_inline_notice: bool,
 };
 
 fn debug_env_truthy(raw: ?[]const u8) bool {
@@ -91,7 +91,7 @@ fn resolve_startup_policy(input: StartupPolicyInput) StartupPolicy {
         .destination = destination,
         .record_stdin = active and record_input_enabled(input.record_input),
         .strict_start = debug_record,
-        .show_startup_notice = active and !debug_env_truthy(input.silent_banner),
+        .show_inline_notice = active and !debug_env_truthy(input.silent_banner),
     };
 }
 
@@ -103,7 +103,7 @@ pub const CaptureStatus = union(enum) {
     inactive,
     active: struct {
         path: []u8,
-        show_startup_notice: bool,
+        show_inline_notice: bool,
     },
     failed,
 
@@ -135,7 +135,7 @@ pub fn configureFromEnv(
             initial_cols,
             initial_rows,
             fx_version,
-            policy.show_startup_notice,
+            policy.show_inline_notice,
         ),
         .explicit => |path| configureWithOptions(
             alloc,
@@ -145,7 +145,7 @@ pub fn configureFromEnv(
             fx_version,
             false,
             false,
-            policy.show_startup_notice,
+            policy.show_inline_notice,
         ) catch |err| {
             if (policy.strict_start) return err;
             return;
@@ -175,7 +175,7 @@ fn configureAutomatic(
     initial_cols: u16,
     initial_rows: u16,
     fx_version: []const u8,
-    show_startup_notice: bool,
+    show_inline_notice: bool,
 ) !void {
     const home = if (io_mod.getenv("HOME")) |value| blk: {
         const trimmed = std.mem.trim(u8, value, " \t\r\n");
@@ -196,7 +196,7 @@ fn configureAutomatic(
         const path = try std.fmt.allocPrint(alloc, "{s}/fx-record-{d}-{s}.fxtape", .{ root, nowMs(), random_hex });
         defer alloc.free(path);
 
-        configureWithOptions(alloc, path, initial_cols, initial_rows, fx_version, true, true, show_startup_notice) catch |err| switch (err) {
+        configureWithOptions(alloc, path, initial_cols, initial_rows, fx_version, true, true, show_inline_notice) catch |err| switch (err) {
             error.PathAlreadyExists => continue,
             else => return err,
         };
@@ -213,7 +213,7 @@ fn configureWithOptions(
     fx_version: []const u8,
     exclusive: bool,
     private: bool,
-    show_startup_notice: bool,
+    show_inline_notice: bool,
 ) !void {
     const zio = io_mod.getIo();
     state_mutex.lockUncancelable(zio);
@@ -238,7 +238,7 @@ fn configureWithOptions(
     const now = nowMs();
     state = .{
         .enabled = true,
-        .show_startup_notice = show_startup_notice,
+        .show_inline_notice = show_inline_notice,
         .file = file,
         .path = owned_path,
         .path_alloc = alloc,
@@ -375,7 +375,7 @@ pub fn captureStatus(alloc: Allocator) !CaptureStatus {
     if (state.enabled and state.path != null) {
         return .{ .active = .{
             .path = try alloc.dupe(u8, state.path.?),
-            .show_startup_notice = state.show_startup_notice,
+            .show_inline_notice = state.show_inline_notice,
         } };
     }
     return if (state.failed) .failed else .inactive;
@@ -766,7 +766,7 @@ test "startup policy resolves recording environment without effects" {
         explicit_path: ?[]const u8 = null,
         record_stdin: bool = false,
         strict_start: bool = false,
-        show_startup_notice: bool = false,
+        show_inline_notice: bool = false,
     }{
         .{
             .input = .{},
@@ -776,7 +776,7 @@ test "startup policy resolves recording environment without effects" {
             .input = .{ .debug_record = "1" },
             .destination = .automatic,
             .strict_start = true,
-            .show_startup_notice = true,
+            .show_inline_notice = true,
         },
         .{
             .input = .{ .debug_record = "0", .record_input = "1" },
@@ -801,7 +801,7 @@ test "startup policy resolves recording environment without effects" {
             .destination = .explicit,
             .explicit_path = "/tmp/explicit.fxtape",
             .strict_start = true,
-            .show_startup_notice = true,
+            .show_inline_notice = true,
         },
         .{
             .input = .{
@@ -810,7 +810,7 @@ test "startup policy resolves recording environment without effects" {
             },
             .destination = .explicit,
             .explicit_path = "/tmp/input-yes.fxtape",
-            .show_startup_notice = true,
+            .show_inline_notice = true,
         },
     };
 
@@ -818,7 +818,7 @@ test "startup policy resolves recording environment without effects" {
         const policy = resolve_startup_policy(case.input);
         try testing.expectEqual(case.record_stdin, policy.record_stdin);
         try testing.expectEqual(case.strict_start, policy.strict_start);
-        try testing.expectEqual(case.show_startup_notice, policy.show_startup_notice);
+        try testing.expectEqual(case.show_inline_notice, policy.show_inline_notice);
         switch (policy.destination) {
             .inactive => try testing.expectEqual(ExpectedDestination.inactive, case.destination),
             .automatic => try testing.expectEqual(ExpectedDestination.automatic, case.destination),

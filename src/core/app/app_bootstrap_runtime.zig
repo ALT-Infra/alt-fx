@@ -388,7 +388,7 @@ pub fn Runtime(comptime App: type) type {
             }
             var recording = try record_tape.captureStatus(app.alloc);
             defer recording.deinit(app.alloc);
-            if (recording == .active and recording.active.show_startup_notice) {
+            if (recording == .active) {
                 const recording_body = try std.fmt.allocPrint(
                     app.alloc,
                     "visual terminal capture: {s}\nvisible terminal content, including typed prompt text, is recorded",
@@ -399,6 +399,7 @@ pub fn Runtime(comptime App: type) type {
                     .topic = "recording",
                     .tone = .warning,
                     .body = recording_body,
+                    .visibility = if (recording.active.show_inline_notice) .compact_and_full else .full_only,
                 }, true);
             }
             {

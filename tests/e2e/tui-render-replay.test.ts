@@ -457,7 +457,7 @@ describe("tui: render record/replay", () => {
   );
 
   test.skipIf(SKIP)(
-    "silent automatic recording omits its banner and remains replayable",
+    "silent automatic recording hides its banner inline but keeps it in Ctrl-O",
     async () => {
       const marker = "silent_automatic_recording_marker";
       const launched = await launchAutomaticRecording({ silentBanner: true });
@@ -467,6 +467,15 @@ describe("tui: render record/replay", () => {
         "visual terminal capture:",
       );
       expect(statSync(launched.tapePath).mode & 0o077).toBe(0);
+
+      await session.sendKeys("C-o");
+      await session.waitForText("Full detail · ctrl o close", 5_000);
+      await session.waitForText("visual terminal capture:", 5_000);
+      await session.sendKeys("C-o");
+      await session.waitForComposer(5_000);
+      expect(await session.captureFullScrollback()).not.toContain(
+        "visual terminal capture:",
+      );
 
       await session.sendText(marker);
       await session.waitForText("fx needs access to Vercel AI Gateway", 5_000);
