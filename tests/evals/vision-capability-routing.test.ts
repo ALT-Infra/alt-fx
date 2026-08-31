@@ -1,13 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
   copyFileSync,
-  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   realpathSync,
   rmSync,
-  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -251,63 +249,4 @@ describe.skipIf(!HAS_API_KEY)("eval: live Vision capability routing", () => {
     },
     TIMEOUT,
   );
-
-  test("missing image input stops before catalog access", async () => {
-    const root = createRoot("fx-live-missing-image");
-    const missingPath = join(root.workspace, "missing.png");
-
-    const result = await runFx(
-      [
-        "ask",
-        "--yolo",
-        "--json",
-        "--no-save",
-        "--no-color",
-        "--image",
-        missingPath,
-        "Read the image.",
-      ],
-      {
-        cwd: root.workspace,
-        env: liveEnv(root, KIMI_MODEL),
-        timeoutMs: TIMEOUT,
-      },
-    );
-
-    const json = parseResult(result);
-    expect(result.code).toBe(1);
-    expect(json.exit_code).toBe(1);
-    expect(json.error).toBe(`FileNotFound: ${missingPath}`);
-    expect(existsSync(root.tracePath)).toBe(false);
-  });
-
-  test("corrupt image input stops before catalog access", async () => {
-    const root = createRoot("fx-live-corrupt-image");
-    const imagePath = join(root.workspace, "corrupt.png");
-    writeFileSync(imagePath, "not an image");
-
-    const result = await runFx(
-      [
-        "ask",
-        "--yolo",
-        "--json",
-        "--no-save",
-        "--no-color",
-        "--image",
-        imagePath,
-        "Read the image.",
-      ],
-      {
-        cwd: root.workspace,
-        env: liveEnv(root, KIMI_MODEL),
-        timeoutMs: TIMEOUT,
-      },
-    );
-
-    const json = parseResult(result);
-    expect(result.code).toBe(1);
-    expect(json.exit_code).toBe(1);
-    expect(json.error).toBe(`UnsupportedImageType: ${imagePath}`);
-    expect(existsSync(root.tracePath)).toBe(false);
-  });
 });

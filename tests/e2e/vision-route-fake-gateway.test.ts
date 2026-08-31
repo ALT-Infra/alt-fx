@@ -1609,6 +1609,49 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
+    "catalog failure explains unresolved image capability in text mode",
+    async () => {
+      const root = createIsolatedRoot();
+      const fixture = createScopedImageFixture(root);
+      const gateway = startImageGateway(
+        [],
+        undefined,
+        new Response("catalog unavailable", { status: 503 }),
+      );
+      try {
+        const result = await runFx(
+          [
+            "ask",
+            "--no-save",
+            "--no-color",
+            "--image",
+            fixture.imagePath,
+            "Describe the attached image.",
+          ],
+          {
+            cwd: root.workspace,
+            env: fakeGatewayEnv(root, gateway, KIMI_MODEL),
+            timeoutMs: TIMEOUT,
+          },
+        );
+
+        expect(result.code).toBe(1);
+        expect(result.stdout).toBe("");
+        expect(result.stderr).toBe(
+          "fx ask: Unable to verify image support for this model, so the image was not sent. Try again later, choose another model, or remove the image.\n",
+        );
+        expect(result.stderr).not.toContain("ModelImageCapabilityUnavailable");
+        expect(gateway.catalogRequests).toBe(1);
+        expect(gateway.chatRequests).toHaveLength(0);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "Vision outage is an ordinary failed tool result with the exact notice",
     async () => {
       const root = createIsolatedRoot();

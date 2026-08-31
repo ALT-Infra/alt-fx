@@ -1184,6 +1184,7 @@ fn writeAskUsage(deps: RunDeps, usage: []const u8) !void {
 fn askErrorNotice(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.ImagePreparationFailed => image_attachments.image_preparation_failed_notice,
+        error.ModelImageCapabilityUnavailable => image_attachments.model_image_capability_unavailable_notice,
         else => null,
     };
 }
@@ -5313,6 +5314,24 @@ test "image preparation failure has stable text and JSON contracts" {
     defer alloc.free(json);
     try std.testing.expectEqualStrings(
         "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"ImagePreparationFailed\"}\n",
+        json,
+    );
+}
+
+test "unresolved image capability has actionable text and stable JSON code" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectEqualStrings(
+        "Unable to verify image support for this model, so the image was not sent. Try again later, choose another model, or remove the image.",
+        askErrorNotice(error.ModelImageCapabilityUnavailable).?,
+    );
+
+    const json = try renderErrorJsonResult(
+        alloc,
+        @errorName(error.ModelImageCapabilityUnavailable),
+    );
+    defer alloc.free(json);
+    try std.testing.expectEqualStrings(
+        "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"ModelImageCapabilityUnavailable\"}\n",
         json,
     );
 }
