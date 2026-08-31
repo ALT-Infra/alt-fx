@@ -2469,7 +2469,7 @@ pub fn reloadAuthorityClaim(
     ) or !std.mem.eql(u8, record.cwd, input.principal.cwd) or
         record.backend != input.principal.backend)
     {
-        return error.PrincipalMismatch;
+        return failReloadedAuthorityClaim(error.PrincipalMismatch);
     }
     const authority = try load_authority(
         alloc,
@@ -2482,21 +2482,21 @@ pub fn reloadAuthorityClaim(
         &authority.value,
     );
     if (record.authority_revoked or authority.value.revoked) {
-        return error.AuthorityRevoked;
+        return failReloadedAuthorityClaim(error.AuthorityRevoked);
     }
     const grant = authority.value.grant;
     if (!grant.principal.eql(input.principal)) {
-        return error.PrincipalMismatch;
+        return failReloadedAuthorityClaim(error.PrincipalMismatch);
     }
     if (record.authority_generation.value != input.generation.value or
         grant.generation.value != input.generation.value)
     {
-        return error.StaleAuthorityGeneration;
+        return failReloadedAuthorityClaim(error.StaleAuthorityGeneration);
     }
     const direct_model_observer = observer_policy and
         grant.actor == .human and input.actor == .agent;
     if (!direct_model_observer and grant.actor != input.actor) {
-        return error.ActorRoleMismatch;
+        return failReloadedAuthorityClaim(error.ActorRoleMismatch);
     }
     const controls = if (direct_model_observer)
         contracts.AllowedControls.observer()
@@ -2507,7 +2507,7 @@ pub fn reloadAuthorityClaim(
     defer std.crypto.secureZero(u8, @volatileCast(proof.bytes[0..]));
     const actual = proof_verifier(proof, grant, observer_policy);
     if (!std.mem.eql(u8, &actual, &authority.value.verifier)) {
-        return error.InvalidHolderProof;
+        return failReloadedAuthorityClaim(error.InvalidHolderProof);
     }
     return operation.ownAuthorityClaim(alloc, .{
         .principal = input.principal,
@@ -2515,6 +2515,26 @@ pub fn reloadAuthorityClaim(
         .generation = input.generation,
         .proof = proof,
     }, controls);
+}
+
+inline fn failReloadedAuthorityClaim(err: anytype) @TypeOf(err)!operation.OwnedAuthorityClaim {
+    return @errorCast(failReloadedAuthorityClaimDynamic(err));
+}
+
+noinline fn failReloadedAuthorityClaimDynamic(err: anyerror) anyerror!operation.OwnedAuthorityClaim {
+    return err;
+}
+
+test "reloaded authority failures preserve exact error types and identities" {
+    const revoked = failReloadedAuthorityClaim(error.AuthorityRevoked);
+    try std.testing.expect(
+        @TypeOf(revoked) == error{AuthorityRevoked}!operation.OwnedAuthorityClaim,
+    );
+    try std.testing.expectError(error.AuthorityRevoked, revoked);
+    try std.testing.expectError(
+        error.InvalidHolderProof,
+        failReloadedAuthorityClaim(error.InvalidHolderProof),
+    );
 }
 
 pub const RecoveredExecutionScope = struct {

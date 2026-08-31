@@ -2341,7 +2341,13 @@ describe("MCP remote authentication lifecycle", () => {
       expect(auth.authorizationRequests).toBe(0);
       await tui.waitForComposer(5_000);
 
-      await tui.sendText("/mcp auth fixture --open");
+      const beforeMenu = await tui.captureFullScrollback();
+      await tui.sendText("/mcp");
+      const menu = await tui.waitForText("Needs authentication", 10_000);
+      expect(menu).toContain("fixture");
+      await tui.sendKeys("Enter");
+      await tui.waitForText("Profile · ~/.fx/mcp.json", 5_000);
+      await tui.sendKeys("Enter");
       const authDeadline = Date.now() + 10_000;
       while (auth.authorizationRequests === 0 && Date.now() < authDeadline) {
         await Bun.sleep(25);
@@ -2352,7 +2358,7 @@ describe("MCP remote authentication lifecycle", () => {
         await Bun.sleep(25);
       }
       expect(auth.tokenExchanges).toBe(1);
-      await tui.waitForText("Authenticated MCP server 'fixture'.", 15_000);
+      await tui.waitForText("MCP configuration reloaded.", 15_000);
       expect(auth.authorizationRequests).toBe(1);
       expect(auth.tokenExchanges).toBe(1);
       const credentialPath = join(
@@ -2364,6 +2370,12 @@ describe("MCP remote authentication lifecycle", () => {
       expect(existsSync(credentialPath)).toBe(true);
       let stored = JSON.parse(readFileSync(credentialPath, "utf8"));
       expect(stored.credentials[0].access_token).toBe(ACCESS_INITIAL);
+
+      await tui.sendKeys("Escape");
+      await tui.waitForText("fixture", 5_000);
+      await tui.sendKeys("Escape");
+      await tui.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
+      expect(await tui.captureFullScrollback()).toBe(beforeMenu);
 
       await tui.kill();
       tui = null;
@@ -2421,15 +2433,28 @@ describe("MCP remote authentication lifecycle", () => {
       });
       await tui.waitForComposer(15_000);
       await tui.sendText("/mcp");
-      const summary = await tui.waitForText("1 ready", 5_000);
-      expect(summary).toContain("Use /mcp list for details.");
+      const summary = await tui.waitForText("MCP 1", 5_000);
+      expect(summary).toContain("fixture");
+      expect(summary).toContain("Ready");
+      await tui.sendKeys("Escape");
+      await tui.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
       await tui.sendText("/mcp list");
       const status = await tui.waitForText("auth=authenticated", 5_000);
       expect(status).not.toContain(ACCESS_REFRESHED);
-      await tui.sendText("/mcp logout fixture");
-      await tui.waitForText("Logged out of MCP server 'fixture'.", 10_000);
+      const beforeLogoutMenu = await tui.captureFullScrollback();
+      await tui.sendText("/mcp");
+      await tui.waitForText("[Servers]", 5_000);
+      await tui.sendKeys("Enter");
+      await tui.waitForText("Profile · ~/.fx/mcp.json", 5_000);
+      await tui.sendKeys("L");
+      await tui.waitForText("Log out of this MCP server?", 5_000);
+      await tui.sendKeys("Enter");
+      await tui.waitForText("MCP reloaded with 1 unavailable server.", 15_000);
       expect(existsSync(credentialPath)).toBe(false);
       expect(auth.revocations).toBe(2);
+      await tui.sendKeys("Escape");
+      await tui.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
+      expect(await tui.captureFullScrollback()).toBe(beforeLogoutMenu);
       await tui.kill();
       tui = null;
 

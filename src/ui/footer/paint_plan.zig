@@ -23,6 +23,7 @@ const model_menu_presentation = @import("model_menu_presentation.zig");
 const skills_menu_presentation = @import("skills_menu_presentation.zig");
 const help_menu_presentation = @import("help_menu_presentation.zig");
 const settings_menu_presentation = @import("settings_menu_presentation.zig");
+const mcp_menu_presentation = @import("mcp_menu_presentation.zig");
 const resume_menu_presentation = @import("resume_menu_presentation.zig");
 const question_ui = @import("question_ui.zig");
 const render_input = @import("render_input.zig");
@@ -842,6 +843,18 @@ pub fn composeFooterFrame(
                 );
                 try pushFooterBandRow(alloc, &frame, plan, rows.picker_start + menu_row_index, &menu_row);
             }
+        } else if (input.picker_kind == .mcp and ctx.mcp_menu.state.active) {
+            var menu_row_index: u16 = 0;
+            while (menu_row_index < input.picker_rows) : (menu_row_index += 1) {
+                var menu_row = try mcp_menu_presentation.composeMcpMenuRow(
+                    alloc,
+                    ctx.mcp_menu,
+                    menu_row_index,
+                    shell.layout.cols,
+                    input.picker_rows,
+                );
+                try pushFooterBandRow(alloc, &frame, plan, rows.picker_start + menu_row_index, &menu_row);
+            }
         } else if (input.picker_kind == .help and ctx.help_menu.active) {
             var menu_row_index: u16 = 0;
             while (menu_row_index < input.picker_rows) : (menu_row_index += 1) {
@@ -1019,6 +1032,13 @@ pub fn composeFooterFrame(
         try input_presentation.composeSkillsMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
     else if (input.show_picker and input.picker_kind == .settings)
         try input_presentation.composeSettingsMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
+    else if (input.show_picker and input.picker_kind == .mcp)
+        try input_presentation.composeMcpMenuHintRow(
+            alloc,
+            shell.layout.cols,
+            ctx.ctrl_c_pending,
+            ctx.mcp_menu.state,
+        )
     else if (input.show_picker and input.picker_kind == .help)
         try input_presentation.composeHelpMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
     else if (input.show_picker and input.picker_kind == .sessions)
@@ -1059,8 +1079,7 @@ fn composeTranscriptViewerFooterFrame(
     errdefer frame.deinit(alloc);
     const width = shell.layout.cols;
     const navigation = switch (input.ctx.transcript_depth) {
-        .review => "Review · ←/→ switch · ctrl o close · PgUp/PgDn scroll · Esc close",
-        .full => "Full detail · ←/→ switch · ctrl o close · PgUp/PgDn scroll · Esc close",
+        .full => "Full detail · ctrl o close · PgUp/PgDn scroll · Esc close",
         .inline_mode => unreachable,
     };
 
@@ -1351,7 +1370,7 @@ test "transcript viewer footer keeps navigation blank row and aligns main status
     };
     defer shell.deinit(alloc);
     var ctx = testContext(&input);
-    ctx.transcript_depth = .review;
+    ctx.transcript_depth = .full;
     const planner_input: FooterPlannerInput = .{
         .active_label = null,
         .ctx = ctx,
@@ -1370,7 +1389,7 @@ test "transcript viewer footer keeps navigation blank row and aligns main status
         &frame,
         frame_plan.paint.footer.top_divider,
         shell.layout.cols,
-        "┃ Review · ←/→ switch · ctrl o close · PgUp/PgDn scroll · Esc close",
+        "┃ Full detail · ctrl o close · PgUp/PgDn scroll · Esc close",
     );
     try expectFrameRowTextTrimmed(
         &frame,
@@ -1404,7 +1423,7 @@ test "transcript viewer footer keeps navigation blank row and aligns main status
         &full_frame,
         full_plan.paint.footer.top_divider,
         shell.layout.cols,
-        "┃ Full detail · ←/→ switch · ctrl o close · PgUp/PgDn scroll · Esc close",
+        "┃ Full detail · ctrl o close · PgUp/PgDn scroll · Esc close",
     );
 }
 

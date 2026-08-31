@@ -752,7 +752,7 @@ pub noinline fn composePickerOptionRow(
     // pickers keep the filled row.
     const selected_style = switch (kind) {
         .model_stage, .models => ui_render.selected_completion_style,
-        .file, .slash, .skills, .help, .settings, .sessions, .auth => ui_render.approval_button_inactive_style,
+        .file, .slash, .skills, .help, .settings, .sessions, .mcp, .auth => ui_render.approval_button_inactive_style,
     };
     try row.appendSlice(alloc, if (selected) selected_style else ui_render.dim_style);
 
@@ -826,6 +826,7 @@ pub fn composePickerStatusRow(
         .help => "no matching commands",
         .settings => "no matching settings",
         .sessions => "no matching sessions",
+        .mcp => "no MCP items available",
         .auth => "authentication actions unavailable",
     };
 
