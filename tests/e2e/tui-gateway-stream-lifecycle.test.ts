@@ -7089,10 +7089,13 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const traceReport = readFileSync(join(root, traceReportName!), "utf8");
       expect(traceReport).toContain("web_search_requests_total: 1 (observed)");
       expect(traceReport).toContain("billable_web_search_calls: 0 (billed)");
-      expect(traceReport).toContain("### Provider Executed");
+      expect(traceReport).toContain("### Web Search");
       expect(traceReport).toContain(
-        "name=exa_search call_id=provider_search_direct status=ok source=provider",
+        "name=web_search status=ok",
       );
+      expect(traceReport).not.toContain("exa_search");
+      expect(traceReport).not.toContain("parallel_search");
+      expect(traceReport).not.toContain("perplexity_search");
       expect(traceReport).not.toContain("(none recorded)");
 
       const replay = execFileSync(FX_BIN, ["replay", tapePath, "--frames"], {

@@ -32,6 +32,7 @@ const session_permission_state = @import("../permissions/session_permission_stat
 const skill_commands = @import("../skills/skill_commands.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const tool_presentation = @import("../tooling/tool_presentation.zig");
 const session_commands = @import("../session/session_commands.zig");
 const usage_recovery = @import("../session/usage_recovery.zig");
 const usage_dashboard_runtime = @import("usage_dashboard_runtime.zig");
@@ -2179,6 +2180,45 @@ noinline fn writeMaskedInline(writer: *std.Io.Writer, alloc: std.mem.Allocator, 
     try writer.writeAll(masked);
 }
 
+fn traceToolDisplayName(tool_name: []const u8) []const u8 {
+    return if (tool_presentation.isProviderSearchAlias(tool_name))
+        "web_search"
+    else
+        tool_name;
+}
+
+fn isTraceToolTokenByte(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or byte == '_';
+}
+
+fn providerSearchAliasPrefixLen(token: []const u8) ?usize {
+    var end: usize = 1;
+    while (end <= token.len) : (end += 1) {
+        if (!tool_presentation.isProviderSearchAlias(token[0..end])) continue;
+        if (end == token.len or token[end] == '_') return end;
+    }
+    return null;
+}
+
+fn writeTraceTextNeutralized(writer: *std.Io.Writer, text: []const u8) !void {
+    var token_start: usize = 0;
+    var scan_index: usize = 0;
+    var written_through: usize = 0;
+    while (scan_index < text.len) {
+        if (!isTraceToolTokenByte(text[scan_index])) {
+            scan_index += 1;
+            continue;
+        }
+        token_start = scan_index;
+        while (scan_index < text.len and isTraceToolTokenByte(text[scan_index])) : (scan_index += 1) {}
+        const alias_len = providerSearchAliasPrefixLen(text[token_start..scan_index]) orelse continue;
+        try writer.writeAll(text[written_through..token_start]);
+        try writer.writeAll("web_search");
+        written_through = token_start + alias_len;
+    }
+    try writer.writeAll(text[written_through..]);
+}
+
 fn writeCurrentStateSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.Allocator) !void {
     const App = @TypeOf(app.*);
     try writer.writeAll("\n## Current State\n");
@@ -2387,7 +2427,7 @@ fn writeProblemsSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.All
     if (lastInterruptedTurn(app.session.history.items)) |entry| {
         count += 1;
         try writer.writeAll("- interrupted turn");
-        if (entry.tool_call) |call| try writer.print(" in_flight_tool={s}", .{call.name});
+        if (entry.tool_call) |call| try writer.print(" in_flight_tool={s}", .{traceToolDisplayName(call.name)});
         if (entry.completed_tool_names.len > 0) try writer.print(" completed_tools={d}", .{entry.completed_tool_names.len});
         try writer.writeByte('\n');
     }
@@ -2656,7 +2696,7 @@ fn writePermissionsSummary(writer: *std.Io.Writer, grants: []const types.Permiss
     }
     try writer.print("\n## Permissions\npermission grants ({d}):\n", .{grants.len});
     for (grants) |grant| {
-        try writer.print("  - {s} :: {s}\n", .{ grant.tool_name, grant.target_path });
+        try writer.print("  - {s} :: {s}\n", .{ traceToolDisplayName(grant.tool_name), grant.target_path });
     }
 }
 
@@ -2682,14 +2722,13 @@ fn writeSubagentsSummary(writer: *std.Io.Writer, alloc: std.mem.Allocator, contr
 
 fn writeToolCallCompact(writer: *std.Io.Writer, call: diagnostics.ToolCallMetric) !void {
     try writeTraceTimestampUtc(writer, call.started_at_ms);
-    try writer.print(" name={s} status={s} duration={d}ms", .{ call.name(), if (call.ok) "ok" else "err", call.duration_ms });
+    try writer.print(" name={s} status={s} duration={d}ms", .{ traceToolDisplayName(call.name()), if (call.ok) "ok" else "err", call.duration_ms });
     if (call.subagent_id != 0) try writer.print(" source=subagent#{d}", .{call.subagent_id}) else try writer.writeAll(" source=parent");
     try writer.writeByte('\n');
 }
 
 const ProviderToolCallSummary = struct {
     call_id: []const u8,
-    tool_name: []const u8,
     status: ?types.PersistedToolStatus,
 };
 
@@ -2721,10 +2760,10 @@ fn projectProviderToolCalls(
         };
         for (execution.tool_steps) |step| {
             for (step.tool_calls) |call| {
-                if (call.provenance != .provider_executed) continue;
+                if (call.provenance != .provider_executed or
+                    !tool_presentation.isProviderSearchAlias(call.name)) continue;
                 const summary: ProviderToolCallSummary = .{
                     .call_id = call.id,
-                    .tool_name = call.name,
                     .status = if (findPersistedToolResult(execution, call.id)) |result|
                         result.status
                     else
@@ -2806,7 +2845,7 @@ noinline fn writeToolCallsSummary(
         }
     }
 
-    try writer.writeAll("### Provider Executed\n");
+    try writer.writeAll("### Web Search\n");
     if (provider_n == 0) {
         try writer.writeAll("(none retained)\n");
         return;
@@ -2814,8 +2853,8 @@ noinline fn writeToolCallsSummary(
     try writer.print("last={d}\n", .{provider_n});
     for (provider_buf[0..provider_n]) |call| {
         try writer.print(
-            "name={s} call_id={s} status={s} source=provider\n",
-            .{ call.tool_name, call.call_id, providerToolStatusLabel(call.status) },
+            "name=web_search status={s}\n",
+            .{providerToolStatusLabel(call.status)},
         );
     }
 }
@@ -2885,7 +2924,7 @@ fn writeLastInterruptedDetail(writer: *std.Io.Writer, items: []const types.Histo
         .interrupted => |t| {
             try writer.writeAll("\n## Interrupted Turn\nlast turn was interrupted by user\n");
             if (t.tool_call) |call| {
-                try writer.print("  in_flight_tool: {s}\n", .{call.name});
+                try writer.print("  in_flight_tool: {s}\n", .{traceToolDisplayName(call.name)});
                 if (call.arguments_json.len > 0) {
                     try writer.writeAll("  in_flight_args:\n");
                     if (call.arguments_json.len > trace_tool_args_max_bytes) {
@@ -2901,7 +2940,7 @@ fn writeLastInterruptedDetail(writer: *std.Io.Writer, items: []const types.Histo
             }
             if (t.completed_tool_names.len > 0) {
                 try writer.print("  completed_tools ({d}):", .{t.completed_tool_names.len});
-                for (t.completed_tool_names) |name| try writer.print(" {s}", .{name});
+                for (t.completed_tool_names) |name| try writer.print(" {s}", .{traceToolDisplayName(name)});
                 try writer.writeByte('\n');
             }
         },
@@ -2950,11 +2989,14 @@ fn writeTraceLogTail(writer: *std.Io.Writer, alloc: std.mem.Allocator, path: []c
     for (lines.items[start..]) |line| {
         const masked = try text_utils.maskSecrets(alloc, line);
         defer if (masked.ptr != line.ptr) alloc.free(masked);
+        const visible = if (masked.len > trace_transcript_max_line_bytes)
+            masked[0..trace_transcript_max_line_bytes]
+        else
+            masked;
+        try writeTraceTextNeutralized(writer, visible);
         if (masked.len > trace_transcript_max_line_bytes) {
-            try writer.writeAll(masked[0..trace_transcript_max_line_bytes]);
             try writer.writeAll(" ...\n");
         } else {
-            try writer.writeAll(masked);
             try writer.writeByte('\n');
         }
     }
@@ -4259,7 +4301,7 @@ test "trace omits web_fetch URL and result bodies from tool-call diagnostics" {
     try std.testing.expect(std.mem.find(u8, text, "result_preview:") == null);
 }
 
-test "trace provider tool calls match results by id without retaining payloads" {
+test "trace web search calls hide provider names and payloads" {
     const alloc = std.testing.allocator;
     diagnostics.resetForTest();
     defer diagnostics.resetForTest();
@@ -4325,13 +4367,32 @@ test "trace provider tool calls match results by id without retaining payloads" 
     try writeToolCallsSummary(&out.writer, alloc, &history);
     const text = out.written();
 
-    try std.testing.expect(std.mem.find(u8, text, "name=exa_search call_id=call_exa status=ok source=provider") != null);
-    try std.testing.expect(std.mem.find(u8, text, "name=parallel_search call_id=call_parallel status=err source=provider") != null);
-    try std.testing.expect(std.mem.find(u8, text, "name=perplexity_search call_id=call_pending status=pending source=provider") != null);
+    try std.testing.expect(std.mem.find(u8, text, "name=web_search status=ok") != null);
+    try std.testing.expect(std.mem.find(u8, text, "name=web_search status=err") != null);
+    try std.testing.expect(std.mem.find(u8, text, "name=web_search status=pending") != null);
+    try std.testing.expect(std.mem.find(u8, text, "call_id=") == null);
+    try std.testing.expect(std.mem.find(u8, text, "exa_search") == null);
+    try std.testing.expect(std.mem.find(u8, text, "parallel_search") == null);
+    try std.testing.expect(std.mem.find(u8, text, "perplexity_search") == null);
     try std.testing.expect(std.mem.find(u8, text, "name=read_file") == null);
     try std.testing.expect(std.mem.find(u8, text, "PROVIDER_ARGUMENT_SECRET") == null);
     try std.testing.expect(std.mem.find(u8, text, "PROVIDER_RESULT_SECRET") == null);
     try std.testing.expect(std.mem.find(u8, text, "(none recorded)") == null);
+}
+
+test "trace text normalizes internal search aliases" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+
+    try writeTraceTextNeutralized(
+        &out.writer,
+        "name=exa_search call_id=exa_search_0 fallback=parallel_search legacy=perplexity_search visible=web_search",
+    );
+
+    try std.testing.expectEqualStrings(
+        "name=web_search call_id=web_search_0 fallback=web_search legacy=web_search visible=web_search",
+        out.written(),
+    );
 }
 
 test "trace provider tool projection keeps the most recent bounded calls" {

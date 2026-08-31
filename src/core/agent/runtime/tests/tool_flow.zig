@@ -1440,6 +1440,13 @@ test "parallel streamed cancellation closes every concrete tool action" {
         toolCall("call_read", "read_file", "{\"path\":\"README.md\"}"),
         toolCall("call_fetch", "web_fetch", "{\"url\":\"https://example.com\"}"),
         toolCall("call_glob", "glob_files", "{\"pattern\":\"README.md\"}"),
+        .{
+            .id = "call_search",
+            .name = "exa_search",
+            .arguments_json = "{}",
+            .provider_result = "{\"results\":[]}",
+            .provenance = .provider_executed,
+        },
     };
     const cancellation_points = [_][]const u8{ "read_file", "web_fetch" };
 
@@ -1464,12 +1471,16 @@ test "parallel streamed cancellation closes every concrete tool action" {
         try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
         try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
         for (calls) |call| {
+            if (call.provenance == .provider_executed) continue;
             try expectSingleTerminalOutcome(
                 hooks.lifecycle_events.items,
                 call.id,
                 .cancelled,
             );
         }
+        try std.testing.expectEqual(@as(usize, 1), hooks.inner_usages.items.len);
+        try std.testing.expectEqualStrings("exa_search", hooks.inner_usage_names.items[0]);
+        try std.testing.expectEqual(@as(u32, 1), hooks.inner_usages.items[0].web_search_requests);
         for (hooks.lifecycle_events.items) |event| {
             if (event != .terminal) continue;
             try std.testing.expect(!std.mem.eql(u8, event.terminal.outcome.summary, "Tool cancelled"));
@@ -5566,7 +5577,7 @@ test "execution cancellation closes every later streamed tool action" {
         toolCall("later_read", "read_file", "{\"path\":\"README.md\"}"),
         .{
             .id = "later_search",
-            .name = "web_search",
+            .name = "exa_search",
             .arguments_json = "{\"query\":\"zig\"}",
             .provider_result = "{\"results\":[]}",
             .provenance = .provider_executed,
@@ -5595,6 +5606,9 @@ test "execution cancellation closes every later streamed tool action" {
     try expectSingleTerminalOutcome(deps.lifecycle_events.items, "active_command", .cancelled);
     try expectSingleTerminalOutcome(deps.lifecycle_events.items, "later_read", .cancelled);
     try expectSingleTerminalOutcome(deps.lifecycle_events.items, "later_search", .completed);
+    try std.testing.expectEqual(@as(usize, 1), deps.inner_usages.items.len);
+    try std.testing.expectEqualStrings("exa_search", deps.inner_usage_names.items[0]);
+    try std.testing.expectEqual(@as(u32, 1), deps.inner_usages.items[0].web_search_requests);
     for (deps.lifecycle_events.items) |event| {
         if (event != .terminal) continue;
         try std.testing.expect(!std.mem.eql(u8, event.terminal.outcome.summary, "Tool cancelled"));

@@ -1376,6 +1376,16 @@ fn providerExecutedResult(call: ToolCall) ?ToolExecutionResult {
     };
 }
 
+fn reportProviderExecutedUsage(
+    deps: *const AgentRuntimeDeps,
+    calls: []const ToolCall,
+) void {
+    for (calls) |call| {
+        const execution = providerExecutedResult(call) orelse continue;
+        runtime_parallel_execution.reportInnerToolUsage(deps, call.name, execution);
+    }
+}
+
 test "provider executed result reports one observed request only for search aliases" {
     const aliases = [_][]const u8{
         "exa_search",
@@ -1434,7 +1444,6 @@ fn appendProviderExecutedToolResult(
     const provider_status = runtime_execution_memory.classifyProviderExecutedResultStatus(
         provider_result,
     );
-    runtime_parallel_execution.reportInnerToolUsage(deps, call.name, execution);
     const prepared = try runtime_execution_memory.prepareToolModelOutput(
         arena,
         config,
@@ -1548,6 +1557,7 @@ fn materializeConfirmedProviderTools(
         completion.provider_state_json,
     );
     var batch: runtime_tool_batch.StepBatchState = .{};
+    reportProviderExecutedUsage(deps, novel_calls);
     for (novel_calls) |call| {
         try appendProviderExecutedToolResult(
             deps,
@@ -4934,7 +4944,7 @@ fn processQueuedPromptLoop(
         if (disposition == .completed and completion.tool_calls.len > 0) {
             const admission = types.authoritativeToolAdmission(completion);
             switch (admission) {
-                .admitted => {},
+                .admitted => reportProviderExecutedUsage(deps, completion.tool_calls),
                 .reject_duplicate_identity => {
                     try stream_ctx.provisional_statuses.finishRejectedCompletions(deps, arena, turn_id, completion.tool_calls, advertised_dynamic_tool_names);
                     debug_trace.eventf("agent", "authoritative_tool_admission_rejected", step_ctx, "failure=duplicate", .{});
