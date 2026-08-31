@@ -1408,6 +1408,7 @@ const InteractiveAuthorizationContext = struct {
 
 const interactive_callback_timeout_ms: i32 = 5 * 60 * 1000;
 const interactive_callback_poll_ms: i32 = 50;
+const interactive_callback_max_accepts: usize = 16;
 
 fn checkAuthorizationCancellation(
     cancellation: operation_control.CancellationSources,
@@ -1465,10 +1466,36 @@ fn requestInteractiveAuthorization(
     if (!try ctx.open_url(ctx.open_ctx, alloc, authorization_url)) {
         return error.McpAuthorizationBrowserOpenFailed;
     }
-    const listener = try waitForInteractiveCallback(ctx.listener, ctx.ipv6_listener, ctx.cancellation);
+    const max_accepts = if (ctx.ipv6_listener == null)
+        1
+    else
+        interactive_callback_max_accepts;
+    var accepts: usize = 0;
+    while (accepts < max_accepts) : (accepts += 1) {
+        const listener = try waitForInteractiveCallback(ctx.listener, ctx.ipv6_listener, ctx.cancellation);
+        var stream = listener.accept(io_mod.getIo()) catch |err| {
+            if (ctx.ipv6_listener != null and
+                (err == error.ConnectionAborted or err == error.WouldBlock))
+            {
+                continue;
+            }
+            return err;
+        };
+        const response = readInteractiveAuthorizationCallback(alloc, stream) catch |err| {
+            stream.close(io_mod.getIo());
+            if (ctx.ipv6_listener != null and err == error.ReadFailed) continue;
+            return err;
+        };
+        stream.close(io_mod.getIo());
+        return response;
+    }
+    return error.InvalidAuthorizationCallback;
+}
 
-    var stream = try listener.accept(io_mod.getIo());
-    defer stream.close(io_mod.getIo());
+fn readInteractiveAuthorizationCallback(
+    alloc: Allocator,
+    stream: std.Io.net.Stream,
+) !AuthorizationResponse {
     setSocketTimeouts(stream.socket.handle, callback_io_timeout_seconds);
     var socket_buffer: [4096]u8 = undefined;
     var reader = stream.reader(io_mod.getIo(), &socket_buffer);
@@ -2036,27 +2063,36 @@ fn validateJsonContentType(content_type: ?[]const u8) !void {
 fn setSocketTimeouts(socket: std.posix.socket_t, seconds: i64) void {
     if (comptime host_target.is_wasm) return;
     const timeout = std.posix.timeval{ .sec = seconds, .usec = 0 };
-    const bytes = std.mem.asBytes(&timeout);
-    std.posix.setsockopt(
+    const receive_rc = std.c.setsockopt(
         socket,
-        std.posix.SOL.SOCKET,
-        std.posix.SO.RCVTIMEO,
-        bytes,
-    ) catch |err| debug_trace.logf(
-        "mcp",
-        "OAuth receive timeout setup failed err={s}",
-        .{@errorName(err)},
+        std.c.SOL.SOCKET,
+        std.c.SO.RCVTIMEO,
+        &timeout,
+        @sizeOf(std.posix.timeval),
     );
-    std.posix.setsockopt(
+    if (receive_rc != 0) {
+        const err = std.posix.errno(receive_rc);
+        debug_trace.logf(
+            "mcp",
+            "OAuth receive timeout setup failed errno={s}",
+            .{@tagName(err)},
+        );
+    }
+    const send_rc = std.c.setsockopt(
         socket,
-        std.posix.SOL.SOCKET,
-        std.posix.SO.SNDTIMEO,
-        bytes,
-    ) catch |err| debug_trace.logf(
-        "mcp",
-        "OAuth send timeout setup failed err={s}",
-        .{@errorName(err)},
+        std.c.SOL.SOCKET,
+        std.c.SO.SNDTIMEO,
+        &timeout,
+        @sizeOf(std.posix.timeval),
     );
+    if (send_rc != 0) {
+        const err = std.posix.errno(send_rc);
+        debug_trace.logf(
+            "mcp",
+            "OAuth send timeout setup failed errno={s}",
+            .{@tagName(err)},
+        );
+    }
 }
 
 fn dupeRequiredSecret(
