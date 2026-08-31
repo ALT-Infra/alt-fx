@@ -17,7 +17,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { FX_BIN, HAS_API_KEY, REPO_ROOT, runFx } from "../evals/eval-helpers";
 import {
-  AUTO_PERPLEXITY_SERIALIZED_TOOL_NAMES,
+  AUTO_EXA_SERIALIZED_TOOL_NAMES,
   customProviderGuidanceState,
   findUnavailableCapabilityReferences,
   parseGatewayRequest,
@@ -1467,10 +1467,10 @@ describe("acp: model-independent", () => {
         expect(request.tools).toHaveLength(18);
         const toolNames = serializedToolNames(oracleRequest);
         expect(toolNames).toEqual(
-          AUTO_PERPLEXITY_SERIALIZED_TOOL_NAMES,
+          AUTO_EXA_SERIALIZED_TOOL_NAMES,
         );
         expect(toolNames.filter((name) => name === "terminal")).toHaveLength(1);
-        expect(toolNames.filter((name) => name === "perplexity_search"))
+        expect(toolNames.filter((name) => name === "exa_search"))
           .toHaveLength(1);
         expect(findUnavailableCapabilityReferences(oracleRequest)).toEqual([]);
         expect(customProviderGuidanceState(oracleRequest)).toEqual({
@@ -7887,7 +7887,7 @@ describe("acp: model-independent", () => {
         await waitForCondition("the code-mode Gateway request", () => gateway.requests.length === 1);
         const codeRequest = parseGatewayRequest(gateway.requests[0]!.body);
         expect(serializedToolNames(codeRequest)).toEqual(
-          AUTO_PERPLEXITY_SERIALIZED_TOOL_NAMES,
+          AUTO_EXA_SERIALIZED_TOOL_NAMES,
         );
         expect(findUnavailableCapabilityReferences(codeRequest)).toEqual([]);
         expect(customProviderGuidanceState(codeRequest).guidanceMessageIndices).toEqual([1]);
