@@ -1464,7 +1464,7 @@ describe("acp: model-independent", () => {
           .map((message) => acpContentText(message.content))
           .join("\n");
         expect(prompt).toContain(submitted);
-        expect(request.tools).toHaveLength(18);
+        expect(request.tools).toHaveLength(17);
         const toolNames = serializedToolNames(oracleRequest);
         expect(toolNames).toEqual(
           AUTO_EXA_SERIALIZED_TOOL_NAMES,
@@ -1474,7 +1474,7 @@ describe("acp: model-independent", () => {
           .toHaveLength(1);
         expect(findUnavailableCapabilityReferences(oracleRequest)).toEqual([]);
         expect(customProviderGuidanceState(oracleRequest)).toEqual({
-          providerToolIndices: [15],
+          providerToolIndices: [14],
           guidanceMessageIndices: [1],
         });
         expect(gateway.requests[0]!.body).not.toContain(
@@ -2191,6 +2191,11 @@ describe("acp: model-independent", () => {
         const prompt = await runPrompt(client, "Find and call the supplied MCP echo tool.", TIMEOUT);
         expect(prompt.promptResult.result.stopReason).toBe("end_turn");
         expect(gateway.requests).toHaveLength(requestStart + 4);
+        expect(
+          acpGatewayRequest(gateway.requests[requestStart]!.body).tools.some(
+            (tool) => tool.name === "memory",
+          ),
+        ).toBe(false);
         expect(acpToolResultText(gateway.requests[requestStart + 1]!.body, "search_http"))
           .toContain(MCP_TOOL_NAME);
         expect(acpToolResultText(gateway.requests[requestStart + 3]!.body, "call_http"))
