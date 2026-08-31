@@ -376,7 +376,6 @@ pub const ExecutorKind = enum {
     read_tool_result,
     write_file,
     edit_file,
-    memory,
     web_fetch,
     web_search,
     run_command,

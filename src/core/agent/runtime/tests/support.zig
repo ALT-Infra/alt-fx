@@ -163,7 +163,6 @@ const test_tools = [_]tool_dispatch.Tool{
     builtin_tools.read_file,
     builtin_tools.write_file,
     builtin_tools.edit_file,
-    builtin_tools.memory,
     builtin_tools.web_fetch,
     builtin_tools.web_search,
     builtin_tools.terminal,

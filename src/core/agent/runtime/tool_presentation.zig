@@ -1315,7 +1315,7 @@ const test_tools = [_]tool_dispatch.Tool{
 };
 const test_tool_registry = tool_dispatch.Registry{ .tools = test_tools[0..] };
 const custom_activity_tool = blk: {
-    var tool = test_builtin_tools.memory;
+    var tool = test_builtin_tools.read_file;
     tool.name = "custom_activity";
     tool.action_label = "Custom activity";
     tool.activity_kind = .open;
@@ -1520,41 +1520,6 @@ test "tool lifecycle uses activity metadata from the supplied registry" {
         &.{},
     ));
     try std.testing.expectEqual(types.ToolActivityKind.open, capture.events.items[0].authoritative_started.activity_kind);
-}
-
-test "memory list authoritative lifecycle is classified as a read" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var capture = ProvisionalStatusTestCapture{
-        .alloc = alloc,
-        .tool_registry = .{ .tools = &.{test_builtin_tools.memory} },
-    };
-    defer capture.deinit();
-    const hooks = capture.hooks();
-
-    try std.testing.expect(try startToolVisibleLifecycle(
-        &hooks,
-        arena,
-        1,
-        null,
-        .{
-            .id = "memory_list",
-            .name = "memory",
-            .arguments_json = "{\"action\":\"list\"}",
-        },
-        null,
-        &.{},
-    ));
-
-    switch (capture.events.items[0]) {
-        .authoritative_started => |event| try std.testing.expectEqual(
-            types.ToolActivityKind.read,
-            event.activity_kind,
-        ),
-        else => return error.TestExpectedEqual,
-    }
 }
 
 test "presentation grouping spans silent tool steps and splits on visible prose" {

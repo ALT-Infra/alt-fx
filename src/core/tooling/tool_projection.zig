@@ -79,32 +79,6 @@ const test_read_file = blk: {
     break :blk spec;
 };
 
-const test_memory = blk: {
-    var spec = test_read_file;
-    spec.name = "memory";
-    spec.description = "Test durable memory. When to use: exercise registered memory projection. When NOT to use: assert product-specific persistence behavior.";
-    spec.model_schema = .{
-        .name = "memory",
-        .description = spec.description,
-        .input_schema = .{
-            .properties = &.{
-                .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "save", "list", "clear" } } },
-                .{ .name = "fact", .json_type = .string },
-            },
-            .required = &.{"action"},
-        },
-    };
-    spec.executor_kind = .memory;
-    spec.activity_kind = .write;
-    spec.requires_approval = false;
-    spec.action_label = "Remembering";
-    spec.completed_action_label = "Remembered";
-    spec.label_arg_kind = .action;
-    spec.label_arg_default = "memory";
-    spec.permission_target_kind = .none;
-    break :blk spec;
-};
-
 const test_write_file = blk: {
     var spec = test_read_file;
     spec.name = "write_file";
@@ -533,7 +507,6 @@ const test_all_tools = [_]tool_dispatch.Tool{
     test_read_file,
     test_write_file,
     test_edit_file,
-    test_memory,
     test_web_fetch,
     test_web_search,
     test_terminal,
@@ -559,7 +532,6 @@ const test_order = [_][]const u8{
     "skill",
     "install_skill",
     "mcp_select_tool",
-    "memory",
     "ask_user_question",
     "web_fetch",
     "web_search",
