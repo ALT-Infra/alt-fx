@@ -1101,8 +1101,6 @@ pub fn providerToolsJson(alloc: Allocator, input: ProviderToolInput) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     if (input.backend.eql(exa_search_backend_id)) {
-        const result_count = @max(@as(usize, input.max_results), 1);
-        const max_characters = @max(input.max_output_chars / result_count, 1);
         try out.writer.print(
             "[{{\"type\":\"provider\",\"id\":\"gateway.exa_search\",\"name\":\"exa_search\",\"args\":{{\"numResults\":{d}",
             .{input.max_results},
@@ -1112,8 +1110,7 @@ pub fn providerToolsJson(alloc: Allocator, input: ProviderToolInput) ![]u8 {
         } else if (hasValues(input.blocked_domains)) {
             try writeExaDomains(&out.writer, "excludeDomains", input.blocked_domains.?);
         }
-        try out.writer.print(",\"contents\":{{\"highlights\":{{\"maxCharacters\":{d}", .{max_characters});
-        try out.writer.writeAll("}}}}]");
+        try out.writer.writeAll(",\"contents\":{\"highlights\":true}}}]");
     } else if (input.backend.eql(perplexity_search_backend_id)) {
         try out.writer.print(
             "[{{\"type\":\"provider\",\"id\":\"gateway.perplexity_search\",\"name\":\"perplexity_search\",\"args\":{{\"maxResults\":{d},\"maxTokens\":{d}",
@@ -1425,7 +1422,7 @@ test "built-in search rejects an unknown provider-owned backend identity" {
     }));
 }
 
-test "private exa worker advertises bounded results with allowed domains" {
+test "private exa worker requests concise highlights with allowed domains" {
     const alloc = std.testing.allocator;
     const allowed_domains = [_][]const u8{"ziglang.org"};
     const tools_json = try providerToolsJson(alloc, .{
@@ -1440,7 +1437,8 @@ test "private exa worker advertises bounded results with allowed domains" {
     try std.testing.expect(std.mem.find(u8, tools_json, "\"name\":\"exa_search\"") != null);
     try std.testing.expect(std.mem.find(u8, tools_json, "\"numResults\":7") != null);
     try std.testing.expect(std.mem.find(u8, tools_json, "\"includeDomains\":[\"ziglang.org\"]") != null);
-    try std.testing.expect(std.mem.find(u8, tools_json, "\"maxCharacters\":585") != null);
+    try std.testing.expect(std.mem.find(u8, tools_json, "\"contents\":{\"highlights\":true}") != null);
+    try std.testing.expect(std.mem.find(u8, tools_json, "maxCharacters") == null);
 }
 
 test "private exa worker preserves blocked domains" {
@@ -1455,7 +1453,7 @@ test "private exa worker preserves blocked domains" {
     defer alloc.free(tools_json);
 
     try std.testing.expect(std.mem.find(u8, tools_json, "\"excludeDomains\":[\"example.com\"]") != null);
-    try std.testing.expect(std.mem.find(u8, tools_json, "\"maxCharacters\":1200") != null);
+    try std.testing.expect(std.mem.find(u8, tools_json, "\"contents\":{\"highlights\":true}") != null);
 }
 
 test "private perplexity worker advertises only selected gateway provider search tool" {
