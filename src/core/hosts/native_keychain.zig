@@ -1,8 +1,27 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
+const host = @import("host.zig");
 const io_mod = @import("../shared/io.zig");
 const secret = @import("../auth/secret.zig");
+
+const MacSecurity = struct {
+    const err_sec_success: i32 = 0;
+    const err_sec_item_not_found: i32 = -25300;
+
+    extern "c" fn SecKeychainFindGenericPassword(
+        keychain_or_array: ?*const anyopaque,
+        service_name_length: u32,
+        service_name: [*]const u8,
+        account_name_length: u32,
+        account_name: [*]const u8,
+        password_length: ?*u32,
+        password_data: ?*?*anyopaque,
+        item_ref: ?*?*anyopaque,
+    ) i32;
+
+    extern "c" fn CFRelease(value: *const anyopaque) void;
+};
 
 pub const service_name = "FX_AI_GATEWAY_API_KEY";
 const mcp_credentials_service_name = "FX_MCP_OAUTH_CREDENTIALS_V1";
@@ -132,6 +151,34 @@ fn posixAccountName(buf: *AccountBuffer) ?[]const u8 {
 
 pub fn load(alloc: std.mem.Allocator) !?[]u8 {
     return loadFromService(alloc, service_name);
+}
+
+/// Checks Keychain metadata only. It never asks Security.framework for the
+/// secret value and never spawns the `security` command-line tool.
+pub fn contains() Error!host.SecretStorePresence {
+    if (comptime builtin.os.tag != .macos) return .missing;
+    var account_buf: AccountBuffer = undefined;
+    const account = try accountName(&account_buf);
+    const service_len = std.math.cast(u32, service_name.len) orelse
+        return error.KeychainReadFailed;
+    const account_len = std.math.cast(u32, account.len) orelse
+        return error.KeychainReadFailed;
+    var item: ?*anyopaque = null;
+    const status = MacSecurity.SecKeychainFindGenericPassword(
+        null,
+        service_len,
+        service_name.ptr,
+        account_len,
+        account.ptr,
+        null,
+        null,
+        &item,
+    );
+    if (item) |owned| MacSecurity.CFRelease(owned);
+    if (status == MacSecurity.err_sec_success) return .present;
+    if (status == MacSecurity.err_sec_item_not_found) return .missing;
+    debug_trace.logf("keychain", "presence failed status={d}", .{status});
+    return error.KeychainReadFailed;
 }
 
 pub fn loadMcpCredentials(alloc: std.mem.Allocator) !?[]u8 {

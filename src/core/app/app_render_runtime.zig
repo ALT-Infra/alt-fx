@@ -2187,8 +2187,12 @@ pub fn Runtime(comptime App: type) type {
                             .{ .top = area.top, .bottom = area.bottom },
                             checkpoint,
                         );
-                        owned_transcript_source = staged.source;
-                        transcript_source = &owned_transcript_source.?;
+                        if (staged.owned_source) |source| {
+                            owned_transcript_source = source;
+                            transcript_source = &owned_transcript_source.?;
+                        } else {
+                            transcript_source = staged.borrowed_source.?;
+                        }
                         prepared_transcript = staged.prepared;
                         footer_frame.paint.viewport = prepared_transcript.?.selection;
                         try validatePreparedTranscriptFitsPlan(&prepared_transcript.?, footer_frame.paint);

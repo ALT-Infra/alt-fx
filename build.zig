@@ -65,6 +65,10 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addImport("build_options", build_options.createModule());
+    if (target.result.os.tag == .macos) {
+        exe.root_module.linkFramework("CoreFoundation", .{});
+        exe.root_module.linkFramework("Security", .{});
+    }
 
     b.installArtifact(exe);
 

@@ -112,7 +112,6 @@ pub fn Runtime(comptime App: type) type {
                 try beginSignIn(app, false);
                 return;
             }
-            try app.auth.refreshSourceInventory(app.alloc);
             app.auth.openPickerForProvider(app.alloc, provider_runtime.provider(app));
             app.shell.render_requests.request(.footer);
         }
@@ -223,7 +222,6 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return;
             }
-            try app.auth.refreshSourceInventory(app.alloc);
             app.auth.openPickerForProvider(app.alloc, provider_runtime.provider(app));
             app.shell.render_requests.request(.footer);
         }
@@ -1739,6 +1737,18 @@ test "setup hub projects the selected provider into the auth picker" {
 
     try std.testing.expect(app.auth.picker_opened);
     try std.testing.expectEqual(model_provider.ProviderId.codex, app.auth.picker_provider);
+}
+
+test "login opens from the authoritative inventory without probing on the input path" {
+    var app: TestApp = .{ .selected_provider = .grok };
+    defer app.deinit();
+
+    try Runtime(TestApp).runLoginCommand(&app);
+
+    try std.testing.expectEqual(@as(usize, 0), app.auth.source_inventory_refresh_count);
+    try std.testing.expect(app.auth.picker_opened);
+    try std.testing.expectEqual(model_provider.ProviderId.grok, app.auth.picker_provider);
+    try std.testing.expect(app.shell.render_requests.footer_requested);
 }
 
 test "OAuth app gating accepts native auth or JS-host auth and rejects neither" {

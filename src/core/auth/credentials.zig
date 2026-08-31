@@ -438,16 +438,18 @@ pub fn sourceExists(
         .grok_subscription => grok_oauth.sourceExists(alloc),
         .stored_key => blk: {
             if (secret_store.isDisabled()) break :blk false;
-            const stored = secret_store.load(alloc) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => {
-                    debug_trace.logf("auth", "source probe failed source=stored_key err={s}", .{@errorName(err)});
-                    break :blk false;
+            break :blk switch (secret_store.presence()) {
+                .present => true,
+                .missing => false,
+                .unavailable => {
+                    debug_trace.logf(
+                        "auth",
+                        "source probe failed source=stored_key err=StoredKeyUnreadable",
+                        .{},
+                    );
+                    return error.StoredKeyUnreadable;
                 },
             };
-            const value = stored orelse break :blk false;
-            secret.zeroAndFree(alloc, value);
-            break :blk true;
         },
     };
 }
@@ -855,12 +857,14 @@ const SecretStoreFixture = struct {
     disabled: bool = false,
     unreadable: bool = false,
     load_calls: usize = 0,
+    presence_calls: usize = 0,
 
     fn provider(self: *@This()) host.SecretStore {
         return .{
             .context = self,
             .backend_label = "test credential store",
             .is_disabled_fn = isDisabled,
+            .presence_fn = presence,
             .load_fn = load,
             .store_fn = store,
             .store_interactive_fn = storeInteractive,
@@ -870,6 +874,13 @@ const SecretStoreFixture = struct {
     fn isDisabled(raw_context: ?*anyopaque) bool {
         const self: *@This() = @ptrCast(@alignCast(raw_context.?));
         return self.disabled;
+    }
+
+    fn presence(raw_context: ?*anyopaque) host.SecretStorePresence {
+        const self: *@This() = @ptrCast(@alignCast(raw_context.?));
+        self.presence_calls += 1;
+        if (self.unreadable) return .unavailable;
+        return if (self.value == null) .missing else .present;
     }
 
     fn load(
@@ -1023,6 +1034,21 @@ test "credential resolution loads a stored key only through the injected host po
     try std.testing.expectEqual(StoredKeyReadStatus.not_attempted, resolution.stored_key_status);
     try std.testing.expectEqual(Source.stored_key, resolution.credential.?.source);
     try std.testing.expectEqualStrings("injected-test-value", resolution.credential.?.token);
+}
+
+test "stored key existence never loads secret bytes" {
+    const alloc = std.testing.allocator;
+    const env = try CredentialTestEnv.install(alloc, &.{});
+    defer env.deinit();
+    var store_fixture = SecretStoreFixture{ .value = "presence-only-secret" };
+
+    try std.testing.expect(try sourceExists(
+        alloc,
+        store_fixture.provider(),
+        .stored_key,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), store_fixture.load_calls);
+    try std.testing.expectEqual(@as(usize, 1), store_fixture.presence_calls);
 }
 
 test "credential resolution preserves unreadable store classification" {

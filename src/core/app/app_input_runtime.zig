@@ -2914,8 +2914,10 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !@hasField(App, "skills")) return;
             if (!app.skills.menu.active) return;
             if (!app.skills.menu.origin.isMention()) {
-                app.skills.menu.setQuery(app.input_runtime.edit_state.input.items);
-                app.skills.menu.clamp(app.skills.items);
+                app.skills.setMenuQuery(
+                    app.alloc,
+                    app.input_runtime.edit_state.input.items,
+                );
                 return;
             }
             const target = app.skills.menu.target orelse return;
@@ -2926,8 +2928,7 @@ pub fn Runtime(comptime App: type) type {
             }
             const end = skillTokenEnd(items, target.start + 1);
             app.skills.menu.target = .{ .start = target.start, .end = end };
-            app.skills.menu.setQuery(items[target.start + 1 .. end]);
-            app.skills.menu.clamp(app.skills.items);
+            app.skills.setMenuQuery(app.alloc, items[target.start + 1 .. end]);
         }
 
         fn syncModelMenu(app: *App) void {

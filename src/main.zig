@@ -1379,7 +1379,7 @@ const App = struct {
         user_prompt_already_presented: bool,
         intent: PromptSubmitIntent,
     ) !bool {
-        try self.reloadSkills();
+        try self.requestSkillsRefresh();
 
         const source_images = if (recovery_checkpoint) |checkpoint|
             checkpoint.user.images
@@ -1881,10 +1881,31 @@ const App = struct {
         return AgentAppRuntime.runSubagentChild(raw, turn, message, admission, cancel);
     }
 
-    pub fn reloadSkills(self: *App) !void {
-        const loaded = try app_runtime_setup.loadSkills(std.heap.c_allocator, self.workspace_root, builtin_skills.root_policy);
-        skill_runtime.traceDiagnostics("interactive_reload", loaded.diagnostics);
-        self.skills.replaceLoaded(std.heap.c_allocator, loaded.dir, loaded.skills, loaded.diagnostics);
+    pub fn requestSkillsRefresh(self: *App) !void {
+        const home = io_mod.getenv("HOME") orelse return;
+        try self.skills.requestRefresh(
+            std.heap.c_allocator,
+            self.workspace_root,
+            home,
+            builtin_skills.root_policy,
+        );
+    }
+
+    fn pollSkillsRefresh(self: *App) !skill_runtime.RefreshCompletion {
+        const home = io_mod.getenv("HOME") orelse return .none;
+        const completion = try self.skills.pollRefresh(
+            std.heap.c_allocator,
+            self.workspace_root,
+            home,
+            builtin_skills.root_policy,
+        );
+        if (completion == .adopted) {
+            skill_runtime.traceDiagnostics(
+                "interactive_refresh",
+                self.skills.diagnostics,
+            );
+        }
+        return completion;
     }
 
     pub fn allowToolForSession(self: *App, tool_name: []const u8, target_path: []const u8) !void {
@@ -2834,6 +2855,10 @@ const App = struct {
             if (self.file_index.joinThreadIfDone(std.heap.c_allocator)) {
                 self.shell.render_requests.request(.footer);
             }
+            switch (try self.pollSkillsRefresh()) {
+                .none, .unchanged => {},
+                .adopted, .failed => self.shell.render_requests.request(.footer),
+            }
         }
         if (try self.model_cache.pollLoadTransition()) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
@@ -2900,10 +2925,18 @@ const App = struct {
         if (comptime !host_target.is_wasm) {
             try SessionAppRuntime.pollSessionPicker(self);
         }
+        try self.shell.prewarmFullTranscriptPage(
+            self.fullTranscriptSidecarCapability(),
+            self.fullTranscriptDiffResolver(),
+        );
         if (try self.shell.pollFullTranscriptPageLoad()) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .modal);
         }
         if (self.subagents.childConversationRuntime()) |child| {
+            try child.prewarmFullTranscriptPage(
+                null,
+                self.subagents.childFullTranscriptDiffResolver(),
+            );
             if (try child.pollFullTranscriptPageLoad()) {
                 RenderAppRuntime.requestActiveSurfaceFrame(self, .modal);
             }

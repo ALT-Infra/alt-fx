@@ -1093,6 +1093,59 @@ const SkillMenuViewEntry = struct {
     actual_index: usize,
 };
 
+/// Owns one materialized menu query. Rebuilding mutates only this private
+/// buffer; consumers borrow it until the next rebuild or deinit.
+pub const SkillMenuIndex = struct {
+    actual_indices: std.ArrayList(u32) = .empty,
+
+    pub fn deinit(self: *SkillMenuIndex, alloc: Allocator) void {
+        self.actual_indices.deinit(alloc);
+        self.* = .{};
+    }
+
+    pub fn rebuild(
+        self: *SkillMenuIndex,
+        alloc: Allocator,
+        skills: []const Skill,
+        filter: SkillMenuSourceFilter,
+        query: []const u8,
+    ) Allocator.Error!void {
+        try self.actual_indices.ensureTotalCapacity(alloc, skills.len);
+        self.rebuildAssumeCapacity(skills, filter, query);
+    }
+
+    fn rebuildAssumeCapacity(
+        self: *SkillMenuIndex,
+        skills: []const Skill,
+        filter: SkillMenuSourceFilter,
+        query: []const u8,
+    ) void {
+        std.debug.assert(self.actual_indices.capacity >= skills.len);
+        std.debug.assert(skills.len <= std.math.maxInt(u32));
+        self.actual_indices.clearRetainingCapacity();
+
+        var view = SkillMenuView.init(skills, filter, query);
+        while (view.next()) |entry| {
+            self.actual_indices.appendAssumeCapacity(@intCast(entry.actual_index));
+        }
+    }
+
+    pub fn count(self: *const SkillMenuIndex) usize {
+        return self.actual_indices.items.len;
+    }
+
+    pub fn skillAt(
+        self: *const SkillMenuIndex,
+        skills: []const Skill,
+        display_index: usize,
+    ) ?*const Skill {
+        if (display_index >= self.actual_indices.items.len) return null;
+        const actual_index: usize = self.actual_indices.items[display_index];
+        if (actual_index >= skills.len) return null;
+        return &skills[actual_index];
+    }
+};
+
 const SkillMenuView = struct {
     skills: []const Skill,
     filter: SkillMenuSourceFilter,
@@ -1204,28 +1257,31 @@ pub const SkillMenu = struct {
     }
 
     pub fn openWithQuery(self: *SkillMenu, items: []const Skill, origin: SkillMenuOrigin, target: ?SkillMenuTarget, query_text: []const u8) void {
+        self.beginOpen(origin, target, query_text);
+        self.clamp(items);
+    }
+
+    fn beginOpen(self: *SkillMenu, origin: SkillMenuOrigin, target: ?SkillMenuTarget, query_text: []const u8) void {
         self.active = true;
         self.source_filter = .all;
         self.origin = origin;
         self.target = target;
         self.setQuery(query_text);
-        self.clamp(items);
     }
 
     pub fn openFocused(self: *SkillMenu, items: []const Skill, filter: SkillMenuSourceFilter, index: usize) void {
+        self.beginOpenFocused(filter, index);
+        self.clamp(items);
+    }
+
+    fn beginOpenFocused(self: *SkillMenu, filter: SkillMenuSourceFilter, index: usize) void {
         self.active = true;
         self.source_filter = filter;
         self.origin = .command;
         self.target = null;
         self.setQuery("");
-        const item_count = self.filteredItemCount(items);
-        self.selected_index = if (item_count == 0) 0 else @min(index, item_count - 1);
-        self.window_start = list_window.updateEdgeStart(
-            self.window_start,
-            item_count,
-            self.selected_index,
-            skill_menu_max_visible_rows,
-        );
+        self.selected_index = index;
+        self.window_start = 0;
     }
 
     pub fn close(self: *SkillMenu) void {
@@ -1247,7 +1303,10 @@ pub const SkillMenu = struct {
     }
 
     pub fn moveVisibleRows(self: *SkillMenu, items: []const Skill, delta: i32, visible_rows: u16) bool {
-        const item_count = self.filteredItemCount(items);
+        return self.moveVisibleRowsCount(self.filteredItemCount(items), delta, visible_rows);
+    }
+
+    fn moveVisibleRowsCount(self: *SkillMenu, item_count: usize, delta: i32, visible_rows: u16) bool {
         if (!self.active or item_count == 0) return false;
         const max_rows: u16 = @max(visible_rows, 1);
         // Clamp at both ends instead of wrapping: at the top the selection
@@ -1267,6 +1326,12 @@ pub const SkillMenu = struct {
     }
 
     pub fn moveSourceFilter(self: *SkillMenu, items: []const Skill, delta: i32) bool {
+        if (!self.advanceSourceFilter(delta)) return false;
+        self.clamp(items);
+        return true;
+    }
+
+    fn advanceSourceFilter(self: *SkillMenu, delta: i32) bool {
         if (!self.active) return false;
         const count = skill_menu_source_filters.len;
         const current = skillMenuSourceFilterIndex(self.source_filter);
@@ -1276,12 +1341,14 @@ pub const SkillMenu = struct {
         self.source_filter = skill_menu_source_filters[@intCast(next)];
         self.selected_index = 0;
         self.window_start = 0;
-        self.clamp(items);
         return true;
     }
 
     pub fn clamp(self: *SkillMenu, items: []const Skill) void {
-        const item_count = self.filteredItemCount(items);
+        self.clampCount(self.filteredItemCount(items));
+    }
+
+    fn clampCount(self: *SkillMenu, item_count: usize) void {
         if (item_count == 0) {
             self.selected_index = 0;
             self.window_start = 0;
@@ -1301,6 +1368,158 @@ pub const SkillMenu = struct {
     }
 };
 
+pub const LoadedCatalog = struct {
+    dir: []u8 = &.{},
+    skills: []Skill = &.{},
+    diagnostics: []SkillDiagnostic = &.{},
+
+    pub fn deinit(self: *LoadedCatalog, alloc: Allocator) void {
+        if (self.dir.len > 0) alloc.free(self.dir);
+        freeSkills(alloc, self.skills);
+        freeSkillDiagnostics(alloc, self.diagnostics);
+        self.* = .{};
+    }
+};
+
+pub const RefreshCompletion = enum {
+    none,
+    unchanged,
+    adopted,
+    failed,
+};
+
+const CatalogRefreshTask = struct {
+    alloc: Allocator,
+    thread: ?std.Thread = null,
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    workspace_root: []u8,
+    home: []u8,
+    skills_dir: []u8,
+    root_policy: skill_contract.RootPolicy,
+    catalog: ?LoadedCatalog = null,
+    failure: ?anyerror = null,
+
+    fn create(
+        alloc: Allocator,
+        workspace_root: []const u8,
+        home: []const u8,
+        skills_dir: []const u8,
+        root_policy: skill_contract.RootPolicy,
+    ) Allocator.Error!*CatalogRefreshTask {
+        const task = try alloc.create(CatalogRefreshTask);
+        errdefer alloc.destroy(task);
+        const owned_workspace = try alloc.dupe(u8, workspace_root);
+        errdefer alloc.free(owned_workspace);
+        const owned_home = try alloc.dupe(u8, home);
+        errdefer alloc.free(owned_home);
+        const owned_skills_dir = try alloc.dupe(u8, skills_dir);
+        errdefer alloc.free(owned_skills_dir);
+        task.* = .{
+            .alloc = alloc,
+            .workspace_root = owned_workspace,
+            .home = owned_home,
+            .skills_dir = owned_skills_dir,
+            .root_policy = root_policy,
+        };
+        return task;
+    }
+
+    fn start(self: *CatalogRefreshTask) !void {
+        if (comptime @import("builtin").single_threaded) {
+            self.run();
+            return;
+        }
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    fn run(self: *CatalogRefreshTask) void {
+        if (self.cancel_requested.load(.acquire)) {
+            self.done.store(true, .release);
+            return;
+        }
+        const discovery = loadVisibleSkills(
+            self.alloc,
+            self.workspace_root,
+            self.home,
+            self.skills_dir,
+            self.root_policy,
+        ) catch |err| {
+            self.failure = err;
+            self.done.store(true, .release);
+            return;
+        };
+        var catalog = LoadedCatalog{
+            .dir = self.alloc.dupe(u8, self.skills_dir) catch |err| {
+                var owned = discovery;
+                owned.deinit(self.alloc);
+                self.failure = err;
+                self.done.store(true, .release);
+                return;
+            },
+            .skills = discovery.skills,
+            .diagnostics = discovery.diagnostics,
+        };
+        if (self.cancel_requested.load(.acquire)) {
+            catalog.deinit(self.alloc);
+        } else {
+            self.catalog = catalog;
+        }
+        self.done.store(true, .release);
+    }
+
+    fn takeCatalog(self: *CatalogRefreshTask) ?LoadedCatalog {
+        const catalog = self.catalog orelse return null;
+        self.catalog = null;
+        return catalog;
+    }
+
+    fn deinit(self: *CatalogRefreshTask) void {
+        self.cancel_requested.store(true, .release);
+        if (self.thread) |thread| thread.join();
+        if (self.catalog) |*catalog| catalog.deinit(self.alloc);
+        self.alloc.free(self.workspace_root);
+        self.alloc.free(self.home);
+        self.alloc.free(self.skills_dir);
+        const alloc = self.alloc;
+        alloc.destroy(self);
+    }
+};
+
+fn catalogMatches(runtime: *const Runtime, catalog: LoadedCatalog) bool {
+    if (!std.mem.eql(u8, runtime.dir, catalog.dir) or
+        runtime.items.len != catalog.skills.len or
+        runtime.diagnostics.len != catalog.diagnostics.len)
+    {
+        return false;
+    }
+    for (runtime.items, catalog.skills) |active, refreshed| {
+        if (!std.mem.eql(u8, active.name, refreshed.name) or
+            !std.mem.eql(u8, active.description, refreshed.description) or
+            !std.mem.eql(u8, active.path, refreshed.path) or
+            active.source != refreshed.source or
+            !optionalStringEqual(active.read_authority, refreshed.read_authority))
+        {
+            return false;
+        }
+    }
+    for (runtime.diagnostics, catalog.diagnostics) |active, refreshed| {
+        if (!std.mem.eql(u8, active.path, refreshed.path) or
+            active.source != refreshed.source or
+            active.scope != refreshed.scope or
+            !std.meta.eql(active.cause, refreshed.cause))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn optionalStringEqual(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, left.?, right.?);
+}
+
 fn skillMenuSourceFilterIndex(filter: SkillMenuSourceFilter) usize {
     for (skill_menu_source_filters, 0..) |candidate, index| {
         if (candidate == filter) return index;
@@ -1313,10 +1532,86 @@ pub const Runtime = struct {
     items: []Skill = &.{},
     diagnostics: []SkillDiagnostic = &.{},
     menu: SkillMenu = .{},
+    menu_index: SkillMenuIndex = .{},
+    menu_index_ready: bool = false,
+    refresh_task: ?*CatalogRefreshTask = null,
+    refresh_pending: bool = false,
 
     pub fn deinit(self: *Runtime, alloc: Allocator) void {
+        if (self.refresh_task) |task| task.deinit();
+        self.refresh_task = null;
         self.freeLoaded(alloc);
         self.menu.close();
+        self.menu_index.deinit(alloc);
+    }
+
+    pub fn requestRefresh(
+        self: *Runtime,
+        alloc: Allocator,
+        workspace_root: []const u8,
+        home: []const u8,
+        root_policy: skill_contract.RootPolicy,
+    ) !void {
+        if (self.refresh_task != null) {
+            self.refresh_pending = true;
+            return;
+        }
+        const task = try CatalogRefreshTask.create(
+            alloc,
+            workspace_root,
+            home,
+            self.dir,
+            root_policy,
+        );
+        errdefer task.deinit();
+        try task.start();
+        self.refresh_task = task;
+    }
+
+    pub fn pollRefresh(
+        self: *Runtime,
+        alloc: Allocator,
+        workspace_root: []const u8,
+        home: []const u8,
+        root_policy: skill_contract.RootPolicy,
+    ) !RefreshCompletion {
+        const task = self.refresh_task orelse return .none;
+        if (!task.done.load(.acquire)) return .none;
+        if (task.thread) |thread| {
+            thread.join();
+            task.thread = null;
+        }
+        self.refresh_task = null;
+        defer task.deinit();
+        var completion: RefreshCompletion = .failed;
+        if (task.failure == null) {
+            if (task.takeCatalog()) |catalog_value| {
+                var catalog = catalog_value;
+                defer catalog.deinit(alloc);
+                if (catalogMatches(self, catalog)) {
+                    completion = .unchanged;
+                } else {
+                    try self.replaceLoaded(
+                        alloc,
+                        catalog.dir,
+                        catalog.skills,
+                        catalog.diagnostics,
+                    );
+                    catalog = .{};
+                    completion = .adopted;
+                }
+            }
+        }
+        if (self.refresh_pending) {
+            self.refresh_pending = false;
+            try self.requestRefresh(
+                alloc,
+                workspace_root,
+                home,
+                root_policy,
+            );
+        }
+        return completion;
     }
 
     fn freeLoaded(self: *Runtime, alloc: Allocator) void {
@@ -1328,20 +1623,69 @@ pub const Runtime = struct {
         self.diagnostics = &.{};
     }
 
-    pub fn replaceLoaded(self: *Runtime, alloc: Allocator, dir: []u8, skills: []Skill, diagnostics: []SkillDiagnostic) void {
+    /// Transfers `dir`, `skills`, and `diagnostics` only after the menu index
+    /// has reserved enough storage. On failure the caller retains all inputs
+    /// and the current runtime catalog remains unchanged.
+    pub fn replaceLoaded(
+        self: *Runtime,
+        alloc: Allocator,
+        dir: []u8,
+        skills: []Skill,
+        diagnostics: []SkillDiagnostic,
+    ) Allocator.Error!void {
+        try self.menu_index.actual_indices.ensureTotalCapacity(alloc, skills.len);
         self.freeLoaded(alloc);
         self.dir = dir;
         self.items = skills;
         self.diagnostics = diagnostics;
-        self.menu.clamp(self.items);
+        self.menu_index.rebuildAssumeCapacity(
+            self.items,
+            self.menu.source_filter,
+            self.menu.query(),
+        );
+        self.menu_index_ready = true;
+        self.menu.clampCount(self.menu_index.count());
+    }
+
+    pub fn prepareMenuIndex(self: *Runtime, alloc: Allocator) Allocator.Error!void {
+        try self.menu_index.rebuild(
+            alloc,
+            self.items,
+            self.menu.source_filter,
+            self.menu.query(),
+        );
+        self.menu_index_ready = true;
+    }
+
+    fn rebuildPreparedMenuIndex(self: *Runtime) void {
+        if (self.menu_index.actual_indices.capacity < self.items.len) {
+            self.menu_index.actual_indices.clearRetainingCapacity();
+            self.menu_index_ready = false;
+            return;
+        }
+        self.menu_index.rebuildAssumeCapacity(
+            self.items,
+            self.menu.source_filter,
+            self.menu.query(),
+        );
+        self.menu_index_ready = true;
+    }
+
+    pub fn menuItemCount(self: Runtime) usize {
+        if (self.menu_index_ready) return self.menu_index.count();
+        return self.menu.filteredItemCount(self.items);
     }
 
     pub fn openMenu(self: *Runtime) void {
-        self.menu.open(self.items);
+        self.menu.beginOpen(.command, null, "");
+        self.rebuildPreparedMenuIndex();
+        self.menu.clampCount(self.menuItemCount());
     }
 
     pub fn openMenuWithQuery(self: *Runtime, origin: SkillMenuOrigin, target: ?SkillMenuTarget, query: []const u8) void {
-        self.menu.openWithQuery(self.items, origin, target, query);
+        self.menu.beginOpen(origin, target, query);
+        self.rebuildPreparedMenuIndex();
+        self.menu.clampCount(self.menuItemCount());
     }
 
     pub fn openMenuFocusedByName(self: *Runtime, name: []const u8) bool {
@@ -1354,8 +1698,18 @@ pub const Runtime = struct {
         const actual_index = matched_index orelse return false;
         const skill = self.items[actual_index];
         const filter = skillMenuFilterForSource(skill.source);
-        const display_index = skillMenuDisplayIndexForActual(self.items, filter, actual_index) orelse return false;
-        self.menu.openFocused(self.items, filter, display_index);
+        self.menu.beginOpenFocused(filter, 0);
+        self.rebuildPreparedMenuIndex();
+        const display_index = if (self.menu_index_ready)
+            std.mem.indexOfScalar(
+                u32,
+                self.menu_index.actual_indices.items,
+                @intCast(actual_index),
+            )
+        else
+            skillMenuDisplayIndexForActual(self.items, filter, actual_index);
+        self.menu.selected_index = display_index orelse return false;
+        self.menu.clampCount(self.menuItemCount());
         return true;
     }
 
@@ -1364,21 +1718,59 @@ pub const Runtime = struct {
     }
 
     pub fn moveMenuSelection(self: *Runtime, delta: i32) bool {
-        return self.menu.move(self.items, delta);
+        return self.menu.moveVisibleRowsCount(
+            self.menuItemCount(),
+            delta,
+            skill_menu_max_visible_rows,
+        );
     }
 
     pub fn moveMenuSelectionVisibleRows(self: *Runtime, delta: i32, visible_rows: u16) bool {
-        return self.menu.moveVisibleRows(self.items, delta, visible_rows);
+        return self.menu.moveVisibleRowsCount(self.menuItemCount(), delta, visible_rows);
     }
 
     pub fn moveMenuSourceFilter(self: *Runtime, delta: i32) bool {
-        return self.menu.moveSourceFilter(self.items, delta);
+        if (!self.menu.advanceSourceFilter(delta)) return false;
+        self.rebuildPreparedMenuIndex();
+        self.menu.clampCount(self.menuItemCount());
+        return true;
+    }
+
+    pub fn setMenuQuery(
+        self: *Runtime,
+        _: Allocator,
+        query: []const u8,
+    ) void {
+        self.menu.setQuery(query);
+        self.rebuildPreparedMenuIndex();
+        const item_count = self.menuItemCount();
+        if (item_count == 0) {
+            self.menu.selected_index = 0;
+            self.menu.window_start = 0;
+            return;
+        }
+        if (self.menu.selected_index >= item_count) {
+            self.menu.selected_index = item_count - 1;
+        }
+        self.menu.window_start = list_window.updateEdgeStart(
+            self.menu.window_start,
+            item_count,
+            self.menu.selected_index,
+            skill_menu_max_visible_rows,
+        );
     }
 
     pub fn selectedMenuSkill(self: Runtime) ?Skill {
         if (!self.menu.active) return null;
-        const item_count = self.menu.filteredItemCount(self.items);
+        const item_count = self.menuItemCount();
         if (item_count == 0) return null;
+        if (self.menu_index_ready) {
+            const skill = self.menu_index.skillAt(
+                self.items,
+                self.menu.selected_index % item_count,
+            ) orelse return null;
+            return skill.*;
+        }
         return skillMenuSkillAtQuery(self.items, self.menu.source_filter, self.menu.query(), self.menu.selected_index % item_count);
     }
 
@@ -2064,6 +2456,161 @@ test "skill menu query ranks name matches before metadata matches" {
     try std.testing.expectEqual(@as(usize, 3), skillMenuDisplayIndexForActualQuery(&skills, .all, "zig", 0).?);
 }
 
+test "skill menu index materializes and reuses one stable query snapshot" {
+    const alloc = std.testing.allocator;
+    const skills = [_]Skill{
+        .{ .name = "zig-best-practices", .description = "Zig guidance", .path = "/skills/zig", .source = .global_fx },
+        .{ .name = "pure-core", .description = "Functional core", .path = "/skills/pure", .source = .global_codex },
+        .{ .name = "zig-review", .description = "Review Zig", .path = "/skills/review", .source = .workspace_agents },
+    };
+
+    var index: SkillMenuIndex = .{};
+    defer index.deinit(alloc);
+
+    try index.rebuild(alloc, &skills, .all, "zig");
+    try std.testing.expectEqual(@as(usize, 2), index.count());
+    try std.testing.expectEqualStrings("zig-best-practices", index.skillAt(&skills, 0).?.name);
+    try std.testing.expectEqualStrings("zig-review", index.skillAt(&skills, 1).?.name);
+    const retained_ptr = index.actual_indices.items.ptr;
+    const retained_capacity = index.actual_indices.capacity;
+
+    try index.rebuild(alloc, &skills, .all, "core");
+    try std.testing.expectEqual(@as(usize, 1), index.count());
+    try std.testing.expectEqualStrings("pure-core", index.skillAt(&skills, 0).?.name);
+    try std.testing.expectEqual(retained_ptr, index.actual_indices.items.ptr);
+    try std.testing.expectEqual(retained_capacity, index.actual_indices.capacity);
+}
+
+test "skill runtime keeps menu count selection and query on one index" {
+    const alloc = std.testing.allocator;
+    const skills = [_]Skill{
+        .{ .name = "zig-best-practices", .description = "Zig guidance", .path = "/skills/zig", .source = .global_fx },
+        .{ .name = "pure-core", .description = "Functional core", .path = "/skills/pure", .source = .global_codex },
+        .{ .name = "zig-review", .description = "Review Zig", .path = "/skills/review", .source = .workspace_agents },
+    };
+    var runtime = Runtime{ .items = @constCast(&skills) };
+    defer {
+        runtime.items = &.{};
+        runtime.deinit(alloc);
+    }
+
+    try runtime.prepareMenuIndex(alloc);
+    runtime.openMenu();
+    try std.testing.expectEqual(@as(usize, 3), runtime.menuItemCount());
+    try std.testing.expectEqualStrings("zig-best-practices", runtime.selectedMenuSkill().?.name);
+
+    runtime.setMenuQuery(alloc, "core");
+    try std.testing.expectEqual(@as(usize, 1), runtime.menuItemCount());
+    try std.testing.expectEqualStrings("pure-core", runtime.selectedMenuSkill().?.name);
+    try std.testing.expectEqualSlices(u32, &.{1}, runtime.menu_index.actual_indices.items);
+}
+
+test "skill menu query navigation and close stay allocation free for ten thousand cycles" {
+    const alloc = std.testing.allocator;
+    const skills = [_]Skill{
+        .{ .name = "alpha", .description = "first", .path = "/skills/alpha", .source = .global_fx },
+        .{ .name = "beta", .description = "second", .path = "/skills/beta", .source = .global_codex },
+        .{ .name = "gamma", .description = "third", .path = "/skills/gamma", .source = .workspace_agents },
+    };
+    var runtime = Runtime{ .items = @constCast(&skills) };
+    defer {
+        runtime.items = &.{};
+        runtime.deinit(alloc);
+    }
+    try runtime.prepareMenuIndex(alloc);
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+
+    for (0..10_000) |cycle| {
+        runtime.openMenu();
+        runtime.setMenuQuery(
+            failing.allocator(),
+            if (cycle & 1 == 0) "a" else "",
+        );
+        _ = runtime.moveMenuSelection(1);
+        _ = runtime.moveMenuSourceFilter(1);
+        runtime.closeMenu();
+    }
+}
+
+test "skill runtime replacement preserves the active catalog when index allocation fails" {
+    const alloc = std.testing.allocator;
+    const active = [_]Skill{
+        .{ .name = "active", .description = "active", .path = "/skills/active", .source = .global_fx },
+    };
+    const replacement = [_]Skill{.{
+        .name = "replacement",
+        .description = "replacement",
+        .path = "/skills/replacement",
+        .source = .global_fx,
+    }} ** 64;
+    var runtime = Runtime{ .items = @constCast(&active) };
+    defer {
+        runtime.items = &.{};
+        runtime.diagnostics = &.{};
+        runtime.dir = &.{};
+        runtime.deinit(alloc);
+    }
+    try runtime.prepareMenuIndex(alloc);
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        runtime.replaceLoaded(
+            failing.allocator(),
+            @constCast("/replacement"),
+            @constCast(&replacement),
+            &.{},
+        ),
+    );
+    try std.testing.expect(runtime.items.ptr == active[0..].ptr);
+    try std.testing.expectEqual(@as(usize, 1), runtime.menu_index.count());
+    try std.testing.expectEqualStrings("active", runtime.menu_index.skillAt(runtime.items, 0).?.name);
+}
+
+test "skill refresh publishes one generation and coalesces one latest request" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTempFile(
+        &tmp,
+        "home/.fx/skills/refreshable/SKILL.md",
+        "---\nname: refreshable\ndescription: refreshed off-thread\n---\nbody\n",
+    );
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const managed = try std.fs.path.join(alloc, &.{ home, ".fx", "skills" });
+    defer alloc.free(managed);
+    var runtime = Runtime{ .dir = try alloc.dupe(u8, managed) };
+    defer runtime.deinit(alloc);
+    const policy: skill_contract.RootPolicy = .{ .managed_root_source = .global_fx };
+
+    try runtime.requestRefresh(alloc, home, home, policy);
+    try runtime.requestRefresh(alloc, home, home, policy);
+    try std.testing.expect(runtime.refresh_pending);
+
+    var adopted = false;
+    for (0..100_000) |_| {
+        switch (try runtime.pollRefresh(alloc, home, home, policy)) {
+            .adopted => adopted = true,
+            .none, .unchanged, .failed => {},
+        }
+        if (adopted and runtime.refresh_task == null) break;
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+    try std.testing.expect(adopted);
+    try std.testing.expectEqual(@as(usize, 1), runtime.items.len);
+    try std.testing.expectEqualStrings("refreshable", runtime.items[0].name);
+
+    var terminal: RefreshCompletion = .none;
+    try runtime.requestRefresh(alloc, home, home, policy);
+    for (0..100_000) |_| {
+        terminal = try runtime.pollRefresh(alloc, home, home, policy);
+        if (terminal != .none) break;
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+    try std.testing.expectEqual(RefreshCompletion.unchanged, terminal);
+}
+
 test "skill menu fills a bounded query range in display order" {
     const skills = [_]Skill{
         staticSkill("metadata-first", "zig workflow", .global_fx),
@@ -2278,12 +2825,12 @@ test "skill runtime replaces and frees owned discovery diagnostics" {
         .scope = .candidate,
         .cause = .{ .invalid_metadata = .missing_name },
     };
-    runtime.replaceLoaded(alloc, first_dir, &.{}, first_diagnostics);
+    try runtime.replaceLoaded(alloc, first_dir, &.{}, first_diagnostics);
 
     try std.testing.expectEqual(@as(usize, 1), runtime.diagnostics.len);
     try std.testing.expectEqualStrings("/tmp/first-skills/bad", runtime.diagnostics[0].path);
 
-    runtime.replaceLoaded(
+    try runtime.replaceLoaded(
         alloc,
         try alloc.dupe(u8, "/tmp/second-skills"),
         &.{},

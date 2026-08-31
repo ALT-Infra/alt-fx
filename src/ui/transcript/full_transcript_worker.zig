@@ -8,6 +8,7 @@ const full_transcript_screen = @import("../full_transcript_screen.zig");
 const build_checkpoint = @import("../render_engine/build_checkpoint.zig");
 const transcript_blocks = @import("../render_engine/transcript_blocks.zig");
 const command_output_runtime = @import("command_output_runtime.zig");
+const source_preparation = @import("source_preparation.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -106,13 +107,24 @@ pub const Source = struct {
     }
 };
 
+pub const InstalledSource = struct {
+    request: full_transcript_page.Request,
+    range: full_transcript_page.SourceRange,
+    capability: ?session_child_store.SessionChildCapability = null,
+
+    pub fn deinit(self: *InstalledSource) void {
+        if (self.capability) |*capability| capability.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const Task = struct {
     thread: ?std.Thread = null,
     done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     source: Source,
-    source_owned: bool = true,
     projection: ?full_transcript_screen.Projection = null,
+    prepared_source: ?source_preparation.TranscriptPreparationSource = null,
     failure: ?anyerror = null,
 
     pub fn deinit(self: *Task) void {
@@ -121,7 +133,10 @@ pub const Task = struct {
         if (self.projection) |*projection| {
             projection.deinit(std.heap.c_allocator);
         }
-        if (self.source_owned) self.source.deinit(std.heap.c_allocator);
+        if (self.prepared_source) |*source| {
+            source.deinit(std.heap.c_allocator);
+        }
+        self.source.deinit(std.heap.c_allocator);
         std.heap.c_allocator.destroy(self);
     }
 
@@ -131,10 +146,22 @@ pub const Task = struct {
         return projection;
     }
 
-    pub fn takeSource(self: *Task) Source {
-        std.debug.assert(self.source_owned);
-        self.source_owned = false;
-        return self.source;
+    pub fn takeInstalledSource(self: *Task) InstalledSource {
+        const capability = self.source.capability;
+        self.source.capability = null;
+        return .{
+            .request = self.source.request,
+            .range = self.source.range,
+            .capability = capability,
+        };
+    }
+
+    pub fn takePreparedSource(
+        self: *Task,
+    ) ?source_preparation.TranscriptPreparationSource {
+        const source = self.prepared_source orelse return null;
+        self.prepared_source = null;
+        return source;
     }
 
     fn cancelled(context: *anyopaque) bool {
@@ -187,6 +214,27 @@ pub const Task = struct {
             self.done.store(true, .release);
             return;
         };
+        const page_bytes = full_transcript_screen.renderProjectionSourceInterruptible(
+            alloc,
+            &projection,
+            if (self.source.capability) |*capability| capability else null,
+            self.source.request.cols,
+            &checkpoint,
+        ) catch |err| {
+            self.failure = err;
+            self.done.store(true, .release);
+            return;
+        };
+        const prepared_source = source_preparation.prepareIndexedFullTranscriptSourceInterruptible(
+            alloc,
+            page_bytes,
+            self.source.request.cols,
+            &checkpoint,
+        ) catch |err| {
+            self.failure = err;
+            self.done.store(true, .release);
+            return;
+        };
         debug_trace.logf(
             "full_transcript_cache",
             "page_built revision={d} cols={d} entries={d} details={d} blocks={d} segments={d} rows={d}",
@@ -201,6 +249,7 @@ pub const Task = struct {
             },
         );
         self.projection = projection;
+        self.prepared_source = prepared_source;
         projection_owned = false;
         self.done.store(true, .release);
     }

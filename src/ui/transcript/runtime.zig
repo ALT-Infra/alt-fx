@@ -770,7 +770,6 @@ test "live full transcript content requests one frame per revision stride" {
                     .anchor = .tail,
                 },
                 .range = .{ .start = 0, .end = 0 },
-                .styles = .{},
             },
             .projection = .{ .styles = .{} },
         },
@@ -890,8 +889,7 @@ test "full transcript loading projection preserves restored viewport intent" {
         null,
         .{ .top = 1, .bottom = 8 },
     );
-    defer paint.source.deinit(alloc);
-    defer paint.prepared.deinit(alloc);
+    defer paint.deinit(alloc);
 
     try std.testing.expectEqual(@as(u32, 56), runtime.full_transcript.scroll_rows);
     try std.testing.expect(!runtime.full_transcript.follow_tail);
@@ -994,7 +992,6 @@ test "full transcript page boundaries preserve monotonic navigation" {
                     .source = .{
                         .request = request,
                         .range = range,
-                        .styles = .{},
                     },
                     .projection = .{ .styles = .{} },
                 };
@@ -1146,14 +1143,80 @@ test "full transcript staging paints its selected wheel viewport without reselec
         null,
         .{ .top = 1, .bottom = 4 },
     );
-    defer staged.source.deinit(alloc);
-    defer staged.prepared.deinit(alloc);
+    defer staged.deinit(alloc);
 
     try std.testing.expectEqual(@as(u32, 3), runtime.full_transcript.scroll_rows);
     try std.testing.expect(!runtime.full_transcript.follow_tail);
     try std.testing.expectEqual(@as(usize, 0), staged.prepared.selection.start_line);
-    try std.testing.expect(std.mem.find(u8, staged.source.bytes, "row-3") != null);
-    try std.testing.expect(std.mem.find(u8, staged.source.bytes, "row-0") == null);
+    try std.testing.expect(std.mem.find(u8, staged.source().bytes, "row-3") != null);
+    try std.testing.expect(std.mem.find(u8, staged.source().bytes, "row-0") == null);
+}
+
+test "installed full transcript paints from the worker indexed source" {
+    const alloc = std.testing.allocator;
+    const page_alloc = std.heap.c_allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 8,
+            .cols = 40,
+            .content_bottom = 4,
+            .divider_top_row = 5,
+            .input_row = 6,
+            .divider_bottom_row = 7,
+            .hint_row = 8,
+        },
+        .owned_top_row = 1,
+        .full_transcript = .{
+            .depth = .full,
+            .scroll_rows = 3,
+            .follow_tail = false,
+        },
+    };
+    defer runtime.deinit(alloc);
+    _ = try runtime.appendRawTranscriptEntryClassified(
+        alloc,
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ\nrow-0\nrow-1\nrow-2\nrow-3\nrow-4\nrow-5\nrow-6\nrow-7\n",
+        .unknown_raw,
+    );
+    var projection = try runtime.buildFullTranscriptProjection(page_alloc, null);
+    const bytes = try full_transcript_screen.renderProjectionSourceInterruptible(
+        page_alloc,
+        &projection,
+        null,
+        runtime.layout.cols,
+        null,
+    );
+    const prepared_source = try source_preparation.prepareIndexedFullTranscriptSourceInterruptible(
+        page_alloc,
+        bytes,
+        runtime.layout.cols,
+        null,
+    );
+    runtime.full_transcript_installed_page = .{
+        .source = .{
+            .request = runtime.desiredFullTranscriptPageRequest(),
+            .range = .{ .start = 0, .end = runtime.entries.items.len },
+        },
+        .projection = projection,
+        .prepared_source = prepared_source,
+    };
+    const installed = &runtime.full_transcript_installed_page.?;
+    var metrics: Metrics = .{};
+    var staged = try runtime.prepareFullTranscriptSurfacePaint(
+        alloc,
+        &metrics,
+        &installed.projection,
+        null,
+        .{ .top = 1, .bottom = 4 },
+    );
+    defer staged.deinit(alloc);
+
+    try std.testing.expect(staged.owned_source == null);
+    try std.testing.expect(staged.borrowed_source == &installed.prepared_source.?);
+    try std.testing.expectEqual(@as(?u16, 4), staged.prepared.projection_visual_rows);
+    try std.testing.expect(staged.prepared.selection.last_visible_row <= 4);
+    try std.testing.expect(std.mem.find(u8, staged.source().bytes, "row-0") != null);
+    try std.testing.expect(std.mem.find(u8, staged.source().bytes, "row-7") != null);
 }
 
 test "compact transcript cache survives navigation and invalidates on content change" {
@@ -1293,7 +1356,6 @@ test "clearing a transcript releases compact source and installed page" {
                 .anchor = .tail,
             },
             .range = .{ .start = 0, .end = 0 },
-            .styles = .{},
         },
         .projection = .{ .styles = .{} },
     };
@@ -1503,11 +1565,10 @@ test "full transcript staging keeps its selected viewport visible during resize 
         null,
         .{ .top = 1, .bottom = 4 },
     );
-    defer staged.source.deinit(alloc);
-    defer staged.prepared.deinit(alloc);
+    defer staged.deinit(alloc);
 
-    try std.testing.expect(std.mem.find(u8, staged.source.bytes, "row-3") != null);
-    try std.testing.expect(std.mem.find(u8, staged.source.bytes, "row-0") == null);
+    try std.testing.expect(std.mem.find(u8, staged.source().bytes, "row-3") != null);
+    try std.testing.expect(std.mem.find(u8, staged.source().bytes, "row-0") == null);
     try std.testing.expectEqual(@as(?i32, 22), runtime.resize_history_row_delta);
     try std.testing.expectEqual(@as(usize, 0), staged.prepared.selection.start_line);
     try std.testing.expect(staged.prepared.selection.last_visible_row >= staged.prepared.selection.top_row);
@@ -1679,8 +1740,7 @@ test "full transcript opening follows the tail instead of consuming its compact 
         null,
         .{ .top = 1, .bottom = 4 },
     );
-    defer staged.source.deinit(alloc);
-    defer staged.prepared.deinit(alloc);
+    defer staged.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 0), staged.prepared.selection.start_line);
     try std.testing.expectEqual(
@@ -1688,9 +1748,9 @@ test "full transcript opening follows the tail instead of consuming its compact 
         runtime.full_transcript.scroll_rows,
     );
     try std.testing.expect(runtime.full_transcript.follow_tail);
-    try std.testing.expect(std.mem.find(u8, staged.source.bytes, "row-7") != null);
-    try std.testing.expect(std.mem.find(u8, staged.source.bytes, "anchor") == null);
-    try std.testing.expect(std.mem.find(u8, staged.source.bytes, "row-0") == null);
+    try std.testing.expect(std.mem.find(u8, staged.source().bytes, "row-7") != null);
+    try std.testing.expect(std.mem.find(u8, staged.source().bytes, "anchor") == null);
+    try std.testing.expect(std.mem.find(u8, staged.source().bytes, "row-0") == null);
     try std.testing.expect(!runtime.full_transcript.anchor_pending);
 }
 
@@ -3670,12 +3730,14 @@ pub const FullTranscriptPrimaryRestore = enum {
 };
 
 const InstalledFullTranscriptPage = struct {
-    source: full_transcript_worker.Source,
+    source: full_transcript_worker.InstalledSource,
     projection: full_transcript_screen.Projection,
+    prepared_source: ?TranscriptPreparationSource = null,
 
     fn deinit(self: *InstalledFullTranscriptPage) void {
+        if (self.prepared_source) |*source| source.deinit(std.heap.c_allocator);
         self.projection.deinit(std.heap.c_allocator);
-        self.source.deinit(std.heap.c_allocator);
+        self.source.deinit();
         self.* = undefined;
     }
 };
@@ -9042,8 +9104,20 @@ pub const TranscriptRuntime = struct {
     }
 
     pub const FullTranscriptSurfacePaint = struct {
-        source: TranscriptPreparationSource,
+        owned_source: ?TranscriptPreparationSource = null,
+        borrowed_source: ?*TranscriptPreparationSource = null,
         prepared: transcript_painter.PreparedTranscriptSurfacePaint,
+
+        pub fn source(self: *FullTranscriptSurfacePaint) *TranscriptPreparationSource {
+            if (self.owned_source) |*owned| return owned;
+            return self.borrowed_source.?;
+        }
+
+        pub fn deinit(self: *FullTranscriptSurfacePaint, alloc: Allocator) void {
+            self.prepared.deinit(alloc);
+            if (self.owned_source) |*source_value| source_value.deinit(alloc);
+            self.* = undefined;
+        }
     };
 
     pub noinline fn buildFullTranscriptProjection(
@@ -9085,17 +9159,28 @@ pub const TranscriptRuntime = struct {
             full_transcript_page.sameSurface(desired, request))
         {
             if (task.takeProjection()) |projection| {
-                const source = task.takeSource();
+                const prepared_source = task.takePreparedSource() orelse
+                    return error.MissingPreparedFullTranscriptSource;
+                const source = task.takeInstalledSource();
                 if (self.full_transcript_installed_page) |*page| page.deinit();
                 self.full_transcript_installed_page = .{
                     .source = source,
                     .projection = projection,
+                    .prepared_source = prepared_source,
                 };
                 installed = true;
             }
         }
 
         return installed or self.full_transcript.depth == .full;
+    }
+
+    pub fn prewarmFullTranscriptPage(
+        self: *TranscriptRuntime,
+        capability: ?*session_child_store.SessionChildCapability,
+        full_diff_resolver: ?full_transcript_screen.FullDiffResolver,
+    ) !void {
+        try self.ensureFullTranscriptPageLoad(capability, full_diff_resolver);
     }
 
     pub fn preparedFullTranscriptPageProjectionInterruptible(
@@ -9599,6 +9684,40 @@ pub const TranscriptRuntime = struct {
         area: render_engine.frame_layout.FrameRect,
         checkpoint: ?*build_checkpoint.BuildCheckpoint,
     ) !FullTranscriptSurfacePaint {
+        if (self.installedFullTranscriptPreparedSource(projection)) |source| {
+            const measurement = full_transcript_screen.ProjectionMeasurement{
+                .total_rows = projection.measured_total_rows,
+                .anchor_row = projection.measured_anchor_row,
+                .item_rows = projection.measured_item_rows.items,
+            };
+            const offset = selectProjectionViewportOffset(
+                self,
+                measurement,
+                area.height(),
+            );
+            debug_trace.logf(
+                "full_transcript_cache",
+                "window cols={d} offset={d} visible={d} source=indexed rows={d}",
+                .{
+                    self.layout.cols,
+                    offset,
+                    area.height(),
+                    measurement.total_rows,
+                },
+            );
+            const prepared = try transcript_painter.prepareIndexedFullTranscriptSurfacePaintForArea(
+                self,
+                alloc,
+                metrics,
+                source,
+                area,
+                offset,
+            );
+            return .{
+                .borrowed_source = source,
+                .prepared = prepared,
+            };
+        }
         const source_bytes = if (self.fullTranscriptProjectionIsLoading(projection))
             try full_transcript_screen.renderProjectionViewportSourceInterruptible(
                 alloc,
@@ -9628,7 +9747,16 @@ pub const TranscriptRuntime = struct {
             &source,
             area,
         );
-        return .{ .source = source, .prepared = prepared };
+        return .{ .owned_source = source, .prepared = prepared };
+    }
+
+    fn installedFullTranscriptPreparedSource(
+        self: *TranscriptRuntime,
+        projection: *const full_transcript_screen.Projection,
+    ) ?*TranscriptPreparationSource {
+        const page = if (self.full_transcript_installed_page) |*value| value else return null;
+        if (&page.projection != projection) return null;
+        return if (page.prepared_source) |*source| source else null;
     }
 
     fn fullTranscriptProjectionIsLoading(

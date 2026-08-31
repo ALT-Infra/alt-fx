@@ -860,7 +860,7 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
         FX_RECORD_INPUT: "1",
         FX_TRACE_LOG: paths.tracePath,
         FX_TRACE_SCOPES:
-          "full_transcript_cache,full_transcript,scroll,frame_render,terminal_diff,frame_schedule",
+          "full_transcript_cache,full_transcript,scroll,frame_render,terminal_diff,frame_schedule,frame_plan",
       },
       stderrPath: paths.stderrPath,
       width: 104,
@@ -1094,7 +1094,7 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
           ...gatewayEnv(paths.home, resumedGateway),
           FX_TRACE_LOG: paths.resumedTracePath,
           FX_TRACE_SCOPES:
-            "full_transcript_cache,full_transcript,scroll,frame_render,terminal_diff",
+            "full_transcript_cache,full_transcript,scroll,frame_render,terminal_diff,frame_plan",
         },
         stderrPath: paths.resumedStderrPath,
         width: 96,

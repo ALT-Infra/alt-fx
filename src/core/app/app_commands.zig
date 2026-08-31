@@ -1721,7 +1721,12 @@ pub fn Handlers(comptime App: type) type {
             const provider = app.skillsCommandProvider();
             const command = provider.parseCommand(rest);
 
-            try app.reloadSkills();
+            switch (command) {
+                .list, .show => if (comptime @hasDecl(App, "requestSkillsRefresh")) {
+                    try app.requestSkillsRefresh();
+                },
+                .install, .create, .remove, .path, .usage => {},
+            }
             try writeSkillDiagnosticNotice(app);
 
             switch (command) {
@@ -1817,7 +1822,7 @@ pub fn Handlers(comptime App: type) type {
                         .tone = .neutral,
                         .body = notice.text,
                     }, true);
-                    if (notice.reload) try app.reloadSkills();
+                    if (notice.reload) try app.requestSkillsRefresh();
                 },
                 .installed => |install_result| {
                     var installed_notice: std.Io.Writer.Allocating = .init(app.alloc);
@@ -1834,7 +1839,7 @@ pub fn Handlers(comptime App: type) type {
                         .tone = .neutral,
                         .body = std.mem.trimEnd(u8, msg, "\n"),
                     }, true);
-                    try app.reloadSkills();
+                    try app.requestSkillsRefresh();
                 },
             }
         }
@@ -3961,7 +3966,7 @@ const SkillsInstallReplayApp = struct {
         self.shell.deinit(self.alloc);
     }
 
-    fn reloadSkills(self: *SkillsInstallReplayApp) !void {
+    fn requestSkillsRefresh(self: *SkillsInstallReplayApp) !void {
         self.reload_count += 1;
     }
 
@@ -4458,7 +4463,7 @@ test "skills install groups command notice fragments for entry replay" {
 
     try std.testing.expectEqual(@as(usize, 2), app.shell.entries.items.len);
     try std.testing.expectEqual(@as(usize, 2), app.write_count);
-    try std.testing.expectEqual(@as(usize, 2), app.reload_count);
+    try std.testing.expectEqual(@as(usize, 1), app.reload_count);
     try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
     try std.testing.expect(app.shell.entries.items[0] == .semantic_notice);
     try std.testing.expect(app.shell.entries.items[1] == .semantic_notice);
@@ -4657,7 +4662,7 @@ test "skills remove prefers a managed match after a workspace duplicate" {
     const rendered = try transcript_runtime.renderEntriesToBytes(alloc, app.shell.entries.items, 80, .{});
     defer alloc.free(rendered);
     try std.testing.expect(std.mem.find(u8, rendered, "Removed skill 'review'.") != null);
-    try std.testing.expectEqual(@as(usize, 2), app.reload_count);
+    try std.testing.expectEqual(@as(usize, 1), app.reload_count);
     try std.testing.expectError(
         error.FileNotFound,
         tmp.dir.access(io_mod.getIo(), "home/.fx/skills/review", .{}),
