@@ -19,6 +19,7 @@ const secret = @import("../../auth/secret.zig");
 const credentials = @import("../../auth/credentials.zig");
 const credential_authority = @import("../../auth/credential_authority.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
+const tool_projection = @import("../../tooling/tool_projection.zig");
 const model_tool_schema = @import("../../tooling/model_tool_schema.zig");
 const command_result_mapping = @import("../../tooling/command_result_mapping.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
@@ -3553,6 +3554,12 @@ fn processQueuedPromptLoop(
                 .stream = &stream_ctx,
                 .pending_status = &pending_auto_retry_status,
             };
+            const turn_tool_projection = try tool_projection.projectForTurn(
+                arena,
+                config.advertised_tool_names,
+                config.advertised_functions,
+                within_turn_suffix.items,
+            );
             var model_request = agent_stream_provider.ModelRequest{
                 .credential = .{
                     .secret = active_api_key,
@@ -3566,8 +3573,8 @@ fn processQueuedPromptLoop(
                 .messages = request_messages,
                 .tools = .{
                     .registry = deps.tool_registry,
-                    .advertised_names = config.advertised_tool_names,
-                    .advertised_functions = config.advertised_functions,
+                    .advertised_names = turn_tool_projection.advertised_names,
+                    .advertised_functions = turn_tool_projection.advertised_functions,
                     .selected_dynamic = selected_dynamic_tools.items,
                 },
                 .tool_choice = tool_choice,

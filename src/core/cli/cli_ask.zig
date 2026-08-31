@@ -1702,7 +1702,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .items = loaded_skills.skills,
         .diagnostics = loaded_skills.diagnostics,
     };
-    var bounded_skills = try skills_view.buildBoundedSystemPromptSection(alloc, ctx.context_limits);
+    var bounded_skills = try skills_view.buildRoutedSystemPromptSection(alloc, owned_prompt, ctx.context_limits);
     defer bounded_skills.deinit(alloc);
     if (bounded_skills.notice) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
     if (bounded_skills.diagnostic_notice) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
@@ -3123,10 +3123,10 @@ fn mcpCallTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, argument
     );
 }
 
-fn mcpSearchTools(raw_ctx: *anyopaque, arena: Allocator, query: *const tool_mcp_runtime.PreparedQuery, limit: usize, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.SearchResult {
+fn mcpSearchTools(raw_ctx: *anyopaque, arena: Allocator, request: tool_mcp_runtime.SearchRequest, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.SearchResult {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     const mcp = try activateAskMcp(ctx);
-    return mcp.searchToolsPrepared(arena, query, limit, permission_rules, limits, access);
+    return mcp.searchToolsPrepared(arena, request, permission_rules, limits, access);
 }
 
 fn mcpToolSchemaJson(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access) anyerror!?tool_mcp_runtime.ToolSchemaResult {

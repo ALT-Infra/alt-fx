@@ -359,8 +359,10 @@ pub const LabelArgKind = enum {
     command,
     description,
     source,
+    resource,
     action,
     query,
+    server,
     selector,
     session_id,
 };
@@ -578,8 +580,10 @@ fn labelValueForKind(kind: LabelArgKind, args: std.json.ObjectMap) ?[]const u8 {
         .command => optionalStringArg(args, "command"),
         .description => optionalStringArg(args, "description"),
         .source => optionalStringArg(args, "source"),
+        .resource => optionalStringArg(args, "resource"),
         .action => optionalStringArg(args, "action"),
         .query => optionalStringArg(args, "query"),
+        .server => optionalStringArg(args, "server"),
         .selector => optionalStringArg(args, "selector"),
         .session_id => optionalStringArg(args, "session_id"),
     };
