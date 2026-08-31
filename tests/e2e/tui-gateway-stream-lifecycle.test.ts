@@ -6958,7 +6958,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "provider search renders a transcript lifecycle row with URL detail",
+    "provider search renders lifecycle detail and trace observability",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-provider-search-")));
       const home = join(root, "home");
@@ -7018,6 +7018,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_GATEWAY_CHAT_URL: providerGateway.chatUrl,
           FX_E2E_GATEWAY_CHAT_URL: providerGateway.chatUrl,
           FX_MODEL: MODEL,
+          TMPDIR: root,
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
           FX_TRACE_LOG: tracePath,
@@ -7070,6 +7071,29 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const detail = await session.waitForText(sourceUrl, TIMEOUT);
       expect(detail).toContain(sourceUrl);
       expect(detail).toContain("└ Searched web");
+
+      await session.sendKeys("Escape");
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("/trace");
+      await waitForCondition(
+        () => readdirSync(root!).some((entry) =>
+          entry.startsWith("fx-trace-") && entry.endsWith(".md")
+        ),
+        "provider search trace report",
+      );
+      const traceReportName = readdirSync(root)
+        .filter((entry) => entry.startsWith("fx-trace-") && entry.endsWith(".md"))
+        .sort()
+        .at(-1);
+      expect(traceReportName).toBeDefined();
+      const traceReport = readFileSync(join(root, traceReportName!), "utf8");
+      expect(traceReport).toContain("web_search_requests_total: 1 (observed)");
+      expect(traceReport).toContain("billable_web_search_calls: 0 (billed)");
+      expect(traceReport).toContain("### Provider Executed");
+      expect(traceReport).toContain(
+        "name=exa_search call_id=provider_search_direct status=ok source=provider",
+      );
+      expect(traceReport).not.toContain("(none recorded)");
 
       const replay = execFileSync(FX_BIN, ["replay", tapePath, "--frames"], {
         encoding: "utf8",

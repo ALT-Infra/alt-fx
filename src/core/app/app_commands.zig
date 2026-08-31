@@ -2142,7 +2142,7 @@ fn buildTraceReport(app: anytype) ![]u8 {
     try writeProblemsSummary(&out.writer, app, app.alloc);
     try writeLastInterruptedDetail(&out.writer, app.session.history.items, app.alloc);
     try writeNetworkCallsSummary(&out.writer);
-    try writeToolCallsSummary(&out.writer, app.alloc);
+    try writeToolCallsSummary(&out.writer, app.alloc, app.session.history.items);
     try writeSubagentsSummary(&out.writer, app.alloc, &app.subagents);
     try writePermissionsSummary(&out.writer, app.permission_engine.grants.items);
     try writeRuntimeContextSummary(&out.writer, app, app.alloc);
@@ -2202,7 +2202,13 @@ fn writeCurrentStateSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem
         try writer.print("tokens_total: {d}->{d}\n", .{ app.total_input_tokens, app.total_output_tokens });
     }
     if (comptime @hasField(App, "total_web_search_requests")) {
-        try writer.print("web_search_requests_total: {d}\n", .{app.total_web_search_requests});
+        var usage = try app.session.usage.snapshot(alloc);
+        defer usage.deinit(alloc);
+        try writeSearchUsageSummary(
+            writer,
+            app.total_web_search_requests,
+            usage.billable_web_search_calls,
+        );
     }
     try writeAuthStateSummary(writer, app);
     try writeProcessSummary(writer, alloc);
@@ -2681,40 +2687,136 @@ fn writeToolCallCompact(writer: *std.Io.Writer, call: diagnostics.ToolCallMetric
     try writer.writeByte('\n');
 }
 
-noinline fn writeToolCallsSummary(writer: *std.Io.Writer, alloc: std.mem.Allocator) !void {
+const ProviderToolCallSummary = struct {
+    call_id: []const u8,
+    tool_name: []const u8,
+    status: ?types.PersistedToolStatus,
+};
+
+fn findPersistedToolResult(
+    execution: types.ExecutionMemory,
+    call_id: []const u8,
+) ?types.PersistedToolResult {
+    for (execution.tool_steps) |step| {
+        for (step.tool_results) |result| {
+            if (std.mem.eql(u8, result.tool_call_id, call_id)) return result;
+        }
+    }
+    return null;
+}
+
+fn projectProviderToolCalls(
+    history: []const types.HistoryTurn,
+    output: []ProviderToolCallSummary,
+) usize {
+    if (output.len == 0) return 0;
+
+    var count: usize = 0;
+    for (history) |turn| {
+        const execution: types.ExecutionMemory = switch (turn) {
+            .assistant => |entry| entry.execution,
+            .background_command => |entry| entry.execution,
+            .interrupted => |entry| entry.execution,
+            .compacted_summary => continue,
+        };
+        for (execution.tool_steps) |step| {
+            for (step.tool_calls) |call| {
+                if (call.provenance != .provider_executed) continue;
+                const summary: ProviderToolCallSummary = .{
+                    .call_id = call.id,
+                    .tool_name = call.name,
+                    .status = if (findPersistedToolResult(execution, call.id)) |result|
+                        result.status
+                    else
+                        null,
+                };
+                if (count < output.len) {
+                    output[count] = summary;
+                    count += 1;
+                } else {
+                    std.mem.copyForwards(
+                        ProviderToolCallSummary,
+                        output[0 .. output.len - 1],
+                        output[1..],
+                    );
+                    output[output.len - 1] = summary;
+                }
+            }
+        }
+    }
+    return count;
+}
+
+fn providerToolStatusLabel(status: ?types.PersistedToolStatus) []const u8 {
+    return if (status) |value| switch (value) {
+        .success => "ok",
+        .failure => "err",
+    } else "pending";
+}
+
+fn writeSearchUsageSummary(writer: *std.Io.Writer, observed: u64, billed: u64) !void {
+    try writer.print("web_search_requests_total: {d} (observed)\n", .{observed});
+    try writer.print("billable_web_search_calls: {d} (billed)\n", .{billed});
+}
+
+noinline fn writeToolCallsSummary(
+    writer: *std.Io.Writer,
+    alloc: std.mem.Allocator,
+    history: []const types.HistoryTurn,
+) !void {
     var buf: [diagnostics.tool_call_ring_capacity]diagnostics.ToolCallMetric = undefined;
     const n = diagnostics.snapshotToolCalls(&buf);
-    if (n == 0) {
+    var provider_buf: [diagnostics.tool_call_ring_capacity]ProviderToolCallSummary = undefined;
+    const provider_n = projectProviderToolCalls(history, &provider_buf);
+    if (n == 0 and provider_n == 0) {
         try writer.writeAll("\n## Tool Calls\n(none recorded)\n");
         return;
     }
 
-    var ok_count: u32 = 0;
-    var error_count: u32 = 0;
-    var total_ms: u64 = 0;
-    for (buf[0..n]) |call| {
-        if (call.ok) ok_count += 1 else error_count += 1;
-        total_ms += call.duration_ms;
-    }
-
-    try writer.print("\n## Tool Calls\nlast={d} ok={d} errors={d} total={d}ms\n", .{ n, ok_count, error_count, total_ms });
-    if (error_count > 0) {
-        try writer.writeAll("errors first:\n");
+    try writer.writeAll("\n## Tool Calls\n### Local\n");
+    if (n == 0) {
+        try writer.writeAll("(none locally executed)\n");
+    } else {
+        var ok_count: u32 = 0;
+        var error_count: u32 = 0;
+        var total_ms: u64 = 0;
         for (buf[0..n]) |call| {
-            if (call.ok) continue;
+            if (call.ok) ok_count += 1 else error_count += 1;
+            total_ms += call.duration_ms;
+        }
+
+        try writer.print("last={d} ok={d} errors={d} total={d}ms\n", .{ n, ok_count, error_count, total_ms });
+        if (error_count > 0) {
+            try writer.writeAll("errors first:\n");
+            for (buf[0..n]) |call| {
+                if (call.ok) continue;
+                try writeToolCallCompact(writer, call);
+                try writeToolFieldBlock(writer, alloc, "args", call.args(), call.args_len, call.args_total_bytes);
+                try writeToolFieldBlock(writer, alloc, "result", call.result(), call.result_len, call.result_total_bytes);
+            }
+            try writer.writeAll("recent successes (compact):\n");
+        } else {
+            try writer.writeAll("recent successes (compact):\n");
+        }
+        for (buf[0..n]) |call| {
+            if (!call.ok) continue;
             try writeToolCallCompact(writer, call);
             try writeToolFieldBlock(writer, alloc, "args", call.args(), call.args_len, call.args_total_bytes);
-            try writeToolFieldBlock(writer, alloc, "result", call.result(), call.result_len, call.result_total_bytes);
+            try writeToolResultPreview(writer, alloc, call.result(), call.result_total_bytes);
         }
-        try writer.writeAll("recent successes (compact):\n");
-    } else {
-        try writer.writeAll("recent successes (compact):\n");
     }
-    for (buf[0..n]) |call| {
-        if (!call.ok) continue;
-        try writeToolCallCompact(writer, call);
-        try writeToolFieldBlock(writer, alloc, "args", call.args(), call.args_len, call.args_total_bytes);
-        try writeToolResultPreview(writer, alloc, call.result(), call.result_total_bytes);
+
+    try writer.writeAll("### Provider Executed\n");
+    if (provider_n == 0) {
+        try writer.writeAll("(none retained)\n");
+        return;
+    }
+    try writer.print("last={d}\n", .{provider_n});
+    for (provider_buf[0..provider_n]) |call| {
+        try writer.print(
+            "name={s} call_id={s} status={s} source=provider\n",
+            .{ call.tool_name, call.call_id, providerToolStatusLabel(call.status) },
+        );
     }
 }
 
@@ -4098,7 +4200,7 @@ test "trace tool calls print errors first and mask obvious secrets" {
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try writeToolCallsSummary(&out.writer, alloc);
+    try writeToolCallsSummary(&out.writer, alloc, &.{});
     const text = out.written();
 
     const error_pos = std.mem.find(u8, text, "name=run_command") orelse return error.TestExpectedEqual;
@@ -4123,7 +4225,7 @@ test "trace successful tool calls use compact result previews" {
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try writeToolCallsSummary(&out.writer, alloc);
+    try writeToolCallsSummary(&out.writer, alloc, &.{});
     const text = out.written();
 
     try std.testing.expect(std.mem.find(u8, text, "recent successes (compact):") != null);
@@ -4145,7 +4247,7 @@ test "trace omits web_fetch URL and result bodies from tool-call diagnostics" {
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try writeToolCallsSummary(&out.writer, alloc);
+    try writeToolCallsSummary(&out.writer, alloc, &.{});
     const text = out.written();
 
     try std.testing.expect(std.mem.find(u8, text, "name=web_fetch") != null);
@@ -4155,6 +4257,124 @@ test "trace omits web_fetch URL and result bodies from tool-call diagnostics" {
     try std.testing.expect(std.mem.find(u8, text, "EXTRACTED_RESULT_SECRET") == null);
     try std.testing.expect(std.mem.find(u8, text, "args:") == null);
     try std.testing.expect(std.mem.find(u8, text, "result_preview:") == null);
+}
+
+test "trace provider tool calls match results by id without retaining payloads" {
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    var calls = [_]types.ToolCall{
+        .{
+            .id = "call_exa",
+            .name = "exa_search",
+            .arguments_json = "{\"query\":\"PROVIDER_ARGUMENT_SECRET\"}",
+            .provenance = .provider_executed,
+        },
+        .{
+            .id = "call_parallel",
+            .name = "parallel_search",
+            .arguments_json = "{}",
+            .provenance = .provider_executed,
+        },
+        .{
+            .id = "call_pending",
+            .name = "perplexity_search",
+            .arguments_json = "{}",
+            .provenance = .provider_executed,
+        },
+        .{
+            .id = "call_local",
+            .name = "read_file",
+            .arguments_json = "{}",
+            .provenance = .fx_local,
+        },
+    };
+    var results = [_]types.PersistedToolResult{
+        .{
+            .tool_call_id = @constCast("call_parallel"),
+            .tool_name = @constCast("parallel_search"),
+            .status = .failure,
+            .output = @constCast("PROVIDER_RESULT_SECRET"),
+            .output_bytes = 22,
+            .stored_output_bytes = 22,
+            .provider_native = true,
+        },
+        .{
+            .tool_call_id = @constCast("call_exa"),
+            .tool_name = @constCast("exa_search"),
+            .status = .success,
+            .output = @constCast("{\"results\":[]}"),
+            .output_bytes = 14,
+            .stored_output_bytes = 14,
+            .provider_native = true,
+        },
+    };
+    var steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = &calls,
+        .tool_results = &results,
+    }};
+    const history = [_]types.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("search") },
+        .assistant = @constCast("answer"),
+        .execution = .{ .tool_steps = &steps },
+    } }};
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeToolCallsSummary(&out.writer, alloc, &history);
+    const text = out.written();
+
+    try std.testing.expect(std.mem.find(u8, text, "name=exa_search call_id=call_exa status=ok source=provider") != null);
+    try std.testing.expect(std.mem.find(u8, text, "name=parallel_search call_id=call_parallel status=err source=provider") != null);
+    try std.testing.expect(std.mem.find(u8, text, "name=perplexity_search call_id=call_pending status=pending source=provider") != null);
+    try std.testing.expect(std.mem.find(u8, text, "name=read_file") == null);
+    try std.testing.expect(std.mem.find(u8, text, "PROVIDER_ARGUMENT_SECRET") == null);
+    try std.testing.expect(std.mem.find(u8, text, "PROVIDER_RESULT_SECRET") == null);
+    try std.testing.expect(std.mem.find(u8, text, "(none recorded)") == null);
+}
+
+test "trace provider tool projection keeps the most recent bounded calls" {
+    var calls: [diagnostics.tool_call_ring_capacity + 1]types.ToolCall = undefined;
+    for (&calls, 0..) |*call, index| {
+        call.* = .{
+            .id = if (index == 0)
+                "oldest"
+            else if (index + 1 == calls.len)
+                "newest"
+            else
+                "middle",
+            .name = "exa_search",
+            .arguments_json = "{}",
+            .provenance = .provider_executed,
+        };
+    }
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls }};
+    const history = [_]types.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("search") },
+        .assistant = @constCast("answer"),
+        .execution = .{ .tool_steps = &steps },
+    } }};
+    var summaries: [diagnostics.tool_call_ring_capacity]ProviderToolCallSummary = undefined;
+
+    const count = projectProviderToolCalls(&history, &summaries);
+
+    try std.testing.expectEqual(diagnostics.tool_call_ring_capacity, count);
+    try std.testing.expectEqualStrings("middle", summaries[0].call_id);
+    try std.testing.expectEqualStrings("newest", summaries[count - 1].call_id);
+}
+
+test "trace labels observed and billed search usage independently" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+
+    try writeSearchUsageSummary(&out.writer, 3, 1);
+
+    try std.testing.expectEqualStrings(
+        "web_search_requests_total: 3 (observed)\n" ++
+            "billable_web_search_calls: 1 (billed)\n",
+        out.written(),
+    );
 }
 
 test "trace renders web search request count without content" {

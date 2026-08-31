@@ -2083,12 +2083,12 @@ test "vision denial settles the authorized attempt without reading the image" {
     try std.testing.expectEqualStrings("Final", hooks.finish_assistant_text.?);
 }
 
-test "provider search emits visible lifecycle and retains URL result detail" {
+test "provider search emits visible lifecycle retains detail and reports observed usage" {
     const alloc = std.testing.allocator;
     const provider_result = "{\"results\":[{\"url\":\"https://example.test/source\"}]}";
     const calls = [_]ToolCall{.{
         .id = "provider_search",
-        .name = "perplexity_search",
+        .name = "exa_search",
         .arguments_json = "{}",
         .provider_result = provider_result,
         .provenance = .provider_executed,
@@ -2107,6 +2107,9 @@ test "provider search emits visible lifecycle and retains URL result detail" {
 
     try std.testing.expectEqual(@as(usize, 0), hooks.permission_names.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.inner_usages.items.len);
+    try std.testing.expectEqualStrings("exa_search", hooks.inner_usage_names.items[0]);
+    try std.testing.expectEqual(@as(u32, 1), hooks.inner_usages.items[0].web_search_requests);
     try expectLifecycleCallIds(
         hooks.lifecycle_events.items,
         &.{ "provider_search", "provider_search", "provider_search" },
