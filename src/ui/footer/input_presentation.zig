@@ -263,6 +263,23 @@ fn slashRawAnchor(input_items: []const u8, prefix: []const u8) ?usize {
     return leading_ws + slash_anchor;
 }
 
+fn modelPickerAnchor(ctx: RenderContext) usize {
+    // The effort and fast stages would otherwise anchor past the completed
+    // model id, pushing their option rows toward the middle of wide
+    // terminals. Pinning them to the model query column keeps every stage
+    // of the /model picker left-aligned like the model stage.
+    if (ctx.model_picker_stage == .model) return ctx.model_completion_anchor;
+    const items = ctx.input.edit_state.input.items;
+    const prefix = "/model ";
+    var trim_start: usize = 0;
+    while (trim_start < items.len and
+        (items[trim_start] == ' ' or items[trim_start] == '\t' or items[trim_start] == '\r' or items[trim_start] == '\n')) : (trim_start += 1)
+    {}
+    if (items.len < trim_start + prefix.len) return ctx.model_completion_anchor;
+    if (!std.ascii.eqlIgnoreCase(items[trim_start .. trim_start + prefix.len], prefix)) return ctx.model_completion_anchor;
+    return trim_start + prefix.len;
+}
+
 pub fn measureRawInputGeometry(
     ctx: RenderContext,
     terminal_cols: u16,
@@ -282,7 +299,7 @@ pub fn measureRawInputGeometry(
     const raw_anchor: ?usize = if (ctx.queued_editor_active)
         null
     else if (show_model_query)
-        ctx.model_completion_anchor
+        modelPickerAnchor(ctx)
     else if (show_file_query)
         ctx.file_completion_anchor
     else
@@ -1306,6 +1323,32 @@ test "footer model and file anchors on earlier soft rows project to cursor row s
     ctx.file_query_active = true;
     ctx.file_completion_anchor = 1;
     try std.testing.expectEqual(@as(u16, 3), measureRawInputGeometry(ctx, 5, 20, true, false, false, true).picker_start_col);
+}
+
+test "footer effort and fast stages anchor at the model query column" {
+    const alloc = std.testing.allocator;
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    const text = "/model z-ai/glm-5.3-flash";
+    try input.edit_state.input.appendSlice(alloc, text);
+    input.edit_state.cursor = text.len;
+    var ctx = testRenderContext(&input);
+    ctx.model_query_active = true;
+    ctx.model_completion_anchor = text.len;
+    ctx.model_picker_stage = .effort;
+    // "❯ " prefix (2 cells) + "/model " (7 cells) + 1.
+    try std.testing.expectEqual(@as(u16, 10), measureRawInputGeometry(ctx, 80, 20, true, false, true, false).picker_start_col);
+
+    ctx.model_picker_stage = .fast;
+    try std.testing.expectEqual(@as(u16, 10), measureRawInputGeometry(ctx, 80, 20, true, false, true, false).picker_start_col);
+
+    ctx.model_picker_stage = .model;
+    ctx.model_completion_anchor = "/model ".len;
+    try std.testing.expectEqual(@as(u16, 10), measureRawInputGeometry(ctx, 80, 20, true, false, true, false).picker_start_col);
+
+    ctx.model_picker_stage = .effort;
+    ctx.model_completion_anchor = 3;
+    try std.testing.expectEqual(@as(u16, 10), measureRawInputGeometry(ctx, 80, 20, true, false, true, false).picker_start_col);
 }
 
 test "footer slash anchor contract handles top level and argument completions" {
