@@ -512,7 +512,6 @@ fn destroyActiveSession(state: *ServerState) void {
             state.alloc.destroy(runtime);
         }
     }
-    _ = active.session_rt.agent.close();
     active.session_rt.deinit(state.alloc);
     if (active.writable) |*writable| writable.deinit(state.alloc);
     if (active.store) |*store| store.deinit(state.alloc);
