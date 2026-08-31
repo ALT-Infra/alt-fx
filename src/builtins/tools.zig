@@ -2224,7 +2224,7 @@ test "built-in web_search owns its Gateway provider advertisement" {
     defer std.testing.allocator.free(json);
 
     try std.testing.expectEqualStrings(
-        "{\"type\":\"provider\",\"id\":\"gateway.perplexity_search\",\"name\":\"perplexity_search\",\"args\":{\"maxResults\":10,\"maxTokens\":4096}}",
+        "{\"type\":\"provider\",\"id\":\"gateway.exa_search\",\"name\":\"exa_search\",\"args\":{\"numResults\":10,\"contents\":{\"highlights\":{\"maxCharacters\":10000}}}}",
         json,
     );
 }

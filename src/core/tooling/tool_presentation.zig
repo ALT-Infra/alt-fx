@@ -34,7 +34,8 @@ pub const RunCommandActivity = struct {
 };
 
 pub fn isProviderSearchAlias(name: []const u8) bool {
-    return std.mem.eql(u8, name, "perplexity_search") or
+    return std.mem.eql(u8, name, "exa_search") or
+        std.mem.eql(u8, name, "perplexity_search") or
         std.mem.eql(u8, name, "parallel_search");
 }
 
@@ -929,7 +930,7 @@ test "tool presentation frees all formatted output with a normal allocator" {
         .tool_registry = test_tool_registry,
         .call = .{
             .id = "provider_search",
-            .name = "perplexity_search",
+            .name = "exa_search",
             .arguments_json = "{}",
             .provenance = .provider_executed,
         },

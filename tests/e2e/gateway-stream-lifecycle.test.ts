@@ -19,7 +19,7 @@ import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import {
   AMBIGUOUS_CAPABILITY_CLAUSES,
-  AUTO_PERPLEXITY_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES,
+  AUTO_EXA_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES,
   customProviderGuidanceState,
   findUnavailableCapabilityReferences,
   parseGatewayRequest,
@@ -224,7 +224,7 @@ function providerToolResultResponse(finish: "provider_error" | "tool-calls"): Re
     `data: ${JSON.stringify({
       type: "tool-call",
       toolCallId: "provider_search_recovery_1",
-      toolName: "perplexity_search",
+      toolName: "exa_search",
       input: { query: "zig recovery" },
       providerExecuted: true,
     })}\n\n` +
@@ -743,7 +743,7 @@ describe("gateway stream lifecycle", () => {
       const oracleRequest = parseGatewayRequest(gateway.requests[0]!.body);
       expect(promptText(gateway.requests[0]!.body)).toContain(submitted);
       expect(serializedToolNames(oracleRequest)).toEqual(
-        AUTO_PERPLEXITY_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES,
+        AUTO_EXA_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES,
       );
       expect(request.tools).toHaveLength(17);
       expect(findUnavailableCapabilityReferences(oracleRequest)).toEqual([]);
