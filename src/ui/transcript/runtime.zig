@@ -3911,6 +3911,7 @@ pub const TranscriptRuntime = struct {
     full_transcript_page_load: full_transcript_worker.Load = .{},
     full_transcript_page_anchor: full_transcript_page.Anchor = .tail,
     full_transcript_installed_page: ?InstalledFullTranscriptPage = null,
+    full_transcript_prepared_page_visible: bool = false,
     full_transcript_loading_projection: ?full_transcript_screen.Projection = null,
     full_transcript_content_revision: u64 = 0,
     compact_transcript_source_cache: CompactTranscriptSourceCache = .{},
@@ -5834,6 +5835,7 @@ pub const TranscriptRuntime = struct {
         const current = self.full_transcript.depth;
         if (current == depth) return false;
         if (current == .inline_mode and depth != .inline_mode) {
+            self.full_transcript_prepared_page_visible = false;
             self.full_transcript_open_content_revision = self.full_transcript_content_revision;
             self.full_transcript_open_cols = self.layout.cols;
             self.full_transcript_open_rows = self.layout.rows;
@@ -6079,6 +6081,7 @@ pub const TranscriptRuntime = struct {
 
     fn resetFullTranscriptPageNavigation(self: *TranscriptRuntime) void {
         self.full_transcript_page_anchor = .tail;
+        self.full_transcript_prepared_page_visible = false;
         self.full_transcript_page_load.cancelActive();
     }
 
@@ -9255,11 +9258,16 @@ pub const TranscriptRuntime = struct {
         if (full_transcript_page.sameRequest(desired, page.source.request)) {
             return &page.projection;
         }
-        if (self.command_output_display.open_command_block == null or
-            !full_transcript_page.sameSurface(desired, page.source.request))
-        {
+        if (!full_transcript_page.sameSurface(desired, page.source.request)) {
             return null;
         }
+        if (self.full_transcript_page_load.busy() and
+            (self.command_output_display.open_command_block != null or
+                self.full_transcript_prepared_page_visible))
+        {
+            return &page.projection;
+        }
+        if (self.command_output_display.open_command_block == null) return null;
         if (!self.full_transcript_page_load.busy() and
             full_transcript_page.liveRefreshDue(
                 page.source.request.content_revision,
@@ -9748,6 +9756,7 @@ pub const TranscriptRuntime = struct {
         checkpoint: ?*build_checkpoint.BuildCheckpoint,
     ) !FullTranscriptSurfacePaint {
         if (self.installedFullTranscriptPreparedSource(projection)) |source| {
+            self.full_transcript_prepared_page_visible = true;
             const measurement = full_transcript_screen.ProjectionMeasurement{
                 .total_rows = projection.measured_total_rows,
                 .anchor_row = projection.measured_anchor_row,
