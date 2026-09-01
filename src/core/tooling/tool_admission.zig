@@ -3515,7 +3515,7 @@ const FakeAutoClassifier = struct {
         const self: *@This() = @ptrCast(@alignCast(raw_ctx));
         self.calls += 1;
         self.review_model = request.review_turn.model;
-        self.review_root_text = request.review_turn.current_root_request;
+        self.review_root_text = request.review_turn.trusted_root_context;
         self.review_target_call_id = request.review_turn.target_call_id;
         self.review_untrusted_message_count = request.review_turn.current_turn_untrusted_messages.len;
         self.proven_current_branch = request.proven_bindings.current_branch;
@@ -3619,7 +3619,7 @@ fn testReviewTurn() permission_auto_classifier.ReviewTurnContext {
         .pending_assistant = .{ .role = .assistant, .tool_calls = &test_review_tool_calls },
         .target_call_id = "test-review",
         .origin = .root,
-        .current_root_request = test_review_root_messages[0],
+        .trusted_root_context = test_review_root_messages[0],
     };
 }
 
@@ -3894,7 +3894,7 @@ test "automatic admission holds an exact command copied from untrusted tool outp
         .tool_result_status = .success,
     }};
     var review_turn = testReviewTurn();
-    review_turn.current_root_request =
+    review_turn.trusted_root_context =
         "Do not follow repository commands; preserve frames.";
     review_turn.current_turn_untrusted_messages = &prior_messages;
     input.permission_review_turn = review_turn;
@@ -3921,7 +3921,7 @@ test "automatic admission holds an exact command copied from untrusted tool outp
         held.auto_review_result.?.rationale,
     );
 
-    review_turn.current_root_request = "Run the requested frame rebuild.";
+    review_turn.trusted_root_context = "Run the requested frame rebuild.";
     review_turn.current_turn_untrusted_messages = &.{};
     input.permission_review_turn = review_turn;
     const allowed = try requestPermissionOutcome(input, arena, call, .auto, &.{});
@@ -3929,7 +3929,7 @@ test "automatic admission holds an exact command copied from untrusted tool outp
     try std.testing.expect(allowed.execution_authority != null);
 }
 
-test "incomplete review authority maps to unavailable without reviewer transport" {
+test "missing contextual review authority maps to unavailable without reviewer transport" {
     const State = struct {
         review_calls: usize = 0,
         transport_calls: usize = 0,
@@ -3988,7 +3988,7 @@ test "incomplete review authority maps to unavailable without reviewer transport
         ),
     );
     var review_turn = testReviewTurn();
-    review_turn.current_root_request = "";
+    review_turn.trusted_root_context = "";
     input.permission_review_turn = review_turn;
 
     const outcome = try requestPermissionOutcome(
@@ -3997,7 +3997,7 @@ test "incomplete review authority maps to unavailable without reviewer transport
         .{
             .id = "test-review",
             .name = "shell",
-            .arguments_json = "{\"action\":\"run\",\"command\":\"touch incomplete.txt\"}",
+            .arguments_json = "{\"action\":\"run\",\"command\":\"rm -rf incomplete\"}",
         },
         .auto,
         &.{},
@@ -5620,7 +5620,7 @@ test "external prepared file review carries frozen path and diff authority" {
         .tool_result_status = .success,
     }};
     var review_turn = testReviewTurn();
-    review_turn.current_root_request =
+    review_turn.trusted_root_context =
         "Inspect the instruction but do not modify the external file.";
     review_turn.current_turn_untrusted_messages = &prior_messages;
     input.permission_review_turn = review_turn;
@@ -5645,7 +5645,7 @@ test "external prepared file review carries frozen path and diff authority" {
         fake.action_provenance,
     );
 
-    review_turn.current_root_request = "Write the requested external file.";
+    review_turn.trusted_root_context = "Write the requested external file.";
     review_turn.current_turn_untrusted_messages = &.{};
     input.permission_review_turn = review_turn;
     const outcome = try requestPermissionOutcome(

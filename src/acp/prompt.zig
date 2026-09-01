@@ -106,6 +106,7 @@ const AcpContext = struct {
     /// session/set_mode changes never mutate a running turn.
     captured_mode: ?[]const u8 = null,
     captured_permission_mode: ?PermissionMode = null,
+    retain_external_root_user_turn: bool = false,
 
     fn deinitPublishedToolCalls(self: *AcpContext) void {
         var keys = self.published_tool_calls.keyIterator();
@@ -662,13 +663,19 @@ pub fn handlePrompt(
     }
     defer session.session_rt.usage.configureCheckpointSink(null);
     const deps = agentRuntimeDeps(&ctx);
+    const current_prompt_is_root_authority = if (session.writable) |writable|
+        writable.external_prompt_origin == .persistent_child and
+            recovery_checkpoint == null
+    else
+        false;
+    ctx.retain_external_root_user_turn = current_prompt_is_root_authority;
     var agent_config = buildAgentConfig(state, session, .{
         .skills_prompt_section = skills_section,
         .explicit_skills_prompt_section = explicit_skills.text,
         .advertised_tool_names = tool_projection.advertised_names,
         .advertised_functions = tool_projection.advertised_functions,
         .custom_tool_guidance = tool_projection.custom_guidance,
-    });
+    }, current_prompt_is_root_authority);
     agent_config.session_child_capability = if (session.writable) |*writable|
         writable.childCapability() catch null
     else
@@ -798,7 +805,12 @@ const AgentConfigSections = struct {
     custom_tool_guidance: []const u8,
 };
 
-fn buildAgentConfig(state: *server.ServerState, session: *server.ActiveSessionState, sections: AgentConfigSections) agent_runtime.Config {
+fn buildAgentConfig(
+    state: *server.ServerState,
+    session: *server.ActiveSessionState,
+    sections: AgentConfigSections,
+    current_prompt_is_external: bool,
+) agent_runtime.Config {
     return .{
         .system_prompt = state.cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = state.cfg.prompt_policy.modelPromptOverlay(session.model),
@@ -831,7 +843,8 @@ fn buildAgentConfig(state: *server.ServerState, session: *server.ActiveSessionSt
         else
             false,
         .current_prompt_is_root_authority = if (session.writable) |writable|
-            writable.external_prompt_origin == .persistent_child
+            writable.external_prompt_origin == .persistent_child and
+                current_prompt_is_external
         else
             false,
         .context_limits = state.context_limits,
@@ -1346,7 +1359,7 @@ const TestReviewTurn = struct {
             .pending_assistant = .{ .role = .assistant, .tool_calls = &self.tool_calls },
             .target_call_id = self.tool_calls[0].id,
             .origin = .root,
-            .current_root_request = self.root_messages[0],
+            .trusted_root_context = self.root_messages[0],
         };
     }
 };
@@ -1696,7 +1709,12 @@ fn toolUpdateContentText(result: ToolExecutionResult) []const u8 {
 fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     if (ctx.state.active_session) |*session| {
-        try persistAcpHistoryTurn(ctx.alloc, session, turn);
+        try persistAcpHistoryTurn(
+            ctx.alloc,
+            session,
+            turn,
+            ctx.retain_external_root_user_turn,
+        );
     }
 }
 
@@ -1704,6 +1722,7 @@ fn persistAcpHistoryTurn(
     alloc: Allocator,
     session: *server.ActiveSessionState,
     turn: HistoryTurn,
+    prompt_is_root_authority: bool,
 ) !void {
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
@@ -1714,9 +1733,11 @@ fn persistAcpHistoryTurn(
     }
     const writable = if (session.writable) |*value| value else return;
     try subagent_resume_admission.retainExternalRootUserTurn(
+        session.store,
         alloc,
         writable,
         turn,
+        prompt_is_root_authority,
     );
     if (writable.degradedTail() != null) {
         const now_ms = io_mod.milliTimestamp();
@@ -1827,7 +1848,7 @@ test "ACP degraded history repair commits the finished turn once" {
 
     const turn = try session_runtime.makeAssistantTurn(alloc, "hello", "done");
     defer types.freeHistoryTurn(alloc, turn);
-    try persistAcpHistoryTurn(alloc, &session, turn);
+    try persistAcpHistoryTurn(alloc, &session, turn, true);
 
     try std.testing.expect(session.writable.?.degradedTail() == null);
     try std.testing.expectEqual(@as(usize, 1), session.session_rt.history.items.len);
@@ -4129,7 +4150,7 @@ test "ACP auto mode uses automatic review clear and caution without prompting" {
         ) anyerror!permission_auto_classifier.ParseOutcome {
             const self: *@This() = @ptrCast(@alignCast(raw_ctx));
             self.calls += 1;
-            self.root_text = request.review_turn.current_root_request;
+            self.root_text = request.review_turn.trusted_root_context;
             return .{ .valid = .{
                 .risk = if (self.decision == .clear) .low else .high,
                 .decision = self.decision,
@@ -4229,7 +4250,7 @@ test "ACP auto mode automatic review clears or cautions prepared external file m
         ) anyerror!permission_auto_classifier.ParseOutcome {
             const self: *@This() = @ptrCast(@alignCast(raw_ctx));
             self.calls += 1;
-            self.root_text = request.review_turn.current_root_request;
+            self.root_text = request.review_turn.trusted_root_context;
             self.saw_file_mutation_context = std.meta.activeTag(request.action) == .file_mutation;
             return .{ .valid = .{
                 .risk = if (self.decision == .clear) .low else .high,
@@ -4419,7 +4440,7 @@ test "ACP prompt agent config carries request options from active session" {
         .advertised_tool_names = &.{"read_file"},
         .advertised_functions = &.{builtin_tools.read_file.model_schema},
         .custom_tool_guidance = "acp custom tool guidance",
-    });
+    }, true);
 
     try std.testing.expect(config.fast_mode);
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), config.effort);

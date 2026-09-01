@@ -902,6 +902,12 @@ pub fn Runtime(comptime App: type) type {
             defer app.worker.endActivePromptSnapshots(&snapshot_ownership);
             app.worker.active_context_snapshot = &job.context_snapshot;
             defer app.worker.active_context_snapshot = null;
+            app.worker.active_prompt_is_root_authority = if (app.session_persistence.writable) |writable|
+                writable.external_prompt_origin == .persistent_child and
+                    job.recovery_checkpoint == null
+            else
+                false;
+            defer app.worker.active_prompt_is_root_authority = false;
             app.worker.setActiveAgentTurnSettings(job.agent_settings);
             defer app.worker.clearActiveAgentTurnSettings();
             var preflight_context_notices: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
@@ -1166,10 +1172,7 @@ pub fn Runtime(comptime App: type) type {
                     writable.external_root_user_evidence_complete
                 else
                     false,
-                .current_prompt_is_root_authority = if (app.session_persistence.writable) |writable|
-                    writable.external_prompt_origin == .persistent_child
-                else
-                    false,
+                .current_prompt_is_root_authority = app.worker.active_prompt_is_root_authority,
                 .session_child_capability = session_child_capability,
                 .context_limits = if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
             };
@@ -1889,7 +1892,7 @@ test "interactive app prepared file mutation callback applies app permission pol
         .pending_assistant = .{ .role = .assistant, .tool_calls = &review_calls },
         .target_call_id = call.id,
         .origin = .root,
-        .current_root_request = review_root_messages[0],
+        .trusted_root_context = review_root_messages[0],
     };
     const outcome = try callback(
         deps.ctx,

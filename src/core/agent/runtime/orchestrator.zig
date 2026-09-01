@@ -3322,17 +3322,14 @@ fn containsImageId(image_ids: []const usize, candidate: usize) bool {
 fn buildReviewTurnContext(
     config: Config,
     model: []const u8,
-    current_prompt: []const u8,
     root_user_intent_context: []const u8,
     current_turn_messages: []const ChatMessage,
     pending_assistant: ChatMessage,
     target_call_id: []const u8,
 ) permission_auto_classifier.ReviewTurnContext {
-    const current_root_request = currentRootRequest(
-        config,
-        current_prompt,
+    const trusted_root_context = auto_classifier_context.rootUserRequestContext(
         root_user_intent_context,
-    );
+    ) orelse "";
     return .{
         .model = model,
         .pending_assistant = pending_assistant,
@@ -3341,32 +3338,9 @@ fn buildReviewTurnContext(
             .root => .root,
             .subagent => .subagent,
         },
-        .current_root_request = current_root_request,
+        .trusted_root_context = trusted_root_context,
         .current_turn_untrusted_messages = current_turn_messages,
     };
-}
-
-fn currentRootRequest(
-    config: Config,
-    current_prompt: []const u8,
-    root_user_intent_context: []const u8,
-) []const u8 {
-    return if (root_user_intent_context.len > 0)
-        auto_classifier_context.currentRootUserRequest(
-            root_user_intent_context,
-        ) orelse root_user_intent_context
-    else if (config.origin == .root)
-        current_prompt
-    else if (config.current_prompt_is_root_authority)
-        current_prompt
-    else if (auto_classifier_context.currentRootUserRequest(
-        config.root_user_intent_context,
-    )) |request|
-        request
-    else if (config.root_user_messages.len > 0)
-        config.root_user_messages[config.root_user_messages.len - 1]
-    else
-        "";
 }
 
 fn appendTrustedPermissionFeedback(
@@ -3539,7 +3513,24 @@ fn processQueuedPromptLoop(
         .{};
     defer context_delivery_state.deinit(arena);
     const root_user_intent_context = switch (config.origin) {
-        .subagent => config.root_user_intent_context,
+        .subagent => if (config.current_prompt_is_root_authority)
+            try auto_classifier_context.buildRootUserContextFromVerifiedRequests(
+                arena,
+                job.prompt,
+                config.root_user_messages,
+                config.root_user_evidence_complete,
+            )
+        else if (config.root_user_intent_context.len > 0)
+            config.root_user_intent_context
+        else if (config.root_user_messages.len > 0)
+            try auto_classifier_context.buildRootUserContextFromVerifiedRequests(
+                arena,
+                config.root_user_messages[config.root_user_messages.len - 1],
+                config.root_user_messages,
+                config.root_user_evidence_complete,
+            )
+        else
+            "",
         .root => if (job.root_user_intent_context.len > 0)
             job.root_user_intent_context
         else
@@ -6014,7 +6005,6 @@ fn processQueuedPromptLoop(
                     const parallel_review_context = buildReviewTurnContext(
                         config,
                         successful_gateway_model,
-                        job.prompt,
                         root_user_intent_context,
                         within_turn_suffix.items,
                         pending_assistant,
@@ -6943,7 +6933,6 @@ fn processQueuedPromptLoop(
             const review_context = buildReviewTurnContext(
                 config,
                 successful_gateway_model,
-                job.prompt,
                 root_user_intent_context,
                 within_turn_suffix.items,
                 pending_assistant,

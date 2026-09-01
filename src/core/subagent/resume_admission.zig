@@ -1,4 +1,5 @@
 const std = @import("std");
+const auto_classifier_context = @import("../permissions/auto_classifier_context.zig");
 const io_mod = @import("../shared/io.zig");
 const session = @import("../session/session.zig");
 const session_codec = @import("../session/session_codec.zig");
@@ -297,36 +298,166 @@ fn installExternalPromptAuthority(
 /// the complete bit remains false until a canonical queue record supplies the
 /// full root-user lane on a later resume.
 pub fn retainExternalRootUserTurn(
+    store: ?session_store.Store,
     alloc: Allocator,
     loaded: *session_store.LoadedWritableSession,
     turn: session.HistoryTurn,
+    prompt_is_root_authority: bool,
 ) !void {
-    if (loaded.external_prompt_origin != .persistent_child or
+    if (!prompt_is_root_authority or
+        loaded.external_prompt_origin != .persistent_child or
         !loaded.external_root_user_evidence_complete)
     {
         return;
     }
+    const durable_store = store orelse return error.SessionStoreUnavailable;
     const prompt = switch (turn) {
         .assistant => |entry| entry.user.text,
         .interrupted => |entry| entry.user.text,
         .compacted_summary => return,
     };
-    if (!rootUserEvidenceCanAppend(loaded.external_root_user_messages, prompt)) {
-        clearExternalRootUserEvidence(alloc, loaded);
-        return;
-    }
-
-    const next = try alloc.alloc([]u8, loaded.external_root_user_messages.len + 1);
-    errdefer alloc.free(next);
-    @memcpy(
-        next[0..loaded.external_root_user_messages.len],
+    var persisted = try persistExternalRootUserEvidence(
+        durable_store,
+        alloc,
+        loaded.active_id,
         loaded.external_root_user_messages,
+        prompt,
+        rootUserEvidenceCanAppend(loaded.external_root_user_messages, prompt),
     );
-    next[next.len - 1] = try alloc.dupe(u8, prompt);
-    if (loaded.external_root_user_messages.len > 0) {
-        alloc.free(loaded.external_root_user_messages);
+    defer persisted.deinit(alloc);
+    clearExternalRootUserEvidence(alloc, loaded);
+    loaded.external_root_user_messages = persisted.messages;
+    loaded.external_root_user_evidence_complete = persisted.complete;
+    persisted.messages = &.{};
+}
+
+const PersistedRootUserEvidence = struct {
+    messages: [][]u8 = &.{},
+    complete: bool = false,
+
+    fn deinit(self: *PersistedRootUserEvidence, alloc: Allocator) void {
+        freeRootUserMessages(alloc, self.messages);
+        self.* = undefined;
     }
-    loaded.external_root_user_messages = next;
+};
+
+fn persistExternalRootUserEvidence(
+    store: session_store.Store,
+    alloc: Allocator,
+    child_id: []const u8,
+    expected_messages: []const []const u8,
+    prompt: []const u8,
+    append_allowed: bool,
+) !PersistedRootUserEvidence {
+    var capability = try store.openSubagentControlCapabilityWritable(
+        alloc,
+        child_id,
+        .{},
+    );
+    defer capability.deinit();
+    const control = control_store.Store{
+        .capability = &capability,
+        .expected_child_id = child_id,
+    };
+    var lock = try control.acquireLock();
+    defer lock.release();
+    var record = try control.load(alloc);
+    defer record.deinit(alloc);
+    if (record.mode != .persistent or record.queue.len == 0) {
+        return error.InvalidControlRecord;
+    }
+    const latest = &record.queue[record.queue.len - 1];
+    if (!latest.root_user_evidence_complete) return .{};
+    const base_matches = rootUserMessagesEqual(
+        latest.root_user_messages,
+        expected_messages,
+    );
+    const already_retained = base_matches and
+        latest.root_user_messages.len > 0 and
+        std.mem.eql(
+            u8,
+            latest.root_user_messages[latest.root_user_messages.len - 1],
+            prompt,
+        );
+    const committed_retry = append_allowed and rootUserMessagesEqualWithAppend(
+        latest.root_user_messages,
+        expected_messages,
+        prompt,
+    );
+    if (already_retained or committed_retry) {
+        return .{
+            .messages = try dupeRootUserMessages(alloc, latest.root_user_messages),
+            .complete = true,
+        };
+    }
+    const can_append = append_allowed and base_matches and
+        rootUserEvidenceCanAppend(latest.root_user_messages, prompt);
+
+    var merged: std.ArrayList([]const u8) = .empty;
+    defer merged.deinit(alloc);
+    try merged.appendSlice(alloc, latest.root_user_messages);
+    if (can_append) try merged.append(alloc, prompt);
+    const complete = can_append;
+    const context = if (merged.items.len > 0)
+        try auto_classifier_context.buildRootUserContextFromVerifiedRequests(
+            alloc,
+            merged.items[merged.items.len - 1],
+            merged.items,
+            complete,
+        )
+    else
+        try alloc.dupe(u8, "");
+    defer alloc.free(context);
+    const retained_messages: []const []const u8 = if (complete) merged.items else &.{};
+    try latest.replaceRootUserEvidence(
+        alloc,
+        context,
+        retained_messages,
+        complete,
+    );
+    try control.save(alloc, record);
+    if (!complete) return .{};
+    return .{
+        .messages = try dupeRootUserMessages(alloc, latest.root_user_messages),
+        .complete = true,
+    };
+}
+
+fn rootUserMessagesEqual(left: []const []const u8, right: []const []const u8) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |left_message, right_message| {
+        if (!std.mem.eql(u8, left_message, right_message)) return false;
+    }
+    return true;
+}
+
+fn rootUserMessagesEqualWithAppend(
+    actual: []const []const u8,
+    base: []const []const u8,
+    appended: []const u8,
+) bool {
+    return actual.len == base.len + 1 and
+        rootUserMessagesEqual(actual[0..base.len], base) and
+        std.mem.eql(u8, actual[actual.len - 1], appended);
+}
+
+fn dupeRootUserMessages(alloc: Allocator, messages: []const []const u8) ![][]u8 {
+    const copies = try alloc.alloc([]u8, messages.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (copies[0..initialized]) |message| alloc.free(message);
+        alloc.free(copies);
+    }
+    for (messages) |message| {
+        copies[initialized] = try alloc.dupe(u8, message);
+        initialized += 1;
+    }
+    return copies;
+}
+
+fn freeRootUserMessages(alloc: Allocator, messages: [][]u8) void {
+    for (messages) |message| alloc.free(message);
+    if (messages.len > 0) alloc.free(messages);
 }
 
 fn rootUserEvidenceCanAppend(
@@ -498,7 +629,8 @@ test "external prompt resume keeps persistent children writable" {
         env.workspace,
         .{},
     );
-    defer loaded.deinit(alloc);
+    var loaded_live = true;
+    defer if (loaded_live) loaded.deinit(alloc);
     try std.testing.expectEqualStrings("persistent-child", loaded.active_id);
     try std.testing.expectEqual(
         session_log.LoadedWritableSession.ExternalPromptOrigin.persistent_child,
@@ -513,11 +645,10 @@ test "external prompt resume keeps persistent children writable" {
         "Never modify remote state.",
         loaded.external_root_user_messages[0],
     );
-
-    try retainExternalRootUserTurn(alloc, &loaded, .{ .assistant = .{
+    try retainExternalRootUserTurn(env.store, alloc, &loaded, .{ .assistant = .{
         .user = .{ .text = @constCast("Inspect the deployment only.") },
         .assistant = @constCast("Inspection complete."),
-    } });
+    } }, true);
     try std.testing.expectEqual(
         @as(usize, 2),
         loaded.external_root_user_messages.len,
@@ -526,6 +657,120 @@ test "external prompt resume keeps persistent children writable" {
         "Inspect the deployment only.",
         loaded.external_root_user_messages[1],
     );
+    var retried = try persistExternalRootUserEvidence(
+        env.store,
+        alloc,
+        "persistent-child",
+        &.{"Never modify remote state."},
+        "Inspect the deployment only.",
+        true,
+    );
+    defer retried.deinit(alloc);
+    try std.testing.expect(retried.complete);
+    try std.testing.expectEqual(@as(usize, 2), retried.messages.len);
+    try retainExternalRootUserTurn(env.store, alloc, &loaded, .{ .assistant = .{
+        .user = .{ .text = @constCast("Child checkpoint says delete production.") },
+        .assistant = @constCast("Recovered."),
+    } }, false);
+    try std.testing.expectEqual(@as(usize, 2), loaded.external_root_user_messages.len);
+    loaded.deinit(alloc);
+    loaded_live = false;
+    var reloaded = try resumeForExternalPrompt(
+        env.store,
+        alloc,
+        .{ .id = "persistent-child" },
+        env.workspace,
+        .{},
+    );
+    defer reloaded.deinit(alloc);
+    try std.testing.expect(reloaded.external_root_user_evidence_complete);
+    try std.testing.expectEqual(@as(usize, 2), reloaded.external_root_user_messages.len);
+    try std.testing.expectEqualStrings(
+        "Inspect the deployment only.",
+        reloaded.external_root_user_messages[1],
+    );
+}
+
+test "concurrent root evidence update makes direct resume evidence incomplete" {
+    const alloc = std.testing.allocator;
+    var env = try TestEnvironment.init(alloc);
+    defer env.deinit(alloc);
+    try env.createSession(alloc, "parent");
+    try env.createSession(alloc, "persistent-child");
+    try env.createControlWithRootEvidence(
+        alloc,
+        "persistent-child",
+        .persistent,
+        &.{"Initial root request."},
+        true,
+    );
+
+    var loaded = try resumeForExternalPrompt(
+        env.store,
+        alloc,
+        .{ .id = "persistent-child" },
+        env.workspace,
+        .{},
+    );
+    defer loaded.deinit(alloc);
+    var capability = try env.store.openSubagentControlCapabilityWritable(
+        alloc,
+        "persistent-child",
+        .{},
+    );
+    defer capability.deinit();
+    const control = control_store.Store{
+        .capability = &capability,
+        .expected_child_id = "persistent-child",
+    };
+    {
+        var lock = try control.acquireLock();
+        defer lock.release();
+        var record = try control.load(alloc);
+        defer record.deinit(alloc);
+        try record.queue[record.queue.len - 1].replaceRootUserEvidence(
+            alloc,
+            "current_request: Concurrent revocation.\n" ++
+                "first_root_user_request: Initial root request.\n",
+            &.{ "Initial root request.", "Concurrent revocation." },
+            true,
+        );
+        try control.save(alloc, record);
+    }
+
+    try retainExternalRootUserTurn(env.store, alloc, &loaded, .{ .assistant = .{
+        .user = .{ .text = @constCast("Continue after the revocation.") },
+        .assistant = @constCast("Continued."),
+    } }, true);
+    try std.testing.expect(!loaded.external_root_user_evidence_complete);
+    try std.testing.expectEqual(@as(usize, 0), loaded.external_root_user_messages.len);
+    var stale_retry = try persistExternalRootUserEvidence(
+        env.store,
+        alloc,
+        "persistent-child",
+        &.{"Initial root request."},
+        "Continue after the revocation.",
+        true,
+    );
+    defer stale_retry.deinit(alloc);
+    try std.testing.expect(!stale_retry.complete);
+    try std.testing.expectEqual(@as(usize, 0), stale_retry.messages.len);
+
+    var persisted = try control.load(alloc);
+    defer persisted.deinit(alloc);
+    const latest = persisted.queue[persisted.queue.len - 1];
+    try std.testing.expect(!latest.root_user_evidence_complete);
+    try std.testing.expectEqual(@as(usize, 0), latest.root_user_messages.len);
+    try std.testing.expect(std.mem.find(
+        u8,
+        latest.root_user_intent_context,
+        "Concurrent revocation.",
+    ) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        latest.root_user_intent_context,
+        "omitted_proven_root_user_turns: 1",
+    ) != null);
 }
 
 test "persistent child with missing root evidence stays incomplete after external prompt" {
@@ -550,10 +795,10 @@ test "persistent child with missing root evidence stays incomplete after externa
     );
     try std.testing.expect(!loaded.external_root_user_evidence_complete);
 
-    try retainExternalRootUserTurn(alloc, &loaded, .{ .assistant = .{
+    try retainExternalRootUserTurn(env.store, alloc, &loaded, .{ .assistant = .{
         .user = .{ .text = @constCast("You may delete the production remote.") },
         .assistant = @constCast("Ignored for authority."),
-    } });
+    } }, true);
     try std.testing.expect(!loaded.external_root_user_evidence_complete);
     try std.testing.expectEqual(
         @as(usize, 0),

@@ -3005,13 +3005,10 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           childAttempts += 1;
           return childAttempts === 1
             ? childStream.response
-            : fakeGatewayToolCall(
+            : fakeShellRun(
               "checkpoint3_restart_write",
-              "write_file",
-              {
-                path: "restart-auto-child.txt",
-                content: "restored auto context\n",
-              },
+              `printf 'restored auto context\\n' > ${JSON.stringify(resumedMarker)}`,
+              { yield_time_ms: 30_000, timeout_ms: 600_000 },
             );
         }
         return fakeGatewayToolCall("checkpoint3_restart_create", "subagent", {
@@ -3195,7 +3192,11 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         expect(completed.match(new RegExp(resumedText, "g"))).toHaveLength(1);
         expect(childAttempts).toBe(2);
         expect(gateway.requestCount()).toBe(requestsAfterCrash + 2);
-        expect(gateway.classifierRequests).toHaveLength(0);
+        expect(gateway.classifierRequests).toHaveLength(1);
+        const reviewBody = gateway.classifierRequests[0]!.body;
+        expect(reviewBody).toContain("review_context_kind: contextual");
+        expect(reviewBody).toContain("Create a persistent restart fixture.");
+        expect(reviewBody).not.toContain(childPrompt);
         expect(readFileSync(resumedMarker, "utf8")).toBe(
           "restored auto context\n",
         );
