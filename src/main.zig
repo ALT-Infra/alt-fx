@@ -1912,11 +1912,10 @@ const App = struct {
     }
 
     pub fn requestSkillsRefresh(self: *App) !u64 {
-        const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
         return self.skills.requestRefresh(
             std.heap.c_allocator,
             self.workspace_root,
-            home,
+            io_mod.getenv("HOME"),
             builtin_skills.root_policy,
         );
     }

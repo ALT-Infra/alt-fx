@@ -12,7 +12,7 @@ const source_preparation = @import("source_preparation.zig");
 const transcript_presentation = @import("../../core/output/transcript_presentation.zig");
 
 const Allocator = std.mem.Allocator;
-pub const prepared_cache_max_rows: u16 = 192;
+pub const prepared_cache_overscan_max_rows: u16 = 192;
 pub const prepared_cache_max_bytes: usize = 2 * 1024 * 1024;
 
 pub fn preparedWindowRequest(
@@ -22,11 +22,11 @@ pub fn preparedWindowRequest(
     visible_rows: u16,
 ) WindowRequest {
     const bounded_visible_rows = @max(visible_rows, 1);
-    const cache_rows: u16 = @intCast(@min(
-        @as(u32, prepared_cache_max_rows),
-        @max(
+    const cache_rows: u16 = @intCast(@max(
+        @as(u32, bounded_visible_rows),
+        @min(
+            @as(u32, prepared_cache_overscan_max_rows),
             @as(u32, bounded_visible_rows) *| 3,
-            @as(u32, bounded_visible_rows),
         ),
     ));
     const overscan = (cache_rows -| bounded_visible_rows) / 2;
@@ -37,6 +37,21 @@ pub fn preparedWindowRequest(
         .start_row = @min(target_offset -| overscan, max_start),
         .row_count = cache_rows,
     };
+}
+
+test "prepared window always covers one complete visible viewport" {
+    const request = preparedWindowRequest(
+        .{ .content_revision = 1, .cols = 80, .anchor = .tail },
+        1_000,
+        780,
+        220,
+    );
+    try std.testing.expectEqual(@as(u16, 220), request.row_count);
+    try std.testing.expect(request.start_row <= request.target_offset);
+    try std.testing.expect(
+        request.start_row + @as(u32, request.row_count) >=
+            request.target_offset + 220,
+    );
 }
 
 pub const FullDiffSnapshot = struct {
@@ -266,24 +281,11 @@ pub const Task = struct {
             selected.offset,
             visible_rows,
         );
-        const page_bytes = full_transcript_screen.renderProjectionViewportSourceBoundedInterruptible(
+        const prepared_window = prepareWindowInterruptible(
             alloc,
             &projection,
             if (self.source.capability) |*capability| capability else null,
-            self.source.request.cols,
-            window_request.row_count,
-            window_request.start_row,
-            prepared_cache_max_bytes,
-            &checkpoint,
-        ) catch |err| {
-            self.failure = err;
-            self.done.store(true, .release);
-            return;
-        };
-        const prepared_source = source_preparation.prepareIndexedFullTranscriptWindowSourceInterruptible(
-            alloc,
-            page_bytes,
-            self.source.request.cols,
+            window_request,
             &checkpoint,
         ) catch |err| {
             self.failure = err;
@@ -304,11 +306,7 @@ pub const Task = struct {
             },
         );
         self.projection = projection;
-        self.prepared_window = .{
-            .source = prepared_source,
-            .start_row = window_request.start_row,
-            .target_offset = selected.offset,
-        };
+        self.prepared_window = prepared_window;
         projection_owned = false;
         self.done.store(true, .release);
     }
@@ -435,34 +433,16 @@ pub const WindowTask = struct {
             self,
             WindowTask.cancelled,
         );
-        const bytes = full_transcript_screen.renderProjectionViewportSourceBoundedInterruptible(
+        self.prepared_window = prepareWindowInterruptible(
             alloc,
             self.projection,
             self.capability,
-            self.request.page_request.cols,
-            self.request.row_count,
-            self.request.start_row,
-            prepared_cache_max_bytes,
+            self.request,
             &checkpoint,
         ) catch |err| {
             self.failure = err;
             self.done.store(true, .release);
             return;
-        };
-        const source = source_preparation.prepareIndexedFullTranscriptWindowSourceInterruptible(
-            alloc,
-            bytes,
-            self.request.page_request.cols,
-            &checkpoint,
-        ) catch |err| {
-            self.failure = err;
-            self.done.store(true, .release);
-            return;
-        };
-        self.prepared_window = .{
-            .source = source,
-            .start_row = self.request.start_row,
-            .target_offset = self.request.target_offset,
         };
         self.done.store(true, .release);
     }
@@ -487,6 +467,36 @@ pub const WindowTask = struct {
         std.heap.c_allocator.destroy(self);
     }
 };
+
+fn prepareWindowInterruptible(
+    alloc: Allocator,
+    projection: *full_transcript_screen.Projection,
+    capability: ?*session_child_store.SessionChildCapability,
+    request: WindowRequest,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) !PreparedWindow {
+    const bytes = try full_transcript_screen.renderProjectionViewportSourceBoundedInterruptible(
+        alloc,
+        projection,
+        capability,
+        request.page_request.cols,
+        request.row_count,
+        request.start_row,
+        prepared_cache_max_bytes,
+        checkpoint,
+    );
+    const source = try source_preparation.prepareIndexedFullTranscriptWindowSourceInterruptible(
+        alloc,
+        bytes,
+        request.page_request.cols,
+        checkpoint,
+    );
+    return .{
+        .source = source,
+        .start_row = request.start_row,
+        .target_offset = request.target_offset,
+    };
+}
 
 pub const WindowLoad = struct {
     task: ?*WindowTask = null,

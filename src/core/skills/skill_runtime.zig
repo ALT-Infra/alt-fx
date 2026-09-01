@@ -441,14 +441,85 @@ fn collectRootFingerprints(
             }
             return err;
         };
+        const candidate_digest = if (stat.kind == .directory)
+            try candidateDirectoryDigest(alloc, root)
+        else
+            [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length;
         fingerprints[filled] = .{
             .path = path,
             .exists = true,
             .inode = stat.inode,
             .mtime = stat.mtime,
+            .candidate_digest = candidate_digest,
         };
     }
     return fingerprints;
+}
+
+fn candidateDirectoryDigest(
+    alloc: Allocator,
+    root: SkillRoot,
+) ![std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    var dir = if (root.read_authority) |authority|
+        try openContainedDir(alloc, root.path, authority, .{ .iterate = true })
+    else
+        try io_mod.openDirAbsoluteNoFollow(root.path, .{ .iterate = true });
+    defer dir.close(io_mod.getIo());
+
+    var entries: std.ArrayList(SkillEntry) = .empty;
+    defer {
+        for (entries.items) |entry| alloc.free(entry.name);
+        entries.deinit(alloc);
+    }
+    var it = dir.iterate();
+    while (try it.next(io_mod.getIo())) |entry| {
+        const linked = entry.kind == .sym_link;
+        if (entry.kind != .directory and !(linked and root.read_authority != null)) continue;
+        const name = try alloc.dupe(u8, entry.name);
+        entries.append(alloc, .{ .name = name, .linked = linked }) catch |err| {
+            alloc.free(name);
+            return err;
+        };
+    }
+    sort_utils.sort(SkillEntry, entries.items, {}, struct {
+        fn lessThan(_: void, left: SkillEntry, right: SkillEntry) bool {
+            return std.mem.order(u8, left.name, right.name) == .lt;
+        }
+    }.lessThan);
+
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    for (entries.items) |entry| {
+        hash.update(entry.name);
+        hash.update(if (entry.linked) "\x01" else "\x00");
+        const stat = if (entry.linked) linked: {
+            const candidate_path = try std.fs.path.join(alloc, &.{ root.path, entry.name });
+            defer alloc.free(candidate_path);
+            var candidate_dir = openContainedDir(
+                alloc,
+                candidate_path,
+                root.read_authority.?,
+                .{},
+            ) catch {
+                hash.update("unavailable");
+                continue;
+            };
+            defer candidate_dir.close(io_mod.getIo());
+            break :linked candidate_dir.stat(io_mod.getIo()) catch {
+                hash.update("unavailable");
+                continue;
+            };
+        } else dir.statFile(
+            io_mod.getIo(),
+            entry.name,
+            .{ .follow_symlinks = false },
+        ) catch {
+            hash.update("unavailable");
+            continue;
+        };
+        hash.update(std.mem.asBytes(&stat.inode));
+        hash.update(std.mem.asBytes(&stat.mtime.nanoseconds));
+    }
+    return hash.finalResult();
 }
 
 fn appendWorkspaceRoots(
@@ -1466,6 +1537,8 @@ const RootFingerprint = struct {
     exists: bool,
     inode: std.Io.File.INode = 0,
     mtime: std.Io.Timestamp = .zero,
+    candidate_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 =
+        [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length,
 
     fn deinit(self: *RootFingerprint, alloc: Allocator) void {
         alloc.free(self.path);
@@ -1591,11 +1664,17 @@ fn refreshKnownCatalog(
     {
         return .full_discovery;
     }
-    _ = workspace_root;
-    _ = home;
-    _ = root_policy;
-    if (!rootFingerprintsStillCurrent(
+    const current_roots = try collectRootFingerprints(
+        alloc,
+        workspace_root,
+        home,
+        skills_dir,
+        root_policy,
+    );
+    defer freeRootFingerprints(alloc, current_roots);
+    if (!rootFingerprintsEqual(
         generation.catalog.root_fingerprints,
+        current_roots,
     )) return .full_discovery;
 
     const changed = try alloc.alloc(bool, base.items.len);
@@ -1776,26 +1855,6 @@ fn copyCompactString(
     @memcpy(backing[start..end], value);
     cursor.* = end;
     return backing[start..end];
-}
-
-fn rootFingerprintsStillCurrent(roots: []const RootFingerprint) bool {
-    for (roots) |root| {
-        const stat = std.Io.Dir.cwd().statFile(
-            io_mod.getIo(),
-            root.path,
-            .{ .follow_symlinks = false },
-        ) catch |err| {
-            if (err == error.FileNotFound or err == error.NotDir) {
-                if (root.exists) return false;
-                continue;
-            }
-            return false;
-        };
-        if (!root.exists or
-            root.inode != stat.inode or
-            !std.meta.eql(root.mtime, stat.mtime)) return false;
-    }
-    return true;
 }
 
 fn cloneRootFingerprints(
@@ -2054,7 +2113,8 @@ fn rootFingerprintsEqual(
         if (!std.mem.eql(u8, a.path, b.path) or
             a.exists != b.exists or
             a.inode != b.inode or
-            !std.meta.eql(a.mtime, b.mtime)) return false;
+            !std.meta.eql(a.mtime, b.mtime) or
+            !std.mem.eql(u8, &a.candidate_digest, &b.candidate_digest)) return false;
     }
     return true;
 }
@@ -2107,9 +2167,17 @@ pub const Runtime = struct {
         self: *Runtime,
         alloc: Allocator,
         workspace_root: []const u8,
-        home: []const u8,
+        home: ?[]const u8,
         root_policy: skill_contract.RootPolicy,
     ) !u64 {
+        const configured_home = home orelse {
+            const generation = self.nextGeneration();
+            self.fresh_through_generation = @max(
+                self.fresh_through_generation,
+                generation,
+            );
+            return generation;
+        };
         if (self.refresh_task != null) {
             if (self.refresh_pending_generation) |generation| return generation;
             const generation = self.nextGeneration();
@@ -2126,7 +2194,7 @@ pub const Runtime = struct {
         try self.startRefresh(
             alloc,
             workspace_root,
-            home,
+            configured_home,
             root_policy,
             generation,
         );
@@ -3402,6 +3470,7 @@ test "skill refresh publishes one generation and coalesces one latest request" {
         "home/.fx/skills/refreshable/SKILL.md",
         "---\nname: refreshable\ndescription: refreshed off-thread\n---\nbody\n",
     );
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/skills/added");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
     const managed = try std.fs.path.join(alloc, &.{ home, ".fx", "skills" });

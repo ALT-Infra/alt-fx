@@ -480,6 +480,99 @@ test.skipIf(!tmuxAvailable())(
   120_000,
 );
 
+test.skipIf(!tmuxAvailable())(
+  "prompt admission treats missing HOME as an empty optional skill catalog",
+  async () => {
+    const fixture = createFixture();
+    const noHomeGateway = startFakeGateway([
+      fakeGatewayFinalText("MISSING_HOME_PROMPT_OK"),
+    ]);
+    let active: TmuxSession | null = null;
+    try {
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: fixture.workspace,
+        env: {
+          HOME: undefined,
+          AI_GATEWAY_API_KEY: "missing-home-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: noHomeGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: noHomeGateway.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_AUTO_UPGRADE: "0",
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_SKIP_ONBOARDING: "1",
+          FX_SOUND: "0",
+          NO_COLOR: "1",
+        },
+        stderrPath: fixture.stderrPath,
+        width: 104,
+        height: 30,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Submit without an optional home directory.");
+      const pane = await active.waitForText("MISSING_HOME_PROMPT_OK", 5_000);
+      expect(pane).not.toContain("HomeNotSet");
+      expect(noHomeGateway.requestCount()).toBe(1);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+    } finally {
+      await active?.kill();
+      noHomeGateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  30_000,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "skills refresh discovers SKILL.md added inside an existing candidate directory",
+  async () => {
+    const fixture = createFixture();
+    const candidate = join(
+      fixture.workspace,
+      ".agents",
+      "skills",
+      "late-skill",
+    );
+    mkdirSync(candidate);
+    let active: TmuxSession | null = null;
+    try {
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: fixture.workspace,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_SOUND: "0",
+          NO_COLOR: "1",
+        },
+        stderrPath: fixture.stderrPath,
+        width: 104,
+        height: 30,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("/skills");
+      await active.waitForText("Skills 289", TIMEOUT);
+      await closeSurface(active, "Skills ");
+
+      writeFileSync(
+        join(candidate, "SKILL.md"),
+        "---\nname: late-skill\ndescription: created inside an existing candidate\n---\nbody\n",
+      );
+      await active.sendText("/skills");
+      const refreshed = await active.waitForText("late-skill", TIMEOUT);
+      expect(refreshed).toContain("Skills 290");
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+    } finally {
+      await active?.kill();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  30_000,
+);
+
 test.skipIf(!ENABLED || !tmuxAvailable())(
   "interactive terminal surfaces stay within one frame at p95",
   async () => {

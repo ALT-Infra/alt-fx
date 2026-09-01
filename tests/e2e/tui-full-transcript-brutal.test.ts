@@ -1210,6 +1210,56 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
 }
 
 test.skipIf(!tmuxAvailable())(
+  "Ctrl-O fills a viewport taller than the prepared overscan cache",
+  async () => {
+    const paths = makeRoot("tall-viewport");
+    mkdirSync(join(paths.home, ".fx"), { recursive: true });
+    mkdirSync(paths.workspace);
+    writeFileSync(paths.stderrPath, "");
+    const tallTail = "TALL_TRANSCRIPT_TAIL";
+    const response = Array.from(
+      { length: 500 },
+      (_, index) => index === 499
+        ? tallTail
+        : `TALL_TRANSCRIPT_ROW_${String(index).padStart(3, "0")}`,
+    ).join("\n");
+    const tallGateway = startFakeGateway([fakeGatewayFinalText(response)]);
+    let active: TmuxSession | null = null;
+    try {
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: realpathSync(paths.workspace),
+        env: gatewayEnv(paths.home, tallGateway),
+        stderrPath: paths.stderrPath,
+        width: 80,
+        height: 220,
+        minimumHistoryLines: 2_000,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Build a tall transcript.");
+      await active.waitForText(tallTail, TIMEOUT);
+      await active.sendHexBytes(CTRL_O);
+      const full = await active.waitForText(FULL_FOOTER, TIMEOUT);
+      const rows = full.split("\n");
+      const tail_row = rows.findIndex((row) => row.includes(tallTail));
+      const footer_row = rows.findIndex((row) => row.includes(FULL_FOOTER));
+      expect(tail_row).toBeGreaterThanOrEqual(0);
+      expect(footer_row).toBeGreaterThan(tail_row);
+      expect(footer_row - tail_row).toBeLessThanOrEqual(6);
+
+      await active.sendHexBytes(CTRL_O);
+      await active.waitForComposer(TIMEOUT);
+      expect(readFileSync(paths.stderrPath, "utf8")).toBe("");
+    } finally {
+      await active?.kill();
+      tallGateway.stop();
+      rmSync(paths.root, { recursive: true, force: true });
+    }
+  },
+  60_000,
+);
+
+test.skipIf(!tmuxAvailable())(
   "Ctrl-O repeatedly survives mixed long chats, dense tool batches, live output, resize storms, and resume",
   async () => {
     await runStress({
