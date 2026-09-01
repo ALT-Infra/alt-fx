@@ -821,8 +821,63 @@ test "installed full transcript never publishes a stale closed page" {
     try std.testing.expect(runtime.installedFullTranscriptPageProjection() == null);
 }
 
-test "active full transcript defers repaint while replacement loads" {
+test "active full transcript keeps its installed page while replacement loads" {
     const alloc = std.testing.allocator;
+    const page_alloc = std.heap.c_allocator;
+    const prepared_source = try source_preparation.prepareIndexedFullTranscriptWindowSourceInterruptible(
+        page_alloc,
+        try page_alloc.dupe(u8, "installed page\n"),
+        80,
+        null,
+    );
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 20,
+            .divider_top_row = 21,
+            .input_row = 22,
+            .divider_bottom_row = 23,
+            .hint_row = 24,
+        },
+        .full_transcript = .{ .depth = .full },
+        .full_transcript_content_revision = 41,
+        .full_transcript_installed_page = .{
+            .source = .{
+                .request = .{
+                    .content_revision = 40,
+                    .cols = 80,
+                    .anchor = .tail,
+                },
+                .range = .{ .start = 0, .end = 0 },
+            },
+            .projection = .{ .styles = .{} },
+            .prepared_window = .{
+                .source = prepared_source,
+                .start_row = 0,
+            },
+        },
+    };
+    defer runtime.deinit(alloc);
+    const installed = &runtime.full_transcript_installed_page.?.projection;
+    const visible = try runtime.preparedFullTranscriptPageProjectionInterruptible(
+        null,
+        null,
+        null,
+    );
+    try std.testing.expect(visible == installed);
+    try std.testing.expect(runtime.full_transcript_page_load.busy());
+}
+
+test "active full transcript defers repaint while width replacement loads" {
+    const alloc = std.testing.allocator;
+    const page_alloc = std.heap.c_allocator;
+    const prepared_source = try source_preparation.prepareIndexedFullTranscriptWindowSourceInterruptible(
+        page_alloc,
+        try page_alloc.dupe(u8, "installed page\n"),
+        80,
+        null,
+    );
     var runtime = TranscriptRuntime{
         .layout = .{
             .rows = 24,
@@ -845,6 +900,10 @@ test "active full transcript defers repaint while replacement loads" {
                 .range = .{ .start = 0, .end = 0 },
             },
             .projection = .{ .styles = .{} },
+            .prepared_window = .{
+                .source = prepared_source,
+                .start_row = 0,
+            },
         },
     };
     defer runtime.deinit(alloc);
@@ -857,6 +916,36 @@ test "active full transcript defers repaint while replacement loads" {
         ),
     );
     try std.testing.expect(runtime.full_transcript_page_load.busy());
+}
+
+test "restored full transcript opens without replacing its exact offset" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 12,
+            .cols = 60,
+            .content_bottom = 8,
+            .divider_top_row = 9,
+            .input_row = 10,
+            .divider_bottom_row = 11,
+            .hint_row = 12,
+        },
+        .full_transcript = .{
+            .depth = .full,
+            .scroll_rows = 47,
+            .follow_tail = false,
+        },
+    };
+    defer runtime.deinit(alloc);
+
+    runtime.deferRestoredFullTranscriptOpen();
+    try std.testing.expectEqual(
+        transcript_presentation.Depth.inline_mode,
+        runtime.full_transcript.depth,
+    );
+    try std.testing.expect(try runtime.setTranscriptPresentationDepth(alloc, .full));
+    const selected = runtime.full_transcript.select_visual_offset(100, 8, &.{});
+    try std.testing.expectEqual(@as(u32, 47), selected.offset);
 }
 
 test "full transcript viewport snapshot restores reading position" {
@@ -4016,6 +4105,7 @@ pub const TranscriptRuntime = struct {
     full_transcript_failed_request: ?full_transcript_page.Request = null,
     full_transcript_failure_pending: bool = false,
     full_transcript_open_request: ?full_transcript_page.Request = null,
+    full_transcript_restore_open_pending: bool = false,
     full_transcript_prepared_page_visible: bool = false,
     full_transcript_content_revision: u64 = 0,
     compact_transcript_source_cache: CompactTranscriptSourceCache = .{},
@@ -5945,16 +6035,26 @@ pub const TranscriptRuntime = struct {
         depth: transcript_presentation.Depth,
     ) !bool {
         const current = self.full_transcript.depth;
-        if (current == depth) return false;
+        if (current == depth) {
+            if (depth == .inline_mode) {
+                self.full_transcript_restore_open_pending = false;
+            }
+            return false;
+        }
+        const restored_open = current == .inline_mode and
+            depth != .inline_mode and
+            self.full_transcript_restore_open_pending;
         if (current == .inline_mode and depth != .inline_mode) {
             self.full_transcript_prepared_page_visible = false;
             self.full_transcript_open_content_revision = self.full_transcript_content_revision;
             self.full_transcript_open_cols = self.layout.cols;
             self.full_transcript_open_rows = self.layout.rows;
-            try self.captureFullTranscriptAnchor(alloc);
+            if (!restored_open) try self.captureFullTranscriptAnchor(alloc);
         }
         self.full_transcript = self.full_transcript.with_depth(depth);
+        if (depth != .inline_mode) self.full_transcript_restore_open_pending = false;
         if (depth == .inline_mode) {
+            self.full_transcript_restore_open_pending = false;
             self.full_transcript_open_content_revision = null;
             self.full_transcript_open_cols = 0;
             self.full_transcript_open_rows = 0;
@@ -6200,6 +6300,7 @@ pub const TranscriptRuntime = struct {
         self.full_transcript_page_anchor = .tail;
         self.full_transcript_prepared_page_visible = false;
         self.full_transcript_open_request = null;
+        self.full_transcript_restore_open_pending = false;
         self.full_transcript_window_load.cancelActive();
         self.full_transcript_page_load.cancelActive();
     }
@@ -9429,6 +9530,7 @@ pub const TranscriptRuntime = struct {
     }
 
     pub fn requestFullTranscriptOpen(self: *TranscriptRuntime) bool {
+        self.full_transcript_restore_open_pending = false;
         if (self.fullTranscriptPreparedForOpen()) {
             self.full_transcript_open_request = null;
             debug_trace.logf("full_transcript", "open_request state=ready", .{});
@@ -9456,9 +9558,27 @@ pub const TranscriptRuntime = struct {
         return false;
     }
 
+    pub fn deferRestoredFullTranscriptOpen(self: *TranscriptRuntime) void {
+        std.debug.assert(self.full_transcript.depth == .full);
+        self.full_transcript_open_request = self.desiredFullTranscriptPageRequest();
+        self.full_transcript = self.full_transcript.defer_full_open();
+        self.full_transcript_restore_open_pending = true;
+        debug_trace.logf(
+            "full_transcript",
+            "restored_open deferred scroll_rows={d} follow_tail={} bookmark_pending={} bookmark_entry_id={d}",
+            .{
+                self.full_transcript.scroll_rows,
+                self.full_transcript.follow_tail,
+                self.full_transcript.bookmark_pending,
+                self.full_transcript.bookmark_entry_id orelse 0,
+            },
+        );
+    }
+
     pub fn cancelPendingFullTranscriptOpen(self: *TranscriptRuntime) bool {
         if (self.full_transcript_open_request == null) return false;
         self.full_transcript_open_request = null;
+        self.full_transcript_restore_open_pending = false;
         debug_trace.logf("full_transcript", "open_request state=cancelled", .{});
         return true;
     }
@@ -9493,6 +9613,15 @@ pub const TranscriptRuntime = struct {
 
         try self.ensureFullTranscriptPageLoad(capability, full_diff_resolver);
         if (self.installedFullTranscriptPageProjection()) |projection| return projection;
+        if (!self.full_transcript_installed_page_retired) {
+            if (self.full_transcript_installed_page) |*page| {
+                if (page.prepared_window != null and
+                    page.source.request.cols == self.layout.cols)
+                {
+                    return &page.projection;
+                }
+            }
+        }
         return error.InputPending;
     }
 
