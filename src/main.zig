@@ -106,7 +106,6 @@ const shell_process_provider = @import("tools/shell/process_provider.zig");
 const process_provider = @import("core/execution/process_provider.zig");
 const terminal_client_runtime = @import("core/terminal/client.zig");
 const app_terminal_runtime = @import("core/app/app_terminal_runtime.zig");
-const app_terminal_takeover_runtime = @import("core/app/app_terminal_takeover_runtime.zig");
 const terminal_host = @import("core/terminal/host.zig");
 const terminal_native_session = @import("core/terminal/native_session.zig");
 const terminal_tmux_session = @import("core/terminal/tmux_session.zig");
@@ -146,7 +145,6 @@ const ui_render = @import("ui/render.zig");
 const shell_runtime = @import("ui/shell_runtime.zig");
 const ui_terminal = @import("ui/terminal/terminal.zig");
 const cursor_probe = @import("ui/terminal/cursor_probe.zig");
-const ui_subagents = @import("ui/subagent/controller.zig");
 const transcript_runtime = @import("ui/transcript/runtime.zig");
 const resume_projection = @import("ui/transcript/resume_projection.zig");
 const assistant_pacer = @import("ui/assistant/pacer.zig");
@@ -570,9 +568,7 @@ const App = struct {
     terminal_client: terminal_client_runtime.Runtime = .{},
     managed_executions: managed_execution.Runtime = managed_execution.Runtime.init(std.heap.c_allocator),
     legacy_process_provider: process_provider.Provider = process_provider.unavailable_provider,
-    terminal_takeover: app_terminal_takeover_runtime.Controller = .{},
     upgrader: auto_upgrade.AutoUpgrade = .{},
-    subagents: ui_subagents.Controller = .{},
     change_tracker: change_tracker_mod.ChangeTracker = .{},
     mcp: app_mcp_runtime.State = .{},
     skills: skill_runtime.Runtime = .{},
@@ -612,7 +608,6 @@ const App = struct {
             .usage_dashboard = undefined,
             .session_persistence = undefined,
             .shell = TranscriptRuntime.init(),
-            .subagents = ui_subagents.Controller.init(),
             .lifecycle_runtime = hooks.Runtime.init(alloc),
             .terminal_client = terminal_client_runtime.Runtime.init(if (comptime host_target.is_wasm)
                 process_provider.unavailable_provider
@@ -848,10 +843,8 @@ const App = struct {
         self.upgrader.stop();
         self.file_index.requestStop();
 
-        self.terminal_takeover.shutdown(App, self);
         self.releaseTerminal();
         if (self.worker_thread) |thread| thread.join();
-        self.terminal_takeover.deinit(self.alloc);
         self.terminal_client.deinit();
         self.managed_executions.deinit();
         self.model_cache.deinit();
@@ -866,7 +859,6 @@ const App = struct {
         self.worker.deinit(std.heap.c_allocator);
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
-        self.subagents.deinit(self.alloc);
         self.queued_prompt_review.deinit(self.alloc);
         self.prompt_history.deinit(self.alloc);
         self.clearPendingImages();
@@ -2052,28 +2044,6 @@ const App = struct {
         );
     }
 
-    pub fn writeSubagentSnapshot(self: *App) !void {
-        try RenderAppRuntime.toggleSubagentView(self);
-    }
-
-    pub fn refreshSubagentManagerProjection(self: *App) !void {
-        if (comptime !host_profile.subagents) return;
-        try RenderAppRuntime.refreshSubagentManager(self, false);
-    }
-
-    pub fn refreshSubagentManagerProjectionNow(self: *App) !void {
-        if (comptime !host_profile.subagents) return;
-        try RenderAppRuntime.refreshSubagentManagerAfterSessionInstall(self);
-    }
-
-    pub fn acknowledgeSubagentManagerSelection(self: *App) !void {
-        try RenderAppRuntime.acknowledgeSubagentManagerSelection(self);
-    }
-
-    pub fn acknowledgeVisibleSubagentChildBeforeClose(self: *App) void {
-        RenderAppRuntime.acknowledgeVisibleSubagentChildBeforeClose(self);
-    }
-
     pub fn fetchModelIds(self: *App) !std.ArrayList([]u8) {
         return AgentAppRuntime.fetchModelIds(
             self,
@@ -2437,13 +2407,6 @@ const App = struct {
         try app_terminal_runtime.Runtime(App).submitDirect(self, command);
     }
 
-    pub fn requestTerminalOpen(
-        self: *App,
-        session_id: []const u8,
-    ) app_terminal_runtime.OpenRequestResult {
-        return app_terminal_runtime.Runtime(App).requestOpen(self, session_id);
-    }
-
     pub fn appendDomainNotice(self: *App, notice: types.SemanticNotice) !u32 {
         return self.shell.appendSemanticNotice(self.alloc, notice);
     }
@@ -2633,7 +2596,6 @@ const App = struct {
             self.approval_prompt.isActive() or
             @constCast(&self.mcp).projectPromptActive() or
             self.auth.apiKeyEntryActive() or
-            self.subagents.isViewActive() or
             !self.shell.has_committed_frame or
             !self.shell.footer_viewport.has_frame or
             self.shell.footer_viewport.cursor.row == 0 or
@@ -2875,11 +2837,7 @@ const App = struct {
         }
         InputSubmitRuntime.collectPendingSubmissionFacts(self);
 
-        if (!self.terminal_takeover.blocksFxSurface(&self.terminal)) {
-            try self.collectThemeFacts();
-        } else {
-            self.terminal_input_runtime.terminal_theme_monitor.poll(io_mod.milliTimestamp());
-        }
+        try self.collectThemeFacts();
 
         if (comptime !host_target.is_wasm) {
             UpgradeAppRuntime.collectUpgradeFacts(self);
@@ -2918,10 +2876,7 @@ const App = struct {
         try self.processNextCooperativePrompt();
 
         const cols_before_resize = self.shell.layout.cols;
-        if (self.terminal_takeover.blocksFxSurface(&self.terminal)) {
-            self.shell.layout = self.terminal.queryLayout(footer_rows) catch
-                self.shell.layout;
-        } else if (self.terminal_input_runtime.native_clear_probe.active() or
+        if (self.terminal_input_runtime.native_clear_probe.active() or
             self.terminal_input_runtime.native_clear_probe.awaitingLateResponse())
         {
             try self.collectNativeClearProbeFacts();
@@ -2941,8 +2896,6 @@ const App = struct {
                 }
             };
         }
-        try self.terminal_takeover.collect(App, self);
-
         // Terminal width changed with the modal open, so the footer
         // panel needs to re-wrap labels and descriptions.
         if (self.question_prompt.isActive() and cols_before_resize != self.shell.layout.cols) {
@@ -2995,49 +2948,14 @@ const App = struct {
                 .body = "Full transcript preparation failed. The reader was closed instead of showing stale content.",
             }, true);
         }
-        if (self.subagents.childConversationRuntime()) |child| {
-            try child.prewarmFullTranscriptPage(
-                null,
-                self.subagents.childFullTranscriptDiffResolver(),
-            );
-            if (try child.pollFullTranscriptPageLoad()) {
-                RenderAppRuntime.requestActiveSurfaceFrame(self, .modal);
-            }
-            if (!child.fullTranscriptActive() and
-                child.takeReadyFullTranscriptOpen())
-            {
-                _ = try self.subagents.setChildTranscriptPresentationDepth(
-                    self.alloc,
-                    .full,
-                );
-                debug_trace.logf(
-                    "full_transcript",
-                    "depth_transition from=inline to=full route=child trigger=ctrl_o",
-                    .{},
-                );
-                RenderAppRuntime.requestActiveSurfaceFrame(self, .modal);
-            }
-            if (child.takeFullTranscriptPreparationFailure()) {
-                if (child.fullTranscriptActive()) {
-                    _ = try self.subagents.closeChildTranscriptPresentation(self.alloc);
-                }
-                try self.writeDomainNotice(.{
-                    .topic = "transcript",
-                    .tone = .@"error",
-                    .body = "The child full transcript reader was closed because its current page could not be prepared.",
-                }, true);
-            }
-        }
-        if (!self.terminal_takeover.blocksFxSurface(&self.terminal)) {
-            const input_now_ms = io_mod.milliTimestamp();
-            InputAppRuntime.expireTerminalInputGestures(self, input_now_ms);
-            const terminal_input = self.terminal_input_runtime.flushTerminalAction(
-                input_now_ms,
-                input_escape_timeout_ms,
-                InputAppRuntime.terminalPasteActive(self),
-            );
-            try self.routeTerminalInputIngress(terminal_input);
-        }
+        const input_now_ms = io_mod.milliTimestamp();
+        InputAppRuntime.expireTerminalInputGestures(self, input_now_ms);
+        const terminal_input = self.terminal_input_runtime.flushTerminalAction(
+            input_now_ms,
+            input_escape_timeout_ms,
+            InputAppRuntime.terminalPasteActive(self),
+        );
+        try self.routeTerminalInputIngress(terminal_input);
         try WorkerAppRuntime.tick(self, app_callbacks.Bindings(App).workerEventHandlers(self));
         const now_ns = io_mod.nanoTimestamp();
         if (!self.approval_prompt.isActive() and !self.question_prompt.isActive() and !self.auth.apiKeyEntryActive()) {
@@ -3050,7 +2968,6 @@ const App = struct {
     pub fn loopCommitFrame(ctx: *anyopaque) !void {
         const self: *App = @ptrCast(@alignCast(ctx));
         if (!try WorkerAppRuntime.authorizeInteractiveAdmission(self)) return;
-        if (try self.terminal_takeover.commit(App, self)) return;
         if (self.terminal_input_runtime.native_clear_probe.active()) return;
         _ = self.admitPendingResizeSignal("post_input");
         try self.flushRequestedFrame();
@@ -3104,7 +3021,6 @@ const App = struct {
 
     fn handleAfterThemeMonitorByte(self: *App, byte: u8) !void {
         if (try self.routeActivePasteTransportByte(byte)) return;
-        if (try self.terminal_takeover.handleByte(App, self, byte)) return;
         if (!self.terminal_input_runtime.terminal_cursor_probe.interceptsInput()) {
             if (try self.beginNativeClearProbe(byte)) return;
             try self.handleTerminalInputByte(byte);
@@ -3163,9 +3079,7 @@ const App = struct {
             switch (source) {
                 .cursor_probe => {
                     if (try self.routeActivePasteTransportByte(byte)) return;
-                    if (!try self.terminal_takeover.handleByte(App, self, byte)) {
-                        try self.handleCursorDeferredInputByte(byte);
-                    }
+                    try self.handleCursorDeferredInputByte(byte);
                 },
                 .theme_monitor => try self.handleAfterThemeMonitorByte(byte),
             }
@@ -3175,7 +3089,6 @@ const App = struct {
         switch (ui_input.terminalInputOwner(
             &self.terminal_input_runtime.terminal_theme_monitor,
             InputAppRuntime.terminalPasteActive(self),
-            true,
         )) {
             .theme_monitor => {
                 try self.handleThemeMonitorByte(byte);
@@ -3186,10 +3099,9 @@ const App = struct {
                 std.debug.assert(routed);
                 return;
             },
-            .takeover, .fx_input => {},
+            .fx_input => {},
         }
 
-        if (try self.terminal_takeover.handleByte(App, self, byte)) return;
         if (self.terminal_input_runtime.terminal_theme_monitor.enabled) {
             try self.handleThemeMonitorByte(byte);
             return;
@@ -3208,9 +3120,6 @@ const App = struct {
 
     pub fn loopNextCollectedByte(ctx: *anyopaque) ?u8 {
         const self: *App = @ptrCast(@alignCast(ctx));
-        if (self.terminal_takeover.blocksFxSurface(&self.terminal)) {
-            return self.terminal_input_runtime.takeDeferredThemeMonitorByte();
-        }
         return self.terminal_input_runtime.takeDeferredTerminalInputByte();
     }
 };
@@ -4215,7 +4124,6 @@ test {
     _ = @import("core/app/usage_dashboard_runtime.zig");
     _ = @import("core/app/app_process_runtime.zig");
     _ = @import("core/app/app_render_runtime.zig");
-    _ = @import("core/app/app_terminal_takeover_runtime.zig");
     _ = @import("core/app/app_runtime_setup.zig");
     _ = @import("core/app/app_session_runtime.zig");
     _ = @import("core/app/app_upgrade_runtime.zig");
@@ -4225,8 +4133,6 @@ test {
     _ = @import("ui/render_engine/assistant_wrap.zig");
     _ = @import("ui/render_engine/transcript_blocks.zig");
     _ = @import("ui/render_engine/viewport_selection.zig");
-    _ = @import("ui/subagent/controller.zig");
-    _ = @import("ui/subagent/runtime.zig");
     _ = @import("core/agent/assistant_presentation.zig");
     _ = @import("core/upgrade/auto_upgrade.zig");
     _ = @import("core/cli/cli_ask.zig");
@@ -4309,23 +4215,15 @@ test {
     _ = @import("core/session/web_fetch_artifacts.zig");
     _ = @import("core/skills/skill_runtime.zig");
     _ = @import("core/subagent/domain.zig");
+    _ = @import("core/subagent/agent_config.zig");
+    _ = @import("core/subagent/child_state.zig");
+    _ = @import("core/subagent/managed_owner.zig");
     _ = @import("core/subagent/tool_result.zig");
-    _ = @import("core/subagent/create_store.zig");
-    _ = @import("core/subagent/control_store.zig");
     _ = @import("core/subagent/resume_admission.zig");
-    _ = @import("core/subagent/relationship_index.zig");
-    _ = @import("core/subagent/manager.zig");
     _ = @import("core/subagent/execution.zig");
     _ = @import("core/subagent/tool_host.zig");
-    _ = @import("core/subagent/communication.zig");
-    _ = @import("core/subagent/communication_store.zig");
-    _ = @import("core/subagent/communication_manager.zig");
-    _ = @import("core/subagent/parent_delivery_projector.zig");
-    _ = @import("core/subagent/ui_projection.zig");
     _ = @import("core/subagent/authority.zig");
     _ = @import("core/subagent/approval_registry.zig");
-    _ = @import("core/subagent/approval_persistence.zig");
-    _ = @import("core/subagent/work_events.zig");
     _ = @import("core/terminal/contracts.zig");
     _ = @import("core/terminal/operation.zig");
     _ = @import("core/terminal/protocol.zig");
