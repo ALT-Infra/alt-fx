@@ -1062,12 +1062,7 @@ const App = struct {
             prompt,
             skill_tokens,
             null,
-            .queue,
         );
-    }
-
-    pub fn steerPrompt(self: *App, prompt: []const u8) !bool {
-        return self.enqueuePromptWithOptionalReview(prompt, &.{}, null, .steer);
     }
 
     pub fn enqueuePromptWithReviewDraft(
@@ -1096,18 +1091,14 @@ const App = struct {
                 .image_tokens = @constCast(review_image_tokens),
                 .skill_display_spans = review_skill_spans,
             },
-            .queue,
         );
     }
-
-    const PromptSubmitIntent = enum { queue, steer };
 
     fn enqueuePromptWithOptionalReview(
         self: *App,
         prompt: []const u8,
         skill_tokens: []const registered_entities.SkillTokenSpan,
         review_draft: ?worker_runtime.QueueReviewDraft,
-        intent: PromptSubmitIntent,
     ) !bool {
         const context_targets = if (self.context_enabled)
             try context_contract.applicableTargetsForImages(self.alloc, self.pending_images.items)
@@ -1128,11 +1119,10 @@ const App = struct {
                 debug_trace.preview(prompt, 120),
             },
         );
-        if (!try self.snapshotAndQueuePromptWithSkillBindings(
+        if (!try self.snapshotAndAdmitInteractivePromptWithSkillBindings(
             prompt,
             skill_tokens,
             review_draft,
-            intent,
         )) return false;
         WorkerAppRuntime.syncState(
             self,
@@ -1177,7 +1167,6 @@ const App = struct {
             draft.images,
             draft.turn_id,
             true,
-            .queue,
         )) return error.PendingPromptQueueRejected;
         WorkerAppRuntime.syncState(
             self,
@@ -1326,14 +1315,13 @@ const App = struct {
         try RenderAppRuntime.flushRequestedFrame(@as(*Self, self));
     }
 
-    pub fn snapshotAndQueuePromptWithSkillBindings(
+    fn snapshotAndAdmitInteractivePromptWithSkillBindings(
         self: *App,
         prompt: []const u8,
         skill_tokens: []const registered_entities.SkillTokenSpan,
         review_draft: ?worker_runtime.QueueReviewDraft,
-        intent: PromptSubmitIntent,
     ) !bool {
-        return self.snapshotAndQueuePrompt(
+        const queued = try self.snapshotPrompt(
             prompt,
             skill_tokens,
             review_draft,
@@ -1341,8 +1329,11 @@ const App = struct {
             null,
             0,
             false,
-            intent,
         );
+        errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
+        try self.worker.admitInteractivePrompt(std.heap.c_allocator, queued);
+        HerdrAppRuntime.reportWorking(self);
+        return true;
     }
 
     pub fn continuePausedRecovery(self: *App) !bool {
@@ -1361,7 +1352,6 @@ const App = struct {
             null,
             checkpoint.turn_id,
             false,
-            .queue,
         )) return false;
         WorkerAppRuntime.syncState(
             self,
@@ -1379,8 +1369,33 @@ const App = struct {
         prompt_images: ?[]const types.ImageAttachment,
         turn_id: u64,
         user_prompt_already_presented: bool,
-        intent: PromptSubmitIntent,
     ) !bool {
+        const queued = try self.snapshotPrompt(
+            prompt,
+            skill_tokens,
+            review_draft,
+            recovery_checkpoint,
+            prompt_images,
+            turn_id,
+            user_prompt_already_presented,
+        );
+        errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
+        try self.worker.enqueuePrompt(std.heap.c_allocator, queued);
+        HerdrAppRuntime.reportWorking(self);
+        return true;
+    }
+
+    // Caller owns the returned prompt until worker admission succeeds.
+    fn snapshotPrompt(
+        self: *App,
+        prompt: []const u8,
+        skill_tokens: []const registered_entities.SkillTokenSpan,
+        review_draft: ?worker_runtime.QueueReviewDraft,
+        recovery_checkpoint: ?*const session_codec.RecoveryCheckpoint,
+        prompt_images: ?[]const types.ImageAttachment,
+        turn_id: u64,
+        user_prompt_already_presented: bool,
+    ) !worker_runtime.QueuedPrompt {
         const source_images = if (recovery_checkpoint) |checkpoint|
             checkpoint.user.images
         else if (prompt_images) |images|
@@ -1465,7 +1480,7 @@ const App = struct {
                 review,
             );
 
-        try self.worker.admitPrompt(std.heap.c_allocator, .{
+        return .{
             .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else turn_id,
             .prompt = prompt_copy,
             .images = images_copy,
@@ -1487,9 +1502,7 @@ const App = struct {
             .recovery_checkpoint = recovery_checkpoint_copy,
             .recovery_source_already_presented = recovery_checkpoint != null,
             .user_prompt_already_presented = user_prompt_already_presented,
-        }, recovery_checkpoint == null and intent == .steer);
-        HerdrAppRuntime.reportWorking(self);
-        return true;
+        };
     }
 
     pub fn installInitialMcpRuntime(self: *App, runtime: ?*mcp_runtime_mod.McpRuntime) void {

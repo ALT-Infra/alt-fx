@@ -215,6 +215,36 @@ test "processQueuedPrompt accounts exact direct-provider usage without deferred 
     try std.testing.expectEqual(@as(?u64, 1), snapshot.request_count);
 }
 
+test "terminal assistant completion continues with steering admitted during the response" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .content = "Original answer" },
+        .{ .content = "Updated answer" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    const steering = [_][]const u8{"change direction"};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.steering_messages = &steering;
+    hooks.steering_take_at = 2;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try expectBodyContainsInOrder(&gateway, 1, &.{
+        "Original answer",
+        "user_steering",
+        "change direction",
+    });
+    try std.testing.expectEqualStrings("Updated answer", hooks.finish_assistant_text.?);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    const execution = hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), execution.steering.len);
+    try std.testing.expectEqualStrings("change direction", execution.steering[0]);
+}
+
 fn makeOwnedProviderPrompt(alloc: Allocator, text: []const u8, model: []const u8) !QueuedPrompt {
     const prompt = try alloc.dupe(u8, text);
     errdefer alloc.free(prompt);

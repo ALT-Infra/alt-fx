@@ -83,6 +83,30 @@ const TurnFinalizationGuard = runtime_finalization.TurnFinalizationGuard;
 const PromptFinishTrace = runtime_finalization.PromptFinishTrace;
 const ToolExecutionResult = runtime_tool_contracts.ToolExecutionResult;
 
+fn append_pending_steering_after_assistant(
+    deps: *const AgentRuntimeDeps,
+    arena: Allocator,
+    within_turn_suffix: *std.ArrayList(ChatMessage),
+    turn_id: u64,
+    assistant_text: []const u8,
+) !bool {
+    const take_steering = deps.take_steering orelse return false;
+    const guidance = try take_steering(deps.ctx, arena, turn_id);
+    if (guidance.len == 0) return false;
+
+    try within_turn_suffix.append(arena, .{
+        .role = .assistant,
+        .content = assistant_text,
+    });
+    for (guidance) |text| {
+        try within_turn_suffix.append(arena, .{
+            .role = .user,
+            .content = try runtime_execution_memory.steeringMessage(arena, text),
+        });
+    }
+    return true;
+}
+
 fn request_union_schema_advertised(
     advertised_functions: []const model_tool_schema.FunctionSchema,
     tool_name: []const u8,
@@ -6082,6 +6106,19 @@ fn processQueuedPromptLoop(
                 rendered,
             );
 
+            if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
+                try append_pending_steering_after_assistant(
+                    deps,
+                    arena,
+                    &within_turn_suffix,
+                    turn_id,
+                    history_text,
+                ))
+            {
+                try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+                continue;
+            }
+
             if (!lifecycle.view.hasStop() or stop_state.dispatched) {
                 if (!has_content) {
                     try deps.push_text(deps.ctx, .{ .operational = rendered });
@@ -8673,24 +8710,17 @@ fn processQueuedPromptLoop(
             const final_text = try runtime_assistant_stream.normalizeAssistantTextForDisplay(arena, raw_final);
             const rendered = if (final_text.len > 0) final_text else "Done.";
 
-            // Close the model-response race: guidance admitted while this step
-            // was streaming converts the terminal response into an assistant
-            // prefix followed by a new user steering message.
-            if (agent_steps.allowsStep(config.agent_step_limit, step + 1)) {
-                if (deps.take_steering) |take_steering| {
-                    const guidance = try take_steering(deps.ctx, arena, turn_id);
-                    if (guidance.len > 0) {
-                        try within_turn_suffix.append(arena, .{ .role = .assistant, .content = rendered });
-                        for (guidance) |text| {
-                            try within_turn_suffix.append(arena, .{
-                                .role = .user,
-                                .content = try runtime_execution_memory.steeringMessage(arena, text),
-                            });
-                        }
-                        try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
-                        continue;
-                    }
-                }
+            if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
+                try append_pending_steering_after_assistant(
+                    deps,
+                    arena,
+                    &within_turn_suffix,
+                    turn_id,
+                    rendered,
+                ))
+            {
+                try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+                continue;
             }
 
             if (!lifecycle.view.hasStop() or stop_state.dispatched) {
