@@ -748,7 +748,7 @@ test "closing the full transcript resets bounded paging to the tail" {
     ));
 }
 
-test "live full transcript content requests one frame per revision stride" {
+test "live command keeps the full transcript stable until completion" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{
         .layout = .{
@@ -777,15 +777,21 @@ test "live full transcript content requests one frame per revision stride" {
     };
     defer runtime.deinit(alloc);
 
-    for (0..full_transcript_page.live_refresh_revision_stride - 1) |_| {
+    for (0..32) |_| {
         runtime.markTranscriptContentDirty();
         try std.testing.expect(!runtime.render_requests.hasReason(.transcript));
     }
+    runtime.command_output_display.open_command_block = null;
     runtime.markTranscriptContentDirty();
     try std.testing.expect(runtime.render_requests.hasReason(.transcript));
+
+    runtime.command_output_display.open_command_block = 0;
+    runtime.full_transcript_open_request = runtime.desiredFullTranscriptPageRequest();
+    try runtime.prewarmFullTranscriptPage(null, null);
+    try std.testing.expect(runtime.full_transcript_page_load.busy());
 }
 
-test "installed full transcript never publishes a stale closed page" {
+test "installed full transcript stays stable only while its command is active" {
     var runtime = TranscriptRuntime{
         .layout = .{
             .rows = 24,
@@ -818,6 +824,8 @@ test "installed full transcript never publishes a stale closed page" {
     runtime.command_output_display.open_command_block = 0;
     try std.testing.expect(runtime.installedFullTranscriptPageProjection() != null);
     runtime.full_transcript_content_revision = 48;
+    try std.testing.expect(runtime.installedFullTranscriptPageProjection() != null);
+    runtime.command_output_display.open_command_block = null;
     try std.testing.expect(runtime.installedFullTranscriptPageProjection() == null);
 }
 
@@ -9645,14 +9653,6 @@ pub const TranscriptRuntime = struct {
             return &page.projection;
         }
         if (self.command_output_display.open_command_block == null) return null;
-        if (!self.full_transcript_page_load.busy() and
-            full_transcript_page.liveRefreshDue(
-                page.source.request.content_revision,
-                desired.content_revision,
-            ))
-        {
-            return null;
-        }
         return &page.projection;
     }
 
@@ -9695,13 +9695,14 @@ pub const TranscriptRuntime = struct {
         if (self.full_transcript_installed_page) |*page| {
             if (full_transcript_page.sameRequest(request, page.source.request)) return;
         }
-        if (self.command_output_display.open_command_block != null) {
+        if (self.command_output_display.open_command_block != null and
+            self.full_transcript_open_request == null)
+        {
             if (self.full_transcript_installed_page) |*page| {
-                if (full_transcript_page.sameSurface(request, page.source.request) and
-                    !full_transcript_page.liveRefreshDue(
-                        page.source.request.content_revision,
-                        self.full_transcript_content_revision,
-                    )) return;
+                if (full_transcript_page.sameSurface(
+                    request,
+                    page.source.request,
+                )) return;
             }
         }
 
@@ -10472,10 +10473,7 @@ pub const TranscriptRuntime = struct {
         {
             return false;
         }
-        return !full_transcript_page.liveRefreshDue(
-            page.source.request.content_revision,
-            self.full_transcript_content_revision,
-        );
+        return true;
     }
 
     pub fn nativeHistoryActive(self: *const TranscriptRuntime) bool {
