@@ -2655,6 +2655,7 @@ fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
     defer ctx.session_write_mutex.unlock(io_mod.getIo());
     const writable = if (ctx.writable) |*value| value else return;
     try subagent_resume_admission.retainExternalRootUserTurn(
+        ctx.store,
         ctx.alloc,
         writable,
         turn,

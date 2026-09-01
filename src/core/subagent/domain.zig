@@ -565,6 +565,27 @@ pub const QueuedMessage = struct {
             .created_at_ms = self.created_at_ms,
         };
     }
+
+    pub fn replaceRootUserEvidence(
+        self: *QueuedMessage,
+        alloc: Allocator,
+        context: []const u8,
+        messages: []const []const u8,
+        complete: bool,
+    ) !void {
+        const owned_context = try alloc.dupe(u8, context);
+        errdefer alloc.free(owned_context);
+        const owned_messages = try cloneStrings(alloc, messages);
+        errdefer freeStrings(alloc, owned_messages);
+
+        if (self.root_user_intent_context.len > 0) {
+            alloc.free(self.root_user_intent_context);
+        }
+        freeStrings(alloc, self.root_user_messages);
+        self.root_user_intent_context = owned_context;
+        self.root_user_messages = owned_messages;
+        self.root_user_evidence_complete = complete;
+    }
 };
 
 pub const EventKind = union(enum) {

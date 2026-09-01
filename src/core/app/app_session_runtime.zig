@@ -2696,6 +2696,7 @@ pub fn Runtime(comptime App: type) type {
             else
                 return .committed;
             try subagent_resume_admission.retainExternalRootUserTurn(
+                app.session_persistence.store,
                 app.alloc,
                 loaded,
                 turn,

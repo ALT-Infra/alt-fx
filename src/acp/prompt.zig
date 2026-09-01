@@ -1736,6 +1736,7 @@ fn persistAcpHistoryTurn(
     }
     const writable = if (session.writable) |*value| value else return;
     try subagent_resume_admission.retainExternalRootUserTurn(
+        session.store,
         alloc,
         writable,
         turn,
