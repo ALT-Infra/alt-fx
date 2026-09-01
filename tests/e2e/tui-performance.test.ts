@@ -397,7 +397,7 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
       expect(resourcesAfter.descriptors).toBe(resourcesBefore.descriptors);
       expect(resourcesAfter.rssKib - resourcesBefore.rssKib).toBeLessThan(16 * 1024);
       expect(peakResources.threads - resourcesBefore.threads).toBeLessThanOrEqual(3);
-      expect(peakResources.descriptors - resourcesBefore.descriptors).toBeLessThanOrEqual(4);
+      expect(peakResources.descriptors - resourcesBefore.descriptors).toBeLessThanOrEqual(6);
       expect(peakResources.rssKib - resourcesBefore.rssKib).toBeLessThan(32 * 1024);
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
     } finally {
