@@ -1416,7 +1416,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       );
 
       await session.sendKeys("C-u");
-      const absolutePath = "/Users/faxes/Developer/Fx";
+      const absolutePath = "/opt/project/src/main.zig";
       await session.sendLiteralText(absolutePath);
       await session.waitForPane(
         (current) => composerContains(current, absolutePath),
