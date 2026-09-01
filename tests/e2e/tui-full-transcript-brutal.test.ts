@@ -447,6 +447,22 @@ async function waitForTraceAfter(
   );
 }
 
+async function waitForAnyTraceAfter(
+  tracePath: string,
+  startByte: number,
+  needles: readonly string[],
+  timeoutMs = TIMEOUT,
+): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const appended = readFileSync(tracePath).subarray(startByte).toString("utf8");
+    const matched = needles.find((needle) => appended.includes(needle));
+    if (matched) return matched;
+    await sleep(25);
+  }
+  throw new Error(`Timed out waiting for any trace marker ${JSON.stringify(needles)}.`);
+}
+
 function projectionWindows(text: string): ProjectionWindowTrace[] {
   return [...text.matchAll(
     /\[full_transcript_cache\] window cols=(\d+) offset=(\d+)/g,
@@ -491,8 +507,15 @@ async function waitForScrolledViewport(
     appended = readFileSync(tracePath).subarray(startByte).toString("utf8");
     const scrollIndex = appended.indexOf("[full_transcript_cache] scroll ");
     if (scrollIndex >= 0) {
-      const windows = projectionWindows(appended.slice(scrollIndex));
+      const afterScroll = appended.slice(scrollIndex);
+      const windows = projectionWindows(afterScroll);
       if (windows.some((window) => window.offset !== previousOffset)) return;
+      const after = afterScroll.match(/ after=(\d+)/)?.[1];
+      if (
+        after !== undefined &&
+        Number(after) !== previousOffset &&
+        /frame_plan\] build [^\n]*body=transcript transcript_body=paint/.test(afterScroll)
+      ) return;
     }
     await sleep(10);
   }
@@ -510,7 +533,11 @@ async function waitForRenderedViewportAfter(
   let appended = "";
   while (Date.now() < deadline) {
     appended = readFileSync(tracePath).subarray(startByte).toString("utf8");
-    if (projectionWindows(appended).length > 0) return;
+    if (
+      projectionWindows(appended).length > 0 ||
+      /attempt_end outcome=committed reasons=[^\n]*modal/.test(appended) ||
+      /frame_plan\] build [^\n]*body=transcript transcript_body=paint/.test(appended)
+    ) return;
     await sleep(10);
   }
   throw new Error(
@@ -901,9 +928,18 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
 
     const immediateTraceStart = traceSize(paths.tracePath);
     const escapeStarted = performance.now();
-    session.sendKeysImmediate(["C-o", "Escape"]);
-    await waitForTraceAfter(paths.tracePath, immediateTraceStart, [
-      "attempt_restore outcome=input_pending",
+    session.sendKeysImmediate(["C-o"]);
+    await waitForAnyTraceAfter(
+      paths.tracePath,
+      immediateTraceStart,
+      [
+        "open_request state=pending",
+        "depth_transition from=inline to=full route=root trigger=ctrl_o",
+      ],
+    );
+    session.sendKeysImmediate(["Escape"]);
+    await waitForAnyTraceAfter(paths.tracePath, immediateTraceStart, [
+      "open_request state=cancelled",
       "depth_transition from=full to=inline route=root trigger=escape",
     ]);
     await waitForMode(session, "main", DRAFT);

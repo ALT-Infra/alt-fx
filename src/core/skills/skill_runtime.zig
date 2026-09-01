@@ -23,6 +23,9 @@ pub const Skill = struct {
     source: SkillSource,
     /// Owned with discovered catalog entries. Null keeps managed skills strict.
     read_authority: ?[]const u8 = null,
+    metadata_inode: std.Io.File.INode = 0,
+    metadata_size: u64 = 0,
+    metadata_mtime: std.Io.Timestamp = .zero,
 };
 
 pub const BoundedPromptSection = struct {
@@ -348,19 +351,14 @@ pub fn loadVisibleSkills(
         roots.deinit(alloc);
     }
 
-    if (workspace_root) |root| {
-        try appendWorkspaceRoots(alloc, &roots, root, home, root_policy.workspace_roots);
-    }
-
-    if (root_policy.managed_root_source) |source| {
-        try appendDupeRoot(alloc, &roots, source, skills_dir);
-    }
-
-    if (home) |home_root| {
-        for (root_policy.global_roots) |spec| {
-            try appendSpecRoot(alloc, &roots, home_root, spec);
-        }
-    }
+    try appendConfiguredSkillRoots(
+        alloc,
+        &roots,
+        workspace_root,
+        home,
+        skills_dir,
+        root_policy,
+    );
 
     for (roots.items) |root| {
         try appendSkillsFromDir(alloc, &skills, &diagnostics, &canonical_skill_paths, root);
@@ -373,6 +371,84 @@ pub fn loadVisibleSkills(
         .skills = owned_skills,
         .diagnostics = owned_diagnostics,
     };
+}
+
+fn appendConfiguredSkillRoots(
+    alloc: Allocator,
+    roots: *std.ArrayList(SkillRoot),
+    workspace_root: ?[]const u8,
+    home: ?[]const u8,
+    skills_dir: []const u8,
+    root_policy: skill_contract.RootPolicy,
+) !void {
+    if (workspace_root) |root| {
+        try appendWorkspaceRoots(
+            alloc,
+            roots,
+            root,
+            home,
+            root_policy.workspace_roots,
+        );
+    }
+    if (root_policy.managed_root_source) |source| {
+        try appendDupeRoot(alloc, roots, source, skills_dir);
+    }
+    if (home) |home_root| {
+        for (root_policy.global_roots) |spec| {
+            try appendSpecRoot(alloc, roots, home_root, spec);
+        }
+    }
+}
+
+fn collectRootFingerprints(
+    alloc: Allocator,
+    workspace_root: ?[]const u8,
+    home: ?[]const u8,
+    skills_dir: []const u8,
+    root_policy: skill_contract.RootPolicy,
+) ![]RootFingerprint {
+    var roots: std.ArrayList(SkillRoot) = .empty;
+    defer {
+        for (roots.items) |root| alloc.free(root.path);
+        roots.deinit(alloc);
+    }
+    try appendConfiguredSkillRoots(
+        alloc,
+        &roots,
+        workspace_root,
+        home,
+        skills_dir,
+        root_policy,
+    );
+    const fingerprints = try alloc.alloc(RootFingerprint, roots.items.len);
+    var filled: usize = 0;
+    errdefer {
+        for (fingerprints[0..filled]) |*root| root.deinit(alloc);
+        if (fingerprints.len > 0) alloc.free(fingerprints);
+    }
+    while (filled < roots.items.len) : (filled += 1) {
+        const root = roots.items[filled];
+        const path = try alloc.dupe(u8, root.path);
+        errdefer alloc.free(path);
+        const stat = std.Io.Dir.cwd().statFile(
+            io_mod.getIo(),
+            root.path,
+            .{ .follow_symlinks = false },
+        ) catch |err| {
+            if (err == error.FileNotFound or err == error.NotDir) {
+                fingerprints[filled] = .{ .path = path, .exists = false };
+                continue;
+            }
+            return err;
+        };
+        fingerprints[filled] = .{
+            .path = path,
+            .exists = true,
+            .inode = stat.inode,
+            .mtime = stat.mtime,
+        };
+    }
+    return fingerprints;
 }
 
 fn appendWorkspaceRoots(
@@ -704,6 +780,20 @@ fn appendSkillCandidate(
         },
     };
     defer file.close(io_mod.getIo());
+    const file_stat = file.stat(io_mod.getIo()) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        if (diagnostics) |items| {
+            try appendSkillDiagnostic(
+                alloc,
+                items,
+                candidate_path,
+                root.source,
+                .candidate,
+                .unreadable,
+            );
+        }
+        return;
+    };
 
     if (!try canonical_skill_paths.remember(alloc, candidate_path)) return;
 
@@ -746,6 +836,9 @@ fn appendSkillCandidate(
         .path = path,
         .source = root.source,
         .read_authority = read_authority,
+        .metadata_inode = file_stat.inode,
+        .metadata_size = file_stat.size,
+        .metadata_mtime = file_stat.mtime,
     });
 }
 
@@ -1368,24 +1461,400 @@ pub const SkillMenu = struct {
     }
 };
 
+const RootFingerprint = struct {
+    path: []u8,
+    exists: bool,
+    inode: std.Io.File.INode = 0,
+    mtime: std.Io.Timestamp = .zero,
+
+    fn deinit(self: *RootFingerprint, alloc: Allocator) void {
+        alloc.free(self.path);
+        self.* = undefined;
+    }
+};
+
+fn freeRootFingerprints(alloc: Allocator, roots: []RootFingerprint) void {
+    for (roots) |*root| root.deinit(alloc);
+    if (roots.len > 0) alloc.free(roots);
+}
+
 pub const LoadedCatalog = struct {
     dir: []u8 = &.{},
     skills: []Skill = &.{},
+    skill_backing: ?[]u8 = null,
     diagnostics: []SkillDiagnostic = &.{},
+    root_fingerprints: []RootFingerprint = &.{},
 
     pub fn deinit(self: *LoadedCatalog, alloc: Allocator) void {
         if (self.dir.len > 0) alloc.free(self.dir);
-        freeSkills(alloc, self.skills);
+        if (self.skill_backing) |backing| {
+            alloc.free(backing);
+            if (self.skills.len > 0) alloc.free(self.skills);
+        } else {
+            freeSkills(alloc, self.skills);
+        }
         freeSkillDiagnostics(alloc, self.diagnostics);
+        freeRootFingerprints(alloc, self.root_fingerprints);
         self.* = .{};
     }
 };
+
+const CatalogGeneration = struct {
+    alloc: Allocator,
+    references: std.atomic.Value(usize) = std.atomic.Value(usize).init(1),
+    generation: u64,
+    catalog: LoadedCatalog,
+
+    fn create(
+        alloc: Allocator,
+        generation: u64,
+        catalog: LoadedCatalog,
+    ) Allocator.Error!*CatalogGeneration {
+        const value = try alloc.create(CatalogGeneration);
+        value.* = .{
+            .alloc = alloc,
+            .generation = generation,
+            .catalog = catalog,
+        };
+        return value;
+    }
+
+    fn retain(self: *CatalogGeneration) void {
+        _ = self.references.fetchAdd(1, .seq_cst);
+    }
+
+    fn release(self: *CatalogGeneration) void {
+        if (self.references.fetchSub(1, .seq_cst) != 1) return;
+        const alloc = self.alloc;
+        self.catalog.deinit(alloc);
+        alloc.destroy(self);
+    }
+
+    fn referenceCount(self: *const CatalogGeneration) usize {
+        return self.references.load(.seq_cst);
+    }
+};
+
+pub const CatalogLease = struct {
+    generation: ?*CatalogGeneration = null,
+    items: []const Skill = &.{},
+    diagnostics: []const SkillDiagnostic = &.{},
+
+    pub fn deinit(self: *CatalogLease) void {
+        if (self.generation) |generation| generation.release();
+        self.* = undefined;
+    }
+
+    pub fn buildRoutedSystemPromptSection(
+        self: CatalogLease,
+        alloc: Allocator,
+        prompt: []const u8,
+        limits: context_limits.Values,
+    ) !BoundedPromptSection {
+        const ordered = try orderSkillsForPrompt(alloc, self.items, prompt);
+        defer alloc.free(ordered);
+        return attachCatalogDiagnostics(
+            alloc,
+            try buildSkillsSystemPromptSectionWithLimits(alloc, ordered, limits),
+            self.diagnostics,
+        );
+    }
+};
+
+const PendingCatalog = struct {
+    generation: u64,
+    catalog: LoadedCatalog,
+
+    fn deinit(self: *PendingCatalog, alloc: Allocator) void {
+        self.catalog.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+const KnownCatalogRefresh = union(enum) {
+    full_discovery,
+    unchanged,
+    catalog: LoadedCatalog,
+};
+
+fn refreshKnownCatalog(
+    alloc: Allocator,
+    workspace_root: []const u8,
+    home: []const u8,
+    skills_dir: []const u8,
+    root_policy: skill_contract.RootPolicy,
+    base: CatalogLease,
+) !KnownCatalogRefresh {
+    const generation = base.generation orelse return .full_discovery;
+    if (base.diagnostics.len > 0 or
+        generation.catalog.root_fingerprints.len == 0)
+    {
+        return .full_discovery;
+    }
+    _ = workspace_root;
+    _ = home;
+    _ = root_policy;
+    if (!rootFingerprintsStillCurrent(
+        generation.catalog.root_fingerprints,
+    )) return .full_discovery;
+
+    const changed = try alloc.alloc(bool, base.items.len);
+    defer alloc.free(changed);
+    var changed_count: usize = 0;
+    for (base.items, 0..) |skill, index| {
+        const stat = statKnownSkill(skill) catch return .full_discovery;
+        const differs = stat.inode != skill.metadata_inode or
+            stat.size != skill.metadata_size or
+            !std.meta.eql(stat.mtime, skill.metadata_mtime);
+        changed[index] = differs;
+        changed_count += @intFromBool(differs);
+    }
+    if (changed_count == 0) return .unchanged;
+    if (changed_count > 8) return .full_discovery;
+
+    const replacements = try alloc.alloc(?Skill, base.items.len);
+    defer alloc.free(replacements);
+    @memset(replacements, null);
+    errdefer for (replacements) |maybe_skill| {
+        if (maybe_skill) |skill| freeSkill(alloc, skill);
+    };
+    for (base.items, 0..) |skill, index| {
+        if (!changed[index]) continue;
+        replacements[index] = (try loadKnownSkill(alloc, skill)) orelse {
+            for (replacements) |maybe_skill| {
+                if (maybe_skill) |owned| freeSkill(alloc, owned);
+            }
+            return .full_discovery;
+        };
+    }
+    const compact = try compactCloneSkills(alloc, base.items, replacements);
+    errdefer compact.deinit(alloc);
+    for (replacements) |*maybe_skill| {
+        if (maybe_skill.*) |skill| freeSkill(alloc, skill);
+        maybe_skill.* = null;
+    }
+    const roots = try cloneRootFingerprints(
+        alloc,
+        generation.catalog.root_fingerprints,
+    );
+    errdefer freeRootFingerprints(alloc, roots);
+    const dir = try alloc.dupe(u8, skills_dir);
+    return .{ .catalog = .{
+        .dir = dir,
+        .skills = compact.skills,
+        .skill_backing = compact.backing,
+        .root_fingerprints = roots,
+    } };
+}
+
+fn statKnownSkill(skill: Skill) !std.Io.File.Stat {
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(
+        &path_buffer,
+        "{s}" ++ std.fs.path.sep_str ++ "SKILL.md",
+        .{skill.path},
+    );
+    return std.Io.Dir.cwd().statFile(
+        io_mod.getIo(),
+        path,
+        .{ .follow_symlinks = false },
+    );
+}
+
+fn loadKnownSkill(alloc: Allocator, previous: Skill) !?Skill {
+    var candidate_dir = if (previous.read_authority) |authority|
+        openContainedDir(alloc, previous.path, authority, .{}) catch return null
+    else
+        io_mod.openDirAbsoluteNoFollow(previous.path, .{}) catch return null;
+    defer candidate_dir.close(io_mod.getIo());
+    var file = switch (try openPrimarySkillFile(
+        alloc,
+        &candidate_dir,
+        previous.read_authority,
+    )) {
+        .opened => |opened| opened,
+        .missing, .rejected => return null,
+    };
+    defer file.close(io_mod.getIo());
+    const stat = file.stat(io_mod.getIo()) catch return null;
+    const entry_name = std.fs.path.basename(previous.path);
+    const inspection = try inspectSkillCandidateFile(alloc, &file, entry_name);
+    const candidate = switch (inspection) {
+        .valid => |value| value,
+        .invalid, .unreadable, .oversized => return null,
+    };
+    defer candidate.deinit(alloc);
+    const name = try alloc.dupe(u8, candidate.metadata.name);
+    errdefer alloc.free(name);
+    const description = try alloc.alloc(u8, candidate.metadata.description_len());
+    errdefer alloc.free(description);
+    candidate.metadata.write_description(description);
+    const path = try alloc.dupe(u8, previous.path);
+    errdefer alloc.free(path);
+    const authority = if (previous.read_authority) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    return .{
+        .name = name,
+        .description = description,
+        .path = path,
+        .source = previous.source,
+        .read_authority = authority,
+        .metadata_inode = stat.inode,
+        .metadata_size = stat.size,
+        .metadata_mtime = stat.mtime,
+    };
+}
+
+const CompactSkills = struct {
+    skills: []Skill,
+    backing: []u8,
+
+    fn deinit(self: CompactSkills, alloc: Allocator) void {
+        alloc.free(self.backing);
+        if (self.skills.len > 0) alloc.free(self.skills);
+    }
+};
+
+fn compactCloneSkills(
+    alloc: Allocator,
+    source: []const Skill,
+    replacements: []const ?Skill,
+) !CompactSkills {
+    std.debug.assert(source.len == replacements.len);
+    var byte_count: usize = 0;
+    for (source, replacements) |current, replacement| {
+        const skill = replacement orelse current;
+        byte_count = std.math.add(usize, byte_count, skill.name.len) catch
+            return error.OutOfMemory;
+        byte_count = std.math.add(usize, byte_count, skill.description.len) catch
+            return error.OutOfMemory;
+        byte_count = std.math.add(usize, byte_count, skill.path.len) catch
+            return error.OutOfMemory;
+        if (skill.read_authority) |authority| {
+            byte_count = std.math.add(usize, byte_count, authority.len) catch
+                return error.OutOfMemory;
+        }
+    }
+    const skills = try alloc.alloc(Skill, source.len);
+    errdefer if (skills.len > 0) alloc.free(skills);
+    const backing = try alloc.alloc(u8, byte_count);
+    errdefer alloc.free(backing);
+    var cursor: usize = 0;
+    for (source, replacements, 0..) |current, replacement, index| {
+        const skill = replacement orelse current;
+        const name = copyCompactString(backing, &cursor, skill.name);
+        const description = copyCompactString(backing, &cursor, skill.description);
+        const path = copyCompactString(backing, &cursor, skill.path);
+        const authority = if (skill.read_authority) |value|
+            copyCompactString(backing, &cursor, value)
+        else
+            null;
+        skills[index] = .{
+            .name = name,
+            .description = description,
+            .path = path,
+            .source = skill.source,
+            .read_authority = authority,
+            .metadata_inode = skill.metadata_inode,
+            .metadata_size = skill.metadata_size,
+            .metadata_mtime = skill.metadata_mtime,
+        };
+    }
+    std.debug.assert(cursor == backing.len);
+    return .{ .skills = skills, .backing = backing };
+}
+
+fn copyCompactString(
+    backing: []u8,
+    cursor: *usize,
+    value: []const u8,
+) []const u8 {
+    const start = cursor.*;
+    const end = start + value.len;
+    @memcpy(backing[start..end], value);
+    cursor.* = end;
+    return backing[start..end];
+}
+
+fn rootFingerprintsStillCurrent(roots: []const RootFingerprint) bool {
+    for (roots) |root| {
+        const stat = std.Io.Dir.cwd().statFile(
+            io_mod.getIo(),
+            root.path,
+            .{ .follow_symlinks = false },
+        ) catch |err| {
+            if (err == error.FileNotFound or err == error.NotDir) {
+                if (root.exists) return false;
+                continue;
+            }
+            return false;
+        };
+        if (!root.exists or
+            root.inode != stat.inode or
+            !std.meta.eql(root.mtime, stat.mtime)) return false;
+    }
+    return true;
+}
+
+fn cloneRootFingerprints(
+    alloc: Allocator,
+    roots: []const RootFingerprint,
+) ![]RootFingerprint {
+    const copy = try alloc.alloc(RootFingerprint, roots.len);
+    var filled: usize = 0;
+    errdefer {
+        for (copy[0..filled]) |*root| root.deinit(alloc);
+        if (copy.len > 0) alloc.free(copy);
+    }
+    while (filled < roots.len) : (filled += 1) {
+        copy[filled] = roots[filled];
+        copy[filled].path = try alloc.dupe(u8, roots[filled].path);
+    }
+    return copy;
+}
 
 pub const RefreshCompletion = enum {
     none,
     unchanged,
     adopted,
     failed,
+};
+
+pub const RefreshAction = union(enum) {
+    list,
+    show: []u8,
+    notice: []u8,
+
+    pub fn deinit(self: *RefreshAction, alloc: Allocator) void {
+        switch (self.*) {
+            .list => {},
+            .show => |value| alloc.free(value),
+            .notice => |value| alloc.free(value),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const ReadyRefreshAction = struct {
+    action: RefreshAction,
+    succeeded: bool,
+
+    pub fn deinit(self: *ReadyRefreshAction, alloc: Allocator) void {
+        self.action.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+const PendingRefreshAction = struct {
+    generation: u64,
+    action: RefreshAction,
+
+    fn deinit(self: *PendingRefreshAction, alloc: Allocator) void {
+        self.action.deinit(alloc);
+        self.* = undefined;
+    }
 };
 
 const CatalogRefreshTask = struct {
@@ -1397,7 +1866,10 @@ const CatalogRefreshTask = struct {
     home: []u8,
     skills_dir: []u8,
     root_policy: skill_contract.RootPolicy,
+    generation: u64,
+    base_catalog: CatalogLease,
     catalog: ?LoadedCatalog = null,
+    unchanged: bool = false,
     failure: ?anyerror = null,
 
     fn create(
@@ -1406,6 +1878,8 @@ const CatalogRefreshTask = struct {
         home: []const u8,
         skills_dir: []const u8,
         root_policy: skill_contract.RootPolicy,
+        generation: u64,
+        base_catalog: CatalogLease,
     ) Allocator.Error!*CatalogRefreshTask {
         const task = try alloc.create(CatalogRefreshTask);
         errdefer alloc.destroy(task);
@@ -1421,6 +1895,8 @@ const CatalogRefreshTask = struct {
             .home = owned_home,
             .skills_dir = owned_skills_dir,
             .root_policy = root_policy,
+            .generation = generation,
+            .base_catalog = base_catalog,
         };
         return task;
     }
@@ -1438,6 +1914,31 @@ const CatalogRefreshTask = struct {
             self.done.store(true, .release);
             return;
         }
+        const known_refresh = refreshKnownCatalog(
+            self.alloc,
+            self.workspace_root,
+            self.home,
+            self.skills_dir,
+            self.root_policy,
+            self.base_catalog,
+        ) catch |err| {
+            self.failure = err;
+            self.done.store(true, .release);
+            return;
+        };
+        switch (known_refresh) {
+            .unchanged => {
+                self.unchanged = true;
+                self.done.store(true, .release);
+                return;
+            },
+            .catalog => |catalog| {
+                self.catalog = catalog;
+                self.done.store(true, .release);
+                return;
+            },
+            .full_discovery => {},
+        }
         const discovery = loadVisibleSkills(
             self.alloc,
             self.workspace_root,
@@ -1449,16 +1950,32 @@ const CatalogRefreshTask = struct {
             self.done.store(true, .release);
             return;
         };
+        const roots = collectRootFingerprints(
+            self.alloc,
+            self.workspace_root,
+            self.home,
+            self.skills_dir,
+            self.root_policy,
+        ) catch |err| {
+            var owned = discovery;
+            owned.deinit(self.alloc);
+            self.failure = err;
+            self.done.store(true, .release);
+            return;
+        };
+        const dir = self.alloc.dupe(u8, self.skills_dir) catch |err| {
+            freeRootFingerprints(self.alloc, roots);
+            var owned = discovery;
+            owned.deinit(self.alloc);
+            self.failure = err;
+            self.done.store(true, .release);
+            return;
+        };
         var catalog = LoadedCatalog{
-            .dir = self.alloc.dupe(u8, self.skills_dir) catch |err| {
-                var owned = discovery;
-                owned.deinit(self.alloc);
-                self.failure = err;
-                self.done.store(true, .release);
-                return;
-            },
+            .dir = dir,
             .skills = discovery.skills,
             .diagnostics = discovery.diagnostics,
+            .root_fingerprints = roots,
         };
         if (self.cancel_requested.load(.acquire)) {
             catalog.deinit(self.alloc);
@@ -1481,6 +1998,7 @@ const CatalogRefreshTask = struct {
         self.alloc.free(self.workspace_root);
         self.alloc.free(self.home);
         self.alloc.free(self.skills_dir);
+        self.base_catalog.deinit();
         const alloc = self.alloc;
         alloc.destroy(self);
     }
@@ -1498,7 +2016,8 @@ fn catalogMatches(runtime: *const Runtime, catalog: LoadedCatalog) bool {
             !std.mem.eql(u8, active.description, refreshed.description) or
             !std.mem.eql(u8, active.path, refreshed.path) or
             active.source != refreshed.source or
-            !optionalStringEqual(active.read_authority, refreshed.read_authority))
+            !optionalStringEqual(active.read_authority, refreshed.read_authority) or
+            !skillFingerprintEqual(active, refreshed))
         {
             return false;
         }
@@ -1511,6 +2030,31 @@ fn catalogMatches(runtime: *const Runtime, catalog: LoadedCatalog) bool {
         {
             return false;
         }
+    }
+    const active_catalog = runtime.active_catalog orelse return true;
+    if (!rootFingerprintsEqual(
+        active_catalog.catalog.root_fingerprints,
+        catalog.root_fingerprints,
+    )) return false;
+    return true;
+}
+
+fn skillFingerprintEqual(left: Skill, right: Skill) bool {
+    return left.metadata_inode == right.metadata_inode and
+        left.metadata_size == right.metadata_size and
+        std.meta.eql(left.metadata_mtime, right.metadata_mtime);
+}
+
+fn rootFingerprintsEqual(
+    left: []const RootFingerprint,
+    right: []const RootFingerprint,
+) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |a, b| {
+        if (!std.mem.eql(u8, a.path, b.path) or
+            a.exists != b.exists or
+            a.inode != b.inode or
+            !std.meta.eql(a.mtime, b.mtime)) return false;
     }
     return true;
 }
@@ -1534,13 +2078,27 @@ pub const Runtime = struct {
     menu: SkillMenu = .{},
     menu_index: SkillMenuIndex = .{},
     menu_index_ready: bool = false,
+    catalog_mutex: std.Io.Mutex = .init,
+    active_catalog: ?*CatalogGeneration = null,
+    retired_catalog: ?*CatalogGeneration = null,
+    pending_catalog: ?PendingCatalog = null,
+    next_refresh_generation: u64 = 0,
+    fresh_through_generation: u64 = 0,
+    failed_refresh_generation: ?u64 = null,
+    pending_refresh_action: ?PendingRefreshAction = null,
     refresh_task: ?*CatalogRefreshTask = null,
-    refresh_pending: bool = false,
+    refresh_pending_generation: ?u64 = null,
 
     pub fn deinit(self: *Runtime, alloc: Allocator) void {
         if (self.refresh_task) |task| task.deinit();
         self.refresh_task = null;
+        if (self.pending_catalog) |*pending| pending.deinit(alloc);
+        self.pending_catalog = null;
+        if (self.pending_refresh_action) |*action| action.deinit(alloc);
+        self.pending_refresh_action = null;
         self.freeLoaded(alloc);
+        if (self.retired_catalog) |catalog| catalog.release();
+        self.retired_catalog = null;
         self.menu.close();
         self.menu_index.deinit(alloc);
     }
@@ -1551,21 +2109,59 @@ pub const Runtime = struct {
         workspace_root: []const u8,
         home: []const u8,
         root_policy: skill_contract.RootPolicy,
-    ) !void {
+    ) !u64 {
         if (self.refresh_task != null) {
-            self.refresh_pending = true;
-            return;
+            if (self.refresh_pending_generation) |generation| return generation;
+            const generation = self.nextGeneration();
+            self.refresh_pending_generation = generation;
+            return generation;
         }
+        if (self.pending_catalog != null) {
+            if (self.refresh_pending_generation) |generation| return generation;
+            const generation = self.nextGeneration();
+            self.refresh_pending_generation = generation;
+            return generation;
+        }
+        const generation = self.nextGeneration();
+        try self.startRefresh(
+            alloc,
+            workspace_root,
+            home,
+            root_policy,
+            generation,
+        );
+        return generation;
+    }
+
+    fn startRefresh(
+        self: *Runtime,
+        alloc: Allocator,
+        workspace_root: []const u8,
+        home: []const u8,
+        root_policy: skill_contract.RootPolicy,
+        generation: u64,
+    ) !void {
+        var base_catalog = self.acquireCatalog();
+        var base_catalog_owned = true;
+        defer if (base_catalog_owned) base_catalog.deinit();
         const task = try CatalogRefreshTask.create(
             alloc,
             workspace_root,
             home,
             self.dir,
             root_policy,
+            generation,
+            base_catalog,
         );
+        base_catalog_owned = false;
         errdefer task.deinit();
         try task.start();
         self.refresh_task = task;
+    }
+
+    fn nextGeneration(self: *Runtime) u64 {
+        self.next_refresh_generation +|= 1;
+        return self.next_refresh_generation;
     }
 
     pub fn pollRefresh(
@@ -1575,7 +2171,24 @@ pub const Runtime = struct {
         home: []const u8,
         root_policy: skill_contract.RootPolicy,
     ) !RefreshCompletion {
-        const task = self.refresh_task orelse return .none;
+        self.reapRetiredCatalog();
+        var completion: RefreshCompletion = .none;
+        if (self.pending_catalog) |*pending| {
+            if (try self.adoptCatalog(alloc, pending.generation, &pending.catalog)) {
+                pending.catalog = .{};
+                self.pending_catalog = null;
+                completion = .adopted;
+            }
+        }
+        const task = self.refresh_task orelse {
+            try self.startPendingRefresh(
+                alloc,
+                workspace_root,
+                home,
+                root_policy,
+            );
+            return completion;
+        };
         if (!task.done.load(.acquire)) return .none;
         if (task.thread) |thread| {
             thread.join();
@@ -1583,41 +2196,150 @@ pub const Runtime = struct {
         }
         self.refresh_task = null;
         defer task.deinit();
-        var completion: RefreshCompletion = .failed;
+        completion = .failed;
         if (task.failure == null) {
-            if (task.takeCatalog()) |catalog_value| {
+            if (task.unchanged) {
+                self.fresh_through_generation = @max(
+                    self.fresh_through_generation,
+                    task.generation,
+                );
+                completion = .unchanged;
+            } else if (task.takeCatalog()) |catalog_value| {
                 var catalog = catalog_value;
                 defer catalog.deinit(alloc);
                 if (catalogMatches(self, catalog)) {
+                    self.fresh_through_generation = @max(
+                        self.fresh_through_generation,
+                        task.generation,
+                    );
                     completion = .unchanged;
                 } else {
-                    try self.replaceLoaded(
-                        alloc,
-                        catalog.dir,
-                        catalog.skills,
-                        catalog.diagnostics,
-                    );
-                    catalog = .{};
-                    completion = .adopted;
+                    if (try self.adoptCatalog(alloc, task.generation, &catalog)) {
+                        completion = .adopted;
+                    } else {
+                        self.pending_catalog = .{
+                            .generation = task.generation,
+                            .catalog = catalog,
+                        };
+                        catalog = .{};
+                        completion = .none;
+                    }
                 }
             }
+        } else {
+            self.failed_refresh_generation = task.generation;
         }
-        if (self.refresh_pending) {
-            self.refresh_pending = false;
-            try self.requestRefresh(
-                alloc,
-                workspace_root,
-                home,
-                root_policy,
-            );
-        }
+        try self.startPendingRefresh(alloc, workspace_root, home, root_policy);
         return completion;
     }
 
+    fn startPendingRefresh(
+        self: *Runtime,
+        alloc: Allocator,
+        workspace_root: []const u8,
+        home: []const u8,
+        root_policy: skill_contract.RootPolicy,
+    ) !void {
+        if (self.refresh_task != null or self.pending_catalog != null) return;
+        const generation = self.refresh_pending_generation orelse return;
+        self.refresh_pending_generation = null;
+        try self.startRefresh(
+            alloc,
+            workspace_root,
+            home,
+            root_policy,
+            generation,
+        );
+    }
+
+    pub const GenerationStatus = enum {
+        pending,
+        current,
+        failed,
+    };
+
+    pub fn generationStatus(self: *const Runtime, generation: u64) GenerationStatus {
+        if (self.fresh_through_generation >= generation) return .current;
+        if (self.failed_refresh_generation) |failed| {
+            if (failed == generation) return .failed;
+        }
+        return .pending;
+    }
+
+    pub fn refreshActive(self: *const Runtime) bool {
+        return self.refresh_task != null or self.pending_catalog != null;
+    }
+
+    pub fn queueRefreshAction(
+        self: *Runtime,
+        alloc: Allocator,
+        generation: u64,
+        action: union(enum) {
+            list,
+            show: []const u8,
+            notice: []const u8,
+        },
+    ) !void {
+        if (self.pending_refresh_action != null) {
+            return error.SkillRefreshActionBusy;
+        }
+        const owned: RefreshAction = switch (action) {
+            .list => .list,
+            .show => |value| .{ .show = try alloc.dupe(u8, value) },
+            .notice => |value| .{ .notice = try alloc.dupe(u8, value) },
+        };
+        self.pending_refresh_action = .{
+            .generation = generation,
+            .action = owned,
+        };
+    }
+
+    pub fn takeReadyRefreshAction(
+        self: *Runtime,
+    ) ?ReadyRefreshAction {
+        const pending = self.pending_refresh_action orelse return null;
+        const status = self.generationStatus(pending.generation);
+        if (status == .pending) return null;
+        self.pending_refresh_action = null;
+        return .{
+            .action = pending.action,
+            .succeeded = status == .current,
+        };
+    }
+
+    pub fn acquireCatalog(self: *Runtime) CatalogLease {
+        self.catalog_mutex.lockUncancelable(io_mod.getIo());
+        defer self.catalog_mutex.unlock(io_mod.getIo());
+        if (self.active_catalog) |catalog| {
+            catalog.retain();
+            return .{
+                .generation = catalog,
+                .items = catalog.catalog.skills,
+                .diagnostics = catalog.catalog.diagnostics,
+            };
+        }
+        return .{
+            .items = self.items,
+            .diagnostics = self.diagnostics,
+        };
+    }
+
+    fn reapRetiredCatalog(self: *Runtime) void {
+        const retired = self.retired_catalog orelse return;
+        if (retired.referenceCount() != 1) return;
+        self.retired_catalog = null;
+        retired.release();
+    }
+
     fn freeLoaded(self: *Runtime, alloc: Allocator) void {
-        if (self.dir.len > 0) alloc.free(self.dir);
-        freeSkills(alloc, self.items);
-        freeSkillDiagnostics(alloc, self.diagnostics);
+        if (self.active_catalog) |catalog| {
+            self.active_catalog = null;
+            catalog.release();
+        } else {
+            if (self.dir.len > 0) alloc.free(self.dir);
+            freeSkills(alloc, self.items);
+            freeSkillDiagnostics(alloc, self.diagnostics);
+        }
         self.dir = &.{};
         self.items = &.{};
         self.diagnostics = &.{};
@@ -1634,10 +2356,56 @@ pub const Runtime = struct {
         diagnostics: []SkillDiagnostic,
     ) Allocator.Error!void {
         try self.menu_index.actual_indices.ensureTotalCapacity(alloc, skills.len);
-        self.freeLoaded(alloc);
-        self.dir = dir;
-        self.items = skills;
-        self.diagnostics = diagnostics;
+        const generation = self.nextGeneration();
+        var catalog = LoadedCatalog{
+            .dir = dir,
+            .skills = skills,
+            .diagnostics = diagnostics,
+        };
+        const adopted = try self.adoptCatalog(alloc, generation, &catalog);
+        std.debug.assert(adopted);
+    }
+
+    fn adoptCatalog(
+        self: *Runtime,
+        alloc: Allocator,
+        generation: u64,
+        catalog: *LoadedCatalog,
+    ) Allocator.Error!bool {
+        try self.menu_index.actual_indices.ensureTotalCapacity(
+            alloc,
+            catalog.skills.len,
+        );
+        self.reapRetiredCatalog();
+        self.catalog_mutex.lockUncancelable(io_mod.getIo());
+        defer self.catalog_mutex.unlock(io_mod.getIo());
+        if (self.active_catalog) |active| {
+            if (active.referenceCount() > 1 and self.retired_catalog != null) {
+                return false;
+            }
+        }
+        const next = try CatalogGeneration.create(alloc, generation, catalog.*);
+        catalog.* = .{};
+        if (self.active_catalog) |active| {
+            if (active.referenceCount() > 1) {
+                self.retired_catalog = active;
+            } else {
+                active.release();
+            }
+        } else {
+            if (self.dir.len > 0) alloc.free(self.dir);
+            freeSkills(alloc, self.items);
+            freeSkillDiagnostics(alloc, self.diagnostics);
+        }
+        self.active_catalog = next;
+        self.dir = next.catalog.dir;
+        self.items = next.catalog.skills;
+        self.diagnostics = next.catalog.diagnostics;
+        self.fresh_through_generation = @max(
+            self.fresh_through_generation,
+            generation,
+        );
+        self.failed_refresh_generation = null;
         self.menu_index.rebuildAssumeCapacity(
             self.items,
             self.menu.source_filter,
@@ -1645,6 +2413,7 @@ pub const Runtime = struct {
         );
         self.menu_index_ready = true;
         self.menu.clampCount(self.menu_index.count());
+        return true;
     }
 
     pub fn prepareMenuIndex(self: *Runtime, alloc: Allocator) Allocator.Error!void {
@@ -1782,44 +2551,45 @@ pub const Runtime = struct {
     ) !BoundedPromptSection {
         const ordered = try orderSkillsForPrompt(alloc, self.items, prompt);
         defer alloc.free(ordered);
-        return self.attachDiagnostics(
+        return attachCatalogDiagnostics(
             alloc,
             try buildSkillsSystemPromptSectionWithLimits(alloc, ordered, limits),
+            self.diagnostics,
         );
-    }
-
-    fn attachDiagnostics(
-        self: Runtime,
-        alloc: Allocator,
-        section: BoundedPromptSection,
-    ) !BoundedPromptSection {
-        var result = section;
-        errdefer result.deinit(alloc);
-        if (self.diagnostics.len == 0) return result;
-
-        var candidate_count: usize = 0;
-        var root_count: usize = 0;
-        for (self.diagnostics) |diagnostic| switch (diagnostic.scope) {
-            .candidate => candidate_count += 1,
-            .root => root_count += 1,
-        };
-        const marker = try std.fmt.allocPrint(
-            alloc,
-            "<skill_discovery_warning skipped_candidate_count=\"{d}\" incomplete_root_count=\"{d}\" missing_from_incomplete_roots=\"{s}\" />\n",
-            .{ candidate_count, root_count, if (root_count > 0) "unknown" else "0" },
-        );
-        defer alloc.free(marker);
-        const marked_text = try std.mem.concat(alloc, u8, &.{ marker, result.text });
-        alloc.free(result.text);
-        result.text = marked_text;
-
-        var diagnostic_notice: std.Io.Writer.Allocating = .init(alloc);
-        defer diagnostic_notice.deinit();
-        try writeDiagnosticSummary(alloc, &diagnostic_notice.writer, self.diagnostics);
-        result.diagnostic_notice = try diagnostic_notice.toOwnedSlice();
-        return result;
     }
 };
+
+fn attachCatalogDiagnostics(
+    alloc: Allocator,
+    section: BoundedPromptSection,
+    diagnostics: []const SkillDiagnostic,
+) !BoundedPromptSection {
+    var result = section;
+    errdefer result.deinit(alloc);
+    if (diagnostics.len == 0) return result;
+
+    var candidate_count: usize = 0;
+    var root_count: usize = 0;
+    for (diagnostics) |diagnostic| switch (diagnostic.scope) {
+        .candidate => candidate_count += 1,
+        .root => root_count += 1,
+    };
+    const marker = try std.fmt.allocPrint(
+        alloc,
+        "<skill_discovery_warning skipped_candidate_count=\"{d}\" incomplete_root_count=\"{d}\" missing_from_incomplete_roots=\"{s}\" />\n",
+        .{ candidate_count, root_count, if (root_count > 0) "unknown" else "0" },
+    );
+    defer alloc.free(marker);
+    const marked_text = try std.mem.concat(alloc, u8, &.{ marker, result.text });
+    alloc.free(result.text);
+    result.text = marked_text;
+
+    var diagnostic_notice: std.Io.Writer.Allocating = .init(alloc);
+    defer diagnostic_notice.deinit();
+    try writeDiagnosticSummary(alloc, &diagnostic_notice.writer, diagnostics);
+    result.diagnostic_notice = try diagnostic_notice.toOwnedSlice();
+    return result;
+}
 
 fn orderSkillsForPrompt(alloc: Allocator, skills: []const Skill, prompt: []const u8) ![]Skill {
     const ordered = try alloc.dupe(Skill, skills);
@@ -2567,6 +3337,51 @@ test "skill runtime replacement preserves the active catalog when index allocati
     try std.testing.expectEqualStrings("active", runtime.menu_index.skillAt(runtime.items, 0).?.name);
 }
 
+test "skill catalog lease keeps one retired generation alive until release" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+
+    const first = try alloc.alloc(Skill, 1);
+    first[0] = .{
+        .name = try alloc.dupe(u8, "first"),
+        .description = try alloc.dupe(u8, "first generation"),
+        .path = try alloc.dupe(u8, "/skills/first"),
+        .source = .global_fx,
+    };
+    try runtime.replaceLoaded(
+        alloc,
+        try alloc.dupe(u8, "/skills"),
+        first,
+        &.{},
+    );
+
+    var lease = runtime.acquireCatalog();
+    var lease_owned = true;
+    defer if (lease_owned) lease.deinit();
+    const second = try alloc.alloc(Skill, 1);
+    second[0] = .{
+        .name = try alloc.dupe(u8, "second"),
+        .description = try alloc.dupe(u8, "second generation"),
+        .path = try alloc.dupe(u8, "/skills/second"),
+        .source = .global_fx,
+    };
+    try runtime.replaceLoaded(
+        alloc,
+        try alloc.dupe(u8, "/skills"),
+        second,
+        &.{},
+    );
+
+    try std.testing.expectEqualStrings("first", lease.items[0].name);
+    try std.testing.expectEqualStrings("second", runtime.items[0].name);
+    try std.testing.expect(runtime.retired_catalog != null);
+    lease.deinit();
+    lease_owned = false;
+    runtime.reapRetiredCatalog();
+    try std.testing.expect(runtime.retired_catalog == null);
+}
+
 test "skill refresh publishes one generation and coalesces one latest request" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2584,9 +3399,13 @@ test "skill refresh publishes one generation and coalesces one latest request" {
     defer runtime.deinit(alloc);
     const policy: skill_contract.RootPolicy = .{ .managed_root_source = .global_fx };
 
-    try runtime.requestRefresh(alloc, home, home, policy);
-    try runtime.requestRefresh(alloc, home, home, policy);
-    try std.testing.expect(runtime.refresh_pending);
+    const first_generation = try runtime.requestRefresh(alloc, home, home, policy);
+    const pending_generation = try runtime.requestRefresh(alloc, home, home, policy);
+    try std.testing.expect(pending_generation > first_generation);
+    try std.testing.expectEqual(
+        pending_generation,
+        runtime.refresh_pending_generation.?,
+    );
 
     var adopted = false;
     for (0..100_000) |_| {
@@ -2602,13 +3421,41 @@ test "skill refresh publishes one generation and coalesces one latest request" {
     try std.testing.expectEqualStrings("refreshable", runtime.items[0].name);
 
     var terminal: RefreshCompletion = .none;
-    try runtime.requestRefresh(alloc, home, home, policy);
+    _ = try runtime.requestRefresh(alloc, home, home, policy);
     for (0..100_000) |_| {
         terminal = try runtime.pollRefresh(alloc, home, home, policy);
         if (terminal != .none) break;
         std.Thread.yield() catch std.atomic.spinLoopHint();
     }
     try std.testing.expectEqual(RefreshCompletion.unchanged, terminal);
+
+    try writeTempFile(
+        &tmp,
+        "home/.fx/skills/refreshable/SKILL.md",
+        "---\nname: refreshable-v2\ndescription: one-file delta refresh with a new size\n---\nbody changed\n",
+    );
+    _ = try runtime.requestRefresh(alloc, home, home, policy);
+    for (0..100_000) |_| {
+        terminal = try runtime.pollRefresh(alloc, home, home, policy);
+        if (terminal != .none) break;
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+    try std.testing.expectEqual(RefreshCompletion.adopted, terminal);
+    try std.testing.expectEqualStrings("refreshable-v2", runtime.items[0].name);
+
+    try writeTempFile(
+        &tmp,
+        "home/.fx/skills/added/SKILL.md",
+        "---\nname: added\ndescription: root manifest changed\n---\nbody\n",
+    );
+    _ = try runtime.requestRefresh(alloc, home, home, policy);
+    for (0..100_000) |_| {
+        terminal = try runtime.pollRefresh(alloc, home, home, policy);
+        if (terminal != .none) break;
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+    try std.testing.expectEqual(RefreshCompletion.adopted, terminal);
+    try std.testing.expectEqual(@as(usize, 2), runtime.items.len);
 }
 
 test "skill menu fills a bounded query range in display order" {

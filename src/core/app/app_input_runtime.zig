@@ -708,6 +708,10 @@ pub fn Runtime(comptime App: type) type {
             input_limits: paste_framing.InputLimits,
             max_prompt_history: usize,
         ) !void {
+            if (byte != 15) {
+                const cancelled = full_transcript_rt.cancelPendingOpenForInput(app);
+                if (cancelled and byte == 0x1b) return;
+            }
             var context = try prepareTerminalDecode(app) orelse return;
             var ingress = app.terminal_input_runtime.decodeTerminalByte(
                 byte,

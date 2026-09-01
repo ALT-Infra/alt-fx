@@ -259,6 +259,7 @@ test "interruptible full projection rendering retries after cancellation" {
             std.math.maxInt(u16),
             .{ .fixed_offset = 0 },
             &checkpoint,
+            std.math.maxInt(usize),
         ),
     );
 
@@ -3720,6 +3721,7 @@ const ProjectionRowWalker = struct {
     row_has_bytes: bool = false,
     window: ?Window = null,
     build_checkpoint: ?*BuildCheckpoint = null,
+    max_output_bytes: usize = std.math.maxInt(usize),
 
     const Window = struct {
         writer: std.Io.Writer.Allocating,
@@ -3792,7 +3794,12 @@ const ProjectionRowWalker = struct {
 
     fn emit(self: *ProjectionRowWalker, bytes: []const u8) !void {
         if (self.window) |*window| {
-            if (self.row >= window.start_row) try window.writer.writer.writeAll(bytes);
+            if (self.row >= window.start_row) {
+                if (bytes.len > self.max_output_bytes -| window.writer.written().len) {
+                    return error.PreparedWindowTooLarge;
+                }
+                try window.writer.writer.writeAll(bytes);
+            }
         }
     }
 
@@ -5408,6 +5415,29 @@ pub fn renderProjectionViewportSourceInterruptible(
         visible_rows,
         .{ .fixed_offset = scroll_offset },
         checkpoint,
+        std.math.maxInt(usize),
+    );
+}
+
+pub fn renderProjectionViewportSourceBoundedInterruptible(
+    alloc: Allocator,
+    projection: *Projection,
+    capability: ?*session_child_store.SessionChildCapability,
+    cols: u16,
+    visible_rows: u16,
+    scroll_offset: u32,
+    max_bytes: usize,
+    checkpoint: ?*BuildCheckpoint,
+) ![]u8 {
+    return renderProjectionViewportSourceWithSelection(
+        alloc,
+        projection,
+        capability,
+        cols,
+        visible_rows,
+        .{ .fixed_offset = scroll_offset },
+        checkpoint,
+        max_bytes,
     );
 }
 
@@ -5454,6 +5484,7 @@ pub fn renderProjectionViewportSourceWithSelectorInterruptible(
         visible_rows,
         .{ .selector = offset_selector },
         checkpoint,
+        std.math.maxInt(usize),
     );
 }
 
@@ -5470,6 +5501,7 @@ fn renderProjectionViewportSourceWithSelection(
     visible_rows: u16,
     selection: ViewportSelection,
     checkpoint: ?*BuildCheckpoint,
+    max_bytes: usize,
 ) ![]u8 {
     if (cols == 0 or visible_rows == 0) return error.InvalidViewport;
     while (true) {
@@ -5486,7 +5518,7 @@ fn renderProjectionViewportSourceWithSelection(
                 break :blk selector.select_offset(selector.context, measurement, visible_rows);
             },
         };
-        return renderProjectionWindow(alloc, projection, capability, cols, visible_rows, offset, checkpoint) catch |err| switch (err) {
+        return renderProjectionWindow(alloc, projection, capability, cols, visible_rows, offset, checkpoint, max_bytes) catch |err| switch (err) {
             error.StoredSegmentDegraded => continue,
             else => |other| return other,
         };
@@ -5501,6 +5533,7 @@ fn renderProjectionWindow(
     visible_rows: u16,
     scroll_offset: u32,
     checkpoint: ?*BuildCheckpoint,
+    max_bytes: usize,
 ) ![]u8 {
     const start = projection.windowStart(cols, scroll_offset);
     debug_trace.logf(
@@ -5525,6 +5558,7 @@ fn renderProjectionWindow(
         checkpoint,
     );
     defer walker.deinit();
+    walker.max_output_bytes = max_bytes;
     _ = try walkProjectionSegments(
         alloc,
         projection,

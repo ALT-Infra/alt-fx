@@ -21,6 +21,7 @@ const app_entry_runtime = @import("core/app/app_entry_runtime.zig");
 const acp_runner = @import("core/cli/acp_runner.zig");
 const acp_server = @import("acp/server.zig");
 const app_input_runtime = @import("core/app/app_input_runtime.zig");
+const input_full_transcript_runtime = @import("core/app/input_full_transcript_runtime.zig");
 const input_submit_runtime = @import("core/app/input_submit_runtime.zig");
 const core_input_runtime = @import("core/input/runtime.zig");
 const input_queue_runtime = @import("core/app/input_queue_runtime.zig");
@@ -186,6 +187,7 @@ const RuntimeContextSnapshot = background_runtime.RuntimeContextSnapshot;
 
 const footer_rows: u16 = 4;
 const active_poll_timeout_ms: i32 = 8;
+const focused_ui_worker_poll_timeout_ms: i32 = 1;
 const idle_wasm_poll_timeout_ms: i32 = 16;
 const resize_debounce_ms: i64 = 100;
 const max_transcript_bytes: usize = 256 * 1024;
@@ -395,6 +397,7 @@ const App = struct {
     const HostConfigAppRuntime = app_host_config_runtime.Runtime(Self);
     const BootstrapAppRuntime = app_bootstrap_runtime.Runtime(Self);
     const InputAppRuntime = app_input_runtime.Runtime(Self);
+    const InputFullTranscriptRuntime = input_full_transcript_runtime.Runtime(Self);
     const InputSubmitRuntime = input_submit_runtime.SubmitRuntime(Self);
     const NotificationAppRuntime = app_notification_runtime.Runtime(
         Self,
@@ -1008,7 +1011,13 @@ const App = struct {
 
     pub fn loopPollTimeoutMs(ctx: *anyopaque, default_timeout_ms: i32) i32 {
         const self: *const App = @ptrCast(@alignCast(ctx));
-        if (comptime !host_target.is_wasm) return default_timeout_ms;
+        if (comptime !host_target.is_wasm) {
+            if (self.auth.sourceInventoryRefreshActive()) return 0;
+            if (self.skills.refreshActive()) {
+                return @min(default_timeout_ms, focused_ui_worker_poll_timeout_ms);
+            }
+            return default_timeout_ms;
+        }
         return if (self.pacer.hasPending()) default_timeout_ms else idle_wasm_poll_timeout_ms;
     }
 
@@ -1379,8 +1388,6 @@ const App = struct {
         user_prompt_already_presented: bool,
         intent: PromptSubmitIntent,
     ) !bool {
-        try self.requestSkillsRefresh();
-
         const source_images = if (recovery_checkpoint) |checkpoint|
             checkpoint.user.images
         else if (prompt_images) |images|
@@ -1881,14 +1888,30 @@ const App = struct {
         return AgentAppRuntime.runSubagentChild(raw, turn, message, admission, cancel);
     }
 
-    pub fn requestSkillsRefresh(self: *App) !void {
-        const home = io_mod.getenv("HOME") orelse return;
-        try self.skills.requestRefresh(
+    pub fn requestSkillsRefresh(self: *App) !u64 {
+        const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+        return self.skills.requestRefresh(
             std.heap.c_allocator,
             self.workspace_root,
             home,
             builtin_skills.root_policy,
         );
+    }
+
+    pub fn collectPendingSkillRefresh(
+        self: *App,
+        pending: *input_submit_runtime.PendingSubmission,
+    ) !input_submit_runtime.PendingSkillRefresh {
+        const generation = pending.skill_refresh_generation orelse blk: {
+            const requested = try self.requestSkillsRefresh();
+            pending.skill_refresh_generation = requested;
+            break :blk requested;
+        };
+        return switch (self.skills.generationStatus(generation)) {
+            .pending => .pending,
+            .current => .current,
+            .failed => error.SkillCatalogRefreshFailed,
+        };
     }
 
     fn pollSkillsRefresh(self: *App) !skill_runtime.RefreshCompletion {
@@ -2657,6 +2680,10 @@ const App = struct {
     }
 
     fn handleTerminalInputByte(self: *App, byte: u8) !void {
+        if (byte != 15) {
+            const cancelled = InputFullTranscriptRuntime.cancelPendingOpenForInput(self);
+            if (cancelled and byte == 0x1b) return;
+        }
         const context = try InputAppRuntime.prepareTerminalDecode(self) orelse return;
         const ingress = self.terminal_input_runtime.decodeTerminalByte(
             byte,
@@ -2835,6 +2862,17 @@ const App = struct {
     pub fn loopCollectFacts(ctx: *anyopaque) !void {
         const self: *App = @ptrCast(@alignCast(ctx));
         if (!try WorkerAppRuntime.authorizeInteractiveAdmission(self)) return;
+
+        if (comptime !host_target.is_wasm) {
+            if (self.file_index.joinThreadIfDone(std.heap.c_allocator)) {
+                self.shell.render_requests.request(.footer);
+            }
+            switch (try self.pollSkillsRefresh()) {
+                .none, .unchanged => {},
+                .adopted, .failed => self.shell.render_requests.request(.footer),
+            }
+            try app_commands.Handlers(App).collectSkillsRefreshFacts(self);
+        }
         InputSubmitRuntime.collectPendingSubmissionFacts(self);
 
         if (!self.terminal_takeover.blocksFxSurface(&self.terminal)) {
@@ -2851,15 +2889,6 @@ const App = struct {
             app_permission_runtime.monotonicMillis(),
         );
 
-        if (comptime !host_target.is_wasm) {
-            if (self.file_index.joinThreadIfDone(std.heap.c_allocator)) {
-                self.shell.render_requests.request(.footer);
-            }
-            switch (try self.pollSkillsRefresh()) {
-                .none, .unchanged => {},
-                .adopted, .failed => self.shell.render_requests.request(.footer),
-            }
-        }
         if (try self.model_cache.pollLoadTransition()) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }
@@ -2879,6 +2908,7 @@ const App = struct {
         try app_commands.Handlers(App).collectMcpAuthenticationFacts(self);
         try app_commands.Handlers(App).collectMcpReloadFacts(self);
         if (comptime host_profile.native_auth or host_profile.js_host_auth) {
+            try AuthAppRuntime.collectSourceInventoryFacts(self);
             try AuthAppRuntime.collectSignInFacts(self);
         }
         if (comptime host_profile.native_auth) {
@@ -2932,6 +2962,39 @@ const App = struct {
         if (try self.shell.pollFullTranscriptPageLoad()) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .modal);
         }
+        if (!self.shell.fullTranscriptActive() and
+            self.shell.takeReadyFullTranscriptOpen() and
+            self.terminal.alternate_screen_owner == .none and
+            !self.approval_prompt.isActive())
+        {
+            try app_lifecycle.openFullTranscript(
+                self.alloc,
+                &self.terminal,
+                &self.shell,
+                &self.metrics,
+            );
+            debug_trace.logf(
+                "full_transcript",
+                "depth_transition from=inline to=full route=root trigger=ctrl_o",
+                .{},
+            );
+            RenderAppRuntime.requestActiveSurfaceFrame(self, .modal);
+        }
+        if (self.shell.takeFullTranscriptPreparationFailure()) {
+            if (self.shell.fullTranscriptActive()) {
+                try app_lifecycle.closeFullTranscript(
+                    self.alloc,
+                    &self.terminal,
+                    &self.shell,
+                    &self.metrics,
+                );
+            }
+            try self.writeDomainNotice(.{
+                .topic = "transcript",
+                .tone = .@"error",
+                .body = "Full transcript preparation failed. The reader was closed instead of showing stale content.",
+            }, true);
+        }
         if (self.subagents.childConversationRuntime()) |child| {
             try child.prewarmFullTranscriptPage(
                 null,
@@ -2939,6 +3002,30 @@ const App = struct {
             );
             if (try child.pollFullTranscriptPageLoad()) {
                 RenderAppRuntime.requestActiveSurfaceFrame(self, .modal);
+            }
+            if (!child.fullTranscriptActive() and
+                child.takeReadyFullTranscriptOpen())
+            {
+                _ = try self.subagents.setChildTranscriptPresentationDepth(
+                    self.alloc,
+                    .full,
+                );
+                debug_trace.logf(
+                    "full_transcript",
+                    "depth_transition from=inline to=full route=child trigger=ctrl_o",
+                    .{},
+                );
+                RenderAppRuntime.requestActiveSurfaceFrame(self, .modal);
+            }
+            if (child.takeFullTranscriptPreparationFailure()) {
+                if (child.fullTranscriptActive()) {
+                    _ = try self.subagents.closeChildTranscriptPresentation(self.alloc);
+                }
+                try self.writeDomainNotice(.{
+                    .topic = "transcript",
+                    .tone = .@"error",
+                    .body = "The child full transcript reader was closed because its current page could not be prepared.",
+                }, true);
             }
         }
         if (!self.terminal_takeover.blocksFxSurface(&self.terminal)) {

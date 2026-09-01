@@ -454,9 +454,9 @@ pub fn prepareFullTranscriptViewportSourceInterruptible(
     };
 }
 
-/// Takes ownership of one complete width-rendered full-transcript page and
+/// Takes ownership of one bounded width-rendered full-transcript window and
 /// builds its reusable line index once on the page worker.
-pub fn prepareIndexedFullTranscriptSourceInterruptible(
+pub fn prepareIndexedFullTranscriptWindowSourceInterruptible(
     alloc: Allocator,
     bytes: []u8,
     cols: u16,

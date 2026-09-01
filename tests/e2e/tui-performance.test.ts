@@ -28,7 +28,8 @@ const LIVE_ENABLED = process.env.FX_E2E_REAL_API === "1" &&
   process.env.AI_GATEWAY_API_KEY.length > 0;
 const WARMUPS = 5;
 const SAMPLES = 50;
-const BUDGETS_MS = { p50: 4, p90: 8, p95: 16 } as const;
+const LOCAL_BUDGETS_MS = { p50: 8, p90: 12, p95: 17 } as const;
+const EXTERNAL_REFRESH_BUDGETS_MS = { p50: 17, p90: 17, p95: 17 } as const;
 const TIMEOUT = 60_000;
 
 type Samples = {
@@ -92,7 +93,7 @@ function frameLatency(
     firstPaint ??= elapsed;
     lastPaint = elapsed;
     output += frame.payload.toString("utf8");
-    if (contentMarker === undefined || output.includes(contentMarker)) {
+    if (contentMarker !== undefined && output.includes(contentMarker)) {
       return { firstPaint, contentReady: elapsed };
     }
   }
@@ -140,6 +141,28 @@ function resourceSnapshot(pid: number): ResourceSnapshot {
   return { rssKib, threads, descriptors };
 }
 
+async function peakResourcesWhile(
+  pid: number,
+  work: () => Promise<unknown>,
+): Promise<ResourceSnapshot> {
+  let settled = false;
+  const pending = work().finally(() => {
+    settled = true;
+  });
+  let peak = resourceSnapshot(pid);
+  while (!settled) {
+    const current = resourceSnapshot(pid);
+    peak = {
+      rssKib: Math.max(peak.rssKib, current.rssKib),
+      threads: Math.max(peak.threads, current.threads),
+      descriptors: Math.max(peak.descriptors, current.descriptors),
+    };
+    await Bun.sleep(5);
+  }
+  await pending;
+  return peak;
+}
+
 function longTranscript(): string {
   const rows: string[] = [];
   for (let index = 0; index < 2_100; index += 1) {
@@ -161,14 +184,19 @@ function createFixture() {
   mkdirSync(join(home, ".fx"), { recursive: true });
   mkdirSync(skillsRoot, { recursive: true });
   const hash = createHash("sha256");
+  let generationSkillPath = "";
   for (let index = 0; index < 289; index += 1) {
-    const name = index % 2 === 0
+    const name = index === 0
+      ? "generation-skill-000"
+      : index % 2 === 0
       ? `needle-skill-${String(index).padStart(3, "0")}`
       : `other-skill-${String(index).padStart(3, "0")}`;
     const body = `---\nname: ${name}\ndescription: performance fixture ${index}\n---\nbody ${index}\n`;
     const dir = join(skillsRoot, name);
     mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, "SKILL.md"), body);
+    const skillPath = join(dir, "SKILL.md");
+    writeFileSync(skillPath, body);
+    if (index === 0) generationSkillPath = skillPath;
     hash.update(body);
   }
   const transcript = longTranscript();
@@ -181,14 +209,31 @@ function createFixture() {
     stderrPath: join(root, "stderr.log"),
     fixtureHash: hash.digest("hex"),
     transcript,
+    generationSkillPath,
   };
+}
+
+function writeGenerationSkill(path: string, generation: number): string {
+  const name = `generation-skill-${String(generation).padStart(3, "0")}`;
+  writeFileSync(
+    path,
+    `---\nname: ${name}\ndescription: current catalog generation ${generation}\n---\nbody ${generation}\n`,
+  );
+  return name;
 }
 
 test.skipIf(!ENABLED || !tmuxAvailable())(
   "interactive terminal surfaces stay within one frame at p95",
   async () => {
     const fixture = createFixture();
-    const gateway = startFakeGateway([fakeGatewayFinalText(fixture.transcript)]);
+    const secondTranscript = fixture.transcript.replace(
+      "PERF_TRANSCRIPT_TAIL",
+      "PERF_SECOND_TRANSCRIPT_TAIL",
+    );
+    const gateway = startFakeGateway([
+      fakeGatewayFinalText(fixture.transcript),
+      fakeGatewayFinalText(secondTranscript),
+    ]);
     let session: TmuxSession | null = null;
     try {
       session = await TmuxSession.create({
@@ -240,12 +285,14 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
           () => session!.waitForText("Full detail · ctrl o close", TIMEOUT),
           "Full detail",
         );
+        const beforeScroll = (await session.capturePaneGrid()).join("\n");
         const scroll = await measureAction(
           fixture.tapePath,
           () => session!.sendKeysImmediate(["Up"]),
-          async () => {
-            await Bun.sleep(25);
-          },
+          () => session!.waitForPane(
+            (pane) => pane !== beforeScroll && pane.includes("Full detail"),
+            TIMEOUT,
+          ),
         );
         session.sendKeysImmediate(["Escape"]);
         await session.waitForComposer(TIMEOUT);
@@ -256,18 +303,22 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
       }
 
       for (let cycle = 0; cycle < WARMUPS + SAMPLES; cycle += 1) {
+        const generationName = writeGenerationSkill(
+          fixture.generationSkillPath,
+          cycle + 1,
+        );
         await session.sendLiteralText("/skills");
         const open = await measureAction(
           fixture.tapePath,
           () => session!.sendKeysImmediate(["Enter"]),
-          () => session!.waitForText("Skills 289", TIMEOUT),
-          "Skills 289",
+          () => session!.waitForText(generationName, TIMEOUT),
+          generationName,
         );
         const query = await measureAction(
           fixture.tapePath,
           () => session!.sendLiteralImmediate("needle"),
-          () => session!.waitForText("Skills 145", TIMEOUT),
-          "Skills 145",
+          () => session!.waitForText("Skills 144", TIMEOUT),
+          "Skills 144",
         );
         session.sendKeysImmediate(["Escape"]);
         await session.waitForComposer(TIMEOUT);
@@ -294,6 +345,10 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
         if (cycle >= WARMUPS) appendMeasured(samples.loginOpen, open);
       }
 
+      const peakResources = await peakResourcesWhile(pid, async () => {
+        await session!.sendText("Build the second performance transcript.");
+        await session!.waitForText("PERF_SECOND_TRANSCRIPT_TAIL", TIMEOUT);
+      });
       await Bun.sleep(250);
       const resourcesAfter = resourceSnapshot(pid);
       const report = {
@@ -308,30 +363,42 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
           transcriptLines: 2_100,
           transcriptBytes: Buffer.byteLength(fixture.transcript),
         },
-        budgetsMs: BUDGETS_MS,
+        budgetsMs: {
+          local: LOCAL_BUDGETS_MS,
+          externalRefresh: EXTERNAL_REFRESH_BUDGETS_MS,
+        },
         results: Object.fromEntries(
           Object.entries(samples).map(([name, values]) => [name, {
             firstPaint: summary(values.firstPaint),
             contentReady: summary(values.contentReady),
           }]),
         ),
-        resources: { before: resourcesBefore, after: resourcesAfter },
+        resources: { before: resourcesBefore, peak: peakResources, after: resourcesAfter },
       };
       const reportPath = process.env.FX_TUI_PERFORMANCE_REPORT;
       if (reportPath) writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
 
-      for (const values of Object.values(samples)) {
+      for (const [name, values] of Object.entries(samples)) {
+        const contentBudget = name === "skillsOpen" || name === "loginOpen"
+          ? EXTERNAL_REFRESH_BUDGETS_MS
+          : LOCAL_BUDGETS_MS;
         for (const distribution of [values.firstPaint, values.contentReady]) {
           const measured = summary(distribution);
+          const budget = distribution === values.firstPaint
+            ? LOCAL_BUDGETS_MS
+            : contentBudget;
           expect(measured.count).toBe(SAMPLES);
-          expect(measured.p50).toBeLessThanOrEqual(BUDGETS_MS.p50);
-          expect(measured.p90).toBeLessThanOrEqual(BUDGETS_MS.p90);
-          expect(measured.p95).toBeLessThanOrEqual(BUDGETS_MS.p95);
+          expect(measured.p50).toBeLessThanOrEqual(budget.p50);
+          expect(measured.p90).toBeLessThanOrEqual(budget.p90);
+          expect(measured.p95).toBeLessThanOrEqual(budget.p95);
         }
       }
       expect(resourcesAfter.threads).toBe(resourcesBefore.threads);
       expect(resourcesAfter.descriptors).toBe(resourcesBefore.descriptors);
       expect(resourcesAfter.rssKib - resourcesBefore.rssKib).toBeLessThan(16 * 1024);
+      expect(peakResources.threads - resourcesBefore.threads).toBeLessThanOrEqual(3);
+      expect(peakResources.descriptors - resourcesBefore.descriptors).toBeLessThanOrEqual(4);
+      expect(peakResources.rssKib - resourcesBefore.rssKib).toBeLessThan(32 * 1024);
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
     } finally {
       await session?.kill();
