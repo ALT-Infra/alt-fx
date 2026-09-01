@@ -660,22 +660,26 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
         }],
       }),
       fakeGatewayFinalText("PERF_QUESTION_DONE"),
-      fakeGatewayToolCall("performance-approval", "terminal", {
-        action: "exec",
-        command: "touch performance-approval.txt",
-        timeout_ms: 600_000,
+      fakeGatewayToolCall("performance-approval", "shell", {
+        request: {
+          action: "run",
+          command: "touch performance-approval.txt",
+          profile: "clean",
+          timeout_ms: 600_000,
+        },
       }),
       fakeGatewayFinalText("PERF_APPROVAL_DONE"),
-      fakeGatewayToolCall("performance-terminal", "terminal", {
-        action: "start",
-        cwd: fixture.workspace,
-        command:
-          "printf 'PERF_TERMINAL_READY\\n'; " +
-          "while :; do sleep 1; done",
-        backend: "native",
-        return_when: { kind: "match", pattern: "PERF_TERMINAL_READY" },
-        wait_ceiling_ms: 20_000,
-        dimensions: { rows: 24, columns: 80 },
+      fakeGatewayToolCall("performance-terminal", "shell", {
+        request: {
+          action: "run",
+          cwd: fixture.workspace,
+          command:
+            "printf 'PERF_TERMINAL_READY\\n'; " +
+            "while :; do sleep 1; done",
+          profile: "clean",
+          tty: true,
+          yield_time_ms: 0,
+        },
       }),
       (body) => {
         hostedTerminalSessionId = findSessionId(JSON.parse(body)) ?? "";
@@ -684,10 +688,12 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
         }
         return fakeGatewayFinalText("PERF_TERMINAL_AGENT_READY");
       },
-      () => fakeGatewayToolCall("performance-terminal-close", "terminal", {
-        action: "close",
-        session_id: hostedTerminalSessionId,
-        close_policy: "force",
+      () => fakeGatewayToolCall("performance-terminal-close", "shell", {
+        request: {
+          action: "stop",
+          session_id: hostedTerminalSessionId,
+          force: true,
+        },
       }),
       fakeGatewayFinalText("PERF_TERMINAL_CLOSED"),
       fakeGatewayFinalText(secondTranscript),
@@ -988,13 +994,14 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
       session.sendKeysImmediate(["C-x"]);
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Close the performance terminal.");
-      await session.waitForText("terminal close", TIMEOUT);
+      await session.waitForText("shell stop", TIMEOUT);
       session.sendKeysImmediate(["1"]);
       await session.waitForText("PERF_TERMINAL_CLOSED", TIMEOUT);
       await session.waitForComposer(TIMEOUT);
       const resourcesBefore = await waitForResourceStability(pid);
       expect(resourcesBefore.threads - preFeatureResources.threads).toBeLessThanOrEqual(2);
-      expect(resourcesBefore.descriptors - preFeatureResources.descriptors).toBeLessThanOrEqual(3);
+      // Three terminal routes plus the shared command-replay logs and commands routes.
+      expect(resourcesBefore.descriptors - preFeatureResources.descriptors).toBeLessThanOrEqual(5);
       expect(resourcesBefore.rssKib - preFeatureResources.rssKib).toBeLessThan(16 * 1024);
 
       const peakResources = await peakResourcesWhile(pid, async () => {

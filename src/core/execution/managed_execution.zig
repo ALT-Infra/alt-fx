@@ -1272,6 +1272,12 @@ pub const Runtime = struct {
             .tty => {},
             .tombstone => unreachable,
         }
+        if (entry.replay_capture) |capture| {
+            capture.releaseRetained(entry.arena.allocator());
+            entry.replay_capture = null;
+        }
+        deinitReplayCapability(self, entry.replay_capability);
+        entry.replay_capability = null;
         entry.backend_state = .tombstone;
         entry.tombstone_sequence.store(
             self.next_tombstone_sequence.fetchAdd(1, .seq_cst),
@@ -1756,6 +1762,69 @@ test "terminal tombstone retains raw output behind an opaque replay handle" {
         "raw-frame-one\nraw-frame-two\n",
         frame.payload,
     );
+}
+
+test "terminal tombstone releases consumed replay authority" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(
+        io_mod.getIo(),
+        "session",
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer session_dir.close(io_mod.getIo());
+    const display_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "session");
+    defer alloc.free(display_path);
+    var capability = try session_child_store.SessionChildCapability.initForTesting(
+        alloc,
+        session_dir,
+        display_path,
+        .writable,
+        .{},
+    );
+    defer capability.deinit();
+
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    var prepared = try runtime.registerTty(alloc, .{
+        .execution_id = "tty-saved-replay",
+        .command = "saved-replay-command",
+        .state = .{ .completed = .{ .exit_code = 0 } },
+        .output = "current screen",
+        .replay_output = "durable raw output\n",
+        .max_output_bytes = 64,
+        .published_running = true,
+        .replay_capability = &capability,
+    });
+    defer prepared.deinit(alloc);
+    const handle = prepared.snapshot.output_file orelse
+        return error.TestExpectedEqual;
+    try runtime.commitDelivery(
+        prepared.snapshot.execution_id,
+        prepared.reservation_id,
+    );
+
+    const entry = runtime.acquireEntry(prepared.snapshot.execution_id) orelse
+        return error.TestExpectedEqual;
+    defer runtime.releaseEntry(entry);
+    try std.testing.expect(entry.backend_state == .tombstone);
+    try std.testing.expect(entry.replay_capture == null);
+    try std.testing.expect(entry.replay_capability == null);
+
+    var reader = try command_replay_store.Reader.openHandle(
+        alloc,
+        &capability,
+        handle,
+    );
+    defer reader.deinit();
+    const frame = (try reader.next(alloc)) orelse return error.TestExpectedEqual;
+    defer alloc.free(frame.payload);
+    try std.testing.expectEqualStrings("durable raw output\n", frame.payload);
 }
 
 test "TTY cursor advances monotonically and delivers each delta once" {
