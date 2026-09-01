@@ -1302,12 +1302,13 @@ fn publishSnapshotMetadata(
     };
     if (timed_out) {
         memory.command_process_presentation = .timed_out;
-    } else if (completed and projection.signal != null) {
-        const signal = projection.signal.?;
-        memory.command_process_presentation = .{ .signal = signal };
-    } else if (projection.exit_code) |exit_code| {
-        if (exit_code != 0) {
-            memory.command_process_presentation = .{ .exit_code = exit_code };
+    } else if (completed) {
+        if (projection.signal) |signal| {
+            memory.command_process_presentation = .{ .signal = signal };
+        } else if (projection.exit_code) |exit_code| {
+            if (exit_code != 0) {
+                memory.command_process_presentation = .{ .exit_code = exit_code };
+            }
         }
     }
     if (ctx.command_result_json_sink != null) {
@@ -1763,21 +1764,27 @@ test "shell decoder applies Codex parity observation defaults" {
 
 test "stopped execution is a successful shell observation without command failure metadata" {
     const alloc = std.testing.allocator;
-    var memory: ?types.ToolResultMemory = null;
-    try publishSnapshotMetadata(.{
-        .allocator = alloc,
-        .tool_result_memory_sink = &memory,
-    }, .{
-        .execution_id = @constCast("shell-stopped"),
-        .command = @constCast("sleep 60"),
-        .cwd = @constCast("/tmp"),
-        .retained = true,
-        .state = .{ .stopped = .{ .signal = 15 } },
-        .output_delta = @constCast(""),
-        .output_truncated = false,
-    });
-    try std.testing.expect(memory != null);
-    try std.testing.expect(memory.?.command_process_presentation == null);
+    const statuses = [_]command_contract.CommandStatus{
+        .{ .signal = 15 },
+        .{ .exit_code = 143 },
+    };
+    for (statuses) |status| {
+        var memory: ?types.ToolResultMemory = null;
+        try publishSnapshotMetadata(.{
+            .allocator = alloc,
+            .tool_result_memory_sink = &memory,
+        }, .{
+            .execution_id = @constCast("shell-stopped"),
+            .command = @constCast("sleep 60"),
+            .cwd = @constCast("/tmp"),
+            .retained = true,
+            .state = .{ .stopped = status },
+            .output_delta = @constCast(""),
+            .output_truncated = false,
+        });
+        try std.testing.expect(memory != null);
+        try std.testing.expect(memory.?.command_process_presentation == null);
+    }
 }
 
 test "lost shell snapshot preserves indeterminate execution guidance" {

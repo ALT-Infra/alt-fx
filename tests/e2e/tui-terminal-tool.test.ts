@@ -402,6 +402,7 @@ test.skipIf(!tmuxAvailable())(
     await active.sendKeys("Enter");
     await active.waitForText("SHELL_TTY_OK", TIMEOUT);
 
+    expect(sessionId).toMatch(/^shell-[A-Za-z0-9_-]{22}$/);
     const writeResult = toolResultEnvelope(
       gateway.requests[2]!.body,
       "shell_tty_write",
@@ -572,7 +573,7 @@ test.skipIf(!tmuxAvailable())(
     const first = await launch(fixture, gateway);
     await first.sendText("Start the durable managed TTY.");
     await first.waitForText("SHELL_TTY_RESUME_STARTED", TIMEOUT);
-    expect(sessionId.length).toBeGreaterThan(0);
+    expect(sessionId).toMatch(/^shell-[A-Za-z0-9_-]{22}$/);
     await first.sendText("/quit");
     expect(await first.waitForSessionEnd(TIMEOUT)).toBe(true);
 
@@ -589,6 +590,9 @@ test.skipIf(!tmuxAvailable())(
       "shell_tty_resume_stop",
     );
     expect(stopResult).toContain('\\"state\\":\\"stopped\\"');
+    const scrollback = await resumed.captureFullScrollback();
+    expect(scrollback).toContain("Stopped printf 'TTY_RESUME_READY");
+    expect(scrollback).not.toContain("Exited 143");
     const record = terminalRecords(fixture.home).find((candidate) =>
       candidate.session_id === sessionId
     );

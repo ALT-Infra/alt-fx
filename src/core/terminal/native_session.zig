@@ -1060,7 +1060,7 @@ const SupportedRegistry = struct {
         const persistence = request.persistence orelse
             return self.failure(.start, .authority_denied, null);
 
-        const session_id = try session_layout.generateSessionId(self.alloc);
+        const session_id = try session_layout.generateTerminalSessionId(self.alloc);
         var session_id_owned = true;
         defer if (session_id_owned) self.alloc.free(session_id);
         const session = try self.alloc.create(Session);
