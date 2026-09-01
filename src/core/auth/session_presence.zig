@@ -9,7 +9,15 @@ pub fn profileFile(
     max_bytes: usize,
 ) host.SecretStorePresence {
     if (comptime host_target.is_wasm) return .missing;
-    const home = io_mod.getenv("HOME") orelse return .missing;
+    return profileFileFromHome(io_mod.getenv("HOME"), file_name, max_bytes);
+}
+
+fn profileFileFromHome(
+    home_value: ?[]const u8,
+    file_name: []const u8,
+    max_bytes: usize,
+) host.SecretStorePresence {
+    const home = home_value orelse return .unavailable;
     var home_dir = std.Io.Dir.openDirAbsolute(
         io_mod.getIo(),
         home,
@@ -42,4 +50,11 @@ pub fn profileFile(
         return .unavailable;
     }
     return .present;
+}
+
+test "missing native profile root is unavailable" {
+    try std.testing.expectEqual(
+        host.SecretStorePresence.unavailable,
+        profileFileFromHome(null, "auth.json", 1024),
+    );
 }

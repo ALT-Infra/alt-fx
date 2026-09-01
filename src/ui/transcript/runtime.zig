@@ -926,6 +926,84 @@ test "active full transcript defers repaint while width replacement loads" {
     try std.testing.expect(runtime.full_transcript_page_load.busy());
 }
 
+test "cross-page replacement preserves its pending boundary until adoption" {
+    const alloc = std.testing.allocator;
+    const page_alloc = std.heap.c_allocator;
+    const Case = struct {
+        installed_anchor: full_transcript_page.Anchor,
+        boundary_index: usize,
+    };
+    const cases = [_]Case{
+        .{ .installed_anchor = .tail, .boundary_index = 743 },
+        .{ .installed_anchor = .{ .entry_index = 743 }, .boundary_index = 871 },
+    };
+
+    for (cases) |case| {
+        var runtime = TranscriptRuntime{
+            .layout = .{
+                .rows = 24,
+                .cols = 80,
+                .content_bottom = 20,
+                .divider_top_row = 21,
+                .input_row = 22,
+                .divider_bottom_row = 23,
+                .hint_row = 24,
+            },
+            .owned_top_row = 1,
+            .full_transcript = .{ .depth = .full, .follow_tail = false },
+        };
+        defer runtime.deinit(alloc);
+        for (0..1_000) |_| {
+            _ = try runtime.appendRawTranscriptEntryClassified(
+                alloc,
+                "row\n",
+                .unknown_raw,
+            );
+        }
+
+        const installed_request = full_transcript_page.Request{
+            .content_revision = runtime.full_transcript_content_revision,
+            .cols = runtime.layout.cols,
+            .anchor = case.installed_anchor,
+        };
+        runtime.full_transcript_installed_page = .{
+            .source = .{
+                .request = installed_request,
+                .range = full_transcript_page.sourceRange(
+                    installed_request,
+                    runtime.entries.items.len,
+                ),
+            },
+            .projection = .{ .styles = .{} },
+            .prepared_window = .{
+                .source = try source_preparation.prepareIndexedFullTranscriptWindowSourceInterruptible(
+                    page_alloc,
+                    try page_alloc.dupe(u8, "installed page\n"),
+                    runtime.layout.cols,
+                    null,
+                ),
+                .start_row = 0,
+            },
+        };
+        runtime.full_transcript_page_anchor = .{ .entry_index = case.boundary_index };
+        runtime.full_transcript = runtime.full_transcript.select_page_boundary(
+            runtime.entries.items[case.boundary_index].id(),
+        );
+        const before = runtime.full_transcript.snapshot();
+
+        try std.testing.expectError(
+            error.InputPending,
+            runtime.preparedFullTranscriptPageProjectionInterruptible(
+                null,
+                null,
+                null,
+            ),
+        );
+        try std.testing.expectEqualDeep(before, runtime.full_transcript.snapshot());
+        try std.testing.expect(runtime.full_transcript_page_load.busy());
+    }
+}
+
 test "restored full transcript opens without replacing its exact offset" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{
@@ -9625,7 +9703,10 @@ pub const TranscriptRuntime = struct {
         if (!self.full_transcript_installed_page_retired) {
             if (self.full_transcript_installed_page) |*page| {
                 if (page.prepared_window != null and
-                    page.source.request.cols == self.layout.cols)
+                    full_transcript_page.sameSurface(
+                        self.desiredFullTranscriptPageRequest(),
+                        page.source.request,
+                    ))
                 {
                     return &page.projection;
                 }

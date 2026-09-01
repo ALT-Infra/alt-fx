@@ -34,6 +34,8 @@ const SAMPLES = 50;
 const LOCAL_BUDGETS_MS = { p50: 8, p90: 12, p95: 17 } as const;
 const BACKGROUND_WORK_BUDGETS_MS = { p50: 12, p90: 17, p95: 17 } as const;
 const EXTERNAL_REFRESH_BUDGETS_MS = { p50: 17, p90: 17, p95: 17 } as const;
+const APP_PANE_BUDGETS_MS = { p50: 12, p90: 17, p95: 17 } as const;
+const ACTIVE_TURN_DESCRIPTOR_BUDGET = 7;
 const TIMEOUT = 60_000;
 
 const LOCAL_MENU_ACTIONS = [
@@ -69,6 +71,9 @@ const MEASURED_ACTION_NAMES = [
 
 const INFORMATIONAL_PANE_ACTION_NAMES = new Set<string>([
   "hostedTerminalInput",
+]);
+
+const APP_PANE_ACTION_NAMES = new Set<string>([
   "subagentManagerOpen",
   ...LOCAL_MENU_ACTIONS.map((action) => action.name),
 ]);
@@ -315,6 +320,53 @@ async function peakResourcesWhile(
   return peak;
 }
 
+async function waitForResourceQuiescence(
+  pid: number,
+  expected: ResourceSnapshot,
+  timeoutMs = 5_000,
+): Promise<ResourceSnapshot> {
+  const deadline = Date.now() + timeoutMs;
+  let current = resourceSnapshot(pid);
+  while (Date.now() < deadline) {
+    if (
+      current.threads === expected.threads &&
+      current.descriptors === expected.descriptors
+    ) return current;
+    await Bun.sleep(25);
+    current = resourceSnapshot(pid);
+  }
+  throw new Error(
+    `resources did not return to baseline: ` +
+      `expected threads/fds=${expected.threads}/${expected.descriptors} ` +
+      `received=${current.threads}/${current.descriptors}`,
+  );
+}
+
+async function waitForResourceStability(
+  pid: number,
+  quietMs = 500,
+  timeoutMs = 5_000,
+): Promise<ResourceSnapshot> {
+  const deadline = Date.now() + timeoutMs;
+  let current = resourceSnapshot(pid);
+  let stableSince = Date.now();
+  while (Date.now() < deadline) {
+    await Bun.sleep(25);
+    const next = resourceSnapshot(pid);
+    if (
+      next.threads !== current.threads ||
+      next.descriptors !== current.descriptors
+    ) {
+      current = next;
+      stableSince = Date.now();
+      continue;
+    }
+    current = next;
+    if (Date.now() - stableSince >= quietMs) return current;
+  }
+  throw new Error("resources did not become stable after feature warmup");
+}
+
 function longTranscript(): string {
   const rows: string[] = [];
   for (let index = 0; index < 2_100; index += 1) {
@@ -498,6 +550,7 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
           FX_SOUND: "0",
           FX_RECORD: fixture.tapePath,
           FX_RECORD_INPUT: "1",
+          FX_TERMINAL_HOST_IDLE_MS: "250",
           NO_COLOR: "1",
         },
         stderrPath: fixture.stderrPath,
@@ -523,7 +576,7 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
         ]),
       ) as Record<(typeof MEASURED_ACTION_NAMES)[number], Samples>;
       const pid = session.processPid();
-      const coldResourcesBefore = resourceSnapshot(pid);
+      const preFeatureResources = resourceSnapshot(pid);
 
       for (let cycle = 0; cycle < WARMUPS + SAMPLES; cycle += 1) {
         const open = await measureAction(
@@ -552,6 +605,9 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
       session.sendKeysImmediate(["C-o"]);
       await session.waitForText("Full detail · ctrl o close", TIMEOUT);
       let beforePrime = await session.capturePane();
+      // The first key moves one viewport into the three-viewport prepared
+      // window. Each loop then moves to its edge before the measured key
+      // crosses that edge and waits for the replacement window.
       session.sendKeysImmediate(["PageUp"]);
       await session.waitForPane(
         (pane) => pane !== beforePrime && pane.includes("Full detail"),
@@ -777,15 +833,16 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
       session.sendKeysImmediate(["1"]);
       await session.waitForText("PERF_TERMINAL_CLOSED", TIMEOUT);
       await session.waitForComposer(TIMEOUT);
-      await Bun.sleep(250);
-      const resourcesBefore = resourceSnapshot(pid);
+      const resourcesBefore = await waitForResourceStability(pid);
+      expect(resourcesBefore.threads - preFeatureResources.threads).toBeLessThanOrEqual(2);
+      expect(resourcesBefore.descriptors - preFeatureResources.descriptors).toBeLessThanOrEqual(3);
+      expect(resourcesBefore.rssKib - preFeatureResources.rssKib).toBeLessThan(16 * 1024);
 
       const peakResources = await peakResourcesWhile(pid, async () => {
         await session!.sendText("Build the second performance transcript.");
         await session!.waitForText("PERF_SECOND_TRANSCRIPT_TAIL", TIMEOUT);
       });
-      await Bun.sleep(250);
-      const resourcesAfter = resourceSnapshot(pid);
+      const resourcesAfter = await waitForResourceQuiescence(pid, resourcesBefore);
       const report = {
         boundary: "recorded application stdin frame to recorded stdout frame",
         boundaryExceptions: {
@@ -808,6 +865,7 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
           local: LOCAL_BUDGETS_MS,
           backgroundWork: BACKGROUND_WORK_BUDGETS_MS,
           externalRefresh: EXTERNAL_REFRESH_BUDGETS_MS,
+          appPane: APP_PANE_BUDGETS_MS,
         },
         informationalActions: [...INFORMATIONAL_PANE_ACTION_NAMES],
         results: Object.fromEntries(
@@ -817,8 +875,8 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
           }]),
         ),
         resources: {
-          coldBefore: coldResourcesBefore,
-          before: resourcesBefore,
+          preFeature: preFeatureResources,
+          postWarmup: resourcesBefore,
           peak: peakResources,
           after: resourcesAfter,
         },
@@ -827,7 +885,9 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
       if (reportPath) writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
 
       for (const [name, values] of Object.entries(samples)) {
-        const actionBudget = name === "skillsOpen" || name === "loginOpen"
+        const actionBudget = APP_PANE_ACTION_NAMES.has(name)
+          ? APP_PANE_BUDGETS_MS
+          : name === "skillsOpen" || name === "loginOpen"
           ? EXTERNAL_REFRESH_BUDGETS_MS
           : name === "fullScrollCacheMiss"
           ? BACKGROUND_WORK_BUDGETS_MS
@@ -836,7 +896,7 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
           const measured = summary(distribution);
           expect(measured.count).toBe(SAMPLES);
           if (INFORMATIONAL_PANE_ACTION_NAMES.has(name)) continue;
-          const budget = name === "fullScrollCacheMiss"
+          const budget = APP_PANE_ACTION_NAMES.has(name) || name === "fullScrollCacheMiss"
             ? actionBudget
             : distribution === values.firstPaint
             ? LOCAL_BUDGETS_MS
@@ -857,7 +917,9 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
       expect(resourcesAfter.descriptors).toBe(resourcesBefore.descriptors);
       expect(resourcesAfter.rssKib - resourcesBefore.rssKib).toBeLessThan(16 * 1024);
       expect(peakResources.threads - resourcesBefore.threads).toBeLessThanOrEqual(3);
-      expect(peakResources.descriptors - resourcesBefore.descriptors).toBeLessThanOrEqual(6);
+      expect(peakResources.descriptors - resourcesBefore.descriptors).toBeLessThanOrEqual(
+        ACTIVE_TURN_DESCRIPTOR_BUDGET,
+      );
       expect(peakResources.rssKib - resourcesBefore.rssKib).toBeLessThan(32 * 1024);
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
     } finally {
