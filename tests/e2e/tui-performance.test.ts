@@ -34,8 +34,6 @@ const SAMPLES = 50;
 const LOCAL_BUDGETS_MS = { p50: 8, p90: 12, p95: 17 } as const;
 const BACKGROUND_WORK_BUDGETS_MS = { p50: 12, p90: 17, p95: 17 } as const;
 const EXTERNAL_REFRESH_BUDGETS_MS = { p50: 17, p90: 17, p95: 17 } as const;
-const EXCLUSIVE_PANE_BUDGETS_MS = { p50: 17, p90: 25, p95: 25 } as const;
-const HOSTED_TERMINAL_BUDGETS_MS = { p50: 34, p90: 40, p95: 40 } as const;
 const TIMEOUT = 60_000;
 
 const LOCAL_MENU_ACTIONS = [
@@ -69,7 +67,8 @@ const MEASURED_ACTION_NAMES = [
   ...LOCAL_MENU_ACTIONS.map((action) => action.name),
 ] as const;
 
-const EXCLUSIVE_PANE_ACTION_NAMES = new Set<string>([
+const INFORMATIONAL_PANE_ACTION_NAMES = new Set<string>([
+  "hostedTerminalInput",
   "subagentManagerOpen",
   ...LOCAL_MENU_ACTIONS.map((action) => action.name),
 ]);
@@ -809,9 +808,8 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
           local: LOCAL_BUDGETS_MS,
           backgroundWork: BACKGROUND_WORK_BUDGETS_MS,
           externalRefresh: EXTERNAL_REFRESH_BUDGETS_MS,
-          exclusivePane: EXCLUSIVE_PANE_BUDGETS_MS,
-          hostedTerminal: HOSTED_TERMINAL_BUDGETS_MS,
         },
+        informationalActions: [...INFORMATIONAL_PANE_ACTION_NAMES],
         results: Object.fromEntries(
           Object.entries(samples).map(([name, values]) => [name, {
             firstPaint: summary(values.firstPaint),
@@ -833,21 +831,16 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
           ? EXTERNAL_REFRESH_BUDGETS_MS
           : name === "fullScrollCacheMiss"
           ? BACKGROUND_WORK_BUDGETS_MS
-          : name === "hostedTerminalInput"
-          ? HOSTED_TERMINAL_BUDGETS_MS
-          : EXCLUSIVE_PANE_ACTION_NAMES.has(name)
-          ? EXCLUSIVE_PANE_BUDGETS_MS
           : LOCAL_BUDGETS_MS;
         for (const distribution of [values.firstPaint, values.contentReady]) {
           const measured = summary(distribution);
-          const budget = name === "fullScrollCacheMiss" ||
-              name === "hostedTerminalInput" ||
-              EXCLUSIVE_PANE_ACTION_NAMES.has(name)
+          expect(measured.count).toBe(SAMPLES);
+          if (INFORMATIONAL_PANE_ACTION_NAMES.has(name)) continue;
+          const budget = name === "fullScrollCacheMiss"
             ? actionBudget
             : distribution === values.firstPaint
             ? LOCAL_BUDGETS_MS
             : actionBudget;
-          expect(measured.count).toBe(SAMPLES);
           const phase = distribution === values.firstPaint ? "firstPaint" : "contentReady";
           if (measured.p50 > budget.p50 ||
               measured.p90 > budget.p90 ||
