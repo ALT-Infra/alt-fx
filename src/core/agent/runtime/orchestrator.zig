@@ -1369,7 +1369,51 @@ fn providerExecutedResult(call: ToolCall) ?ToolExecutionResult {
     return .{
         .status = if (provider_status == .success) .success else .failure,
         .model_output = provider_result,
+        .inner_usage = if (runtime_tool_presentation.isProviderSearchAlias(call.name))
+            .{ .web_search_requests = 1 }
+        else
+            null,
     };
+}
+
+fn reportProviderExecutedUsage(
+    deps: *const AgentRuntimeDeps,
+    calls: []const ToolCall,
+) void {
+    for (calls) |call| {
+        const execution = providerExecutedResult(call) orelse continue;
+        runtime_parallel_execution.reportInnerToolUsage(deps, call.name, execution);
+    }
+}
+
+test "provider executed result reports one observed request only for search aliases" {
+    const aliases = [_][]const u8{
+        "exa_search",
+        "parallel_search",
+        "perplexity_search",
+    };
+    for (aliases) |name| {
+        const result = providerExecutedResult(.{
+            .id = "provider_call",
+            .name = name,
+            .arguments_json = "{}",
+            .provider_result = "{\"results\":[]}",
+            .provenance = .provider_executed,
+        }) orelse return error.TestExpectedProviderResult;
+        const usage = result.inner_usage orelse return error.TestExpectedSearchUsage;
+        try std.testing.expectEqual(@as(u32, 1), usage.web_search_requests);
+        try std.testing.expectEqual(@as(u64, 0), usage.input_tokens);
+        try std.testing.expectEqual(@as(u64, 0), usage.output_tokens);
+    }
+
+    const non_search = providerExecutedResult(.{
+        .id = "provider_call",
+        .name = "provider_tool",
+        .arguments_json = "{}",
+        .provider_result = "{}",
+        .provenance = .provider_executed,
+    }) orelse return error.TestExpectedProviderResult;
+    try std.testing.expectEqual(@as(?types.ToolUsage, null), non_search.inner_usage);
 }
 
 fn hasToolResult(messages: []const ChatMessage, call_id: []const u8) bool {
@@ -1394,15 +1438,12 @@ fn appendProviderExecutedToolResult(
     completed_tool_names: *std.ArrayList([]u8),
     batch: *runtime_tool_batch.StepBatchState,
 ) !void {
-    const provider_result = call.provider_result orelse
+    const execution = providerExecutedResult(call) orelse
         return error.MalformedProviderResultIdentity;
+    const provider_result = execution.model_output;
     const provider_status = runtime_execution_memory.classifyProviderExecutedResultStatus(
         provider_result,
     );
-    const execution: ToolExecutionResult = .{
-        .status = if (provider_status == .success) .success else .failure,
-        .model_output = provider_result,
-    };
     const prepared = try runtime_execution_memory.prepareToolModelOutput(
         arena,
         config,
@@ -1516,6 +1557,7 @@ fn materializeConfirmedProviderTools(
         completion.provider_state_json,
     );
     var batch: runtime_tool_batch.StepBatchState = .{};
+    reportProviderExecutedUsage(deps, novel_calls);
     for (novel_calls) |call| {
         try appendProviderExecutedToolResult(
             deps,
@@ -4902,7 +4944,7 @@ fn processQueuedPromptLoop(
         if (disposition == .completed and completion.tool_calls.len > 0) {
             const admission = types.authoritativeToolAdmission(completion);
             switch (admission) {
-                .admitted => {},
+                .admitted => reportProviderExecutedUsage(deps, completion.tool_calls),
                 .reject_duplicate_identity => {
                     try stream_ctx.provisional_statuses.finishRejectedCompletions(deps, arena, turn_id, completion.tool_calls, advertised_dynamic_tool_names);
                     debug_trace.eventf("agent", "authoritative_tool_admission_rejected", step_ctx, "failure=duplicate", .{});

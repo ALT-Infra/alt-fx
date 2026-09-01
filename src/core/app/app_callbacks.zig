@@ -20,6 +20,7 @@ const file_mutation = @import("../tooling/file_mutation.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
 const command_output_content = @import("../tooling/command_output_content.zig");
 const tool_admission = @import("../tooling/tool_admission.zig");
+const tool_presentation = @import("../tooling/tool_presentation.zig");
 const gateway_error_format = @import("../shared/gateway_error_format.zig");
 const io_mod = @import("../shared/io.zig");
 const session_runtime = @import("../session/session.zig");
@@ -1022,7 +1023,8 @@ pub fn Bindings(comptime App: type) type {
         }
 
         fn agentReportInnerToolUsage(ctx: *anyopaque, tool_name: []const u8, usage: types.ToolUsage) void {
-            if (!std.mem.eql(u8, tool_name, "web_search")) return;
+            if (!std.mem.eql(u8, tool_name, "web_search") and
+                !tool_presentation.isProviderSearchAlias(tool_name)) return;
             const app: *App = @ptrCast(@alignCast(ctx));
             app.total_web_search_requests +|= @as(u64, usage.web_search_requests);
         }
@@ -1915,15 +1917,25 @@ test "inner search tokens do not replace outer context counters" {
         .input_tokens = 100,
         .output_tokens = 20,
     });
-    (deps.report_inner_tool_usage orelse return error.TestExpectedEqual)(deps.ctx, "web_search", .{
-        .input_tokens = 999,
-        .output_tokens = 888,
-        .web_search_requests = 3,
-    });
+    const report = deps.report_inner_tool_usage orelse return error.TestExpectedEqual;
+    const search_names = [_][]const u8{
+        "web_search",
+        "exa_search",
+        "parallel_search",
+        "perplexity_search",
+    };
+    for (search_names) |name| {
+        report(deps.ctx, name, .{
+            .input_tokens = 999,
+            .output_tokens = 888,
+            .web_search_requests = 1,
+        });
+    }
+    report(deps.ctx, "provider_tool", .{ .web_search_requests = 7 });
 
     try std.testing.expectEqual(@as(u64, 100), app.total_input_tokens);
     try std.testing.expectEqual(@as(u64, 20), app.total_output_tokens);
-    try std.testing.expectEqual(@as(u64, 3), app.total_web_search_requests);
+    try std.testing.expectEqual(@as(u64, 4), app.total_web_search_requests);
 }
 
 test "agent diff block callback enqueues worker event without direct transcript mutation" {
