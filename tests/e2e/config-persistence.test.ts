@@ -1161,7 +1161,8 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         for (let i = 0; i < 2; i += 1) await session.sendKeys("Down");
         await session.waitForText("xhigh", TIMEOUT);
         await session.sendKeys("Enter");
-        await session.waitForText("fable-5 · xhigh", TIMEOUT);
+        const selected = await session.waitForText("fable-5 · xhigh", TIMEOUT);
+        expect(selected).not.toContain("⚡︎");
         await session.sendText("/quit");
         await session.waitForSessionEnd(TIMEOUT);
         session = null;

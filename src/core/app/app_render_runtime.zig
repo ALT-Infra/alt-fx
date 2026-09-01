@@ -610,7 +610,8 @@ pub fn Runtime(comptime App: type) type {
                 visible_capabilities.intrinsic_fast or
                     (model_supports_fast and pendingPickerFastMode(model_query, app.input_runtime.picker.model_picker_fast_index))
             else
-                visible_capabilities.intrinsic_fast or app.fast_mode;
+                visible_capabilities.intrinsic_fast or
+                    ((model_supports_fast or active_capabilities_pending) and app.fast_mode);
 
             const upgrade_label = app.upgrader.statusLabel(upgrade_status_buf);
             const yolo_warning_active =
@@ -4851,6 +4852,28 @@ test "core.app_render_runtime keeps Kimi fast indicator stable across catalog hy
             try std.testing.expectEqual(case.expected_indicator, ctx.fast_indicator_active);
         }
     }
+}
+
+test "core.app_render_runtime hides stale fast preference for unsupported model" {
+    var app = CoordinatorTestApp{
+        .alloc = std.testing.allocator,
+        .shell = .{},
+        .fast_mode = true,
+        .gateway_metadata_model = "anthropic/claude-fable-5",
+    };
+    defer app.deinit();
+    try app.selected_model.appendSlice(std.testing.allocator, "anthropic/claude-fable-5");
+
+    var upgrade_status_buf: [64]u8 = undefined;
+    const queued_cards: QueuedCardProjection = .{};
+    const ctx = Runtime(CoordinatorTestApp).footerContext(
+        &app,
+        &upgrade_status_buf,
+        0,
+        &queued_cards,
+    );
+
+    try std.testing.expect(!ctx.fast_indicator_active);
 }
 
 test "core.app_render_runtime projects only the visible inline completion suffix" {
