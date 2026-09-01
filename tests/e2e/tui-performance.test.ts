@@ -376,6 +376,59 @@ function writeGenerationSkill(path: string, generation: number): string {
   return name;
 }
 
+function sendOverlappingSkillCommands(
+  session: TmuxSession,
+  newestSkill: string,
+): void {
+  execFileSync("tmux", [
+    "send-keys", "-t", session.name, "-l", "--", "/skills",
+    ";", "send-keys", "-t", session.name, "Enter",
+    ";", "send-keys", "-t", session.name, "-l", "--",
+    `/skills show ${newestSkill}`,
+    ";", "send-keys", "-t", session.name, "Enter",
+  ]);
+}
+
+test.skipIf(!tmuxAvailable())(
+  "overlapping skill commands keep the latest action and the shell alive",
+  async () => {
+    const fixture = createFixture();
+    let session: TmuxSession | null = null;
+    try {
+      session = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: fixture.workspace,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_SOUND: "0",
+          NO_COLOR: "1",
+        },
+        stderrPath: fixture.stderrPath,
+        width: 104,
+        height: 30,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("/skills");
+      await session.waitForText("Skills 289", TIMEOUT);
+      await closeSurface(session, "Skills ");
+
+      const newest = writeGenerationSkill(fixture.generationSkillPath, 999);
+      sendOverlappingSkillCommands(session, newest);
+      await session.waitForText(newest, TIMEOUT);
+      await session.waitForText("Skills 289", TIMEOUT);
+      expect(session.isAlive()).toBe(true);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+    } finally {
+      await session?.kill();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  120_000,
+);
+
 test.skipIf(!ENABLED || !tmuxAvailable())(
   "interactive terminal surfaces stay within one frame at p95",
   async () => {
@@ -461,19 +514,6 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
       session.sendKeysImmediate(["C-o"]);
       await session.waitForText("Full detail · ctrl o close", TIMEOUT);
       expect(await session.captureFullScrollback()).toContain("PERF_TRANSCRIPT_HEAD");
-      session.sendKeysImmediate(["Escape"]);
-      await session.waitForComposer(TIMEOUT);
-
-      const overlapGeneration = writeGenerationSkill(
-        fixture.generationSkillPath,
-        999,
-      );
-      session.sendLiteralImmediate("/skills");
-      session.sendKeysImmediate(["Enter"]);
-      session.sendLiteralImmediate(`/skills show ${overlapGeneration}`);
-      session.sendKeysImmediate(["Enter"]);
-      await session.waitForText(overlapGeneration, TIMEOUT);
-      await session.waitForText("Skills 289", TIMEOUT);
       session.sendKeysImmediate(["Escape"]);
       await session.waitForComposer(TIMEOUT);
 
