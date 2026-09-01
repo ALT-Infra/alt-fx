@@ -849,10 +849,7 @@ test "destructive review context catches expanded and wrapped removal" {
         "cat <(rm -rf generated)",
         "echo `echo \\`rm -rf generated\\``",
     }) |command| {
-        if (!destructive_review_context_required(command)) {
-            std.debug.print("expected contextual review: {s}\n", .{command});
-            return error.TestUnexpectedResult;
-        }
+        try std.testing.expect(destructive_review_context_required(command));
     }
 
     for ([_][]const u8{
@@ -864,10 +861,7 @@ test "destructive review context catches expanded and wrapped removal" {
         "echo $(echo $(echo ok))",
         "echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo ok)))))))))",
     }) |command| {
-        if (destructive_review_context_required(command)) {
-            std.debug.print("expected normal review: {s}\n", .{command});
-            return error.TestUnexpectedResult;
-        }
+        try std.testing.expect(!destructive_review_context_required(command));
     }
 }
 
