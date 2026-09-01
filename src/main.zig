@@ -1912,10 +1912,12 @@ const App = struct {
     }
 
     pub fn requestSkillsRefresh(self: *App) !u64 {
+        const home = try app_runtime_setup.resolveSkillsHome(std.heap.c_allocator);
+        defer if (home) |value| std.heap.c_allocator.free(value);
         return self.skills.requestRefresh(
             std.heap.c_allocator,
             self.workspace_root,
-            io_mod.getenv("HOME"),
+            home,
             builtin_skills.root_policy,
         );
     }

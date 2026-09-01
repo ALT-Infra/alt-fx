@@ -8,6 +8,7 @@ import {
   readdirSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -571,6 +572,72 @@ test.skipIf(!tmuxAvailable())(
     }
   },
   30_000,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "skills refresh preserves the canonical catalog for a symlinked HOME",
+  async () => {
+    const fixture = createFixture();
+    const linkedHome = join(fixture.root, "linked-home");
+    const globalSkill = join(
+      fixture.home,
+      ".agents",
+      "skills",
+      "global-skill",
+    );
+    mkdirSync(globalSkill, { recursive: true });
+    writeFileSync(
+      join(globalSkill, "SKILL.md"),
+      "---\nname: global-skill\ndescription: survives canonical home refresh\n---\nbody\n",
+    );
+    symlinkSync(fixture.home, linkedHome, "dir");
+    const linkedHomeGateway = startFakeGateway([
+      fakeGatewayFinalText("SYMLINKED_HOME_PROMPT_OK"),
+    ]);
+    let active: TmuxSession | null = null;
+    try {
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: fixture.workspace,
+        env: {
+          HOME: linkedHome,
+          AI_GATEWAY_API_KEY: "symlinked-home-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: linkedHomeGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: linkedHomeGateway.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_AUTO_UPGRADE: "0",
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_SKIP_ONBOARDING: "1",
+          FX_SOUND: "0",
+          NO_COLOR: "1",
+        },
+        stderrPath: fixture.stderrPath,
+        width: 104,
+        height: 30,
+      });
+      await active.waitForComposer(TIMEOUT);
+      active.sendLiteralImmediate("$global");
+      await active.waitForText("global-skill", TIMEOUT);
+      await closeSurface(active, "Skills ");
+
+      await active.sendText("/skills");
+      await active.waitForText("Skills 290", 5_000);
+      active.sendLiteralImmediate("global");
+      await active.waitForText("global-skill", 5_000);
+      await closeSurface(active, "Skills ");
+
+      await active.sendText("Submit after canonical home refresh.");
+      await active.waitForText("SYMLINKED_HOME_PROMPT_OK", TIMEOUT);
+      expect(linkedHomeGateway.requestCount()).toBe(1);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+    } finally {
+      await active?.kill();
+      linkedHomeGateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  60_000,
 );
 
 test.skipIf(!ENABLED || !tmuxAvailable())(

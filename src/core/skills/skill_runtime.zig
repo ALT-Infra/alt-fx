@@ -297,6 +297,36 @@ const SkillEntry = struct {
     linked: bool,
 };
 
+fn freeSkillEntries(alloc: Allocator, entries: *std.ArrayList(SkillEntry)) void {
+    for (entries.items) |entry| alloc.free(entry.name);
+    entries.deinit(alloc);
+}
+
+fn collectSkillEntries(
+    alloc: Allocator,
+    dir: *std.Io.Dir,
+    allow_linked: bool,
+) !std.ArrayList(SkillEntry) {
+    var entries: std.ArrayList(SkillEntry) = .empty;
+    errdefer freeSkillEntries(alloc, &entries);
+    var it = dir.iterate();
+    while (try it.next(io_mod.getIo())) |entry| {
+        const linked = entry.kind == .sym_link;
+        if (entry.kind != .directory and !(linked and allow_linked)) continue;
+        const name = try alloc.dupe(u8, entry.name);
+        entries.append(alloc, .{ .name = name, .linked = linked }) catch |err| {
+            alloc.free(name);
+            return err;
+        };
+    }
+    sort_utils.sort(SkillEntry, entries.items, {}, struct {
+        fn lessThan(_: void, left: SkillEntry, right: SkillEntry) bool {
+            return std.mem.order(u8, left.name, right.name) == .lt;
+        }
+    }.lessThan);
+    return entries;
+}
+
 /// Deduplicates filesystem aliases without collapsing distinct skills that
 /// share metadata names. Ordered discovery makes the first logical root the
 /// stable source and display path for each canonical candidate directory.
@@ -460,32 +490,10 @@ fn candidateDirectoryDigest(
     alloc: Allocator,
     root: SkillRoot,
 ) ![std.crypto.hash.sha2.Sha256.digest_length]u8 {
-    var dir = if (root.read_authority) |authority|
-        try openContainedDir(alloc, root.path, authority, .{ .iterate = true })
-    else
-        try io_mod.openDirAbsoluteNoFollow(root.path, .{ .iterate = true });
+    var dir = try openSkillRoot(alloc, root, .{ .iterate = true });
     defer dir.close(io_mod.getIo());
-
-    var entries: std.ArrayList(SkillEntry) = .empty;
-    defer {
-        for (entries.items) |entry| alloc.free(entry.name);
-        entries.deinit(alloc);
-    }
-    var it = dir.iterate();
-    while (try it.next(io_mod.getIo())) |entry| {
-        const linked = entry.kind == .sym_link;
-        if (entry.kind != .directory and !(linked and root.read_authority != null)) continue;
-        const name = try alloc.dupe(u8, entry.name);
-        entries.append(alloc, .{ .name = name, .linked = linked }) catch |err| {
-            alloc.free(name);
-            return err;
-        };
-    }
-    sort_utils.sort(SkillEntry, entries.items, {}, struct {
-        fn lessThan(_: void, left: SkillEntry, right: SkillEntry) bool {
-            return std.mem.order(u8, left.name, right.name) == .lt;
-        }
-    }.lessThan);
+    var entries = try collectSkillEntries(alloc, &dir, root.read_authority != null);
+    defer freeSkillEntries(alloc, &entries);
 
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     for (entries.items) |entry| {
@@ -666,10 +674,7 @@ fn appendSkillsFromDir(
     canonical_skill_paths: *CanonicalSkillPaths,
     root: SkillRoot,
 ) !void {
-    var dir = (if (root.read_authority) |read_authority|
-        openContainedDir(alloc, root.path, read_authority, .{ .iterate = true })
-    else
-        io_mod.openDirAbsoluteNoFollow(root.path, .{ .iterate = true })) catch |err| {
+    var dir = openSkillRoot(alloc, root, .{ .iterate = true }) catch |err| {
         if ((err == error.FileNotFound or err == error.NotDir) and rootPathIsMissing(root.path)) return;
         if (err == error.OutOfMemory) return error.OutOfMemory;
         if (diagnostics) |items| try appendSkillDiagnostic(alloc, items, root.path, root.source, .root, .unreadable);
@@ -677,38 +682,27 @@ fn appendSkillsFromDir(
     };
     defer dir.close(io_mod.getIo());
 
-    var entries: std.ArrayList(SkillEntry) = .empty;
-    defer {
-        for (entries.items) |entry| alloc.free(entry.name);
-        entries.deinit(alloc);
-    }
-
-    var it = dir.iterate();
-    while (true) {
-        const entry = it.next(io_mod.getIo()) catch |err| {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            if (diagnostics) |items| try appendSkillDiagnostic(alloc, items, root.path, root.source, .root, .unreadable);
-            return;
-        } orelse break;
-        const linked = entry.kind == .sym_link;
-        if (entry.kind != .directory and !(linked and root.read_authority != null)) continue;
-
-        const owned_name = try alloc.dupe(u8, entry.name);
-        entries.append(alloc, .{ .name = owned_name, .linked = linked }) catch |err| {
-            alloc.free(owned_name);
-            return err;
-        };
-    }
-
-    sort_utils.sort(SkillEntry, entries.items, {}, struct {
-        fn lessThan(_: void, left: SkillEntry, right: SkillEntry) bool {
-            return std.mem.order(u8, left.name, right.name) == .lt;
-        }
-    }.lessThan);
+    var entries = collectSkillEntries(alloc, &dir, root.read_authority != null) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        if (diagnostics) |items| try appendSkillDiagnostic(alloc, items, root.path, root.source, .root, .unreadable);
+        return;
+    };
+    defer freeSkillEntries(alloc, &entries);
 
     for (entries.items) |entry| {
         try appendSkillCandidate(alloc, skills, diagnostics, canonical_skill_paths, root, &dir, entry.name, entry.linked);
     }
+}
+
+fn openSkillRoot(
+    alloc: Allocator,
+    root: SkillRoot,
+    options: std.Io.Dir.OpenOptions,
+) !std.Io.Dir {
+    return if (root.read_authority) |authority|
+        openContainedDir(alloc, root.path, authority, options)
+    else
+        io_mod.openDirAbsoluteNoFollow(root.path, options);
 }
 
 fn rootPathIsMissing(path: []const u8) bool {
