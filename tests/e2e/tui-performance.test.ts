@@ -621,10 +621,9 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText("global-skill", TIMEOUT);
       await closeSurface(active, "Skills ");
 
-      await active.sendText("/skills");
-      await active.waitForText("Skills 290", 5_000);
-      active.sendLiteralImmediate("global");
+      sendOverlappingSkillCommands(active, "global-skill");
       await active.waitForText("global-skill", 5_000);
+      await active.waitForText("Skills 290", 5_000);
       await closeSurface(active, "Skills ");
 
       await active.sendText("Submit after canonical home refresh.");

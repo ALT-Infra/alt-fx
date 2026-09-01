@@ -1940,11 +1940,9 @@ const App = struct {
     }
 
     fn pollSkillsRefresh(self: *App) !skill_runtime.RefreshCompletion {
-        const home = io_mod.getenv("HOME") orelse return .none;
         const completion = try self.skills.pollRefresh(
             std.heap.c_allocator,
             self.workspace_root,
-            home,
             builtin_skills.root_policy,
         );
         if (completion == .adopted) {

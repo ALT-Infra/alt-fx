@@ -1638,6 +1638,17 @@ const PendingCatalog = struct {
     }
 };
 
+const PendingRefresh = struct {
+    alloc: Allocator,
+    generation: u64,
+    home: []u8,
+
+    fn deinit(self: *PendingRefresh) void {
+        self.alloc.free(self.home);
+        self.* = undefined;
+    }
+};
+
 const KnownCatalogRefresh = union(enum) {
     full_discovery,
     unchanged,
@@ -2141,7 +2152,7 @@ pub const Runtime = struct {
     failed_refresh_generation: ?u64 = null,
     pending_refresh_action: ?PendingRefreshAction = null,
     refresh_task: ?*CatalogRefreshTask = null,
-    refresh_pending_generation: ?u64 = null,
+    refresh_pending: ?PendingRefresh = null,
 
     pub fn deinit(self: *Runtime, alloc: Allocator) void {
         if (self.refresh_task) |task| task.deinit();
@@ -2150,6 +2161,8 @@ pub const Runtime = struct {
         self.pending_catalog = null;
         if (self.pending_refresh_action) |*action| action.deinit(alloc);
         self.pending_refresh_action = null;
+        if (self.refresh_pending) |*pending| pending.deinit();
+        self.refresh_pending = null;
         self.freeLoaded(alloc);
         if (self.retired_catalog) |catalog| catalog.release();
         self.retired_catalog = null;
@@ -2172,16 +2185,15 @@ pub const Runtime = struct {
             );
             return generation;
         };
-        if (self.refresh_task != null) {
-            if (self.refresh_pending_generation) |generation| return generation;
+        if (self.refresh_task != null or self.pending_catalog != null) {
+            if (self.refresh_pending) |pending| return pending.generation;
+            const owned_home = try alloc.dupe(u8, configured_home);
             const generation = self.nextGeneration();
-            self.refresh_pending_generation = generation;
-            return generation;
-        }
-        if (self.pending_catalog != null) {
-            if (self.refresh_pending_generation) |generation| return generation;
-            const generation = self.nextGeneration();
-            self.refresh_pending_generation = generation;
+            self.refresh_pending = .{
+                .alloc = alloc,
+                .generation = generation,
+                .home = owned_home,
+            };
             return generation;
         }
         const generation = self.nextGeneration();
@@ -2230,7 +2242,6 @@ pub const Runtime = struct {
         self: *Runtime,
         alloc: Allocator,
         workspace_root: []const u8,
-        home: []const u8,
         root_policy: skill_contract.RootPolicy,
     ) !RefreshCompletion {
         self.reapRetiredCatalog();
@@ -2246,7 +2257,6 @@ pub const Runtime = struct {
             try self.startPendingRefresh(
                 alloc,
                 workspace_root,
-                home,
                 root_policy,
             );
             return completion;
@@ -2291,7 +2301,7 @@ pub const Runtime = struct {
         } else {
             self.failed_refresh_generation = task.generation;
         }
-        try self.startPendingRefresh(alloc, workspace_root, home, root_policy);
+        try self.startPendingRefresh(alloc, workspace_root, root_policy);
         return completion;
     }
 
@@ -2299,18 +2309,18 @@ pub const Runtime = struct {
         self: *Runtime,
         alloc: Allocator,
         workspace_root: []const u8,
-        home: []const u8,
         root_policy: skill_contract.RootPolicy,
     ) !void {
         if (self.refresh_task != null or self.pending_catalog != null) return;
-        const generation = self.refresh_pending_generation orelse return;
-        self.refresh_pending_generation = null;
+        var pending = self.refresh_pending orelse return;
+        self.refresh_pending = null;
+        defer pending.deinit();
         try self.startRefresh(
             alloc,
             workspace_root,
-            home,
+            pending.home,
             root_policy,
-            generation,
+            pending.generation,
         );
     }
 
@@ -3478,12 +3488,12 @@ test "skill refresh publishes one generation and coalesces one latest request" {
     try std.testing.expect(pending_generation > first_generation);
     try std.testing.expectEqual(
         pending_generation,
-        runtime.refresh_pending_generation.?,
+        runtime.refresh_pending.?.generation,
     );
 
     var adopted = false;
     for (0..100_000) |_| {
-        switch (try runtime.pollRefresh(alloc, home, home, policy)) {
+        switch (try runtime.pollRefresh(alloc, home, policy)) {
             .adopted => adopted = true,
             .none, .unchanged, .failed => {},
         }
@@ -3497,7 +3507,7 @@ test "skill refresh publishes one generation and coalesces one latest request" {
     var terminal: RefreshCompletion = .none;
     _ = try runtime.requestRefresh(alloc, home, home, policy);
     for (0..100_000) |_| {
-        terminal = try runtime.pollRefresh(alloc, home, home, policy);
+        terminal = try runtime.pollRefresh(alloc, home, policy);
         if (terminal != .none) break;
         std.Thread.yield() catch std.atomic.spinLoopHint();
     }
@@ -3510,7 +3520,7 @@ test "skill refresh publishes one generation and coalesces one latest request" {
     );
     _ = try runtime.requestRefresh(alloc, home, home, policy);
     for (0..100_000) |_| {
-        terminal = try runtime.pollRefresh(alloc, home, home, policy);
+        terminal = try runtime.pollRefresh(alloc, home, policy);
         if (terminal != .none) break;
         std.Thread.yield() catch std.atomic.spinLoopHint();
     }
@@ -3524,7 +3534,7 @@ test "skill refresh publishes one generation and coalesces one latest request" {
     );
     _ = try runtime.requestRefresh(alloc, home, home, policy);
     for (0..100_000) |_| {
-        terminal = try runtime.pollRefresh(alloc, home, home, policy);
+        terminal = try runtime.pollRefresh(alloc, home, policy);
         if (terminal != .none) break;
         std.Thread.yield() catch std.atomic.spinLoopHint();
     }
