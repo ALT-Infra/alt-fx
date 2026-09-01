@@ -83,24 +83,33 @@ function gatewayEnv(
 }
 
 function commandCall(command: string, id: string) {
-  return fakeGatewayToolCall(id, "terminal", { action: "exec", timeout_ms: 600_000, command });
+  return fakeGatewayToolCall(id, "shell", {
+    request: { action: "run", command, yield_time_ms: 30_000 },
+  });
 }
 
 function userCommandCall(command: string, id: string) {
-  return fakeGatewayToolCall(id, "terminal", {
-    action: "exec",
-    timeout_ms: 600_000,
-    command,
-    profile: "user",
+  return fakeGatewayToolCall(id, "shell", {
+    request: { action: "run", command, profile: "user", yield_time_ms: 30_000 },
   });
 }
 
 function cleanCommandCall(command: string, id: string) {
-  return fakeGatewayToolCall(id, "terminal", {
-    action: "exec",
-    timeout_ms: 600_000,
-    command,
-    profile: "clean",
+  return fakeGatewayToolCall(id, "shell", {
+    request: { action: "run", command, profile: "clean", yield_time_ms: 30_000 },
+  });
+}
+
+function cleanTtyCommandCall(command: string, id: string) {
+  return fakeGatewayToolCall(id, "shell", {
+    request: {
+      action: "run",
+      command,
+      profile: "clean",
+      tty: true,
+      yield_time_ms: 0,
+      timeout_ms: 5_000,
+    },
   });
 }
 
@@ -219,7 +228,7 @@ describe("lean auto mode reliability", () => {
         tool_calls: Array<{ name: string; status: string }>;
       };
       expect(json.tool_calls).toContainEqual(
-        expect.objectContaining({ name: "terminal", status: "success" }),
+        expect.objectContaining({ name: "shell", status: "success" }),
       );
     },
     TIMEOUT,
@@ -317,7 +326,7 @@ describe("lean auto mode reliability", () => {
         tool_calls: Array<{ name: string; status: string }>;
       };
       expect(json.tool_calls).toContainEqual(
-        expect.objectContaining({ name: "terminal", status: "success" }),
+        expect.objectContaining({ name: "shell", status: "success" }),
       );
     },
     TIMEOUT,
@@ -336,29 +345,33 @@ describe("lean auto mode reliability", () => {
             {
               type: "tool-call",
               toolCallId: "clean_direct_pwd",
-              toolName: "terminal",
-              input: { action: "exec", timeout_ms: 600_000, command: "pwd", profile: "clean" },
+              toolName: "shell",
+              input: { request: { action: "run", command: "pwd", profile: "clean", yield_time_ms: 30_000 } },
             },
             {
               type: "tool-call",
               toolCallId: "clean_direct_git_status",
-              toolName: "terminal",
+              toolName: "shell",
               input: {
-                action: "exec",
-                timeout_ms: 600_000,
-                command: "git status --short",
-                profile: "clean",
+                request: {
+                  action: "run",
+                  command: "git status --short",
+                  profile: "clean",
+                  yield_time_ms: 30_000,
+                },
               },
             },
             {
               type: "tool-call",
               toolCallId: "clean_blocked_reset",
-              toolName: "terminal",
+              toolName: "shell",
               input: {
-                action: "exec",
-                timeout_ms: 600_000,
-                command: "git reset --hard",
-                profile: "clean",
+                request: {
+                  action: "run",
+                  command: "git reset --hard",
+                  profile: "clean",
+                  yield_time_ms: 30_000,
+                },
               },
             },
             {
@@ -367,8 +380,8 @@ describe("lean auto mode reliability", () => {
             },
           ]),
           (body) => {
-            expect(toolResultText(body, "clean_direct_pwd")).toContain("exit_code=0");
-            expect(toolResultText(body, "clean_direct_git_status")).toContain("exit_code=0");
+            expect(toolResultText(body, "clean_direct_pwd")).toContain("\"exit_code\":0");
+            expect(toolResultText(body, "clean_direct_git_status")).toContain("\"exit_code\":0");
             expect(toolResultText(body, "clean_blocked_reset", "execution-denied")).toContain("review_caution");
             return fakeGatewayFinalText("Clean command group complete.");
           },
@@ -401,7 +414,7 @@ describe("lean auto mode reliability", () => {
         tool_calls: Array<{ name: string; status: string }>;
       };
       const terminalStatuses = json.tool_calls
-        .filter(({ name }) => name === "terminal")
+        .filter(({ name }) => name === "shell")
         .map(({ status }) => status);
       expect(terminalStatuses.filter((status) => status === "success")).toHaveLength(2);
       expect(terminalStatuses.filter((status) => status === "error")).toHaveLength(1);
@@ -455,6 +468,119 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
+    "clean TTY reads require shell review before execution",
+    async () => {
+      const root = createIsolatedRoot();
+      const tracePath = join(root.root, "trace.log");
+      const gateway = startGateway(
+        [
+          cleanTtyCommandCall("git status --short --branch", "clean_tty_status"),
+          (body) => {
+            expect(
+              toolResultText(body, "clean_tty_status", "execution-denied"),
+            ).toContain("review_caution");
+            return fakeGatewayFinalText("clean TTY review blocked execution");
+          },
+        ],
+        [fakeGatewayPermissionDecision("caution", "tty_requires_shell_review")],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "Inspect the working directory in a TTY."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...gatewayEnv(root, gateway),
+            FX_TRACE_LOG: tracePath,
+            FX_TRACE_SCOPES: "permission,tool,terminal",
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(1);
+      expect(gateway.requests).toHaveLength(2);
+      const json = JSON.parse(result.stdout.trim()) as {
+        tool_calls: Array<{ name: string; status: string }>;
+      };
+      expect(json.tool_calls).toContainEqual(
+        expect.objectContaining({ name: "shell", status: "error" }),
+      );
+      const trace = readFileSync(tracePath, "utf8");
+      expect(trace).toContain(
+        "event=auto_review_start tool_name=shell action_kind=command " +
+          "call_id=clean_tty_status",
+      );
+      expect(trace).not.toContain(
+        "event=execution_start turn_id=1 step_id=1 " +
+          "call_id=clean_tty_status name=shell",
+      );
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "reviewed clean TTY reads execute with shell authority",
+    async () => {
+      const root = createIsolatedRoot();
+      const tracePath = join(root.root, "trace.log");
+      const gateway = startGateway(
+        [
+          cleanTtyCommandCall("printf 'TTY_REVIEWED_OK\\n'", "reviewed_clean_tty"),
+          (body) => {
+            const started = JSON.parse(
+              toolResultText(body, "reviewed_clean_tty"),
+            ) as { session_id: string; state: string };
+            expect(started.state).toBe("running");
+            return fakeGatewayToolCall("wait_reviewed_clean_tty", "shell", {
+              request: {
+                action: "interact",
+                session_id: started.session_id,
+                yield_time_ms: 5_000,
+              },
+            });
+          },
+          (body) => {
+            expect(toolResultText(body, "wait_reviewed_clean_tty")).toContain(
+              "TTY_REVIEWED_OK",
+            );
+            return fakeGatewayFinalText("reviewed clean TTY complete");
+          },
+        ],
+        [fakeGatewayPermissionDecision("clear", "tty_shell_review_clear")],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "Inspect through the reviewed clean TTY."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...gatewayEnv(root, gateway),
+            FX_TRACE_LOG: tracePath,
+            FX_TRACE_SCOPES: "core,permission,tool,terminal",
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(1);
+      expect(gateway.requests).toHaveLength(3);
+      const json = JSON.parse(result.stdout.trim()) as {
+        tool_calls: Array<{ name: string; status: string }>;
+      };
+      expect(json.tool_calls).toContainEqual(
+        expect.objectContaining({ name: "shell", status: "success" }),
+      );
+      expect(readFileSync(tracePath, "utf8")).toContain(
+        "approval_source=auto_classifier",
+      );
+    },
+    TIMEOUT,
+  );
+
+  test(
     "explicit destructive commands reach the reviewer and clear exact actions",
     async () => {
       for (const [name, commandForBin] of [
@@ -485,7 +611,7 @@ describe("lean auto mode reliability", () => {
           [
             userCommandCall(reviewedCommand, `reviewed_${name}`),
             (body) => {
-              expect(toolResultText(body, `reviewed_${name}`)).toContain("exit_code=0");
+              expect(toolResultText(body, `reviewed_${name}`)).toContain("\"exit_code\":0");
               return fakeGatewayFinalText(`${name} reviewed and ran`);
             },
           ],
@@ -993,19 +1119,19 @@ describe("lean auto mode reliability", () => {
         [
           userCommandCall(probeCommand, "media_probe"),
           (body) => {
-            expect(toolResultText(body, "media_probe")).toContain("exit_code=0");
+            expect(toolResultText(body, "media_probe")).toContain("\"exit_code\":0");
             return userCommandCall(rebuildCommand, "media_rebuild");
           },
           (body) => {
-            expect(toolResultText(body, "media_rebuild")).toContain("exit_code=0");
+            expect(toolResultText(body, "media_rebuild")).toContain("\"exit_code\":0");
             return userCommandCall(renderCommand, "media_render");
           },
           (body) => {
-            expect(toolResultText(body, "media_render")).toContain("exit_code=0");
+            expect(toolResultText(body, "media_render")).toContain("\"exit_code\":0");
             return userCommandCall(pythonCommand, "media_python");
           },
           (body) => {
-            expect(toolResultText(body, "media_python")).toContain("exit_code=0");
+            expect(toolResultText(body, "media_python")).toContain("\"exit_code\":0");
             return fakeGatewayToolCall("media_html", "write_file", {
               path: htmlPath,
               content: uiContent,
@@ -1084,7 +1210,7 @@ describe("lean auto mode reliability", () => {
             return commandCall("pwd", "safe_after_injection");
           },
           (body) => {
-            expect(toolResultText(body, "safe_after_injection")).toContain("exit_code=0");
+            expect(toolResultText(body, "safe_after_injection")).toContain("\"exit_code\":0");
             return fakeGatewayFinalText("Injected instruction ignored safely.");
           },
         ],
@@ -1285,14 +1411,14 @@ describe("lean auto mode reliability", () => {
             {
               type: "tool-call",
               toolCallId: "mixed_block_3",
-              toolName: "terminal",
-              input: { action: "exec", timeout_ms: 600_000, command: `touch ${JSON.stringify(markers[2]!)}` },
+              toolName: "shell",
+              input: { request: { action: "run", yield_time_ms: 30_000, command: `touch ${JSON.stringify(markers[2]!)}` } },
             },
             {
               type: "tool-call",
               toolCallId: "mixed_safe_pwd",
-              toolName: "terminal",
-              input: { action: "exec", timeout_ms: 600_000, command: "pwd" },
+              toolName: "shell",
+              input: { request: { action: "run", yield_time_ms: 30_000, command: "pwd" } },
             },
             {
               type: "finish",
@@ -1419,7 +1545,7 @@ describe("lean auto mode reliability", () => {
       await activeSession.sendText("Initialize the saved allow session.");
       await activeSession.waitForText("allow session initialized", TIMEOUT);
       await activeSession.sendText(
-        `/permissions remember allow terminal ${JSON.stringify({ action: "exec", timeout_ms: 600_000, command: allowedCommand })}`,
+        `/permissions remember allow shell ${JSON.stringify({ action: "run", timeout_ms: 600_000, command: allowedCommand })}`,
       );
       await activeSession.waitForText("Remember allow for this saved session", TIMEOUT);
       await activeSession.sendKeys("1");
@@ -1541,7 +1667,7 @@ describe("lean auto mode reliability", () => {
       await activeSession.sendText("Initialize this saved session.");
       await activeSession.waitForText("session initialized", TIMEOUT);
       await activeSession.sendText(
-        `/permissions remember deny terminal ${JSON.stringify({ action: "exec", timeout_ms: 600_000, command: blockedCommand })}`,
+        `/permissions remember deny shell ${JSON.stringify({ action: "run", timeout_ms: 600_000, command: blockedCommand })}`,
       );
       await activeSession.waitForText("Remember deny for this saved session", TIMEOUT);
       await activeSession.sendKeys("1");

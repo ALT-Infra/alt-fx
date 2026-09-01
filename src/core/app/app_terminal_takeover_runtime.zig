@@ -34,6 +34,11 @@ const ReturnReason = enum {
     failure,
 };
 
+pub const OpenAdmission = enum {
+    accepted,
+    occupied,
+};
+
 const SurfaceReturnAction = enum {
     handoff_to_manager,
     enter_manager,
@@ -164,6 +169,18 @@ pub const Controller = struct {
         self.* = .{};
     }
 
+    pub fn requestOpen(
+        self: *Controller,
+        comptime App: type,
+        app: *App,
+        session_id: []const u8,
+    ) !OpenAdmission {
+        if (self.phase != .inactive) return .occupied;
+        const owned = try app.alloc.dupe(u8, session_id);
+        try self.beginOpen(App, app, owned);
+        return .accepted;
+    }
+
     pub fn shutdown(self: *Controller, comptime App: type, app: *App) void {
         if (self.phase == .inactive) return;
         if (self.input.items.len != 0) {
@@ -288,13 +305,6 @@ pub const Controller = struct {
     }
 
     pub fn collect(self: *Controller, comptime App: type, app: *App) !void {
-        if (self.phase == .inactive) {
-            const session_id = app.terminal_direct.takeOpenIntent() orelse return;
-            self.beginOpen(App, app, session_id) catch |err| {
-                self.containFailure(App, app, "acquire_admission", err);
-            };
-        }
-
         self.collectAcquire(App, app) catch |err| {
             self.containFailure(App, app, "acquire", err);
         };
@@ -357,6 +367,7 @@ pub const Controller = struct {
             return error.TerminalTakeoverInputFull;
         }
         try self.input.appendSlice(alloc, bytes);
+        self.next_screen_ms = 0;
     }
 
     fn containFailure(
@@ -554,6 +565,7 @@ pub const Controller = struct {
             return self.beginReturn(App, app, completionReason(completion), true);
         };
         self.inflight_write_bytes = 0;
+        self.next_screen_ms = 0;
         if (terminalEnded(result.write.session.lifecycle)) {
             try self.beginReturn(App, app, lifecycleReason(result.write.session.lifecycle), true);
         }
@@ -658,7 +670,9 @@ pub const Controller = struct {
     }
 
     fn scheduleScreen(self: *Controller, app: anytype) !void {
-        if (self.screen_correlation != null) return;
+        if (self.screen_correlation != null or
+            self.write_correlation != null or
+            self.input.items.len != 0) return;
         const now_ms = io_mod.milliTimestamp();
         if (now_ms < self.next_screen_ms) return;
         if (takeoverFailureRequested("screen")) {
@@ -838,6 +852,15 @@ pub const Controller = struct {
         std.debug.assert(self.release_correlation == null);
         std.debug.assert(!self.blocksFxSurface(&app.terminal));
         const reason = self.return_reason;
+
+        if (comptime @hasField(App, "managed_executions")) {
+            if ((reason == .lost or reason == .failure) and
+                self.session_id != null)
+            {
+                const session_id = self.session_id.?;
+                app.managed_executions.observeTtyState(session_id, .lost);
+            }
+        }
 
         self.reset(app.alloc);
         if (reason != .detach) {
@@ -1059,12 +1082,16 @@ test "takeover prefix is raw data inside fragmented bracketed paste" {
     try std.testing.expect(!parser.in_paste);
 }
 
-test "takeover retains bounded input while lease acquisition is pending" {
-    var controller = Controller{ .phase = .acquiring };
+test "takeover retains bounded input and requests an immediate screen refresh" {
+    var controller = Controller{
+        .phase = .acquiring,
+        .next_screen_ms = 100,
+    };
     defer controller.deinit(std.testing.allocator);
 
     try controller.retainInput(std.testing.allocator, "before-acquire");
     try std.testing.expectEqualStrings("before-acquire", controller.input.items);
+    try std.testing.expectEqual(@as(i64, 0), controller.next_screen_ms);
 
     try controller.input.ensureTotalCapacity(
         std.testing.allocator,

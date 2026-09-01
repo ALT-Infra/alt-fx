@@ -313,7 +313,6 @@ pub fn retainExternalRootUserTurn(
     const durable_store = store orelse return error.SessionStoreUnavailable;
     const prompt = switch (turn) {
         .assistant => |entry| entry.user.text,
-        .background_command => |entry| entry.user.text,
         .interrupted => |entry| entry.user.text,
         .compacted_summary => return,
     };

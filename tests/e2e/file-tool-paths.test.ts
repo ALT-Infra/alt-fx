@@ -461,8 +461,8 @@ describe("filesystem path handling", () => {
           },
           {
             id: "added_cwd_1",
-            name: "terminal",
-            input: { action: "exec", timeout_ms: 600_000, command: "pwd", cwd: root.external },
+            name: "shell",
+            input: { request: { action: "run", yield_time_ms: 30_000, command: "pwd", cwd: root.external } },
             expected: root.external,
           },
         ];
@@ -643,12 +643,13 @@ describe("filesystem path handling", () => {
       const root = createIsolatedRoot();
       const marker = join(root.external, "command-proof.txt");
       const gateway = startFakeGateway([
-        toolCall("added_command_write_1", "terminal", {
-          action: "exec",
+        toolCall("added_command_write_1", "shell", { request: {
+          action: "run",
+          yield_time_ms: 30_000,
           timeout_ms: 600_000,
           command: "printf COMMAND_ADDED_WRITE > command-proof.txt",
           cwd: root.external,
-        }),
+        } }),
         finalText("command write complete"),
       ]);
       try {
@@ -672,7 +673,7 @@ describe("filesystem path handling", () => {
         const json = parseFxJson(result);
         expect(readFileSync(marker, "utf8")).toBe("COMMAND_ADDED_WRITE");
         expect(json.tool_calls.map(({ name, status }) => ({ name, status }))).toEqual([
-          { name: "terminal", status: "success" },
+          { name: "shell", status: "success" },
         ]);
         expect(gateway.classifierRequests).toHaveLength(1);
       } finally {
@@ -783,7 +784,7 @@ describe("filesystem path handling", () => {
   );
 
   test(
-    "terminal reviews and executes external working-directory aliases",
+    "shell reviews and executes external working-directory aliases",
     async () => {
       const root = createIsolatedRoot();
       try {
@@ -800,12 +801,13 @@ describe("filesystem path handling", () => {
         for (const scenario of cases) {
           const marker = join(scenario.canonical, `${scenario.id}.txt`);
           const gateway = startFakeGateway([
-            toolCall(scenario.id, "terminal", {
-              action: "exec",
+            toolCall(scenario.id, "shell", { request: {
+              action: "run",
+              yield_time_ms: 30_000,
               timeout_ms: 600_000,
               command: `pwd; printf ${scenario.id} > ${scenario.id}.txt`,
               cwd: scenario.cwd,
-            }),
+            } }),
             finalText("external cwd complete"),
           ]);
           try {
@@ -829,7 +831,7 @@ describe("filesystem path handling", () => {
             expect(readFileSync(marker, "utf8")).toBe(scenario.id);
             expect(
               json.tool_calls.map(({ name, status }) => ({ name, status })),
-            ).toEqual([{ name: "terminal", status: "success" }]);
+            ).toEqual([{ name: "shell", status: "success" }]);
           } finally {
             gateway.stop();
           }
@@ -1371,7 +1373,7 @@ describe("filesystem path handling", () => {
   );
 
   test(
-    "removed filesystem tools are absent and terminal completes the fallback flow",
+    "removed filesystem tools are absent and shell completes the fallback flow",
     async () => {
       const root = createIsolatedRoot();
       const command =
@@ -1399,13 +1401,14 @@ describe("filesystem path handling", () => {
             "edit_file",
             "glob_files",
             "grep_files",
-            "terminal",
+            "shell",
           ]));
-          return toolCall("terminal_fallback_1", "terminal", {
-            action: "exec",
+          return toolCall("terminal_fallback_1", "shell", { request: {
+            action: "run",
             command,
+            yield_time_ms: 30_000,
             timeout_ms: 600_000,
-          });
+          } });
         },
         (body) => {
           const output = toolResultOutput(body, "terminal_fallback_1");
@@ -1414,7 +1417,7 @@ describe("filesystem path handling", () => {
           expect(output).toContain("fallback-complete");
           expect(existsSync(join(root.workspace, "fallback-dir"))).toBe(false);
           expect(existsSync(join(root.workspace, "fallback-source.txt"))).toBe(false);
-          return finalText("terminal fallback complete");
+          return finalText("shell fallback complete");
         },
       ], { classifierDecision: "clear" });
 
@@ -1425,7 +1428,7 @@ describe("filesystem path handling", () => {
             "--auto",
             "--json",
             "--no-save",
-            "Use the terminal to create, inspect, search, copy, rename, and remove disposable files.",
+            "Use the shell to create, inspect, search, copy, rename, and remove disposable files.",
           ],
           {
             cwd: root.workspace,
@@ -1438,7 +1441,7 @@ describe("filesystem path handling", () => {
         expect(gateway.classifierRequests).toHaveLength(1);
         expect(gateway.remainingResponseCount()).toBe(0);
         expect(json.tool_calls).toEqual([
-          expect.objectContaining({ name: "terminal", status: "success" }),
+          expect.objectContaining({ name: "shell", status: "success" }),
         ]);
       } finally {
         gateway.stop();
@@ -1449,7 +1452,7 @@ describe("filesystem path handling", () => {
   );
 
   liveTest(
-    "live Gateway uses terminal for removed filesystem operations",
+    "live Gateway uses shell for removed filesystem operations",
     async () => {
       const root = createIsolatedRoot();
       const completion = `LIVE_FILESYSTEM_FALLBACK_COMPLETE_${Date.now()}`;
@@ -1461,7 +1464,7 @@ describe("filesystem path handling", () => {
             "--json",
             "--no-save",
             [
-              "Use terminal for this exact disposable filesystem task in the current workspace.",
+              "Use shell for this exact disposable filesystem task in the current workspace.",
               "In one command, create live-fallback/source.txt containing live-fallback-data,",
               "copy it to copied.txt, rename that file to renamed.txt, list the directory,",
               "stat and grep the renamed file, then remove the live-fallback directory.",
@@ -1483,7 +1486,7 @@ describe("filesystem path handling", () => {
         const json = parseFxJson(result);
         expect(json.output).toContain(completion);
         expect(json.tool_calls.some(({ name, status }) =>
-          name === "terminal" && status === "success"
+          name === "shell" && status === "success"
         )).toBe(true);
         for (const removed of REMOVED_FILESYSTEM_TOOLS) {
           expect(json.tool_calls.some(({ name }) => name === removed)).toBe(false);

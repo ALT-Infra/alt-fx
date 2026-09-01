@@ -30,6 +30,16 @@ import { readTapeFrames, stdoutFrames } from "./render-lab/tape";
 
 const TIMEOUT = 30_000;
 
+function fakeShellRun(
+  callId: string,
+  command: string,
+  options: Record<string, unknown> = {},
+): Response {
+  return fakeGatewayToolCall(callId, "shell", {
+    request: { action: "run", command, ...options },
+  });
+}
+
 async function pasteVisibleText(
   session: TmuxSession,
   text: string,
@@ -922,11 +932,11 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           return fakeGatewayFinalText("DEFAULT_YOLO_TOOL_COMPLETE");
         }
         if (body.includes(childPrompt)) {
-          return fakeGatewayToolCall(callId, "terminal", {
-            action: "exec",
-            timeout_ms: 600_000,
-            command: `printf yolo > ${JSON.stringify(marker)}`,
-          });
+          return fakeShellRun(
+            callId,
+            `printf yolo > ${JSON.stringify(marker)}`,
+            { timeout_ms: 600_000 },
+          );
         }
         return fakeGatewayFinalText("unexpected default-yolo request");
       }, {
@@ -1486,11 +1496,11 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           return fakeGatewayFinalText("AUTO_DELETE_CHILD_COMPLETE");
         }
         if (body.includes(childPrompt)) {
-          return fakeGatewayToolCall("auto_terminal_remove", "terminal", {
-            action: "exec",
-            command: `rm ${JSON.stringify(marker)}`,
-            timeout_ms: 600_000,
-          });
+          return fakeShellRun(
+            "auto_terminal_remove",
+            `rm ${JSON.stringify(marker)}`,
+            { timeout_ms: 600_000 },
+          );
         }
         return fakeGatewayToolCall("auto_terminal_create", "subagent", {
           command: {
@@ -1746,20 +1756,24 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           if (next > commandCount) {
             return fakeGatewayFinalText("COMMAND_STREAM_CHILD_COMPLETE");
           }
-          return fakeGatewayToolCall(`command_stream_${next}`, "terminal", {
-            action: "exec",
-            timeout_ms: 600_000,
-            command:
-              `printf COMMAND_${next}_START; sleep 0.35; printf COMMAND_${next}_END`,
-          });
+          return fakeShellRun(
+            `command_stream_${next}`,
+            `printf COMMAND_${next}_START; sleep 0.35; printf COMMAND_${next}_END`,
+            {
+              yield_time_ms: 30_000,
+              timeout_ms: 600_000,
+            },
+          );
         }
         if (body.includes(childPrompt)) {
-          return fakeGatewayToolCall("command_stream_1", "terminal", {
-            action: "exec",
-            timeout_ms: 600_000,
-            command:
-              "printf COMMAND_1_START; sleep 0.35; printf COMMAND_1_END",
-          });
+          return fakeShellRun(
+            "command_stream_1",
+            "printf COMMAND_1_START; sleep 0.35; printf COMMAND_1_END",
+            {
+              yield_time_ms: 30_000,
+              timeout_ms: 600_000,
+            },
+          );
         }
         return fakeGatewayToolCall("command_stream_create", "subagent", {
           command: {
@@ -1837,10 +1851,10 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         const completed = await active.waitForPane(
           (pane) =>
             pane.includes("COMMAND_STREAM_CHILD_COMPLETE") &&
-            pane.includes("status: idle"),
+            pane.includes(`${childName} · idle`),
           TIMEOUT,
         );
-        expect(completed).toContain("10 tool calls");
+        expect(completed).toContain("COMMAND_STREAM_CHILD_COMPLETE");
         expect(active.paneStatus()).toEqual({ dead: false, status: null });
         expect(gateway.requests).toHaveLength(commandCount + 3);
         expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
@@ -3877,8 +3891,6 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         );
         await active.sendText(childPrompt);
         await active.waitForText("[pending]", TIMEOUT);
-        await active.sendKeys("C-o");
-        await active.waitForText("Full detail · ctrl o close", TIMEOUT);
         heldStream.release("CHECKPOINT2_PARENT_FOLLOWUP_COMPLETE");
         const childApprovalRequestStartedAt = Date.now();
         while (
@@ -3889,11 +3901,11 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         }
         expect(childApprovalRequestStarted).toBe(true);
         expect(gateway.requests.some((request) => request.body.includes(childPrompt))).toBe(true);
-        releaseChildApproval(fakeGatewayToolCall(callId, "terminal", {
-          action: "exec",
-          timeout_ms: 600_000,
-          command: "printf approved > child-approval-effect.txt",
-        }));
+        releaseChildApproval(fakeShellRun(
+          callId,
+          "printf approved > child-approval-effect.txt",
+          { timeout_ms: 600_000 },
+        ));
         const childApproval = await active.waitForPane(
           (pane) =>
             pane.includes("Subagent approval-child needs permission") &&
@@ -3904,7 +3916,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         );
         expect(childApproval).toContain("Command");
         expect(childApproval).toContain("printf approved");
-        expect(childApproval).toContain("$ # terminal.exec profile=user shell=");
+        expect(childApproval).toContain("$ # shell.run profile=user shell=");
         expect(childApproval).toContain("printf approved > child-approval-effect.txt");
         expect(childApproval).toContain("1. Yes");
         expect(childApproval).toContain("2. Yes, and don't ask again");
@@ -3924,13 +3936,13 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           (pane) =>
             pane.includes("Subagent approval-child needs permission") &&
             pane.includes("Command") &&
-            pane.includes("$ # terminal.exec profile=user shell=") &&
+            pane.includes("$ # shell.run profile=user shell=") &&
             pane.includes("printf approved > child-approval-effect.txt") &&
             !pane.includes(childPrompt),
           TIMEOUT,
         );
         expect(mainApproval).toContain("Command");
-        expect(mainApproval).toContain("$ # terminal.exec profile=user shell=");
+        expect(mainApproval).toContain("$ # shell.run profile=user shell=");
         expect(mainApproval).toContain("printf approved > child-approval-effect.txt");
         expect(mainApproval).not.toContain(childPrompt);
 
@@ -3960,7 +3972,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
             pane.includes("Subagent approval-child needs permission") &&
             pane.includes("status: approval") &&
             pane.includes("Command") &&
-            pane.includes("$ # terminal.exec profile=user shell=") &&
+            pane.includes("$ # shell.run profile=user shell=") &&
             pane.includes("printf approved > child-approval-effect.txt") &&
             pane.includes("❯ 1. Yes"),
           TIMEOUT,
@@ -5789,18 +5801,18 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           return fakeGatewayFinalText("CHECKPOINT2_SECOND_APPROVAL_COMPLETE");
         }
         if (body.includes(firstPrompt)) {
-          return fakeGatewayToolCall(firstCallId, "terminal", {
-            action: "exec",
-            timeout_ms: 600_000,
-            command: `printf first > ${JSON.stringify(firstMarker)}`,
-          });
+          return fakeShellRun(
+            firstCallId,
+            `printf first > ${JSON.stringify(firstMarker)}`,
+            { timeout_ms: 600_000 },
+          );
         }
         if (body.includes(secondPrompt)) {
-          return fakeGatewayToolCall(secondCallId, "terminal", {
-            action: "exec",
-            timeout_ms: 600_000,
-            command: `printf second > ${JSON.stringify(secondMarker)}`,
-          });
+          return fakeShellRun(
+            secondCallId,
+            `printf second > ${JSON.stringify(secondMarker)}`,
+            { timeout_ms: 600_000 },
+          );
         }
         return fakeGatewayFinalText("unexpected simultaneous approval request");
       }, {
@@ -5873,7 +5885,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           TIMEOUT,
         );
         expect(firstMain).toContain("Command");
-        expect(firstMain).toContain("$ # terminal.exec profile=user shell=");
+        expect(firstMain).toContain("$ # shell.run profile=user shell=");
         expect(firstMain).toContain("printf first >");
 
         await active.sendKeys("C-x");
@@ -5932,7 +5944,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           TIMEOUT,
         );
         expect(secondMain).toContain("Command");
-        expect(secondMain).toContain("$ # terminal.exec profile=user shell=");
+        expect(secondMain).toContain("$ # shell.run profile=user shell=");
         expect(secondMain).toContain("printf second >");
 
         await active.sendKeys("C-x");
@@ -6293,11 +6305,11 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           return fakeGatewayFinalText("CANCEL_BLOCKED_APPROVAL_PARENT_READY");
         }
         if (body.includes(childPrompt)) {
-          return fakeGatewayToolCall(childCallId, "terminal", {
-            action: "exec",
-            timeout_ms: 600_000,
-            command: "printf denied > cancelled-approval-effect.txt",
-          });
+          return fakeShellRun(
+            childCallId,
+            "printf denied > cancelled-approval-effect.txt",
+            { timeout_ms: 600_000 },
+          );
         }
         return fakeGatewayToolCall(parentCallId, "subagent", {
           command: {
@@ -6353,7 +6365,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
             pane.includes("status: approval") &&
             pane.includes("Subagent approval-cancel-child needs permission") &&
             pane.includes("Command") &&
-            pane.includes("$ # terminal.exec profile=user shell=") &&
+            pane.includes("$ # shell.run profile=user shell=") &&
             pane.includes("printf denied > cancelled-approval-effect.txt") &&
             pane.includes("❯ 1. Yes"),
           TIMEOUT,

@@ -58,10 +58,10 @@ const vision_and_read_file_tools = [_]tool_dispatch.Tool{
 const vision_read_and_terminal_tools = [_]tool_dispatch.Tool{
     builtin_tools.vision,
     builtin_tools.read_file,
-    builtin_tools.terminal,
+    builtin_tools.shell,
 };
-const terminal_advertised_names = [_][]const u8{"terminal"};
-const terminal_advertised_functions = [_]model_tool_schema.FunctionSchema{builtin_tools.terminal.model_schema};
+const terminal_advertised_names = [_][]const u8{"shell"};
+const terminal_advertised_functions = [_]model_tool_schema.FunctionSchema{builtin_tools.shell.model_schema};
 
 const VisionAndReadExecutor = struct {
     vision: ExecuteDelegate,
@@ -959,10 +959,10 @@ test "required Vision rejects non-Vision before effects and stays required until
     var images = [_]types.ImageAttachment{image};
 
     const wrapped_terminal_arguments =
-        "{\"request\":{\"action\":\"exec\",\"command\":\"printf must-not-run\"}}";
+        "{\"request\":{\"action\":\"run\",\"command\":\"printf must-not-run\"}}";
     const blocked_calls = [_]ToolCall{toolCall(
         "call_terminal_while_vision_required",
-        "terminal",
+        "shell",
         wrapped_terminal_arguments,
     )};
     const vision_calls = [_]ToolCall{toolCall(
@@ -1064,7 +1064,7 @@ test "required Vision rejects non-Vision before effects and stays required until
         "call_terminal_while_vision_required",
     );
     try std.testing.expectEqual(@as(usize, 1), hooks.rejected_names.items.len);
-    try std.testing.expectEqualStrings("terminal", hooks.rejected_names.items[0]);
+    try std.testing.expectEqualStrings("shell", hooks.rejected_names.items[0]);
     try std.testing.expectEqual(@as(usize, 1), vision_runtime.execution_count);
     var persisted_arguments: ?[]const u8 = null;
     for (hooks.history_turns.items) |turn| {
@@ -3307,10 +3307,9 @@ test "processQueuedPrompt places transient overlay before history and current pr
     hooks.static_context_text = "static project context unique";
     hooks.runtime_context_text = "runtime tail context unique";
 
-    var history = [_]HistoryTurn{.{ .background_command = .{
+    var history = [_]HistoryTurn{.{ .assistant = .{
         .user = .{ .text = @constCast("past background prompt") },
-        .log_path = @constCast("/tmp/past-background.log"),
-        .expect_url = false,
+        .assistant = @constCast("historical command is no longer owned"),
     } }};
     var fixture = PromptFixture{};
     var job = fixture.job();
@@ -3607,48 +3606,6 @@ test "processQueuedPrompt delivers parent context created between tool steps" {
     try expectBodyContains(&first_gateway, 1, "late child delivery");
 }
 
-test "processQueuedPrompt blocks accidental terminal restart of non-live background history" {
-    const alloc = std.testing.allocator;
-    const command = "while true; do echo labs7; sleep 1; done";
-    const args = "{\"action\":\"start\",\"command\":\"while true; do echo labs7; sleep 1; done\"}";
-    const calls = [_]ToolCall{toolCall("call_restart", "terminal", args)};
-    const completions = [_]FakeCompletion{
-        .{ .content = "I will check it.", .tool_calls = &calls },
-        .{ .content = "No." },
-    };
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer hooks.deinit();
-    hooks.runtime_context_text =
-        "Runtime context: previous background command history includes command(s) that are no longer live. Treat these as terminal historical records, not running tasks.\n" ++
-        "- command=while true; do echo labs7; sleep 1; done; log=/tmp/labs7.log; state=stopped\n" ++
-        "For any listed command, answer liveness questions from this state; do not assume it is still running or reuse it as a live background task. Restart a listed command only if the user explicitly asks.";
-
-    var fixture = PromptFixture{};
-    var job = fixture.job();
-    job.prompt = @constCast("Is the background command you just started still running? Do not run or restart it unless I ask.");
-    job.permission_mode = .auto;
-
-    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
-
-    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
-    try std.testing.expectEqual(@as(usize, 3), hooks.lifecycle_events.items.len);
-    try std.testing.expect(hooks.lifecycle_events.items[0] == .authoritative_started);
-    try std.testing.expect(hooks.lifecycle_events.items[1] == .progress);
-    try std.testing.expectEqual(
-        types.ToolOutcomeKind.denied,
-        hooks.lifecycle_events.items[2].terminal.outcome.kind,
-    );
-    try std.testing.expectEqualStrings("No.", hooks.finish_assistant_text.?);
-    try expectBodyContains(
-        &gateway,
-        1,
-        "Blocked restarting non-live background command from history",
-    );
-    try expectBodyContains(&gateway, 1, command);
-}
-
 test "processQueuedPrompt projects history exactly once into each gateway request" {
     const alloc = std.testing.allocator;
     var history = [_]HistoryTurn{.{ .assistant = .{
@@ -3786,6 +3743,7 @@ test "processQueuedPrompt pauses when uncertain tool reconciliation returns anot
 
 test "processQueuedPrompt preserves a confirmed provider tool result across recovery" {
     const alloc = std.testing.allocator;
+    const decision_prompt = "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.";
     const calls = [_]ToolCall{.{
         .id = "provider_search_1",
         .name = "perplexity_search",
@@ -3823,9 +3781,14 @@ test "processQueuedPrompt preserves a confirmed provider tool result across reco
     try expectGatewayPromptTailText(
         &gateway,
         1,
-        .user,
-        "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.",
+        .system,
+        "confirmed tool result",
     );
+    try expectGatewayPromptTextCount(&gateway, 1, decision_prompt, 1);
+    try expectBodyContainsInOrder(&gateway, 1, &.{
+        decision_prompt,
+        "confirmed tool result",
+    });
     const execution = hooks.history_turns.items[0].assistant.execution;
     try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
     try std.testing.expectEqual(@as(usize, 1), execution.tool_steps[0].tool_results.len);
@@ -3873,9 +3836,14 @@ test "processQueuedPrompt preserves a confirmed provider tool result across reco
     try expectGatewayPromptTailText(
         &restored_gateway,
         0,
-        .user,
-        "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.",
+        .system,
+        "confirmed tool result",
     );
+    try expectGatewayPromptTextCount(&restored_gateway, 0, decision_prompt, 1);
+    try expectBodyContainsInOrder(&restored_gateway, 0, &.{
+        decision_prompt,
+        "confirmed tool result",
+    });
 }
 
 test "processQueuedPrompt preserves the provider-executed subset of mixed failed tools" {
@@ -3986,20 +3954,14 @@ test "processQueuedPrompt suppresses a repeated confirmed provider tool identity
 
     try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
-    for ([_]usize{ 1, 2 }) |request_index| {
-        try expectGatewayPromptTailText(
-            &gateway,
-            request_index,
-            .user,
-            decision_prompt,
-        );
-        try expectGatewayPromptTextCount(
-            &gateway,
-            request_index,
-            decision_prompt,
-            1,
-        );
-    }
+    try expectGatewayPromptTailText(&gateway, 1, .system, "confirmed tool result");
+    try expectGatewayPromptTextCount(&gateway, 1, decision_prompt, 1);
+    try expectBodyContainsInOrder(&gateway, 1, &.{
+        decision_prompt,
+        "confirmed tool result",
+    });
+    try expectGatewayPromptTailText(&gateway, 2, .user, decision_prompt);
+    try expectGatewayPromptTextCount(&gateway, 2, decision_prompt, 1);
     const execution = hooks.history_turns.items[0].assistant.execution;
     try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
     try std.testing.expectEqual(@as(usize, 1), execution.tool_steps[0].tool_results.len);
@@ -4067,6 +4029,38 @@ test "processQueuedPrompt retries replay-safe provider errors before success" {
     try expectRouteStatus(&hooks, 2, .auto_retry, "⚠ Provider unavailable · provider_error: route failed twice · retrying request in 1s · attempt 2/3");
     try expectRouteStatus(&hooks, 3, .auto_retry, "⚠ Provider unavailable · provider_error: route failed twice · retrying request · attempt 3/3");
     try expectRouteStatus(&hooks, 4, .auto_recovered, "✓ recovered · succeeded on attempt 3/3");
+}
+
+test "processQueuedPrompt keeps recovery system last after post-tool provider error" {
+    const alloc = std.testing.allocator;
+    const decision_prompt = "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.";
+    const calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls, .finish_reason = .tool_calls },
+        .{ .finish_reason = .provider_error, .provider_failure_detail = "route failed after tool" },
+        .{ .content = "Recovered after tool" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.gateway_retry_count = 1;
+    config.max_provider_attempts = 2;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    const retry_roles = [_]types.ChatRole{ .system, .user, .assistant, .tool, .user, .system };
+    try expectGatewayPromptRoles(&gateway, 2, &retry_roles);
+    try expectGatewayPromptTextCount(&gateway, 2, decision_prompt, 1);
+    try expectBodyContainsInOrder(&gateway, 2, &.{
+        decision_prompt,
+        "<network_recovery>",
+    });
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try std.testing.expectEqualStrings("read_file", hooks.executed_names.items[0]);
 }
 
 test "processQueuedPrompt masks and terminal-encodes provider diagnostics" {
@@ -4707,8 +4701,8 @@ test "processQueuedPrompt counts only failed provider attempts across tool follo
     try expectGatewayPromptTailText(
         &continued_gateway,
         0,
-        .user,
-        decision_prompt,
+        .system,
+        "Re-run the response for the same user request.",
     );
     try expectGatewayPromptTextCount(
         &continued_gateway,
@@ -4716,6 +4710,10 @@ test "processQueuedPrompt counts only failed provider attempts across tool follo
         decision_prompt,
         1,
     );
+    try expectBodyContainsInOrder(&continued_gateway, 0, &.{
+        decision_prompt,
+        "Re-run the response for the same user request.",
+    });
     try std.testing.expectEqualStrings("Finished after Continue", continued_hooks.history_assistant_text.?);
 }
 

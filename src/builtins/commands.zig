@@ -171,20 +171,6 @@ pub const top_level_specs = [_]TopLevelSpec{
         .options = &.{json_option},
     },
     .{
-        .kind = .background,
-        .token = "background",
-        .usage = "background [last|<id>] [--json]",
-        .summary = "List or inspect background commands",
-        .options = &.{
-            .{ .flag = "last", .description = "Inspect the most recent background command" },
-            .{ .flag = "<id>", .description = "Inspect a background command by id" },
-            json_option,
-        },
-        .details = &.{
-            "With no target, lists the persisted background command history.",
-        },
-    },
-    .{
         .kind = .teams,
         .token = "teams",
         .usage = "teams",
@@ -304,7 +290,6 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
     .{ .entries = &.{
         .{ .kind = .pr, .usage = "pr [context]" },
         .{ .kind = .issue, .usage = "issue [context]" },
-        .{ .kind = .background, .usage = "background [last|<id>]" },
     } },
     .{ .entries = &.{
         .{ .kind = .sessions, .usage = "sessions" },
@@ -314,22 +299,26 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .usage = "session recover <id>", .summary = "Copy a recoverable corrupt session" },
     } },
     .{ .entries = &.{
-        .{ .kind = .login, .usage = "login [vercel|codex|grok]" },
-        .{ .kind = .logout, .usage = "logout [vercel|codex|grok]" },
-        .{ .kind = .provider, .usage = "provider <gateway|codex|grok>" },
-        .{ .kind = .setup, .usage = "setup" },
-        .{ .kind = .teams, .usage = "teams" },
-        .{ .kind = .credits, .usage = "credits|balance" },
-        .{ .kind = .usage, .usage = "usage [--period <24h|7d|30d>]" },
+        .{ .kind = .login, .usage = "login [vercel|codex|grok]", .summary = "Sign in to a model provider" },
+        .{ .kind = .logout, .usage = "logout [vercel|codex|grok]", .summary = "Sign out of a model provider" },
+        .{ .kind = .provider, .usage = "provider <gateway|codex|grok>", .summary = "Choose the active model provider" },
+        .{ .kind = .models, .usage = "models" },
+    } },
+    .{ .entries = &.{
+        .{ .kind = .setup, .usage = "setup", .summary = "Configure a Vercel AI Gateway API key" },
+        .{ .kind = .teams, .usage = "teams", .summary = "Choose a Vercel AI Gateway team" },
+        .{ .kind = .credits, .usage = "credits|balance", .summary = "Show Vercel AI Gateway credits" },
+    } },
+    .{ .entries = &.{
+        .{ .kind = .usage, .usage = "usage [--period <24h|7d|30d>]", .summary = "Show locally recorded token usage and spend" },
     } },
     .{ .entries = &.{
         .{ .kind = .status, .usage = "status" },
         .{ .kind = .doctor, .usage = "doctor" },
         .{ .kind = .mcp, .usage = "mcp <command> ..." },
-        .{ .kind = .models, .usage = "models" },
         .{ .kind = .permissions, .usage = "permissions" },
         .{ .kind = .workspace, .usage = "workspace" },
-        .{ .kind = .upgrade, .usage = "upgrade" },
+        .{ .kind = .upgrade, .usage = "upgrade", .summary = "Upgrade fx on the selected release channel" },
         .{ .kind = .acp, .usage = "acp" },
         .{ .kind = .help, .usage = "help" },
     } },
@@ -374,7 +363,7 @@ pub const top_level_flags = [_]TopLevelFlag{
     },
     .{
         .usage = "-v, --version",
-        .description = "Print the 𝒇x version and exit",
+        .description = "Print the fx version and exit",
     },
 };
 
@@ -386,19 +375,19 @@ pub const top_level_examples = [_]TopLevelExample{
 };
 
 pub const top_level_notes = [_][]const u8{
-    "Run `fx <command> --help` for command-specific options and examples.",
+    "Run `fx <command> --help` for command-specific usage and options.",
     "Run `/help` inside an interactive session for slash commands.",
 };
 
 pub const top_level_resources = [_]TopLevelResource{
-    .{ .label = "Learn more about 𝒇x:", .value = "https://fx.sh/docs", .link = true },
-    .{ .label = "Report a problem:", .value = "run `/feedback` inside 𝒇x" },
+    .{ .label = "Learn more about fx:", .value = "https://fx.sh/docs", .link = true },
+    .{ .label = "Report a problem:", .value = "run `/feedback` inside fx" },
 };
 
 pub const top_level_registry = TopLevelRegistry{
     .specs = top_level_specs[0..],
     .description = "Fast, native coding agent for the terminal.",
-    .interactive_hint = "𝒇x starts an interactive session by default. Use `fx ask` to run one noninteractive request.",
+    .interactive_hint = "fx starts an interactive session by default. Use `fx ask` to run one noninteractive request.",
     .help_groups = top_level_help_groups[0..],
     .flags = top_level_flags[0..],
     .examples = top_level_examples[0..],
@@ -432,7 +421,7 @@ pub fn topLevelUsage(kind: TopLevelKind) []const u8 {
 
 pub const slash_specs = [_]SlashSpec{
     .{ .kind = .help, .command = "/help", .help_entry = "/help", .completion_description = "show available slash commands", .presentation_category = .general, .show_in_welcome = true },
-    .{ .kind = .clear_screen, .command = "/clear", .help_entry = "/clear", .completion_description = "start a fresh session and keep background processes", .presentation_category = .general, .show_in_welcome = true },
+    .{ .kind = .clear_screen, .command = "/clear", .help_entry = "/clear", .completion_description = "start a fresh conversation while keeping managed processes", .presentation_category = .general, .show_in_welcome = true },
     .{ .kind = .new_session, .command = "/new", .help_entry = "/new", .completion_description = "start a fresh session", .presentation_category = .session, .show_in_welcome = true },
     .{ .kind = .reset_session, .command = "/reset", .help_entry = "/reset", .completion_description = "reset the current session context", .presentation_category = .session },
     .{ .kind = .resume_session, .command = "/resume", .help_entry = "/resume", .completion_description = "resume a saved session", .presentation_category = .session },
@@ -444,10 +433,6 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .stats, .command = "/stats", .help_entry = "/stats", .completion_description = "show token and turn statistics", .presentation_category = .account },
     .{ .kind = .usage, .command = "/usage", .aliases = &.{"/cost"}, .help_entry = "/usage (/cost)", .completion_description = "show local fx tokens, models, and spend", .presentation_category = .account },
     .{ .kind = .status, .command = "/status", .help_entry = "/status", .completion_description = "show runtime configuration", .presentation_category = .general, .show_in_welcome = true },
-    .{ .kind = .background, .command = "/background", .help_entry = "/background [open|logs|stop <id|last>]", .completion_description = "inspect background command history", .presentation_category = .agents, .show_in_welcome = true, .has_args = true },
-    .{ .kind = .background_stop, .command = "/background stop", .accepts_payload = true },
-    .{ .kind = .background_open, .command = "/background open", .accepts_payload = true },
-    .{ .kind = .background_logs, .command = "/background logs", .accepts_payload = true },
     .{ .kind = .image, .command = "/image", .aliases = &.{"/img"}, .help_entry = "/image <path> (/img)", .completion_description = "attach an image by path", .presentation_category = .media, .has_args = true, .accepts_payload = true },
     .{ .kind = .images, .command = "/images", .help_entry = "/images [clear]", .completion_description = "manage pending image attachments", .presentation_category = .media, .has_args = true, .accepts_payload = true },
     .{ .kind = .model, .command = "/model", .help_entry = "/model <id-or-query>", .completion_description = "choose what model and reasoning effort to use", .presentation_category = .model, .has_args = true, .accepts_payload = true },
@@ -544,10 +529,6 @@ test "built-in slash commands register exact active order" {
         "/stats",
         "/usage",
         "/status",
-        "/background",
-        "/background stop",
-        "/background open",
-        "/background logs",
         "/image",
         "/images",
         "/model",

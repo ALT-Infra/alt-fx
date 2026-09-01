@@ -12,7 +12,6 @@ const provider_runtime = @import("provider_runtime.zig");
 const app_worker_runtime = @import("app_worker_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
-const background_runtime = @import("../background/background_runtime.zig");
 const change_tracker = @import("../workspace/change_tracker.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
 const hooks = @import("../hooks/hooks.zig");
@@ -251,10 +250,17 @@ pub fn Runtime(comptime App: type) type {
                 .worker = &app.worker,
                 .permission_prompter = tool_admission.workerPrompter(&app.worker),
                 .cancel_flag = &app.worker.worker_cancel_requested,
-                .background = &app.background,
                 .session_child_capability = child_capability,
                 .terminal_client = if (comptime @hasField(App, "terminal_client"))
                     &app.terminal_client
+                else
+                    null,
+                .managed_executions = if (comptime @hasField(App, "managed_executions"))
+                    &app.managed_executions
+                else
+                    null,
+                .ephemeral_command_replay = if (comptime @hasField(App, "managed_executions"))
+                    app.managed_executions.replayStore()
                 else
                     null,
                 .session = &app.session,
@@ -265,8 +271,6 @@ pub fn Runtime(comptime App: type) type {
                 .context_registry = app.contextRegistry(),
                 .output_chunk_ctx = @ptrCast(app),
                 .on_output_chunk = app_callbacks.Bindings(App).onCommandOutputChunk,
-                .background_url_ctx = @ptrCast(app),
-                .on_background_url_ready = app_callbacks.Bindings(App).onBackgroundUrlReady,
                 .workspace_executor = if (comptime @hasDecl(App, "workspaceExecutor")) app.workspaceExecutor() else null,
                 .host_sandbox_default = if (host_workspace) |info| switch (info.permission) {
                     .allow_sandboxed => .allow_sandboxed,
@@ -834,8 +838,6 @@ pub fn Runtime(comptime App: type) type {
                 .interactive = true,
                 .permission_mode = permission_snapshot.mode,
                 .tracker = &app.change_tracker,
-                .background = &app.background,
-                .session = &app.session,
             }, arena, messages);
         }
 
@@ -916,7 +918,10 @@ pub fn Runtime(comptime App: type) type {
                 try appendClaimedContextNotice(app, &preflight_context_notices.writer, notice);
             }
 
-            var bounded_skills = try app.skills.buildRoutedSystemPromptSection(
+            var skill_catalog = app.skills.acquireCatalog();
+            var skill_catalog_owned = true;
+            defer if (skill_catalog_owned) skill_catalog.deinit();
+            var bounded_skills = try skill_catalog.buildRoutedSystemPromptSection(
                 std.heap.c_allocator,
                 job.prompt,
                 if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
@@ -936,12 +941,14 @@ pub fn Runtime(comptime App: type) type {
             }
             var explicit_skills = try skill_invocation.buildExplicitPromptSection(
                 std.heap.c_allocator,
-                .{ .skills = app.skills.items, .diagnostics = app.skills.diagnostics },
+                .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics },
                 job.prompt,
                 explicit_bindings,
                 if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
             );
             defer explicit_skills.deinit(std.heap.c_allocator);
+            skill_catalog.deinit();
+            skill_catalog_owned = false;
             if (explicit_skills.notice) |notice| {
                 try appendClaimedContextNotice(app, &postflight_context_notices.writer, notice);
             }
@@ -1037,7 +1044,10 @@ pub fn Runtime(comptime App: type) type {
             ) catch
                 return error.OutOfMemory;
             defer child_projection.deinit(alloc);
-            var bounded_skills = app.skills.buildRoutedSystemPromptSection(
+            var skill_catalog = app.skills.acquireCatalog();
+            var skill_catalog_owned = true;
+            defer if (skill_catalog_owned) skill_catalog.deinit();
+            var bounded_skills = skill_catalog.buildRoutedSystemPromptSection(
                 alloc,
                 message.content,
                 if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
@@ -1045,14 +1055,18 @@ pub fn Runtime(comptime App: type) type {
             defer bounded_skills.deinit(alloc);
             var explicit_skills = skill_invocation.buildExplicitPromptSection(
                 alloc,
-                .{ .skills = app.skills.items, .diagnostics = app.skills.diagnostics },
+                .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics },
                 message.content,
                 &.{},
                 if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
             ) catch return error.OutOfMemory;
             defer explicit_skills.deinit(alloc);
+            skill_catalog.deinit();
+            skill_catalog_owned = false;
             const prompt_policy = app.promptPolicy();
-            const tool_context = childToolContext(app.subagentToolContextForAdmission(admission));
+            var tool_context = childToolContext(app.subagentToolContextForAdmission(admission));
+            tool_context.managed_executions = turn.managedExecutionRuntime();
+            tool_context.ephemeral_command_replay = turn.managedExecutionRuntime().replayStore();
             const providers = if (comptime @hasDecl(App, "providerSet"))
                 app.providerSet()
             else
@@ -1296,7 +1310,7 @@ const test_ignored_list_entries = [_][]const u8{ ".git", "zig-out" };
 const test_gateway_chat_url = "https://gateway.test/chat";
 const test_tools = [_]tool_dispatch.Tool{
     test_builtin_tools.web_search,
-    test_builtin_tools.terminal,
+    test_builtin_tools.shell,
     test_builtin_tools.grep_files,
     test_builtin_tools.skill,
     test_builtin_tools.install_skill,
@@ -1461,7 +1475,6 @@ const FakeApp = struct {
     fast_mode: bool = true,
     effort: types.ReasoningEffort = types.ReasoningEffort.literal("high"),
     worker: worker_runtime.WorkerRuntime = .{},
-    background: background_runtime.BackgroundRuntime = .{},
     session: session_runtime.SessionRuntime = .{ .max_history_turns = 4 },
     session_persistence: app_session_runtime.Persistence = .{},
     skills_dir: []const u8 = "/tmp/skills",
@@ -1547,7 +1560,6 @@ const FakeApp = struct {
         self.worker.deinit(std.heap.c_allocator);
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
-        self.background.deinit(self.alloc);
         self.session.deinit(self.alloc);
         self.change_tracker.deinit(self.alloc);
         self.lifecycle_runtime.deinit();
@@ -1811,7 +1823,7 @@ test "app agent runtime builds tool context from app state and MCP callbacks" {
     try std.testing.expectEqual(types.ToolChoice.none, ctx.first_call_tool_choice);
     try std.testing.expect(ctx.cancel_flag.? == &app.worker.worker_cancel_requested);
     try std.testing.expectEqual(&app.worker, ctx.worker);
-    try std.testing.expectEqual(&app.background, ctx.background);
+    try std.testing.expect(!@hasField(tool_runtime.Context, "background"));
     try std.testing.expect(ctx.subagent_host == null);
     try std.testing.expect(ctx.subagent_caller_id == null);
     try std.testing.expectEqual(&app.session, ctx.session);
@@ -2046,8 +2058,8 @@ test "app agent runtime formats active completed denied and MCP tool actions" {
 
     const run_call: ToolCall = .{
         .id = "1",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"zig build\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"zig build\"}",
     };
 
     const active = try app.describeToolAction(arena, run_call);
@@ -2134,7 +2146,7 @@ test "app agent runtime formats active completed denied and MCP tool actions" {
     try std.testing.expectEqual(@as(usize, 1), app.mcp_has_tool_calls);
 
     app.mcp_has_tool_calls = 0;
-    const builtin_advertised = [_][]const u8{"terminal"};
+    const builtin_advertised = [_][]const u8{"shell"};
     _ = try Runtime(FakeApp).describeToolActionCompleted(&app, arena, run_call, null, &builtin_advertised, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
     try std.testing.expectEqual(@as(usize, 0), app.mcp_has_tool_calls);
 }
@@ -2172,10 +2184,10 @@ test "app agent runtime bounds a large multiline run command activity" {
     var app = try FakeApp.init(alloc);
     defer app.deinit();
 
-    const arguments_json = "{\"action\":\"exec\",\"command\":\"" ++ ("x\\n" ** 20_000) ++ "\"}";
+    const arguments_json = "{\"action\":\"run\",\"command\":\"" ++ ("x\\n" ** 20_000) ++ "\"}";
     const label = try app.describeToolAction(arena, .{
         .id = "large_command",
-        .name = "terminal",
+        .name = "shell",
         .arguments_json = arguments_json,
     });
 

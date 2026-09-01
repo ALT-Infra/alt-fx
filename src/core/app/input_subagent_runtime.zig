@@ -377,6 +377,9 @@ pub fn SubagentRuntime(comptime App: type) type {
             if (comptime @hasDecl(@TypeOf(app.subagents), "selectedTerminalId") and
                 @hasDecl(App, "requestTerminalOpen"))
             {
+                if (comptime @hasDecl(@TypeOf(app.subagents), "selectedTerminalAttachable")) {
+                    if (!app.subagents.selectedTerminalAttachable()) return;
+                }
                 const session_id = app.subagents.selectedTerminalId() orelse return;
                 switch (app.requestTerminalOpen(session_id)) {
                     .accepted, .occupied, .rejected => {},
@@ -776,8 +779,10 @@ pub fn SubagentRuntime(comptime App: type) type {
 
         fn syncChildSkillsQuery(app: *App) void {
             const view = app.subagents.childPresentationView() orelse return;
-            app.skills.menu.setQuery(view.editor.edit_state.input.items);
-            app.skills.menu.clamp(app.skills.items);
+            app.skills.setMenuQuery(
+                app.alloc,
+                view.editor.edit_state.input.items,
+            );
         }
 
         fn moveChildModelMenu(app: *App, delta: i32) void {

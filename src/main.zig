@@ -21,6 +21,7 @@ const app_entry_runtime = @import("core/app/app_entry_runtime.zig");
 const acp_runner = @import("core/cli/acp_runner.zig");
 const acp_server = @import("acp/server.zig");
 const app_input_runtime = @import("core/app/app_input_runtime.zig");
+const input_full_transcript_runtime = @import("core/app/input_full_transcript_runtime.zig");
 const input_submit_runtime = @import("core/app/input_submit_runtime.zig");
 const core_input_runtime = @import("core/input/runtime.zig");
 const input_queue_runtime = @import("core/app/input_queue_runtime.zig");
@@ -28,6 +29,7 @@ const app_bootstrap_runtime = @import("core/app/app_bootstrap_runtime.zig");
 const app_notification_runtime = @import("core/app/app_notification_runtime.zig");
 const app_permission_runtime = @import("core/app/app_permission_runtime.zig");
 const app_process_runtime = @import("core/app/app_process_runtime.zig");
+const managed_execution = @import("core/execution/managed_execution.zig");
 const prompt_history_runtime = @import("core/app/prompt_history_runtime.zig");
 const app_agent_runtime = @import("core/app/app_agent_runtime.zig");
 const app_runtime_setup = @import("core/app/app_runtime_setup.zig");
@@ -100,14 +102,9 @@ const update_target = @import("core/upgrade/update_target.zig");
 
 const compiled_update_channel = update_target.Channel.parse(build_options.update_channel) orelse
     @compileError("invalid compiled update channel");
-const background_runtime = @import("core/background/background_runtime.zig");
-const background_process_provider = @import(
-    "core/execution/background_process_provider.zig",
-);
-const background_process = @import("tools/shell/background_process.zig");
-const process_supervisor = @import("core/background/process_supervisor.zig");
+const shell_process_provider = @import("tools/shell/process_provider.zig");
+const process_provider = @import("core/execution/process_provider.zig");
 const terminal_client_runtime = @import("core/terminal/client.zig");
-const terminal_direct_runtime = @import("core/terminal/direct_runtime.zig");
 const app_terminal_runtime = @import("core/app/app_terminal_runtime.zig");
 const app_terminal_takeover_runtime = @import("core/app/app_terminal_takeover_runtime.zig");
 const terminal_host = @import("core/terminal/host.zig");
@@ -170,7 +167,6 @@ const QueuedPrompt = worker_runtime.QueuedPrompt;
 const WorkerRuntime = worker_runtime.WorkerRuntime;
 const SessionRuntime = session_runtime.SessionRuntime;
 const PromptHistoryRuntime = prompt_history_runtime.PromptHistoryRuntime;
-const BackgroundRuntime = background_runtime.BackgroundRuntime;
 const ToolExecutionResult = agent_runtime.ToolExecutionResult;
 const ApprovalPrompt = approval_prompt.ApprovalPrompt;
 const ApprovalScreenState = footer_runtime.ApprovalScreenState;
@@ -182,10 +178,9 @@ const TranscriptRuntime = transcript_runtime.TranscriptRuntime;
 const ResumeProjection = resume_projection.ResumeProjection;
 const RawEnviron = io_mod.RawEnviron;
 
-const RuntimeContextSnapshot = background_runtime.RuntimeContextSnapshot;
-
 const footer_rows: u16 = 4;
 const active_poll_timeout_ms: i32 = 8;
+const focused_ui_worker_poll_timeout_ms: i32 = 1;
 const idle_wasm_poll_timeout_ms: i32 = 16;
 const resize_debounce_ms: i64 = 100;
 const max_transcript_bytes: usize = 256 * 1024;
@@ -198,6 +193,21 @@ const max_read_file_lines: usize = 400;
 const max_read_file_line_len: usize = 2000;
 const max_command_output_bytes: usize = 64 * 1024;
 const input_escape_timeout_ms: i64 = 30;
+
+fn nativeLoopPollTimeoutMs(
+    default_timeout_ms: i32,
+    auth_refresh_active: bool,
+    skills_refresh_active: bool,
+    transcript_page_work_active: bool,
+) i32 {
+    return if (auth_refresh_active or
+        skills_refresh_active or
+        transcript_page_work_active)
+        @min(default_timeout_ms, focused_ui_worker_poll_timeout_ms)
+    else
+        default_timeout_ms;
+}
+
 const max_prompt_history: usize = 100;
 
 const ignored_list_entries = [_][]const u8{
@@ -395,6 +405,7 @@ const App = struct {
     const HostConfigAppRuntime = app_host_config_runtime.Runtime(Self);
     const BootstrapAppRuntime = app_bootstrap_runtime.Runtime(Self);
     const InputAppRuntime = app_input_runtime.Runtime(Self);
+    const InputFullTranscriptRuntime = input_full_transcript_runtime.Runtime(Self);
     const InputSubmitRuntime = input_submit_runtime.SubmitRuntime(Self);
     const NotificationAppRuntime = app_notification_runtime.Runtime(
         Self,
@@ -485,7 +496,6 @@ const App = struct {
         }
         try WorkerAppRuntime.tick(
             self,
-            app_callbacks.Bindings(App).onTaskCompletion,
             app_callbacks.Bindings(App).workerEventHandlers(self),
         );
         try self.flushRequestedFrame();
@@ -557,9 +567,9 @@ const App = struct {
 
     worker_thread: ?std.Thread = null,
     worker: WorkerRuntime = .{},
-    background: BackgroundRuntime = .{},
     terminal_client: terminal_client_runtime.Runtime = .{},
-    terminal_direct: terminal_direct_runtime.Runtime = .{},
+    managed_executions: managed_execution.Runtime = managed_execution.Runtime.init(std.heap.c_allocator),
+    legacy_process_provider: process_provider.Provider = process_provider.unavailable_provider,
     terminal_takeover: app_terminal_takeover_runtime.Controller = .{},
     upgrader: auto_upgrade.AutoUpgrade = .{},
     subagents: ui_subagents.Controller = .{},
@@ -604,14 +614,14 @@ const App = struct {
             .shell = TranscriptRuntime.init(),
             .subagents = ui_subagents.Controller.init(),
             .lifecycle_runtime = hooks.Runtime.init(alloc),
-            .background = BackgroundRuntime.init(if (comptime host_target.is_wasm)
-                background_process_provider.unavailable_provider
-            else
-                background_process.provider),
             .terminal_client = terminal_client_runtime.Runtime.init(if (comptime host_target.is_wasm)
-                background_process_provider.unavailable_provider
+                process_provider.unavailable_provider
             else
-                background_process.provider),
+                shell_process_provider.provider),
+            .legacy_process_provider = if (comptime host_target.is_wasm)
+                process_provider.unavailable_provider
+            else
+                shell_process_provider.provider,
         };
         auth_runtime.Runtime.initInto(
             &app.auth,
@@ -834,7 +844,7 @@ const App = struct {
         self.stopStream();
 
         self.worker.requestShutdown();
-        self.background.requestStop();
+        self.managed_executions.shutdown();
         self.upgrader.stop();
         self.file_index.requestStop();
 
@@ -842,24 +852,17 @@ const App = struct {
         self.releaseTerminal();
         if (self.worker_thread) |thread| thread.join();
         self.terminal_takeover.deinit(self.alloc);
-        const direct_deinit_disposition = if (capture_resume_handoff)
-            self.terminal_direct.deinitSettled(self.alloc)
-        else blk: {
-            self.terminal_direct.deinitAbnormal(self.alloc, "runtime_failure");
-            break :blk terminal_direct_runtime.DeinitDisposition.abnormal;
-        };
         self.terminal_client.deinit();
+        self.managed_executions.deinit();
         self.model_cache.deinit();
         self.usage_dashboard.deinit();
         InputSubmitRuntime.clearPendingSubmission(self, "shutdown");
-        const resume_handoff = if (capture_resume_handoff and
-            direct_deinit_disposition == .settled)
+        const resume_handoff = if (capture_resume_handoff)
             SessionAppRuntime.finalizePersistenceWithResumeHandoff(self)
         else blk: {
             SessionAppRuntime.finalizePersistence(self);
             break :blk null;
         };
-        self.background.deinit(std.heap.c_allocator);
         self.worker.deinit(std.heap.c_allocator);
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
@@ -987,10 +990,7 @@ const App = struct {
             );
             switch (exit_cause) {
                 .requested_exit => {},
-                .input_closed => {
-                    self.terminal_direct.deinitAbnormal(self.alloc, "input_closed");
-                    return error.TerminalInputClosed;
-                },
+                .input_closed => return error.TerminalInputClosed,
             }
             switch (app_terminal_runtime.Runtime(App).prepareGracefulExit(self)) {
                 .ready => return,
@@ -1007,16 +1007,29 @@ const App = struct {
     }
 
     pub fn loopPollTimeoutMs(ctx: *anyopaque, default_timeout_ms: i32) i32 {
-        const self: *const App = @ptrCast(@alignCast(ctx));
-        if (comptime !host_target.is_wasm) return default_timeout_ms;
+        const self: *App = @ptrCast(@alignCast(ctx));
+        if (comptime !host_target.is_wasm) {
+            return nativeLoopPollTimeoutMs(
+                default_timeout_ms,
+                self.auth.sourceInventoryRefreshActive(),
+                self.skills.refreshActive(),
+                self.fullTranscriptFocusedWorkActive(),
+            );
+        }
         return if (self.pacer.hasPending()) default_timeout_ms else idle_wasm_poll_timeout_ms;
+    }
+
+    fn fullTranscriptFocusedWorkActive(self: *App) bool {
+        if (self.shell.fullTranscriptFocusedWorkActive()) return true;
+        const child = self.subagents.childConversationRuntime() orelse
+            return false;
+        return child.fullTranscriptFocusedWorkActive();
     }
 
     fn processNextCooperativePrompt(self: *App) !void {
         if (comptime !host_target.is_wasm) return;
         try app_process_runtime.Runtime(App).processNextCooperativePrompt(
             self,
-            app_callbacks.Bindings(App).onTaskCompletion,
             app_callbacks.Bindings(App).workerEventHandlers(self),
             flushRequestedFrame,
         );
@@ -1379,8 +1392,6 @@ const App = struct {
         user_prompt_already_presented: bool,
         intent: PromptSubmitIntent,
     ) !bool {
-        try self.reloadSkills();
-
         const source_images = if (recovery_checkpoint) |checkpoint|
             checkpoint.user.images
         else if (prompt_images) |images|
@@ -1881,10 +1892,47 @@ const App = struct {
         return AgentAppRuntime.runSubagentChild(raw, turn, message, admission, cancel);
     }
 
-    pub fn reloadSkills(self: *App) !void {
-        const loaded = try app_runtime_setup.loadSkills(std.heap.c_allocator, self.workspace_root, builtin_skills.root_policy);
-        skill_runtime.traceDiagnostics("interactive_reload", loaded.diagnostics);
-        self.skills.replaceLoaded(std.heap.c_allocator, loaded.dir, loaded.skills, loaded.diagnostics);
+    pub fn requestSkillsRefresh(self: *App) !u64 {
+        const home = try app_runtime_setup.resolveSkillsHome(std.heap.c_allocator);
+        defer if (home) |value| std.heap.c_allocator.free(value);
+        return self.skills.requestRefresh(
+            std.heap.c_allocator,
+            self.workspace_root,
+            home,
+            builtin_skills.root_policy,
+        );
+    }
+
+    pub fn collectPendingSkillRefresh(
+        self: *App,
+        pending: *input_submit_runtime.PendingSubmission,
+    ) !input_submit_runtime.PendingSkillRefresh {
+        if (comptime host_target.is_wasm) return .current;
+        const generation = pending.skill_refresh_generation orelse blk: {
+            const requested = try self.requestSkillsRefresh();
+            pending.skill_refresh_generation = requested;
+            break :blk requested;
+        };
+        return switch (self.skills.generationStatus(generation)) {
+            .pending => .pending,
+            .current => .current,
+            .failed => error.SkillCatalogRefreshFailed,
+        };
+    }
+
+    fn pollSkillsRefresh(self: *App) !skill_runtime.RefreshCompletion {
+        const completion = try self.skills.pollRefresh(
+            std.heap.c_allocator,
+            self.workspace_root,
+            builtin_skills.root_policy,
+        );
+        if (completion == .adopted) {
+            skill_runtime.traceDiagnostics(
+                "interactive_refresh",
+                self.skills.diagnostics,
+            );
+        }
+        return completion;
     }
 
     pub fn allowToolForSession(self: *App, tool_name: []const u8, target_path: []const u8) !void {
@@ -2162,7 +2210,7 @@ const App = struct {
             .text = @constCast(text),
         } });
         if (comptime host_profile.cooperative_agent) {
-            try WorkerAppRuntime.tick(self, app_callbacks.Bindings(App).onTaskCompletion, app_callbacks.Bindings(App).workerEventHandlers(self));
+            try WorkerAppRuntime.tick(self, app_callbacks.Bindings(App).workerEventHandlers(self));
             try self.flushRequestedFrame();
         }
     }
@@ -2227,10 +2275,6 @@ const App = struct {
                 .content = browser_capabilities.model_context,
             });
         }
-    }
-
-    fn runtimeContextSnapshot(self: *App, alloc: Allocator) !RuntimeContextSnapshot {
-        return self.background.snapshot(alloc);
     }
 
     pub fn writeTranscript(self: *App, text: []const u8, record: bool) !void {
@@ -2814,6 +2858,17 @@ const App = struct {
     pub fn loopCollectFacts(ctx: *anyopaque) !void {
         const self: *App = @ptrCast(@alignCast(ctx));
         if (!try WorkerAppRuntime.authorizeInteractiveAdmission(self)) return;
+
+        if (comptime !host_target.is_wasm) {
+            if (self.file_index.joinThreadIfDone(std.heap.c_allocator)) {
+                self.shell.render_requests.request(.footer);
+            }
+            switch (try self.pollSkillsRefresh()) {
+                .none, .unchanged => {},
+                .adopted, .failed => self.shell.render_requests.request(.footer),
+            }
+            try app_commands.Handlers(App).collectSkillsRefreshFacts(self);
+        }
         InputSubmitRuntime.collectPendingSubmissionFacts(self);
 
         if (!self.terminal_takeover.blocksFxSurface(&self.terminal)) {
@@ -2830,11 +2885,6 @@ const App = struct {
             app_permission_runtime.monotonicMillis(),
         );
 
-        if (comptime !host_target.is_wasm) {
-            if (self.file_index.joinThreadIfDone(std.heap.c_allocator)) {
-                self.shell.render_requests.request(.footer);
-            }
-        }
         if (try self.model_cache.pollLoadTransition()) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }
@@ -2854,6 +2904,7 @@ const App = struct {
         try app_commands.Handlers(App).collectMcpAuthenticationFacts(self);
         try app_commands.Handlers(App).collectMcpReloadFacts(self);
         if (comptime host_profile.native_auth or host_profile.js_host_auth) {
+            try AuthAppRuntime.collectSourceInventoryFacts(self);
             try AuthAppRuntime.collectSignInFacts(self);
         }
         if (comptime host_profile.native_auth) {
@@ -2900,12 +2951,77 @@ const App = struct {
         if (comptime !host_target.is_wasm) {
             try SessionAppRuntime.pollSessionPicker(self);
         }
+        try self.shell.prewarmFullTranscriptPage(
+            self.fullTranscriptSidecarCapability(),
+            self.fullTranscriptDiffResolver(),
+        );
         if (try self.shell.pollFullTranscriptPageLoad()) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .modal);
         }
+        if (!self.shell.fullTranscriptActive() and
+            self.shell.takeReadyFullTranscriptOpen() and
+            self.terminal.alternate_screen_owner == .none and
+            !self.approval_prompt.isActive())
+        {
+            try app_lifecycle.openFullTranscript(
+                self.alloc,
+                &self.terminal,
+                &self.shell,
+                &self.metrics,
+            );
+            debug_trace.logf(
+                "full_transcript",
+                "depth_transition from=inline to=full route=root trigger=ctrl_o",
+                .{},
+            );
+            RenderAppRuntime.requestActiveSurfaceFrame(self, .modal);
+        }
+        if (self.shell.takeFullTranscriptPreparationFailure()) {
+            if (self.shell.fullTranscriptActive()) {
+                try app_lifecycle.closeFullTranscript(
+                    self.alloc,
+                    &self.terminal,
+                    &self.shell,
+                    &self.metrics,
+                );
+            }
+            try self.writeDomainNotice(.{
+                .topic = "transcript",
+                .tone = .@"error",
+                .body = "Full transcript preparation failed. The reader was closed instead of showing stale content.",
+            }, true);
+        }
         if (self.subagents.childConversationRuntime()) |child| {
+            try child.prewarmFullTranscriptPage(
+                null,
+                self.subagents.childFullTranscriptDiffResolver(),
+            );
             if (try child.pollFullTranscriptPageLoad()) {
                 RenderAppRuntime.requestActiveSurfaceFrame(self, .modal);
+            }
+            if (!child.fullTranscriptActive() and
+                child.takeReadyFullTranscriptOpen())
+            {
+                _ = try self.subagents.setChildTranscriptPresentationDepth(
+                    self.alloc,
+                    .full,
+                );
+                debug_trace.logf(
+                    "full_transcript",
+                    "depth_transition from=inline to=full route=child trigger=ctrl_o",
+                    .{},
+                );
+                RenderAppRuntime.requestActiveSurfaceFrame(self, .modal);
+            }
+            if (child.takeFullTranscriptPreparationFailure()) {
+                if (child.fullTranscriptActive()) {
+                    _ = try self.subagents.closeChildTranscriptPresentation(self.alloc);
+                }
+                try self.writeDomainNotice(.{
+                    .topic = "transcript",
+                    .tone = .@"error",
+                    .body = "The child full transcript reader was closed because its current page could not be prepared.",
+                }, true);
             }
         }
         if (!self.terminal_takeover.blocksFxSurface(&self.terminal)) {
@@ -2918,7 +3034,7 @@ const App = struct {
             );
             try self.routeTerminalInputIngress(terminal_input);
         }
-        try WorkerAppRuntime.tick(self, app_callbacks.Bindings(App).onTaskCompletion, app_callbacks.Bindings(App).workerEventHandlers(self));
+        try WorkerAppRuntime.tick(self, app_callbacks.Bindings(App).workerEventHandlers(self));
         const now_ns = io_mod.nanoTimestamp();
         if (!self.approval_prompt.isActive() and !self.question_prompt.isActive() and !self.auth.apiKeyEntryActive()) {
             try self.pacer.tick(self.alloc, now_ns, self.pacerCallbacks());
@@ -3169,7 +3285,7 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
             io_mod.setIo(threaded.io());
             try terminal_tmux_session.runLauncher(
                 processAllocator(),
-                background_process.provider,
+                shell_process_provider.provider,
                 raw_args,
             );
             return;
@@ -3212,7 +3328,7 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
             try terminal_host.run(
                 processAllocator(),
                 try terminal_host.Config.fromEnvironment(
-                    background_process.provider,
+                    shell_process_provider.provider,
                 ),
             );
             return;
@@ -3572,6 +3688,14 @@ test "lightweight local commands do not request early threaded io" {
     }
 }
 
+test "focused UI workers retain a bounded native poll timeout" {
+    try std.testing.expectEqual(@as(i32, 8), nativeLoopPollTimeoutMs(8, false, false, false));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, false, false));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, true, false));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, true));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, true, true));
+}
+
 test "footer runtime compatibility facade exports composeFooterFrame" {
     _ = footer_runtime.composeFooterFrame;
 }
@@ -3620,7 +3744,7 @@ fn fullEntryConfig() app_entry_runtime.Config {
         .gateway_chat_url = builtin_gateway.default_chat_url,
         .gateway_provider = native_gateway_provider,
         .provider_set = builtin_providers.native,
-        .background_process_provider = background_process.provider,
+        .process_provider = shell_process_provider.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
         .prompt_policy = builtin_context.prompt_policy,
@@ -3658,7 +3782,7 @@ fn localEntryConfig() app_entry_runtime.Config {
         .gateway_chat_url = builtin_gateway.default_chat_url,
         .gateway_provider = native_gateway_provider,
         .provider_set = builtin_providers.native,
-        .background_process_provider = background_process.provider,
+        .process_provider = shell_process_provider.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
         .prompt_policy = .{ .system_prompt = "" },
@@ -3696,7 +3820,7 @@ fn emptyEntryConfig() app_entry_runtime.Config {
         .gateway_chat_url = "",
         .gateway_provider = native_gateway_provider,
         .provider_set = builtin_providers.native,
-        .background_process_provider = background_process.provider,
+        .process_provider = shell_process_provider.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
         .prompt_policy = .{ .system_prompt = "" },
@@ -3989,80 +4113,6 @@ test "/version command writes version to transcript" {
     try std.testing.expect(std.mem.find(u8, notice.body, version) != null);
 }
 
-test "background process registry ignores stale watcher urls" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const tmp_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
-    defer std.testing.allocator.free(tmp_root);
-    const old_log = try std.fs.path.join(std.testing.allocator, &.{ tmp_root, "old.log" });
-    defer std.testing.allocator.free(old_log);
-    const new_log = try std.fs.path.join(std.testing.allocator, &.{ tmp_root, "new.log" });
-    defer std.testing.allocator.free(new_log);
-    {
-        var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), old_log, .{ .truncate = true });
-        file.close(io_mod.getIo());
-    }
-    {
-        var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), new_log, .{ .truncate = true });
-        file.close(io_mod.getIo());
-    }
-    const Stub = struct {
-        fn match(
-            pid_text: []const u8,
-            _: process_supervisor.ProcessInstanceToken,
-        ) process_supervisor.TokenMatch {
-            return if (std.mem.eql(u8, pid_text, "12345"))
-                .matched
-            else
-                .missing;
-        }
-    };
-    process_supervisor.process_token_match_for_test = Stub.match;
-    defer process_supervisor.process_token_match_for_test = null;
-    const token = try process_supervisor.ProcessInstanceToken.parse(
-        "linux:00112233445566778899aabbccddeeff:12345",
-    );
-
-    var app = App{ .alloc = std.testing.allocator };
-    app.background.process_provider =
-        background_process_provider.process_supervisor_test_provider;
-    defer {
-        app.worker.deinit(std.heap.c_allocator);
-        app.background.deinit(std.heap.c_allocator);
-    }
-
-    const old_id = try app.background.registerBackground(std.heap.c_allocator, .{
-        .pid = "12345",
-        .process_token = token,
-        .command = "npm run dev",
-        .cwd = "/tmp/a",
-        .log_path = old_log,
-        .expect_url = true,
-    });
-    const new_id = try app.background.registerBackground(std.heap.c_allocator, .{
-        .pid = "12345",
-        .process_token = token,
-        .command = "npm run dev",
-        .cwd = "/tmp/b",
-        .log_path = new_log,
-        .expect_url = true,
-    });
-
-    _ = app.background.publishServerUrl(std.heap.c_allocator, old_id, try std.heap.c_allocator.dupe(u8, "http://localhost:3000"));
-
-    var snapshot = try app.runtimeContextSnapshot(std.testing.allocator);
-    defer snapshot.deinit(std.testing.allocator);
-    try std.testing.expectEqual(new_id, snapshot.process_id.?);
-    try std.testing.expect(snapshot.server_url == null);
-
-    const resolved = app.background.publishServerUrl(std.heap.c_allocator, new_id, try std.heap.c_allocator.dupe(u8, "http://localhost:4000")) orelse return error.TestExpectedEqual;
-    std.heap.c_allocator.free(resolved);
-
-    snapshot.deinit(std.testing.allocator);
-    snapshot = try app.runtimeContextSnapshot(std.testing.allocator);
-    try std.testing.expectEqualStrings("http://localhost:4000", snapshot.server_url.?);
-}
-
 test "normalize assistant text removes markdown emphasis and leading blank lines" {
     const normalized = try agent_runtime.normalizeAssistantTextForDisplay(std.testing.allocator, "\n\n**Hola** `mundo`");
     defer std.testing.allocator.free(normalized);
@@ -4175,10 +4225,6 @@ test {
     _ = @import("ui/subagent/runtime.zig");
     _ = @import("core/agent/assistant_presentation.zig");
     _ = @import("core/upgrade/auto_upgrade.zig");
-    _ = @import("core/background/background.zig");
-    _ = @import("core/background/background_commands.zig");
-    _ = @import("core/background/background_runtime.zig");
-    _ = @import("core/background/background_store.zig");
     _ = @import("core/cli/cli_ask.zig");
     _ = @import("core/cli/cli_replay.zig");
     _ = @import("core/cli/cli_surface.zig");
@@ -4242,7 +4288,10 @@ test {
     _ = @import("core/workspace/current_branch.zig");
     _ = @import("core/permissions/permission_gate.zig");
     _ = @import("core/permissions/permissions.zig");
-    _ = @import("core/background/process_supervisor.zig");
+    _ = @import("core/execution/process_identity.zig");
+    _ = @import("core/execution/process_provider.zig");
+    _ = @import("core/execution/managed_execution_contract.zig");
+    _ = @import("core/execution/managed_execution.zig");
     _ = @import("core/execution/process_tree.zig");
     _ = @import("core/config/prompt_policy.zig");
     _ = @import("core/workspace/record_tape.zig");
@@ -4250,6 +4299,7 @@ test {
     _ = @import("core/session/session_commands.zig");
     _ = @import("core/session/session_json.zig");
     _ = @import("core/session/session_store.zig");
+    _ = @import("core/session/legacy_background_migration.zig");
     _ = @import("core/session/prompt_history_store.zig");
     _ = @import("core/app/prompt_history_runtime.zig");
     _ = @import("core/session/web_fetch_artifacts.zig");
@@ -4273,7 +4323,6 @@ test {
     _ = @import("core/subagent/approval_persistence.zig");
     _ = @import("core/subagent/work_events.zig");
     _ = @import("core/terminal/contracts.zig");
-    _ = @import("core/terminal/monitor.zig");
     _ = @import("core/terminal/operation.zig");
     _ = @import("core/terminal/protocol.zig");
     _ = @import("core/terminal/host_policy.zig");
@@ -4284,12 +4333,12 @@ test {
     _ = @import("core/terminal/host.zig");
     _ = @import("core/terminal/tmux_session.zig");
     _ = @import("core/terminal/client.zig");
-    _ = @import("core/terminal/direct_runtime.zig");
+    _ = @import("core/terminal/managed_observer.zig");
     _ = @import("core/app/app_terminal_runtime.zig");
-    _ = @import("tools/terminal/terminal.zig");
+    _ = @import("tools/shell/shell.zig");
+    _ = @import("tools/shell/process_provider.zig");
     _ = @import("core/app/input_approval_runtime.zig");
     _ = @import("acp/sessions.zig");
-    _ = @import("core/tasks/task_helpers.zig");
     _ = @import("core/shared/text_utils.zig");
     _ = @import("core/tooling/tool_projection.zig");
     _ = @import("core/tooling/tool_dispatch.zig");
