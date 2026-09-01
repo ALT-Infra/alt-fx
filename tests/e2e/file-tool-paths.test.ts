@@ -931,7 +931,8 @@ describe("filesystem path handling", () => {
             if (scenario.expectedReview) {
               const reviewBody = classifierGateway.classifierRequests[0]!.body;
               expect(reviewBody).toContain("\"permission_decision\"");
-              expect(reviewBody).toContain("Execute the requested file tool once.");
+              expect(reviewBody).toContain("review_context_kind: normal");
+              expect(reviewBody).not.toContain("Execute the requested file tool once.");
               expect(reviewBody).not.toContain("escalation_reason:");
               expect(reviewBody).not.toContain("workspace:");
               expect(reviewBody).not.toContain("external_file_mutation");
