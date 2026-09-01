@@ -821,10 +821,6 @@ fn buildAgentConfig(
         .advertised_functions = sections.advertised_functions,
         .provider_capabilities = state.cfg.provider_set.select(session.provider).capabilities,
         .custom_tool_guidance = sections.custom_tool_guidance,
-        .persistent_agents_prompt_section = if (state.subagent_host) |subagent_host|
-            subagent_host.agentGuidance()
-        else
-            "",
         .agent_step_limit = session.agent_step_limit,
         .max_tool_result_bytes = session.max_tool_result_bytes,
         .cancel_flag = &session.cancel_flag,
