@@ -6232,9 +6232,10 @@ pub const TranscriptRuntime = struct {
         return self.full_transcript.depth.active();
     }
 
-    pub fn fullTranscriptPageWorkActive(self: *const TranscriptRuntime) bool {
-        return self.full_transcript_page_load.busy() or
-            self.full_transcript_window_load.busy();
+    pub fn fullTranscriptFocusedWorkActive(self: *const TranscriptRuntime) bool {
+        return self.full_transcript_window_load.busy() or
+            (self.full_transcript_page_load.busy() and
+                self.full_transcript_open_request != null);
     }
 
     pub fn transcriptPresentationDepth(

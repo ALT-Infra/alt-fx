@@ -1031,17 +1031,17 @@ const App = struct {
                 default_timeout_ms,
                 self.auth.sourceInventoryRefreshActive(),
                 self.skills.refreshActive(),
-                self.fullTranscriptPageWorkActive(),
+                self.fullTranscriptFocusedWorkActive(),
             );
         }
         return if (self.pacer.hasPending()) default_timeout_ms else idle_wasm_poll_timeout_ms;
     }
 
-    fn fullTranscriptPageWorkActive(self: *App) bool {
-        if (self.shell.fullTranscriptPageWorkActive()) return true;
+    fn fullTranscriptFocusedWorkActive(self: *App) bool {
+        if (self.shell.fullTranscriptFocusedWorkActive()) return true;
         const child = self.subagents.childConversationRuntime() orelse
             return false;
-        return child.fullTranscriptPageWorkActive();
+        return child.fullTranscriptFocusedWorkActive();
     }
 
     fn processNextCooperativePrompt(self: *App) !void {
