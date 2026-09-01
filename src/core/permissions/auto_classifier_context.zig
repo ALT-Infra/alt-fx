@@ -64,6 +64,13 @@ pub fn currentRootUserRequest(context: []const u8) ?[]const u8 {
     return lineValue(context, current_label);
 }
 
+/// Returns the validated canonical root-request prefix without detached
+/// permission feedback. The returned slice borrows `context`.
+pub fn rootUserRequestContext(context: []const u8) ?[]const u8 {
+    if (!isCanonicalRootUserContext(context)) return null;
+    return context[0..canonicalFeedbackStart(context)];
+}
+
 fn canonicalTextLine(line: []const u8, label: []const u8) bool {
     if (!std.mem.startsWith(u8, line, label)) return false;
     const value = line[label.len..];
@@ -794,6 +801,27 @@ test "current root request comes only from canonical bounded context" {
         "assistant_task: inspect the requested file\n",
     ) == null);
     try std.testing.expect(currentRootUserRequest(
+        "current_request: missing terminator",
+    ) == null);
+}
+
+test "root user request context excludes permission feedback" {
+    const context =
+        "current_request: inspect the requested file\n" ++
+        "first_root_user_request: preserve the repository\n" ++
+        "recent_root_user_request: continue the fix\n" ++
+        "omitted_proven_root_user_turns: 2\n" ++
+        "trusted_user_permission_feedback: allow the prior exact action\n" ++
+        "omitted_trusted_user_permission_feedback: 1\n";
+
+    try std.testing.expectEqualStrings(
+        "current_request: inspect the requested file\n" ++
+            "first_root_user_request: preserve the repository\n" ++
+            "recent_root_user_request: continue the fix\n" ++
+            "omitted_proven_root_user_turns: 2\n",
+        rootUserRequestContext(context).?,
+    );
+    try std.testing.expect(rootUserRequestContext(
         "current_request: missing terminator",
     ) == null);
 }

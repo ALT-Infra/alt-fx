@@ -1877,7 +1877,7 @@ test "interactive app prepared file mutation callback applies app permission pol
         .pending_assistant = .{ .role = .assistant, .tool_calls = &review_calls },
         .target_call_id = call.id,
         .origin = .root,
-        .current_root_request = review_root_messages[0],
+        .trusted_root_context = review_root_messages[0],
     };
     const outcome = try callback(
         deps.ctx,

@@ -2333,7 +2333,7 @@ const TestReviewTurn = struct {
             .pending_assistant = .{ .role = .assistant, .tool_calls = &self.tool_calls },
             .target_call_id = self.tool_calls[0].id,
             .origin = .root,
-            .current_root_request = self.root_messages[0],
+            .trusted_root_context = self.root_messages[0],
         };
     }
 };
@@ -6444,7 +6444,7 @@ test "fx ask auto mode uses automatic allow for external prepared file mutation"
         ) anyerror!permission_auto_classifier.ParseOutcome {
             const self: *@This() = @ptrCast(@alignCast(raw_ctx));
             self.calls += 1;
-            self.root_text = request.review_turn.current_root_request;
+            self.root_text = request.review_turn.trusted_root_context;
             try std.testing.expect(request.targets.len >= 1);
             const file = switch (request.action) {
                 .file_mutation => |value| value,

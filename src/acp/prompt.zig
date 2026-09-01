@@ -1349,7 +1349,7 @@ const TestReviewTurn = struct {
             .pending_assistant = .{ .role = .assistant, .tool_calls = &self.tool_calls },
             .target_call_id = self.tool_calls[0].id,
             .origin = .root,
-            .current_root_request = self.root_messages[0],
+            .trusted_root_context = self.root_messages[0],
         };
     }
 };
@@ -4133,7 +4133,7 @@ test "ACP auto mode uses automatic review clear and caution without prompting" {
         ) anyerror!permission_auto_classifier.ParseOutcome {
             const self: *@This() = @ptrCast(@alignCast(raw_ctx));
             self.calls += 1;
-            self.root_text = request.review_turn.current_root_request;
+            self.root_text = request.review_turn.trusted_root_context;
             return .{ .valid = .{
                 .risk = if (self.decision == .clear) .low else .high,
                 .decision = self.decision,
@@ -4233,7 +4233,7 @@ test "ACP auto mode automatic review clears or cautions prepared external file m
         ) anyerror!permission_auto_classifier.ParseOutcome {
             const self: *@This() = @ptrCast(@alignCast(raw_ctx));
             self.calls += 1;
-            self.root_text = request.review_turn.current_root_request;
+            self.root_text = request.review_turn.trusted_root_context;
             self.saw_file_mutation_context = std.meta.activeTag(request.action) == .file_mutation;
             return .{ .valid = .{
                 .risk = if (self.decision == .clear) .low else .high,

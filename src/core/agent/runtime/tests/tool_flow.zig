@@ -1600,7 +1600,10 @@ test "resumed persistent child review rejects child-authored authority provenanc
 
     try std.testing.expectEqual(@as(usize, 1), hooks.permission_user_intent_contexts.items.len);
     const review_context = hooks.permission_user_intent_contexts.items[0];
-    try std.testing.expectEqualStrings("Inspect the repository only.\n", review_context);
+    try std.testing.expectEqualStrings(
+        "current_request: Inspect the repository only.\n",
+        review_context,
+    );
     try std.testing.expect(std.mem.find(
         u8,
         review_context,
@@ -4086,7 +4089,7 @@ test "three distinct review cautions preserve an exhausted positive step cap" {
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
 }
 
-test "permission review receives only the current proven root request" {
+test "permission review receives bounded root requests without permission feedback" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_1", "write_file", "{\"path\":\"a\",\"content\":\"x\"}")};
     const completions = [_]FakeCompletion{
@@ -4147,10 +4150,14 @@ test "permission review receives only the current proven root request" {
 
     try std.testing.expectEqual(@as(usize, 1), hooks.permission_user_intent_contexts.items.len);
     const context = hooks.permission_user_intent_contexts.items[0];
+    try std.testing.expectEqualStrings(
+        auto_classifier_context.rootUserRequestContext(job.root_user_intent_context).?,
+        context,
+    );
     try std.testing.expect(std.mem.find(u8, context, "Go ahead.") != null);
-    try std.testing.expect(std.mem.find(u8, context, "Inspect the final state before continuing.") == null);
-    try std.testing.expect(std.mem.find(u8, context, "true first root request") == null);
-    try std.testing.expect(std.mem.find(u8, context, "Create a.txt in the workspace.") == null);
+    try std.testing.expect(std.mem.find(u8, context, "Inspect the final state before continuing.") != null);
+    try std.testing.expect(std.mem.find(u8, context, "true first root request") != null);
+    try std.testing.expect(std.mem.find(u8, context, "Create a.txt in the workspace.") != null);
     try std.testing.expect(std.mem.find(u8, context, "surviving recent assistant") == null);
     try std.testing.expect(std.mem.find(u8, context, "excluded older assistant") == null);
     try std.testing.expect(std.mem.find(u8, context, "Do not make any more file changes.") == null);

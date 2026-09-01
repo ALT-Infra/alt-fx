@@ -123,6 +123,17 @@ function toolResultText(
   return content as string;
 }
 
+function reviewerText(body: string): string {
+  const request = JSON.parse(body) as {
+    prompt?: Array<{ content?: Array<{ type?: string; text?: string }> }>;
+  };
+  return (request.prompt ?? [])
+    .flatMap((message) => message.content ?? [])
+    .filter((part) => part.type === "text")
+    .map((part) => part.text ?? "")
+    .join("\n");
+}
+
 function installRecorder(root: IsolatedRoot, name: string, marker: string) {
   const bin = join(root.root, "bin");
   mkdirSync(bin, { recursive: true });
@@ -400,24 +411,68 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
+    "normal deployment review ignores conflicting task text",
+    async () => {
+      const root = createIsolatedRoot();
+      const marker = join(root.root, "deployment-ran");
+      const bin = installRecorder(root, "vercel", marker);
+      const deployCommand = `${join(bin, "vercel")} deploy --prod`;
+      const gateway = startGateway(
+        [
+          userCommandCall(deployCommand, "normal_deploy"),
+          fakeGatewayFinalText("deployment completed"),
+        ],
+        [fakeGatewayPermissionDecision("clear", "normal_deploy_clear")],
+      );
+
+      const result = await runFx(
+        [
+          "ask",
+          "--quiet",
+          "--json",
+          "--no-save",
+          "Inspect the local site only. Do not deploy it.",
+        ],
+        {
+          cwd: root.workspace,
+          env: {
+            ...gatewayEnv(root, gateway),
+            PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(1);
+      const review = reviewerText(gateway.classifierRequests[0]!.body);
+      expect(review).toContain("review_context_kind: normal");
+      expect(review).not.toContain("Inspect the local site only");
+      expect(existsSync(marker)).toBe(true);
+      expect(result.stderr).not.toContain(COMMAND_APPROVAL_PROMPT);
+    },
+    TIMEOUT,
+  );
+
+  test(
     "explicit destructive commands reach the reviewer and clear exact actions",
     async () => {
-      for (const [name, command] of [
-        ["rm", "rm disposable.txt"],
-        ["rmdir", "rmdir disposable-dir"],
-        ["unlink", "unlink disposable-link"],
-        ["shred", "shred disposable.txt"],
-        ["git_clean", "git clean -fd"],
-        ["git_rm", "git rm tracked.txt"],
-        ["git_rm_separator", "git rm -- -n"],
-        ["git_clean_separator", "git clean -f -- -n"],
-        ["git_clean_exclude_short", "git clean -f -e --dry-run"],
-        ["git_clean_exclude_long", "git clean -f --exclude --dry-run"],
-        ["git_reset", "git reset --hard HEAD~1"],
-        ["git_reset_boundary", "git reset --hard; printf ok"],
-        ["compound_rm", "pwd && rm compound.txt"],
-        ["rm_boundary", "rm victim; printf ok"],
-        ["escaped_space_rm", "printf foo\\ #bar; rm victim"],
+      for (const [name, commandForBin] of [
+        ["rm", (bin: string) => `${join(bin, "rm")} disposable.txt`],
+        ["rmdir", (bin: string) => `${join(bin, "rmdir")} disposable-dir`],
+        ["unlink", (bin: string) => `${join(bin, "unlink")} disposable-link`],
+        ["shred", (bin: string) => `${join(bin, "shred")} disposable.txt`],
+        ["git_clean", (bin: string) => `${join(bin, "git")} clean -fd`],
+        ["git_rm", (bin: string) => `${join(bin, "git")} rm tracked.txt`],
+        ["git_rm_separator", (bin: string) => `${join(bin, "git")} rm -- -n`],
+        ["git_clean_separator", (bin: string) => `${join(bin, "git")} clean -f -- -n`],
+        ["git_clean_exclude_short", (bin: string) => `${join(bin, "git")} clean -f -e --dry-run`],
+        ["git_clean_exclude_long", (bin: string) => `${join(bin, "git")} clean -f --exclude --dry-run`],
+        ["git_reset", (bin: string) => `${join(bin, "git")} reset --hard HEAD~1`],
+        ["git_reset_boundary", (bin: string) => `${join(bin, "git")} reset --hard; printf ok`],
+        ["compound_rm", (bin: string) => `pwd && ${join(bin, "rm")} compound.txt`],
+        ["rm_boundary", (bin: string) => `${join(bin, "rm")} victim; printf ok`],
+        ["escaped_space_rm", (bin: string) => `printf foo\\ #bar; ${join(bin, "rm")} victim`],
       ] as const) {
         const root = createIsolatedRoot();
         const marker = join(root.root, `${name}-reviewed-and-ran`);
@@ -425,7 +480,7 @@ describe("lean auto mode reliability", () => {
         for (const executable of ["rmdir", "unlink", "shred", "git"]) {
           bin = installRecorder(root, executable, marker);
         }
-        const reviewedCommand = `export PATH=${JSON.stringify(bin)}:$PATH; ${command}`;
+        const reviewedCommand = commandForBin(bin);
         const gateway = startGateway(
           [
             userCommandCall(reviewedCommand, `reviewed_${name}`),
@@ -451,10 +506,14 @@ describe("lean auto mode reliability", () => {
 
         expect(
           result.code,
-          `command: ${command}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`,
+          `command: ${reviewedCommand}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`,
         ).toBe(0);
         expect(result.stdout).toContain(`${name} reviewed and ran`);
         expect(gateway.classifierRequests).toHaveLength(1);
+        const review = reviewerText(gateway.classifierRequests[0]!.body);
+        expect(review).toContain("review_context_kind: contextual");
+        expect(review).toContain(`Run exactly this requested ${name} command.`);
+        expect(review).not.toContain("trusted_user_permission_feedback:");
         expect(gateway.requests).toHaveLength(2);
         expect(existsSync(marker)).toBe(true);
       }
@@ -669,7 +728,7 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
-    "oversized history gives the reviewer only the current root request",
+    "normal review omits root context regardless of oversized history",
     async () => {
       const root = createIsolatedRoot();
       const blockedMarker = join(root.workspace, "oversized-history-must-not-run");
@@ -736,7 +795,8 @@ describe("lean auto mode reliability", () => {
         .map((part) => part.text ?? "")
         .join("");
       expect(Buffer.byteLength(rootContext)).toBeLessThanOrEqual(1024);
-      expect(rootContext).toContain("current-required-marker");
+      expect(rootContext).toContain("review_context_kind: normal");
+      expect(rootContext).not.toContain("current-required-marker");
       expect(rootContext).not.toContain("first-required-marker");
       expect(rootContext).not.toContain("newest-recent-required-marker");
       expect(rootContext).not.toContain("older-middle-marker");
