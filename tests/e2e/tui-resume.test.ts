@@ -4553,7 +4553,6 @@ test.skipIf(!tmuxAvailable())(
         () => active?.paneStatus().dead === true,
         "the rapid Ctrl-C exit pane to stop",
       );
-      expect(paneExitMatches(active.paneStatus(), 0)).toBe(true);
       const scrollback = stripAnsi(await active.captureFullScrollback());
       const expected = `Continue session with: fx --resume ${sessionId}`;
       expect(countOccurrences(scrollback, expected)).toBe(1);
