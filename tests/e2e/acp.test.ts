@@ -1343,7 +1343,7 @@ describe("acp: model-independent", () => {
         expect(gateway.requests).toHaveLength(1);
         const request = acpGatewayRequest(gateway.requests[0]!.body);
         expect(request.tools.some((tool) => tool.name === "private_lookup")).toBe(false);
-        expect(request.tools.some((tool) => tool.name === "terminal")).toBe(true);
+        expect(request.tools.some((tool) => tool.name === "shell")).toBe(true);
         expect(gateway.requests[0]!.body).not.toContain("PRIVATE_LIBFX_INSTRUCTIONS");
         expect(client.stderr).toBe("");
       } finally {
