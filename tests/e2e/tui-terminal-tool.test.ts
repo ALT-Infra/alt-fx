@@ -232,13 +232,77 @@ test.skipIf(!tmuxAvailable())(
       gateway.requests[1]!.body,
       "shell_run",
     );
-    expect(runResult).toContain('\\"next_action\\":{\\"action\\":\\"wait\\"');
+    expect(runResult).not.toContain('\\"next_action\\"');
     expect(runResult).toContain(`\\"session_id\\":\\"${sessionId}\\"`);
     const scrollback = await active.captureFullScrollback();
     expect(scrollback).toContain("Ran printf CAPTURED_READY");
     expect(scrollback).toContain(`Finished waiting for session ${sessionId}`);
     expect(scrollback).not.toContain("Using terminal");
     expect(scrollback).not.toContain("Used terminal");
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "shell run handoff returns control and restores tools on the next user turn",
+  async () => {
+    const fixture = createFixture("fx-shell-next-turn-handoff-");
+    let sessionId = "";
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("shell_handoff_run", "shell", {
+        request: {
+          action: "run",
+          command: "printf HANDOFF_READY; sleep 30",
+          profile: "clean",
+          yield_time_ms: 0,
+          handoff: "next_turn",
+        },
+      }),
+      (body) => {
+        sessionId = findSessionId(JSON.parse(body)) ?? "";
+        if (!sessionId) return new Response("missing session id", { status: 500 });
+        if (!body.includes('"toolChoice":{"type":"none"}')) {
+          return new Response("handoff did not force a text response", { status: 500 });
+        }
+        if (body.includes("Continue the original task. If work remains")) {
+          return new Response("handoff injected a conflicting continuation prompt", { status: 500 });
+        }
+        return fakeGatewayFinalText("PHASE_ONE_READY");
+      },
+      (body) => {
+        if (body.includes('"toolChoice":{"type":"none"}')) {
+          return new Response("next user turn did not restore tools", { status: 500 });
+        }
+        return fakeGatewayToolCall("shell_handoff_stop", "shell", {
+          request: {
+            action: "stop",
+            session_id: sessionId,
+            force: true,
+          },
+        });
+      },
+      fakeGatewayFinalText("PHASE_TWO_READY"),
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway);
+
+    await active.sendText("Start the command and return control while it remains active.");
+    await active.sendKeys("Enter");
+    await active.waitForText("PHASE_ONE_READY", TIMEOUT);
+    expect(sessionId.length).toBeGreaterThan(0);
+    expect(toolResultEnvelope(
+      gateway.requests[1]!.body,
+      "shell_handoff_run",
+    )).not.toContain('\\"next_action\\"');
+
+    await active.sendText("Stop the exact retained command now.");
+    await active.sendKeys("Enter");
+    await active.waitForText("PHASE_TWO_READY", TIMEOUT);
+    expect(toolResultEnvelope(
+      gateway.requests[3]!.body,
+      "shell_handoff_stop",
+    )).toContain('\\"state\\":\\"stopped\\"');
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
   TIMEOUT,

@@ -38,6 +38,7 @@ pub const Action = enum {
 
 const ShellKind = enum { executable };
 const PayloadKind = enum { text, keys, controls, paste };
+const Handoff = enum { next_turn };
 
 pub const ShellInput = struct {
     kind: ShellKind,
@@ -61,6 +62,7 @@ pub const Input = struct {
     tty: bool = false,
     yield_time_ms: u32 = managed_contract.default_yield_time_ms,
     timeout_ms: ?u64 = null,
+    handoff: ?Handoff = null,
     session_id: ?[]const u8 = null,
     wait_ceiling_ms: u32 = managed_contract.default_wait_ceiling_ms,
     input: ?WriteInput = null,
@@ -83,7 +85,7 @@ pub const ActionFieldContract = struct {
 pub fn actionFieldContract(action: Action) ActionFieldContract {
     return switch (action) {
         .run => .{
-            .allowed = &.{ "action", "command", "cwd", "profile", "shell", "tty", "yield_time_ms", "timeout_ms" },
+            .allowed = &.{ "action", "command", "cwd", "profile", "shell", "tty", "yield_time_ms", "timeout_ms", "handoff" },
             .required = &.{ "action", "command" },
             .conflicts = &.{.{ "profile", "shell" }},
         },
@@ -411,7 +413,7 @@ fn callRun(
         return runtimeFailure(ctx, err);
     };
     defer prepared.deinit(ctx.allocator);
-    return finishPrepared(ctx, runtime, &prepared, .command);
+    return finishRun(ctx, runtime, &prepared, input.handoff);
 }
 
 fn callWait(
@@ -594,7 +596,7 @@ fn callTtyRun(
     session_owned = false;
     defer prepared.deinit(ctx.allocator);
     _ = owner;
-    return finishPrepared(ctx, runtime, &prepared, .command);
+    return finishRun(ctx, runtime, &prepared, input.handoff);
 }
 
 fn callTtyWait(
@@ -1255,6 +1257,33 @@ fn finishPrepared(
         .{ .success = body };
 }
 
+fn finishRun(
+    ctx: tool_dispatch.DispatchContext,
+    runtime: *managed_execution.Runtime,
+    prepared: *managed_execution.PreparedSnapshot,
+    handoff: ?Handoff,
+) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+    const result = try finishPrepared(ctx, runtime, prepared, .command);
+    switch (result) {
+        .success => if (turnControlForRun(handoff, prepared.snapshot.state)) |control| {
+            tool_dispatch.reportTurnControl(ctx, control);
+        },
+        .failure => {},
+    }
+    return result;
+}
+
+fn turnControlForRun(
+    handoff: ?Handoff,
+    state: managed_execution.SnapshotState,
+) ?tool_dispatch.TurnControl {
+    if (handoff != .next_turn) return null;
+    return switch (state) {
+        .running => .return_to_user,
+        .completed, .stopped, .lost => null,
+    };
+}
+
 fn publishSnapshotMetadata(
     ctx: tool_dispatch.DispatchContext,
     snapshot: managed_execution.Snapshot,
@@ -1450,19 +1479,6 @@ fn formatSnapshotRaw(
     output_delta: []const u8,
     output_truncated: bool,
 ) ![]u8 {
-    const NextAction = struct {
-        action: []const u8,
-        session_id: []const u8,
-        instruction: []const u8,
-    };
-    const next_action: ?NextAction = switch (snapshot.state) {
-        .running => .{
-            .action = "wait",
-            .session_id = snapshot.execution_id,
-            .instruction = "Execution is still running. Call shell.wait again with this session_id; do not rerun or stop it unless cancellation was requested.",
-        },
-        .completed, .stopped, .lost => null,
-    };
     const status = switch (snapshot.state) {
         .completed => |value| value,
         .stopped => |value| value,
@@ -1492,7 +1508,6 @@ fn formatSnapshotRaw(
         .duration_ms = snapshot.duration_ms,
         .accepted_bytes = accepted_bytes,
         .@"error" = snapshot.error_name,
-        .next_action = next_action,
         .retry_guidance = switch (snapshot.state) {
             .lost => "Execution status is indeterminate. Inspect external state before retrying; do not blindly rerun a command that may have changed state.",
             .running, .completed, .stopped => null,
@@ -1643,7 +1658,7 @@ pub fn isIrreversible(_: tool_dispatch.ToolInput) bool {
 test "shell action fields are closed and command authority covers every run" {
     try std.testing.expectEqualSlices(
         []const u8,
-        &.{ "action", "command", "cwd", "profile", "shell", "tty", "yield_time_ms", "timeout_ms" },
+        &.{ "action", "command", "cwd", "profile", "shell", "tty", "yield_time_ms", "timeout_ms", "handoff" },
         actionFieldContract(.run).allowed,
     );
     try std.testing.expectEqualSlices(
@@ -1762,6 +1777,47 @@ test "shell decoder applies Codex parity observation defaults" {
     }
 }
 
+test "shell decoder accepts next turn handoff only for run" {
+    const alloc = std.testing.allocator;
+    const ctx = tool_dispatch.DispatchContext{ .allocator = alloc };
+    const run_decoded = try decode(
+        ctx,
+        "{\"action\":\"run\",\"command\":\"sleep 30\",\"yield_time_ms\":0,\"handoff\":\"next_turn\"}",
+    );
+    switch (run_decoded) {
+        .failure => |failure| {
+            defer alloc.free(failure);
+            return error.TestUnexpectedResult;
+        },
+        .input => |input| input.deinit(alloc),
+    }
+
+    const wait_decoded = try decode(
+        ctx,
+        "{\"action\":\"wait\",\"session_id\":\"shell-session\",\"handoff\":\"next_turn\"}",
+    );
+    switch (wait_decoded) {
+        .input => |input| {
+            defer input.deinit(alloc);
+            return error.TestUnexpectedResult;
+        },
+        .failure => |failure| {
+            defer alloc.free(failure);
+        },
+    }
+}
+
+test "next turn handoff applies only to a running run result" {
+    try std.testing.expectEqual(
+        tool_dispatch.TurnControl.return_to_user,
+        turnControlForRun(.next_turn, .running).?,
+    );
+    try std.testing.expect(turnControlForRun(.next_turn, .{
+        .completed = .{ .exit_code = 0 },
+    }) == null);
+    try std.testing.expect(turnControlForRun(null, .running) == null);
+}
+
 test "stopped execution is a successful shell observation without command failure metadata" {
     const alloc = std.testing.allocator;
     const statuses = [_]command_contract.CommandStatus{
@@ -1841,7 +1897,7 @@ test "shell snapshot keeps bounded head tail and control metadata" {
     try std.testing.expect(std.mem.find(u8, projected, "bytes omitted") != null);
 }
 
-test "running shell snapshot directs the same handle to wait again" {
+test "running shell snapshot leaves continuation intent to the caller" {
     const alloc = std.testing.allocator;
     const body = try formatSnapshot(alloc, .{
         .execution_id = @constCast("shell-running"),
@@ -1856,17 +1912,15 @@ test "running shell snapshot directs the same handle to wait again" {
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
-    const next_action = parsed.value.object.get("next_action").?.object;
-    try std.testing.expectEqualStrings("wait", next_action.get("action").?.string);
+    try std.testing.expect(parsed.value.object.get("next_action") == null);
     try std.testing.expectEqualStrings(
         "shell-running",
-        next_action.get("session_id").?.string,
+        parsed.value.object.get("session_id").?.string,
     );
-    try std.testing.expect(std.mem.find(
-        u8,
-        next_action.get("instruction").?.string,
-        "do not rerun or stop",
-    ) != null);
+    try std.testing.expectEqualStrings(
+        "running",
+        parsed.value.object.get("state").?.string,
+    );
 }
 
 test "registered shell run yields and waits through one managed execution" {

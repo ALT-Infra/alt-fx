@@ -120,6 +120,10 @@ pub const SelectedDynamicToolSinkFn = *const fn (
 
 pub const ContextNoticeSinkFn = *const fn (?*anyopaque, []const u8) error{OutOfMemory}!void;
 
+pub const TurnControl = enum {
+    return_to_user,
+};
+
 /// Erased, owned typed input decoded by a concrete tool.
 pub const ToolInput = struct {
     ptr: *anyopaque,
@@ -266,6 +270,7 @@ pub const DispatchContext = struct {
     web_fetch_completion_sink: ?*?core_types.WebFetchCompletion = null,
     tool_result_memory_sink: ?*?core_types.ToolResultMemory = null,
     command_result_json_sink: ?*?[]const u8 = null,
+    turn_control_sink: ?*?TurnControl = null,
     result_commit_sink: ?*?result_commit.Token = null,
 };
 
@@ -926,6 +931,11 @@ pub fn reportToolResultMemory(ctx: DispatchContext, memory: core_types.ToolResul
 pub fn reportCommandResultJson(ctx: DispatchContext, json: []const u8) void {
     const sink = ctx.command_result_json_sink orelse return;
     sink.* = json;
+}
+
+pub fn reportTurnControl(ctx: DispatchContext, control: TurnControl) void {
+    const sink = ctx.turn_control_sink orelse return;
+    sink.* = control;
 }
 
 pub fn reportResultCommit(ctx: DispatchContext, token: result_commit.Token) void {
