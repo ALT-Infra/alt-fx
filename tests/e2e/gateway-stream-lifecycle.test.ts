@@ -6406,6 +6406,74 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
+  test("post-tool provider retry keeps recovery system provider-valid", async () => {
+    const root = createFixtureRoot("post-tool-retry-order");
+    const tracePath = join(root.root, "trace.log");
+    writeFileSync(join(root.workspace, "fixture.txt"), "deterministic fixture\n");
+    let requestIndex = 0;
+    const recoveredText = "Recovered after provider-valid retry.";
+    const gateway = startDynamicFakeGateway((body) => {
+      requestIndex += 1;
+      if (requestIndex === 1) {
+        return fakeGatewayToolCall("read_retry_order", "read_file", {
+          path: "fixture.txt",
+        });
+      }
+      if (requestIndex === 2) return unavailableResponse();
+
+      const prompt = gatewayRequest(body).prompt;
+      let sawNonSystem = false;
+      const invalidSystemIndex = prompt.findIndex((message, index) => {
+        if (message.role !== "system") {
+          sawNonSystem = true;
+          return false;
+        }
+        if (!sawNonSystem || index === prompt.length - 1) return false;
+        return prompt[index + 1]?.role !== "assistant";
+      });
+      if (invalidSystemIndex >= 0) {
+        return new Response(
+          JSON.stringify({
+            error: {
+              message:
+                `messages.${invalidSystemIndex}: role 'system' must precede an 'assistant' message or end the array`,
+            },
+          }),
+          { status: 400, headers: { "content-type": "application/json" } },
+        );
+      }
+      return fakeGatewayFinalText(recoveredText);
+    }, {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Read fixture.txt, then continue."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+      const retryPrompt = gatewayRequest(gateway.requests[2]!.body).prompt;
+
+      expect(result.code).toBe(0);
+      expect(json.exit_code).toBe(0);
+      expect(json.output).toBe(recoveredText);
+      expect(json.tool_calls).toEqual([{ name: "read_file", status: "success" }]);
+      expect(gateway.requestCount()).toBe(3);
+      expect(retryPrompt.at(-2)?.role).toBe("user");
+      expect(contentText(retryPrompt.at(-2)?.content)).toBe(POST_TOOL_DECISION_PROMPT);
+      expect(retryPrompt.at(-1)?.role).toBe("system");
+      expect(contentText(retryPrompt.at(-1)?.content)).toContain("<network_recovery>");
+      expect(result.stderr).not.toContain("HTTP 400");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
   test("streamed tool calls without finish reconcile without executing the uncertain call", async () => {
     const root = createFixtureRoot("tool-without-finish");
     const tracePath = join(root.root, "trace.log");
