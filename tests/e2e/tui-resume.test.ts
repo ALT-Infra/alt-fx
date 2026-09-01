@@ -4441,6 +4441,7 @@ test.skipIf(!tmuxAvailable())(
       await active.sendText("Save this conversation for the exit handoff.");
       await active.waitForText(marker, TIMEOUT);
       const sessionId = sessionIdFromHome(home);
+      expect(sessionId).toMatch(/^[A-Za-z0-9_-]{12}$/);
 
       await active.sendText("/quit");
       await waitForCondition(
