@@ -33,6 +33,7 @@ import {
   fakeGatewaySerializedToolCall,
   fakeGatewaySse,
   fakeGatewayToolCall,
+  fakeShellRun,
   POST_TOOL_DECISION_PROMPT,
   startDynamicFakeGateway,
   startFakeGateway,
@@ -144,8 +145,10 @@ function lengthLimitedCommandCall(command: string) {
     {
       type: "tool-call",
       toolCallId: "command_1",
-      toolName: "terminal",
-      input: { action: "exec", timeout_ms: 600_000, command },
+      toolName: "shell",
+      input: {
+        request: { action: "run", yield_time_ms: 30_000, timeout_ms: 600_000, command },
+      },
     },
     {
       type: "finish",
@@ -976,7 +979,7 @@ function createShortIsolatedRoot(prefix: string) {
 }
 
 async function waitForTerminalHostExit(root: string): Promise<void> {
-  const identityPath = join(root, "home", ".fx", "terminal-host", "host.json");
+  const identityPath = join(root, "home", ".fx", "terminal-host-v7", "host.json");
   const deadline = Date.now() + TERMINAL_HOST_EXIT_TIMEOUT_MS;
   while (Date.now() < deadline) {
     if (!existsSync(identityPath)) return;
@@ -1469,7 +1472,7 @@ describe("acp: model-independent", () => {
         expect(toolNames).toEqual(
           AUTO_EXA_SERIALIZED_TOOL_NAMES,
         );
-        expect(toolNames.filter((name) => name === "terminal")).toHaveLength(1);
+        expect(toolNames.filter((name) => name === "shell")).toHaveLength(1);
         expect(toolNames.filter((name) => name === "exa_search"))
           .toHaveLength(1);
         expect(findUnavailableCapabilityReferences(oracleRequest)).toEqual([]);
@@ -1752,26 +1755,26 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "ACP executes the shared public terminal tool through the native backend",
+    "ACP executes the shared managed shell TTY path",
     async () => {
       const root = createShortIsolatedRoot("fx-acp-terminal-");
-      const toolCallId = "acp_terminal_native_1";
+      const toolCallId = "acp_shell_tty_1";
       const gateway = startFakeGateway([
-        fakeGatewayToolCall(toolCallId, "terminal", {
-          action: "start",
-          cwd: root.workspace,
-          command: "printf ACP_PUBLIC_TERMINAL_NATIVE",
-          shell: {
-            kind: "executable",
-            path: TERMINAL_FIXTURE_SHELL,
-            clean_start: true,
+        fakeGatewayToolCall(toolCallId, "shell", {
+          request: {
+            action: "run",
+            cwd: root.workspace,
+            command: "printf ACP_PUBLIC_SHELL_TTY",
+            shell: {
+              kind: "executable",
+              path: TERMINAL_FIXTURE_SHELL,
+              clean_start: true,
+            },
+            tty: true,
+            yield_time_ms: 30_000,
           },
-          backend: "native",
-          return_when: { kind: "exit" },
-          wait_ceiling_ms: 5_000,
-          dimensions: { rows: 24, columns: 80 },
         }),
-        finalText("ACP public terminal complete"),
+        finalText("ACP public shell complete"),
       ]);
       try {
         client = await AcpClient.create({
@@ -1786,7 +1789,7 @@ describe("acp: model-independent", () => {
         await client.request("session/set_mode", { modeId: "ask" }, 4);
         const result = await runPrompt(
           client,
-          "Run the native public terminal fixture.",
+          "Run the managed shell TTY fixture.",
           TIMEOUT,
         );
 
@@ -1796,9 +1799,9 @@ describe("acp: model-independent", () => {
           gateway.requests[1]!.body,
           toolCallId,
         );
-        expect(toolResult).toContain('"success":{"start"');
-        expect(toolResult).toContain('"backend":"native"');
-        expect(toolResult).toContain('"exited":0');
+        expect(toolResult).toContain('"state":"completed"');
+        expect(toolResult).toContain('"backend":"tty"');
+        expect(toolResult).toContain('"exit_code":0');
         expect(toolResult).not.toContain("owner_authority");
         expect(toolResult).not.toContain("proof");
         expect(client.stderr).toBe("");
@@ -7164,10 +7167,8 @@ describe("acp: model-independent", () => {
         JSON.stringify({ permission: { bash: { "printf *": "ask" } } }),
       );
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("approved_command_1", "terminal", {
-          action: "exec",
+        fakeShellRun("approved_command_1", `printf approved > '${marker}'`, {
           timeout_ms: 600_000,
-          command: `printf approved > '${marker}'`,
         }),
         finalText("command approval complete"),
       ]);
@@ -7948,11 +7949,11 @@ describe("acp: model-independent", () => {
       const heldReview = deferred<Response>();
       const gateway = startFakeGateway(
         [
-          fakeGatewayToolCall("cancelled_review_command", "terminal", {
-            action: "exec",
-            timeout_ms: 600_000,
-            command: `printf cancelled > ${JSON.stringify(marker)}`,
-          }),
+          fakeShellRun(
+            "cancelled_review_command",
+            `printf cancelled > ${JSON.stringify(marker)}`,
+            { timeout_ms: 600_000 },
+          ),
           finalText("follow-up after ACP review cancellation"),
         ],
         { classifierResponses: [() => heldReview.promise] },

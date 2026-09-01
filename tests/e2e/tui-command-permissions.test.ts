@@ -118,11 +118,19 @@ function gatewayToolCall(toolName: string, input: object, toolCallId: string) {
 }
 
 function toolCall(
-  command: string,
-  options: Record<string, unknown> = {},
-  toolCallId = "command_1",
+    command: string,
+    options: Record<string, unknown> = {},
+    toolCallId = "command_1",
 ) {
-  return gatewayToolCall("terminal", { action: "exec", timeout_ms: 600_000, command, ...options }, toolCallId);
+  return gatewayToolCall("shell", {
+    request: {
+      action: "run",
+      yield_time_ms: 30_000,
+      timeout_ms: 600_000,
+      command,
+      ...options,
+    },
+  }, toolCallId);
 }
 
 function permissionDecision(
@@ -174,8 +182,15 @@ function toolCalls(command: string, callIds: string[]) {
     ...callIds.map((toolCallId) => ({
       type: "tool-call",
       toolCallId,
-      toolName: "terminal",
-      input: { action: "exec", timeout_ms: 600_000, command },
+      toolName: "shell",
+      input: {
+        request: {
+          action: "run",
+          command,
+          yield_time_ms: 30_000,
+          timeout_ms: 600_000,
+        },
+      },
     })),
     {
       type: "finish",
@@ -189,14 +204,28 @@ function twoEffectfulCommandBatch(first: string, second: string) {
     {
       type: "tool-call",
       toolCallId: "history_feedback_first",
-      toolName: "terminal",
-      input: { action: "exec", timeout_ms: 600_000, command: first },
+      toolName: "shell",
+      input: {
+        request: {
+          action: "run",
+          command: first,
+          yield_time_ms: 30_000,
+          timeout_ms: 600_000,
+        },
+      },
     },
     {
       type: "tool-call",
       toolCallId: "history_feedback_second",
-      toolName: "terminal",
-      input: { action: "exec", timeout_ms: 600_000, command: second },
+      toolName: "shell",
+      input: {
+        request: {
+          action: "run",
+          command: second,
+          yield_time_ms: 30_000,
+          timeout_ms: 600_000,
+        },
+      },
     },
     {
       type: "finish",
@@ -252,7 +281,11 @@ function expectOrdinaryToolResults(body: string, callIds: string[]) {
   for (const result of results) {
     const output = result.output as Record<string, unknown> | undefined;
     expect(output?.type).toBe("text");
-    expect(output?.value).toEqual(expect.stringContaining("exit_code=0"));
+    expect(JSON.parse(output?.value as string)).toMatchObject({
+      state: "completed",
+      exit_code: 0,
+      error: null,
+    });
   }
   expect(JSON.stringify(results)).not.toContain("Repeated identical tool call blocked");
 }
@@ -436,7 +469,7 @@ async function waitForPendingSubagentApproval(
   const id = await waitForPersistedDeliveryId(
     root,
     childId,
-    "terminal.exec /usr/bin/touch",
+    "shell.run /usr/bin/touch",
   );
   const communicationPath = join(
     root.home,
@@ -1045,7 +1078,7 @@ async function launchPermissionResumeHarness(initialResponses: Response[]) {
 function expectUserProfileTrace(tracePath: string) {
   const trace = readFileSync(tracePath, "utf8");
   expect(trace).toContain(
-    "terminal.exec authority=shell_allowed source=yolo " +
+    "shell.run authority=shell_allowed source=yolo " +
       "route=approved_shell environment=user",
   );
   expect(trace).toContain("command runner explicit environment=user shell=");
@@ -1094,11 +1127,10 @@ function largeEffectfulCommand(marker: string) {
   return command;
 }
 
-async function expectSavedTerminalExec(
+async function expectSavedShellRun(
     root: IsolatedRoot,
     sessionId: string,
     command: string,
-    background = false,
     status: "success" | "failure" = "success",
 ) {
   const result = await runFx(
@@ -1109,19 +1141,19 @@ async function expectSavedTerminalExec(
   const detail = JSON.parse(result.stdout) as any;
   const step = detail.history
     .flatMap((turn: any) => turn.execution?.tool_steps ?? [])
-    .find((entry: any) => entry.tool_calls?.some((call: any) => call.name === "terminal"));
+    .find((entry: any) => entry.tool_calls?.some((call: any) => call.name === "shell"));
   expect(step).toBeDefined();
-  const call = step.tool_calls.find((entry: any) => entry.name === "terminal");
+  const call = step.tool_calls.find((entry: any) => entry.name === "shell");
   expect(JSON.parse(call.arguments_json)).toEqual(
     expect.objectContaining({
-      action: "exec",
+      action: "run",
+      yield_time_ms: 30_000,
       timeout_ms: 600_000,
       command,
-      ...(background ? { background: true } : {}),
     }),
   );
   expect(step.tool_results).toContainEqual(
-    expect.objectContaining({ tool_call_id: call.id, tool_name: "terminal", status }),
+    expect.objectContaining({ tool_call_id: call.id, tool_name: "shell", status }),
   );
 }
 
@@ -1130,13 +1162,16 @@ function normalizeVolatileStatusRows(grid: string[]): string[] {
     /^• Streaming \([^)]*\)$/.test(line) ||
       isVolatileTokenStatusRow(line)
       ? "<status>"
-      : line
+      : line.replace(/\s+YOLO enabled: fx permission checks disabled$/, "")
   );
 }
 
 test("volatile token status rows normalize before transcript grid comparison", () => {
   expect(normalizeVolatileStatusRows(["  (↑10 ↓5)"])).toEqual(["<status>"]);
   expect(normalizeVolatileStatusRows(["  0s (↑10 ↓5)"])).toEqual(["<status>"]);
+  expect(normalizeVolatileStatusRows([
+    "YOLO · gpt-5                 YOLO enabled: fx permission checks disabled",
+  ])).toEqual(["YOLO · gpt-5"]);
 });
 
 describe("effect-aware command permissions", () => {
@@ -1369,13 +1404,20 @@ describe("effect-aware command permissions", () => {
       const streamText = "DIRECT_NO_NOTICE_STREAM_TEXT";
       const gateway = startFakeGateway([
         sse([
-          { type: "tool-input-start", id: "command_1", toolName: "terminal" },
+          { type: "tool-input-start", id: "command_1", toolName: "shell" },
           { type: "text-delta", id: "answer_1", delta: streamText },
           {
             type: "tool-call",
             toolCallId: "command_1",
-            toolName: "terminal",
-            input: { action: "exec", timeout_ms: 600_000, command: "pwd" },
+            toolName: "shell",
+            input: {
+              request: {
+                action: "run",
+                yield_time_ms: 30_000,
+                timeout_ms: 600_000,
+                command: "pwd",
+              },
+            },
           },
           {
             type: "finish",
@@ -1472,7 +1514,7 @@ describe("effect-aware command permissions", () => {
           ...calls.map((call) => ({
             type: "tool-input-start",
             id: call.id,
-            toolName: "terminal",
+            toolName: "shell",
           })),
           {
             type: "text-delta",
@@ -1482,8 +1524,15 @@ describe("effect-aware command permissions", () => {
           ...calls.map((call) => ({
             type: "tool-call",
             toolCallId: call.id,
-            toolName: "terminal",
-            input: { action: "exec", timeout_ms: 600_000, command: call.command },
+            toolName: "shell",
+            input: {
+              request: {
+                action: "run",
+                yield_time_ms: 30_000,
+                timeout_ms: 600_000,
+                command: call.command,
+              },
+            },
           })),
           {
             type: "finish",
@@ -1717,8 +1766,8 @@ describe("effect-aware command permissions", () => {
         "direct_printf_lossy",
       );
       expect(lossyModelResult).toContain(lossyRows[1]!);
-      expect(lossyModelResult).not.toContain("  DIRECT_PADDED  ");
-      expect(lossyModelResult).not.toContain("DIRECT_TRAILING   ");
+      expect(lossyModelResult).toContain("  DIRECT_PADDED  ");
+      expect(lossyModelResult).toContain("DIRECT_TRAILING   ");
       expect(lossyModelResult).not.toContain("command_output_replay");
       expectUserProfileTrace(tracePath);
       expect(existsSync(root.profileMarker)).toBe(true);
@@ -1736,7 +1785,8 @@ describe("effect-aware command permissions", () => {
       expect(publicSession.stdout).not.toContain("command_replay");
       expect(publicSession.stdout).not.toContain("command_process_presentation");
       expect(publicSession.stdout).not.toContain("process_presentation");
-      expect(publicSession.stdout).toContain("<command_output_handle>fx-command-replay-");
+      expect(publicSession.stdout).toContain("full_output_handle");
+      expect(publicSession.stdout).toContain("fx-command-replay-");
 
       await activeSession.sendText("/quit");
       expect(await activeSession.waitForSessionEnd(TIMEOUT)).toBe(true);
@@ -2184,13 +2234,20 @@ describe("effect-aware command permissions", () => {
             {
               type: "tool-input-start",
               id: "scrollback_command",
-              toolName: "terminal",
+              toolName: "shell",
             },
             {
               type: "tool-call",
               toolCallId: "scrollback_command",
-              toolName: "terminal",
-              input: { action: "exec", timeout_ms: 600_000, command: "seq 1 1" },
+              toolName: "shell",
+              input: {
+                request: {
+                  action: "run",
+                  yield_time_ms: 30_000,
+                  timeout_ms: 600_000,
+                  command: "seq 1 1",
+                },
+              },
             },
             {
               type: "finish",
@@ -2399,19 +2456,17 @@ describe("effect-aware command permissions", () => {
           gateway.requests[1]!.body,
           "terminal_session_command",
         );
-        expect(commandResult).toContain(
-          "exit_code=0\n" +
-            "<stdout>\n" +
-            "TTY_SESSION_STDOUT_BEGIN\n" +
-            "TTY_SESSION_STDOUT_END\n" +
-            "</stdout>\n" +
-            "<stderr>\n" +
-            "TTY_SESSION_STDERR\n" +
-            "</stderr>\n",
-        );
-        expect(commandResult).toMatch(
-          /<command_output_handle>fx-command-replay-[^<]+<\/command_output_handle>/,
-        );
+        const commandSnapshot = JSON.parse(commandResult);
+        expect(commandSnapshot).toMatchObject({
+          state: "completed",
+          backend: "captured",
+          persistence: "process",
+          exit_code: 0,
+        });
+        expect(commandSnapshot.output_delta).toContain("TTY_SESSION_STDOUT_BEGIN");
+        expect(commandSnapshot.output_delta).toContain("TTY_SESSION_STDOUT_END");
+        expect(commandSnapshot.output_delta).toContain("TTY_SESSION_STDERR");
+        expect(commandSnapshot.full_output_handle).toMatch(/^fx-command-replay-.+\.bin$/);
         expect(gateway.requests[1]!.body).not.toContain("\\u001e");
         expect(gateway.requests[1]!.body).not.toContain("\\u0006");
         expect(gateway.requests[1]!.body).not.toContain("\\u0000");
@@ -2420,7 +2475,7 @@ describe("effect-aware command permissions", () => {
           gateway.requests[3]!.body,
           "terminal_session_pwd",
         );
-        expect(pwdResult).toContain(`\n${root.workspace}\n`);
+        expect(JSON.parse(pwdResult).output_delta).toContain(root.workspace);
 
         const scrollback = await activeSession.captureFullScrollback();
         const completedIndex = scrollback.indexOf("Ran exec python3");
@@ -2448,7 +2503,7 @@ describe("effect-aware command permissions", () => {
 
         const trace = readFileSync(tracePath, "utf8");
         expect(trace).toContain(
-          "terminal.exec authority=shell_allowed source=auto_classifier " +
+          "shell.run authority=shell_allowed source=auto_classifier " +
             "route=approved_shell environment=user",
         );
         expect(trace).toContain("command runner explicit environment=user shell=");
@@ -2471,7 +2526,7 @@ describe("effect-aware command permissions", () => {
         await activeSession.kill();
         activeSession = null;
 
-        await expectSavedTerminalExec(
+        await expectSavedShellRun(
           root,
           sessionIdFromHome(root),
           command,
@@ -2540,7 +2595,7 @@ describe("effect-aware command permissions", () => {
       expect(permissionResultRequest).toContain("review_caution");
       expect(permissionResultRequest).not.toContain("user_denied");
       const trace = readFileSync(tracePath, "utf8");
-      expect(trace).toContain("auto_review_result tool_name=terminal decision=caution");
+      expect(trace).toContain("auto_review_result tool_name=shell decision=caution");
       expect(trace).toContain("decision=deny approval_source=denied");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
@@ -2888,8 +2943,8 @@ describe("effect-aware command permissions", () => {
             activity.tool_name,
             activity.phase,
           ])).toEqual([
-            ["terminal", "started"],
-            ["terminal", "succeeded"],
+            ["shell", "started"],
+            ["shell", "succeeded"],
           ]);
           return finalText("parent inspected canonical child");
         }
@@ -4585,11 +4640,11 @@ describe("effect-aware command permissions", () => {
           return finalText("INTERACTIVE_CHILD_DENIED_COMPLETE");
         }
         if (userText.includes(childPrompt)) {
-          return gatewayToolCall("terminal", {
-            action: "exec",
-            timeout_ms: 600_000,
-            command: `/usr/bin/touch ${shellQuote(markerPath)}`,
-          }, childCommandCallId);
+          return toolCall(
+            `/usr/bin/touch ${shellQuote(markerPath)}`,
+            {},
+            childCommandCallId,
+          );
         }
         if (body.includes(`\"toolCallId\":\"${rootProbeCallId}\"`) &&
             body.includes('"type":"tool-result"')) {
@@ -4733,11 +4788,11 @@ describe("effect-aware command permissions", () => {
           childRequestCount += 1;
           if (childRequestCount <= 4) {
             if (childRequestCount > 1) expect(body).toContain("review_caution");
-            return gatewayToolCall("terminal", {
-              action: "exec",
-              timeout_ms: 600_000,
-              command: `/usr/bin/touch ${shellQuote(markerPath)}`,
-            }, `child_auto_command_${childRequestCount}`);
+            return toolCall(
+              `/usr/bin/touch ${shellQuote(markerPath)}`,
+              {},
+              `child_auto_command_${childRequestCount}`,
+            );
           }
           if (childRequestCount === 5) {
             return finalText("INTERACTIVE_AUTO_CAUTION_CHILD_COMPLETE");
@@ -5418,7 +5473,7 @@ describe("effect-aware command permissions", () => {
       expect(await activeSession.waitForSessionEnd()).toBe(true);
       await activeSession.kill();
       activeSession = null;
-      await expectSavedTerminalExec(
+      await expectSavedShellRun(
         foregroundRoot,
         sessionIdFromHome(foregroundRoot),
         foregroundCommand,
@@ -5489,7 +5544,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test(
-    "fx ask yolo executes pwd through the default user profile without an artifact",
+    "fx ask yolo executes pwd through the default user profile with process-scoped replay",
     async () => {
       const root = createIsolatedRoot();
       const gateway = startFakeGateway([toolCall("pwd"), finalText("ask direct complete")]);
@@ -5509,15 +5564,21 @@ describe("effect-aware command permissions", () => {
 
       expect(result.code).toBe(0);
       expect(result.stderr).toContain("Running pwd");
-      expect(result.stderr).toContain(root.workspace);
       expect(result.stderr.toLowerCase()).not.toContain("error");
+      expect(JSON.parse(toolResultText(gateway.requests[1].body, "command_1"))).toMatchObject({
+        state: "completed",
+        output_delta: `${root.workspace}\n`,
+        exit_code: 0,
+      });
       const json = JSON.parse(result.stdout.trim()) as any;
       expect(json.tool_calls).toHaveLength(1);
-      expect(json.tool_calls[0].name).toBe("terminal");
+      expect(json.tool_calls[0].name).toBe("shell");
       expect(json.tool_calls[0].status).toBe("success");
       expect(json.tool_calls[0].command_result.command).toBe("pwd");
       expect(json.tool_calls[0].command_result.cwd).toBe(root.workspace);
-      expect(json.tool_calls[0].command_result.output_file).toBeNull();
+      expect(json.tool_calls[0].command_result.output_file).toMatch(
+        /^fx-command-replay-[a-f0-9-]+\.bin$/,
+      );
       expectUserProfileTrace(tracePath);
       expect(existsSync(root.profileMarker)).toBe(true);
       expectNoHostileExecutables(root);
@@ -5558,7 +5619,7 @@ describe("effect-aware command permissions", () => {
       const json = JSON.parse(result.stdout.trim()) as any;
       expect(json.output).toContain("classifier accept complete");
       expect(json.tool_calls).toContainEqual(
-        expect.objectContaining({ name: "terminal", status: "success" }),
+        expect.objectContaining({ name: "shell", status: "success" }),
       );
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.classifierRequests).toHaveLength(1);
@@ -5848,7 +5909,7 @@ describe("effect-aware command permissions", () => {
       const json = JSON.parse(result.stdout.trim()) as any;
       expect(json.output).toContain("delegated classifier complete");
       expect(json.tool_calls).toContainEqual(
-        expect.objectContaining({ name: "terminal", status: "success" }),
+        expect.objectContaining({ name: "shell", status: "success" }),
       );
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.classifierRequests).toHaveLength(1);
@@ -5936,7 +5997,7 @@ describe("effect-aware command permissions", () => {
       expect(cliJson.output).toContain("large CLI complete");
       expect(cliJson.tool_calls).toHaveLength(1);
       expect(cliJson.tool_calls).toContainEqual(
-        expect.objectContaining({ name: "terminal", status: "success" }),
+        expect.objectContaining({ name: "shell", status: "success" }),
       );
       expect(existsSync(join(cliRoot.workspace, cliMarker))).toBe(true);
       expect(cliGateway.requests).toHaveLength(2);
@@ -5944,11 +6005,10 @@ describe("effect-aware command permissions", () => {
       expect(
         Buffer.byteLength(cliGateway.classifierRequests[0]!.body),
       ).toBeGreaterThan(16 * 1024);
-      await expectSavedTerminalExec(
+      await expectSavedShellRun(
         cliRoot,
         cliJson.session_id,
         cliCommand,
-        false,
         "success",
       );
 
@@ -5977,11 +6037,10 @@ describe("effect-aware command permissions", () => {
       expect(
         Buffer.byteLength(acpGateway.classifierRequests[0]!.body),
       ).toBeGreaterThan(16 * 1024);
-      await expectSavedTerminalExec(
+      await expectSavedShellRun(
         acpRoot,
         sessionIdFromHome(acpRoot),
         acpCommand,
-        false,
         "success",
       );
     },
@@ -6008,10 +6067,11 @@ describe("effect-aware command permissions", () => {
 
       expect(result.code).toBe(0);
       expect(gateway.requests).toHaveLength(2);
-      expect(gateway.requests[1].body).toContain("\\u001bname");
-      expect(gateway.requests[1].body).toContain("line\\nname");
-      expect(gateway.requests[1].body).not.toContain("\x1b");
-      expect(gateway.requests[1].body).not.toContain("\\x1b");
+      const encoded = toolResultText(gateway.requests[1].body, "command_1");
+      expect(encoded).toContain("\\u001bname");
+      expect(encoded).toContain("line\\nname");
+      expect(encoded).not.toContain("\x1b");
+      expect(encoded).not.toContain("\\x1b");
       expectUserProfileTrace(tracePath);
       expect(existsSync(root.profileMarker)).toBe(true);
       expectNoHostileExecutables(root);
@@ -6045,7 +6105,11 @@ describe("effect-aware command permissions", () => {
       expect(result.code).toBe(0);
       expect(result.stderr).toContain("Running printf '%s' '<'");
       expect(gateway.requests).toHaveLength(2);
-      expect(gateway.requests[1].body).toContain("<stdout>\\n<\\n</stdout>");
+      expect(JSON.parse(toolResultText(gateway.requests[1].body, "command_1"))).toMatchObject({
+        state: "completed",
+        output_delta: "<",
+        exit_code: 0,
+      });
       expectUserProfileTrace(tracePath);
       expect(existsSync(root.profileMarker)).toBe(true);
       expectNoHostileExecutables(root);

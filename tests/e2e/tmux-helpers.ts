@@ -150,6 +150,21 @@ export function fakeGatewayToolCall(
   ]);
 }
 
+export function fakeShellRun(
+  id: string,
+  command: string,
+  options: Record<string, unknown> = {},
+) {
+  return fakeGatewayToolCall(id, "shell", {
+    request: {
+      yield_time_ms: 30_000,
+      ...options,
+      action: "run",
+      command,
+    },
+  });
+}
+
 export function fakeGatewayPermissionDecision(
   decision: "clear" | "caution" = "clear",
   toolCallId = "permission_decision_1",
