@@ -1902,6 +1902,7 @@ const App = struct {
         self: *App,
         pending: *input_submit_runtime.PendingSubmission,
     ) !input_submit_runtime.PendingSkillRefresh {
+        if (comptime host_target.is_wasm) return .current;
         const generation = pending.skill_refresh_generation orelse blk: {
             const requested = try self.requestSkillsRefresh();
             pending.skill_refresh_generation = requested;
