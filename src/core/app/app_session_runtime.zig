@@ -4918,6 +4918,11 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             preferences: session_codec.DurableSessionPreferences,
         ) !void {
+            const fast_mode_model_bound = restoredFastModeModelBound(
+                app.session_persistence.fast_mode_model_bound,
+                app.session_persistence.workspace_preferences,
+                preferences,
+            );
             try provider_runtime.replaceSelection(app, preferences.provider, preferences.model);
             if (app.session_persistence.process_model_override) |model| {
                 try provider_runtime.replaceModel(app, model);
@@ -4928,7 +4933,7 @@ pub fn Runtime(comptime App: type) type {
             );
             app.effort = preferences.effort;
             app.fast_mode = preferences.fast_mode;
-            app.session_persistence.fast_mode_model_bound = true;
+            app.session_persistence.fast_mode_model_bound = fast_mode_model_bound;
             app.worker.syncQueuedPromptEffort(preferences.effort);
             app.worker.syncQueuedPromptFastMode(preferences.fast_mode);
         }
@@ -4989,6 +4994,46 @@ fn replacePreferences(
     const replacement = try source.dupe(alloc);
     if (target.*) |*current| current.deinit(alloc);
     target.* = replacement;
+}
+
+fn restoredFastModeModelBound(
+    current_bound: bool,
+    configured: ?session_codec.DurableSessionPreferences,
+    restored: session_codec.DurableSessionPreferences,
+) bool {
+    if (!current_bound) return false;
+    const current = configured orelse return false;
+    return current.provider == restored.provider and
+        std.mem.eql(u8, current.model, restored.model) and
+        current.fast_mode == restored.fast_mode;
+}
+
+test "restored fast mode remains bound only for the configured model selection" {
+    const configured = session_codec.DurableSessionPreferences{
+        .model = @constCast("provider/model"),
+        .effort = .auto,
+        .fast_mode = true,
+    };
+    const matching = session_codec.DurableSessionPreferences{
+        .model = @constCast("provider/model"),
+        .effort = types.ReasoningEffort.literal("high"),
+        .fast_mode = true,
+    };
+    const different_model = session_codec.DurableSessionPreferences{
+        .model = @constCast("provider/other"),
+        .effort = .auto,
+        .fast_mode = true,
+    };
+    const different_fast_mode = session_codec.DurableSessionPreferences{
+        .model = @constCast("provider/model"),
+        .effort = .auto,
+        .fast_mode = false,
+    };
+
+    try std.testing.expect(restoredFastModeModelBound(true, configured, matching));
+    try std.testing.expect(!restoredFastModeModelBound(false, configured, matching));
+    try std.testing.expect(!restoredFastModeModelBound(true, configured, different_model));
+    try std.testing.expect(!restoredFastModeModelBound(true, configured, different_fast_mode));
 }
 
 fn applyPreferencePatch(
@@ -5678,6 +5723,7 @@ test "js-host resume restores transcript context preferences usage and revision"
     try std.testing.expectEqualStrings("restored/model", app.selected_model.items);
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.effort);
     try std.testing.expect(app.fast_mode);
+    try std.testing.expect(!Runtime(TestApp).fastModeModelBound(&app));
     try std.testing.expectEqual(@as(u64, 17), app.total_input_tokens);
     try std.testing.expectEqual(@as(u64, 23), app.total_output_tokens);
     var restored_usage = try app.session.usage.snapshot(alloc);
