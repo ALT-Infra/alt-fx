@@ -3700,7 +3700,7 @@ pub const PaintTestMode = enum {
 
 const PaintTestModeField = if (@import("builtin").is_test) PaintTestMode else void;
 const default_max_retained_transcript_bytes: usize = 1024 * 1024;
-const full_transcript_snapshot_clone_max_bytes: usize = 512 * 1024;
+const full_transcript_snapshot_clone_max_bytes: usize = 8 * 1024 * 1024;
 const resume_publication_rows_per_frame: u32 = 64;
 
 pub const PaintTraceState = struct {
