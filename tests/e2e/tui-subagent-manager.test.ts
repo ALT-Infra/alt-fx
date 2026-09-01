@@ -3005,15 +3005,10 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           childAttempts += 1;
           return childAttempts === 1
             ? childStream.response
-            : fakeGatewayToolCall(
+            : fakeShellRun(
               "checkpoint3_restart_write",
-              "terminal",
-              {
-                action: "exec",
-                command:
-                  `printf 'restored auto context\\n' > ${JSON.stringify(resumedMarker)}`,
-                timeout_ms: 600_000,
-              },
+              `printf 'restored auto context\\n' > ${JSON.stringify(resumedMarker)}`,
+              { yield_time_ms: 30_000, timeout_ms: 600_000 },
             );
         }
         return fakeGatewayToolCall("checkpoint3_restart_create", "subagent", {

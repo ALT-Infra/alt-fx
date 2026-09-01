@@ -3204,7 +3204,7 @@ describe("effect-aware command permissions", () => {
       const route = (body: string): Response | Promise<Response> => {
         if (body.includes('"toolCallId":"persistent_direct_write"')) {
           expect(toolResultText(body, "persistent_direct_write")).toContain(
-            "exit_code=0",
+            '"exit_code":0',
           );
           return finalText("persistent direct resume complete");
         }
