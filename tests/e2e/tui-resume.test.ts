@@ -2440,7 +2440,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText(streamMarker, TIMEOUT);
 
       await active.sendKeys("C-o");
-      await Bun.sleep(250);
+      await active.waitForText("┃ Full detail · ctrl o close", TIMEOUT);
       const enterAlternate = Buffer.from("\x1b[?1049h");
       const leaveAlternate = Buffer.from("\x1b[?1049l");
       const tapeBeforeCancel = readFileSync(tapePath);
