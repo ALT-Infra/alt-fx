@@ -705,12 +705,12 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
   );
 
   test(
-    "Fast command rejects an intrinsically Fast Kimi alias",
+    "Fast command rejects an intrinsic Fast alias",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-fast-unsupported-"));
       const gateway = startFakeGateway([], {
         models: [{
-          id: "moonshotai/kimi-k3-fast",
+          id: "anthropic/claude-opus-4.8-fast",
           type: "language",
           released: 1,
           tags: ["reasoning", "tool-use"],
@@ -724,7 +724,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         mkdirSync(workspace);
         const settingsPath = join(home, ".fx", "settings.json");
         const initialSettings = JSON.stringify({
-          model: "moonshotai/kimi-k3-fast",
+          model: "anthropic/claude-opus-4.8-fast",
           fast_mode: false,
         }) + "\n";
         writeFileSync(settingsPath, initialSettings, { mode: 0o600 });
