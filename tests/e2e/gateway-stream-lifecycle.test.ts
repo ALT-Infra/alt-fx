@@ -5435,14 +5435,36 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
   test("SIGKILL during persistent child work keeps parent recovery selectable", async () => {
     const root = createFixtureRoot("subagent-persistent-sigkill-recovery");
     const tracePath = join(root.root, "trace.log");
+    const startedPath = join(root.workspace, "child-command.started");
+    const finishedPath = join(root.workspace, "child-command.finished");
+    const pidsPath = join(root.workspace, "child-command.pids");
     const childPrompt = "Remain active until the saved parent is killed.";
     const resumePrompt = "Continue after the interrupted persistent child.";
     const gateway = startDynamicFakeGateway((body) => {
       if (promptText(body).includes(resumePrompt)) {
         return fakeGatewayFinalText("PARENT_RECOVERY_COMPLETE");
       }
+      if (hasCurrentToolResult(body, "persistent_sigkill_shell")) {
+        return fakeGatewayFinalText("CHILD_COMMAND_COMPLETE");
+      }
       if (promptText(body).includes(childPrompt)) {
-        return delayedSuccessfulResponse();
+        return fakeShellRun(
+          "persistent_sigkill_shell",
+          [
+            "sleep 30 & descendant=$!",
+            `printf STARTED > ${JSON.stringify(startedPath)}`,
+            `printf '%s %s %s' "$$" "$PPID" "$descendant" > ${JSON.stringify(pidsPath)}`,
+            "sleep 3",
+            `printf FINISHED > ${JSON.stringify(finishedPath)}`,
+            "kill \"$descendant\" 2>/dev/null || true",
+            "wait \"$descendant\" 2>/dev/null || true",
+          ].join("; "),
+          {
+            profile: "clean",
+            yield_time_ms: 30_000,
+            timeout_ms: 60_000,
+          },
+        );
       }
       return fakeGatewayToolCall("persistent_sigkill_message", "subagent", {
         request: {
@@ -5465,23 +5487,30 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         stderr: "pipe",
       },
     );
+    let ownedPids: number[] = [];
     try {
       const childDeadline = Date.now() + 10_000;
-      while (
-        !gateway.requests.some((request) =>
-          promptText(request.body).includes(childPrompt)
-        ) && Date.now() < childDeadline
-      ) {
+      while (!existsSync(startedPath) && Date.now() < childDeadline) {
         await Bun.sleep(25);
       }
-      expect(gateway.requests.some((request) =>
-        promptText(request.body).includes(childPrompt)
-      )).toBe(true);
+      expect(existsSync(startedPath)).toBe(true);
+      ownedPids = readFileSync(pidsPath, "utf8")
+        .trim()
+        .split(/\s+/)
+        .map(Number);
+      expect(ownedPids).toHaveLength(3);
+      for (const pid of ownedPids) {
+        expect(Number.isSafeInteger(pid) && pid > 0).toBe(true);
+        expect(isProcessAlive(pid)).toBe(true);
+      }
 
       first.kill("SIGKILL");
       await first.exited;
       const firstStderr = await new Response(first.stderr).text();
       expect(firstStderr).not.toContain("panic: reached unreachable code");
+      await Bun.sleep(3_500);
+      expect(existsSync(finishedPath)).toBe(false);
+      for (const pid of ownedPids) await waitForProcessExit(pid, 3_000);
 
       const latest = await runFx(["session", "last", "--json"], {
         cwd: root.workspace,
@@ -5536,6 +5565,12 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       );
     } finally {
       if (first.exitCode === null) first.kill("SIGKILL");
+      for (const pid of ownedPids) {
+        if (!isProcessAlive(pid)) continue;
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {}
+      }
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
     }
