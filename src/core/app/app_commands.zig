@@ -2192,7 +2192,7 @@ fn buildTraceReport(app: anytype) ![]u8 {
     try writeProblemsSummary(&out.writer, app, app.alloc);
     try writeLastInterruptedDetail(&out.writer, app.session.agent.history.items, app.alloc);
     try writeNetworkCallsSummary(&out.writer);
-    try writeToolCallsSummary(&out.writer, app.alloc, app.session.history.items);
+    try writeToolCallsSummary(&out.writer, app.alloc, app.session.agent.history.items);
     try writePermissionsSummary(&out.writer, app.permission_engine.grants.items);
     try writeRuntimeContextSummary(&out.writer, app, app.alloc);
     try writeRendererState(&out.writer, app, app.alloc);
