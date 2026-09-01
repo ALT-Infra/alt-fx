@@ -3881,9 +3881,15 @@ fn processQueuedPromptLoop(
                     pending_image_ids.len,
                 },
             );
-            const recovery_source_messages = try appendReadFailureRecoveryContext(
+            const decision_source_messages = try append_post_tool_decision_prompt(
                 overlay_arena,
                 gateway_messages.items,
+                post_tool_decision_pending or
+                    recovery_strategy == .continue_after_confirmed_tool,
+            );
+            const recovery_source_messages = try appendReadFailureRecoveryContext(
+                overlay_arena,
+                decision_source_messages,
                 recovery_strategy,
                 try recoveryCheckpointAssistantSource(
                     arena,
@@ -3891,20 +3897,14 @@ fn processQueuedPromptLoop(
                     stream_ctx.raw_text.items,
                 ),
             );
-            const decision_source_messages = try append_post_tool_decision_prompt(
-                overlay_arena,
-                recovery_source_messages,
-                post_tool_decision_pending or
-                    recovery_strategy == .continue_after_confirmed_tool,
-            );
             const projected_request_messages = blk: {
                 if (job.authorized_image_catalog.len == 0 and job.images.len == 0) {
-                    break :blk decision_source_messages;
+                    break :blk recovery_source_messages;
                 }
                 break :blk switch (vision_policy.route) {
                     .native => try runtime_vision_contracts.project_native_messages(
                         overlay_arena,
-                        decision_source_messages,
+                        recovery_source_messages,
                         current_user_message_index,
                     ),
                     .fallback => fallback: {
@@ -3913,7 +3913,7 @@ fn processQueuedPromptLoop(
                         }
                         break :fallback try runtime_vision_contracts.project_text_only_messages(
                             overlay_arena,
-                            decision_source_messages,
+                            recovery_source_messages,
                             current_user_message_index,
                             job.authorized_image_catalog,
                         );
