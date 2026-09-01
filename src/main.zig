@@ -2552,6 +2552,10 @@ const App = struct {
         return SessionAppRuntime.commitRuntimePreferences(self, patch);
     }
 
+    pub fn fastModeModelBound(self: *const App) bool {
+        return SessionAppRuntime.fastModeModelBound(self);
+    }
+
     pub fn appendFinishedPrompt(self: *App, finished: types.FinishedPrompt) !void {
         try SessionAppRuntime.appendFinishedPrompt(self, finished);
         if (finished.summary) |summary| {

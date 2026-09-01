@@ -6575,7 +6575,7 @@ test "active stream Enter commits a complete model choice for the next turn" {
     try std.testing.expectEqualStrings(model, app.last_preference_model.items);
     try std.testing.expectEqual(types.ReasoningEffort.auto, app.effort);
     try std.testing.expectEqual(types.ReasoningEffort.auto, app.last_preference_effort.?);
-    try std.testing.expect(app.last_preference_fast_mode == null);
+    try std.testing.expectEqual(false, app.last_preference_fast_mode.?);
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
     try std.testing.expectEqualStrings(
@@ -7455,7 +7455,7 @@ test "app_input_runtime model picker commits a model without options directly" {
     try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
     try std.testing.expectEqualStrings("openai/gpt-4o", app.selected_model.items);
     try std.testing.expect(app.last_preference_effort == null);
-    try std.testing.expect(app.last_preference_fast_mode == null);
+    try std.testing.expectEqual(false, app.last_preference_fast_mode.?);
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
 }
 
@@ -7482,7 +7482,7 @@ test "app_input_runtime model picker skips effort stage for reasoning model with
     try std.testing.expectEqual(ModelPickerStage.model, app.input_runtime.picker.model_picker_stage);
     try std.testing.expect(!app.input_runtime.picker.hasPendingModelPickerSelection());
     try std.testing.expect(app.last_preference_effort == null);
-    try std.testing.expect(app.last_preference_fast_mode == null);
+    try std.testing.expectEqual(false, app.last_preference_fast_mode.?);
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
 }
 
@@ -7514,7 +7514,7 @@ test "app_input_runtime model picker exposes opaque Gateway reasoning effort" {
     try std.testing.expectEqual(types.ReasoningEffort.literal("future-tier"), app.effort);
     try std.testing.expect(!app.fast_mode);
     try std.testing.expectEqual(types.ReasoningEffort.literal("future-tier"), app.last_preference_effort.?);
-    try std.testing.expect(app.last_preference_fast_mode == null);
+    try std.testing.expectEqual(false, app.last_preference_fast_mode.?);
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
 }
 

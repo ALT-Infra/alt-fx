@@ -48,6 +48,7 @@ fn BootstrapDeps(comptime App: type) type {
             []const u8,
             types.ReasoningEffort,
             bool,
+            bool,
         ) anyerror!void;
         const InitializePersistenceFn = *const fn (*App, bool) anyerror!void;
         const StageRequestedResumeViewFn = *const fn (*App) app_session_runtime.ResumeViewStage;
@@ -142,6 +143,7 @@ pub fn Runtime(comptime App: type) type {
             selected_model: []const u8,
             effort: types.ReasoningEffort,
             fast_mode: bool,
+            fast_mode_model_bound: bool,
         ) !void {
             try app_session_runtime.Runtime(App).configureStartupPreferences(
                 app,
@@ -151,6 +153,7 @@ pub fn Runtime(comptime App: type) type {
                 selected_model,
                 effort,
                 fast_mode,
+                fast_mode_model_bound,
             );
         }
 
@@ -276,6 +279,7 @@ pub fn Runtime(comptime App: type) type {
                 active_model,
                 startup.effort,
                 startup.fast_mode,
+                startup.fast_mode_model_bound,
             );
             app.permission_engine.mode = startup.permission_mode;
             app.permission_engine.replaceRules(app.alloc, startup.takePermissionRules());
@@ -486,6 +490,7 @@ const TestCapture = struct {
     runtime_model_len: usize = 0,
     configured_effort: types.ReasoningEffort = .auto,
     configured_fast_mode: bool = false,
+    configured_fast_mode_model_bound: bool = false,
     initialize_required: bool = false,
     load_skills_workspace: []const u8 = "",
     load_skills_workspace_root_count: usize = 0,
@@ -714,6 +719,7 @@ fn makeStartupState(alloc: Allocator) !app_lifecycle.StartupState {
     state.permission_mode = .auto;
     state.context_enabled = false;
     state.fast_mode = true;
+    state.fast_mode_model_bound = true;
     state.auto_upgrade = false;
     state.update_channel = .dev;
     state.effort = types.ReasoningEffort.literal("high");
@@ -791,6 +797,7 @@ fn configureSessionPreferencesForTest(
     selected_model: []const u8,
     effort: types.ReasoningEffort,
     fast_mode: bool,
+    fast_mode_model_bound: bool,
 ) !void {
     const capture = active_capture.?;
     capture.configured_model_len = @min(
@@ -812,6 +819,7 @@ fn configureSessionPreferencesForTest(
     );
     capture.configured_effort = effort;
     capture.configured_fast_mode = fast_mode;
+    capture.configured_fast_mode_model_bound = fast_mode_model_bound;
 }
 
 fn beginFreshPersistedSessionForTest(app: *TestApp) !void {
@@ -901,6 +909,7 @@ test "app_bootstrap_runtime transfers startup state and starts a fresh session" 
         capture.configured_effort,
     );
     try std.testing.expect(capture.configured_fast_mode);
+    try std.testing.expect(capture.configured_fast_mode_model_bound);
     try std.testing.expectEqual(
         update_target.Channel.dev,
         app.upgrader.channel(),

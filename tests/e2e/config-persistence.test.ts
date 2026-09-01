@@ -235,6 +235,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         expect(stored.permission_mode).toBe("auto");
         expect(stored.effort).toBe("auto");
         expect(stored.fast_mode).toBe(true);
+        expect(stored.fast_mode_model_bound).toBe(true);
         expect(stored.startup_scrollback).toBe(false);
         expect(stored.prompt_history).toMatchObject({ enabled: false });
         expect(stored.statusLine).toMatchObject({
@@ -606,13 +607,14 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
   );
 
   test(
-    "Kimi Fast indicator remains stable while model catalog resolves",
+    "Fast indicator remains stable while model catalog resolves",
     async () => {
       const cases = [
         {
           label: "normal",
           model: "moonshotai/kimi-k3",
           fastMode: false,
+          modelBound: true,
           supportsFastMode: true,
           expectedFastIndicator: false,
         },
@@ -620,6 +622,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           label: "toggle",
           model: "moonshotai/kimi-k3",
           fastMode: true,
+          modelBound: true,
           supportsFastMode: true,
           expectedFastIndicator: true,
         },
@@ -627,8 +630,17 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           label: "intrinsic",
           model: "moonshotai/kimi-k3-fast",
           fastMode: false,
+          modelBound: true,
           supportsFastMode: false,
           expectedFastIndicator: true,
+        },
+        {
+          label: "legacy-unbound",
+          model: "zai/glm-5.3",
+          fastMode: true,
+          modelBound: false,
+          supportsFastMode: false,
+          expectedFastIndicator: false,
         },
       ] as const;
 
@@ -664,6 +676,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
               model: testCase.model,
               permission_mode: "auto",
               fast_mode: testCase.fastMode,
+              fast_mode_model_bound: testCase.modelBound,
             }) + "\n",
             { mode: 0o600 },
           );
@@ -1172,7 +1185,8 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           models: { gateway: "anthropic/claude-fable-5" },
           effort: "xhigh",
         });
-        expect(stored).not.toHaveProperty("fast_mode");
+        expect(stored.fast_mode).toBe(false);
+        expect(stored.fast_mode_model_bound).toBe(true);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
       } finally {
         gateway.stop();
@@ -1234,7 +1248,8 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         const stored = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
         expect(stored.models.gateway).toBe("xai/grok-build-1");
         expect(stored).not.toHaveProperty("effort");
-        expect(stored).not.toHaveProperty("fast_mode");
+        expect(stored.fast_mode).toBe(false);
+        expect(stored.fast_mode_model_bound).toBe(true);
 
         const scrollback = await session.captureFullScrollbackEscapes();
         expect(scrollback).toContain("grok-build-1");
@@ -1313,7 +1328,8 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
 
         let stored = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
         expect(stored.models.gateway).toBe("provider/new-reasoning-model");
-        expect(stored).not.toHaveProperty("fast_mode");
+        expect(stored.fast_mode).toBe(false);
+        expect(stored.fast_mode_model_bound).toBe(true);
 
         await session.sendText("Use portable auto.");
         await session.waitForText("portable auto complete", TIMEOUT);
@@ -1374,7 +1390,8 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           models: { gateway: "provider/new-reasoning-model" },
           effort: "future-tier",
         });
-        expect(stored).not.toHaveProperty("fast_mode");
+        expect(stored.fast_mode).toBe(false);
+        expect(stored.fast_mode_model_bound).toBe(true);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
       } finally {
         gateway.stop();

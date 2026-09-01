@@ -606,12 +606,16 @@ pub fn Runtime(comptime App: type) type {
                 app.effort
             else
                 .auto;
+            const active_fast_mode_model_bound = if (comptime @hasDecl(App, "fastModeModelBound"))
+                app.fastModeModelBound()
+            else
+                true;
             const fast_indicator_active = if (pending_model != null)
                 visible_capabilities.intrinsic_fast or
                     (model_supports_fast and pendingPickerFastMode(model_query, app.input_runtime.picker.model_picker_fast_index))
             else
                 visible_capabilities.intrinsic_fast or
-                    ((model_supports_fast or active_capabilities_pending) and app.fast_mode);
+                    (app.fast_mode and active_fast_mode_model_bound);
 
             const upgrade_label = app.upgrader.statusLabel(upgrade_status_buf);
             const yolo_warning_active =
@@ -4854,7 +4858,7 @@ test "core.app_render_runtime keeps Kimi fast indicator stable across catalog hy
     }
 }
 
-test "core.app_render_runtime hides stale fast preference for unsupported model" {
+test "core.app_render_runtime keeps a bound fast preference stable after catalog hydration" {
     var app = CoordinatorTestApp{
         .alloc = std.testing.allocator,
         .shell = .{},
@@ -4873,7 +4877,7 @@ test "core.app_render_runtime hides stale fast preference for unsupported model"
         &queued_cards,
     );
 
-    try std.testing.expect(!ctx.fast_indicator_active);
+    try std.testing.expect(ctx.fast_indicator_active);
 }
 
 test "core.app_render_runtime projects only the visible inline completion suffix" {
