@@ -192,12 +192,10 @@ const AcpContext = struct {
         const publication = self.published_tool_calls.getPtr(tool_call_id) orelse return;
         if (publication.* != .pending) return;
         const status = providerTerminalStatus(outcome.kind) orelse return;
-        const plain = try stripAnsiAlloc(self.alloc, outcome.summary);
-        defer if (plain.ptr != outcome.summary.ptr) self.alloc.free(plain);
 
         switch (status) {
-            .completed => try self.sendToolCallCompletedWithCommandResult(tool_call_id, plain, null),
-            .failed => try self.sendToolCallErrorWithCommandResult(tool_call_id, plain, null),
+            .completed => try self.sendToolCallCompletedWithCommandResult(tool_call_id, "Web search completed", null),
+            .failed => try self.sendToolCallErrorWithCommandResult(tool_call_id, "Web search failed", null),
             .pending, .in_progress => unreachable,
         }
         const updated = self.published_tool_calls.getPtr(tool_call_id) orelse
@@ -3583,7 +3581,7 @@ test "ACP pending tool_call updates keep provider ids stable and dedupe" {
     try std.testing.expectEqual(@as(usize, 1), malformed_count);
 }
 
-test "ACP provider search lifecycle publishes one public terminal update" {
+test "ACP provider search lifecycle publishes only public terminal updates" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const alloc = arena_state.allocator();
@@ -3613,6 +3611,39 @@ test "ACP provider search lifecycle publishes one public terminal update" {
     } };
     try pushToolLifecycle(&ctx, completed);
     try pushToolLifecycle(&ctx, completed);
+    try pushToolLifecycle(&ctx, .{ .provisional = .{
+        .id = .{ .turn_id = 1, .call_id = "provider_search_2" },
+        .tool_name = "perplexity_search",
+        .activity_kind = .read,
+    } });
+    const failed = types.ToolLifecycleEvent{ .terminal = .{
+        .id = .{ .turn_id = 1, .call_id = "provider_search_2" },
+        .outcome = .{ .kind = .failed, .summary = "perplexity_search failed: invalid JSON arguments" },
+    } };
+    try pushToolLifecycle(&ctx, failed);
+    try pushToolLifecycle(&ctx, failed);
+    try pushToolLifecycle(&ctx, .{ .provisional = .{
+        .id = .{ .turn_id = 1, .call_id = "provider_search_3" },
+        .tool_name = "parallel_search",
+        .activity_kind = .read,
+    } });
+    try pushToolLifecycle(&ctx, .{ .terminal = .{
+        .id = .{ .turn_id = 1, .call_id = "provider_search_3" },
+        .outcome = .{ .kind = .cancelled, .summary = "Cancelled parallel_search" },
+    } });
+    try pushToolLifecycle(&ctx, .{ .provisional = .{
+        .id = .{ .turn_id = 1, .call_id = "provider_search_4" },
+        .tool_name = "exa_search",
+        .activity_kind = .read,
+    } });
+    try pushToolLifecycle(&ctx, .{ .terminal = .{
+        .id = .{ .turn_id = 1, .call_id = "provider_search_4" },
+        .outcome = .{ .kind = .deferred, .summary = "Deferred exa_search" },
+    } });
+    try pushToolLifecycle(&ctx, .{ .terminal = .{
+        .id = .{ .turn_id = 1, .call_id = "unknown_provider_search" },
+        .outcome = .{ .kind = .failed, .summary = "exa_search failed" },
+    } });
     try pushToolLifecycle(&ctx, .{ .authoritative_started = .{
         .id = .{ .turn_id = 1, .call_id = "read_1" },
         .reconciles_provisional_call_id = null,
@@ -3632,11 +3663,14 @@ test "ACP provider search lifecycle publishes one public terminal update" {
     var lines = std.mem.splitScalar(u8, captured, '\n');
     var provider_pending: usize = 0;
     var provider_completed: usize = 0;
+    var provider_failed: usize = 0;
     var read_pending: usize = 0;
     var read_completed: usize = 0;
     while (lines.next()) |line| {
         if (line.len == 0) continue;
         try std.testing.expect(std.mem.find(u8, line, "exa_search") == null);
+        try std.testing.expect(std.mem.find(u8, line, "perplexity_search") == null);
+        try std.testing.expect(std.mem.find(u8, line, "parallel_search") == null);
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, line, .{});
         defer parsed.deinit();
         const update = parsed.value.object.get("params").?.object.get("update").?.object;
@@ -3652,14 +3686,37 @@ test "ACP provider search lifecycle publishes one public terminal update" {
             } else if (std.mem.eql(u8, session_update, "tool_call_update")) {
                 provider_completed += 1;
                 try std.testing.expectEqualStrings("completed", update.get("status").?.string);
+                try std.testing.expectEqualStrings(
+                    "Web search completed",
+                    update.get("content").?.array.items[0].object.get("content").?.object.get("text").?.string,
+                );
             }
+        } else if (std.mem.eql(u8, call_id, "provider_search_2") or
+            std.mem.eql(u8, call_id, "provider_search_3"))
+        {
+            if (std.mem.eql(u8, session_update, "tool_call")) {
+                provider_pending += 1;
+            } else if (std.mem.eql(u8, session_update, "tool_call_update")) {
+                provider_failed += 1;
+                try std.testing.expectEqualStrings("failed", update.get("status").?.string);
+                try std.testing.expectEqualStrings(
+                    "Web search failed",
+                    update.get("content").?.array.items[0].object.get("content").?.object.get("text").?.string,
+                );
+            }
+        } else if (std.mem.eql(u8, call_id, "provider_search_4")) {
+            try std.testing.expectEqualStrings("tool_call", session_update);
+            provider_pending += 1;
         } else if (std.mem.eql(u8, call_id, "read_1")) {
             if (std.mem.eql(u8, session_update, "tool_call")) read_pending += 1;
             if (std.mem.eql(u8, session_update, "tool_call_update")) read_completed += 1;
+        } else {
+            return error.TestUnexpectedToolCallId;
         }
     }
-    try std.testing.expectEqual(@as(usize, 1), provider_pending);
+    try std.testing.expectEqual(@as(usize, 4), provider_pending);
     try std.testing.expectEqual(@as(usize, 1), provider_completed);
+    try std.testing.expectEqual(@as(usize, 2), provider_failed);
     try std.testing.expectEqual(@as(usize, 1), read_pending);
     try std.testing.expectEqual(@as(usize, 0), read_completed);
 }
