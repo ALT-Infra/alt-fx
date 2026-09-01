@@ -99,7 +99,7 @@ pub fn composeSteeringMessageRow(
     const width_usize: usize = width;
     const escape_width = display_width.visibleWidth(escape_hint);
     if (show_escape_hint and width_usize > escape_width) {
-        try row_text.appendSingleLineEllipsized(
+        try row_text.appendSingleLineMiddleEllipsized(
             alloc,
             &row,
             safe_message.bytes,
@@ -107,7 +107,7 @@ pub fn composeSteeringMessageRow(
         );
         try row.appendSlice(alloc, escape_hint);
     } else {
-        try row_text.appendSingleLineEllipsized(alloc, &row, safe_message.bytes, width_usize);
+        try row_text.appendSingleLineMiddleEllipsized(alloc, &row, safe_message.bytes, width_usize);
     }
     try row.appendSlice(alloc, ui_render.reset_style);
     return row;
@@ -151,6 +151,17 @@ test "steering rows show actual messages and only the final escape hint" {
     try std.testing.expect(std.mem.find(u8, first.items, "First steer") != null);
     try std.testing.expect(std.mem.find(u8, first.items, "Esc to steer now") == null);
     try std.testing.expect(std.mem.find(u8, final.items, "Second steer · Esc to steer now") != null);
+}
+
+test "narrow steering row preserves distinguishing message ends and the escape hint" {
+    const message = "BEGIN change the implementation direction and retain this unique END";
+    var row = try composeSteeringMessageRow(std.testing.allocator, message, true, 48);
+    defer row.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.find(u8, row.items, "BEGIN") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "END") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "Esc to steer now") != null);
+    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 48);
 }
 
 test "steering rows visibly escape terminal control bytes" {

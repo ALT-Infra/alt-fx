@@ -2794,7 +2794,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "complete assistant block precedes a queued user prompt in scrollback",
+    "visible assistant prefix precedes immediate steering in scrollback",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-prompt-boundary-")));
       const home = join(root, "home");
@@ -2859,11 +2859,13 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForText("SPLIT_OLD_TAIL_FINAL", TIMEOUT);
 
       await session.sendText(SPLIT_NEW_USER_PROMPT);
-      expect(splitGateway.requests).toHaveLength(1);
-      firstResponse.release?.();
+      await waitForCondition(
+        () => firstResponse.cancelled,
+        "visible assistant steering cancellation",
+      );
       await waitForCondition(
         () => splitGateway.requests.length === 2 && secondResponse.started,
-        "held second Gateway stream",
+        "immediate steering Gateway stream",
       );
 
       const rawScrollback = await waitForEscapedScrollback(
@@ -2886,6 +2888,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(finalTailIndex).toBeLessThan(promptIndex);
       expect(countOccurrences(rawScrollback, SPLIT_NEW_USER_PROMPT)).toBe(1);
 
+      expect(splitGateway.requests[1]!.body).toContain("<user_steering>");
+      expect(splitGateway.requests[1]!.body).toContain(SPLIT_NEW_USER_PROMPT);
+      const trace = readFileSync(tracePath, "utf8");
+      expect(trace).not.toContain("event=queue_review_started");
       expect(scrollback).toContain("SPLIT_OLD_TAIL_FINAL");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(existsSync(tapePath)).toBe(true);
@@ -2901,7 +2907,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     SPLIT_BOUNDARY_TEST_TIMEOUT,
   );
   test(
-    "ordinary Enter keeps pending steering visible in submission order",
+    "ordinary Enter keeps pending steering visible through narrow resize",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-cooperative-steering-")));
       const home = join(root, "home");
@@ -2915,8 +2921,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const command =
         `while [ ! -f ${JSON.stringify(releasePath)} ]; do sleep 0.05; done; ` +
         "printf COOPERATIVE_TOOL_DONE";
-      const firstSteering = "Use COOPERATIVE_STEERING_SENTINEL in the answer.";
-      const secondSteering = "Keep the answer to one sentence.";
+      const firstSteering = "FIRST_BEGIN use COOPERATIVE_STEERING_SENTINEL in the answer FIRST_END";
+      const secondSteering = "SECOND_BEGIN keep the answer concise while preserving its result SECOND_END";
+      const thirdSteering = "THIRD_BEGIN mention the completed command before the conclusion THIRD_END";
       const finalText = "COOPERATIVE_STEERING_COMPLETE";
       const steeringGateway = startFakeGateway([
         fakeGatewayToolCall("cooperative_steering_tool", "terminal", {
@@ -2954,18 +2961,39 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForText("Running while", TIMEOUT);
       await session.sendText(firstSteering);
       await session.sendText(secondSteering);
+      await session.sendText(thirdSteering);
       await Bun.sleep(150);
       const pendingPane = await session.capturePane();
       expect(pendingPane).toContain(firstSteering);
-      expect(pendingPane).toContain(`${secondSteering} · Esc to steer now`);
+      expect(pendingPane).toContain(secondSteering);
+      expect(pendingPane).toContain(`${thirdSteering} · Esc to steer now`);
       expect(pendingPane.indexOf(firstSteering)).toBeLessThan(
         pendingPane.indexOf(secondSteering),
+      );
+      expect(pendingPane.indexOf(secondSteering)).toBeLessThan(
+        pendingPane.indexOf(thirdSteering),
       );
       expect(countOccurrences(pendingPane, "Esc to steer now")).toBe(1);
       expect(pendingPane).not.toContain("Waiting for tool");
       expect(pendingPane).not.toContain("pending message");
       expect(pendingPane).not.toContain("queued 1");
       expect(steeringGateway.requests).toHaveLength(1);
+
+      await session.resizeWindow(60, 16);
+      const narrowPane = await session.capturePane();
+      for (const marker of [
+        "FIRST_BEGIN",
+        "FIRST_END",
+        "SECOND_BEGIN",
+        "SECOND_END",
+        "THIRD_BEGIN",
+        "THIRD_END",
+      ]) {
+        expect(narrowPane).toContain(marker);
+      }
+      expect(countOccurrences(narrowPane, "Esc to steer now")).toBe(1);
+      expect(narrowPane).not.toContain("queued message");
+      await session.resizeWindow(120, 40);
 
       writeFileSync(releasePath, "release\n");
       await session.waitForText(finalText, TIMEOUT);
@@ -2983,7 +3011,187 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(continuedBody.indexOf(secondSteering)).toBeGreaterThan(
         continuedBody.indexOf(firstSteering),
       );
+      expect(continuedBody.indexOf(thirdSteering)).toBeGreaterThan(
+        continuedBody.indexOf(secondSteering),
+      );
       expect(continuedBody).toContain("live user update");
+      expect(trace).toContain("event=prompt_steering_consumed");
+      expect(trace).not.toContain("event=queue_review_started");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(session.isAlive()).toBe(true);
+      expect(session.isPaneAlive()).toBe(true);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "rich steering waits for the running tool and hands off without queue UI",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-rich-steering-tool-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const tracePath = join(root, "trace.log");
+      const stderrPath = join(root, "stderr.log");
+      const releasePath = join(workspace, ".release-rich-steering-tool");
+      const imagePath = join(workspace, "steering-image.png");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      copyFileSync(join(REPO_ROOT, "tests/e2e/fixtures/favicon.png"), imagePath);
+      const expectedImageData = readFileSync(imagePath).toString("base64");
+      const command =
+        `while [ ! -f ${JSON.stringify(releasePath)} ]; do sleep 0.05; done; ` +
+        "printf RICH_STEERING_TOOL_DONE";
+      const steering = "Use the attached image after this command finishes.";
+      const finalText = "RICH_STEERING_HANDOFF_COMPLETE";
+      const steeringGateway = startFakeGateway([
+        fakeGatewayToolCall("rich_steering_tool", "terminal", {
+          action: "exec",
+          timeout_ms: 600_000,
+          command,
+        }),
+        fakeGatewayFinalText(finalText),
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["vision", "file-input", "tool-use"] }],
+      });
+      gateway = steeringGateway;
+
+      session = await TmuxSession.create({
+        cwd: workspace,
+        stderrPath,
+        width: 120,
+        height: 40,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-rich-steering-tool-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_SOUND: "0",
+          FX_PERMISSION_MODE: "yolo",
+          FX_GATEWAY_BASE_URL: steeringGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_E2E_GATEWAY_MODELS_URL: `${steeringGateway.baseUrl}/coding-agent/v1/models`,
+          FX_MODEL: MODEL,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "agent,worker,input,tool,interrupt",
+        },
+      });
+
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Run the rich steering tool fixture.");
+      await session.waitForText("Running while", TIMEOUT);
+      await session.sendText(`/image ${imagePath}`);
+      await session.waitForText("attached image: steering-image.png", TIMEOUT);
+      await session.sendText(steering);
+      await session.waitForText(`${steering} · Esc to steer now`, TIMEOUT);
+      expect(steeringGateway.requests).toHaveLength(1);
+
+      writeFileSync(releasePath, "release\n");
+      await session.waitForText(finalText, TIMEOUT);
+      await waitForCondition(
+        () => steeringGateway.requests.length === 2,
+        "rich steering handoff request",
+      );
+
+      const continuedBody = steeringGateway.requests[1]!.body;
+      const continuedRequest = JSON.parse(continuedBody) as {
+        prompt: Array<{ role?: string; content?: unknown }>;
+      };
+      const continuedUser = continuedRequest.prompt.filter((message) =>
+        message.role === "user"
+      ).at(-1);
+      expect(continuedUser).toBeDefined();
+      expect(Array.isArray(continuedUser!.content)).toBe(true);
+      const continuedParts = continuedUser!.content as Array<Record<string, unknown>>;
+      expect(continuedParts.filter((part) => part.type === "file")).toEqual([{
+        type: "file",
+        mediaType: "image/png",
+        data: expectedImageData,
+      }]);
+      expect(continuedBody).toContain("RICH_STEERING_TOOL_DONE");
+      expect(continuedBody).toContain("<user_steering>");
+      expect(continuedBody).toContain(steering);
+      const trace = readFileSync(tracePath, "utf8");
+      expect(trace).toContain("outcome_kind=steering_handoff");
+      expect(trace).not.toContain("event=queue_review_started");
+      const scrollback = await session.captureFullScrollback();
+      expect(scrollback).not.toContain(queuedSummaryText(1));
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(session.isAlive()).toBe(true);
+      expect(session.isPaneAlive()).toBe(true);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "failed tool result precedes pending steering",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-failed-tool-steering-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const tracePath = join(root, "trace.log");
+      const stderrPath = join(root, "stderr.log");
+      const releasePath = join(workspace, ".release-failed-steering-tool");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      const command =
+        `while [ ! -f ${JSON.stringify(releasePath)} ]; do sleep 0.05; done; ` +
+        "printf FAILED_TOOL_STEERING_RESULT; exit 7";
+      const steering = "Respond exactly FAILED_TOOL_STEERING_COMPLETE.";
+      const steeringGateway = startFakeGateway([
+        fakeGatewayToolCall("failed_steering_tool", "terminal", {
+          action: "exec",
+          timeout_ms: 600_000,
+          command,
+        }),
+        fakeGatewayFinalText("FAILED_TOOL_STEERING_COMPLETE"),
+      ]);
+      gateway = steeringGateway;
+
+      session = await TmuxSession.create({
+        cwd: workspace,
+        stderrPath,
+        width: 120,
+        height: 40,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-failed-tool-steering-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_SOUND: "0",
+          FX_PERMISSION_MODE: "yolo",
+          FX_GATEWAY_BASE_URL: steeringGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_MODEL: MODEL,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "agent,worker,input,tool,interrupt",
+        },
+      });
+
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Run the failed steering tool fixture.");
+      await session.waitForText("Running while", TIMEOUT);
+      await session.sendText(steering);
+      await session.waitForText(`${steering} · Esc to steer now`, TIMEOUT);
+      expect(steeringGateway.requests).toHaveLength(1);
+
+      writeFileSync(releasePath, "release\n");
+      await session.waitForText("FAILED_TOOL_STEERING_COMPLETE", TIMEOUT);
+      await waitForCondition(
+        () => steeringGateway.requests.length === 2,
+        "failed tool steering request",
+      );
+
+      const continuedBody = steeringGateway.requests[1]!.body;
+      expect(continuedBody.indexOf("FAILED_TOOL_STEERING_RESULT")).toBeGreaterThanOrEqual(0);
+      expect(continuedBody.indexOf(steering)).toBeGreaterThan(
+        continuedBody.indexOf("FAILED_TOOL_STEERING_RESULT"),
+      );
+      expect(continuedBody).toContain("<user_steering>");
+      const trace = readFileSync(tracePath, "utf8");
       expect(trace).toContain("event=prompt_steering_consumed");
       expect(trace).not.toContain("event=queue_review_started");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -3066,7 +3274,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "queued prompt stays pending until active assistant text completes",
+    "rich steering interrupts tool-free generation without queue UI",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-queued-order-")));
       const home = join(root, "home");
@@ -3083,37 +3291,37 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const sibling = join(workspace, "sibling");
       mkdirSync(nested, { recursive: true });
       mkdirSync(sibling, { recursive: true });
-      const imagePath = join(nested, "queued-snapshot.png");
+      const imagePath = join(nested, "steering-snapshot.png");
       copyFileSync(
         join(REPO_ROOT, "tests/e2e/fixtures/favicon.png"),
         imagePath,
       );
       const image = realpathSync(imagePath);
       const expectedImageData = readFileSync(image).toString("base64");
-      const oldGlobalRule = "QUEUED_SNAPSHOT_OLD_GLOBAL_RULE";
-      const oldAncestorRule = "QUEUED_SNAPSHOT_OLD_ANCESTOR_RULE";
-      const oldRootRule = "QUEUED_SNAPSHOT_OLD_ROOT_RULE";
-      const oldNestedRule = "QUEUED_SNAPSHOT_OLD_NESTED_RULE";
-      const oldSiblingRule = "QUEUED_SNAPSHOT_OLD_SIBLING_MUST_BE_ABSENT";
-      const newGlobalRule = "QUEUED_SNAPSHOT_NEW_GLOBAL_MUST_BE_ABSENT";
-      const newAncestorRule = "QUEUED_SNAPSHOT_NEW_ANCESTOR_MUST_BE_ABSENT";
-      const newRootRule = "QUEUED_SNAPSHOT_NEW_ROOT_MUST_BE_ABSENT";
-      const newNestedRule = "QUEUED_SNAPSHOT_NEW_NESTED_MUST_BE_ABSENT";
-      const newSiblingRule = "QUEUED_SNAPSHOT_NEW_SIBLING_MUST_BE_ABSENT";
+      const oldGlobalRule = "STEERING_SNAPSHOT_OLD_GLOBAL_RULE";
+      const oldAncestorRule = "STEERING_SNAPSHOT_OLD_ANCESTOR_RULE";
+      const oldRootRule = "STEERING_SNAPSHOT_OLD_ROOT_RULE";
+      const oldNestedRule = "STEERING_SNAPSHOT_OLD_NESTED_RULE";
+      const oldSiblingRule = "STEERING_SNAPSHOT_OLD_SIBLING_MUST_BE_ABSENT";
+      const newGlobalRule = "STEERING_SNAPSHOT_NEW_GLOBAL_MUST_BE_ABSENT";
+      const newAncestorRule = "STEERING_SNAPSHOT_NEW_ANCESTOR_MUST_BE_ABSENT";
+      const newRootRule = "STEERING_SNAPSHOT_NEW_ROOT_MUST_BE_ABSENT";
+      const newNestedRule = "STEERING_SNAPSHOT_NEW_NESTED_MUST_BE_ABSENT";
+      const newSiblingRule = "STEERING_SNAPSHOT_NEW_SIBLING_MUST_BE_ABSENT";
       writeFileSync(join(home, ".fx", "AGENTS.md"), `${oldGlobalRule}\n`);
       writeFileSync(join(launchAncestor, "AGENTS.md"), `${oldAncestorRule}\n`);
       writeFileSync(join(workspace, "AGENTS.md"), `${oldRootRule}\n`);
       writeFileSync(join(nested, "AGENTS.md"), `${oldNestedRule}\n`);
       writeFileSync(join(sibling, "AGENTS.md"), `${oldSiblingRule}\n`);
       const hold: HoldState = { started: false, cancelled: false };
-      const activeBefore = "ACTIVE_ASSISTANT_BEFORE_QUEUE_SENTINEL\n";
-      const activeAfter = "ACTIVE_ASSISTANT_AFTER_QUEUE_SENTINEL\n";
-      const queuedPrompt = "QUEUED_PROMPT_CANONICAL_ORDER_SENTINEL";
-      const queuedDone = "QUEUED_PROMPT_CANONICAL_ORDER_DONE";
-      const queuedGateway = startFakeGateway(
+      const activeBefore = "ACTIVE_ASSISTANT_BEFORE_STEERING_SENTINEL\n";
+      const activeAfter = "ACTIVE_ASSISTANT_AFTER_STEERING_MUST_BE_ABSENT\n";
+      const steeringPrompt = "RICH_STEERING_CANONICAL_ORDER_SENTINEL";
+      const steeringDone = "RICH_STEERING_CANONICAL_ORDER_DONE";
+      const steeringGateway = startFakeGateway(
         [
           () => splitHeldTextResponse(hold, activeBefore, activeAfter),
-          fakeGatewayFinalText(queuedDone),
+          fakeGatewayFinalText(steeringDone),
         ],
         {
           models: [{
@@ -3123,7 +3331,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           }],
         },
       );
-      gateway = queuedGateway;
+      gateway = steeringGateway;
 
       session = await TmuxSession.create({
         cwd: workspace,
@@ -3133,13 +3341,13 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         minimumHistoryLines: 2_000,
         env: {
           HOME: home,
-          AI_GATEWAY_API_KEY: "fake-queued-transcript-key",
+          AI_GATEWAY_API_KEY: "fake-rich-steering-key",
           VERCEL_OIDC_TOKEN: undefined,
           FX_AUTO_UPGRADE: "0",
-          FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
+          FX_GATEWAY_BASE_URL: steeringGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_E2E_GATEWAY_MODELS_URL: `${steeringGateway.baseUrl}/coding-agent/v1/models`,
           FX_MODEL: MODEL,
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
@@ -3151,30 +3359,14 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Hold the active turn open.");
       await waitForCondition(
-        () => queuedGateway.requests.length === 1 && hold.started,
+        () => steeringGateway.requests.length === 1 && hold.started,
         "held active Gateway request",
       );
       await session.waitForText("Generating", TIMEOUT);
 
       await session.sendText(`/image ${image}`);
-      await session.waitForText("attached image: queued-snapshot.png", TIMEOUT);
-      await session.sendText(queuedPrompt);
-      const heldScrollback = await waitForEscapedScrollback(
-        session,
-        (candidate) =>
-          queuedGateway.requests.length === 1 &&
-          hold.started &&
-          candidate.includes(queuedSummaryText(1)) &&
-          !candidate.includes(queuedPrompt),
-        "queued prompt count shown before active turn releases",
-      );
-
-      expect(heldScrollback).not.toContain(queuedPrompt);
-      expect(heldScrollback).not.toContain("next:");
-      expect(countOccurrences(heldScrollback, queuedPrompt)).toBe(0);
-      expect(heldScrollback).not.toContain(activeBefore.trim());
-      expect(heldScrollback).not.toContain(activeAfter.trim());
-      expect(queuedGateway.requests).toHaveLength(1);
+      await session.waitForText("attached image: steering-snapshot.png", TIMEOUT);
+      await session.sendText(steeringPrompt);
 
       writeFileSync(join(home, ".fx", "AGENTS.md"), `${newGlobalRule}\n`);
       writeFileSync(join(launchAncestor, "AGENTS.md"), `${newAncestorRule}\n`);
@@ -3182,67 +3374,58 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       writeFileSync(join(nested, "AGENTS.md"), `${newNestedRule}\n`);
       writeFileSync(join(sibling, "AGENTS.md"), `${newSiblingRule}\n`);
 
-      hold.release?.();
-      await session.waitForText(queuedDone, TIMEOUT);
+      await waitForCondition(() => hold.cancelled, "rich steering cancellation");
+      await session.waitForText(steeringDone, TIMEOUT);
       await waitForCondition(
-        () => queuedGateway.requests.length === 2,
-        "queued prompt drained",
+        () => steeringGateway.requests.length === 2,
+        "rich steering request",
       );
 
-      const queuedBody = queuedGateway.requests[1]!.body;
-      const queuedRequest = JSON.parse(queuedBody) as {
+      const steeringBody = steeringGateway.requests[1]!.body;
+      const steeringRequest = JSON.parse(steeringBody) as {
         prompt: Array<{ role?: string; content?: unknown }>;
       };
-      const queuedUser = queuedRequest.prompt.filter((message) =>
+      const steeringUser = steeringRequest.prompt.filter((message) =>
         message.role === "user"
       ).at(-1);
-      expect(queuedUser).toBeDefined();
-      expect(Array.isArray(queuedUser!.content)).toBe(true);
-      const queuedParts = queuedUser!.content as Array<Record<string, unknown>>;
-      expect(queuedParts.filter((part) => part.type === "file")).toEqual([{
+      expect(steeringUser).toBeDefined();
+      expect(Array.isArray(steeringUser!.content)).toBe(true);
+      const steeringParts = steeringUser!.content as Array<Record<string, unknown>>;
+      expect(steeringParts.filter((part) => part.type === "file")).toEqual([{
         type: "file",
         mediaType: "image/png",
         data: expectedImageData,
       }]);
-      expect(countOccurrences(queuedBody, oldGlobalRule)).toBe(1);
-      expect(countOccurrences(queuedBody, oldAncestorRule)).toBe(1);
-      expect(countOccurrences(queuedBody, oldRootRule)).toBe(1);
-      expect(countOccurrences(queuedBody, oldNestedRule)).toBe(1);
-      expect(queuedBody.indexOf(oldGlobalRule)).toBeLessThan(
-        queuedBody.indexOf(oldAncestorRule),
+      expect(steeringBody).toContain("<user_steering>");
+      expect(countOccurrences(steeringBody, oldGlobalRule)).toBe(1);
+      expect(countOccurrences(steeringBody, oldAncestorRule)).toBe(1);
+      expect(countOccurrences(steeringBody, oldRootRule)).toBe(1);
+      expect(countOccurrences(steeringBody, oldNestedRule)).toBe(1);
+      expect(steeringBody.indexOf(oldGlobalRule)).toBeLessThan(
+        steeringBody.indexOf(oldAncestorRule),
       );
-      expect(queuedBody.indexOf(oldAncestorRule)).toBeLessThan(
-        queuedBody.indexOf(oldRootRule),
+      expect(steeringBody.indexOf(oldAncestorRule)).toBeLessThan(
+        steeringBody.indexOf(oldRootRule),
       );
-      expect(queuedBody.indexOf(oldRootRule)).toBeLessThan(
-        queuedBody.indexOf(oldNestedRule),
+      expect(steeringBody.indexOf(oldRootRule)).toBeLessThan(
+        steeringBody.indexOf(oldNestedRule),
       );
-      expect(queuedBody).not.toContain(oldSiblingRule);
-      expect(queuedBody).not.toContain(newGlobalRule);
-      expect(queuedBody).not.toContain(newAncestorRule);
-      expect(queuedBody).not.toContain(newRootRule);
-      expect(queuedBody).not.toContain(newNestedRule);
-      expect(queuedBody).not.toContain(newSiblingRule);
+      expect(steeringBody).not.toContain(oldSiblingRule);
+      expect(steeringBody).not.toContain(newGlobalRule);
+      expect(steeringBody).not.toContain(newAncestorRule);
+      expect(steeringBody).not.toContain(newRootRule);
+      expect(steeringBody).not.toContain(newNestedRule);
+      expect(steeringBody).not.toContain(newSiblingRule);
 
       const finalScrollback = await session.captureFullScrollbackEscapes();
-      const beforeIndex = finalScrollback.indexOf(activeBefore.trim());
-      const afterIndex = finalScrollback.indexOf(activeAfter.trim());
-      const queuedPromptIndex = finalScrollback.indexOf(queuedPrompt);
-      const queuedDoneIndex = finalScrollback.indexOf(queuedDone);
-      const summaryOffset = finalScrollback
-        .slice(afterIndex)
-        .search(
-          / {2}(?:\d+s|\d+m \d+s|\d+h \d{2}m) \(↑\d+(?:\.\d)?k? ↓\d+(?:\.\d)?k?\)/,
-        );
-      const firstSummaryAfterActiveIndex =
-        summaryOffset < 0 ? -1 : afterIndex + summaryOffset;
-      expect(beforeIndex).toBeGreaterThanOrEqual(0);
-      expect(afterIndex).toBeGreaterThan(beforeIndex);
-      expect(firstSummaryAfterActiveIndex).toBeGreaterThan(afterIndex);
-      expect(firstSummaryAfterActiveIndex).toBeLessThan(queuedPromptIndex);
-      expect(queuedPromptIndex).toBeGreaterThan(afterIndex);
-      expect(queuedDoneIndex).toBeGreaterThan(queuedPromptIndex);
-      expect(countOccurrences(finalScrollback, queuedPrompt)).toBe(1);
+      const steeringPromptIndex = finalScrollback.indexOf(steeringPrompt);
+      const steeringDoneIndex = finalScrollback.indexOf(steeringDone);
+      expect(finalScrollback).not.toContain(activeBefore.trim());
+      expect(finalScrollback).not.toContain(activeAfter.trim());
+      expect(steeringPromptIndex).toBeGreaterThanOrEqual(0);
+      expect(steeringDoneIndex).toBeGreaterThan(steeringPromptIndex);
+      expect(countOccurrences(finalScrollback, steeringPrompt)).toBe(1);
+      expect(finalScrollback).not.toContain(queuedSummaryText(1));
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(existsSync(tapePath)).toBe(true);
       expect(session.isAlive()).toBe(true);
@@ -3361,150 +3544,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     TIMEOUT * 2,
   );
 
-  test(
-    "queued image yank survives deleting its queue card",
-    async () => {
-      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-queued-image-yank-")));
-      const home = join(root, "home");
-      const workspacePath = join(root, "workspace");
-      const tracePath = join(root, "trace.log");
-      const stderrPath = join(root, "stderr.log");
-      const imagePath = join(workspacePath, "queued-image.png");
-      mkdirSync(join(home, ".fx"), { recursive: true });
-      mkdirSync(workspacePath, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
-      copyFileSync(
-        join(REPO_ROOT, "tests/e2e/fixtures/favicon.png"),
-        imagePath,
-      );
-      const workspace = realpathSync(workspacePath);
-      const image = realpathSync(imagePath);
-      const expectedImageData = readFileSync(image).toString("base64");
-      const hold: HoldState = { started: false, cancelled: false };
-      const queuedPrompt = "Describe FXC141_QUEUED_IMAGE_YANK.";
-      const done = "FXC141_QUEUED_IMAGE_YANK_DONE";
-      const queuedGateway = startFakeGateway(
-        [
-          () =>
-            heldGatewayResponse(hold, [
-              { type: "text-start", id: "answer_1" },
-              {
-                type: "text-delta",
-                id: "answer_1",
-                delta: "ACTIVE_QUEUED_IMAGE_YANK_STARTED\n",
-              },
-            ]),
-          fakeGatewayFinalText(done),
-        ],
-        {
-          models: [{
-            id: MODEL,
-            type: "language",
-            tags: ["vision", "file-input", "tool-use"],
-          }],
-        },
-      );
-      gateway = queuedGateway;
-
-      session = await TmuxSession.create({
-        cwd: workspace,
-        stderrPath,
-        width: 100,
-        height: 30,
-        env: {
-          HOME: home,
-          AI_GATEWAY_API_KEY: "fake-queued-image-yank-key",
-          VERCEL_OIDC_TOKEN: undefined,
-          FX_AUTO_UPGRADE: "0",
-          FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
-          FX_MODEL: MODEL,
-          FX_TRACE_LOG: tracePath,
-          FX_TRACE_SCOPES: "agent,gateway,stream,worker,input,prompt,interrupt",
-        },
-      });
-
-      await session.waitForComposer(TIMEOUT);
-      await session.sendText("Hold the queued image yank turn open.");
-      await waitForCondition(
-        () => queuedGateway.requests.length === 1 && hold.started,
-        "held active request for queued image yank",
-      );
-      await session.sendText(`/image ${image}`);
-      await session.waitForText("attached image: queued-image.png", TIMEOUT);
-      await session.sendText(queuedPrompt);
-      await session.waitForPane(
-        (pane) =>
-          pane.includes(queuedSummaryText(1)) &&
-          !pane.includes(queuedPrompt),
-        TIMEOUT,
-      );
-      rmSync(image);
-
-      await session.sendKeys("C-c");
-      await waitForCondition(() => hold.cancelled, "queued image active request cancellation");
-      await session.waitForPane(
-        (pane) =>
-          pane.includes(queuedPrompt) &&
-          pane.includes("paused") &&
-          pane.includes("enter to send"),
-        TIMEOUT,
-      );
-
-      await session.sendKeys("End");
-      await session.sendKeys("C-u");
-      await session.waitForPane(
-        (pane) =>
-          !pane.includes(queuedPrompt) &&
-          pane.includes("delete again to remove queued prompt"),
-        TIMEOUT,
-      );
-      await session.sendKeys("C-k");
-      await waitForCondition(
-        () =>
-          existsSync(tracePath) &&
-          readFileSync(tracePath, "utf8").includes(
-            "event=queue_review_draft_deleted",
-          ),
-        "empty queued image card deletion",
-      );
-
-      await session.sendKeys("C-y");
-      await session.waitForPane(
-        (pane) =>
-          pane.includes("[Image 2]") &&
-          pane.includes("FXC141_QUEUED_IMAGE_YANK"),
-        TIMEOUT,
-      );
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
-      expect(session.isAlive()).toBe(true);
-      expect(session.isPaneAlive()).toBe(true);
-
-      await session.sendKeys("Enter");
-      await session.waitForText(done, TIMEOUT);
-      await waitForCondition(
-        () => queuedGateway.requests.length === 2,
-        "yanked image Gateway request",
-      );
-
-      const yankedBody = queuedGateway.requests[1]!.body;
-      const trace = readFileSync(tracePath, "utf8");
-      expect(yankedBody.match(/"type":"file"/g) ?? []).toHaveLength(1);
-      expect(yankedBody).toContain(expectedImageData);
-      expect(yankedBody).toContain("[Image #2]" + queuedPrompt);
-      expect(yankedBody).not.toContain(image);
-      expect(trace).toContain("event=queue_review_started");
-      expect(trace).toContain("reason=post_cancel");
-      expect(trace).toContain("event=queue_review_deleted");
-      expect(trace).toContain("event=queue_review_draft_deleted");
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
-      expect(session.isAlive()).toBe(true);
-      expect(session.isPaneAlive()).toBe(true);
-    },
-    TIMEOUT * 2,
-  );
   test(
     "second Ctrl+C exits after active stream cancellation",
     async () => {

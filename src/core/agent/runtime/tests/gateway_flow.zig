@@ -245,6 +245,31 @@ test "terminal assistant completion continues with steering admitted during the 
     try std.testing.expectEqualStrings("change direction", execution.steering[0]);
 }
 
+test "promoted steering remains model marked across the worker handoff" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .content = "Updated answer" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.steering_continuation = true;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    try expectBodyContainsInOrder(&gateway, 0, &.{
+        "user_steering",
+        "user prompt",
+    });
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expectEqualStrings(
+        "user prompt",
+        hooks.history_turns.items[0].assistant.user.text,
+    );
+}
+
 fn makeOwnedProviderPrompt(alloc: Allocator, text: []const u8, model: []const u8) !QueuedPrompt {
     const prompt = try alloc.dupe(u8, text);
     errdefer alloc.free(prompt);

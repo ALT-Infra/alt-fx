@@ -3890,7 +3890,14 @@ fn processQueuedPromptInner(
         try local_grants.append(arena, .{ .tool_name = grant.tool_name, .target_path = grant.target_path });
     }
 
-    const current_user_message: ChatMessage = .{ .role = .user, .content = job.prompt, .images = job.images };
+    const current_user_message: ChatMessage = .{
+        .role = .user,
+        .content = if (job.steering_continuation)
+            try runtime_execution_memory.steeringMessage(arena, job.prompt)
+        else
+            job.prompt,
+        .images = job.images,
+    };
 
     var stop_state = CommonStopState{};
     processQueuedPromptLoop(
@@ -4356,6 +4363,25 @@ fn processQueuedPromptLoop(
             try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, null, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
             finish_trace.finish("interrupted");
             return;
+        }
+        if (deps.steering_handoff_required) |handoff_required| {
+            if (handoff_required(deps.ctx, turn_id)) {
+                try runtime_interruption.persistInterruptedTurnOnce(
+                    deps,
+                    finalization,
+                    job,
+                    null,
+                    null,
+                    completed_tool_names.items,
+                    &interrupted_persisted,
+                    step_ctx,
+                    within_turn_suffix.items,
+                    stop_state.retained_candidate,
+                    &stop_state.terminal_materializing,
+                );
+                finish_trace.finish("steering_handoff");
+                return;
+            }
         }
         _ = overlay_arena_state.reset(.retain_capacity);
         const overlay_arena = overlay_arena_state.allocator();
