@@ -153,10 +153,18 @@ pub fn load(alloc: std.mem.Allocator) !?[]u8 {
 /// Checks Keychain metadata only. It never asks Security.framework for the
 /// secret value and never spawns the `security` command-line tool.
 pub fn contains() Error!host.SecretStorePresence {
+    return containsService(service_name);
+}
+
+pub fn oauthSessionPresence() Error!host.SecretStorePresence {
+    return containsService(oauth_session_service_name);
+}
+
+fn containsService(service: []const u8) Error!host.SecretStorePresence {
     if (comptime builtin.os.tag != .macos) return .missing;
     var account_buf: AccountBuffer = undefined;
     const account = try accountName(&account_buf);
-    const service_len = std.math.cast(u32, service_name.len) orelse
+    const service_len = std.math.cast(u32, service.len) orelse
         return error.KeychainReadFailed;
     const account_len = std.math.cast(u32, account.len) orelse
         return error.KeychainReadFailed;
@@ -175,7 +183,7 @@ pub fn contains() Error!host.SecretStorePresence {
     const status = find_generic_password(
         null,
         service_len,
-        service_name.ptr,
+        service.ptr,
         account_len,
         account.ptr,
         null,

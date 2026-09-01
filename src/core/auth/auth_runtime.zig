@@ -1949,9 +1949,13 @@ test "auth in-place initialization preserves empty runtime state" {
     try std.testing.expect(runtime.api_key_input.items.len == 0);
 }
 
-fn probeCredentialSource(raw_context: ?*anyopaque, alloc: Allocator, source: credentials.Source) !bool {
+fn probeCredentialSource(raw_context: ?*anyopaque, _: Allocator, source: credentials.Source) !bool {
     const self: *Runtime = @ptrCast(@alignCast(raw_context.?));
-    return credentials.sourceExists(alloc, self.secret_store, source);
+    return switch (credentials.sourcePresence(self.secret_store, source)) {
+        .present => true,
+        .missing => false,
+        .unavailable => error.CredentialSourceUnavailable,
+    };
 }
 
 fn loadCredentialSource(_: ?*anyopaque, alloc: Allocator, source: credentials.Source) !?credentials.Credential {

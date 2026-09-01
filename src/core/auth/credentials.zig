@@ -1,7 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const chatgpt_oauth = @import("chatgpt_oauth.zig");
+const chatgpt_session = @import("chatgpt_session.zig");
 const grok_oauth = @import("grok_oauth.zig");
+const grok_session = @import("grok_session.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
@@ -9,6 +11,7 @@ const model_provider = @import("../config/model_provider.zig");
 const oauth = @import("oauth.zig");
 const oauth_session = @import("oauth_session.zig");
 const oauth_transport = @import("oauth_transport.zig");
+const profile_paths = @import("../shared/profile_paths.zig");
 const secret = @import("secret.zig");
 const types = @import("../shared/types.zig");
 
@@ -451,6 +454,29 @@ pub fn sourceExists(
                 },
             };
         },
+    };
+}
+
+pub fn sourcePresence(
+    secret_store: host.SecretStore,
+    source: Source,
+) host.SecretStorePresence {
+    return switch (source) {
+        .vercel_oidc_token => if (nonEmptyEnvValue("VERCEL_OIDC_TOKEN") != null)
+            .present
+        else
+            .missing,
+        .ai_gateway_api_key => if (nonEmptyEnvValue("AI_GATEWAY_API_KEY") != null)
+            .present
+        else
+            .missing,
+        .fx_login => oauth_session.presence(),
+        .stored_key => if (secret_store.isDisabled())
+            .missing
+        else
+            secret_store.presence(),
+        .chatgpt_subscription => chatgpt_session.presence(),
+        .grok_subscription => grok_session.presence(),
     };
 }
 
@@ -1049,6 +1075,53 @@ test "stored key existence never loads secret bytes" {
     ));
     try std.testing.expectEqual(@as(usize, 0), store_fixture.load_calls);
     try std.testing.expectEqual(@as(usize, 1), store_fixture.presence_calls);
+}
+
+test "credential source presence reads metadata without parsing session secrets" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "");
+    defer alloc.free(home);
+    const env = try CredentialTestEnv.install(alloc, &.{.{ "HOME", home }});
+    defer env.deinit();
+
+    const cases = [_]struct {
+        source: Source,
+        file_name: []const u8,
+    }{
+        .{ .source = .fx_login, .file_name = profile_paths.auth_file_name },
+        .{ .source = .chatgpt_subscription, .file_name = profile_paths.chatgpt_auth_file_name },
+        .{ .source = .grok_subscription, .file_name = profile_paths.grok_auth_file_name },
+    };
+    for (cases) |case| {
+        var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const relative_path = try std.fmt.bufPrint(
+            &path_buffer,
+            ".fx/{s}",
+            .{case.file_name},
+        );
+        var file = try tmp.dir.createFile(io_mod.getIo(), relative_path, .{
+            .truncate = true,
+            .permissions = std.Io.File.Permissions.fromMode(0o600),
+        });
+        defer file.close(io_mod.getIo());
+        try file.writeStreamingAll(io_mod.getIo(), "not valid session JSON");
+
+        try std.testing.expectEqual(
+            host.SecretStorePresence.present,
+            sourcePresence(host.unavailable_secret_store, case.source),
+        );
+        try file.setPermissions(
+            io_mod.getIo(),
+            std.Io.File.Permissions.fromMode(0o644),
+        );
+        try std.testing.expectEqual(
+            host.SecretStorePresence.unavailable,
+            sourcePresence(host.unavailable_secret_store, case.source),
+        );
+    }
 }
 
 test "credential resolution preserves unreadable store classification" {

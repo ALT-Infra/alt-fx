@@ -4018,50 +4018,6 @@ fn commandResultBodyRanges(
     return ranges;
 }
 
-/// Materializes the complete width-rendered page once for worker-side line
-/// indexing. Steady-state viewport selection borrows this result.
-pub fn renderProjectionSourceInterruptible(
-    alloc: Allocator,
-    projection: *Projection,
-    capability: ?*session_child_store.SessionChildCapability,
-    cols: u16,
-    checkpoint: ?*BuildCheckpoint,
-) ![]u8 {
-    if (cols == 0) return error.InvalidViewport;
-    while (true) {
-        const measurement = try measureProjectionInterruptible(
-            alloc,
-            projection,
-            capability,
-            cols,
-            checkpoint,
-        );
-        var walker = ProjectionRowWalker.initWindowAt(
-            alloc,
-            cols,
-            0,
-            measurement.total_rows,
-            .{ .row = 0, .col = 1, .row_has_bytes = false },
-            checkpoint,
-        );
-        defer walker.deinit();
-        _ = walkProjectionSegments(
-            alloc,
-            projection,
-            capability,
-            &walker,
-            0,
-            0,
-            null,
-            null,
-        ) catch |err| switch (err) {
-            error.StoredSegmentDegraded => continue,
-            else => |other| return other,
-        };
-        return walker.toOwnedSlice();
-    }
-}
-
 fn validForegroundStatusRange(
     alloc: Allocator,
     cursor: *PagedReaderCursor,

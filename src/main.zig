@@ -200,6 +200,21 @@ const max_read_file_lines: usize = 400;
 const max_read_file_line_len: usize = 2000;
 const max_command_output_bytes: usize = 64 * 1024;
 const input_escape_timeout_ms: i64 = 30;
+
+fn nativeLoopPollTimeoutMs(
+    default_timeout_ms: i32,
+    auth_refresh_active: bool,
+    skills_refresh_active: bool,
+    transcript_page_work_active: bool,
+) i32 {
+    return if (auth_refresh_active or
+        skills_refresh_active or
+        transcript_page_work_active)
+        @min(default_timeout_ms, focused_ui_worker_poll_timeout_ms)
+    else
+        default_timeout_ms;
+}
+
 const max_prompt_history: usize = 100;
 
 const ignored_list_entries = [_][]const u8{
@@ -1010,15 +1025,23 @@ const App = struct {
     }
 
     pub fn loopPollTimeoutMs(ctx: *anyopaque, default_timeout_ms: i32) i32 {
-        const self: *const App = @ptrCast(@alignCast(ctx));
+        const self: *App = @ptrCast(@alignCast(ctx));
         if (comptime !host_target.is_wasm) {
-            if (self.auth.sourceInventoryRefreshActive()) return 0;
-            if (self.skills.refreshActive()) {
-                return @min(default_timeout_ms, focused_ui_worker_poll_timeout_ms);
-            }
-            return default_timeout_ms;
+            return nativeLoopPollTimeoutMs(
+                default_timeout_ms,
+                self.auth.sourceInventoryRefreshActive(),
+                self.skills.refreshActive(),
+                self.fullTranscriptPageWorkActive(),
+            );
         }
         return if (self.pacer.hasPending()) default_timeout_ms else idle_wasm_poll_timeout_ms;
+    }
+
+    fn fullTranscriptPageWorkActive(self: *App) bool {
+        if (self.shell.fullTranscriptPageWorkActive()) return true;
+        const child = self.subagents.childConversationRuntime() orelse
+            return false;
+        return child.fullTranscriptPageWorkActive();
     }
 
     fn processNextCooperativePrompt(self: *App) !void {
@@ -2681,10 +2704,6 @@ const App = struct {
     }
 
     fn handleTerminalInputByte(self: *App, byte: u8) !void {
-        if (byte != 15) {
-            const cancelled = InputFullTranscriptRuntime.cancelPendingOpenForInput(self);
-            if (cancelled and byte == 0x1b) return;
-        }
         const context = try InputAppRuntime.prepareTerminalDecode(self) orelse return;
         const ingress = self.terminal_input_runtime.decodeTerminalByte(
             byte,
@@ -3691,6 +3710,14 @@ test "lightweight local commands do not request early threaded io" {
     for ([_][:0]const u8{ "help", "sessions", "tasks", "permissions" }) |command| {
         try std.testing.expect(!needsEarlyThreadedIo(&.{command}));
     }
+}
+
+test "focused UI workers retain a bounded native poll timeout" {
+    try std.testing.expectEqual(@as(i32, 8), nativeLoopPollTimeoutMs(8, false, false, false));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, false, false));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, true, false));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, true));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, true, true));
 }
 
 test "footer runtime compatibility facade exports composeFooterFrame" {

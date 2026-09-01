@@ -604,6 +604,9 @@ pub fn Runtime(comptime App: type) type {
             max_prompt_history: usize,
         ) !?u8 {
             if (!ingress.has_routing_work()) return null;
+            if (terminalIngressCancelsPendingFullTranscriptOpen(ingress)) {
+                _ = full_transcript_rt.cancelPendingOpenForInput(app);
+            }
 
             const file_picker_was_active = app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state) != null;
             defer if (comptime runtime_profile.allows(App, .file_index))
@@ -708,10 +711,6 @@ pub fn Runtime(comptime App: type) type {
             input_limits: paste_framing.InputLimits,
             max_prompt_history: usize,
         ) !void {
-            if (byte != 15) {
-                const cancelled = full_transcript_rt.cancelPendingOpenForInput(app);
-                if (cancelled and byte == 0x1b) return;
-            }
             var context = try prepareTerminalDecode(app) orelse return;
             var ingress = app.terminal_input_runtime.decodeTerminalByte(
                 byte,
@@ -736,6 +735,16 @@ pub fn Runtime(comptime App: type) type {
                 return app.subagents.managerPasteActive();
             }
             return false;
+        }
+
+        fn terminalIngressCancelsPendingFullTranscriptOpen(
+            ingress: input_action.TerminalInputIngress,
+        ) bool {
+            const event = ingress.event orelse return false;
+            return switch (event) {
+                .paste_byte, .raw => true,
+                .action => |decoded| decoded.action != .toggle_full_transcript,
+            };
         }
 
         pub fn routeActivePasteIngressByteWithLimits(
@@ -7943,6 +7952,35 @@ test "app_input_runtime decoded kitty Escape follows the raw Escape policy" {
         try feedRoutingBytes(&app, "\x1b[27u");
         try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
         try std.testing.expect(!app.input_runtime.gestures.escapeClearArmed());
+    }
+}
+
+test "pending full transcript open cancels after complete escape input" {
+    const alloc = std.testing.allocator;
+    const sequences = [_][]const u8{
+        "\x1b[A",
+        "\x1b[B",
+        "\x1b[5~",
+        "\x1b[6~",
+    };
+
+    for (sequences) |sequence| {
+        var app = try RoutingFakeApp.init(alloc);
+        defer app.deinit();
+        _ = try app.shell.appendRawTranscriptEntryClassified(
+            alloc,
+            "pending transcript\n",
+            .unknown_raw,
+        );
+        try std.testing.expect(!app.shell.requestFullTranscriptOpen());
+
+        try feedRoutingBytes(&app, sequence);
+
+        try std.testing.expectEqualStrings(
+            "",
+            app.input_runtime.edit_state.input.items,
+        );
+        try std.testing.expect(!app.shell.cancelPendingFullTranscriptOpen());
     }
 }
 

@@ -15,8 +15,11 @@ import { join } from "node:path";
 import { FX_BIN } from "../evals/eval-helpers";
 import { readTapeFrames, type TapeFrame } from "./render-lab/tape";
 import {
+  composerContains,
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
+  fakeGatewayToolCall,
+  hasEmptyComposer,
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -29,8 +32,47 @@ const LIVE_ENABLED = process.env.FX_E2E_REAL_API === "1" &&
 const WARMUPS = 5;
 const SAMPLES = 50;
 const LOCAL_BUDGETS_MS = { p50: 8, p90: 12, p95: 17 } as const;
+const BACKGROUND_WORK_BUDGETS_MS = { p50: 12, p90: 17, p95: 17 } as const;
 const EXTERNAL_REFRESH_BUDGETS_MS = { p50: 17, p90: 17, p95: 17 } as const;
+const EXCLUSIVE_PANE_BUDGETS_MS = { p50: 17, p90: 25, p95: 25 } as const;
+const HOSTED_TERMINAL_BUDGETS_MS = { p50: 34, p90: 40, p95: 40 } as const;
 const TIMEOUT = 60_000;
+
+const LOCAL_MENU_ACTIONS = [
+  { name: "helpOpen", command: "/help", marker: "Commands " },
+  { name: "settingsOpen", command: "/settings", marker: "Settings" },
+  { name: "modelOpen", command: "/model", marker: "Models " },
+  { name: "resumeOpen", command: "/resume", marker: "Sessions " },
+  { name: "mcpOpen", command: "/mcp", marker: "[Servers]" },
+  { name: "usageOpen", command: "/usage", marker: "[30 days]" },
+  { name: "statuslineOpen", command: "/statusline", marker: "Status line" },
+  { name: "workspaceOpen", command: "/workspace", marker: "Enter Use" },
+] as const;
+
+const MEASURED_ACTION_NAMES = [
+  "composerEdit",
+  "slashOpen",
+  "slashQuery",
+  "dollarOpen",
+  "dollarQuery",
+  "fileQuery",
+  "questionNavigate",
+  "approvalNavigate",
+  "hostedTerminalInput",
+  "subagentManagerOpen",
+  "fullOpen",
+  "fullScroll",
+  "fullScrollCacheMiss",
+  "skillsOpen",
+  "skillsQuery",
+  "loginOpen",
+  ...LOCAL_MENU_ACTIONS.map((action) => action.name),
+] as const;
+
+const EXCLUSIVE_PANE_ACTION_NAMES = new Set<string>([
+  "subagentManagerOpen",
+  ...LOCAL_MENU_ACTIONS.map((action) => action.name),
+]);
 
 type Samples = {
   firstPaint: number[];
@@ -42,6 +84,31 @@ type ResourceSnapshot = {
   threads: number;
   descriptors: number;
 };
+
+function findSessionId(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    try {
+      return findSessionId(JSON.parse(value));
+    } catch {
+      return undefined;
+    }
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findSessionId(item);
+      if (found !== undefined) return found;
+    }
+    return undefined;
+  }
+  if (value === null || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  if (typeof record.session_id === "string") return record.session_id;
+  for (const child of Object.values(record)) {
+    const found = findSessionId(child);
+    if (found !== undefined) return found;
+  }
+  return undefined;
+}
 
 function percentile(values: readonly number[], fraction: number): number {
   const sorted = [...values].sort((left, right) => left - right);
@@ -115,6 +182,92 @@ async function measureAction(
   action();
   await waitReady();
   return frameLatency(readCompleteTape(tapePath), fromIndex, contentMarker);
+}
+
+async function measurePaneAction(
+  action: () => void,
+  waitReady: () => Promise<unknown>,
+): Promise<{ firstPaint: number; contentReady: number }> {
+  const started = performance.now();
+  action();
+  await waitReady();
+  const elapsed = Math.ceil(performance.now() - started);
+  return { firstPaint: elapsed, contentReady: elapsed };
+}
+
+async function waitForPaneChange(
+  session: TmuxSession,
+  before: string,
+  timeoutMs = TIMEOUT,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await session.capturePane() !== before) return;
+    await Bun.sleep(1);
+  }
+  throw new Error("terminal pane did not change after input");
+}
+
+async function waitForPaneText(
+  session: TmuxSession,
+  marker: string,
+  before: string,
+  timeoutMs = TIMEOUT,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const pane = await session.capturePane();
+    if (pane !== before && pane.includes(marker)) return;
+    await Bun.sleep(1);
+  }
+  throw new Error(`terminal pane did not show ${JSON.stringify(marker)}`);
+}
+
+async function waitForTapeQuiescence(
+  tapePath: string,
+  quietMs = 20,
+  timeoutMs = TIMEOUT,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let lastLength = readCompleteTape(tapePath).length;
+  let quietSince = Date.now();
+  while (Date.now() < deadline) {
+    await Bun.sleep(2);
+    const length = readCompleteTape(tapePath).length;
+    if (length !== lastLength) {
+      lastLength = length;
+      quietSince = Date.now();
+      continue;
+    }
+    if (Date.now() - quietSince >= quietMs) return;
+  }
+  throw new Error("recording did not become quiescent before the next action");
+}
+
+async function waitForEscapedPaneChange(
+  session: TmuxSession,
+  before: string,
+  label: string,
+  timeoutMs = TIMEOUT,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await session.capturePaneEscapes() !== before) return;
+    await Bun.sleep(2);
+  }
+  throw new Error(`${label} did not produce a changed escaped pane`);
+}
+
+async function closeSurface(
+  session: TmuxSession,
+  visibleMarker: string,
+  closeKey = "Escape",
+): Promise<void> {
+  session.sendKeysImmediate([closeKey, "C-u"]);
+  await session.waitForPane(
+    (pane) => hasEmptyComposer(pane) && !pane.includes(visibleMarker),
+    TIMEOUT,
+  );
 }
 
 function appendMeasured(samples: Samples, value: { firstPaint: number; contentReady: number }) {
@@ -200,6 +353,7 @@ function createFixture() {
     hash.update(body);
   }
   const transcript = longTranscript();
+  writeFileSync(join(workspace, "performance-target.txt"), "fixture\n");
   hash.update(transcript);
   return {
     root,
@@ -230,8 +384,49 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
       "PERF_TRANSCRIPT_TAIL",
       "PERF_SECOND_TRANSCRIPT_TAIL",
     );
+    let hostedTerminalSessionId = "";
     const gateway = startFakeGateway([
       fakeGatewayFinalText(fixture.transcript),
+      fakeGatewayToolCall("performance-question", "ask_user_question", {
+        questions: [{
+          question: "Which performance path should I use?",
+          options: [
+            { label: "Alpha path", description: "Use the first path." },
+            { label: "Beta path", description: "Use the second path." },
+          ],
+        }],
+      }),
+      fakeGatewayFinalText("PERF_QUESTION_DONE"),
+      fakeGatewayToolCall("performance-approval", "terminal", {
+        action: "exec",
+        command: "touch performance-approval.txt",
+        timeout_ms: 600_000,
+      }),
+      fakeGatewayFinalText("PERF_APPROVAL_DONE"),
+      fakeGatewayToolCall("performance-terminal", "terminal", {
+        action: "start",
+        cwd: fixture.workspace,
+        command:
+          "printf 'PERF_TERMINAL_READY\\n'; " +
+          "while :; do sleep 1; done",
+        backend: "native",
+        return_when: { kind: "match", pattern: "PERF_TERMINAL_READY" },
+        wait_ceiling_ms: 20_000,
+        dimensions: { rows: 24, columns: 80 },
+      }),
+      (body) => {
+        hostedTerminalSessionId = findSessionId(JSON.parse(body)) ?? "";
+        if (hostedTerminalSessionId.length === 0) {
+          throw new Error("terminal start result did not contain a session id");
+        }
+        return fakeGatewayFinalText("PERF_TERMINAL_AGENT_READY");
+      },
+      () => fakeGatewayToolCall("performance-terminal-close", "terminal", {
+        action: "close",
+        session_id: hostedTerminalSessionId,
+        close_policy: "force",
+      }),
+      fakeGatewayFinalText("PERF_TERMINAL_CLOSED"),
       fakeGatewayFinalText(secondTranscript),
     ]);
     let session: TmuxSession | null = null;
@@ -246,6 +441,7 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_PERMISSION_MODE: "ask",
           FX_AUTO_UPGRADE: "0",
           FX_SOUND: "0",
           FX_RECORD: fixture.tapePath,
@@ -268,15 +464,27 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
       session.sendKeysImmediate(["Escape"]);
       await session.waitForComposer(TIMEOUT);
 
-      const samples = {
-        fullOpen: { firstPaint: [], contentReady: [] } as Samples,
-        fullScroll: { firstPaint: [], contentReady: [] } as Samples,
-        skillsOpen: { firstPaint: [], contentReady: [] } as Samples,
-        skillsQuery: { firstPaint: [], contentReady: [] } as Samples,
-        loginOpen: { firstPaint: [], contentReady: [] } as Samples,
-      };
+      const overlapGeneration = writeGenerationSkill(
+        fixture.generationSkillPath,
+        999,
+      );
+      session.sendLiteralImmediate("/skills");
+      session.sendKeysImmediate(["Enter"]);
+      session.sendLiteralImmediate(`/skills show ${overlapGeneration}`);
+      session.sendKeysImmediate(["Enter"]);
+      await session.waitForText(overlapGeneration, TIMEOUT);
+      await session.waitForText("Skills 289", TIMEOUT);
+      session.sendKeysImmediate(["Escape"]);
+      await session.waitForComposer(TIMEOUT);
+
+      const samples = Object.fromEntries(
+        MEASURED_ACTION_NAMES.map((name) => [
+          name,
+          { firstPaint: [], contentReady: [] } as Samples,
+        ]),
+      ) as Record<(typeof MEASURED_ACTION_NAMES)[number], Samples>;
       const pid = session.processPid();
-      const resourcesBefore = resourceSnapshot(pid);
+      const coldResourcesBefore = resourceSnapshot(pid);
 
       for (let cycle = 0; cycle < WARMUPS + SAMPLES; cycle += 1) {
         const open = await measureAction(
@@ -285,7 +493,7 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
           () => session!.waitForText("Full detail · ctrl o close", TIMEOUT),
           "Full detail",
         );
-        const beforeScroll = (await session.capturePaneGrid()).join("\n");
+        const beforeScroll = await session.capturePane();
         const scroll = await measureAction(
           fixture.tapePath,
           () => session!.sendKeysImmediate(["Up"]),
@@ -301,6 +509,40 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
           appendMeasured(samples.fullScroll, scroll);
         }
       }
+
+      session.sendKeysImmediate(["C-o"]);
+      await session.waitForText("Full detail · ctrl o close", TIMEOUT);
+      let beforePrime = await session.capturePane();
+      session.sendKeysImmediate(["PageUp"]);
+      await session.waitForPane(
+        (pane) => pane !== beforePrime && pane.includes("Full detail"),
+        TIMEOUT,
+      );
+      await waitForTapeQuiescence(fixture.tapePath);
+      for (let cycle = 0; cycle < WARMUPS + SAMPLES; cycle += 1) {
+        const key = cycle % 2 === 0 ? "PageUp" : "PageDown";
+        beforePrime = await session.capturePane();
+        session.sendKeysImmediate([key]);
+        await session.waitForPane(
+          (pane) => pane !== beforePrime && pane.includes("Full detail"),
+          TIMEOUT,
+        );
+        await waitForTapeQuiescence(fixture.tapePath);
+        const beforeMiss = await session.capturePane();
+        const cacheMiss = await measureAction(
+          fixture.tapePath,
+          () => session!.sendKeysImmediate([key]),
+          () => session!.waitForPane(
+            (pane) => pane !== beforeMiss && pane.includes("Full detail"),
+            TIMEOUT,
+          ),
+        );
+        if (cycle >= WARMUPS) {
+          appendMeasured(samples.fullScrollCacheMiss, cacheMiss);
+        }
+      }
+      session.sendKeysImmediate(["Escape"]);
+      await session.waitForComposer(TIMEOUT);
 
       for (let cycle = 0; cycle < WARMUPS + SAMPLES; cycle += 1) {
         const generationName = writeGenerationSkill(
@@ -345,6 +587,160 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
         if (cycle >= WARMUPS) appendMeasured(samples.loginOpen, open);
       }
 
+      for (let cycle = 0; cycle < WARMUPS + SAMPLES; cycle += 1) {
+        session.sendKeysImmediate(["C-u"]);
+        await session.waitForComposer(TIMEOUT);
+        const marker = `performance-edit-${cycle}`;
+        const edit = await measureAction(
+          fixture.tapePath,
+          () => session!.sendLiteralImmediate(marker),
+          () => session!.waitForText(marker, TIMEOUT),
+          marker,
+        );
+        session.sendKeysImmediate(["C-u"]);
+        await session.waitForComposer(TIMEOUT);
+        if (cycle >= WARMUPS) appendMeasured(samples.composerEdit, edit);
+      }
+
+      for (let cycle = 0; cycle < WARMUPS + SAMPLES; cycle += 1) {
+        const slashOpen = await measureAction(
+          fixture.tapePath,
+          () => session!.sendLiteralImmediate("/"),
+          () => session!.waitForText("Results ", TIMEOUT),
+          "Results ",
+        );
+        const slashQuery = await measureAction(
+          fixture.tapePath,
+          () => session!.sendLiteralImmediate("he"),
+          () => session!.waitForPane(
+            (pane) => composerContains(pane, "/he") &&
+              pane.includes("show available slash commands"),
+            TIMEOUT,
+          ),
+          "┃ /he",
+        );
+        await closeSurface(session, "Results ");
+        if (cycle >= WARMUPS) {
+          appendMeasured(samples.slashOpen, slashOpen);
+          appendMeasured(samples.slashQuery, slashQuery);
+        }
+      }
+
+      for (let cycle = 0; cycle < WARMUPS + SAMPLES; cycle += 1) {
+        const dollarOpen = await measureAction(
+          fixture.tapePath,
+          () => session!.sendLiteralImmediate("$"),
+          () => session!.waitForText("Skills 289", TIMEOUT),
+          "Skills 289",
+        );
+        const dollarQuery = await measureAction(
+          fixture.tapePath,
+          () => session!.sendLiteralImmediate("needle"),
+          () => session!.waitForText("Skills 144", TIMEOUT),
+          "Skills 144",
+        );
+        await closeSurface(session, "Skills ");
+        if (cycle >= WARMUPS) {
+          appendMeasured(samples.dollarOpen, dollarOpen);
+          appendMeasured(samples.dollarQuery, dollarQuery);
+        }
+      }
+
+      for (let cycle = 0; cycle < WARMUPS + SAMPLES; cycle += 1) {
+        const fileQuery = await measureAction(
+          fixture.tapePath,
+          () => session!.sendLiteralImmediate("@performance"),
+          () => session!.waitForText("performance-target.txt", TIMEOUT),
+          "performance-target.txt",
+        );
+        await closeSurface(session, "performance-target.txt");
+        if (cycle >= WARMUPS) appendMeasured(samples.fileQuery, fileQuery);
+      }
+
+      for (const action of LOCAL_MENU_ACTIONS) {
+        for (let cycle = 0; cycle < WARMUPS + SAMPLES; cycle += 1) {
+          await session.sendLiteralText(action.command);
+          const before = await session.capturePane();
+          const open = await measurePaneAction(
+            () => session!.sendKeysImmediate(["Enter"]),
+            () => waitForPaneText(session!, action.marker, before),
+          );
+          await closeSurface(session, action.marker);
+          if (cycle >= WARMUPS) appendMeasured(samples[action.name], open);
+        }
+      }
+
+      for (let cycle = 0; cycle < WARMUPS + SAMPLES; cycle += 1) {
+        const before = await session.capturePane();
+        const open = await measurePaneAction(
+          () => session!.sendKeysImmediate(["C-x"]),
+          () => waitForPaneText(session!, "Agents & processes", before),
+        );
+        await closeSurface(session, "Agents & processes", "C-x");
+        if (cycle >= WARMUPS) appendMeasured(samples.subagentManagerOpen, open);
+      }
+
+      await session.sendText("Open the performance question.");
+      await session.waitForText("Which performance path should I use?", TIMEOUT);
+      for (let cycle = 0; cycle < WARMUPS + SAMPLES; cycle += 1) {
+        const before = await session.capturePaneEscapes();
+        const key = cycle % 2 === 0 ? "Down" : "Up";
+        const navigation = await measureAction(
+          fixture.tapePath,
+          () => session!.sendKeysImmediate([key]),
+          () => waitForEscapedPaneChange(session!, before, `questionNavigate.${cycle}`),
+        );
+        if (cycle >= WARMUPS) appendMeasured(samples.questionNavigate, navigation);
+      }
+      session.sendKeysImmediate(["2"]);
+      await session.waitForText("PERF_QUESTION_DONE", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+
+      await session.sendText("Open the performance approval.");
+      await session.waitForText("touch performance-approval.txt", TIMEOUT);
+      for (let cycle = 0; cycle < WARMUPS + SAMPLES; cycle += 1) {
+        const before = await session.capturePaneEscapes();
+        const key = cycle % 2 === 0 ? "Down" : "Up";
+        const navigation = await measureAction(
+          fixture.tapePath,
+          () => session!.sendKeysImmediate([key]),
+          () => waitForEscapedPaneChange(session!, before, `approvalNavigate.${cycle}`),
+        );
+        if (cycle >= WARMUPS) appendMeasured(samples.approvalNavigate, navigation);
+      }
+      session.sendKeysImmediate(["3"]);
+      await session.waitForText("PERF_APPROVAL_DONE", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+
+      await session.sendText("Start the performance terminal.");
+      await session.waitForText("PERF_TERMINAL_READY", TIMEOUT);
+      session.sendKeysImmediate(["1"]);
+      await session.waitForText("PERF_TERMINAL_AGENT_READY", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      session.sendKeysImmediate(["C-x"]);
+      await session.waitForText("Background processes", TIMEOUT);
+      session.sendKeysImmediate(["Enter"]);
+      await session.waitForText("PERF_TERMINAL_READY", TIMEOUT);
+      for (let cycle = 0; cycle < WARMUPS + SAMPLES; cycle += 1) {
+        const before = await session.capturePane();
+        const input = await measurePaneAction(
+          () => session!.sendLiteralImmediate(cycle % 2 === 0 ? "x" : "y"),
+          () => waitForPaneChange(session!, before),
+        );
+        if (cycle >= WARMUPS) appendMeasured(samples.hostedTerminalInput, input);
+      }
+      await session.sendHexBytes(["1d", "64"]);
+      await session.waitForText("Background processes", TIMEOUT);
+      session.sendKeysImmediate(["C-x"]);
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Close the performance terminal.");
+      await session.waitForText("terminal close", TIMEOUT);
+      session.sendKeysImmediate(["1"]);
+      await session.waitForText("PERF_TERMINAL_CLOSED", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+      await Bun.sleep(250);
+      const resourcesBefore = resourceSnapshot(pid);
+
       const peakResources = await peakResourcesWhile(pid, async () => {
         await session!.sendText("Build the second performance transcript.");
         await session!.waitForText("PERF_SECOND_TRANSCRIPT_TAIL", TIMEOUT);
@@ -353,9 +749,15 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
       const resourcesAfter = resourceSnapshot(pid);
       const report = {
         boundary: "recorded application stdin frame to recorded stdout frame",
+        boundaryExceptions: {
+          catalogMenus: "user input dispatch to changed exclusive catalog pane",
+          subagentManagerOpen: "user input dispatch to changed manager pane",
+          hostedTerminalInput: "user input dispatch to changed hosted-terminal pane",
+        },
         buildMode: "ReleaseSafe",
         warmups: WARMUPS,
         measuredSamples: SAMPLES,
+        actions: MEASURED_ACTION_NAMES,
         terminal: { cols: 104, rows: 30 },
         fixture: {
           hash: fixture.fixtureHash,
@@ -365,7 +767,10 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
         },
         budgetsMs: {
           local: LOCAL_BUDGETS_MS,
+          backgroundWork: BACKGROUND_WORK_BUDGETS_MS,
           externalRefresh: EXTERNAL_REFRESH_BUDGETS_MS,
+          exclusivePane: EXCLUSIVE_PANE_BUDGETS_MS,
+          hostedTerminal: HOSTED_TERMINAL_BUDGETS_MS,
         },
         results: Object.fromEntries(
           Object.entries(samples).map(([name, values]) => [name, {
@@ -373,24 +778,46 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
             contentReady: summary(values.contentReady),
           }]),
         ),
-        resources: { before: resourcesBefore, peak: peakResources, after: resourcesAfter },
+        resources: {
+          coldBefore: coldResourcesBefore,
+          before: resourcesBefore,
+          peak: peakResources,
+          after: resourcesAfter,
+        },
       };
       const reportPath = process.env.FX_TUI_PERFORMANCE_REPORT;
       if (reportPath) writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
 
       for (const [name, values] of Object.entries(samples)) {
-        const contentBudget = name === "skillsOpen" || name === "loginOpen"
+        const actionBudget = name === "skillsOpen" || name === "loginOpen"
           ? EXTERNAL_REFRESH_BUDGETS_MS
+          : name === "fullScrollCacheMiss"
+          ? BACKGROUND_WORK_BUDGETS_MS
+          : name === "hostedTerminalInput"
+          ? HOSTED_TERMINAL_BUDGETS_MS
+          : EXCLUSIVE_PANE_ACTION_NAMES.has(name)
+          ? EXCLUSIVE_PANE_BUDGETS_MS
           : LOCAL_BUDGETS_MS;
         for (const distribution of [values.firstPaint, values.contentReady]) {
           const measured = summary(distribution);
-          const budget = distribution === values.firstPaint
+          const budget = name === "fullScrollCacheMiss" ||
+              name === "hostedTerminalInput" ||
+              EXCLUSIVE_PANE_ACTION_NAMES.has(name)
+            ? actionBudget
+            : distribution === values.firstPaint
             ? LOCAL_BUDGETS_MS
-            : contentBudget;
+            : actionBudget;
           expect(measured.count).toBe(SAMPLES);
-          expect(measured.p50).toBeLessThanOrEqual(budget.p50);
-          expect(measured.p90).toBeLessThanOrEqual(budget.p90);
-          expect(measured.p95).toBeLessThanOrEqual(budget.p95);
+          const phase = distribution === values.firstPaint ? "firstPaint" : "contentReady";
+          if (measured.p50 > budget.p50 ||
+              measured.p90 > budget.p90 ||
+              measured.p95 > budget.p95) {
+            throw new Error(
+              `${name}.${phase} exceeded budget: ` +
+                `measured=${measured.p50}/${measured.p90}/${measured.p95}ms ` +
+                `budget=${budget.p50}/${budget.p90}/${budget.p95}ms`,
+            );
+          }
         }
       }
       expect(resourcesAfter.threads).toBe(resourcesBefore.threads);
@@ -410,7 +837,7 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
       }
     }
   },
-  300_000,
+  900_000,
 );
 
 test.skipIf(!LIVE_ENABLED || !tmuxAvailable())(

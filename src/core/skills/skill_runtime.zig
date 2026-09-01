@@ -2280,14 +2280,25 @@ pub const Runtime = struct {
             notice: []const u8,
         },
     ) !void {
-        if (self.pending_refresh_action != null) {
-            return error.SkillRefreshActionBusy;
-        }
         const owned: RefreshAction = switch (action) {
             .list => .list,
             .show => |value| .{ .show = try alloc.dupe(u8, value) },
             .notice => |value| .{ .notice = try alloc.dupe(u8, value) },
         };
+        if (self.pending_refresh_action) |*pending| {
+            debug_trace.logf(
+                "skills",
+                "refresh action superseded prior_generation={d} prior_action={s} generation={d} action={s}",
+                .{
+                    pending.generation,
+                    @tagName(pending.action),
+                    generation,
+                    @tagName(owned),
+                },
+            );
+            pending.deinit(alloc);
+            self.pending_refresh_action = null;
+        }
         self.pending_refresh_action = .{
             .generation = generation,
             .action = owned,
@@ -3456,6 +3467,25 @@ test "skill refresh publishes one generation and coalesces one latest request" {
     }
     try std.testing.expectEqual(RefreshCompletion.adopted, terminal);
     try std.testing.expectEqual(@as(usize, 2), runtime.items.len);
+}
+
+test "overlapping skill refresh actions retain only the latest bounded action" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime{};
+    defer runtime.deinit(alloc);
+
+    try runtime.queueRefreshAction(alloc, 1, .list);
+    try runtime.queueRefreshAction(alloc, 2, .{ .show = "newest" });
+    runtime.fresh_through_generation = 2;
+
+    var ready = runtime.takeReadyRefreshAction() orelse
+        return error.MissingReadyRefreshAction;
+    defer ready.deinit(alloc);
+    try std.testing.expect(ready.succeeded);
+    switch (ready.action) {
+        .show => |name| try std.testing.expectEqualStrings("newest", name),
+        else => return error.ExpectedLatestShowAction,
+    }
 }
 
 test "skill menu fills a bounded query range in display order" {
