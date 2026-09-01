@@ -186,10 +186,7 @@ pub fn observe(
     else
         try ctx.alloc.dupe(u8, replay_output);
     return .{
-        .state = if (current_state == .running)
-            observed_state
-        else
-            current_state,
+        .state = reconcileObservedState(current_state, observed_state),
         .output = projected_output,
         .replay_output = replay_output,
         .next_cursor = .{
@@ -308,6 +305,20 @@ pub fn snapshotState(
             .finished },
         .lost => .lost,
         .closed => .{ .stopped = if (outcome) |value| statusFromOutcome(value) else null },
+    };
+}
+
+fn reconcileObservedState(
+    current: managed_execution.SnapshotState,
+    observed: managed_execution.SnapshotState,
+) managed_execution.SnapshotState {
+    return switch (current) {
+        .running => observed,
+        .completed => |status| if (status == .finished) switch (observed) {
+            .completed => |refined| if (refined == .finished) current else observed,
+            .running, .stopped, .lost => current,
+        } else current,
+        .stopped, .lost => current,
     };
 }
 
@@ -443,4 +454,32 @@ test "screen projection collapses blank repaint rows" {
     });
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings("\nA B", text);
+}
+
+test "observed status refines only an unknown completed state" {
+    try std.testing.expectEqual(
+        managed_execution.SnapshotState{ .completed = .{ .exit_code = 0 } },
+        reconcileObservedState(
+            .{ .completed = .finished },
+            .{ .completed = .{ .exit_code = 0 } },
+        ),
+    );
+    try std.testing.expectEqual(
+        managed_execution.SnapshotState{ .completed = .{ .exit_code = 1 } },
+        reconcileObservedState(
+            .{ .completed = .{ .exit_code = 1 } },
+            .{ .completed = .{ .exit_code = 0 } },
+        ),
+    );
+    try std.testing.expectEqual(
+        managed_execution.SnapshotState{ .completed = .finished },
+        reconcileObservedState(.{ .completed = .finished }, .running),
+    );
+    try std.testing.expectEqual(
+        managed_execution.SnapshotState{ .stopped = null },
+        reconcileObservedState(
+            .{ .stopped = null },
+            .{ .completed = .{ .exit_code = 0 } },
+        ),
+    );
 }

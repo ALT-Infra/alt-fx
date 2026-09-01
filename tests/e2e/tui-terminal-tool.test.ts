@@ -543,7 +543,7 @@ test.skipIf(!tmuxAvailable())(
         request: {
           action: "run",
           command:
-            "trap 'printf TTY_INTERRUPT_SEEN\\n; exit 0' INT; printf 'TTY_INTERRUPT_READY\\n'; while :; do sleep 1; done",
+            "python3 -u -c 'import signal,sys; signal.signal(signal.SIGINT, lambda *_: (print(\"TTY_INTERRUPT_SEEN\", flush=True), sys.exit(0))); print(\"TTY_INTERRUPT_READY\", flush=True); signal.pause()'",
           profile: "clean",
           tty: true,
           yield_time_ms: 0,
@@ -552,6 +552,15 @@ test.skipIf(!tmuxAvailable())(
       (body) => {
         sessionId = findSessionId(JSON.parse(body)) ?? "";
         if (!sessionId) return new Response("missing session id", { status: 500 });
+        return fakeGatewayToolCall("shell_tty_control_ready", "shell", {
+          request: {
+            action: "interact",
+            session_id: sessionId,
+            yield_time_ms: 5_000,
+          },
+        });
+      },
+      () => {
         return fakeGatewayToolCall("shell_tty_control_interact", "shell", {
           request: {
             action: "interact",
@@ -569,8 +578,13 @@ test.skipIf(!tmuxAvailable())(
     await active.sendKeys("Enter");
     await active.waitForText("SHELL_TTY_CONTROL_OK", TIMEOUT);
 
-    const result = toolResultEnvelope(
+    const ready = toolResultEnvelope(
       gateway.requests[2]!.body,
+      "shell_tty_control_ready",
+    );
+    expect(ready).toContain("TTY_INTERRUPT_READY");
+    const result = toolResultEnvelope(
+      gateway.requests[3]!.body,
       "shell_tty_control_interact",
     );
     expect(result).toContain("TTY_INTERRUPT_SEEN");

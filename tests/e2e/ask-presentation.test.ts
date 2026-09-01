@@ -280,9 +280,8 @@ describe("fx ask presentation", () => {
     const branches = shellSchema?.properties?.request?.oneOf ?? [];
     expect(branches.map((branch: any) => branch.properties.action.enum[0])).toEqual([
       "run",
-      "wait",
+      "interact",
       "stop",
-      "list",
     ]);
     const serializedShellTool = JSON.stringify(shellTool);
     expect(serializedShellTool).not.toContain('"tty"');
