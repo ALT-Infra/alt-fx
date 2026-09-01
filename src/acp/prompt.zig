@@ -3534,7 +3534,7 @@ test "ACP pending tool_call updates keep provider ids stable and dedupe" {
     const call = ToolCall{
         .id = "provider_call_7",
         .name = "shell",
-        .arguments_json = "{\"action\":\"run\",\"command\":\"ls\"}",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"ls\",\"api_key\":\"secret-value\"}",
     };
     const first = try ctx.sendToolCallPending(alloc, call);
     const second = try ctx.sendToolCallPending(alloc, call);
@@ -3562,9 +3562,9 @@ test "ACP pending tool_call updates keep provider ids stable and dedupe" {
         try std.testing.expectEqualStrings("tool_call", update.get("sessionUpdate").?.string);
         const call_id = update.get("toolCallId").?.string;
         if (std.mem.eql(u8, call_id, "provider_call_7")) {
-            try std.testing.expectEqualStrings("terminal", update.get("name").?.string);
+            try std.testing.expectEqualStrings("shell", update.get("name").?.string);
             const raw_input = update.get("rawInput").?.object;
-            try std.testing.expectEqualStrings("exec", raw_input.get("action").?.string);
+            try std.testing.expectEqualStrings("run", raw_input.get("action").?.string);
             try std.testing.expectEqualStrings("ls", raw_input.get("command").?.string);
             try std.testing.expectEqualStrings("[REDACTED]", raw_input.get("api_key").?.string);
             pending_count += 1;
