@@ -37,6 +37,11 @@ const SourceProbeFn = *const fn (?*anyopaque, Allocator, credentials.Source) any
 const CredentialLoaderFn = *const fn (?*anyopaque, Allocator, credentials.Source) anyerror!?credentials.Credential;
 const StoredKeyStoreFn = *const fn (?*anyopaque, Allocator, []const u8) anyerror!void;
 
+const UnavailableSourcePolicy = enum {
+    fail,
+    omit,
+};
+
 const max_api_key_entry_bytes: usize = 8 * 1024;
 const max_api_key_mask_glyphs: usize = 32;
 const max_manual_code_mask_glyphs: usize = 32;
@@ -1058,6 +1063,10 @@ pub const Runtime = struct {
         try self.refreshSourceInventoryWithProbe(alloc, self, probeCredentialSource);
     }
 
+    pub fn refreshSourceInventoryForLogout(self: *Self, alloc: Allocator) !void {
+        try self.refreshSourceInventoryWithProbe(alloc, self, probeCredentialSourceForLogout);
+    }
+
     pub fn beginSourceInventoryRefresh(
         self: *Self,
         alloc: Allocator,
@@ -1853,7 +1862,7 @@ pub const Runtime = struct {
         return self.reconcileAfterFxLoginLogoutWithDeps(
             alloc,
             self,
-            probeCredentialSource,
+            probeCredentialSourceForLogout,
             loadRuntimeCredentialSource,
         );
     }
@@ -1951,10 +1960,29 @@ test "auth in-place initialization preserves empty runtime state" {
 
 fn probeCredentialSource(raw_context: ?*anyopaque, _: Allocator, source: credentials.Source) !bool {
     const self: *Runtime = @ptrCast(@alignCast(raw_context.?));
-    return switch (credentials.sourcePresence(self.secret_store, source)) {
+    return sourcePresenceAvailable(credentials.sourcePresence(self.secret_store, source), .fail);
+}
+
+fn probeCredentialSourceForLogout(raw_context: ?*anyopaque, _: Allocator, source: credentials.Source) !bool {
+    const self: *Runtime = @ptrCast(@alignCast(raw_context.?));
+    const presence = credentials.sourcePresence(self.secret_store, source);
+    if (presence == .unavailable) {
+        debug_trace.logf("auth", "logout inventory omitted unavailable source={s}", .{@tagName(source)});
+    }
+    return sourcePresenceAvailable(presence, .omit);
+}
+
+fn sourcePresenceAvailable(
+    presence: host.SecretStorePresence,
+    unavailable_policy: UnavailableSourcePolicy,
+) error{CredentialSourceUnavailable}!bool {
+    return switch (presence) {
         .present => true,
         .missing => false,
-        .unavailable => error.CredentialSourceUnavailable,
+        .unavailable => switch (unavailable_policy) {
+            .fail => error.CredentialSourceUnavailable,
+            .omit => false,
+        },
     };
 }
 
@@ -2457,6 +2485,16 @@ test "auth runtime detects only credential sources that exist" {
     try std.testing.expect(inventory.contains(.fx_login));
     try std.testing.expect(!inventory.contains(.vercel_oidc_token));
     try std.testing.expect(!inventory.contains(.stored_key));
+}
+
+test "credential inventory treats unavailable sources according to command policy" {
+    try std.testing.expect(try sourcePresenceAvailable(.present, .fail));
+    try std.testing.expect(!try sourcePresenceAvailable(.missing, .fail));
+    try std.testing.expectError(
+        error.CredentialSourceUnavailable,
+        sourcePresenceAvailable(.unavailable, .fail),
+    );
+    try std.testing.expect(!try sourcePresenceAvailable(.unavailable, .omit));
 }
 
 test "auth inventory worker publishes one current action and preserves state on failure" {
