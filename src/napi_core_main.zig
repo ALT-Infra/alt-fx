@@ -5,7 +5,6 @@ const jsonrpc = @import("acp/jsonrpc.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
 const provider_set = @import("core/gateway/provider_set.zig");
 const host = @import("core/hosts/host.zig");
-const debug_trace = @import("core/shared/debug_trace.zig");
 const io_mod = @import("core/shared/io.zig");
 const fetch_state = @import("napi_fetch_state.zig");
 const streamable_http = @import("core/mcp/streamable_http.zig");
@@ -156,18 +155,9 @@ const FetchBridge = struct {
     next_handle: fetch_state.Handle = 1,
     status: u16 = 0,
 
-    fn clearPendingRequest(self: *FetchBridge, reason: []const u8) void {
+    fn clearPendingRequest(self: *FetchBridge) void {
         if (self.request.items.len == 0) return;
-        debug_trace.logf("napi", "dropping pending host fetch reason={s} bytes={d}", .{ reason, self.request.items.len });
         self.request.clearRetainingCapacity();
-    }
-
-    fn trace_stale(operation: []const u8, handle: fetch_state.Handle, reason: fetch_state.StaleReason) void {
-        debug_trace.logf(
-            "napi",
-            "dropping stale host fetch operation={s} handle={d} reason={s}",
-            .{ operation, handle, @tagName(reason) },
-        );
     }
 
     fn advance_handle(self: *FetchBridge) void {
@@ -286,11 +276,8 @@ const FetchBridge = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const decision = fetch_state.decide(self.phase, .{ .close = handle });
-        if (decision.action == .stale) {
-            trace_stale("close", handle, decision.stale_reason.?);
-            return;
-        }
-        self.clearPendingRequest("stream_close");
+        if (decision.action == .stale) return;
+        self.clearPendingRequest();
         self.phase = decision.phase;
         self.status = 0;
         self.response.clearRetainingCapacity();
@@ -303,10 +290,7 @@ const FetchBridge = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const decision = fetch_state.decide(self.phase, .{ .start = handle });
-        if (decision.action == .stale) {
-            trace_stale("start", handle, decision.stale_reason.?);
-            return .stale;
-        }
+        if (decision.action == .stale) return .stale;
         self.status = status;
         self.phase = decision.phase;
         self.wake.broadcast(io);
@@ -318,10 +302,7 @@ const FetchBridge = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const decision = fetch_state.decide(self.phase, .{ .push = handle });
-        if (decision.action == .stale) {
-            trace_stale("push", handle, decision.stale_reason.?);
-            return .stale;
-        }
+        if (decision.action == .stale) return .stale;
         const queued = self.response.items.len - self.response_offset;
         if (data.len > max_fetch_response_bytes or queued > max_fetch_response_bytes - data.len) return .backpressure;
         if (self.response_offset > 0) {
@@ -339,10 +320,7 @@ const FetchBridge = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const decision = fetch_state.decide(self.phase, .{ .finish = handle });
-        if (decision.action == .stale) {
-            trace_stale("finish", handle, decision.stale_reason.?);
-            return .stale;
-        }
+        if (decision.action == .stale) return .stale;
         self.phase = decision.phase;
         self.wake.broadcast(io);
         return .applied;
@@ -353,10 +331,7 @@ const FetchBridge = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const decision = fetch_state.decide(self.phase, .{ .fail = handle });
-        if (decision.action == .stale) {
-            trace_stale("fail", handle, decision.stale_reason.?);
-            return .stale;
-        }
+        if (decision.action == .stale) return .stale;
         self.phase = decision.phase;
         self.wake.broadcast(io);
         return .applied;
@@ -374,7 +349,7 @@ const FetchBridge = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const decision = fetch_state.decide(self.phase, .cancel);
-        self.clearPendingRequest("abort");
+        self.clearPendingRequest();
         self.phase = decision.phase;
         self.wake.broadcast(io);
     }
@@ -384,7 +359,7 @@ const FetchBridge = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const decision = fetch_state.decide(self.phase, .shutdown);
-        self.clearPendingRequest("shutdown");
+        self.clearPendingRequest();
         self.phase = decision.phase;
         self.wake.broadcast(io);
     }
@@ -424,7 +399,6 @@ const Runtime = struct {
     fn writeOutput(context: ?*anyopaque, bytes: []const u8) !void {
         const self: *Runtime = @ptrCast(@alignCast(context.?));
         self.output.write(self.alloc, bytes) catch |err| {
-            debug_trace.logf("napi", "native output failed err={s}", .{@errorName(err)});
             self.exit_code.store(1, .seq_cst);
             return err;
         };
@@ -471,8 +445,7 @@ const Runtime = struct {
             },
             jsonrpc.Reader.initCallback(self, Runtime.readInput),
             jsonrpc.Writer.initCallback(self, Runtime.writeOutput),
-        ) catch |err| {
-            debug_trace.logf("napi", "native runtime failed err={s}", .{@errorName(err)});
+        ) catch {
             self.exit_code.store(1, .seq_cst);
         };
         self.exited.store(true, .seq_cst);
@@ -541,9 +514,6 @@ fn ensureThreadedIo() void {
         io_mod.setIo(threaded_io.?.io());
         const raw_environ: io_mod.RawEnviron = @ptrCast(std.c.environ);
         io_mod.setRawEnviron(raw_environ);
-        const workspace_root = io_mod.realpathAlloc(std.heap.c_allocator, ".") catch null;
-        defer if (workspace_root) |path| std.heap.c_allocator.free(path);
-        debug_trace.configureFromEnv(std.heap.c_allocator, workspace_root orelse ".");
         threaded_io_state.store(2, .release);
         return;
     }
