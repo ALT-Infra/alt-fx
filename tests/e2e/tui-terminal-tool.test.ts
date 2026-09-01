@@ -203,11 +203,11 @@ test.skipIf(!tmuxAvailable())(
       (body) => {
         sessionId = findSessionId(JSON.parse(body)) ?? "";
         if (!sessionId) return new Response("missing session id", { status: 500 });
-        return fakeGatewayToolCall("shell_wait", "shell", {
+        return fakeGatewayToolCall("shell_interact", "shell", {
           request: {
-            action: "wait",
+            action: "interact",
             session_id: sessionId,
-            wait_ceiling_ms: 5_000,
+            yield_time_ms: 5_000,
           },
         });
       },
@@ -226,7 +226,7 @@ test.skipIf(!tmuxAvailable())(
     const actions = request.oneOf.map(
       (branch: any) => branch.properties.action.enum[0],
     );
-    expect(actions).toEqual(["run", "wait", "write", "stop", "list"]);
+    expect(actions).toEqual(["run", "run", "interact", "stop"]);
     expect(gateway.requests[0]!.body).not.toContain('"name":"terminal"');
     const runResult = toolResultEnvelope(
       gateway.requests[1]!.body,
@@ -236,7 +236,7 @@ test.skipIf(!tmuxAvailable())(
     expect(runResult).toContain(`\\"session_id\\":\\"${sessionId}\\"`);
     const scrollback = await active.captureFullScrollback();
     expect(scrollback).toContain("Ran printf CAPTURED_READY");
-    expect(scrollback).toContain(`Finished waiting for session ${sessionId}`);
+    expect(scrollback).toContain(`Observed session ${sessionId}`);
     expect(scrollback).not.toContain("Using terminal");
     expect(scrollback).not.toContain("Used terminal");
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
@@ -245,36 +245,26 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
-  "shell run handoff returns control and restores tools on the next user turn",
+  "running shell survives a model-completed turn without handoff policy",
   async () => {
-    const fixture = createFixture("fx-shell-next-turn-handoff-");
+    const fixture = createFixture("fx-shell-cross-turn-");
     let sessionId = "";
     const gateway = startFakeGateway([
-      fakeGatewayToolCall("shell_handoff_run", "shell", {
+      fakeGatewayToolCall("shell_cross_turn_run", "shell", {
         request: {
           action: "run",
           command: "printf HANDOFF_READY; sleep 30",
           profile: "clean",
           yield_time_ms: 0,
-          handoff: "next_turn",
         },
       }),
       (body) => {
         sessionId = findSessionId(JSON.parse(body)) ?? "";
         if (!sessionId) return new Response("missing session id", { status: 500 });
-        if (!body.includes('"toolChoice":{"type":"none"}')) {
-          return new Response("handoff did not force a text response", { status: 500 });
-        }
-        if (body.includes("Continue the original task. If work remains")) {
-          return new Response("handoff injected a conflicting continuation prompt", { status: 500 });
-        }
         return fakeGatewayFinalText("PHASE_ONE_READY");
       },
       (body) => {
-        if (body.includes('"toolChoice":{"type":"none"}')) {
-          return new Response("next user turn did not restore tools", { status: 500 });
-        }
-        return fakeGatewayToolCall("shell_handoff_stop", "shell", {
+        return fakeGatewayToolCall("shell_cross_turn_stop", "shell", {
           request: {
             action: "stop",
             session_id: sessionId,
@@ -293,7 +283,7 @@ test.skipIf(!tmuxAvailable())(
     expect(sessionId.length).toBeGreaterThan(0);
     expect(toolResultEnvelope(
       gateway.requests[1]!.body,
-      "shell_handoff_run",
+      "shell_cross_turn_run",
     )).not.toContain('\\"next_action\\"');
 
     await active.sendText("Stop the exact retained command now.");
@@ -301,7 +291,7 @@ test.skipIf(!tmuxAvailable())(
     await active.waitForText("PHASE_TWO_READY", TIMEOUT);
     expect(toolResultEnvelope(
       gateway.requests[3]!.body,
-      "shell_handoff_stop",
+      "shell_cross_turn_stop",
     )).toContain('\\"state\\":\\"stopped\\"');
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
@@ -390,17 +380,17 @@ test.skipIf(!tmuxAvailable())(
         secondSessionId = findSessionId(JSON.parse(body)) ?? "";
         return fakeGatewayToolCall("shell_overlap_wait_first", "shell", {
           request: {
-            action: "wait",
+            action: "interact",
             session_id: firstSessionId,
-            wait_ceiling_ms: 5_000,
+            yield_time_ms: 5_000,
           },
         });
       },
       () => fakeGatewayToolCall("shell_overlap_wait_second", "shell", {
         request: {
-          action: "wait",
+          action: "interact",
           session_id: secondSessionId,
-          wait_ceiling_ms: 5_000,
+          yield_time_ms: 5_000,
         },
       }),
       fakeGatewayFinalText("SHELL_OVERLAP_OK"),
@@ -450,11 +440,11 @@ test.skipIf(!tmuxAvailable())(
       (body) => {
         sessionId = findSessionId(JSON.parse(body)) ?? "";
         if (!sessionId) return new Response("missing session id", { status: 500 });
-        return fakeGatewayToolCall("shell_tty_write", "shell", {
+        return fakeGatewayToolCall("shell_tty_interact", "shell", {
           request: {
-            action: "write",
+            action: "interact",
             session_id: sessionId,
-            input: { kind: "text", text: "violet comet\n" },
+            chars: "violet comet\n",
           },
         });
       },
@@ -469,7 +459,7 @@ test.skipIf(!tmuxAvailable())(
     expect(sessionId).toMatch(/^shell-[A-Za-z0-9_-]{22}$/);
     const writeResult = toolResultEnvelope(
       gateway.requests[2]!.body,
-      "shell_tty_write",
+      "shell_tty_interact",
     );
     expect(writeResult).toContain("TTY_ECHO:violet comet");
     expect(writeResult).toContain('\\"state\\":\\"completed\\"');
@@ -502,19 +492,20 @@ test.skipIf(!tmuxAvailable())(
       (body) => {
         sessionId = findSessionId(JSON.parse(body)) ?? "";
         if (!sessionId) return new Response("missing session id", { status: 500 });
-        return fakeGatewayToolCall("shell_tty_cursor_write", "shell", {
+        return fakeGatewayToolCall("shell_tty_cursor_interact", "shell", {
           request: {
-            action: "write",
+            action: "interact",
             session_id: sessionId,
-            input: { kind: "text", text: "continue\n" },
+            chars: "continue\n",
+            yield_time_ms: 0,
           },
         });
       },
-      () => fakeGatewayToolCall("shell_tty_cursor_write_two", "shell", {
+      () => fakeGatewayToolCall("shell_tty_cursor_interact_two", "shell", {
         request: {
-          action: "write",
+          action: "interact",
           session_id: sessionId,
-          input: { kind: "text", text: "next\n" },
+          chars: "next\n",
         },
       }),
       fakeGatewayFinalText("SHELL_TTY_CURSOR_OK"),
@@ -527,16 +518,63 @@ test.skipIf(!tmuxAvailable())(
 
     const first = toolResultEnvelope(
       gateway.requests[2]!.body,
-      "shell_tty_cursor_write",
+      "shell_tty_cursor_interact",
     );
     const second = toolResultEnvelope(
       gateway.requests[3]!.body,
-      "shell_tty_cursor_write_two",
+      "shell_tty_cursor_interact_two",
     );
     expect(first).toContain("CURSOR_FIRST");
     expect(first).not.toContain("CURSOR_SECOND");
     expect(second).toContain("CURSOR_SECOND");
     expect(second).not.toContain("CURSOR_FIRST");
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "shell interact sends exact control characters",
+  async () => {
+    const fixture = createFixture("fx-shell-tty-control-");
+    let sessionId = "";
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("shell_tty_control_run", "shell", {
+        request: {
+          action: "run",
+          command:
+            "trap 'printf TTY_INTERRUPT_SEEN\\n; exit 0' INT; printf 'TTY_INTERRUPT_READY\\n'; while :; do sleep 1; done",
+          profile: "clean",
+          tty: true,
+          yield_time_ms: 0,
+        },
+      }),
+      (body) => {
+        sessionId = findSessionId(JSON.parse(body)) ?? "";
+        if (!sessionId) return new Response("missing session id", { status: 500 });
+        return fakeGatewayToolCall("shell_tty_control_interact", "shell", {
+          request: {
+            action: "interact",
+            session_id: sessionId,
+            chars: "\u0003",
+            yield_time_ms: 5_000,
+          },
+        });
+      },
+      fakeGatewayFinalText("SHELL_TTY_CONTROL_OK"),
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway);
+    await active.sendText("Interrupt the exact managed TTY through Shell input.");
+    await active.sendKeys("Enter");
+    await active.waitForText("SHELL_TTY_CONTROL_OK", TIMEOUT);
+
+    const result = toolResultEnvelope(
+      gateway.requests[2]!.body,
+      "shell_tty_control_interact",
+    );
+    expect(result).toContain("TTY_INTERRUPT_SEEN");
+    expect(result).toContain('\\"state\\":\\"completed\\"');
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
   TIMEOUT,
@@ -562,9 +600,9 @@ test.skipIf(!tmuxAvailable())(
         sessionId = findSessionId(JSON.parse(body)) ?? "";
         return fakeGatewayToolCall("shell_tty_timeout_wait", "shell", {
           request: {
-            action: "wait",
+            action: "interact",
             session_id: sessionId,
-            wait_ceiling_ms: 5_000,
+            yield_time_ms: 5_000,
           },
         });
       },
@@ -614,22 +652,13 @@ test.skipIf(!tmuxAvailable())(
         sessionId = findSessionId(JSON.parse(body)) ?? "";
         return fakeGatewayFinalText("SHELL_TTY_RESUME_STARTED");
       },
-      fakeGatewayToolCall("shell_tty_resume_list", "shell", {
-        request: { action: "list" },
-      }),
-      (body) => {
-        const listed = toolResultEnvelope(body, "shell_tty_resume_list");
-        if (!listed.includes(sessionId)) {
-          throw new Error("resumed shell list omitted the durable TTY");
-        }
-        return fakeGatewayToolCall("shell_tty_resume_stop", "shell", {
+      () => fakeGatewayToolCall("shell_tty_resume_stop", "shell", {
           request: {
             action: "stop",
             session_id: sessionId,
             force: true,
           },
-        });
-      },
+        }),
       fakeGatewayFinalText("SHELL_TTY_RESUME_OK"),
     ]);
     gateways.push(gateway);
@@ -646,16 +675,16 @@ test.skipIf(!tmuxAvailable())(
       gateway,
       `${FX_BIN} --resume-last`,
     );
-    await resumed.sendText("List and force-stop the durable managed TTY.");
+    await resumed.sendText("Force-stop the exact retained managed TTY.");
     await resumed.waitForText("SHELL_TTY_RESUME_OK", TIMEOUT);
 
     const stopResult = toolResultEnvelope(
-      gateway.requests[4]!.body,
+      gateway.requests[3]!.body,
       "shell_tty_resume_stop",
     );
     expect(stopResult).toContain('\\"state\\":\\"stopped\\"');
     const scrollback = await resumed.captureFullScrollback();
-    expect(scrollback).toContain("Stopped printf 'TTY_RESUME_READY");
+    expect(scrollback).toContain(`Stopped session ${sessionId}`);
     expect(scrollback).not.toContain("Exited 143");
     const record = terminalRecords(fixture.home).find((candidate) =>
       candidate.session_id === sessionId

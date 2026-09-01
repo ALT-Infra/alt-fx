@@ -480,9 +480,9 @@ describe("lean auto mode reliability", () => {
             expect(started.state).toBe("running");
             return fakeGatewayToolCall("wait_reviewed_clean_tty", "shell", {
               request: {
-                action: "wait",
+                action: "interact",
                 session_id: started.session_id,
-                wait_ceiling_ms: 5_000,
+                yield_time_ms: 5_000,
               },
             });
           },

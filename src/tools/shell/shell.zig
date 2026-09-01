@@ -30,27 +30,16 @@ const Allocator = std.mem.Allocator;
 
 pub const Action = enum {
     run,
-    wait,
-    write,
+    interact,
     stop,
-    list,
 };
 
 const ShellKind = enum { executable };
-const PayloadKind = enum { text, keys, controls, paste };
-const Handoff = enum { next_turn };
 
 pub const ShellInput = struct {
     kind: ShellKind,
     path: []const u8,
     clean_start: bool = false,
-};
-
-pub const WriteInput = struct {
-    kind: PayloadKind,
-    text: ?[]const u8 = null,
-    keys: []const terminal_contracts.NamedKey = &.{},
-    controls: []const u8 = &.{},
 };
 
 pub const Input = struct {
@@ -62,10 +51,8 @@ pub const Input = struct {
     tty: bool = false,
     yield_time_ms: u32 = managed_contract.default_yield_time_ms,
     timeout_ms: ?u64 = null,
-    handoff: ?Handoff = null,
     session_id: ?[]const u8 = null,
-    wait_ceiling_ms: u32 = managed_contract.default_wait_ceiling_ms,
-    input: ?WriteInput = null,
+    chars: ?[]const u8 = null,
     force: bool = false,
 };
 
@@ -85,25 +72,17 @@ pub const ActionFieldContract = struct {
 pub fn actionFieldContract(action: Action) ActionFieldContract {
     return switch (action) {
         .run => .{
-            .allowed = &.{ "action", "command", "cwd", "profile", "shell", "tty", "yield_time_ms", "timeout_ms", "handoff" },
+            .allowed = &.{ "action", "command", "cwd", "profile", "shell", "tty", "yield_time_ms", "timeout_ms" },
             .required = &.{ "action", "command" },
             .conflicts = &.{.{ "profile", "shell" }},
         },
-        .wait => .{
-            .allowed = &.{ "action", "session_id", "wait_ceiling_ms" },
+        .interact => .{
+            .allowed = &.{ "action", "session_id", "chars", "yield_time_ms" },
             .required = &.{ "action", "session_id" },
-        },
-        .write => .{
-            .allowed = &.{ "action", "session_id", "input" },
-            .required = &.{ "action", "session_id", "input" },
         },
         .stop => .{
             .allowed = &.{ "action", "session_id", "force" },
             .required = &.{ "action", "session_id" },
-        },
-        .list => .{
-            .allowed = &.{"action"},
-            .required = &.{"action"},
         },
     };
 }
@@ -155,12 +134,11 @@ pub fn decode(
         error.OutOfMemory => return error.OutOfMemory,
         else => return decodeFailure(ctx),
     };
-    normalizeCompositeArgument(arena, &raw, "input") catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return decodeFailure(ctx),
-    };
-    const input = std.json.parseFromValueLeaky(Input, arena, raw, .{}) catch
+    var input = std.json.parseFromValueLeaky(Input, arena, raw, .{}) catch
         return decodeFailure(ctx);
+    if (raw.object.get("yield_time_ms") == null) {
+        input.yield_time_ms = defaultYieldTime(action);
+    }
     const owned = try ctx.allocator.create(OwnedInput);
     owned.* = .{
         .arena_state = arena_state.state,
@@ -171,6 +149,14 @@ pub fn decode(
         .ptr = owned,
         .deinit_fn = inputDeinit,
     } };
+}
+
+fn defaultYieldTime(action: Action) u32 {
+    return switch (action) {
+        .run => managed_contract.default_yield_time_ms,
+        .interact => managed_contract.default_wait_ceiling_ms,
+        .stop => 0,
+    };
 }
 
 fn decodeFailure(
@@ -285,13 +271,27 @@ pub fn validate(
     const arena = arena_state.allocator();
     return switch (input.action) {
         .run => validateRun(ctx, arena, input),
-        .wait => if (input.wait_ceiling_ms <= managed_contract.max_wait_ceiling_ms)
-            null
-        else
-            try ctx.allocator.dupe(u8, "shell wait_ceiling_ms must be between 0 and 300000"),
-        .write => null,
-        .stop, .list => null,
+        .interact => validateInteract(ctx, input),
+        .stop => null,
     };
+}
+
+fn validateInteract(
+    ctx: tool_dispatch.DispatchContext,
+    input: Input,
+) tool_dispatch.DispatchError!?[]u8 {
+    if (input.yield_time_ms > managed_contract.max_wait_ceiling_ms) {
+        return try ctx.allocator.dupe(
+            u8,
+            "shell interact yield_time_ms must be between 0 and 300000",
+        );
+    }
+    if (input.chars) |chars| {
+        if (chars.len > terminal_contracts.max_write_bytes) {
+            return try ctx.allocator.dupe(u8, "shell interact chars exceed 65536 bytes");
+        }
+    }
+    return null;
 }
 
 fn validateRun(
@@ -339,10 +339,8 @@ pub fn call(
     const input = erased.as(OwnedInput).value;
     return switch (input.action) {
         .run => callRun(ctx, input),
-        .wait => callWait(ctx, input),
-        .write => callWrite(ctx, input),
+        .interact => callInteract(ctx, input),
         .stop => callStop(ctx, input),
-        .list => callList(ctx),
     };
 }
 
@@ -413,10 +411,10 @@ fn callRun(
         return runtimeFailure(ctx, err);
     };
     defer prepared.deinit(ctx.allocator);
-    return finishRun(ctx, runtime, &prepared, input.handoff);
+    return finishPrepared(ctx, runtime, &prepared, .command);
 }
 
-fn callWait(
+fn callInteract(
     ctx: tool_dispatch.DispatchContext,
     input: Input,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
@@ -424,7 +422,9 @@ fn callWait(
     const session_id = input.session_id orelse return unavailable(ctx);
     ensureOwnedTtyIndexed(ctx, runtime, session_id) catch |err|
         return runtimeFailure(ctx, err);
+    const chars = input.chars orelse "";
     if (runtime.isTombstone(session_id)) {
+        if (chars.len != 0) return runtimeFailure(ctx, error.ExecutionTerminal);
         if (runtime.retainedTerminalSnapshot(ctx.allocator, session_id) catch |err|
             return runtimeFailure(ctx, err)) |retained|
         {
@@ -434,12 +434,13 @@ fn callWait(
         }
     }
     if (runtime.backendFor(session_id) == .tty) {
-        return callTtyWait(ctx, input);
+        return callTtyInteract(ctx, input);
     }
+    if (chars.len != 0) return runtimeFailure(ctx, error.InvalidBackend);
     var prepared = runtime.wait(
         ctx.allocator,
         session_id,
-        input.wait_ceiling_ms,
+        input.yield_time_ms,
         ctx.cancel_flag,
     ) catch |err| return runtimeFailure(ctx, err);
     defer prepared.deinit(ctx.allocator);
@@ -596,10 +597,10 @@ fn callTtyRun(
     session_owned = false;
     defer prepared.deinit(ctx.allocator);
     _ = owner;
-    return finishRun(ctx, runtime, &prepared, input.handoff);
+    return finishPrepared(ctx, runtime, &prepared, .command);
 }
 
-fn callTtyWait(
+fn callTtyInteract(
     ctx: tool_dispatch.DispatchContext,
     input: Input,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
@@ -608,15 +609,86 @@ fn callTtyWait(
     if (runtime.isTombstone(session_id)) {
         return runtimeFailure(ctx, error.ExecutionTerminal);
     }
+    var state: managed_execution.SnapshotState = .running;
+    var accepted_bytes: ?u32 = null;
+    const chars = input.chars orelse "";
+    if (chars.len != 0) {
+        if (runtime.backendFor(session_id) != .tty) {
+            return runtimeFailure(ctx, error.InvalidBackend);
+        }
+        var ready = executeAuthorizedTerminal(ctx, session_id, .{ .wait = .{
+            .session_id = session_id,
+            .return_when = .started,
+            .safety_ceiling_ms = 20_000,
+            .authority = null,
+        } }) catch |err| return runtimeFailure(ctx, err);
+        defer ready.deinit(ctx.allocator);
+        const ready_result = switch (ready.result.view()) {
+            .failure => return cloneTerminalFailure(ctx, ready.result.view()),
+            .success => |success| switch (success) {
+                .wait => |value| value,
+                else => return runtimeFailure(ctx, error.InvalidTerminalResult),
+            },
+        };
+        if (ready_result.session.lifecycle != .running) {
+            return runtimeFailure(ctx, error.TerminalNotReady);
+        }
+
+        var acquired = executeAuthorizedTerminal(ctx, session_id, .{ .write = .{
+            .session_id = session_id,
+            .lease = .acquire,
+            .authority = null,
+        } }) catch |err| return runtimeFailure(ctx, err);
+        defer acquired.deinit(ctx.allocator);
+        switch (acquired.result.view()) {
+            .failure => return cloneTerminalFailure(ctx, acquired.result.view()),
+            .success => |success| switch (success) {
+                .write => {},
+                else => return runtimeFailure(ctx, error.InvalidTerminalResult),
+            },
+        }
+        var release_needed = true;
+        defer if (release_needed) releaseTtyLease(ctx, session_id);
+
+        var used = executeAuthorizedTerminal(ctx, session_id, .{ .write = .{
+            .session_id = session_id,
+            .payload = .{ .text = chars },
+            .lease = .use,
+            .authority = null,
+        } }) catch |err| return runtimeFailure(ctx, err);
+        defer used.deinit(ctx.allocator);
+        accepted_bytes = switch (used.result.view()) {
+            .failure => return cloneTerminalFailure(ctx, used.result.view()),
+            .success => |success| switch (success) {
+                .write => |value| value.accepted_bytes,
+                else => return runtimeFailure(ctx, error.InvalidTerminalResult),
+            },
+        };
+
+        var released = executeAuthorizedTerminal(ctx, session_id, .{ .write = .{
+            .session_id = session_id,
+            .lease = .release,
+            .authority = null,
+        } }) catch |err| return runtimeFailure(ctx, err);
+        defer released.deinit(ctx.allocator);
+        const facts = switch (released.result.view()) {
+            .failure => return cloneTerminalFailure(ctx, released.result.view()),
+            .success => |success| switch (success) {
+                .write => |value| value.session,
+                else => return runtimeFailure(ctx, error.InvalidTerminalResult),
+            },
+        };
+        release_needed = false;
+        state = terminal_managed_observer.snapshotState(facts, null);
+    }
     const waiter_id = runtime.reserveExternalWait(session_id) catch |err|
         return runtimeFailure(ctx, err);
     defer runtime.releaseExternalWait(session_id, waiter_id);
-    var state: managed_execution.SnapshotState = .running;
-    if (input.wait_ceiling_ms != 0) {
+    if (state == .running and input.yield_time_ms != 0) {
         var waited = executeAuthorizedTerminal(ctx, session_id, .{ .wait = .{
             .session_id = session_id,
             .return_when = .exit,
-            .safety_ceiling_ms = input.wait_ceiling_ms,
+            .safety_ceiling_ms = input.yield_time_ms,
             .authority = null,
         } }) catch |err| return runtimeFailure(ctx, err);
         defer waited.deinit(ctx.allocator);
@@ -628,6 +700,9 @@ fn callTtyWait(
             },
         };
         state = terminal_managed_observer.snapshotState(result.session, result.outcome);
+    }
+    if (accepted_bytes != null and input.yield_time_ms == 0) {
+        io_mod.sleep(100 * std.time.ns_per_ms);
     }
     var observed = terminal_managed_observer.observe(
         ttyObserverContext(ctx, runtime) orelse return unavailable(ctx),
@@ -655,120 +730,10 @@ fn callTtyWait(
         .published_running = true,
     }) catch |err| return runtimeFailure(ctx, err);
     defer prepared.deinit(ctx.allocator);
-    return finishPrepared(ctx, runtime, &prepared, .command);
-}
-
-fn callWrite(
-    ctx: tool_dispatch.DispatchContext,
-    input: Input,
-) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    const runtime = ctx.managed_executions orelse return unavailable(ctx);
-    const session_id = input.session_id orelse return unavailable(ctx);
-    ensureOwnedTtyIndexed(ctx, runtime, session_id) catch |err|
-        return runtimeFailure(ctx, err);
-    if (runtime.isTombstone(session_id)) {
-        return runtimeFailure(ctx, error.ExecutionTerminal);
-    }
-    if (runtime.backendFor(session_id) != .tty) return runtimeFailure(ctx, error.InvalidBackend);
-    var ready = executeAuthorizedTerminal(ctx, session_id, .{ .wait = .{
-        .session_id = session_id,
-        .return_when = .started,
-        .safety_ceiling_ms = 20_000,
-        .authority = null,
-    } }) catch |err| return runtimeFailure(ctx, err);
-    defer ready.deinit(ctx.allocator);
-    const ready_result = switch (ready.result.view()) {
-        .failure => return cloneTerminalFailure(ctx, ready.result.view()),
-        .success => |success| switch (success) {
-            .wait => |value| value,
-            else => return runtimeFailure(ctx, error.InvalidTerminalResult),
-        },
-    };
-    if (ready_result.session.lifecycle != .running) {
-        return runtimeFailure(ctx, error.TerminalNotReady);
-    }
-    const payload_input = input.input orelse return unavailable(ctx);
-    var payload_arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
-    defer payload_arena_state.deinit();
-    const payload = buildWritePayload(payload_arena_state.allocator(), payload_input) catch |err|
-        return runtimeFailure(ctx, err);
-
-    var acquired = executeAuthorizedTerminal(ctx, session_id, .{ .write = .{
-        .session_id = session_id,
-        .lease = .acquire,
-        .authority = null,
-    } }) catch |err| return runtimeFailure(ctx, err);
-    defer acquired.deinit(ctx.allocator);
-    switch (acquired.result.view()) {
-        .failure => return cloneTerminalFailure(ctx, acquired.result.view()),
-        .success => |success| switch (success) {
-            .write => {},
-            else => return runtimeFailure(ctx, error.InvalidTerminalResult),
-        },
-    }
-    var release_needed = true;
-    defer if (release_needed) {
-        releaseTtyLease(ctx, session_id);
-    };
-
-    var used = executeAuthorizedTerminal(ctx, session_id, .{ .write = .{
-        .session_id = session_id,
-        .payload = payload,
-        .lease = .use,
-        .authority = null,
-    } }) catch |err| return runtimeFailure(ctx, err);
-    defer used.deinit(ctx.allocator);
-    const accepted_bytes = switch (used.result.view()) {
-        .failure => return cloneTerminalFailure(ctx, used.result.view()),
-        .success => |success| switch (success) {
-            .write => |value| value.accepted_bytes,
-            else => return runtimeFailure(ctx, error.InvalidTerminalResult),
-        },
-    };
-
-    var released = executeAuthorizedTerminal(ctx, session_id, .{ .write = .{
-        .session_id = session_id,
-        .lease = .release,
-        .authority = null,
-    } }) catch |err| return runtimeFailure(ctx, err);
-    defer released.deinit(ctx.allocator);
-    const facts = switch (released.result.view()) {
-        .failure => return cloneTerminalFailure(ctx, released.result.view()),
-        .success => |success| switch (success) {
-            .write => |value| value.session,
-            else => return runtimeFailure(ctx, error.InvalidTerminalResult),
-        },
-    };
-    release_needed = false;
-    io_mod.sleep(100 * std.time.ns_per_ms);
-    var observed = terminal_managed_observer.observe(
-        ttyObserverContext(ctx, runtime) orelse return unavailable(ctx),
-        session_id,
-        terminal_managed_observer.snapshotState(facts, null),
-        runtime.ttyCursorFor(session_id),
-    ) catch |err| return runtimeFailure(ctx, err);
-    defer observed.deinit(ctx.allocator);
-    finalizeCompletedTty(ctx, session_id, observed.state) catch |err|
-        return runtimeFailure(ctx, err);
-    var prepared = runtime.updateTty(ctx.allocator, .{
-        .execution_id = session_id,
-        .command = "",
-        .state = observed.state,
-        .output = observed.output,
-        .replay_output = observed.replay_output,
-        .next_cursor = observed.next_cursor,
-        .output_incomplete = observed.output_incomplete,
-        .error_name = if (observed.timed_out) "TimeoutExpired" else null,
-        .max_output_bytes = ctx.max_command_output_bytes,
-        .published_running = true,
-    }) catch |err| return runtimeFailure(ctx, err);
-    defer prepared.deinit(ctx.allocator);
-    return finishPreparedWithAccepted(
-        ctx,
-        runtime,
-        &prepared,
-        accepted_bytes,
-    );
+    return if (accepted_bytes) |count|
+        finishPreparedWithAccepted(ctx, runtime, &prepared, count)
+    else
+        finishPrepared(ctx, runtime, &prepared, .command);
 }
 
 fn callTtyStop(
@@ -977,27 +942,6 @@ fn statusFromOutcome(
     };
 }
 
-fn buildWritePayload(
-    alloc: Allocator,
-    input: WriteInput,
-) !terminal_contracts.WritePayload {
-    return switch (input.kind) {
-        .text => .{ .text = input.text orelse return error.InvalidWritePayload },
-        .paste => .{ .paste = input.text orelse return error.InvalidWritePayload },
-        .keys => .{ .keys = input.keys },
-        .controls => blk: {
-            const controls = try alloc.alloc(
-                terminal_contracts.ControlInput,
-                input.controls.len,
-            );
-            for (input.controls, 0..) |control, index| {
-                controls[index] = .{ .character = control };
-            }
-            break :blk .{ .controls = controls };
-        },
-    };
-}
-
 fn releaseTtyLease(
     ctx: tool_dispatch.DispatchContext,
     session_id: []const u8,
@@ -1115,50 +1059,6 @@ fn finishPreparedWithAccepted(
     return .{ .success = body };
 }
 
-fn callList(
-    ctx: tool_dispatch.DispatchContext,
-) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    const runtime = ctx.managed_executions orelse return unavailable(ctx);
-    refreshTtyExecutions(ctx, runtime) catch |err| {
-        if (err == error.OutOfMemory) return error.OutOfMemory;
-        debug_trace.logf(
-            "shell",
-            "TTY list refresh degraded err={s}",
-            .{@errorName(err)},
-        );
-    };
-    const items = runtime.list(ctx.allocator) catch |err| return runtimeFailure(ctx, err);
-    defer {
-        for (items) |*item| item.deinit(ctx.allocator);
-        ctx.allocator.free(items);
-    }
-    var out: std.Io.Writer.Allocating = .init(ctx.allocator);
-    errdefer out.deinit();
-    out.writer.writeAll("{\"executions\":[") catch return error.OutOfMemory;
-    for (items, 0..) |item, index| {
-        if (index != 0) out.writer.writeByte(',') catch return error.OutOfMemory;
-        std.json.Stringify.value(.{
-            .session_id = item.execution_id,
-            .command = item.command,
-            .state = snapshotStateName(item.state),
-            .backend = @tagName(item.backend),
-            .persistence = @tagName(item.persistence),
-        }, .{}, &out.writer) catch return error.OutOfMemory;
-    }
-    out.writer.writeAll("]}") catch return error.OutOfMemory;
-    return .{ .success = try out.toOwnedSlice() };
-}
-
-fn refreshTtyExecutions(
-    ctx: tool_dispatch.DispatchContext,
-    runtime: *managed_execution.Runtime,
-) !void {
-    return terminal_managed_observer.refreshAll(
-        ttyObserverContext(ctx, runtime) orelse
-            return error.TerminalAuthorityUnavailable,
-    );
-}
-
 fn ensureOwnedTtyIndexed(
     ctx: tool_dispatch.DispatchContext,
     runtime: *managed_execution.Runtime,
@@ -1255,33 +1155,6 @@ fn finishPrepared(
         .{ .failure = body }
     else
         .{ .success = body };
-}
-
-fn finishRun(
-    ctx: tool_dispatch.DispatchContext,
-    runtime: *managed_execution.Runtime,
-    prepared: *managed_execution.PreparedSnapshot,
-    handoff: ?Handoff,
-) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    const result = try finishPrepared(ctx, runtime, prepared, .command);
-    switch (result) {
-        .success => if (turnControlForRun(handoff, prepared.snapshot.state)) |control| {
-            tool_dispatch.reportTurnControl(ctx, control);
-        },
-        .failure => {},
-    }
-    return result;
-}
-
-fn turnControlForRun(
-    handoff: ?Handoff,
-    state: managed_execution.SnapshotState,
-) ?tool_dispatch.TurnControl {
-    if (handoff != .next_turn) return null;
-    return switch (state) {
-        .running => .return_to_user,
-        .completed, .stopped, .lost => null,
-    };
 }
 
 fn publishSnapshotMetadata(
@@ -1417,15 +1290,17 @@ fn formatSnapshotWithLimit(
         max_bytes,
         result_store.large_result_threshold_bytes,
     );
-    const full = try formatSnapshotRaw(
+    if (try formatModelSafeSnapshotRaw(
         alloc,
         snapshot,
         accepted_bytes,
         snapshot.output_delta,
         snapshot.output_truncated,
-    );
-    if (full.len <= inline_max_bytes) return full;
-    alloc.free(full);
+        inline_max_bytes,
+    )) |full| {
+        if (full.len <= inline_max_bytes) return full;
+        alloc.free(full);
+    }
 
     var minimum: usize = 0;
     var maximum: usize = @min(snapshot.output_delta.len, inline_max_bytes);
@@ -1445,13 +1320,18 @@ fn formatSnapshotWithLimit(
         );
         const projected = try projected_writer.toOwnedSlice();
         defer alloc.free(projected);
-        const candidate = try formatSnapshotRaw(
+        const candidate = (try formatModelSafeSnapshotRaw(
             alloc,
             snapshot,
             accepted_bytes,
             projected,
             true,
-        );
+            inline_max_bytes,
+        )) orelse {
+            if (content_budget == 0) break;
+            maximum = content_budget - 1;
+            continue;
+        };
         if (candidate.len <= inline_max_bytes) {
             if (best) |value| alloc.free(value);
             best = candidate;
@@ -1469,6 +1349,39 @@ fn formatSnapshotWithLimit(
         accepted_bytes,
         "",
         true,
+    );
+}
+
+fn formatModelSafeSnapshotRaw(
+    alloc: Allocator,
+    snapshot: managed_execution.Snapshot,
+    accepted_bytes: ?u32,
+    output_delta: []const u8,
+    output_truncated: bool,
+    max_encoded_bytes: usize,
+) !?[]u8 {
+    if (text_utils.isModelSafeText(output_delta)) {
+        return try formatSnapshotRaw(
+            alloc,
+            snapshot,
+            accepted_bytes,
+            output_delta,
+            output_truncated,
+        );
+    }
+    var encoded = try text_utils.encodeTerminalSafe(
+        alloc,
+        output_delta,
+        max_encoded_bytes,
+    );
+    defer encoded.deinit(alloc);
+    if (encoded.truncated) return null;
+    return try formatSnapshotRaw(
+        alloc,
+        snapshot,
+        accepted_bytes,
+        encoded.bytes,
+        output_truncated,
     );
 }
 
@@ -1501,6 +1414,7 @@ fn formatSnapshotRaw(
         .backend = @tagName(snapshot.backend),
         .persistence = @tagName(snapshot.persistence),
         .output_truncated = output_truncated,
+        .output_terminal_safe = true,
         .full_output_handle = snapshot.output_file,
         .exit_code = projection.exit_code,
         .signal = projection.signal,
@@ -1600,15 +1514,16 @@ pub fn isProcessLocal(erased: tool_dispatch.ToolInput) bool {
     const input = erased.as(OwnedInput).value;
     return switch (input.action) {
         .run => !input.tty,
-        .wait, .stop, .list => true,
-        .write => false,
+        .interact => input.chars == null or input.chars.?.len == 0,
+        .stop => true,
     };
 }
 
 pub fn readsOnly(erased: tool_dispatch.ToolInput) bool {
-    return switch (erased.as(OwnedInput).value.action) {
-        .wait, .list => true,
-        .run, .write, .stop => false,
+    const input = erased.as(OwnedInput).value;
+    return switch (input.action) {
+        .interact => input.chars == null or input.chars.?.len == 0,
+        .run, .stop => false,
     };
 }
 
@@ -1625,16 +1540,14 @@ pub fn presentation(args: std.json.ObjectMap) ?tool_dispatch.CallPresentation {
             .label_arg_kind = .command,
             .label_arg_default = "command",
         },
-        .wait => sessionPresentation("Waiting for", "Finished waiting for"),
-        .write => sessionPresentation("Sending input to", "Sent input to"),
+        .interact => if (tool_args.optionalStringArg(args, "chars")) |chars|
+            if (chars.len == 0)
+                sessionPresentation("Waiting for", "Observed")
+            else
+                sessionPresentation("Sending input to", "Sent input to")
+        else
+            sessionPresentation("Waiting for", "Observed"),
         .stop => sessionPresentation("Stopping", "Stopped"),
-        .list => .{
-            .activity_kind = .read,
-            .action_label = "Listing",
-            .completed_action_label = "Listed",
-            .label_arg_kind = .none,
-            .label_arg_default = "shell executions",
-        },
     };
 }
 
@@ -1658,14 +1571,64 @@ pub fn isIrreversible(_: tool_dispatch.ToolInput) bool {
 test "shell action fields are closed and command authority covers every run" {
     try std.testing.expectEqualSlices(
         []const u8,
-        &.{ "action", "command", "cwd", "profile", "shell", "tty", "yield_time_ms", "timeout_ms", "handoff" },
+        &.{ "action", "command", "cwd", "profile", "shell", "tty", "yield_time_ms", "timeout_ms" },
         actionFieldContract(.run).allowed,
     );
     try std.testing.expectEqualSlices(
         []const u8,
-        &.{ "action", "session_id", "wait_ceiling_ms" },
-        actionFieldContract(.wait).allowed,
+        &.{ "action", "session_id", "chars", "yield_time_ms" },
+        actionFieldContract(.interact).allowed,
     );
+}
+
+test "shell interact classification follows optional input" {
+    const alloc = std.testing.allocator;
+    const ctx = tool_dispatch.DispatchContext{ .allocator = alloc };
+    const cases = [_]struct {
+        json: []const u8,
+        reads_only: bool,
+        process_local: bool,
+    }{
+        .{
+            .json = "{\"action\":\"interact\",\"session_id\":\"shell-1\"}",
+            .reads_only = true,
+            .process_local = true,
+        },
+        .{
+            .json = "{\"action\":\"interact\",\"session_id\":\"shell-1\",\"chars\":\"\"}",
+            .reads_only = true,
+            .process_local = true,
+        },
+        .{
+            .json = "{\"action\":\"interact\",\"session_id\":\"shell-1\",\"chars\":\"hello\\n\"}",
+            .reads_only = false,
+            .process_local = false,
+        },
+    };
+    for (cases) |case| {
+        const decoded = try decode(ctx, case.json);
+        switch (decoded) {
+            .failure => |failure| {
+                defer alloc.free(failure);
+                return error.TestUnexpectedResult;
+            },
+            .input => |input| {
+                defer input.deinit(alloc);
+                try std.testing.expectEqual(case.reads_only, readsOnly(input));
+                try std.testing.expectEqual(case.process_local, isProcessLocal(input));
+            },
+        }
+    }
+
+    const oversized = try alloc.alloc(u8, terminal_contracts.max_write_bytes + 1);
+    defer alloc.free(oversized);
+    const failure = try validateInteract(ctx, .{
+        .action = .interact,
+        .session_id = "shell-1",
+        .chars = oversized,
+    }) orelse return error.TestUnexpectedResult;
+    defer alloc.free(failure);
+    try std.testing.expect(std.mem.find(u8, failure, "exceed") != null);
 }
 
 test "TTY execution requires matching shell authority" {
@@ -1727,7 +1690,7 @@ test "shell decoder preserves null omission and rejects cross action fields" {
     }
     const invalid = try decode(
         ctx,
-        "{\"action\":\"list\",\"command\":\"true\"}",
+        "{\"action\":\"interact\",\"session_id\":\"shell-session\",\"command\":\"true\"}",
     );
     switch (invalid) {
         .input => |input| {
@@ -1741,7 +1704,7 @@ test "shell decoder preserves null omission and rejects cross action fields" {
     }
 }
 
-test "shell decoder applies Codex parity observation defaults" {
+test "shell decoder applies action specific observation defaults" {
     const alloc = std.testing.allocator;
     const ctx = tool_dispatch.DispatchContext{ .allocator = alloc };
     const run_decoded = try decode(ctx, "{\"action\":\"run\",\"command\":\"true\"}");
@@ -1758,11 +1721,11 @@ test "shell decoder applies Codex parity observation defaults" {
             );
         },
     }
-    const wait_decoded = try decode(
+    const interact_decoded = try decode(
         ctx,
-        "{\"action\":\"wait\",\"session_id\":\"shell-session\"}",
+        "{\"action\":\"interact\",\"session_id\":\"shell-session\"}",
     );
-    switch (wait_decoded) {
+    switch (interact_decoded) {
         .failure => |failure| {
             defer alloc.free(failure);
             return error.TestUnexpectedResult;
@@ -1771,13 +1734,13 @@ test "shell decoder applies Codex parity observation defaults" {
             defer input.deinit(alloc);
             try std.testing.expectEqual(
                 @as(u32, 5_000),
-                input.as(OwnedInput).value.wait_ceiling_ms,
+                input.as(OwnedInput).value.yield_time_ms,
             );
         },
     }
 }
 
-test "shell decoder accepts next turn handoff only for run" {
+test "shell decoder rejects removed handoff and legacy actions" {
     const alloc = std.testing.allocator;
     const ctx = tool_dispatch.DispatchContext{ .allocator = alloc };
     const run_decoded = try decode(
@@ -1785,16 +1748,16 @@ test "shell decoder accepts next turn handoff only for run" {
         "{\"action\":\"run\",\"command\":\"sleep 30\",\"yield_time_ms\":0,\"handoff\":\"next_turn\"}",
     );
     switch (run_decoded) {
-        .failure => |failure| {
-            defer alloc.free(failure);
+        .failure => |failure| alloc.free(failure),
+        .input => |input| {
+            defer input.deinit(alloc);
             return error.TestUnexpectedResult;
         },
-        .input => |input| input.deinit(alloc),
     }
 
     const wait_decoded = try decode(
         ctx,
-        "{\"action\":\"wait\",\"session_id\":\"shell-session\",\"handoff\":\"next_turn\"}",
+        "{\"action\":\"wait\",\"session_id\":\"shell-session\"}",
     );
     switch (wait_decoded) {
         .input => |input| {
@@ -1805,17 +1768,6 @@ test "shell decoder accepts next turn handoff only for run" {
             defer alloc.free(failure);
         },
     }
-}
-
-test "next turn handoff applies only to a running run result" {
-    try std.testing.expectEqual(
-        tool_dispatch.TurnControl.return_to_user,
-        turnControlForRun(.next_turn, .running).?,
-    );
-    try std.testing.expect(turnControlForRun(.next_turn, .{
-        .completed = .{ .exit_code = 0 },
-    }) == null);
-    try std.testing.expect(turnControlForRun(null, .running) == null);
 }
 
 test "stopped execution is a successful shell observation without command failure metadata" {
@@ -1897,6 +1849,66 @@ test "shell snapshot keeps bounded head tail and control metadata" {
     try std.testing.expect(std.mem.find(u8, projected, "bytes omitted") != null);
 }
 
+test "shell snapshot projects hostile bytes as readable terminal-safe text" {
+    const alloc = std.testing.allocator;
+    const raw = "\x1b[31mRED\x1b[0m\rREWRITE\t\x00\xff\nCONTROL_TAIL\n";
+    const body = try formatSnapshot(alloc, .{
+        .execution_id = @constCast("shell-hostile"),
+        .command = @constCast("hostile-output"),
+        .cwd = @constCast("/tmp"),
+        .retained = true,
+        .state = .{ .completed = .{ .exit_code = 0 } },
+        .output_delta = @constCast(raw),
+        .output_truncated = false,
+        .output_file = @constCast("fx-command-replay-hostile.bin"),
+    }, null);
+    defer alloc.free(body);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const output_value = parsed.value.object.get("output_delta") orelse
+        return error.TestExpectedEqual;
+    if (output_value != .string) return error.TestUnexpectedResult;
+    const terminal_safe = parsed.value.object.get("output_terminal_safe") orelse
+        return error.TestExpectedEqual;
+    try std.testing.expect(terminal_safe.bool);
+    try std.testing.expect(std.mem.find(u8, output_value.string, "\\x1b") != null);
+    try std.testing.expect(std.mem.find(u8, output_value.string, "\\x00") != null);
+    try std.testing.expect(std.mem.find(u8, output_value.string, "\\xff") != null);
+    try std.testing.expect(std.mem.find(u8, output_value.string, "CONTROL_TAIL") != null);
+    try std.testing.expectEqualStrings(
+        "fx-command-replay-hostile.bin",
+        parsed.value.object.get("full_output_handle").?.string,
+    );
+}
+
+test "shell snapshot keeps a hostile output tail within the result limit" {
+    const alloc = std.testing.allocator;
+    const raw = ("\xff" ** (70 * 1024)) ++ "\nCONTROL_TAIL";
+    const body = try formatSnapshot(alloc, .{
+        .execution_id = @constCast("shell-hostile-large"),
+        .command = @constCast("hostile-large-output"),
+        .cwd = @constCast("/tmp"),
+        .retained = true,
+        .state = .{ .completed = .{ .exit_code = 0 } },
+        .output_delta = @constCast(raw),
+        .output_truncated = false,
+        .output_file = @constCast("fx-command-replay-hostile-large.bin"),
+    }, null);
+    defer alloc.free(body);
+
+    try std.testing.expect(body.len <= 16 * 1024);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const output_value = parsed.value.object.get("output_delta") orelse
+        return error.TestExpectedEqual;
+    if (output_value != .string) return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.find(u8, output_value.string, "\\xff") != null);
+    try std.testing.expect(std.mem.find(u8, output_value.string, "bytes omitted") != null);
+    try std.testing.expect(std.mem.find(u8, output_value.string, "CONTROL_TAIL") != null);
+    try std.testing.expect(parsed.value.object.get("output_truncated").?.bool);
+}
+
 test "running shell snapshot leaves continuation intent to the caller" {
     const alloc = std.testing.allocator;
     const body = try formatSnapshot(alloc, .{
@@ -1965,7 +1977,7 @@ test "registered shell run yields and waits through one managed execution" {
         .clean,
     );
     const command_ctx = command_admission.CommandContext{
-        .command = "printf ready; sleep 0.05; printf done",
+        .command = "printf ready; sleep 1; printf done",
         .resolved_cwd = "/tmp",
         .target_os = @import("builtin").os.tag,
         .environment = environment,
@@ -1997,26 +2009,23 @@ test "registered shell run yields and waits through one managed execution" {
         .{
             .id = "shell-integration",
             .name = "shell",
-            .arguments_json = "{\"action\":\"run\",\"command\":\"printf ready; sleep 0.05; printf done\",\"cwd\":\"/tmp\",\"profile\":\"clean\",\"yield_time_ms\":0}",
+            .arguments_json = "{\"action\":\"run\",\"command\":\"printf ready; sleep 1; printf done\",\"cwd\":\"/tmp\",\"profile\":\"clean\",\"yield_time_ms\":0}",
         },
         &start_status_detail,
     );
     defer started.deinit(alloc);
     try std.testing.expectEqual(tool_dispatch.DispatchResult.Status.success, started.status);
     try std.testing.expect(std.mem.find(u8, started.body, "\"state\":\"running\"") != null);
-
-    const executions = try runtime.list(alloc);
-    defer {
-        for (executions) |*execution| execution.deinit(alloc);
-        alloc.free(executions);
-    }
-    try std.testing.expectEqual(@as(usize, 1), executions.len);
-    const wait_arguments = try std.fmt.allocPrint(
+    var started_json = try std.json.parseFromSlice(std.json.Value, alloc, started.body, .{});
+    defer started_json.deinit();
+    const execution_id = started_json.value.object.get("session_id") orelse
+        return error.TestExpectedEqual;
+    const interact_arguments = try std.fmt.allocPrint(
         alloc,
-        "{{\"action\":\"wait\",\"session_id\":\"{s}\",\"wait_ceiling_ms\":2000}}",
-        .{executions[0].execution_id},
+        "{{\"action\":\"interact\",\"session_id\":\"{s}\",\"yield_time_ms\":2000}}",
+        .{execution_id.string},
     );
-    defer alloc.free(wait_arguments);
+    defer alloc.free(interact_arguments);
 
     var wait_status_detail: ?[]u8 = null;
     defer if (wait_status_detail) |detail| alloc.free(detail);
@@ -2043,7 +2052,7 @@ test "registered shell run yields and waits through one managed execution" {
         .{
             .id = "shell-wait",
             .name = "shell",
-            .arguments_json = wait_arguments,
+            .arguments_json = interact_arguments,
         },
         &wait_status_detail,
     );

@@ -4093,15 +4093,15 @@ test "automatic terminal admission reviews only sensitive typed input" {
             FakeAutoClassifier.classify,
         ),
     );
-    const list_call = ToolCall{
-        .id = "terminal-list",
+    const observe_call = ToolCall{
+        .id = "terminal-observe",
         .name = "shell",
-        .arguments_json = "{\"action\":\"list\"}",
+        .arguments_json = "{\"action\":\"interact\",\"session_id\":\"shell-1\"}",
     };
 
-    const list = try requestPermissionOutcome(input, arena, list_call, .auto, &.{});
-    try std.testing.expectEqual(ToolPermissionDecision.once, list.decision);
-    try std.testing.expectEqual(command_admission.ToolExecutionAuthority.ordinary, list.execution_authority.?);
+    const observe = try requestPermissionOutcome(input, arena, observe_call, .auto, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.once, observe.decision);
+    try std.testing.expectEqual(command_admission.ToolExecutionAuthority.ordinary, observe.execution_authority.?);
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
 
     const start = try requestPermissionOutcome(input, arena, .{
@@ -4112,7 +4112,7 @@ test "automatic terminal admission reviews only sensitive typed input" {
     try std.testing.expectEqual(ToolPermissionDecision.once, start.decision);
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
 
-    const asked = try requestPermissionOutcome(input, arena, list_call, .ask, &.{});
+    const asked = try requestPermissionOutcome(input, arena, observe_call, .ask, &.{});
     try std.testing.expectEqual(ToolPermissionDecision.permission_required, asked.decision);
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
 
@@ -4122,19 +4122,19 @@ test "automatic terminal admission reviews only sensitive typed input" {
         .action = .deny,
     }};
     input.permission_rules = .{ .rules = &rules };
-    const denied = try requestPermissionOutcome(input, arena, list_call, .auto, &.{});
+    const denied = try requestPermissionOutcome(input, arena, observe_call, .auto, &.{});
     try std.testing.expectEqual(ToolPermissionDecision.policy_denied, denied.decision);
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
 
     rules[0].action = .ask;
-    const configured_ask = try requestPermissionOutcome(input, arena, list_call, .auto, &.{});
+    const configured_ask = try requestPermissionOutcome(input, arena, observe_call, .auto, &.{});
     try std.testing.expectEqual(ToolPermissionDecision.permission_required, configured_ask.decision);
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
 
     try std.testing.expectError(
         error.UnexpectedEndOfInput,
         requestPermissionOutcome(input, arena, .{
-            .id = "malformed-terminal-list",
+            .id = "malformed-terminal-observe",
             .name = "shell",
             .arguments_json = "{",
         }, .auto, &.{}),
@@ -4156,13 +4156,13 @@ test "shell admission reuses terminal rules and command authority" {
             FakeAutoClassifier.classify,
         ),
     );
-    const list_call = ToolCall{
-        .id = "shell-list",
+    const observe_call = ToolCall{
+        .id = "shell-observe",
         .name = "shell",
-        .arguments_json = "{\"action\":\"list\"}",
+        .arguments_json = "{\"action\":\"interact\",\"session_id\":\"shell-1\"}",
     };
-    const list = try requestPermissionOutcome(input, arena, list_call, .auto, &.{});
-    try std.testing.expectEqual(ToolPermissionDecision.once, list.decision);
+    const observe = try requestPermissionOutcome(input, arena, observe_call, .auto, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.once, observe.decision);
     try std.testing.expectEqual(@as(usize, 0), classifier.calls);
 
     var rules = [_]types.PermissionRule{.{
@@ -4171,7 +4171,7 @@ test "shell admission reuses terminal rules and command authority" {
         .action = .deny,
     }};
     input.permission_rules = .{ .rules = &rules };
-    const denied = try requestPermissionOutcome(input, arena, list_call, .auto, &.{});
+    const denied = try requestPermissionOutcome(input, arena, observe_call, .auto, &.{});
     try std.testing.expectEqual(ToolPermissionDecision.policy_denied, denied.decision);
     try std.testing.expectEqual(@as(usize, 0), classifier.calls);
 

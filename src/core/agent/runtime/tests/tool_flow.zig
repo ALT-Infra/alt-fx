@@ -4588,21 +4588,21 @@ test "processQueuedPrompt stops repeated distinct terminal corrections after the
     });
     defer alloc.free(correction_s);
     const correction_t = try tool_result_errors.terminalActionFieldCorrectionJson(alloc, .{
-        .action = "wait",
+        .action = "interact",
         .invalid_fields = &.{"command"},
         .missing_fields = &.{},
-        .allowed_fields = &.{ "action", "session_id", "wait_ceiling_ms" },
+        .allowed_fields = &.{ "action", "session_id", "chars", "yield_time_ms" },
         .conflicts = &.{},
     });
     defer alloc.free(correction_t);
 
     const first_calls = [_]ToolCall{
         toolCall("terminal_s_1", "shell", "{\"request\":{\"action\":\"run\",\"session_id\":\"terminal-a\"}}"),
-        toolCall("terminal_t_1", "shell", "{\"request\":{\"action\":\"wait\",\"command\":\"wrong\"}}"),
+        toolCall("terminal_t_1", "shell", "{\"request\":{\"action\":\"interact\",\"command\":\"wrong\"}}"),
     };
     const second_calls = [_]ToolCall{
         toolCall("terminal_s_2", "shell", "{\"request\":{\"action\":\"run\",\"session_id\":\"terminal-b\"}}"),
-        toolCall("terminal_t_2", "shell", "{\"request\":{\"action\":\"wait\",\"command\":\"still wrong\"}}"),
+        toolCall("terminal_t_2", "shell", "{\"request\":{\"action\":\"interact\",\"command\":\"still wrong\"}}"),
     };
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &first_calls },

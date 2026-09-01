@@ -866,9 +866,9 @@ test "terminal display target is call-local across a cold inspect projection upd
     );
 
     const inspect_call = ToolCall{
-        .id = "wait",
+        .id = "interact",
         .name = "shell",
-        .arguments_json = "{\"action\":\"wait\",\"session_id\":\"terminal-cold-session\"}",
+        .arguments_json = "{\"action\":\"interact\",\"session_id\":\"terminal-cold-session\"}",
     };
     var cold_snapshot = try projection.snapshot(alloc);
     const current_target = try resolveTerminalDisplayTargetFromRows(
@@ -901,9 +901,9 @@ test "terminal display target is call-local across a cold inspect projection upd
         test_tool_registry,
         "/tmp/workspace",
         .{
-            .id = "read",
+            .id = "interact-next",
             .name = "shell",
-            .arguments_json = "{\"action\":\"wait\",\"session_id\":\"terminal-cold-session\"}",
+            .arguments_json = "{\"action\":\"interact\",\"session_id\":\"terminal-cold-session\"}",
         },
         learned_snapshot.rows,
     ) orelse return error.TestExpectedEqual;

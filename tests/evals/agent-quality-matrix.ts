@@ -1059,7 +1059,7 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
       category: "managed shell status",
       tools: ["shell"],
       notes:
-        "Use shell.list to find the owned handle, then shell.wait for a bounded output delta without rediscovering or replaying the process.",
+        "Use the owned handle returned by shell.run, then shell.interact for a bounded output delta without rediscovering or replaying the process.",
     },
     forbiddenTools: ["ask_user_question"],
     expectedUserVisibleBehavior:
@@ -1077,12 +1077,12 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
     currentBaselineResult: {
       status: "passing",
       notes:
-        "shell.list and shell.wait expose only fx-owned executions and bounded output deltas.",
+        "shell.interact exposes only fx-owned execution output for the exact returned handle.",
     },
     targetResult:
       "Long-running commands remain inspectable through the same handle without replaying the command or inventing PID/log authority.",
     coveredEntrypoints: [
-      interactiveEntrypoint("Ctrl-X and shell.list expose managed process state."),
+      interactiveEntrypoint("Ctrl-X exposes managed process state."),
       askEntrypoint("Process-local shell handles remain available for the ask lifetime."),
     ],
   },
