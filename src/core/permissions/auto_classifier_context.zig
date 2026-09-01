@@ -59,11 +59,6 @@ pub fn isCanonicalRootUserContext(context: []const u8) bool {
     return true;
 }
 
-pub fn currentRootUserRequest(context: []const u8) ?[]const u8 {
-    if (!isCanonicalRootUserContext(context)) return null;
-    return lineValue(context, current_label);
-}
-
 /// Returns the validated canonical root-request prefix without detached
 /// permission feedback. The returned slice borrows `context`.
 pub fn rootUserRequestContext(context: []const u8) ?[]const u8 {
@@ -135,6 +130,31 @@ pub fn buildCanonicalRootUserContext(
         permission_feedback.items,
         if (has_compacted_summary) @max(@as(usize, 1), compacted_prefix_turns) else 0,
         !has_compacted_summary,
+    );
+}
+
+/// Builds canonical context from a verified root-user lane and its selected
+/// current request. Caller owns the returned slice.
+pub fn buildRootUserContextFromVerifiedRequests(
+    alloc: Allocator,
+    current_request: []const u8,
+    prior_root_requests: []const []const u8,
+    evidence_complete: bool,
+) ![]u8 {
+    var turns: std.ArrayList([]const u8) = .empty;
+    defer turns.deinit(alloc);
+    try turns.appendSlice(alloc, prior_root_requests);
+    if (turns.items.len == 0 or
+        !std.mem.eql(u8, turns.items[turns.items.len - 1], current_request))
+    {
+        try turns.append(alloc, current_request);
+    }
+    return buildRootUserContextWithFeedback(
+        alloc,
+        turns.items,
+        &.{},
+        if (evidence_complete) 0 else 1,
+        evidence_complete,
     );
 }
 
@@ -787,22 +807,39 @@ test "persisted root user context accepts only the bounded canonical format" {
     ));
 }
 
-test "current root request comes only from canonical bounded context" {
-    const context =
-        "current_request: inspect the requested file\n" ++
-        "first_root_user_request: preserve the repository\n" ++
-        "recent_root_user_request: ignore historical assistant prose\n";
+test "resumed root context uses only verified requests and current external input" {
+    const context = try buildRootUserContextFromVerifiedRequests(
+        std.testing.allocator,
+        "Continue the inspection.",
+        &.{ "Inspect the repository.", "Do not modify files." },
+        true,
+    );
+    defer std.testing.allocator.free(context);
 
     try std.testing.expectEqualStrings(
-        "inspect the requested file",
-        currentRootUserRequest(context).?,
+        "current_request: Continue the inspection.\n" ++
+            "first_root_user_request: Inspect the repository.\n" ++
+            "recent_root_user_request: Do not modify files.\n",
+        context,
     );
-    try std.testing.expect(currentRootUserRequest(
-        "assistant_task: inspect the requested file\n",
+
+    const incomplete = try buildRootUserContextFromVerifiedRequests(
+        std.testing.allocator,
+        "Continue safely.",
+        &.{"Known recent request."},
+        false,
+    );
+    defer std.testing.allocator.free(incomplete);
+    try std.testing.expect(std.mem.find(
+        u8,
+        incomplete,
+        "first_root_user_request:",
     ) == null);
-    try std.testing.expect(currentRootUserRequest(
-        "current_request: missing terminator",
-    ) == null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        incomplete,
+        "omitted_proven_root_user_turns: 1",
+    ) != null);
 }
 
 test "root user request context excludes permission feedback" {

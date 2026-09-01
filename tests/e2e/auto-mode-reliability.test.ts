@@ -411,7 +411,7 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
-    "normal deployment review ignores conflicting task text",
+    "contextual deployment review clears despite conflicting task text",
     async () => {
       const root = createIsolatedRoot();
       const marker = join(root.root, "deployment-ran");
@@ -446,8 +446,8 @@ describe("lean auto mode reliability", () => {
       expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
       expect(gateway.classifierRequests).toHaveLength(1);
       const review = reviewerText(gateway.classifierRequests[0]!.body);
-      expect(review).toContain("review_context_kind: normal");
-      expect(review).not.toContain("Inspect the local site only");
+      expect(review).toContain("review_context_kind: contextual");
+      expect(review).toContain("Inspect the local site only");
       expect(existsSync(marker)).toBe(true);
       expect(result.stderr).not.toContain(COMMAND_APPROVAL_PROMPT);
     },
@@ -522,9 +522,9 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
-    "expanded and wrapped destructive commands receive contextual review",
+    "unresolved destructive commands receive contextual review",
     async () => {
-      for (const shape of ["expanded", "wrapped"] as const) {
+      for (const shape of ["expanded", "wrapped", "find_delete"] as const) {
         const root = createIsolatedRoot();
         const protectedPath = join(root.workspace, `${shape}-must-remain`);
         mkdirSync(protectedPath);
@@ -533,11 +533,13 @@ describe("lean auto mode reliability", () => {
         let command: string;
         if (shape === "expanded") {
           command = `target=${JSON.stringify(protectedPath)}; rm -rf \"$target\"`;
-        } else {
+        } else if (shape === "wrapped") {
           const wrapper = join(root.root, "custom-wrapper");
-          writeFileSync(wrapper, "#!/bin/sh\nexec \"$@\"\n");
+          writeFileSync(wrapper, "#!/bin/sh\n/bin/rm -rf \"$1\"\n");
           chmodSync(wrapper, 0o755);
-          command = `${wrapper} /bin/rm -rf ${JSON.stringify(protectedPath)}`;
+          command = `${wrapper} ${JSON.stringify(protectedPath)}`;
+        } else {
+          command = `/usr/bin/find ${JSON.stringify(protectedPath)} -delete`;
         }
 
         const prompt = "Inspect the repository without deleting files.";
@@ -565,6 +567,43 @@ describe("lean auto mode reliability", () => {
         expect(existsSync(join(protectedPath, "keep.txt"))).toBe(true);
         expect(result.stderr).not.toContain(COMMAND_APPROVAL_PROMPT);
       }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "an explicitly requested unknown wrapper clears contextual review",
+    async () => {
+      const root = createIsolatedRoot();
+      const marker = join(root.root, "unknown-wrapper-ran");
+      const wrapper = join(root.root, "custom-build");
+      writeFileSync(wrapper, `#!/bin/sh\nprintf 'ran\\n' > ${JSON.stringify(marker)}\n`);
+      chmodSync(wrapper, 0o755);
+      const prompt = "Run the custom build wrapper exactly once.";
+      const gateway = startGateway(
+        [
+          userCommandCall(wrapper, "unknown_wrapper_clear"),
+          fakeGatewayFinalText("custom build completed"),
+        ],
+        [fakeGatewayPermissionDecision("clear", "unknown_wrapper_clear")],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", prompt],
+        {
+          cwd: root.workspace,
+          env: gatewayEnv(root, gateway),
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(1);
+      const review = reviewerText(gateway.classifierRequests[0]!.body);
+      expect(review).toContain("review_context_kind: contextual");
+      expect(review).toContain(prompt);
+      expect(readFileSync(marker, "utf8")).toBe("ran\n");
+      expect(result.stderr).not.toContain(COMMAND_APPROVAL_PROMPT);
     },
     TIMEOUT,
   );
@@ -776,7 +815,7 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
-    "normal review omits root context regardless of oversized history",
+    "contextual command review keeps oversized root history bounded",
     async () => {
       const root = createIsolatedRoot();
       const blockedMarker = join(root.workspace, "oversized-history-must-not-run");
@@ -842,12 +881,14 @@ describe("lean auto mode reliability", () => {
         .filter((part) => part.type === "text")
         .map((part) => part.text ?? "")
         .join("");
-      expect(Buffer.byteLength(rootContext)).toBeLessThanOrEqual(1024);
-      expect(rootContext).toContain("review_context_kind: normal");
-      expect(rootContext).not.toContain("current-required-marker");
-      expect(rootContext).not.toContain("first-required-marker");
-      expect(rootContext).not.toContain("newest-recent-required-marker");
-      expect(rootContext).not.toContain("older-middle-marker");
+      const prefix = "review_context_kind: contextual\ntrusted_root_context:\n";
+      expect(rootContext.startsWith(prefix)).toBe(true);
+      const trustedRootContext = rootContext.slice(prefix.length);
+      expect(Buffer.byteLength(trustedRootContext)).toBeLessThanOrEqual(1024);
+      expect(trustedRootContext).toContain("current-required-marker");
+      expect(trustedRootContext).toContain("first-required-marker");
+      expect(trustedRootContext).toContain("newest-recent-required-marker");
+      expect(trustedRootContext).not.toContain("older-middle-marker");
     },
     TIMEOUT,
   );

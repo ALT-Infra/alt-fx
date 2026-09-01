@@ -3256,7 +3256,24 @@ fn processQueuedPromptLoop(
         .{};
     defer context_delivery_state.deinit(arena);
     const root_user_intent_context = switch (config.origin) {
-        .subagent => config.root_user_intent_context,
+        .subagent => if (config.current_prompt_is_root_authority)
+            try auto_classifier_context.buildRootUserContextFromVerifiedRequests(
+                arena,
+                job.prompt,
+                config.root_user_messages,
+                config.root_user_evidence_complete,
+            )
+        else if (config.root_user_intent_context.len > 0)
+            config.root_user_intent_context
+        else if (config.root_user_messages.len > 0)
+            try auto_classifier_context.buildRootUserContextFromVerifiedRequests(
+                arena,
+                config.root_user_messages[config.root_user_messages.len - 1],
+                config.root_user_messages,
+                config.root_user_evidence_complete,
+            )
+        else
+            "",
         .root => if (job.root_user_intent_context.len > 0)
             job.root_user_intent_context
         else

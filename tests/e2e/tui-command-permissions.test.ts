@@ -3128,11 +3128,15 @@ describe("effect-aware command permissions", () => {
   );
 
   test(
-    "fx ask runs repeated turns for a persistent canonical subagent",
+    "fx ask preserves root authority across persistent child turns and direct resume",
     async () => {
       const root = createIsolatedRoot();
       const firstPrompt = "Return the deterministic first persistent result.";
       const secondMessage = "Return the deterministic second persistent result.";
+      const directPrompt = "Continue the persistent child from this external user request.";
+      const directMarker = join(root.workspace, "persistent-direct-resume.txt");
+      const directCommand =
+        `printf 'direct resume complete\\n' > ${JSON.stringify(directMarker)}`;
       let childId = "";
       let resolveFirstRequest!: () => void;
       let resolveSecondRequest!: () => void;
@@ -3143,6 +3147,15 @@ describe("effect-aware command permissions", () => {
         resolveSecondRequest = resolve;
       });
       const route = (body: string): Response | Promise<Response> => {
+        if (body.includes('"toolCallId":"persistent_direct_write"')) {
+          expect(toolResultText(body, "persistent_direct_write")).toContain(
+            "exit_code=0",
+          );
+          return finalText("persistent direct resume complete");
+        }
+        if (latestPromptText(body).includes(directPrompt)) {
+          return toolCalls(directCommand, ["persistent_direct_write"]);
+        }
         if (body.includes('"toolCallId":"persistent_inspect_2"')) {
           expect(toolResultText(body, "persistent_inspect_2")).toContain(
             '"status":"idle"',
@@ -3199,7 +3212,7 @@ describe("effect-aware command permissions", () => {
           },
         }, "persistent_create_1");
       };
-      const gateway = startFakeGateway(Array.from({ length: 7 }, () => route));
+      const gateway = startFakeGateway(Array.from({ length: 9 }, () => route));
 
       const result = await runFx(
         ["ask", "Create and continue one persistent child."],
@@ -3217,6 +3230,26 @@ describe("effect-aware command permissions", () => {
         expect(request.body).toContain('"name":"subagent"');
         expect(request.body).not.toContain('"name":"task"');
       }
+
+      const resumed = await runFx(
+        ["ask", "--auto", "--json", "--resume-id", childId, directPrompt],
+        {
+          cwd: root.workspace,
+          env: gatewayEnv(root, gateway, { PATH: hostilePath(root) }),
+          timeoutMs: TIMEOUT,
+        },
+      );
+      expect(resumed.code).toBe(0);
+      expect(resumed.stdout).toContain("persistent direct resume complete");
+      expect(readFileSync(directMarker, "utf8")).toBe("direct resume complete\n");
+      expect(gateway.requests).toHaveLength(9);
+      expect(gateway.classifierRequests).toHaveLength(1);
+      const reviewBody = gateway.classifierRequests[0]!.body;
+      expect(reviewBody).toContain("review_context_kind: contextual");
+      expect(reviewBody).toContain(directPrompt);
+      expect(reviewBody).toContain("omitted_proven_root_user_turns: 1");
+      expect(reviewBody).not.toContain(firstPrompt);
+      expect(reviewBody).not.toContain(secondMessage);
       expectNoHostileExecutables(root);
       expectNoCommandArtifacts(root);
     },
@@ -5572,9 +5605,9 @@ describe("effect-aware command permissions", () => {
       expect(gateway.classifierRequests[0]!.body).toContain("\"toolChoice\":{\"type\":\"required\"}");
       expect(gateway.classifierRequests[0]!.body).toContain("\"maxOutputTokens\":2048");
       expect(gateway.classifierRequests[0]!.body).toContain(
-        "review_context_kind: normal",
+        "review_context_kind: contextual",
       );
-      expect(gateway.classifierRequests[0]!.body).not.toContain(
+      expect(gateway.classifierRequests[0]!.body).toContain(
         "Run the classifier fixture.",
       );
       expect(gateway.classifierRequests[0]!.body).toContain("\"role\":\"assistant\"");
@@ -5856,9 +5889,9 @@ describe("effect-aware command permissions", () => {
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.classifierRequests).toHaveLength(1);
       expect(gateway.classifierRequests[0]!.body).toContain(
-        "review_context_kind: normal",
+        "review_context_kind: contextual",
       );
-      expect(gateway.classifierRequests[0]!.body).not.toContain(
+      expect(gateway.classifierRequests[0]!.body).toContain(
         "Ask Claude to create the requested Desktop note.",
       );
       expect(gateway.classifierRequests[0]!.body).toContain("action: command");

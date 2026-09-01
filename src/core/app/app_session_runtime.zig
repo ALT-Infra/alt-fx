@@ -2699,6 +2699,7 @@ pub fn Runtime(comptime App: type) type {
                 app.alloc,
                 loaded,
                 turn,
+                app.worker.active_prompt_is_root_authority,
             );
             convergeDegraded(app, loaded, .{}) catch |err| {
                 return switch (mode) {
@@ -5092,6 +5093,7 @@ const FakeWorker = struct {
     model: std.ArrayList(u8) = .empty,
     effort: types.ReasoningEffort = .auto,
     fast_mode: bool = false,
+    active_prompt_is_root_authority: bool = false,
 
     fn deinit(self: *FakeWorker, alloc: Allocator) void {
         self.model.deinit(alloc);
