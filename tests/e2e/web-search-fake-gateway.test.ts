@@ -1027,6 +1027,9 @@ describe("web_search Gateway fixture", () => {
         await startAcpCodeSession(client);
         const messages = await runAcpPrompt(client, "Search the web for the latest Zig release.");
         const updates = JSON.stringify(messages);
+        const toolUpdates = messages
+          .filter((message: any) => message.params?.update?.toolCallId === "search_direct_1")
+          .map((message: any) => message.params.update);
 
         expect(gateway.requests).toHaveLength(2);
         expect(gateway.requests[0].body).toContain("gateway.exa_search");
@@ -1042,6 +1045,21 @@ describe("web_search Gateway fixture", () => {
         );
         expect(updates).not.toContain("Searching latest Zig release");
         expect(updates).not.toContain("Found 1 result for latest Zig release");
+        expect(toolUpdates).toHaveLength(2);
+        expect(toolUpdates[0]).toEqual({
+          sessionUpdate: "tool_call",
+          toolCallId: "search_direct_1",
+          name: "web_search",
+          title: "Searching web",
+          kind: "search",
+          status: "pending",
+          rawInput: {},
+        });
+        expect(toolUpdates[1]?.sessionUpdate).toBe("tool_call_update");
+        expect(toolUpdates[1]?.status).toBe("completed");
+        expect(updates).not.toContain("exa_search");
+        expect(updates).not.toContain("perplexity_search");
+        expect(updates).not.toContain("parallel_search");
         expect(updates).toContain(SOURCE_URL);
       } finally {
         await client.close();
