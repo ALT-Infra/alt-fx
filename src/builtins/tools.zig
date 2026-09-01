@@ -190,16 +190,11 @@ const ask_user_question_question_schema = model_tool_schema.ObjectSchema{
 };
 
 const subagent_description =
-    "Delegate work without managing child lifecycle. Use run for one temporary child and one task. Use message with a stable name to create or continue a persistent conversation in this parent session. Optional instructions replace only that child's system overlay; fx preserves its trusted base prompt. A running response includes a child ID for wait or stop. fx owns creation, resume, observation, permissions, persistence, and cleanup.";
+    "Delegate work and receive one terminal child result. Use run for one temporary child and one task. Use message with a stable name to create or continue a persistent conversation in this parent session. Optional instructions replace only that child's system overlay; fx preserves its trusted base prompt. fx owns timing, worker identities, cancellation, permissions, persistence, and cleanup.";
 
 const subagent_model_run_properties = [_]model_tool_schema.Property{
     .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"run"} } },
     .{ .name = "task", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_prompt_bytes }, .description = "One complete task for a temporary child. The child inherits the parent model and effort and accepts no follow-up." },
-};
-
-const subagent_model_wait_properties = [_]model_tool_schema.Property{
-    .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"wait"} }, .description = "Wait once for the exact child. Provide only action and child_id; fx owns the bounded wait." },
-    .{ .name = "child_id", .json_type = .string, .bounds = &.{ .min_length = 1 }, .description = "Exact child ID returned by run." },
 };
 
 const subagent_model_message_properties = [_]model_tool_schema.Property{
@@ -209,16 +204,9 @@ const subagent_model_message_properties = [_]model_tool_schema.Property{
     .{ .name = "message", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_message_bytes }, .description = "Next message for that named agent. fx creates it on first use and continues it afterward." },
 };
 
-const subagent_model_stop_properties = [_]model_tool_schema.Property{
-    .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"stop"} }, .description = "Stop owned active work. Already-settled children remain unchanged." },
-    .{ .name = "child_id", .json_type = .string, .bounds = &.{ .min_length = 1 }, .description = "Exact child ID returned by run." },
-};
-
 const subagent_model_action_schemas = [_]model_tool_schema.ObjectSchema{
     .{ .properties = &subagent_model_run_properties, .required = &.{ "action", "task" }, .additional_properties = false },
-    .{ .properties = &subagent_model_wait_properties, .required = &.{ "action", "child_id" }, .additional_properties = false },
     .{ .properties = &subagent_model_message_properties, .required = &.{ "action", "agent", "message" }, .additional_properties = false },
-    .{ .properties = &subagent_model_stop_properties, .required = &.{ "action", "child_id" }, .additional_properties = false },
 };
 
 const subagent_model_action_union = model_tool_schema.ObjectSchema{
@@ -1381,7 +1369,7 @@ test "built-in subagent owns product metadata schema and callbacks" {
     try std.testing.expect(std.mem.find(u8, subagent.description, "stable name") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"request\":{") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"request\"]") != null);
-    for ([_][]const u8{ "run", "message", "wait", "stop" }) |action| {
+    for ([_][]const u8{ "run", "message" }) |action| {
         try std.testing.expect(std.mem.find(u8, schema_json, action) != null);
     }
     try std.testing.expect(std.mem.find(u8, schema_json, "\"instructions\":") != null);
@@ -1397,6 +1385,9 @@ test "built-in subagent owns product metadata schema and callbacks" {
         "\"model\"",
         "\"effort\"",
         "\"send\"",
+        "\"wait\"",
+        "\"stop\"",
+        "\"child_id\"",
     }) |mechanism| {
         try std.testing.expect(std.mem.find(u8, schema_json, mechanism) == null);
     }
