@@ -881,7 +881,7 @@ test "prepared mutations serialize exact action without operational packet field
 fn selectReviewView(request: ReviewRequest) ReviewView {
     if (request.review_turn.origin == .subagent) return .contextual;
     return switch (request.action) {
-        .command => |command| if (command_policy.destructive_effect_for(command.command) != null)
+        .command => |command| if (command_policy.destructive_review_context_required(command.command))
             .contextual
         else
             .normal,
@@ -913,8 +913,14 @@ test "review view selection uses only normalized action and origin facts" {
     request.action.command.command = "rm -rf dist";
     try std.testing.expectEqual(ReviewView.contextual, selectReviewView(request));
     request.action.command.command = "export PATH=/tmp:$PATH; rm disposable.txt";
-    try std.testing.expectEqual(ReviewView.normal, selectReviewView(request));
+    try std.testing.expectEqual(ReviewView.contextual, selectReviewView(request));
+    request.action.command.command = "rm -rf \"$TARGET\"";
+    try std.testing.expectEqual(ReviewView.contextual, selectReviewView(request));
     request.action.command.command = "custom-wrapper rm -rf dist";
+    try std.testing.expectEqual(ReviewView.contextual, selectReviewView(request));
+    request.action.command.command = "gh pr create --body \"$(cat .fx-pr-body.md)\"";
+    try std.testing.expectEqual(ReviewView.normal, selectReviewView(request));
+    request.action.command.command = "echo 'rm -rf dist'";
     try std.testing.expectEqual(ReviewView.normal, selectReviewView(request));
 
     request.action = .{ .file_mutation = .{

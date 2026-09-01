@@ -13,6 +13,16 @@ pub fn destructive_effect_for(command: []const u8) ?DestructiveEffect {
     return destructive_effect_in_analysis(analysis);
 }
 
+/// Returns true when review needs trusted root context because the command is
+/// destructive or contains a destructive operation behind unresolved shell
+/// syntax or a wrapper.
+pub fn destructive_review_context_required(command: []const u8) bool {
+    return destructive_effect_for(command) != null or
+        contains_obscured_destructive_marker(command) or
+        has_dynamic_command_word(command) or
+        has_command_string_evaluator(command);
+}
+
 /// Returns a short policy note for command text with a high-risk shape.
 pub fn command_risk_note_for(command: []const u8) ?[]const u8 {
     const risk = destructive_effect_for(command) orelse return null;
@@ -166,6 +176,168 @@ fn destructive_effect_in_analysis(command: []const u8) ?DestructiveEffect {
         effect = warning_at_command_position(command[segment_start..]);
     }
     return effect;
+}
+
+const obscured_removal_executables = [_][]const u8{ "rm", "rmdir", "unlink", "shred" };
+
+fn contains_obscured_destructive_marker(command: []const u8) bool {
+    for (obscured_removal_executables) |executable| {
+        if (find_obscured_word(command, executable, 0) != null) return true;
+    }
+
+    var search_from: usize = 0;
+    while (find_obscured_word(command, "git", search_from)) |git_end| {
+        if (git_destructive_effect("git", command[git_end..]) != null) return true;
+        search_from = git_end;
+    }
+    return false;
+}
+
+fn find_obscured_word(command: []const u8, expected: []const u8, start: usize) ?usize {
+    var basename_matched: usize = 0;
+    var in_word = false;
+    var word_dynamic = false;
+    var in_single = false;
+    var in_double = false;
+    var escaped = false;
+    var i = start;
+    while (i <= command.len) : (i += 1) {
+        const at_end = i == command.len;
+        const ch = if (at_end) 0 else command[i];
+        if (!at_end and escaped) {
+            escaped = false;
+            if (ch == '`') {
+                in_word = false;
+                word_dynamic = true;
+                basename_matched = 0;
+                continue;
+            }
+            in_word = true;
+        } else if (!at_end and ch == '\\' and !in_single) {
+            escaped = true;
+            in_word = true;
+            continue;
+        } else if (!at_end and ch == '\'' and !in_double) {
+            in_single = !in_single;
+            in_word = true;
+            continue;
+        } else if (!at_end and ch == '"' and !in_single) {
+            in_double = !in_double;
+            in_word = true;
+            continue;
+        } else if (!at_end and in_double and
+            (ch == '$' or ch == '`' or ch == '(' or ch == ')' or ch == '{' or ch == '}'))
+        {
+            if (in_word and basename_matched == expected.len) return i;
+            in_word = false;
+            word_dynamic = true;
+            basename_matched = 0;
+            continue;
+        } else if (!at_end and (is_word_byte(ch) or ((in_single or in_double) and !word_dynamic))) {
+            in_word = true;
+        } else {
+            if (in_word and basename_matched == expected.len) return i;
+            in_word = false;
+            word_dynamic = false;
+            basename_matched = 0;
+            continue;
+        }
+
+        if (!is_word_byte(ch)) {
+            basename_matched = expected.len + 1;
+            continue;
+        }
+        if (ch == '/') {
+            basename_matched = 0;
+            continue;
+        }
+        if (basename_matched < expected.len and ch == expected[basename_matched]) {
+            basename_matched += 1;
+        } else {
+            basename_matched = expected.len + 1;
+        }
+    }
+    return null;
+}
+
+fn is_word_byte(ch: u8) bool {
+    return std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '_' or ch == '.' or ch == '/';
+}
+
+fn has_dynamic_command_word(command: []const u8) bool {
+    var command_word = true;
+    var in_word = false;
+    var in_single = false;
+    var in_double = false;
+    var escaped = false;
+    for (command) |ch| {
+        if (escaped) {
+            escaped = false;
+            if (ch == '`') {
+                command_word = true;
+                in_word = false;
+                continue;
+            }
+            in_word = true;
+            continue;
+        }
+        if (ch == '\\' and !in_single) {
+            escaped = true;
+            continue;
+        }
+        if (ch == '\'' and !in_double) {
+            in_single = !in_single;
+            in_word = true;
+            continue;
+        }
+        if (ch == '"' and !in_single) {
+            in_double = !in_double;
+            in_word = true;
+            continue;
+        }
+        if (in_single) continue;
+        if (command_word and (ch == '$' or ch == '`')) return true;
+        if (in_double) continue;
+        if (ch == '`') {
+            command_word = true;
+            in_word = false;
+            continue;
+        }
+
+        if (ch == ' ' or ch == '\t' or ch == '\r') {
+            if (in_word) command_word = false;
+            in_word = false;
+            continue;
+        }
+        if (ch == ';' or ch == '\n' or ch == '|' or ch == '&' or
+            ch == '(' or ch == '{')
+        {
+            command_word = true;
+            in_word = false;
+            continue;
+        }
+        if (ch == ')' or ch == '}') continue;
+        in_word = true;
+    }
+    return false;
+}
+
+fn has_command_string_evaluator(command: []const u8) bool {
+    if (find_obscured_word(command, "eval", 0) != null) return true;
+    for ([_][]const u8{ "sh", "bash", "zsh", "dash", "ksh" }) |shell| {
+        var search_from: usize = 0;
+        while (find_obscured_word(command, shell, search_from)) |shell_end| {
+            var option_cursor = shell_end;
+            while (command_classification.next_token(command, option_cursor)) |option| {
+                if (option.text.len > 1 and option.text[0] == '-' and option.text[1] != '-' and
+                    std.mem.findScalar(u8, option.text[1..], 'c') != null) return true;
+                if (!std.mem.startsWith(u8, option.text, "-")) break;
+                option_cursor = option.end;
+            }
+            search_from = shell_end;
+        }
+    }
+    return false;
 }
 
 fn warning_at_command_position(command: []const u8) ?DestructiveEffect {
@@ -653,6 +825,50 @@ test "command risk note detects direct destructive effects only" {
         DestructiveEffect.discard_version_control_state,
         destructive_effect_for("git reset --hard HEAD~1").?,
     );
+}
+
+test "destructive review context catches expanded and wrapped removal" {
+    for ([_][]const u8{
+        "export PATH=/tmp:$PATH; rm disposable.txt",
+        "rm -rf \"$TARGET\"",
+        "custom-wrapper rm -rf generated",
+        "rtk git reset --hard HEAD~1",
+        "sh -c 'rm -rf generated'",
+        "bash -lc 'rm -rf generated'",
+        "bash --norc -c 'rm -rf generated'",
+        "env sh -c 'rm -rf generated'",
+        "sudo sh -c 'rm -rf generated'",
+        "eval 'rm -rf generated'",
+        "echo \"$(rm -rf generated)\"",
+        "echo \"`rm -rf generated`\"",
+        "\"rm\" -rf generated",
+        "r\"\"m -rf generated",
+        "(rm -rf generated)",
+        "X=m; r$X -rf generated",
+        "r$(printf m) -rf generated",
+        "cat <(rm -rf generated)",
+        "echo `echo \\`rm -rf generated\\``",
+    }) |command| {
+        if (!destructive_review_context_required(command)) {
+            std.debug.print("expected contextual review: {s}\n", .{command});
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    for ([_][]const u8{
+        "gh pr create --body \"$(cat .fx-pr-body.md)\"",
+        "gh pr create --body \"`cat .fx-pr-body.md`\"",
+        "echo 'rm -rf generated'",
+        "printf '%s' 'rm generated'",
+        "git commit -m \"rm -rf generated\"",
+        "echo $(echo $(echo ok))",
+        "echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo $(echo ok)))))))))",
+    }) |command| {
+        if (destructive_review_context_required(command)) {
+            std.debug.print("expected normal review: {s}\n", .{command});
+            return error.TestUnexpectedResult;
+        }
+    }
 }
 
 test "command destructive effect leaves unsupported and targetless removal unresolved" {

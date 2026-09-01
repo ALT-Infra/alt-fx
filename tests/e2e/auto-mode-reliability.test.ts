@@ -522,6 +522,54 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
+    "expanded and wrapped destructive commands receive contextual review",
+    async () => {
+      for (const shape of ["expanded", "wrapped"] as const) {
+        const root = createIsolatedRoot();
+        const protectedPath = join(root.workspace, `${shape}-must-remain`);
+        mkdirSync(protectedPath);
+        writeFileSync(join(protectedPath, "keep.txt"), "keep\n");
+
+        let command: string;
+        if (shape === "expanded") {
+          command = `target=${JSON.stringify(protectedPath)}; rm -rf \"$target\"`;
+        } else {
+          const wrapper = join(root.root, "custom-wrapper");
+          writeFileSync(wrapper, "#!/bin/sh\nexec \"$@\"\n");
+          chmodSync(wrapper, 0o755);
+          command = `${wrapper} /bin/rm -rf ${JSON.stringify(protectedPath)}`;
+        }
+
+        const prompt = "Inspect the repository without deleting files.";
+        const gateway = startGateway(
+          [
+            userCommandCall(command, `${shape}_destructive`),
+            fakeGatewayFinalText(`${shape} destructive action held`),
+          ],
+          [fakeGatewayPermissionDecision("caution", `${shape}_destructive_caution`)],
+        );
+        const result = await runFx(
+          ["ask", "--quiet", "--json", "--no-save", prompt],
+          {
+            cwd: root.workspace,
+            env: gatewayEnv(root, gateway),
+            timeoutMs: TIMEOUT,
+          },
+        );
+
+        expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+        expect(gateway.classifierRequests).toHaveLength(1);
+        const review = reviewerText(gateway.classifierRequests[0]!.body);
+        expect(review).toContain("review_context_kind: contextual");
+        expect(review).toContain(prompt);
+        expect(existsSync(join(protectedPath, "keep.txt"))).toBe(true);
+        expect(result.stderr).not.toContain(COMMAND_APPROVAL_PROMPT);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "git checkout hooks remain reviewer owned",
     async () => {
       for (const hookMode of ["default", "configured"] as const) {
