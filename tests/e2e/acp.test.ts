@@ -5124,6 +5124,9 @@ describe("acp: model-independent", () => {
             acceptedGateway.classifierRequests[0]!.headers.get("x-vercel-ai-gateway-team"),
           ).toBe("team_123");
           expect(acceptedGateway.classifierRequests[0]!.body).toContain(
+            "review_context_kind: normal",
+          );
+          expect(acceptedGateway.classifierRequests[0]!.body).not.toContain(
             acceptedPrompt,
           );
           expect(acceptedGateway.classifierRequests[0]!.body).toContain(
@@ -5177,6 +5180,9 @@ describe("acp: model-independent", () => {
           expect(readFileSync(blockedTarget, "utf-8")).toBe("before");
           expect(blockedGateway.classifierRequests).toHaveLength(1);
           expect(blockedGateway.classifierRequests[0]!.body).toContain(
+            "review_context_kind: normal",
+          );
+          expect(blockedGateway.classifierRequests[0]!.body).not.toContain(
             blockedPrompt,
           );
         } finally {
