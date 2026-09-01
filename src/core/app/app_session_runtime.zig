@@ -1078,6 +1078,7 @@ pub const Persistence = struct {
     subagent_host: ?*subagent_tool_host.Runtime = null,
     workspace_preferences: ?session_codec.DurableSessionPreferences = null,
     session_preferences: ?session_codec.DurableSessionPreferences = null,
+    fast_mode_model_bound: bool = false,
     js_host_store: JsHostSessionStore = .{},
     js_host_session: ?JsHostSessionOwner = null,
     process_model_override: ?[]u8 = null,
@@ -1096,7 +1097,7 @@ pub const Persistence = struct {
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (std.meta.fields(Persistence).len != 19) {
+            if (std.meta.fields(Persistence).len != 20) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -1107,6 +1108,7 @@ pub const Persistence = struct {
         storage.subagent_host = null;
         storage.workspace_preferences = null;
         storage.session_preferences = null;
+        storage.fast_mode_model_bound = false;
         storage.js_host_store = .{};
         storage.js_host_session = null;
         storage.process_model_override = null;
@@ -1159,6 +1161,7 @@ test "persistence in-place initialization preserves empty ownership" {
     try std.testing.expect(persistence.store == null);
     try std.testing.expect(persistence.writable == null);
     try std.testing.expect(persistence.subagent_host == null);
+    try std.testing.expect(!persistence.fast_mode_model_bound);
     try std.testing.expect(!persistence.session_picker.active);
     try std.testing.expect(persistence.session_picker_load.task == null);
     try std.testing.expect(!persistence.session_picker_current_cache.ready);
@@ -1338,6 +1341,7 @@ pub fn Runtime(comptime App: type) type {
             selected_model: []const u8,
             effort: types.ReasoningEffort,
             fast_mode: bool,
+            fast_mode_model_bound: bool,
         ) !void {
             try replacePreferences(
                 app.alloc,
@@ -1354,6 +1358,7 @@ pub fn Runtime(comptime App: type) type {
                 &app.session_persistence.session_preferences,
                 app.session_persistence.workspace_preferences.?,
             );
+            app.session_persistence.fast_mode_model_bound = fast_mode_model_bound;
             if (app.session_persistence.process_model_override) |model| {
                 app.alloc.free(model);
                 app.session_persistence.process_model_override = null;
@@ -2775,6 +2780,10 @@ pub fn Runtime(comptime App: type) type {
             applySessionPreferencePatch(app, patch) catch |err| {
                 result.session_error = err;
             };
+            if (patch.model != null or patch.fast_mode != null) {
+                app.session_persistence.fast_mode_model_bound =
+                    patch.model != null and patch.fast_mode != null;
+            }
 
             var settings_attempt = config_runtime.attemptUserPreferences(
                 app.alloc,
@@ -4821,6 +4830,11 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             preferences: session_codec.DurableSessionPreferences,
         ) !void {
+            const fast_mode_model_bound = restoredFastModeModelBound(
+                app.session_persistence.fast_mode_model_bound,
+                app.session_persistence.workspace_preferences,
+                preferences,
+            );
             try provider_runtime.replaceSelection(app, preferences.provider, preferences.model);
             if (app.session_persistence.process_model_override) |model| {
                 try provider_runtime.replaceModel(app, model);
@@ -4831,8 +4845,13 @@ pub fn Runtime(comptime App: type) type {
             );
             app.effort = preferences.effort;
             app.fast_mode = preferences.fast_mode;
+            app.session_persistence.fast_mode_model_bound = fast_mode_model_bound;
             app.worker.syncQueuedPromptEffort(preferences.effort);
             app.worker.syncQueuedPromptFastMode(preferences.fast_mode);
+        }
+
+        pub fn fastModeModelBound(app: *const App) bool {
+            return app.session_persistence.fast_mode_model_bound;
         }
 
         fn applySessionPreferencePatch(
@@ -4887,6 +4906,46 @@ fn replacePreferences(
     const replacement = try source.dupe(alloc);
     if (target.*) |*current| current.deinit(alloc);
     target.* = replacement;
+}
+
+fn restoredFastModeModelBound(
+    current_bound: bool,
+    configured: ?session_codec.DurableSessionPreferences,
+    restored: session_codec.DurableSessionPreferences,
+) bool {
+    if (!current_bound) return false;
+    const current = configured orelse return false;
+    return current.provider == restored.provider and
+        std.mem.eql(u8, current.model, restored.model) and
+        current.fast_mode == restored.fast_mode;
+}
+
+test "restored fast mode remains bound only for the configured model selection" {
+    const configured = session_codec.DurableSessionPreferences{
+        .model = @constCast("provider/model"),
+        .effort = .auto,
+        .fast_mode = true,
+    };
+    const matching = session_codec.DurableSessionPreferences{
+        .model = @constCast("provider/model"),
+        .effort = types.ReasoningEffort.literal("high"),
+        .fast_mode = true,
+    };
+    const different_model = session_codec.DurableSessionPreferences{
+        .model = @constCast("provider/other"),
+        .effort = .auto,
+        .fast_mode = true,
+    };
+    const different_fast_mode = session_codec.DurableSessionPreferences{
+        .model = @constCast("provider/model"),
+        .effort = .auto,
+        .fast_mode = false,
+    };
+
+    try std.testing.expect(restoredFastModeModelBound(true, configured, matching));
+    try std.testing.expect(!restoredFastModeModelBound(false, configured, matching));
+    try std.testing.expect(!restoredFastModeModelBound(true, configured, different_model));
+    try std.testing.expect(!restoredFastModeModelBound(true, configured, different_fast_mode));
 }
 
 fn applyPreferencePatch(
@@ -5525,6 +5584,7 @@ test "js-host resume restores transcript context preferences usage and revision"
         "startup/model",
         .auto,
         false,
+        true,
     );
     app.session_persistence.js_host_store = fake.store();
     app.requested_resume = .last;
@@ -5539,6 +5599,7 @@ test "js-host resume restores transcript context preferences usage and revision"
     try std.testing.expectEqualStrings("restored/model", app.selected_model.items);
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.effort);
     try std.testing.expect(app.fast_mode);
+    try std.testing.expect(!Runtime(TestApp).fastModeModelBound(&app));
     try std.testing.expectEqual(@as(u64, 17), app.total_input_tokens);
     try std.testing.expectEqual(@as(u64, 23), app.total_output_tokens);
     var restored_usage = try app.session.usage.snapshot(alloc);
@@ -5581,6 +5642,7 @@ test "js-host resume store failures and missing records fall back to fresh sessi
             "fresh/model",
             .auto,
             false,
+            true,
         );
         app.session_persistence.js_host_store = fake.store();
         app.requested_resume = .last;
@@ -5610,6 +5672,7 @@ test "js-host picker request stays unsupported and starts fresh" {
         "fresh/model",
         .auto,
         false,
+        true,
     );
     app.session_persistence.js_host_store = fake.store();
     app.requested_resume = .pick;
@@ -5635,6 +5698,7 @@ test "js-host completed and interrupted turns propagate revisions preserve owner
         "fresh/model",
         .auto,
         false,
+        true,
     );
     app.session_persistence.js_host_store = fake.store();
     try Runtime(TestApp).beginFreshJsHostSession(&app);
@@ -5702,6 +5766,7 @@ test "js-host preference changes snapshot the updated session preferences" {
         "fresh/model",
         .auto,
         false,
+        true,
     );
     app.session_persistence.js_host_store = fake.store();
     try Runtime(TestApp).beginFreshJsHostSession(&app);
@@ -5796,6 +5861,7 @@ fn configureTestPreferences(app: *TestApp) !void {
         .user_workspace,
         "configured/model",
         types.ReasoningEffort.literal("high"),
+        true,
         true,
     );
 }
@@ -7422,6 +7488,7 @@ test "upgrade resume restores active session with the installed version notice" 
         "env/model",
         types.ReasoningEffort.literal("high"),
         true,
+        false,
     );
     try Runtime(TestApp).initializePersistence(&app, true);
     var calls = [_]types.ToolCall{.{
@@ -8872,6 +8939,7 @@ test "fresh interactive session retains one writable schema-v3 handle" {
         .user_workspace,
         "configured/model",
         types.ReasoningEffort.literal("high"),
+        true,
         true,
     );
     try Runtime(TestApp).initializePersistence(&app, true);

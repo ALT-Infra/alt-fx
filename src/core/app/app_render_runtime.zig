@@ -599,8 +599,7 @@ pub fn Runtime(comptime App: type) type {
             const visible_model = pending_model orelse provider_runtime.model(app);
             const visible_capabilities = model_capabilities.resolveForApp(App, app, visible_model);
             const active_capabilities_pending = pending_model == null and app.isModelCacheLoading();
-            const model_supports_fast = visible_capabilities.supports_fast_mode or
-                (active_capabilities_pending and app.fast_mode);
+            const model_supports_fast = visible_capabilities.supports_fast_mode;
             const model_supports_effort = visible_capabilities.reasoning_efforts.len > 0 or
                 (active_capabilities_pending and !app.effort.isDefault());
             const visible_effort = if (pending_model != null and model_supports_effort)
@@ -609,10 +608,16 @@ pub fn Runtime(comptime App: type) type {
                 app.effort
             else
                 .auto;
-            const visible_fast_mode = if (pending_model != null and model_supports_fast)
-                pendingPickerFastMode(model_query, app.input_runtime.picker.model_picker_fast_index)
+            const active_fast_mode_model_bound = if (comptime @hasDecl(App, "fastModeModelBound"))
+                app.fastModeModelBound()
             else
-                app.fast_mode;
+                true;
+            const fast_indicator_active = if (pending_model != null)
+                visible_capabilities.intrinsic_fast or
+                    (model_supports_fast and pendingPickerFastMode(model_query, app.input_runtime.picker.model_picker_fast_index))
+            else
+                visible_capabilities.intrinsic_fast or
+                    (app.fast_mode and active_fast_mode_model_bound);
 
             const upgrade_label = app.upgrader.statusLabel(upgrade_status_buf);
             const yolo_warning_active =
@@ -669,8 +674,7 @@ pub fn Runtime(comptime App: type) type {
                 .selected_subagent_status = null,
                 .selected_subagent_tool_calls = 0,
                 .selected_subagent_activity = null,
-                .fast_mode = visible_fast_mode,
-                .model_supports_fast = model_supports_fast,
+                .fast_indicator_active = fast_indicator_active,
                 .effort = visible_effort,
                 .model_supports_effort = model_supports_effort,
                 .ctrl_c_pending = app.input_runtime.gestures.ctrlCExitArmed(),
@@ -1275,8 +1279,7 @@ pub fn Runtime(comptime App: type) type {
             ctx.subagent_view_active = false;
             ctx.selected_subagent_label = display_name;
             ctx.selected_subagent_status = chat.state;
-            ctx.fast_mode = false;
-            ctx.model_supports_fast = capabilities.supports_fast_mode;
+            ctx.fast_indicator_active = capabilities.intrinsic_fast;
             ctx.effort = chat.configuration.effort orelse .auto;
             ctx.model_supports_effort = capabilities.reasoning_efforts.len > 0;
             ctx.ctrl_c_pending = view.editor.gestures.ctrlCExitArmed();
@@ -4666,6 +4669,7 @@ const CoordinatorTestApp = struct {
     effort: types.ReasoningEffort = .auto,
     statusline_context: bool = false,
     total_input_tokens: u64 = 0,
+    intrinsic_fast_model: ?[]const u8 = null,
     gateway_metadata_model: ?[]const u8 = null,
     gateway_metadata: model_capabilities.GatewayMetadata = .{},
     permission_state: app_permission_runtime.State = .{},
@@ -4715,10 +4719,13 @@ const CoordinatorTestApp = struct {
     }
 
     pub fn resolvedModelCapabilities(self: *CoordinatorTestApp, model: []const u8) model_capabilities.Capabilities {
-        const fallback = model_capabilities.Capabilities{
+        var fallback = model_capabilities.Capabilities{
             .prompt_caching = true,
             .context_window = 1_000_000,
         };
+        if (self.intrinsic_fast_model) |intrinsic_model| {
+            fallback.intrinsic_fast = std.mem.eql(u8, intrinsic_model, model);
+        }
         if (self.gateway_metadata_model) |metadata_model| {
             if (std.mem.eql(u8, metadata_model, model)) {
                 return model_capabilities.mergeCapabilities(
@@ -4854,8 +4861,7 @@ test "core.app_render_runtime keeps configured controls visible while model capa
         ctx.permission_mode,
         ctx.queued_count,
         null,
-        ctx.fast_mode,
-        ctx.model_supports_fast,
+        ctx.fast_indicator_active,
         ctx.effort,
         ctx.model_supports_effort,
         ctx.statusline,
@@ -4866,6 +4872,69 @@ test "core.app_render_runtime keeps configured controls visible while model capa
         "run /login · ask · opus 4.8 · xhigh · ⚡︎",
         line,
     );
+}
+
+test "core.app_render_runtime keeps Kimi fast indicator stable across catalog hydration" {
+    const cases = [_]struct {
+        model: []const u8,
+        fast_mode: bool,
+        intrinsic_fast: bool,
+        supports_fast_mode: bool,
+        expected_indicator: bool,
+    }{
+        .{ .model = "moonshotai/kimi-k3", .fast_mode = false, .intrinsic_fast = false, .supports_fast_mode = true, .expected_indicator = false },
+        .{ .model = "moonshotai/kimi-k3", .fast_mode = true, .intrinsic_fast = false, .supports_fast_mode = true, .expected_indicator = true },
+        .{ .model = "moonshotai/kimi-k3-fast", .fast_mode = false, .intrinsic_fast = true, .supports_fast_mode = false, .expected_indicator = true },
+    };
+
+    for (cases) |case| {
+        for ([_]bool{ true, false }) |catalog_loading| {
+            var app = CoordinatorTestApp{
+                .alloc = std.testing.allocator,
+                .shell = .{},
+                .model_cache_loading = catalog_loading,
+                .fast_mode = case.fast_mode,
+                .intrinsic_fast_model = if (case.intrinsic_fast) case.model else null,
+                .gateway_metadata_model = if (catalog_loading) null else case.model,
+                .gateway_metadata = .{ .supports_fast_mode = case.supports_fast_mode },
+            };
+            defer app.deinit();
+            try app.selected_model.appendSlice(std.testing.allocator, case.model);
+
+            var upgrade_status_buf: [64]u8 = undefined;
+            const queued_cards: QueuedCardProjection = .{};
+            const ctx = Runtime(CoordinatorTestApp).footerContext(
+                &app,
+                &upgrade_status_buf,
+                0,
+                &queued_cards,
+            );
+
+            try std.testing.expectEqual(case.expected_indicator, ctx.fast_indicator_active);
+        }
+    }
+}
+
+test "core.app_render_runtime keeps a bound fast preference stable after catalog hydration" {
+    var app = CoordinatorTestApp{
+        .alloc = std.testing.allocator,
+        .shell = .{},
+        .fast_mode = true,
+        .gateway_metadata_model = "anthropic/claude-fable-5",
+    };
+    defer app.deinit();
+    try app.selected_model.appendSlice(std.testing.allocator, "anthropic/claude-fable-5");
+
+    var upgrade_status_buf: [64]u8 = undefined;
+    const queued_cards: QueuedCardProjection = .{};
+    const ctx = Runtime(CoordinatorTestApp).footerContext(
+        &app,
+        &upgrade_status_buf,
+        0,
+        &queued_cards,
+    );
+
+    try std.testing.expect(ctx.fast_indicator_active);
 }
 
 test "core.app_render_runtime projects only the visible inline completion suffix" {
@@ -4950,7 +5019,6 @@ test "core.app_render_runtime projects Opus 4.8 one million token context to foo
         0,
         null,
         false,
-        true,
         .auto,
         true,
         statusline,

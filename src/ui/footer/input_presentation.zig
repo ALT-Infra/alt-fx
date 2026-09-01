@@ -441,8 +441,7 @@ pub fn composeHintRow(
         ctx.permission_mode,
         ctx.queued_count,
         active_label,
-        ctx.fast_mode,
-        ctx.model_supports_fast,
+        ctx.fast_indicator_active,
         ctx.effort,
         ctx.model_supports_effort,
         ctx.statusline,
@@ -1595,8 +1594,7 @@ test "compose hint row keeps model in left hint text" {
         .selected_subagent_id = null,
         .selected_subagent_label = null,
         .selected_subagent_status = null,
-        .fast_mode = true,
-        .model_supports_fast = true,
+        .fast_indicator_active = true,
         .input = &input,
     };
 
@@ -1733,8 +1731,7 @@ test "compose hint row omits the inactive subagent manager marker" {
         .selected_subagent_id = null,
         .selected_subagent_label = null,
         .selected_subagent_status = null,
-        .fast_mode = true,
-        .model_supports_fast = true,
+        .fast_indicator_active = true,
         .input = &input,
     };
 
