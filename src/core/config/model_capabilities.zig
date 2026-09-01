@@ -48,6 +48,7 @@ pub const Capabilities = struct {
     supports_reasoning: bool = false,
     reasoning_efforts: ReasoningEffortOptions = .{},
     supports_fast_mode: bool = false,
+    intrinsic_fast: bool = false,
     supports_tool_use: bool = false,
     supports_vision: bool = false,
     supports_file_input: bool = false,
@@ -178,7 +179,7 @@ test "mergeCapabilities preserves provider controls and supplied fallback policy
         types.ReasoningEffort.literal("future-tier"),
         types.ReasoningEffort.literal("high"),
     };
-    const capabilities = mergeCapabilities(.{ .prompt_caching = true }, .{
+    const capabilities = mergeCapabilities(.{ .intrinsic_fast = true, .prompt_caching = true }, .{
         .reasoning_efforts = .fromSlice(&efforts),
         .supports_fast_mode = true,
         .supports_tool_use = true,
@@ -192,6 +193,7 @@ test "mergeCapabilities preserves provider controls and supplied fallback policy
     });
 
     try std.testing.expect(capabilities.supports_reasoning);
+    try std.testing.expect(capabilities.intrinsic_fast);
     try std.testing.expectEqual(@as(usize, 2), capabilities.reasoning_efforts.len);
     try std.testing.expectEqualStrings("future-tier", capabilities.reasoning_efforts.values[0].label());
     try std.testing.expect(capabilities.supports_fast_mode);

@@ -606,83 +606,114 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
   );
 
   test(
-    "configured effort and Fast are visible before model catalog resolves",
+    "Kimi Fast indicator remains stable while model catalog resolves",
     async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-startup-preferences-"));
-      let releaseCatalog: (() => void) | null = null;
-      const catalogRelease = new Promise<void>((resolve) => {
-        releaseCatalog = resolve;
-      });
-      const gateway = startFakeGateway([], {
-        models: async () => {
-          await catalogRelease;
-          return [{
-            id: "anthropic/claude-opus-4.8",
-            type: "language",
-            released: 1,
-            tags: ["fast", "tool-use"],
-            reasoning_options: [{ type: "effort", values: ["high", "xhigh"] }],
-            pricing: {
-              fast: { input: "0.1", output: "0.2" },
-            },
-          }];
+      const cases = [
+        {
+          label: "normal",
+          model: "moonshotai/kimi-k3",
+          fastMode: false,
+          supportsFastMode: true,
+          expectedFastIndicator: false,
         },
-      });
-      try {
-        const home = join(root, "home");
-        const workspace = join(root, "workspace");
-        const stderrPath = join(root, "stderr.log");
-        mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
-        mkdirSync(workspace);
-        writeFileSync(
-          join(home, ".fx", "settings.json"),
-          JSON.stringify({
-            model: "anthropic/claude-opus-4.8",
-            permission_mode: "auto",
-            effort: "xhigh",
-            fast_mode: true,
-          }) + "\n",
-          { mode: 0o600 },
-        );
+        {
+          label: "toggle",
+          model: "moonshotai/kimi-k3",
+          fastMode: true,
+          supportsFastMode: true,
+          expectedFastIndicator: true,
+        },
+        {
+          label: "intrinsic",
+          model: "moonshotai/kimi-k3-fast",
+          fastMode: false,
+          supportsFastMode: false,
+          expectedFastIndicator: true,
+        },
+      ] as const;
 
-        session = await TmuxSession.create({
-          cwd: realpathSync(workspace),
-          env: {
-            ...NO_AUTH,
-            HOME: home,
-            FX_AUTO_UPGRADE: "0",
-            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
-          },
-          stderrPath,
+      for (const testCase of cases) {
+        const root = mkdtempSync(join(tmpdir(), `fx-startup-fast-${testCase.label}-`));
+        let releaseCatalog: (() => void) | null = null;
+        const catalogRelease = new Promise<void>((resolve) => {
+          releaseCatalog = resolve;
         });
-        const pane = await session.waitForText("auto · opus 4.8", TIMEOUT);
-        expect(pane).toContain("auto · opus 4.8 · xhigh · ⚡︎");
-        releaseCatalog?.();
-        releaseCatalog = null;
+        const gateway = startFakeGateway([], {
+          models: async () => {
+            await catalogRelease;
+            return [{
+              id: testCase.model,
+              type: "language",
+              released: 1,
+              tags: ["reasoning", "tool-use"],
+              pricing: testCase.supportsFastMode
+                ? { fast: { input: "0.1", output: "0.2" } }
+                : undefined,
+            }];
+          },
+        });
+        try {
+          const home = join(root, "home");
+          const workspace = join(root, "workspace");
+          const stderrPath = join(root, "stderr.log");
+          mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+          mkdirSync(workspace);
+          writeFileSync(
+            join(home, ".fx", "settings.json"),
+            JSON.stringify({
+              model: testCase.model,
+              permission_mode: "auto",
+              fast_mode: testCase.fastMode,
+            }) + "\n",
+            { mode: 0o600 },
+          );
 
-        await session.sendText("/quit");
-        await session.waitForSessionEnd(TIMEOUT);
-        session = null;
-        expect(readFileSync(stderrPath, "utf8")).toBe("");
-      } finally {
-        releaseCatalog?.();
-        gateway.stop();
-        rmSync(root, { recursive: true, force: true });
+          session = await TmuxSession.create({
+            cwd: realpathSync(workspace),
+            env: {
+              ...NO_AUTH,
+              HOME: home,
+              FX_AUTO_UPGRADE: "0",
+              FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            },
+            stderrPath,
+          });
+          const modelLabel = testCase.model.split("/").at(-1)!;
+          const before = await session.waitForText(`auto · ${modelLabel}`, TIMEOUT);
+          expect(before.includes("⚡︎")).toBe(testCase.expectedFastIndicator);
+          releaseCatalog?.();
+          releaseCatalog = null;
+
+          await session.sendText("/model");
+          await session.waitForText(testCase.model, TIMEOUT);
+          await session.sendKeys("Escape");
+          const settled = await session.waitForStableComposer(TIMEOUT);
+          expect(settled.includes("⚡︎")).toBe(testCase.expectedFastIndicator);
+
+          await session.sendText("/quit");
+          await session.waitForSessionEnd(TIMEOUT);
+          session = null;
+          expect(readFileSync(stderrPath, "utf8")).toBe("");
+        } finally {
+          releaseCatalog?.();
+          gateway.stop();
+          rmSync(root, { recursive: true, force: true });
+        }
       }
     },
-    30_000,
+    60_000,
   );
 
   test(
-    "Fast command rejects a tag-only intrinsic Fast alias",
+    "Fast command rejects an intrinsically Fast Kimi alias",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-fast-unsupported-"));
       const gateway = startFakeGateway([], {
         models: [{
-          id: "anthropic/claude-opus-4.8-fast",
+          id: "moonshotai/kimi-k3-fast",
           type: "language",
           released: 1,
-          tags: ["fast", "tool-use"],
+          tags: ["reasoning", "tool-use"],
         }],
       });
       try {
@@ -693,7 +724,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         mkdirSync(workspace);
         const settingsPath = join(home, ".fx", "settings.json");
         const initialSettings = JSON.stringify({
-          model: "anthropic/claude-opus-4.8-fast",
+          model: "moonshotai/kimi-k3-fast",
           fast_mode: false,
         }) + "\n";
         writeFileSync(settingsPath, initialSettings, { mode: 0o600 });
@@ -714,7 +745,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           "This model does not come with a fast mode.",
           TIMEOUT,
         );
-        expect(pane).not.toContain("⚡︎");
+        expect(pane).toContain("⚡︎");
         expect(gateway.requests).toHaveLength(0);
         expect(readFileSync(settingsPath, "utf8")).toBe(initialSettings);
 
