@@ -637,7 +637,8 @@ pub const WorkerRuntime = struct {
         defer self.worker_mutex.unlock(io_mod.getIo());
 
         const steering_pending = for (self.queued_prompts.items) |prompt| {
-            if (prompt.steer_target_turn_id == self.active_turn_id) break true;
+            if (prompt.steer_target_turn_id == self.active_turn_id or
+                prompt.steering_continuation) break true;
         } else false;
         const paused = if (steering_pending)
             false
@@ -1245,7 +1246,7 @@ pub const WorkerRuntime = struct {
         self.active_turn_id = job.turn_id;
         if (job.steering_continuation) {
             for (self.queued_prompts.items) |*prompt| {
-                if (!prompt.steering_continuation) continue;
+                if (!prompt.steering_continuation or !sameTurnSteeringEligible(prompt.*)) continue;
                 prompt.steer_target_turn_id = job.turn_id;
                 prompt.steering_continuation = false;
             }
@@ -3541,6 +3542,41 @@ test "promoted steering retargets remaining guidance without exposing a queue" {
     try std.testing.expectEqual(@as(usize, 1), guidance.len);
     try std.testing.expectEqualStrings("second", guidance[0]);
     try std.testing.expectEqual(@as(usize, 0), runtime.queuedPromptCount());
+}
+
+test "promoted steering keeps rich trailing guidance for its own turn" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 9;
+
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "first", "model"));
+    var rich = try makePrompt(alloc, "second with image", "model");
+    var owns_rich = true;
+    errdefer if (owns_rich) freeQueuedPrompt(alloc, rich);
+    rich.images = try alloc.alloc(types.ImageAttachment, 1);
+    rich.images[0] = .{
+        .path = try alloc.dupe(u8, "/tmp/trailing.png"),
+        .media_type = try alloc.dupe(u8, "image/png"),
+    };
+    try runtime.admitInteractivePrompt(alloc, rich);
+    owns_rich = false;
+    runtime.finishProcessing();
+
+    const promoted = (try runtime.tryTakeNextPrompt(alloc)).?;
+    defer freeQueuedPrompt(alloc, promoted);
+    try std.testing.expect(promoted.steering_continuation);
+    try std.testing.expectEqual(@as(usize, 1), runtime.queuePreview().steering_count);
+    try std.testing.expect(!runtime.steeringHandoffRequired(promoted.turn_id));
+    try std.testing.expect(!runtime.requestInteractiveCancel());
+    try std.testing.expect(runtime.queueReviewReason() == null);
+
+    runtime.finishProcessing();
+    const trailing = (try runtime.tryTakeNextPrompt(alloc)).?;
+    defer freeQueuedPrompt(alloc, trailing);
+    try std.testing.expect(trailing.steering_continuation);
+    try std.testing.expectEqualStrings("second with image", trailing.prompt);
 }
 
 test "clear queued prompts also clears steering" {
