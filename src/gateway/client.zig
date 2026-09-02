@@ -2536,25 +2536,39 @@ fn jsonValueString(value: std.json.Value) ?[]const u8 {
     return if (value == .string and value.string.len > 0) value.string else null;
 }
 
+fn isGatewayStreamTimeoutCode(value: std.json.Value) bool {
+    const text = jsonValueString(value) orelse return false;
+    return std.mem.eql(u8, text, "gateway_stream_timeout");
+}
+
+fn objectHasGatewayStreamTimeout(object: std.json.ObjectMap) bool {
+    if (object.get("code")) |value| {
+        if (isGatewayStreamTimeoutCode(value)) return true;
+    }
+    if (object.get("type")) |value| {
+        if (isGatewayStreamTimeoutCode(value)) return true;
+    }
+    return false;
+}
+
 fn providerFailureCause(root: std.json.Value) ?types.ProviderFailureCause {
     if (root != .object) return null;
     const object = root.object;
-    const code = if (object.get("code")) |value|
-        jsonValueString(value)
-    else if (object.get("type")) |value|
-        jsonValueString(value)
-    else
-        null;
-    if (code) |value| {
-        if (std.mem.eql(u8, value, "gateway_stream_timeout")) {
-            return .gateway_stream_timeout;
+    if (objectHasGatewayStreamTimeout(object)) return .gateway_stream_timeout;
+
+    inline for (.{ "error", "providerError" }) |key| {
+        if (object.get(key)) |value| {
+            if (value == .object and objectHasGatewayStreamTimeout(value.object)) {
+                return .gateway_stream_timeout;
+            }
         }
     }
-    if (object.get("error")) |value| {
-        if (providerFailureCause(value)) |cause| return cause;
-    }
-    if (object.get("providerError")) |value| {
-        if (providerFailureCause(value)) |cause| return cause;
+    if (object.get("finishReason")) |value| {
+        if (value == .object) {
+            if (value.object.get("raw")) |raw| {
+                if (isGatewayStreamTimeoutCode(raw)) return .gateway_stream_timeout;
+            }
+        }
     }
     return null;
 }
@@ -3764,6 +3778,25 @@ test "consumeSseStream classifies gateway stream timeout by structured code" {
         "gateway_stream_timeout: stream exceeded maximum duration",
         completion.provider_failure_detail.?,
     );
+}
+
+test "consumeSseStream classifies finish-only gateway stream timeout" {
+    const payload =
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\",\"raw\":\"gateway_stream_timeout\"}}\n" ++
+        "\n";
+
+    var reader = std.Io.Reader.fixed(payload);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+
+    var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
+    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+
+    try std.testing.expectEqual(types.ProviderFinishReason.provider_error, completion.finish_reason.?);
+    try std.testing.expectEqual(types.ProviderFailureCause.gateway_stream_timeout, completion.provider_failure_cause.?);
 }
 
 test "providerFailureCause ignores matching prose without the structured code" {
