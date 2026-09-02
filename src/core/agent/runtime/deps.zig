@@ -180,6 +180,12 @@ pub const AgentRuntimeDeps = struct {
     /// Drains user guidance admitted to the active turn. Returned text is owned
     /// by `arena` and is non-authoritative context, never permission evidence.
     take_steering: ?*const fn (ctx: *anyopaque, arena: Allocator, turn_id: u64) anyerror![]const []const u8 = null,
+    /// Drains guidance whose admission cancelled the current provider wait.
+    /// A non-empty result also clears that host-owned cancellation request.
+    take_immediate_steering: ?*const fn (ctx: *anyopaque, arena: Allocator, turn_id: u64) anyerror![]const []const u8 = null,
+    /// True when pending interactive guidance cannot be transferred into the
+    /// current request and must start after the active turn settles.
+    steering_handoff_required: ?*const fn (ctx: *anyopaque, turn_id: u64) bool = null,
     release_agent_terminal_lease: *const fn (ctx: *anyopaque, session_id: []const u8) anyerror!void = terminalLeaseCleanupUnavailable,
     prepare_parent_turn_context: ?*const fn (ctx: *anyopaque, arena: Allocator) anyerror!?PreparedParentTurnContext = null,
     acknowledge_parent_turn_context: ?*const fn (ctx: *anyopaque, arena: Allocator, acknowledgements: []const ParentTurnDeliveryAck) void = null,

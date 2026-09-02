@@ -215,6 +215,85 @@ test "processQueuedPrompt accounts exact direct-provider usage without deferred 
     try std.testing.expectEqual(@as(?u64, 1), snapshot.request_count);
 }
 
+test "terminal assistant completion continues with steering admitted during the response" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .content = "Original answer" },
+        .{ .content = "Updated answer" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    const steering = [_][]const u8{"change direction"};
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.steering_messages = &steering;
+    hooks.steering_take_at = 2;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try expectBodyContainsInOrder(&gateway, 1, &.{
+        "Original answer",
+        "user_steering",
+        "change direction",
+    });
+    try std.testing.expectEqualStrings("Updated answer", hooks.finish_assistant_text.?);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    const execution = hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), execution.steering.len);
+    try std.testing.expectEqualStrings("change direction", execution.steering[0]);
+
+    const resumed_completions = [_]FakeCompletion{.{ .content = "Follow-up answer" }};
+    var resumed_gateway = FakeGateway.init(alloc, &resumed_completions);
+    defer resumed_gateway.deinit();
+    var resumed_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer resumed_hooks.deinit();
+    var resumed_fixture = PromptFixture{};
+    var resumed_job = resumed_fixture.job();
+    resumed_job.prompt = @constCast("follow up");
+    resumed_job.history = hooks.history_turns.items;
+
+    try runFakePrompt(
+        &resumed_gateway,
+        &resumed_hooks,
+        resumed_fixture.config(),
+        resumed_job,
+    );
+
+    try expectBodyContainsInOrder(&resumed_gateway, 0, &.{
+        "user prompt",
+        "change direction",
+        "Updated answer",
+        "follow up",
+    });
+}
+
+test "promoted steering remains model marked across the worker handoff" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .content = "Updated answer" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.steering_continuation = true;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    try expectBodyContainsInOrder(&gateway, 0, &.{
+        "user_steering",
+        "user prompt",
+    });
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expectEqualStrings(
+        "user prompt",
+        hooks.history_turns.items[0].assistant.user.text,
+    );
+}
+
 fn makeOwnedProviderPrompt(alloc: Allocator, text: []const u8, model: []const u8) !QueuedPrompt {
     const prompt = try alloc.dupe(u8, text);
     errdefer alloc.free(prompt);

@@ -1917,7 +1917,7 @@ pub const SessionRuntime = struct {
         messages: *std.ArrayList(core_types.ChatMessage),
         history: []const HistoryTurn,
     ) !void {
-        _ = try appendHistoryChatMessagesImpl(alloc, messages, history, true);
+        _ = try appendHistoryChatMessagesImpl(alloc, messages, history, true, .closed);
     }
 
     pub fn setConversationLanguageFromUserMessage(self: *SessionRuntime, text: []const u8) void {
@@ -2410,7 +2410,7 @@ pub fn appendHistoryChatMessages(
     messages: *std.ArrayList(core_types.ChatMessage),
     history: []const HistoryTurn,
 ) !void {
-    _ = try appendHistoryChatMessagesImpl(alloc, messages, history, true);
+    _ = try appendHistoryChatMessagesImpl(alloc, messages, history, true, .closed);
 }
 
 pub const HistoryBudgetOptions = struct {
@@ -2461,8 +2461,52 @@ pub fn appendHistoryChatMessagesBudgeted(
     history: []const HistoryTurn,
     opts: HistoryBudgetOptions,
 ) !void {
+    return appendHistoryChatMessagesBudgetedImpl(
+        alloc,
+        messages,
+        history,
+        opts,
+        .closed,
+    );
+}
+
+/// Projects a handoff turn without telling the model that the user aborted it.
+/// Stored execution evidence remains unchanged; only the trailing interruption
+/// closure is omitted because the current prompt already carries steering intent.
+pub fn appendSteeringContinuationHistoryChatMessagesBudgeted(
+    alloc: Allocator,
+    messages: *std.ArrayList(core_types.ChatMessage),
+    history: []const HistoryTurn,
+    opts: HistoryBudgetOptions,
+) !void {
+    return appendHistoryChatMessagesBudgetedImpl(
+        alloc,
+        messages,
+        history,
+        opts,
+        .steering_continuation,
+    );
+}
+
+const InterruptedChatProjection = enum {
+    closed,
+    steering_continuation,
+};
+
+fn appendHistoryChatMessagesBudgetedImpl(
+    alloc: Allocator,
+    messages: *std.ArrayList(core_types.ChatMessage),
+    history: []const HistoryTurn,
+    opts: HistoryBudgetOptions,
+    trailing_interrupted_projection: InterruptedChatProjection,
+) !void {
     const keep = try selectBudgetedHistoryTurns(alloc, history, opts) orelse
-        return appendHistoryChatMessages(alloc, messages, history);
+        return appendHistoryChatMessagesWithTrailingProjection(
+            alloc,
+            messages,
+            history,
+            trailing_interrupted_projection,
+        );
     defer alloc.free(keep);
 
     const trimmed_context = try formatBudgetTrimmedHistoryContext(alloc, history, keep);
@@ -2480,8 +2524,42 @@ pub fn appendHistoryChatMessagesBudgeted(
             messages,
             history[idx .. idx + 1],
             in_leading_summary_prefix,
+            if (idx + 1 == history.len)
+                trailing_interrupted_projection
+            else
+                .closed,
         );
     }
+}
+
+fn appendHistoryChatMessagesWithTrailingProjection(
+    alloc: Allocator,
+    messages: *std.ArrayList(core_types.ChatMessage),
+    history: []const HistoryTurn,
+    trailing_interrupted_projection: InterruptedChatProjection,
+) !void {
+    if (history.len == 0 or trailing_interrupted_projection == .closed) {
+        _ = try appendHistoryChatMessagesImpl(alloc, messages, history, true, .closed);
+        return;
+    }
+
+    var in_leading_summary_prefix = true;
+    if (history.len > 1) {
+        in_leading_summary_prefix = try appendHistoryChatMessagesImpl(
+            alloc,
+            messages,
+            history[0 .. history.len - 1],
+            true,
+            .closed,
+        );
+    }
+    _ = try appendHistoryChatMessagesImpl(
+        alloc,
+        messages,
+        history[history.len - 1 ..],
+        in_leading_summary_prefix,
+        trailing_interrupted_projection,
+    );
 }
 
 fn continuesLeadingSummaryPrefix(in_leading_summary_prefix: bool, turn: HistoryTurn) bool {
@@ -2643,6 +2721,10 @@ fn appendExecutionMemoryMessages(
         errdefer alloc.free(text);
         try messages.append(alloc, message.Message.userOwned(text));
     }
+    for (execution.steering) |text| {
+        if (text.len == 0) continue;
+        try messages.append(alloc, message.Message.userText(text));
+    }
 }
 
 pub fn appendExecutionMemoryChatMessages(
@@ -2677,6 +2759,10 @@ pub fn appendExecutionMemoryChatMessages(
         errdefer alloc.free(text);
         try messages.append(alloc, .{ .role = .user, .content = text });
     }
+    for (execution.steering) |text| {
+        if (text.len == 0) continue;
+        try messages.append(alloc, .{ .role = .user, .content = text });
+    }
 }
 
 fn appendHistoryChatMessagesImpl(
@@ -2684,6 +2770,7 @@ fn appendHistoryChatMessagesImpl(
     messages: *std.ArrayList(core_types.ChatMessage),
     history: []const HistoryTurn,
     starts_in_leading_summary_prefix: bool,
+    interrupted_projection: InterruptedChatProjection,
 ) !bool {
     var in_leading_summary_prefix = starts_in_leading_summary_prefix;
     for (history) |turn| {
@@ -2721,10 +2808,17 @@ fn appendHistoryChatMessagesImpl(
                         .tool_name = tool_call.name,
                         .tool_result_status = .failure,
                     });
+                } else if (interrupted_projection == .steering_continuation) {
+                    if (entry.assistant) |assistant| {
+                        if (assistant.len > 0) {
+                            try messages.append(alloc, .{ .role = .assistant, .content = assistant });
+                        }
+                    }
                 } else {
                     const assistant_content = try formatInterruptedAssistantClosedContent(alloc, entry);
                     try messages.append(alloc, .{ .role = .assistant, .content = assistant_content });
                 }
+                if (interrupted_projection == .steering_continuation) continue;
                 const text = try formatInterruptedHistoryContext(alloc, entry);
                 errdefer alloc.free(text);
                 try messages.append(alloc, .{ .role = .user, .content = text });
@@ -3690,6 +3784,46 @@ test "history projection keeps system role only for leading summaries" {
     try std.testing.expect(saw_interruption_marker);
 }
 
+test "resume history projects steering before the final assistant" {
+    const alloc = std.testing.allocator;
+    var steering = [_][]u8{
+        @constCast("use file B instead"),
+        @constCast("keep the result concise"),
+    };
+    const history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("modify file A") },
+        .assistant = @constCast("updated file B"),
+        .execution = .{ .steering = steering[0..] },
+    } }};
+
+    var messages: std.ArrayList(message.Message) = .empty;
+    defer deinitMessages(alloc, &messages);
+    try appendHistoryMessages(alloc, &messages, &history);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var chat_messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    defer chat_messages.deinit(arena);
+    try appendHistoryChatMessages(arena, &chat_messages, &history);
+
+    try std.testing.expectEqual(@as(usize, 4), messages.items.len);
+    try std.testing.expectEqual(messages.items.len, chat_messages.items.len);
+    const expected_roles = [_]message.Role{ .user, .user, .user, .assistant };
+    const expected_text = [_][]const u8{
+        "modify file A",
+        "use file B instead",
+        "keep the result concise",
+        "updated file B",
+    };
+    for (messages.items, chat_messages.items, expected_roles, expected_text) |projected, chat, role, text| {
+        try std.testing.expectEqual(role, projected.role);
+        try std.testing.expectEqualStrings(@tagName(role), @tagName(chat.role));
+        try std.testing.expectEqualStrings(text, projected.content.?.asText());
+        try std.testing.expectEqualStrings(text, chat.content.?);
+    }
+}
+
 test "resume projection replays assistant tool execution memory before final answer" {
     const alloc = std.testing.allocator;
     var calls = [_]ToolCall{.{
@@ -4418,6 +4552,41 @@ test "no-output interrupted history projects synthetic assistant before marker" 
     try std.testing.expectEqual(core_types.ChatRole.user, chat_messages.items[2].role);
     try std.testing.expect(std.mem.find(u8, chat_messages.items[2].content.?, "<turn_aborted>") != null);
     try std.testing.expect(std.mem.find(u8, chat_messages.items[2].content.?, "user interrupted") == null);
+}
+
+test "steering continuation omits only the trailing interrupted closure" {
+    const alloc = std.testing.allocator;
+    const history = [_]HistoryTurn{
+        .{ .interrupted = .{
+            .user = .{ .text = @constCast("older interrupted request") },
+            .assistant = @constCast("older partial"),
+        } },
+        .{ .interrupted = .{
+            .user = .{ .text = @constCast("active request") },
+            .assistant = @constCast("active partial"),
+        } },
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    defer messages.deinit(arena);
+
+    try appendSteeringContinuationHistoryChatMessagesBudgeted(
+        arena,
+        &messages,
+        &history,
+        .{},
+    );
+
+    try std.testing.expectEqual(@as(usize, 5), messages.items.len);
+    try std.testing.expect(std.mem.find(u8, messages.items[2].content.?, "<turn_aborted>") != null);
+    try std.testing.expectEqual(core_types.ChatRole.user, messages.items[3].role);
+    try std.testing.expectEqualStrings("active request", messages.items[3].content.?);
+    try std.testing.expectEqual(core_types.ChatRole.assistant, messages.items[4].role);
+    try std.testing.expectEqualStrings("active partial", messages.items[4].content.?);
+    try std.testing.expect(std.mem.find(u8, messages.items[4].content.?, interrupted_before_completion_output) == null);
 }
 
 test "partial-text interrupted history projects partial assistant with closure before marker" {

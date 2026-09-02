@@ -285,6 +285,8 @@ pub fn Bindings(comptime App: type) type {
                     null,
                 .finalize_turn = agentFinalizeTurn,
                 .take_steering = if (comptime @hasDecl(@TypeOf(app.worker), "takeSteering")) agentTakeSteering else null,
+                .take_immediate_steering = if (comptime @hasDecl(@TypeOf(app.worker), "takeImmediateSteering")) agentTakeImmediateSteering else null,
+                .steering_handoff_required = if (comptime @hasDecl(@TypeOf(app.worker), "steeringHandoffRequired")) agentSteeringHandoffRequired else null,
                 .append_runtime_context = agentAppendRuntimeContext,
                 .append_static_context = agentAppendStaticContext,
                 .validate_tool_call = agentValidateToolCall,
@@ -565,6 +567,16 @@ pub fn Bindings(comptime App: type) type {
         fn agentTakeSteering(ctx: *anyopaque, arena: std.mem.Allocator, turn_id: u64) ![]const []const u8 {
             const app: *App = @ptrCast(@alignCast(ctx));
             const owned = try app.worker.takeSteering(std.heap.c_allocator, turn_id);
+            return copyOwnedSteering(arena, owned);
+        }
+
+        fn agentTakeImmediateSteering(ctx: *anyopaque, arena: std.mem.Allocator, turn_id: u64) ![]const []const u8 {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            const owned = try app.worker.takeImmediateSteering(std.heap.c_allocator, turn_id);
+            return copyOwnedSteering(arena, owned);
+        }
+
+        fn copyOwnedSteering(arena: std.mem.Allocator, owned: [][]u8) ![]const []const u8 {
             if (owned.len == 0) return &.{};
             defer {
                 for (owned) |text| std.heap.c_allocator.free(text);
@@ -573,6 +585,11 @@ pub fn Bindings(comptime App: type) type {
             const result = try arena.alloc([]const u8, owned.len);
             for (owned, result) |text, *dest| dest.* = try arena.dupe(u8, text);
             return result;
+        }
+
+        fn agentSteeringHandoffRequired(ctx: *anyopaque, turn_id: u64) bool {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            return app.worker.steeringHandoffRequired(turn_id);
         }
 
         fn agentAppendStaticContext(ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
