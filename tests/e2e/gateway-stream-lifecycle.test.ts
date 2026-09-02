@@ -37,7 +37,6 @@ import {
   fakeGatewayToolCall,
   hasEmptyComposer,
   paneExitMatches,
-  POST_TOOL_DECISION_PROMPT,
   startDynamicFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -374,7 +373,7 @@ function toolResultOutput(body: string, callId: string): string {
   const parts = gatewayRequest(body).prompt.flatMap((message) =>
     Array.isArray(message.content) ? message.content : []
   ) as Array<Record<string, unknown>>;
-  const result = parts.findLast((part) =>
+  const result = parts.find((part) =>
     part.type === "tool-result" && part.toolCallId === callId
   );
   if (!result) throw new Error(`Missing tool result for ${callId}`);
@@ -398,20 +397,10 @@ function shellResult(body: string, callId: string): ShellResult {
 }
 
 function hasCurrentToolResult(body: string, callId: string): boolean {
-  const prompt = gatewayRequest(body).prompt;
-  let lastUserIndex = -1;
-  for (let index = prompt.length - 1; index >= 0; index -= 1) {
-    const message = prompt[index];
-    if (message?.role !== "user") continue;
-    if (contentText(message.content) === POST_TOOL_DECISION_PROMPT) continue;
-    lastUserIndex = index;
-    break;
-  }
-  return prompt.slice(lastUserIndex + 1).some((message) =>
-    Array.isArray(message.content) &&
-    (message.content as Array<Record<string, unknown>>).some((part) =>
-      part.type === "tool-result" && part.toolCallId === callId
-    )
+  const last = gatewayRequest(body).prompt.at(-1);
+  if (!last || !Array.isArray(last.content)) return false;
+  return (last.content as Array<Record<string, unknown>>).some((part) =>
+    part.type === "tool-result" && part.toolCallId === callId
   );
 }
 
@@ -6409,8 +6398,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.output).toBe(recoveredText);
       expect(json.tool_calls).toEqual([{ name: "read_file", status: "success" }]);
       expect(gateway.requestCount()).toBe(3);
-      expect(retryPrompt.at(-2)?.role).toBe("user");
-      expect(contentText(retryPrompt.at(-2)?.content)).toBe(POST_TOOL_DECISION_PROMPT);
+      expect(retryPrompt.at(-2)?.role).toBe("tool");
+      expect(toolResultOutput(gateway.requests[2]!.body, "read_retry_order")).toContain(
+        "deterministic fixture",
+      );
       expect(retryPrompt.at(-1)?.role).toBe("system");
       expect(contentText(retryPrompt.at(-1)?.content)).toContain("<network_recovery>");
       expect(result.stderr).not.toContain("HTTP 400");
