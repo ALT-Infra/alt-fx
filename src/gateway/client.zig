@@ -641,6 +641,7 @@ pub fn postGatewayCompletion(
             .{ .name = "HTTP-Referer", .value = "https://github.com/vercel-labs/fx" },
             .{ .name = "X-Title", .value = "fx" },
             .{ .name = "Accept", .value = "application/json" },
+            .{ .name = vercel_gateway_extended_time_header, .value = vercel_gateway_extended_time_value },
             .{ .name = "ai-gateway-protocol-version", .value = "0.0.1" },
             .{ .name = "ai-language-model-specification-version", .value = "4" },
             .{ .name = "ai-language-model-id", .value = model },
@@ -7839,6 +7840,33 @@ test "direct gateway core callbacks stay on the invoking thread" {
     try std.testing.expectEqual(types.ProviderFinishReason.stop, result.completion.finish_reason.?);
     try std.testing.expectEqual(@as(usize, 1), capture.chunk_count);
     try std.testing.expectEqual(capture.expected_thread, capture.observed_thread.?);
+}
+
+test "non-streaming gateway request sends extended time header" {
+    var fixture = try LoopbackGatewayFixture.init(.success_capture, 0);
+    defer fixture.deinit();
+    try fixture.start();
+    try std.testing.expect(fixture.waitForAcceptStart(5000));
+
+    const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/chat", .{fixture.port()});
+    defer std.testing.allocator.free(url);
+
+    var result = try postGatewayCompletion(
+        std.testing.allocator,
+        "test-key",
+        "test/model",
+        1,
+        url,
+        "{}",
+    );
+    defer result.deinit(std.testing.allocator);
+    fixture.deinit();
+
+    if (fixture.failure) |err| return err;
+    try std.testing.expectEqualStrings(
+        vercel_gateway_extended_time_value,
+        fixture.capturedHeaderValue(vercel_gateway_extended_time_header).?,
+    );
 }
 
 test "gateway chat request sends extended time and attribution headers" {
