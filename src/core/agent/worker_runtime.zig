@@ -635,6 +635,8 @@ pub const WorkerRuntime = struct {
     worker_processing: bool = false,
     active_turn_id: u64 = 0,
     active_tool_calls: std.StringHashMapUnmanaged(void) = .empty,
+    /// Allocator used for active call IDs. Allocator handles are capabilities,
+    /// not comparable identities; callers guarantee compatible ownership.
     active_tool_allocator: ?std.mem.Allocator = null,
     /// Retains the tool-producing step so later text from that same step cannot
     /// reopen immediate steering before authoritative lifecycle IDs exist.
@@ -1585,9 +1587,7 @@ pub const WorkerRuntime = struct {
                     {
                         break :blk .none;
                     }
-                    if (self.active_tool_allocator) |active_alloc| {
-                        std.debug.assert(std.meta.eql(active_alloc, alloc));
-                    } else {
+                    if (self.active_tool_allocator == null) {
                         self.active_tool_allocator = alloc;
                     }
                     try self.active_tool_calls.ensureUnusedCapacity(alloc, 1);
@@ -3869,6 +3869,38 @@ test "explicit interrupt overrides immediate steering cancellation" {
     try std.testing.expect(boundary == .interrupt);
     try std.testing.expect(runtime.isCancelRequested());
     try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
+}
+
+test "sequential tool lifecycle does not inspect compatible allocator context identities" {
+    var first_context: u8 = 0;
+    var second_context: u8 = 0;
+    var first_view = std.heap.c_allocator;
+    var second_view = std.heap.c_allocator;
+    first_view.ptr = @ptrCast(&first_context);
+    second_view.ptr = @ptrCast(&second_context);
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(std.heap.c_allocator);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 41;
+
+    try runtime.pushEvent(first_view, .{ .tool_lifecycle = .{ .authoritative_started = .{
+        .id = .{ .turn_id = 41, .call_id = "call_first" },
+        .reconciles_provisional_call_id = null,
+        .tool_name = "shell",
+        .activity_kind = .command,
+    } } });
+    try runtime.pushEvent(first_view, .{ .tool_lifecycle = .{ .terminal = .{
+        .id = .{ .turn_id = 41, .call_id = "call_first" },
+        .outcome = .{ .kind = .completed, .summary = "completed" },
+    } } });
+    try runtime.pushEvent(second_view, .{ .tool_lifecycle = .{ .authoritative_started = .{
+        .id = .{ .turn_id = 41, .call_id = "call_second" },
+        .reconciles_provisional_call_id = null,
+        .tool_name = "shell",
+        .activity_kind = .command,
+    } } });
+
+    try std.testing.expect(runtime.active_tool_calls.contains("call_second"));
 }
 
 test "tool lifecycle decides whether interactive steering interrupts immediately" {
