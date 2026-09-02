@@ -1047,6 +1047,52 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
+    "outer-quoted compound credentials are held before review transport",
+    async () => {
+      const root = createIsolatedRoot();
+      const startup = join(root.home, ".zshrc");
+      const before = "alias r='cd ~/projects/research && fx'\n";
+      const after = before +
+        'sandbox -e "AI_GATEWAY_API_KEY=$key literal-suffix"\n';
+      writeFileSync(startup, before);
+      const gateway = startGateway(
+        [
+          fakeGatewayToolCall("compound_symbolic_startup_edit", "edit_file", {
+            path: startup,
+            old_string: before,
+            new_string: after,
+          }),
+          (body) => {
+            const held = toolResultText(
+              body,
+              "compound_symbolic_startup_edit",
+              "execution-denied",
+            );
+            expect(held).toContain("review_evidence_incomplete");
+            return fakeGatewayFinalText("compound credential stayed blocked");
+          },
+        ],
+        [fakeGatewayPermissionDecision("clear", "compound_symbolic_review")],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Install the shell helper."],
+        {
+          cwd: root.workspace,
+          env: gatewayEnv(root, gateway),
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(result.stdout).toContain("compound credential stayed blocked");
+      expect(gateway.classifierRequests).toHaveLength(0);
+      expect(readFileSync(startup, "utf8")).toBe(before);
+    },
+    TIMEOUT,
+  );
+
+  test(
     "literal credentials produce one deterministic hold for unchanged startup edits",
     async () => {
       const root = createIsolatedRoot();
