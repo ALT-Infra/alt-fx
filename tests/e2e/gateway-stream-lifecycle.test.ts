@@ -5520,8 +5520,13 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(latest.code).toBe(0);
       const latestId = (JSON.parse(latest.stdout) as { id: string }).id;
 
-      const sessionIds = readdirSync(join(root.home, ".fx", "sessions"))
-        .filter((name) => /^\d+-\d+-[0-9a-f]+$/.test(name));
+      const sessionsRoot = join(root.home, ".fx", "sessions");
+      const sessionIds = readdirSync(sessionsRoot, { withFileTypes: true })
+        .filter((entry) =>
+          entry.isDirectory() &&
+          existsSync(join(sessionsRoot, entry.name, "session.json"))
+        )
+        .map((entry) => entry.name);
       expect(sessionIds).toHaveLength(2);
       const parentId = sessionIds.find((id) =>
         existsSync(join(root.home, ".fx", "sessions", id, "subagent", "children.json"))
