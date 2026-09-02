@@ -2804,10 +2804,23 @@ fn build_gateway_messages_with_response_language_control(
     compaction_history_tail: []const ChatMessage,
     compacted_suffix_len: usize,
 ) !GatewayMessageProjection {
+    const effective_overlay = if (origin == .root) blk: {
+        const projected = try alloc.alloc(ChatMessage, ephemeral_overlay.len + 1);
+        @memcpy(projected[0..ephemeral_overlay.len], ephemeral_overlay);
+        projected[ephemeral_overlay.len] = .{
+            .role = .system,
+            .content = if (correction_attempted)
+                response_language_correction_control
+            else
+                response_language_control,
+            .cache_policy = .no_cache,
+        };
+        break :blk projected;
+    } else ephemeral_overlay;
     var messages = try buildGatewayMessagesForCompactionWindow(
         alloc,
         stable_prefix,
-        ephemeral_overlay,
+        effective_overlay,
         durable_history,
         current_user_message,
         within_turn_suffix,
@@ -2816,38 +2829,10 @@ fn build_gateway_messages_with_response_language_control(
         compacted_suffix_len,
     );
     errdefer messages.deinit(alloc);
-    var current_user_index = stable_prefix.len + ephemeral_overlay.len +
-        if (compaction_handoff == null) durable_history.len else 0;
-    if (origin != .root) return .{
-        .messages = messages,
-        .current_user_index = current_user_index,
-    };
-
-    const control = if (correction_attempted)
-        response_language_correction_control
-    else
-        response_language_control;
-    if (messages.items.len > 0 and messages.items[messages.items.len - 1].role == .user) {
-        const insertion_index = messages.items.len - 1;
-        try messages.insert(alloc, insertion_index, .{
-            .role = .system,
-            .content = control,
-            .cache_policy = .no_cache,
-        });
-        if (insertion_index <= current_user_index) current_user_index += 1;
-        return .{
-            .messages = messages,
-            .current_user_index = current_user_index,
-        };
-    }
-    try messages.append(alloc, .{
-        .role = .system,
-        .content = control,
-        .cache_policy = .no_cache,
-    });
     return .{
         .messages = messages,
-        .current_user_index = current_user_index,
+        .current_user_index = stable_prefix.len + effective_overlay.len +
+            if (compaction_handoff == null) durable_history.len else 0,
     };
 }
 
@@ -3235,15 +3220,7 @@ fn isPostVisionAssistantPrefillRejection(
     messages: []const ChatMessage,
 ) bool {
     if (status != .bad_request or messages.len == 0) return false;
-    var tail_index = messages.len - 1;
-    const final_message = messages[tail_index];
-    if (std.mem.eql(u8, final_message.content orelse "", response_language_control) or
-        std.mem.eql(u8, final_message.content orelse "", response_language_correction_control))
-    {
-        if (tail_index == 0) return false;
-        tail_index -= 1;
-    }
-    const tail = messages[tail_index];
+    const tail = messages[messages.len - 1];
     if (tail.role != .tool or
         !std.mem.eql(u8, tail.tool_name orelse return false, "vision"))
     {

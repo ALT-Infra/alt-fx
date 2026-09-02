@@ -772,11 +772,7 @@ describe("Vision route fake Gateway", () => {
         expect(gateway.chatRequests).toHaveLength(4);
 
         const rejectedPrompt = JSON.parse(gateway.chatRequests[2].body).prompt;
-        expect(rejectedPrompt.at(-2)).toMatchObject({ role: "tool" });
-        expect(rejectedPrompt.at(-1)).toMatchObject({ role: "system" });
-        expect(JSON.stringify(rejectedPrompt.at(-1))).toContain(
-          "Use the response language requested by the current external human.",
-        );
+        expect(rejectedPrompt.at(-1)).toMatchObject({ role: "tool" });
         const retryPrompt = JSON.parse(gateway.chatRequests[3].body).prompt;
         expect(retryPrompt.at(-1)).toMatchObject({ role: "user" });
         expect(JSON.stringify(retryPrompt.at(-1))).toContain(
