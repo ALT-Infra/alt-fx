@@ -19,7 +19,8 @@ let streamedText = "";
 const liveDraft = "steering draft";
 const steeringAnswer = "§";
 let draftVisibleAt;
-let pendingVisibleAt;
+let steeringSubmittedAt;
+let postSubmitText = "";
 const originalSetTimeout = globalThis.setTimeout;
 let observeZeroTimeouts = false;
 let zeroTimeoutCount = 0;
@@ -37,9 +38,10 @@ const terminal = {
   write(bytes) {
     const chunk = bytes instanceof Uint8Array ? bytes : new TextEncoder().encode(bytes);
     output.push(chunk);
-    streamedText += streamedDecoder.decode(chunk, { stream: true });
+    const decoded = streamedDecoder.decode(chunk, { stream: true });
+    streamedText += decoded;
+    if (steeringSubmittedAt !== undefined) postSubmitText += decoded;
     if (draftVisibleAt === undefined && streamedText.includes(liveDraft)) draftVisibleAt = performance.now();
-    if (pendingVisibleAt === undefined && streamedText.includes(`${liveDraft} · Esc to steer now`)) pendingVisibleAt = performance.now();
     process.stdout.write(chunk);
   },
   async drain() {
@@ -146,12 +148,8 @@ while (draftVisibleAt === undefined) {
   if (performance.now() >= deadline) throw new Error("timed out waiting for live follow-up input");
   await new Promise((resolve) => setTimeout(resolve, 10));
 }
+steeringSubmittedAt = performance.now();
 runtime.write("\r");
-while (pendingVisibleAt === undefined) {
-  if (streamFinishedAt !== undefined) throw new Error("terminal did not hold steering while the response was active");
-  if (performance.now() >= deadline) throw new Error("timed out waiting for pending steering");
-  await new Promise((resolve) => setTimeout(resolve, 10));
-}
 observeZeroTimeouts = false;
 const steeringDeadline = performance.now() + 5000;
 while (
@@ -179,9 +177,12 @@ if (!text.includes("𝒇x")) throw new Error("shared fx welcome frame was not ob
 if (!text.includes("Run /help for commands")) throw new Error("shared fx welcome guidance was not observed");
 if (requestedModel !== "sdk/term-model") throw new Error(`terminal prompt did not use the host-restored model: ${requestedModel}`);
 if (!(streamStartedAt < secondRequestAt)) throw new Error("terminal started steering before the active response");
-if (!(draftVisibleAt < secondRequestAt)) throw new Error("terminal rendered follow-up input only after steering started");
-if (!(pendingVisibleAt < secondRequestAt)) throw new Error("terminal showed pending steering only after steering started");
+if (!(draftVisibleAt < steeringSubmittedAt)) throw new Error("terminal did not render the steering draft before submission");
+if (!(steeringSubmittedAt <= secondRequestAt)) throw new Error("terminal started steering before submission");
 if (!(secondRequestAt < streamFinishedAt)) throw new Error("terminal waited for the active response before steering");
+if (postSubmitText.includes(`${liveDraft} · Esc to steer now`)) throw new Error("terminal exposed tool-only pending UI during immediate steering");
+if (!postSubmitText.includes(liveDraft)) throw new Error("terminal did not commit the steering user row after cutoff");
+if (!postSubmitText.includes("Thinking")) throw new Error("terminal hid activity during immediate steering");
 const steeringUser = secondRequestBody.prompt?.filter((message) => message.role === "user").at(-1);
 const steeringText = steeringUser?.content?.filter((part) => part.type === "text").map((part) => part.text);
 const steeringRequest = JSON.stringify(secondRequestBody.prompt);
