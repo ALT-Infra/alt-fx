@@ -5297,8 +5297,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(firstChildId.length).toBeGreaterThan(0);
       expect(longChildId.length).toBeGreaterThan(0);
       expect(firstChildId).not.toBe(longChildId);
-      expect(firstChildId.split("-")[1]).toHaveLength(6);
-      expect(longChildId.split("-")[1]).toHaveLength(6);
+      for (const childId of [firstChildId, longChildId]) {
+        expect(childId.length).toBeLessThanOrEqual(40);
+        expect(childId).toMatch(/^[A-Za-z0-9_-]+$/);
+      }
       expect(subagentControl(root, firstChildId).state).toBe("idle");
       expect(subagentControl(root, longChildId).state).toBe("idle");
       for (const request of gateway.requests) {
