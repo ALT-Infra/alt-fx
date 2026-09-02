@@ -1163,7 +1163,11 @@ fn finishPrepared(
     handoffPreparedDelivery(ctx, runtime, prepared.reservation_id) catch {
         return .{ .failure = try ctx.allocator.dupe(u8, "shell result commit failed") };
     };
-    return if (action == .command and snapshotFailed(prepared.snapshot))
+    const failed = switch (action) {
+        .command => snapshotFailed(prepared.snapshot),
+        .stop => stop_result_failed(prepared.snapshot.state),
+    };
+    return if (failed)
         .{ .failure = body }
     else
         .{ .success = body };
@@ -1468,6 +1472,24 @@ fn snapshotFailed(snapshot: managed_execution.Snapshot) bool {
         },
         .stopped, .lost => true,
     };
+}
+
+fn stop_result_failed(state: managed_execution.SnapshotState) bool {
+    return switch (state) {
+        .lost => true,
+        .stopped => |status| if (status) |value| switch (value) {
+            .indeterminate => true,
+            .exit_code, .signal, .finished => false,
+        } else false,
+        .running, .completed => false,
+    };
+}
+
+test "shell stop fails closed only for lost or indeterminate outcomes" {
+    try std.testing.expect(stop_result_failed(.lost));
+    try std.testing.expect(stop_result_failed(.{ .stopped = .indeterminate }));
+    try std.testing.expect(!stop_result_failed(.{ .stopped = .{ .signal = 9 } }));
+    try std.testing.expect(!stop_result_failed(.{ .completed = .{ .exit_code = 0 } }));
 }
 
 fn runtimeFailure(
