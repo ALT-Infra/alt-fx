@@ -3767,7 +3767,15 @@ pub fn Runtime(comptime App: type) type {
             sink: anytype,
             execution: types.ExecutionMemory,
         ) !void {
-            for (execution.tool_steps) |step| {
+            var steering_index: usize = 0;
+            for (execution.tool_steps, 0..) |step, step_index| {
+                try writePersistedSteeringAtBoundary(
+                    app,
+                    sink,
+                    execution.steering,
+                    &steering_index,
+                    step_index,
+                );
                 if (step.assistant) |assistant| {
                     if (assistant.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, assistant);
                 }
@@ -3788,7 +3796,35 @@ pub fn Runtime(comptime App: type) type {
                     }
                 }
             }
-            try writePermissionFeedback(sink, execution.steering);
+            while (steering_index < execution.steering.len) : (steering_index += 1) {
+                const steering = execution.steering[steering_index];
+                if (steering.assistant_prefix) |prefix| {
+                    if (prefix.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, prefix);
+                }
+                if (steering.text.len == 0) continue;
+                try sink.appendUserTurn(.{ .text = steering.text }, true);
+            }
+        }
+
+        fn writePersistedSteeringAtBoundary(
+            app: *App,
+            sink: anytype,
+            steering: []const types.PersistedSteering,
+            index: *usize,
+            tool_step_count: usize,
+        ) !void {
+            while (index.* < steering.len and
+                steering[index.*].after_tool_step_count == tool_step_count)
+            {
+                const item = steering[index.*];
+                if (item.assistant_prefix) |prefix| {
+                    if (prefix.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, prefix);
+                }
+                if (item.text.len > 0) {
+                    try sink.appendUserTurn(.{ .text = item.text }, true);
+                }
+                index.* += 1;
+            }
         }
 
         fn writePermissionFeedback(sink: anytype, feedback: []const []const u8) !void {

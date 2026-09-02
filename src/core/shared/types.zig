@@ -928,6 +928,12 @@ pub const ToolExecutionStep = struct {
     tool_results: []PersistedToolResult = &.{},
 };
 
+pub const PersistedSteering = struct {
+    text: []u8,
+    assistant_prefix: ?[]u8 = null,
+    after_tool_step_count: usize,
+};
+
 pub const FileEvidence = struct {
     path: []u8,
     new_path: ?[]u8 = null,
@@ -942,8 +948,8 @@ pub const FileEvidence = struct {
 pub const ExecutionMemory = struct {
     tool_steps: []ToolExecutionStep = &.{},
     files: []FileEvidence = &.{},
-    /// User guidance consumed between model steps, in presentation order.
-    steering: [][]u8 = &.{},
+    /// User guidance consumed between model steps, with its chronological tool boundary.
+    steering: []PersistedSteering = &.{},
     turn_summary: ?TurnSummary = null,
 
     pub fn isEmpty(self: ExecutionMemory) bool {
@@ -2035,7 +2041,7 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
     errdefer freeToolExecutionSteps(alloc, tool_steps);
     const files = try dupeFileEvidenceSlice(alloc, memory.files);
     errdefer freeFileEvidenceSlice(alloc, files);
-    const steering = try dupePermissionFeedback(alloc, memory.steering);
+    const steering = try dupePersistedSteering(alloc, memory.steering);
     return .{
         .tool_steps = tool_steps,
         .files = files,
@@ -2047,7 +2053,45 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
 pub fn freeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) void {
     freeToolExecutionSteps(alloc, memory.tool_steps);
     freeFileEvidenceSlice(alloc, memory.files);
-    freePermissionFeedback(alloc, memory.steering);
+    freePersistedSteering(alloc, memory.steering);
+}
+
+pub fn dupePersistedSteering(
+    alloc: std.mem.Allocator,
+    steering: []const PersistedSteering,
+) ![]PersistedSteering {
+    if (steering.len == 0) return &.{};
+    const copy = try alloc.alloc(PersistedSteering, steering.len);
+    errdefer alloc.free(copy);
+    var copied: usize = 0;
+    errdefer for (copy[0..copied]) |item| {
+        alloc.free(item.text);
+        if (item.assistant_prefix) |prefix| alloc.free(prefix);
+    };
+    for (steering, copy) |item, *dest| {
+        const text = try alloc.dupe(u8, item.text);
+        errdefer alloc.free(text);
+        const assistant_prefix = if (item.assistant_prefix) |prefix|
+            try alloc.dupe(u8, prefix)
+        else
+            null;
+        errdefer if (assistant_prefix) |prefix| alloc.free(prefix);
+        dest.* = .{
+            .text = text,
+            .assistant_prefix = assistant_prefix,
+            .after_tool_step_count = item.after_tool_step_count,
+        };
+        copied += 1;
+    }
+    return copy;
+}
+
+pub fn freePersistedSteering(alloc: std.mem.Allocator, steering: []PersistedSteering) void {
+    for (steering) |item| {
+        alloc.free(item.text);
+        if (item.assistant_prefix) |prefix| alloc.free(prefix);
+    }
+    if (steering.len > 0) alloc.free(steering);
 }
 
 pub fn dupeToolExecutionSteps(alloc: std.mem.Allocator, steps: []const ToolExecutionStep) ![]ToolExecutionStep {
