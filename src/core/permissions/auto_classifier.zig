@@ -1717,7 +1717,7 @@ test "automatic review does not send redacted action evidence" {
         .send_fn = FakeTransport.send,
         .build_fn = buildTestReviewPayload,
     }, null, 1000);
-    const new_content = "AI_GATEWAY_API_KEY=\"super-secret\" run-sandbox\n";
+    const new_content = "AI_GATEWAY_API_KEY=\"$key\"literal-secret run-sandbox\n";
     var review = try diff_mod.FileReview.init(std.testing.allocator, "", new_content);
     defer review.deinit(std.testing.allocator);
     const pending_assistant = types.ChatMessage{

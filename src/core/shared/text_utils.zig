@@ -771,10 +771,35 @@ const AssignmentValueSpan = struct {
 
 fn secretAssignmentValueSpan(text: []const u8, value_start: usize) ?AssignmentValueSpan {
     const value = assignmentValueSpan(text, value_start) orelse return null;
-    if (text[value_start] != '\'' and isPureShellVariableReference(
-        text[value.prefix_end .. value.prefix_end + value.value_len],
-    )) return null;
+    if (isPureSymbolicAssignment(text, value_start, value)) return null;
     return value;
+}
+
+fn isPureSymbolicAssignment(
+    text: []const u8,
+    value_start: usize,
+    value: AssignmentValueSpan,
+) bool {
+    if (text[value_start] == '\'') return false;
+    if (!isPureShellVariableReference(
+        text[value.prefix_end .. value.prefix_end + value.value_len],
+    )) return false;
+    const value_end = value.prefix_end + value.value_len;
+    if (text[value_start] != '"') {
+        return value_end == text.len or isShellWordBoundary(text[value_end]);
+    }
+
+    const closing_quote = value_end;
+    if (closing_quote >= text.len or text[closing_quote] != '"') return false;
+    const next = closing_quote + 1;
+    return next == text.len or isShellWordBoundary(text[next]);
+}
+
+fn isShellWordBoundary(byte: u8) bool {
+    return std.ascii.isWhitespace(byte) or switch (byte) {
+        ';', '&', '|', '<', '>', '(', ')' => true,
+        else => false,
+    };
 }
 
 fn isPureShellVariableReference(value: []const u8) bool {
@@ -979,7 +1004,8 @@ test "maskSecrets preserves pure symbolic sensitive assignments" {
     const input =
         "AI_GATEWAY_API_KEY=\"$key\"\n" ++
         "GITHUB_TOKEN=$token\n" ++
-        "DATABASE_URL=\"${database_url}\"";
+        "DATABASE_URL=\"${database_url}\"\n" ++
+        "TOKEN=\"$token\"; run-next";
 
     const masked = try maskSecrets(alloc, input);
     defer if (masked.ptr != input.ptr) alloc.free(masked);
@@ -993,7 +1019,10 @@ test "maskSecrets masks compound or literal sensitive assignments" {
         "AI_GATEWAY_API_KEY=\"literal-value\"\n" ++
         "GITHUB_TOKEN=\"$token-suffix\"\n" ++
         "DATABASE_URL=\"${database_url:-fallback}\"\n" ++
-        "API_KEY=\"$(load-key)\"";
+        "API_KEY=\"$(load-key)\"\n" ++
+        "VERCEL_OIDC_TOKEN=\"$token\"literal-suffix\n" ++
+        "OPENAI_API_KEY=$key\"literal-suffix\"\n" ++
+        "SECRET_KEY=\"$key";
 
     const masked = try maskSecrets(alloc, input);
     defer if (masked.ptr != input.ptr) alloc.free(masked);
@@ -1002,7 +1031,10 @@ test "maskSecrets masks compound or literal sensitive assignments" {
         "AI_GATEWAY_API_KEY=\"[redacted]\"\n" ++
             "GITHUB_TOKEN=\"[redacted]\"\n" ++
             "DATABASE_URL=\"[redacted]\"\n" ++
-            "API_KEY=\"[redacted]\"",
+            "API_KEY=\"[redacted]\"\n" ++
+            "VERCEL_OIDC_TOKEN=\"[redacted]\"literal-suffix\n" ++
+            "OPENAI_API_KEY=[redacted]\"literal-suffix\"\n" ++
+            "SECRET_KEY=\"[redacted]",
         masked,
     );
 }
