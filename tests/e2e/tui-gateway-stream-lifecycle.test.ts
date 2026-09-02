@@ -2859,6 +2859,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForText("SPLIT_OLD_TAIL_FINAL", TIMEOUT);
 
       await session.sendText(SPLIT_NEW_USER_PROMPT);
+      const cutoffPane = await session.capturePane();
+      expect(cutoffPane).not.toContain(
+        `${SPLIT_NEW_USER_PROMPT} · Esc to steer now`,
+      );
+      expect(cutoffPane).toMatch(/Thinking|Generating/);
       await waitForCondition(
         () => firstResponse.cancelled,
         "visible assistant steering cancellation",
@@ -2866,6 +2871,18 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await waitForCondition(
         () => splitGateway.requests.length === 2 && secondResponse.started,
         "immediate steering Gateway stream",
+      );
+      const handoffScrollback = await waitForEscapedScrollback(
+        session,
+        (candidate) => {
+          const promptIndex = candidate.lastIndexOf(SPLIT_NEW_USER_PROMPT);
+          return promptIndex >= 0 && candidate.lastIndexOf("Thinking") > promptIndex;
+        },
+        "thinking activity after the steering user row",
+        3_000,
+      );
+      expect(handoffScrollback.lastIndexOf("Thinking")).toBeGreaterThan(
+        handoffScrollback.lastIndexOf(SPLIT_NEW_USER_PROMPT),
       );
 
       const rawScrollback = await waitForEscapedScrollback(
@@ -2906,6 +2923,96 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     },
     SPLIT_BOUNDARY_TEST_TIMEOUT,
   );
+
+  test(
+    "cancelled buffered assistant tail stays before steering and the next answer",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-steering-late-tail-")));
+      const home = join(root, "home");
+      const workspacePath = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const tracePath = join(root, "trace.log");
+      const firstResponse: HoldState = { started: false, cancelled: false };
+      const visiblePrefix = "CANCELLED_RESPONSE_VISIBLE_PREFIX";
+      const bufferedTail = "CANCELLED_RESPONSE_BUFFERED_TAIL";
+      const steering = "Respond with exactly STEERED_RESPONSE_FRESH.";
+      const finalText = "STEERED_RESPONSE_FRESH";
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspacePath, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      const workspace = realpathSync(workspacePath);
+
+      const lateTailGateway = startFakeGateway([
+        () =>
+          heldGatewayResponse(firstResponse, [{
+            type: "text-delta",
+            id: "cancelled_response",
+            delta: `${visiblePrefix}\n\n${bufferedTail}`,
+          }]),
+        fakeGatewayFinalText(finalText),
+      ]);
+      gateway = lateTailGateway;
+      session = await TmuxSession.create({
+        cwd: workspace,
+        width: 120,
+        height: 34,
+        minimumHistoryLines: 2_000,
+        stderrPath,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-steering-late-tail-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_SOUND: "0",
+          FX_GATEWAY_BASE_URL: lateTailGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: lateTailGateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: lateTailGateway.chatUrl,
+          FX_MODEL: MODEL,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "agent,gateway,stream,worker,input,prompt",
+        },
+      });
+
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Start the cancelled response fixture.");
+      await session.waitForText(visiblePrefix, TIMEOUT);
+      expect(await session.captureFullScrollback()).not.toContain(bufferedTail);
+
+      await session.sendText(steering);
+      await session.waitForText(finalText, TIMEOUT);
+      await waitForCondition(
+        () => lateTailGateway.requests.length === 2,
+        "steered response request",
+      );
+
+      const scrollback = await session.captureFullScrollback();
+      const visibleIndex = scrollback.lastIndexOf(visiblePrefix);
+      const tailIndex = scrollback.lastIndexOf(bufferedTail);
+      const steeringIndex = scrollback.lastIndexOf(steering);
+      const finalIndex = scrollback.lastIndexOf(finalText);
+      expect(visibleIndex).toBeGreaterThanOrEqual(0);
+      expect(tailIndex).toBeGreaterThan(visibleIndex);
+      expect(steeringIndex).toBeGreaterThan(tailIndex);
+      expect(finalIndex).toBeGreaterThan(steeringIndex);
+      expect(scrollback.slice(steeringIndex)).not.toContain(bufferedTail);
+
+      const lines = scrollback.split("\n").map((line) => line.trimEnd());
+      const steeringLine = lines.findIndex((line) => line.includes(steering));
+      const finalLine = lines.findIndex((line, index) =>
+        index > steeringLine && line.includes(finalText)
+      );
+      expect(steeringLine).toBeGreaterThanOrEqual(0);
+      expect(finalLine).toBeGreaterThan(steeringLine);
+      expect(
+        lines.slice(steeringLine + 1, finalLine).some((line) => line.trim() === ""),
+      ).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(session.isAlive()).toBe(true);
+      expect(session.isPaneAlive()).toBe(true);
+    },
+    TIMEOUT * 2,
+  );
+
   test(
     "ordinary Enter keeps pending steering visible through narrow resize",
     async () => {

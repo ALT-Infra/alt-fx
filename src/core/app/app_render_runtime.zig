@@ -331,9 +331,9 @@ fn buildQueuedCardProjection(comptime App: type, app: *App) !QueuedCardProjectio
         queue_preview.paused
     else
         false;
-    if (comptime @hasDecl(@TypeOf(app.worker), "snapshotSteeringMessages")) {
+    if (comptime @hasDecl(@TypeOf(app.worker), "snapshotVisibleSteeringMessages")) {
         if (steering_count > 0) {
-            projection.steering_messages = try app.worker.snapshotSteeringMessages(app.alloc);
+            projection.steering_messages = try app.worker.snapshotVisibleSteeringMessages(app.alloc);
         }
     }
     if (comptime !@hasField(App, "queued_prompt_review")) return projection;
