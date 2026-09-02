@@ -13,6 +13,8 @@ const session_store = @import("../session/session_store.zig");
 const usage_report = @import("../session/usage_report.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
+const update_notes = @import("../upgrade/update_notes.zig");
+const update_target = @import("../upgrade/update_target.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
 
@@ -1572,6 +1574,18 @@ pub const UpgradeSnapshot = struct {
                     try writeVersionWithPrefix(&out.writer, self.latest);
                 }
                 try out.writer.writeByte('\n');
+                const channel = update_target.Channel.parse(self.channel) orelse .stable;
+                if (update_notes.destination(
+                    channel,
+                    self.latest,
+                    self.current_revision,
+                    self.latest_revision,
+                )) |notes| {
+                    try update_notes.writeLabel(notes.kind, &out.writer);
+                    try out.writer.writeAll(": ");
+                    try notes.writeUrl(&out.writer);
+                    try out.writer.writeByte('\n');
+                }
             },
             .up_to_date => {
                 if (std.mem.eql(u8, self.channel, "dev") and self.latest_revision.len > 0) {
@@ -2837,7 +2851,11 @@ test "core upgrade snapshot renders errors and statuses" {
         .status = .upgraded,
     }).renderText(std.testing.allocator);
     defer std.testing.allocator.free(upgraded_text);
-    try std.testing.expectEqualStrings("upgraded to v0.2.10\n", upgraded_text);
+    try std.testing.expectEqualStrings(
+        "upgraded to v0.2.10\n" ++
+            "notes: https://fx.sh/changelog#v0.2.10\n",
+        upgraded_text,
+    );
 
     const upgraded_json = try (UpgradeSnapshot{
         .current = "0.2.9",
@@ -2857,7 +2875,11 @@ test "core upgrade snapshot renders errors and statuses" {
         .status = .upgraded,
     }).renderText(std.testing.allocator);
     defer std.testing.allocator.free(prefixed_text);
-    try std.testing.expectEqualStrings("upgraded to v0.2.10\n", prefixed_text);
+    try std.testing.expectEqualStrings(
+        "upgraded to v0.2.10\n" ++
+            "notes: https://fx.sh/changelog#v0.2.10\n",
+        prefixed_text,
+    );
 
     const up_to_date = UpgradeSnapshot{
         .current = "0.2.9",
@@ -2898,7 +2920,11 @@ test "core upgrade snapshot identifies dev revisions" {
 
     const text = try snapshot.renderText(std.testing.allocator);
     defer std.testing.allocator.free(text);
-    try std.testing.expectEqualStrings("upgraded to dev abcdef012345 (v0.3.66)\n", text);
+    try std.testing.expectEqualStrings(
+        "upgraded to dev abcdef012345 (v0.3.66)\n" ++
+            "changes: https://github.com/vercel-labs/fx/compare/111111111111...abcdef0123456789abcdef0123456789abcdef01\n",
+        text,
+    );
 
     const json = try snapshot.renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);

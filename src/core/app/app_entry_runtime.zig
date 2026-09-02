@@ -350,11 +350,13 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
                 "resume",
                 handoff.session_id,
                 cli_surface.upgrade_relaunch_arg,
+                request.previousRevision() orelse "",
             };
+            const argv_slice = if (request.previousRevision() == null) argv[0..4] else argv[0..5];
             const replace_err = deps.replace_process(
                 deps.replace_ctx,
                 io_mod.getIo(),
-                .{ .argv = &argv },
+                .{ .argv = argv_slice },
             );
             writeUpgradeRelaunchFailure(deps, replace_err, handoff.session_id);
         } else {
@@ -620,11 +622,12 @@ const TestCapture = struct {
     resume_handoff_id: ?[]const u8 = null,
     raise_sigint_during_deinit: bool = false,
     upgrade_relaunch_path: ?[]const u8 = null,
+    upgrade_previous_revision: ?[]const u8 = null,
     replace_error: std.process.ReplaceError = error.InvalidExe,
     replace_calls: usize = 0,
     replace_arg_count: usize = 0,
-    replace_arg_bufs: [4][128]u8 = undefined,
-    replace_arg_lens: [4]usize = .{ 0, 0, 0, 0 },
+    replace_arg_bufs: [5][128]u8 = undefined,
+    replace_arg_lens: [5]usize = .{ 0, 0, 0, 0, 0 },
     fail_unexpected_format: bool = false,
 
     fn init(run_result: cli_surface.RunResult) TestCapture {
@@ -771,6 +774,10 @@ const TestApp = struct {
             .executable_path_len = path.len,
         };
         @memcpy(request.executable_path_buf[0..path.len], path);
+        if (active_capture.?.upgrade_previous_revision) |revision| {
+            @memcpy(request.previous_revision_buf[0..revision.len], revision);
+            request.previous_revision_len = @intCast(revision.len);
+        }
         return request;
     }
 
@@ -1008,6 +1015,30 @@ test "app entry relaunches only after teardown with the validated handoff" {
         "deinit",
         "stderr-attempt",
     });
+}
+
+test "app entry carries the previous revision through upgrade relaunch" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    capture.resume_handoff_id = "session-123";
+    capture.upgrade_relaunch_path = "/tmp/fx-upgraded";
+    capture.upgrade_previous_revision = "1111111111111111111111111111111111111111";
+
+    _ = try runWithDeps(
+        TestApp,
+        alloc,
+        &.{},
+        testConfig(),
+        capture.deps(),
+    );
+
+    try std.testing.expectEqual(@as(usize, 5), capture.replace_arg_count);
+    try std.testing.expectEqualStrings("--upgrade-relaunch", capture.replaceArg(3));
+    try std.testing.expectEqualStrings(
+        "1111111111111111111111111111111111111111",
+        capture.replaceArg(4),
+    );
 }
 
 test "app entry never relaunches without a validated handoff" {

@@ -92,6 +92,15 @@ const ResumeInvocation = struct {
 const resume_id_alias_prefix = "--resume-";
 pub const upgrade_relaunch_arg = "--upgrade-relaunch";
 
+pub const UpgradeRelaunch = struct {
+    previous_revision: ?[]u8 = null,
+
+    pub fn deinit(self: *UpgradeRelaunch, alloc: Allocator) void {
+        if (self.previous_revision) |revision| alloc.free(revision);
+        self.* = undefined;
+    }
+};
+
 // The one resume alias that asks which session to open. Every other spelling
 // names its target, so it resumes without a prompt.
 const resume_picker_alias = "-r";
@@ -129,11 +138,12 @@ pub const LaunchModifiers = struct {
 
 pub const InteractiveLaunch = struct {
     requested_resume: ?ResumeTarget = null,
-    upgrade_relaunch: bool = false,
+    upgrade_relaunch: ?UpgradeRelaunch = null,
     modifiers: LaunchModifiers = .{},
 
     pub fn deinit(self: *InteractiveLaunch, alloc: Allocator) void {
         if (self.requested_resume) |*target| target.deinit(alloc);
+        if (self.upgrade_relaunch) |*relaunch| relaunch.deinit(alloc);
         self.modifiers.deinit(alloc);
         self.* = undefined;
     }
@@ -531,22 +541,31 @@ pub fn parseInteractiveLaunch(
         } },
         .resume_session => |invocation| {
             const resume_args = invocation.args;
-            const upgrade_relaunch = !invocation.top_level_alias and
-                resume_args.len == 2 and
+            const has_upgrade_relaunch = !invocation.top_level_alias and
+                resume_args.len >= 2 and
                 std.mem.eql(u8, resume_args[1], upgrade_relaunch_arg);
-            const target_args = if (upgrade_relaunch)
-                resume_args[0..1]
-            else
-                resume_args;
+            if (has_upgrade_relaunch and resume_args.len > 3) return error.InvalidResumeArgs;
+            var upgrade_relaunch: ?UpgradeRelaunch = null;
+            errdefer if (upgrade_relaunch) |*relaunch| relaunch.deinit(alloc);
+            if (has_upgrade_relaunch) {
+                const previous_revision = if (resume_args.len == 3) revision: {
+                    if (!update_target.isValidRevision(resume_args[2])) return error.InvalidResumeArgs;
+                    break :revision try alloc.dupe(u8, resume_args[2]);
+                } else null;
+                upgrade_relaunch = .{ .previous_revision = previous_revision };
+            }
+            const target_args = if (has_upgrade_relaunch) resume_args[0..1] else resume_args;
             const target = try parseResumeArgs(
                 alloc,
                 command_catalog,
                 target_args,
                 invocation.top_level_alias,
             );
+            const relaunch = upgrade_relaunch;
+            upgrade_relaunch = null;
             return .{ .interactive = .{
                 .requested_resume = target,
-                .upgrade_relaunch = upgrade_relaunch,
+                .upgrade_relaunch = relaunch,
                 .modifiers = global_args.takeModifiers(),
             } };
         },
@@ -4117,6 +4136,55 @@ test "parse resume args treats last after id flag as exact id" {
         .pick, .last => return error.TestExpectedExactResumeId,
         .id => |id| try std.testing.expectEqualStrings("last", id),
     }
+}
+
+test "parseInteractiveLaunch accepts legacy and revision-bearing upgrade relaunches" {
+    const alloc = std.testing.allocator;
+    const command_catalog = testCommandCatalog();
+    const revision = "abcdef0123456789abcdef0123456789abcdef01";
+
+    const cases = [_]struct {
+        args: []const [:0]const u8,
+        expected_revision: ?[]const u8,
+    }{
+        .{
+            .args = &.{ @constCast("resume"), @constCast("session-123"), @constCast("--upgrade-relaunch") },
+            .expected_revision = null,
+        },
+        .{
+            .args = &.{ @constCast("resume"), @constCast("session-123"), @constCast("--upgrade-relaunch"), @constCast(revision) },
+            .expected_revision = revision,
+        },
+    };
+
+    for (cases) |case| {
+        const parsed = try parseInteractiveLaunch(alloc, case.args, command_catalog);
+        switch (parsed) {
+            .interactive => |value| {
+                var launch = value;
+                defer launch.deinit(alloc);
+                const relaunch = launch.upgrade_relaunch orelse return error.TestExpectedUpgradeRelaunch;
+                if (case.expected_revision) |expected| {
+                    try std.testing.expectEqualStrings(expected, relaunch.previous_revision.?);
+                } else try std.testing.expect(relaunch.previous_revision == null);
+            },
+            .noninteractive => |value| {
+                var noninteractive = value;
+                defer noninteractive.deinit(alloc);
+                return error.TestExpectedInteractiveLaunch;
+            },
+        }
+    }
+
+    try std.testing.expectError(
+        error.InvalidResumeArgs,
+        parseInteractiveLaunch(alloc, &.{
+            @constCast("resume"),
+            @constCast("session-123"),
+            @constCast("--upgrade-relaunch"),
+            @constCast("not-a-revision"),
+        }, command_catalog),
+    );
 }
 
 test "parseInteractiveLaunch shares native resume grammar" {
