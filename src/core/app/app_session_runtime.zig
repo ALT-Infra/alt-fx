@@ -53,6 +53,8 @@ const shell_runtime = @import("../../ui/shell_runtime.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 const ui_input = @import("../../ui/input/runtime.zig");
 const ui_render = @import("../../ui/render.zig");
+const update_notes = @import("../upgrade/update_notes.zig");
+const update_target = @import("../upgrade/update_target.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -239,10 +241,40 @@ pub const ResumeHandoffIntent = enum {
     upgrade_requested,
 };
 
+const UpgradeNotice = struct {
+    version: []const u8,
+    channel: update_target.Channel,
+    previous_revision: []const u8,
+    revision: []const u8,
+};
+
 const ResumeNotice = union(enum) {
     session,
-    upgrade: []const u8,
+    upgrade: UpgradeNotice,
 };
+
+fn writeUpgradeNoticeBody(writer: *std.Io.Writer, upgrade: UpgradeNotice) !void {
+    try writer.writeAll("fx has been updated to ");
+    if (upgrade.channel == .dev and update_target.isValidRevision(upgrade.revision)) {
+        try writer.print("dev {s} (v{s})", .{
+            upgrade.revision[0..@min(upgrade.revision.len, 12)],
+            update_target.normalizeVersion(upgrade.version),
+        });
+    } else {
+        try writer.print("v{s}", .{update_target.normalizeVersion(upgrade.version)});
+    }
+    if (update_notes.destination(
+        upgrade.channel,
+        upgrade.version,
+        upgrade.previous_revision,
+        upgrade.revision,
+    )) |notes| {
+        try writer.writeByte('\n');
+        try update_notes.writeLabel(notes.kind, writer);
+        try writer.writeAll(": ");
+        try notes.writeUrl(writer);
+    }
+}
 
 pub const ResumeViewStage = union(enum) {
     none,
@@ -1643,8 +1675,16 @@ pub fn Runtime(comptime App: type) type {
         pub fn resumeRequestedSessionAfterUpgrade(
             app: *App,
             version: []const u8,
+            channel: update_target.Channel,
+            previous_revision: []const u8,
+            revision: []const u8,
         ) !void {
-            return resumeRequestedSessionWithNotice(app, .{ .upgrade = version });
+            return resumeRequestedSessionWithNotice(app, .{ .upgrade = .{
+                .version = version,
+                .channel = channel,
+                .previous_revision = previous_revision,
+                .revision = revision,
+            } });
         }
 
         fn resumeRequestedSessionWithNotice(
@@ -3572,17 +3612,16 @@ pub fn Runtime(comptime App: type) type {
                     .tone = .neutral,
                     .body = display_title,
                 }),
-                .upgrade => |version| {
-                    const body = try std.fmt.allocPrint(
-                        app.alloc,
-                        "fx has been updated to v{s}",
-                        .{version},
-                    );
-                    defer app.alloc.free(body);
+                .upgrade => |upgrade| {
+                    var body: std.Io.Writer.Allocating = .init(app.alloc);
+                    defer body.deinit();
+                    try writeUpgradeNoticeBody(&body.writer, upgrade);
+                    const owned_body = try body.toOwnedSlice();
+                    defer app.alloc.free(owned_body);
                     try sink.appendNotice(.{
                         .topic = "",
                         .tone = .success,
-                        .body = body,
+                        .body = owned_body,
                     });
                 },
             }
@@ -7032,6 +7071,48 @@ test "execution replay releases action-formatting scratch allocations" {
     );
 }
 
+test "upgrade notice body identifies stable notes and dev changes" {
+    const cases = [_]struct {
+        upgrade: UpgradeNotice,
+        expected: []const u8,
+    }{
+        .{
+            .upgrade = .{
+                .version = "9.9.9",
+                .channel = .stable,
+                .previous_revision = "",
+                .revision = "",
+            },
+            .expected = "fx has been updated to v9.9.9\nnotes: https://fx.sh/changelog#v9.9.9",
+        },
+        .{
+            .upgrade = .{
+                .version = "9.9.9",
+                .channel = .dev,
+                .previous_revision = "1111111111111111111111111111111111111111",
+                .revision = "abcdef0123456789abcdef0123456789abcdef01",
+            },
+            .expected = "fx has been updated to dev abcdef012345 (v9.9.9)\nchanges: https://github.com/vercel-labs/fx/compare/1111111111111111111111111111111111111111...abcdef0123456789abcdef0123456789abcdef01",
+        },
+        .{
+            .upgrade = .{
+                .version = "9.9.9",
+                .channel = .dev,
+                .previous_revision = "",
+                .revision = "abcdef0123456789abcdef0123456789abcdef01",
+            },
+            .expected = "fx has been updated to dev abcdef012345 (v9.9.9)\nchanges: https://github.com/vercel-labs/fx/commit/abcdef0123456789abcdef0123456789abcdef01",
+        },
+    };
+
+    for (cases) |case| {
+        var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        try writeUpgradeNoticeBody(&out.writer, case.upgrade);
+        try std.testing.expectEqualStrings(case.expected, out.writer.buffered());
+    }
+}
+
 test "execution replay projects answered questions as a semantic card and retains detail" {
     const alloc = std.testing.allocator;
     var app = try TestApp.init(alloc, "/workspace");
@@ -7524,7 +7605,13 @@ test "upgrade resume restores active session with the installed version notice" 
     app.requested_resume = .{ .id = try alloc.dupe(u8, "session-1") };
     app.total_web_search_requests = 99;
 
-    try Runtime(TestApp).resumeRequestedSessionAfterUpgrade(&app, "9.9.9");
+    try Runtime(TestApp).resumeRequestedSessionAfterUpgrade(
+        &app,
+        "9.9.9",
+        .stable,
+        "",
+        "",
+    );
 
     try std.testing.expect(app.requested_resume == null);
     try std.testing.expectEqual(@as(usize, 1), app.startup_resume_anchor_count);
@@ -7548,7 +7635,10 @@ test "upgrade resume restores active session with the installed version notice" 
     try std.testing.expectEqualStrings("inspect file", context[1].assistant.user.text);
     try std.testing.expectEqualStrings("run server", context[2].assistant.user.text);
     try std.testing.expectEqual(@as(usize, 2), app.notices.items.len);
-    try std.testing.expectEqualStrings("● fx has been updated to v9.9.9", app.notices.items[0]);
+    try std.testing.expectEqualStrings(
+        "● fx has been updated to v9.9.9\nnotes: https://fx.sh/changelog#v9.9.9",
+        app.notices.items[0],
+    );
     try std.testing.expect(std.mem.find(u8, app.notices.items[1], "older context") != null);
     try std.testing.expectEqual(@as(usize, 2), app.completed_tool_statuses.items.len);
     try std.testing.expectEqualStrings("● Completed read_file\n", app.completed_tool_statuses.items[0]);

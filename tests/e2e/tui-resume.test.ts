@@ -70,6 +70,9 @@ function shellQuote(value: string): string {
 function startUpgradeServer(
   root: string,
   argvLogPath: string,
+  options: {
+    revision?: string;
+  } = {},
 ): { baseUrl: string; stop: () => void } {
   const artifactDir = join(root, "release-artifact");
   const wrapperPath = join(artifactDir, "fx");
@@ -93,15 +96,24 @@ exec ${shellQuote(FX_BIN)} "$@"
   const archive = readFileSync(archivePath);
   const checksum = createHash("sha256").update(archive).digest("hex");
   const platform = `${process.platform === "darwin" ? "macos" : "linux"}-${process.arch === "arm64" ? "aarch64" : "x86_64"}`;
-  const archiveRoute = `/v9.9.9/fx-${platform}.tar.gz`;
+  const revision = options.revision ?? "abcdef0123456789abcdef0123456789abcdef01";
+  const stableArchiveRoute = `/v9.9.9/fx-${platform}.tar.gz`;
+  const devArchiveRoute = `/dev/${revision}/fx-${platform}.tar.gz`;
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
     fetch(request) {
       const path = new URL(request.url).pathname;
       if (path === "/latest.txt") return new Response("v9.9.9\n");
-      if (path === archiveRoute) return new Response(archive);
-      if (path === `${archiveRoute}.sha256`) return new Response(`${checksum}\n`);
+      if (path === "/dev.json") {
+        return Response.json({ version: "9.9.9", commit: revision });
+      }
+      if (path === stableArchiveRoute || path === devArchiveRoute) {
+        return new Response(archive);
+      }
+      if (path === `${stableArchiveRoute}.sha256` || path === `${devArchiveRoute}.sha256`) {
+        return new Response(`${checksum}\n`);
+      }
       return new Response("not found", { status: 404 });
     },
   });
@@ -5036,6 +5048,51 @@ test.skipIf(!tmuxAvailable())(
   TIMEOUT * 5,
 );
 
+test("manual upgrade output links stable notes and dev changes", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-upgrade-links-")));
+  const argvLogPath = join(root, "upgrade-argv.log");
+  const installedFx = join(root, "fx");
+  const home = join(root, "home");
+  mkdirSync(home);
+  const currentRevision = (await runFx(["status", "--json"], {
+    env: { AI_GATEWAY_API_KEY: undefined, VERCEL_OIDC_TOKEN: undefined },
+  })).stdout;
+  const revision = "abcdef0123456789abcdef0123456789abcdef01";
+  const release = startUpgradeServer(root, argvLogPath, { revision });
+  copyFileSync(FX_BIN, installedFx);
+  chmodSync(installedFx, 0o755);
+
+  try {
+    const stable = Bun.spawn([installedFx, "upgrade", "--channel", "stable"], {
+      env: { ...process.env, HOME: home, FX_E2E_UPGRADE_BASE_URL: release.baseUrl },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const stableExitCode = await stable.exited;
+    expect(stableExitCode).toBe(0);
+    expect(await new Response(stable.stdout).text()).toContain(
+      "notes: https://fx.sh/changelog#v9.9.9",
+    );
+
+    copyFileSync(FX_BIN, installedFx);
+    chmodSync(installedFx, 0o755);
+    const dev = Bun.spawn([installedFx, "upgrade", "--channel", "dev"], {
+      env: { ...process.env, HOME: home, FX_E2E_UPGRADE_BASE_URL: release.baseUrl },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const devExitCode = await dev.exited;
+    expect(devExitCode).toBe(0);
+    const buildRevision = JSON.parse(currentRevision).build_revision;
+    expect(await new Response(dev.stdout).text()).toContain(
+      `changes: https://github.com/vercel-labs/fx/compare/${buildRevision}...${revision}`,
+    );
+  } finally {
+    release.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, UPGRADE_TIMEOUT);
+
 test.skipIf(!tmuxAvailable())(
   "upgrade ctrl-g reloads the background-installed binary and resumes",
   async () => {
@@ -5112,7 +5169,7 @@ test.skipIf(!tmuxAvailable())(
       const version = (await runFx(["--version"])).stdout.trim();
       await active.sendHexBytes(["07"]);
 
-      const updatedNotice = `● fx has been updated to v${version}`;
+      const updatedNotice = `● fx has been updated to v${version}\n  notes: https://fx.sh/changelog#v${version}`;
       await active.waitForText(updatedNotice, TIMEOUT);
       const resumed = await waitForScrollback(active, "UPGRADE_CTRL_G_INITIAL_DONE");
       expect(resumed).toContain("UPGRADE_CTRL_G_INITIAL_DONE");
@@ -5210,7 +5267,10 @@ test.skipIf(!tmuxAvailable())(
       const version = (await runFx(["--version"])).stdout.trim();
       await active.sendHexBytes(["07"]);
 
-      await active.waitForText(`● fx has been updated to v${version}`, TIMEOUT);
+      await active.waitForText(
+        `● fx has been updated to v${version}\n  notes: https://fx.sh/changelog#v${version}`,
+        TIMEOUT,
+      );
       const resumed = await waitForScrollback(
         active,
         "UPGRADE_CORRUPT_INITIAL_DONE",

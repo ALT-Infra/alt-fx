@@ -670,10 +670,13 @@ const App = struct {
         app.context_limits.applyCommandLine(launch.modifiers.context_limit_overrides);
         if (comptime host_profile.durable_sessions or host_profile.js_host_sessions) {
             if (app.requested_resume != null) {
-                if (launch.upgrade_relaunch) {
+                if (launch.upgrade_relaunch != null) {
                     try SessionAppRuntime.resumeRequestedSessionAfterUpgrade(
                         &app,
                         app_version,
+                        build_update_channel,
+                        launch.upgrade_relaunch.?.previous_revision orelse "",
+                        build_revision,
                     );
                 } else {
                     try SessionAppRuntime.resumeRequestedSession(&app);
