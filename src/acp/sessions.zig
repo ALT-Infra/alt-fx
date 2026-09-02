@@ -1326,7 +1326,7 @@ pub fn sendActiveSessionInfoUpdate(state: *server.ServerState, alloc: Allocator)
     const active = if (state.active_session) |*session| session else return;
     var metadata = try session_display_metadata.deriveFromHistory(
         alloc,
-        active.session_rt.history.items,
+        active.session_rt.agent.history.items,
     );
     defer metadata.deinit(alloc);
     const updated_at_ms = if (active.writable) |*writable|

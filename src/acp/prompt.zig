@@ -2135,7 +2135,7 @@ test "ACP degraded history repair commits the finished turn once" {
     try std.testing.expect(prompt_input.retain_image_snapshots);
     prompt_input.deinit(alloc);
     try std.Io.Dir.accessAbsolute(io_mod.getIo(), image_path, .{});
-    try std.testing.expectEqual(@as(usize, 2), session.session_rt.history.items.len);
+    try std.testing.expectEqual(@as(usize, 2), session.session_rt.agent.history.items.len);
 }
 
 fn setRecoveryCheckpoint(
