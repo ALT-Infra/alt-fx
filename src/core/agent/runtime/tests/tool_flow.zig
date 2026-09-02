@@ -501,6 +501,7 @@ fn expectedPermissionDeniedMessage(reason: types.ToolPermissionDenialReason) ?[]
         .user_denied => "Permission denied by user",
         .auto_denied => "Blocked by automatic safety policy",
         .review_caution => "Action held after safety review",
+        .review_evidence_incomplete => "Safety review evidence incomplete; action held",
         .review_unavailable => "Safety reviewer unavailable; action held",
         .policy_denied, .permission_required => null,
     };

@@ -51,12 +51,13 @@ pub const HostSafetyOverride = enum {
 
 pub const ParseOutcome = union(enum) {
     valid: Result,
+    evidence_incomplete,
     invalid,
 
     pub fn deinit(self: *ParseOutcome, alloc: std.mem.Allocator) void {
         switch (self.*) {
             .valid => |*result| result.deinit(alloc),
-            .invalid => {},
+            .evidence_incomplete, .invalid => {},
         }
         self.* = undefined;
     }
@@ -68,7 +69,7 @@ pub fn hostDisposition(outcome: ParseOutcome) HostDisposition {
             .clear => .clear,
             .caution => .caution,
         },
-        .invalid => .unavailable,
+        .evidence_incomplete, .invalid => .unavailable,
     };
 }
 
@@ -450,7 +451,14 @@ pub const Reviewer = struct {
             return constructionFailure(err);
         };
         defer evidence.deinit(alloc);
-        if (!evidence.action_complete) return .invalid;
+        if (!evidence.action_complete) {
+            debug_trace.logf(
+                "permission",
+                "event=auto_review_compose_result result=evidence_incomplete elapsed_ms={d} target_call_id={s}",
+                .{ io_mod.milliTimestamp() - started_ms, review_turn.target_call_id },
+            );
+            return .evidence_incomplete;
+        }
         checkBudget(deadline, cancel_flag) catch |err| return constructionFailure(err);
         const tools_json = toolsJsonAlloc(alloc) catch |err| return constructionFailure(err);
         defer alloc.free(tools_json);
@@ -1395,7 +1403,7 @@ test "automatic review parses clear and caution assessments" {
         defer outcome.deinit(std.testing.allocator);
         switch (outcome) {
             .valid => |result| try std.testing.expectEqual(case.expected, result.decision),
-            .invalid => return error.TestExpectedEqual,
+            .evidence_incomplete, .invalid => return error.TestExpectedEqual,
         }
     }
 }
@@ -1709,35 +1717,122 @@ test "automatic review does not send redacted action evidence" {
         .send_fn = FakeTransport.send,
         .build_fn = buildTestReviewPayload,
     }, null, 1000);
+    const new_content = "AI_GATEWAY_API_KEY=\"$key\"literal-secret run-sandbox\n";
+    var review = try diff_mod.FileReview.init(std.testing.allocator, "", new_content);
+    defer review.deinit(std.testing.allocator);
     const pending_assistant = types.ChatMessage{
         .role = .assistant,
         .tool_calls = &.{.{
             .id = "call_secret",
-            .name = "run_command",
-            .arguments_json = "{\"command\":\"printf API_KEY=super-secret\"}",
+            .name = "edit_file",
+            .arguments_json = "{}",
         }},
     };
-    const outcome = try reviewer.review(std.testing.allocator, .{
+    var outcome = try reviewer.review(std.testing.allocator, .{
         .review_turn = .{
             .model = "openai/gpt-5",
             .pending_assistant = pending_assistant,
             .target_call_id = "call_secret",
             .origin = .root,
-            .trusted_root_context = "Run the requested command.",
         },
-        .targets = &.{},
-        .action = .{ .command = .{
-            .command = "printf API_KEY=super-secret",
-            .resolved_cwd = "/tmp/workspace",
-            .background = false,
-            .target_os = .linux,
+        .targets = &.{.{
+            .role = "target",
+            .path = @constCast("/tmp/home/.zshrc"),
+        }},
+        .action = .{ .file_mutation = .{
+            .tool_name = "edit_file",
+            .display_path = "/tmp/home/.zshrc",
+            .preimage = .present,
+            .additions = review.additions,
+            .deletions = review.deletions,
+            .review = review,
         } },
     });
+    defer outcome.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(std.meta.Tag(ParseOutcome).invalid, std.meta.activeTag(outcome));
+    try std.testing.expectEqual(
+        std.meta.Tag(ParseOutcome).evidence_incomplete,
+        std.meta.activeTag(outcome),
+    );
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
     try std.testing.expect(!fake.saw_redaction);
     try std.testing.expect(!fake.saw_secret);
+}
+
+test "automatic review sends symbolic secret references as complete evidence" {
+    const FakeTransport = struct {
+        calls: usize = 0,
+        saw_symbolic_reference: bool = false,
+
+        fn send(
+            raw_ctx: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            payload: []const u8,
+            _: std.Io.Clock.Timestamp,
+            _: *std.atomic.Value(bool),
+        ) anyerror!TransportOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx));
+            self.calls += 1;
+            self.saw_symbolic_reference = std.mem.find(
+                u8,
+                payload,
+                "AI_GATEWAY_API_KEY=\\\"$key\\\"",
+            ) != null;
+            return .{ .completion = .{ .completion = .{
+                .tool_calls = &.{.{
+                    .id = "review",
+                    .name = tool_name,
+                    .arguments_json = "{\"risk\":\"low\",\"decision\":\"clear\",\"rationale\":\"symbolic reference is reviewable\"}",
+                }},
+            } } };
+        }
+    };
+
+    const new_content =
+        "_rfx() {\n" ++
+        "  local key\n" ++
+        "  key=\"$(load-key)\" || return 1\n" ++
+        "  AI_GATEWAY_API_KEY=\"$key\" run-sandbox\n" ++
+        "}\n";
+    var review = try diff_mod.FileReview.init(std.testing.allocator, "", new_content);
+    defer review.deinit(std.testing.allocator);
+    var fake = FakeTransport{};
+    const reviewer = Reviewer.withTransport(.{
+        .context = @ptrCast(&fake),
+        .send_fn = FakeTransport.send,
+        .build_fn = buildTestReviewPayload,
+    }, null, 1000);
+    var outcome = try reviewer.review(std.testing.allocator, .{
+        .review_turn = .{
+            .model = "test/source-model",
+            .pending_assistant = .{ .role = .assistant, .tool_calls = &.{.{
+                .id = "symbolic-edit",
+                .name = "edit_file",
+                .arguments_json = "{}",
+            }} },
+            .target_call_id = "symbolic-edit",
+            .origin = .root,
+            .trusted_root_context = "Install the requested shell helper.",
+        },
+        .targets = &.{.{
+            .role = "target",
+            .path = @constCast("/tmp/home/.zshrc"),
+        }},
+        .action = .{ .file_mutation = .{
+            .tool_name = "edit_file",
+            .display_path = "/tmp/home/.zshrc",
+            .preimage = .present,
+            .additions = review.additions,
+            .deletions = review.deletions,
+            .review = review,
+        } },
+    });
+    defer outcome.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(std.meta.Tag(ParseOutcome).valid, std.meta.activeTag(outcome));
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expect(fake.saw_symbolic_reference);
 }
 
 test "automatic review preserves prepared file lines within its evidence byte budget" {
