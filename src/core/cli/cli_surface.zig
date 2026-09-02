@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
+const auth_runtime = @import("../auth/auth_runtime.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
 const grok_oauth = @import("../auth/grok_oauth.zig");
 const acp_runner = @import("acp_runner.zig");
@@ -291,7 +292,6 @@ const WorkflowOptions = struct {
 
 const WriteFn = *const fn (?*anyopaque, []const u8) anyerror!void;
 const LoadStartupStateFn = *const fn (Allocator, oauth_transport.Provider, host.SecretStore, []const u8, usize) anyerror!app_lifecycle.StartupState;
-const LoadCatalogStartupStateFn = *const fn (Allocator, host.SecretStore, []const u8, usize) anyerror!app_lifecycle.StartupState;
 const LoadStartupStateWithoutCredentialsFn = *const fn (Allocator, []const u8, usize) anyerror!app_lifecycle.StartupState;
 const LoadStartupStatusFn = *const fn (Allocator, host.SecretStore, []const u8, usize) anyerror!app_lifecycle.StartupStatus;
 const GetenvFn = *const fn (?*anyopaque, []const u8) ?[]const u8;
@@ -308,7 +308,6 @@ const RunDeps = struct {
     write_stdout: WriteFn = writeRealStdout,
     write_stderr: WriteFn = writeRealStderr,
     load_startup_state: LoadStartupStateFn = app_lifecycle.loadStartupState,
-    load_catalog_startup_state: LoadCatalogStartupStateFn = app_lifecycle.loadCatalogStartupState,
     load_startup_state_without_credentials: LoadStartupStateWithoutCredentialsFn = app_lifecycle.loadStartupStateWithoutCredentials,
     load_startup_status: LoadStartupStatusFn = app_lifecycle.loadStartupStatus,
     getenv: GetenvFn = getenvDefault,
@@ -599,6 +598,34 @@ const ProviderActivationCaller = enum {
     provider_login,
 };
 
+const CliTeamValidationContext = struct {
+    alloc: Allocator,
+    cfg: *const Config,
+};
+
+fn validateCliTeamCredential(
+    raw: ?*anyopaque,
+    candidate: credentials.Credential,
+) std.mem.Allocator.Error!login_flow.TeamValidationResult {
+    const context: *CliTeamValidationContext = @ptrCast(@alignCast(raw.?));
+    const access = credentials.catalogAccessAt(candidate, io_mod.milliTimestamp());
+    if (access.authorizationCredential() == null) return .rejected;
+    const provider = context.cfg.provider_set.gateway.model_catalog orelse return .rejected;
+    const fetched = try provider.fetch(context.alloc, .{
+        .access = access,
+        .endpoint = context.cfg.models_path,
+        .view = .picker,
+    });
+    return switch (fetched) {
+        .failure => .rejected,
+        .catalog => |catalog_value| result: {
+            var catalog = catalog_value;
+            defer model_catalog.freeModelCatalog(context.alloc, &catalog);
+            break :result if (catalog.items.len > 0) .accepted else .rejected;
+        },
+    };
+}
+
 fn writeProviderActivationError(
     alloc: Allocator,
     deps: RunDeps,
@@ -620,6 +647,7 @@ fn activateProviderSelection(
     deps: RunDeps,
     target: model_provider.ProviderId,
     caller: ProviderActivationCaller,
+    exact_source: ?credentials.Source,
 ) !bool {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
     defer alloc.free(workspace_root);
@@ -630,18 +658,20 @@ fn activateProviderSelection(
     };
     defer settings.deinit(alloc);
 
-    var resolution = try credentials.resolveForProvider(
+    const preferred_source = exact_source orelse settings.credential_source;
+    var preparation = try auth_runtime.prepareCredential(
         alloc,
         cfg.gateway_provider.oauth_transport,
         cfg.secret_store,
-        .refresh_if_needed,
         target,
-        settings.credential_source,
+        preferred_source,
     );
-    defer if (resolution.credential) |*credential| credential.deinit(alloc);
+    defer preparation.deinit(alloc);
+    var prepared_credential = preparation.takeReady();
+    defer if (prepared_credential) |*credential| credential.deinit(alloc);
 
     const already_selected = (settings.provider orelse .gateway) == target;
-    if (caller == .provider_command and already_selected and resolution.credential != null) {
+    if (caller == .provider_command and already_selected and prepared_credential != null) {
         try writeStdout(deps, switch (target) {
             .gateway => "Gateway is already selected.\n",
             .codex => "Codex is already selected.\n",
@@ -651,40 +681,42 @@ fn activateProviderSelection(
     }
 
     var performed_login: ?model_provider.ProviderId = null;
-    if (resolution.credential == null and target == .codex and caller == .provider_command) {
+    if (prepared_credential == null and target == .codex and caller == .provider_command) {
         chatgpt_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener) catch |err| {
             debug_trace.logf("auth", "provider selection Codex login failed err={s}", .{@errorName(err)});
             try writeProviderActivationError(alloc, deps, caller, "Codex login failed");
             return false;
         };
         performed_login = .codex;
-        resolution = try credentials.resolveForProvider(
+        preparation.deinit(alloc);
+        preparation = try auth_runtime.prepareCredential(
             alloc,
             cfg.gateway_provider.oauth_transport,
             cfg.secret_store,
-            .refresh_if_needed,
             target,
-            settings.credential_source,
+            preferred_source,
         );
+        prepared_credential = preparation.takeReady();
     }
-    if (resolution.credential == null and target == .grok and caller == .provider_command) {
+    if (prepared_credential == null and target == .grok and caller == .provider_command) {
         grok_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener) catch |err| {
             debug_trace.logf("auth", "provider selection Grok login failed err={s}", .{@errorName(err)});
             try writeProviderActivationError(alloc, deps, caller, "Grok login failed");
             return false;
         };
         performed_login = .grok;
-        resolution = try credentials.resolveForProvider(
+        preparation.deinit(alloc);
+        preparation = try auth_runtime.prepareCredential(
             alloc,
             cfg.gateway_provider.oauth_transport,
             cfg.secret_store,
-            .refresh_if_needed,
             target,
-            settings.credential_source,
+            preferred_source,
         );
+        prepared_credential = preparation.takeReady();
     }
 
-    const credential = if (resolution.credential) |*value| value else {
+    const credential = if (prepared_credential) |*value| value else {
         try writeProviderActivationError(
             alloc,
             deps,
@@ -709,9 +741,25 @@ fn activateProviderSelection(
         .access = credentials.catalogAccessAt(credential.*, io_mod.milliTimestamp()),
         .endpoint = cfg.models_path,
         .view = .picker,
+        .allow_public_fallback = false,
     });
     var loaded = switch (fetch_result) {
-        .loaded => |loaded| loaded,
+        .loaded => |loaded| blk: {
+            if (loaded.provenance.access.level != .authenticated or
+                loaded.provenance.anonymous_fallback_used)
+            {
+                var rejected = loaded.catalog;
+                model_catalog.freeModelCatalog(alloc, &rejected);
+                try writeProviderActivationError(
+                    alloc,
+                    deps,
+                    caller,
+                    "target credential did not produce an authenticated model catalog",
+                );
+                return false;
+            }
+            break :blk loaded;
+        },
         .failed => |failure| {
             debug_trace.logf("catalog", "provider selection catalog failed provider={s} category={s}", .{ @tagName(target), @tagName(failure.failure.category) });
             const detail = try std.fmt.allocPrint(
@@ -733,6 +781,7 @@ fn activateProviderSelection(
     var attempt = config_runtime.attemptUserPreferences(alloc, .{
         .provider = target,
         .model_preference = .{ .provider = target, .model = selected_model },
+        .credential_source = exact_source,
     });
     defer attempt.deinit(alloc);
     switch (attempt) {
@@ -877,19 +926,31 @@ fn runNonInteractiveWithDeps(
             // Preserve the original `fx login` behavior for scripts and users.
             const login_provider = maybe_login_provider orelse .gateway;
             switch (login_provider) {
-                .gateway => login_flow.runLogin(
-                    alloc,
-                    cfg.gateway_provider.oauth_transport,
-                    cfg.url_opener,
-                ) catch |err| {
-                    const message = switch (err) {
-                        error.ClientIdMissing => "fx login: missing FX_OAUTH_CLIENT_ID; configure the fx Vercel App client id first\n",
-                        error.AccessDenied => "fx login: authorization denied\n",
-                        error.ExpiredToken, error.LoginTimedOut => "fx login: authorization expired; run fx login again\n",
-                        else => "fx login: failed to sign in\n",
+                .gateway => {
+                    login_flow.runLogin(
+                        alloc,
+                        cfg.gateway_provider.oauth_transport,
+                        cfg.url_opener,
+                    ) catch |err| {
+                        const message = switch (err) {
+                            error.ClientIdMissing => "fx login: missing FX_OAUTH_CLIENT_ID; configure the fx Vercel App client id first\n",
+                            error.AccessDenied => "fx login: authorization denied\n",
+                            error.ExpiredToken, error.LoginTimedOut => "fx login: authorization expired; run fx login again\n",
+                            else => "fx login: failed to sign in\n",
+                        };
+                        try writeStderr(deps, message);
+                        return .handled_failure;
                     };
-                    try writeStderr(deps, message);
-                    return .handled_failure;
+                    if (!try activateProviderSelection(
+                        alloc,
+                        cfg,
+                        deps,
+                        .gateway,
+                        .provider_login,
+                        .fx_login,
+                    )) return .handled_failure;
+                    try writeStdout(deps, "Signed in to Vercel.\n");
+                    try writeStdout(deps, "AI Gateway access may still require billing or API setup for the selected account.\n");
                 },
                 .codex => {
                     chatgpt_oauth.runLogin(
@@ -905,7 +966,7 @@ fn runNonInteractiveWithDeps(
                         try writeStderr(deps, message);
                         return .handled_failure;
                     };
-                    if (!try activateProviderSelection(alloc, cfg, deps, .codex, .provider_login)) {
+                    if (!try activateProviderSelection(alloc, cfg, deps, .codex, .provider_login, null)) {
                         return .handled_failure;
                     }
                     try writeStdout(deps, "Signed in with Codex.\n");
@@ -920,7 +981,7 @@ fn runNonInteractiveWithDeps(
                         try writeStderr(deps, "fx login: failed to sign in with Grok\n");
                         return .handled_failure;
                     };
-                    if (!try activateProviderSelection(alloc, cfg, deps, .grok, .provider_login)) {
+                    if (!try activateProviderSelection(alloc, cfg, deps, .grok, .provider_login, null)) {
                         return .handled_failure;
                     }
                     try writeStdout(deps, "Signed in with Grok.\n");
@@ -984,6 +1045,25 @@ fn runNonInteractiveWithDeps(
                     return .handled_failure;
                 },
             };
+            if (!result.local_durability_failed) {
+                var preference = config_runtime.attemptUserPreferences(
+                    alloc,
+                    .{ .clear_credential_source = true },
+                );
+                defer preference.deinit(alloc);
+                switch (preference) {
+                    .outcome => {},
+                    .failure => |failure| {
+                        debug_trace.logf(
+                            "auth",
+                            "logout credential preference clear failed err={s}",
+                            .{@errorName(failure.err)},
+                        );
+                        try writeStderr(deps, "fx logout: signed out, but failed to clear the saved fx login selection\n");
+                        return .handled_failure;
+                    },
+                }
+            }
             if (result.local_durability_failed) {
                 try writeStderr(deps, "fx logout: failed to durably remove saved fx login\n");
             } else {
@@ -1003,18 +1083,35 @@ fn runNonInteractiveWithDeps(
                 try writeStderr(deps, "usage: fx teams\n");
                 return .handled_failure;
             }
-            login_flow.runTeams(alloc, cfg.gateway_provider.oauth_transport) catch |err| {
+            var validation_context = CliTeamValidationContext{ .alloc = alloc, .cfg = &cfg };
+            login_flow.runTeams(
+                alloc,
+                cfg.gateway_provider.oauth_transport,
+                .{
+                    .context = &validation_context,
+                    .validate_fn = validateCliTeamCredential,
+                },
+            ) catch |err| {
                 const message = switch (err) {
                     error.NoSession => "fx teams: run fx login first\n",
                     error.SessionChanged => "fx teams: authentication changed; try again\n",
                     error.TeamRequestFailed => "fx teams: failed to list Vercel teams\n",
                     error.InvalidTeamSelection => "fx teams: no team selected\n",
                     error.AccessDenied => "fx teams: authorization denied\n",
+                    error.TeamValidationFailed => "fx teams: selected team could not access AI Gateway\n",
                     else => "fx teams: failed to switch team\n",
                 };
                 try writeStderr(deps, message);
                 return .handled_failure;
             };
+            if (!try activateProviderSelection(
+                alloc,
+                cfg,
+                deps,
+                .gateway,
+                .provider_login,
+                .fx_login,
+            )) return .handled_failure;
             return .handled_success;
         },
         .provider => |rest| {
@@ -1026,7 +1123,7 @@ fn runNonInteractiveWithDeps(
                 try writeStderr(deps, "fx provider: expected gateway, codex, or grok\n");
                 return .handled_failure;
             };
-            return if (try activateProviderSelection(alloc, cfg, deps, target, .provider_command))
+            return if (try activateProviderSelection(alloc, cfg, deps, target, .provider_command, null))
                 .handled_success
             else
                 .handled_failure;
@@ -1104,8 +1201,9 @@ fn runNonInteractiveWithDeps(
                 return .handled_failure;
             };
 
-            var startup = try deps.load_catalog_startup_state(
+            var startup = try deps.load_startup_state(
                 alloc,
+                cfg.gateway_provider.oauth_transport,
                 cfg.secret_store,
                 cfg.default_model,
                 cfg.default_agent_step_limit,
@@ -1125,6 +1223,7 @@ fn runNonInteractiveWithDeps(
             const loaded = switch (catalog_provider.fetch(alloc, .{
                 .access = catalog_access,
                 .endpoint = cfg.models_path,
+                .allow_public_fallback = startup.credential_source_preference == null,
             })) {
                 .loaded => |loaded| loaded,
                 .failure => |failure| {
@@ -4805,8 +4904,7 @@ test "runIfRequested model fetch failure is handled" {
     cfg.provider_set.gateway.cli_model_catalog = probe.provider();
 
     var deps = capture.deps();
-    deps.load_startup_state = failingStartupState;
-    deps.load_catalog_startup_state = stubLoadCatalogStartupState;
+    deps.load_startup_state = stubLoadStartupState;
 
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("models")}, cfg, deps);
     try std.testing.expectEqual(RunResult.handled_failure, result);
@@ -4824,7 +4922,7 @@ test "runIfRequested model fetch failure preserves json output" {
     cfg.provider_set.gateway.cli_model_catalog = probe.provider();
 
     var deps = capture.deps();
-    deps.load_catalog_startup_state = stubLoadCatalogStartupState;
+    deps.load_startup_state = stubLoadStartupState;
 
     const result = try runIfRequestedWithDeps(
         std.testing.allocator,
@@ -4848,7 +4946,7 @@ test "runIfRequested model provider cancellation is handled" {
     cfg.provider_set.gateway.cli_model_catalog = probe.provider();
 
     var deps = capture.deps();
-    deps.load_catalog_startup_state = stubLoadCatalogStartupState;
+    deps.load_startup_state = stubLoadStartupState;
 
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("models")}, cfg, deps);
     try std.testing.expectEqual(RunResult.handled_failure, result);
@@ -4866,7 +4964,7 @@ test "runIfRequested models passes startup team to fetch seam" {
     cfg.provider_set.gateway.cli_model_catalog = probe.provider();
 
     var deps = capture.deps();
-    deps.load_catalog_startup_state = stubLoadCatalogStartupState;
+    deps.load_startup_state = stubLoadStartupState;
 
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("models"), @constCast("--json") }, cfg, deps);
     try std.testing.expectEqual(RunResult.handled_success, result);
@@ -5358,15 +5456,6 @@ fn failingStartupStateWithoutCredentials(
     _: usize,
 ) !app_lifecycle.StartupState {
     return error.StartupShouldNotRun;
-}
-
-fn stubLoadCatalogStartupState(
-    alloc: Allocator,
-    secret_store: host.SecretStore,
-    default_model: []const u8,
-    default_agent_step_limit: usize,
-) !app_lifecycle.StartupState {
-    return stubLoadStartupState(alloc, oauth_transport.unavailable_provider, secret_store, default_model, default_agent_step_limit);
 }
 
 fn stubLoadStartupStatus(

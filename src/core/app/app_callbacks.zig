@@ -5,6 +5,7 @@ const command_admission = @import("../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
+const secret = @import("../auth/secret.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
@@ -377,13 +378,26 @@ pub fn Bindings(comptime App: type) type {
             expected_account_id: ?[]const u8,
         ) !?[]u8 {
             const app: *App = @ptrCast(@alignCast(raw_ctx));
-            return auth_runtime.refreshCredentialTokenForAccount(
+            var refreshed = (try auth_runtime.refreshCredentialForAccount(
                 app.auth.oauthTransport(),
-                alloc,
+                std.heap.c_allocator,
                 source,
                 mode,
                 expected_account_id,
-            );
+            )) orelse return null;
+            var owns_refreshed = true;
+            defer if (owns_refreshed) refreshed.deinit(std.heap.c_allocator);
+            if (app.auth.preparedCredentialChange(refreshed) == .authority) {
+                return error.CredentialAuthorityChanged;
+            }
+
+            const worker_token = try alloc.dupe(u8, refreshed.token);
+            errdefer secret.zeroAndFree(alloc, worker_token);
+            try app_worker_runtime.Runtime(App).pushOwnedEvent(app, .{
+                .credential_refreshed = refreshed,
+            });
+            owns_refreshed = false;
+            return worker_token;
         }
 
         pub fn modelCapabilityResolver(app: *App) model_capabilities.Resolver {
@@ -415,6 +429,7 @@ pub fn Bindings(comptime App: type) type {
                 .drain_assistant_text = workerBridgeDrainAssistantText,
                 .open_model_picker = workerBridgeOpenModelPicker,
                 .semantic_notice = workerBridgeSemanticNotice,
+                .credential_refreshed = workerBridgeCredentialRefreshed,
                 .command_output = workerBridgeCommandOutput,
                 .command_output_complete = workerBridgeCommandOutputComplete,
                 .diff_block = workerBridgeDiffBlock,
@@ -882,11 +897,19 @@ pub fn Bindings(comptime App: type) type {
             else
                 try gateway_error_format.formatHttpErrorMessage(std.heap.c_allocator, status, detail);
             defer std.heap.c_allocator.free(message);
-            const label = if (auth_failure != null)
+            const label = if (auth_failure) |failure|
                 try std.fmt.allocPrint(
                     std.heap.c_allocator,
-                    "⚠ {s} · Run /setup to choose another source.",
-                    .{message},
+                    "⚠ {s} · {s}",
+                    .{
+                        message,
+                        switch (failure.source) {
+                            .fx_login => "Run /login to repair this source.",
+                            .chatgpt_subscription => "Reconnect Codex through /login to repair this source.",
+                            .grok_subscription => "Reconnect Grok through /login to repair this source.",
+                            .vercel_oidc_token, .ai_gateway_api_key, .stored_key => "Run /setup to repair this source.",
+                        },
+                    },
                 )
             else
                 try std.fmt.allocPrint(std.heap.c_allocator, "⚠ {s}", .{message});
@@ -1054,6 +1077,20 @@ pub fn Bindings(comptime App: type) type {
         fn workerBridgeSemanticNotice(ctx: *anyopaque, notice: types.SemanticNotice) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try app.writeDomainNotice(notice, true);
+        }
+
+        fn workerBridgeCredentialRefreshed(
+            ctx: *anyopaque,
+            credential: credentials.Credential,
+        ) !void {
+            if (comptime !@hasField(App, "auth")) return;
+            const app: *App = @ptrCast(@alignCast(ctx));
+            var owned = try credential.clone(app.alloc);
+            defer owned.deinit(app.alloc);
+            if (app.auth.preparedCredentialChange(owned) == .authority) {
+                return error.CredentialAuthorityChanged;
+            }
+            _ = app.auth.adoptPreparedCredential(app.alloc, &owned);
         }
 
         fn workerBridgeCommandOutput(
@@ -1692,6 +1729,41 @@ const NoOverridePersistentApp = struct {
         return false;
     }
 };
+
+const CredentialRefreshApp = struct {
+    alloc: std.mem.Allocator = std.testing.allocator,
+    auth: auth_runtime.Runtime = .{},
+
+    fn deinit(self: *CredentialRefreshApp) void {
+        self.auth.deinit(self.alloc);
+    }
+};
+
+test "worker credential publication adopts secret rotation on the app owner" {
+    const alloc = std.testing.allocator;
+    var app: CredentialRefreshApp = .{};
+    defer app.deinit();
+    var initial = credentials.Credential{
+        .token = try alloc.dupe(u8, "stale-token"),
+        .source = .fx_login,
+        .team_id = try alloc.dupe(u8, "team_123"),
+        .refresh_after_ms = 10,
+    };
+    defer initial.deinit(alloc);
+    _ = app.auth.adoptCredential(alloc, &initial);
+
+    var refreshed = credentials.Credential{
+        .token = try alloc.dupe(u8, "fresh-token"),
+        .source = .fx_login,
+        .team_id = try alloc.dupe(u8, "team_123"),
+        .refresh_after_ms = std.math.maxInt(i64),
+    };
+    defer refreshed.deinit(alloc);
+    try Bindings(CredentialRefreshApp).workerBridgeCredentialRefreshed(&app, refreshed);
+
+    try std.testing.expectEqualStrings("fresh-token", app.auth.apiKey().?);
+    try std.testing.expectEqualStrings("team_123", app.auth.gatewayTeam().?);
+}
 
 test "agent deps forward app callbacks through core types" {
     var app = FakeApp.init(std.testing.allocator);

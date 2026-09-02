@@ -502,6 +502,8 @@ pub const FakeAgentRuntimeDeps = struct {
     last_validated_arguments: ?[]u8 = null,
     last_permission_arguments: ?[]u8 = null,
     last_executed_arguments: ?[]u8 = null,
+    last_permission_credential: ?[]u8 = null,
+    last_execute_credential: ?[]u8 = null,
     last_execute_root_user_intent_context: ?[]u8 = null,
     last_execute_root_user_messages: std.ArrayList([]u8) = .empty,
     last_execute_root_user_evidence_complete: bool = false,
@@ -644,7 +646,7 @@ pub const FakeAgentRuntimeDeps = struct {
     credential_refresh_sources: std.ArrayList(types.CredentialSource) = .empty,
     credential_refresh_modes: std.ArrayList(runtime_deps.CredentialRefreshMode) = .empty,
     credential_refresh_error: ?anyerror = null,
-    last_credential_refresh_expected_account: ?[]const u8 = null,
+    last_credential_refresh_expected_account: ?[]u8 = null,
     enable_interactive_notices: bool = false,
     enable_recovery_checkpoint: bool = false,
     recovery_checkpoints: std.ArrayList(session_codec.RecoveryCheckpoint) = .empty,
@@ -689,6 +691,8 @@ pub const FakeAgentRuntimeDeps = struct {
         if (self.last_validated_arguments) |value| self.alloc.free(value);
         if (self.last_permission_arguments) |value| self.alloc.free(value);
         if (self.last_executed_arguments) |value| self.alloc.free(value);
+        if (self.last_permission_credential) |value| self.alloc.free(value);
+        if (self.last_execute_credential) |value| self.alloc.free(value);
         if (self.last_execute_root_user_intent_context) |value| self.alloc.free(value);
         freeStringList(self.alloc, &self.last_execute_root_user_messages);
         freeGrantList(self.alloc, &self.propagated_grants);
@@ -714,6 +718,7 @@ pub const FakeAgentRuntimeDeps = struct {
         freeStringList(self.alloc, &self.capability_queries);
         self.credential_refresh_sources.deinit(self.alloc);
         self.credential_refresh_modes.deinit(self.alloc);
+        if (self.last_credential_refresh_expected_account) |value| self.alloc.free(value);
         for (self.recovery_checkpoints.items) |*checkpoint| checkpoint.deinit(self.alloc);
         self.recovery_checkpoints.deinit(self.alloc);
     }
@@ -834,7 +839,11 @@ pub const FakeAgentRuntimeDeps = struct {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         try self.credential_refresh_sources.append(self.alloc, source);
         try self.credential_refresh_modes.append(self.alloc, mode);
-        self.last_credential_refresh_expected_account = expected_account_id;
+        if (self.last_credential_refresh_expected_account) |value| self.alloc.free(value);
+        self.last_credential_refresh_expected_account = if (expected_account_id) |account_id|
+            try self.alloc.dupe(u8, account_id)
+        else
+            null;
         if (self.credential_refresh_error) |err| return err;
         if (self.credential_refresh_index >= self.credential_refresh_tokens.len) return null;
         const token = self.credential_refresh_tokens[self.credential_refresh_index];
@@ -1061,6 +1070,11 @@ pub const FakeAgentRuntimeDeps = struct {
         try self.permission_review_pending_call_counts.append(
             self.alloc,
             review_turn.pending_assistant.tool_calls.len,
+        );
+        if (self.last_permission_credential) |value| self.alloc.free(value);
+        self.last_permission_credential = try self.alloc.dupe(
+            u8,
+            review_turn.credential.secret,
         );
         if (self.last_permission_arguments) |value| self.alloc.free(value);
         self.last_permission_arguments = try self.alloc.dupe(u8, call.arguments_json);
@@ -1348,6 +1362,8 @@ pub const FakeAgentRuntimeDeps = struct {
             );
             if (self.last_executed_arguments) |value| self.alloc.free(value);
             self.last_executed_arguments = try self.alloc.dupe(u8, call.arguments_json);
+            if (self.last_execute_credential) |value| self.alloc.free(value);
+            self.last_execute_credential = try self.alloc.dupe(u8, request.credential.secret);
             if (self.last_execute_root_user_intent_context) |value| self.alloc.free(value);
             self.last_execute_root_user_intent_context = try self.alloc.dupe(
                 u8,

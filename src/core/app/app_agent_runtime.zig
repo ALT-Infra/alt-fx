@@ -605,6 +605,7 @@ pub fn Runtime(comptime App: type) type {
             gateway_chat_url: []const u8,
         ) !command_admission.PermissionOutcome {
             var ctx = tool_runtime.withAdvertisedDynamicToolNames(toolContext(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), advertised_dynamic_tool_names);
+            applyCredentialLease(app, &ctx, review_turn.credential, gateway_retry_count, gateway_chat_url);
             ctx.permission_review_turn = review_turn;
             const admission = ctx.admissionInputWithLiveAuthority(live_authority);
             return if (revalidation) |request| switch (request) {
@@ -659,6 +660,7 @@ pub fn Runtime(comptime App: type) type {
                 ),
                 advertised_dynamic_tool_names,
             );
+            applyCredentialLease(app, &ctx, review_turn.credential, gateway_retry_count, gateway_chat_url);
             ctx.permission_review_turn = review_turn;
             const admission = ctx.admissionInputWithLiveAuthority(live_authority);
             return tool_admission.requestPreparedFileMutationPermissionOutcome(
@@ -734,6 +736,7 @@ pub fn Runtime(comptime App: type) type {
             gateway_chat_url: []const u8,
         ) !agent_runtime.ToolExecutionResult {
             var ctx = toolContext(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url);
+            applyCredentialLease(app, &ctx, request.credential, gateway_retry_count, gateway_chat_url);
             ctx.root_user_intent_context = request.root_user_intent_context;
             ctx.root_user_messages = request.root_user_messages;
             ctx.root_user_evidence_complete = request.root_user_evidence_complete;
@@ -741,6 +744,35 @@ pub fn Runtime(comptime App: type) type {
             ctx.advertised_dynamic_tool_names = request.advertised_dynamic_tool_names;
             ctx.max_tool_result_bytes = request.max_tool_result_bytes;
             return tool_runtime.executeToolCallAuthorized(ctx, request);
+        }
+
+        fn applyCredentialLease(
+            app: *App,
+            ctx: *tool_runtime.Context,
+            credential: types.CredentialLease,
+            gateway_retry_count: usize,
+            gateway_chat_url: []const u8,
+        ) void {
+            if (credential.secret.len == 0) return;
+            ctx.api_key = credential.secret;
+            ctx.credential_source = credential.source;
+            ctx.account_id = credential.account_id;
+            ctx.gateway_team = credential.tenant;
+            if (comptime @hasField(App, "web_search_runtime") and @hasField(App, "session")) {
+                if (ctx.provider_capabilities.fx_search) {
+                    app.web_search_runtime.configure(.{
+                        .api_key = credential.secret,
+                        .credential_source = credential.source,
+                        .gateway_team = credential.tenant,
+                        .worker_model = provider_runtime.model(app),
+                        .gateway_retry_count = gateway_retry_count,
+                        .gateway_chat_url = gateway_chat_url,
+                        .usage = &app.session.usage,
+                        .usage_allocator = app.alloc,
+                    });
+                    ctx.web_search_backend = app.web_search_runtime.dispatchBackend();
+                }
+            }
         }
 
         pub fn appendStaticContextMessage(

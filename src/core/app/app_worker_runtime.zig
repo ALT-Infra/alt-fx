@@ -1,4 +1,5 @@
 const std = @import("std");
+const credentials = @import("../auth/credentials.zig");
 const activity_status = @import("../output/activity_status.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -55,6 +56,7 @@ fn discardCodeBlock(_: *anyopaque, block: assistant_presentation.CodeBlockPayloa
 }
 
 fn discardThematicRule(_: *anyopaque) !void {}
+fn discardCredentialRefresh(_: *anyopaque, _: credentials.Credential) !void {}
 
 pub const WorkerEventHandlers = struct {
     ctx: *anyopaque,
@@ -68,6 +70,7 @@ pub const WorkerEventHandlers = struct {
     drain_assistant_text: *const fn (*anyopaque) anyerror!AssistantTextDrainResult,
     open_model_picker: *const fn (*anyopaque) anyerror!void,
     semantic_notice: *const fn (*anyopaque, types.SemanticNotice) anyerror!void,
+    credential_refreshed: *const fn (*anyopaque, credentials.Credential) anyerror!void = discardCredentialRefresh,
     command_output: *const fn (*anyopaque, ?types.ToolLifecycleId, command_output_content.Stream, []const u8) anyerror!void,
     command_output_complete: *const fn (*anyopaque, ?types.ToolLifecycleId) anyerror!void,
     diff_block: *const fn (*anyopaque, diff_mod.DiffEntryPayload) anyerror!void,
@@ -215,6 +218,7 @@ pub fn Runtime(comptime App: type) type {
                 .question_requested,
                 .clear_route_recovery_status,
                 .api_status_text,
+                .credential_refreshed,
                 .finish_prompt,
                 .session_grant,
                 .error_text,
@@ -813,6 +817,9 @@ pub fn Runtime(comptime App: type) type {
                         resetStream(app, false);
                         app.shell.worker_status_state().set_api(text, .danger);
                         app.shell.render_requests.request(.footer);
+                    },
+                    .credential_refreshed => |credential| {
+                        try handlers.credential_refreshed(handlers.ctx, credential);
                     },
                     .command_output => |chunk| {
                         try handlers.command_output(handlers.ctx, chunk.lifecycle_id, chunk.stream, chunk.text);

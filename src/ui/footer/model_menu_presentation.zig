@@ -403,6 +403,7 @@ fn loadedCatalogStatusText(state: model_cache_runtime.ModelMenuCatalogState) ?[]
             .no_credential => "Using the public model catalog; sign in or use an API key for team-private models.",
             .fx_login_team_required => "Choose a Vercel team to load its private models.",
             .fx_login_refresh_required => "Vercel sign-in must refresh before team-private models can load.",
+            .credential_refresh_required => "The selected sign-in must refresh before authenticated models can load.",
             .credential_refresh_failed => "Vercel sign-in refresh failed; using the public model catalog.",
             .authenticated_credential_rejected => "Your Gateway credential was rejected; using the public model catalog.",
             .chatgpt_subscription => "Codex models require an authenticated Codex catalog.",
