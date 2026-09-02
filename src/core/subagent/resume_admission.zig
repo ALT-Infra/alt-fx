@@ -246,23 +246,18 @@ pub fn resumeForExternalPrompt(
     workspace_root: []const u8,
     options: session_store.ResumeOptions,
 ) !session_store.LoadedWritableSession {
-    var selected: ?session_store.SessionSummary = switch (target) {
-        .id => null,
-        .last => try latestVisibleWorkspaceSummary(store, alloc),
-    };
-    defer if (selected) |*summary| summary.deinit(alloc);
-    const external_target: session_store.ResumeTarget = if (selected) |summary|
-        .{ .id = summary.id }
-    else
-        target;
-    try ensureExternalMarkerAllowed(store, alloc, external_target.id);
+    switch (target) {
+        .id => |session_id| try ensureExternalMarkerAllowed(store, alloc, session_id),
+        .last => {},
+    }
     var loaded = try store.resumeTargetForWrite(
         alloc,
-        external_target,
+        target,
         workspace_root,
         options,
     );
     errdefer loaded.deinit(alloc);
+    try ensureExternalMarkerAllowed(store, alloc, loaded.active_id);
     try ensureLoadedExternalPromptAllowed(&loaded);
     return loaded;
 }
@@ -272,19 +267,11 @@ pub fn admitResumeViewForExternalPrompt(
     alloc: Allocator,
     target: session_store.ResumeTarget,
 ) !?session_store.ResumeViewAdmission {
-    var selected: ?session_store.SessionSummary = switch (target) {
-        .id => null,
-        .last => latestVisibleWorkspaceSummary(store, alloc) catch |err| switch (err) {
-            error.NoSavedSessions => return null,
-            else => return err,
-        },
-    };
-    defer if (selected) |*summary| summary.deinit(alloc);
-    const external_target: session_store.ResumeTarget = if (selected) |summary|
-        .{ .id = summary.id }
-    else
-        target;
-    var admission = (try store.admitResumeView(alloc, external_target)) orelse return null;
+    switch (target) {
+        .id => |session_id| try ensureExternalMarkerAllowed(store, alloc, session_id),
+        .last => {},
+    }
+    var admission = (try store.admitResumeView(alloc, target)) orelse return null;
     errdefer admission.deinit(alloc);
     try ensureExternalPromptAllowed(store, alloc, admission.sessionId());
     return admission;
