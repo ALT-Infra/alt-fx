@@ -312,6 +312,28 @@ test "read_tool_result admission restores only omitted stored-result suffixes" {
     }
 }
 
+test "read_tool_result admission treats an empty query as a range read" {
+    const alloc = std.testing.allocator;
+    const decoded = try decode(
+        .{ .allocator = alloc },
+        "{\"handle\":\"result-read_file-1705079ba6e278c4-553514ccf082aeb9.txt\",\"start_byte\":2,\"byte_count\":9,\"query\":\"\"}",
+    );
+    const input = switch (decoded) {
+        .input => |value| value,
+        .failure => return error.TestUnexpectedDecodeFailure,
+    };
+    defer input.deinit(alloc);
+    try std.testing.expect((try validate(.{ .allocator = alloc }, input)) == null);
+    const typed = input.as(Input);
+    switch (typed.selector) {
+        .range => |range| {
+            try std.testing.expectEqual(@as(usize, 2), range.start_byte);
+            try std.testing.expectEqual(@as(usize, 9), range.byte_count);
+        },
+        .query => return error.TestUnexpectedQuery,
+    }
+}
+
 test "unknown read_tool_result handle returns failure for legacy and managed stores" {
     const alloc = std.testing.allocator;
     const expected = "read_tool_result failed for handle unknown-dogfood-handle: ResultHandleNotFound. No exact match exists in the active tool-result store; handles are session-scoped and must be copied exactly from the tool result preview.";

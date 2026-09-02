@@ -2113,11 +2113,15 @@ fn FixedPointTranscriptContext(comptime App: type) type {
                 self.presentation_shell.committed_frame_layout.transcript_area,
                 candidate_plan.invalidation,
             );
-            const target = try self.presentation_shell.resolveTranscriptTransitionTargetForFrame(
+            const target = try self.presentation_shell.resolveTranscriptTransitionTargetForFrameInArea(
                 self.app.alloc,
                 source,
                 prepared,
                 render_engine.frame_layout.CommittedLayoutSnapshot.fromLayout(candidate),
+                transcriptAreaBeforePendingTail(
+                    candidate.transcript_area,
+                    self.pending_tail_rows,
+                ),
                 scroll_plan,
                 scroll_facts,
                 destructive_invalidation,

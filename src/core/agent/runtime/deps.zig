@@ -6,6 +6,7 @@ const session_codec = @import("../../session/session_codec.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
+const provider_set = @import("../../gateway/provider_set.zig");
 const types = @import("../../shared/types.zig");
 const worker_runtime = @import("../worker_runtime.zig");
 const file_mutation = @import("../../tooling/file_mutation.zig");
@@ -32,6 +33,13 @@ pub const LiveToolAuthority = tool_contracts.LiveToolAuthority;
 
 pub const RecoveryCheckpointEffect = struct {
     set: *const fn (ctx: *anyopaque, checkpoint: session_codec.RecoveryCheckpoint) anyerror!void,
+};
+
+pub const ContextCompactionCommitEffect = struct {
+    commit: *const fn (
+        ctx: *anyopaque,
+        summary: types.CompactedSummaryHistoryTurn,
+    ) anyerror!void,
 };
 
 pub const LiveToolAuthorityDecision = enum {
@@ -167,6 +175,7 @@ pub const DiffMarkerStyles = struct {
 pub const AgentRuntimeDeps = struct {
     ctx: *anyopaque,
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
+    compaction_route: provider_set.CompactionRouteDecision = .{ .unavailable = .missing_policy },
     flush_assistant_stream_per_content_chunk: bool = false,
     cooperative_transport_pulse: ?agent_stream_provider.CooperativePulse = null,
     tool_registry: tool_dispatch.Registry = .{},
@@ -205,6 +214,7 @@ pub const AgentRuntimeDeps = struct {
     publish_committed_file_handoff: *const fn (ctx: *anyopaque, handoff: file_mutation.CommittedFileHandoff) tool_contracts.SecondaryPublicationReport,
     publish_deferred_tool_completion: ?*const fn (ctx: *anyopaque, completion: DeferredToolCompletion) TransportPublicationOutcome = null,
     propagate_history_turn: *const fn (ctx: *anyopaque, turn: HistoryTurn) anyerror!void,
+    commit_context_compaction: ?ContextCompactionCommitEffect = null,
     recovery_checkpoint: ?RecoveryCheckpointEffect = null,
     propagate_grant: *const fn (ctx: *anyopaque, tool_name: []const u8, target_path: []const u8) anyerror!void,
     push_event: *const fn (ctx: *anyopaque, event: WorkerEvent) anyerror!void,

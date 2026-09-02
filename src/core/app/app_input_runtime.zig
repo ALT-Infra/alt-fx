@@ -561,7 +561,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn terminalDecodeContext(
-            app: *const App,
+            app: *App,
             paste_active: bool,
         ) input_action.TerminalDecodeContext {
             if (paste_active) {
@@ -575,7 +575,7 @@ pub fn Runtime(comptime App: type) type {
             return .{
                 .now_ms = io_mod.milliTimestamp(),
                 .paste_active = false,
-                .cancel_pending = app.stream.active,
+                .cancel_pending = interrupt_rt.hasActiveOperation(app),
                 .question_freeform_selected = app.question_prompt.isFreeformSelected(),
             };
         }
@@ -1595,7 +1595,7 @@ pub fn Runtime(comptime App: type) type {
 
             debug_trace.logf("input", "ctrl_c_exit_hint_armed", .{});
 
-            if (app.stream.active) {
+            if (interrupt_rt.hasActiveOperation(app)) {
                 try interrupt_rt.cancelActiveOperation(app);
                 app.shell.render_requests.request(.footer);
                 return;

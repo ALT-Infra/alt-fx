@@ -12,9 +12,6 @@ const stream_provider = @import("../stream_provider.zig");
 
 const ReasoningEffort = types.ReasoningEffort;
 
-pub const default_history_context_budget_tokens: usize = 24_000;
-pub const history_context_budget_window_divisor: usize = 4;
-
 /// Who owns the prompt driving this run. A root turn's prompt is real user
 /// input; a subagent turn's prompt is assistant-authored delegation and can
 /// never establish user authorization for the automatic reviewer.

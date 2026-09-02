@@ -2744,23 +2744,6 @@ pub fn Runtime(comptime App: type) type {
             return .committed;
         }
 
-        pub fn compactHistory(app: *App) !void {
-            const previous_start = app.session.contextHistoryStart();
-            app.session.forceCompaction();
-            if (app.session.contextHistoryStart() == previous_start) return;
-
-            commitJsHostSnapshot(app, "compaction");
-
-            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
-            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
-            const loaded = if (app.session_persistence.writable) |*value|
-                value
-            else
-                return;
-            try convergeDegraded(app, loaded, .{});
-            try commitCurrentStateReplacement(app, loaded, .compaction, .{}, false);
-        }
-
         pub fn commitRuntimePreferences(
             app: *App,
             patch: SessionPreferencePatch,

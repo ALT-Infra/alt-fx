@@ -34,6 +34,7 @@ const CodexLimits = struct {
 
 pub const agent_stream_provider = stream_provider.Provider{
     .stream_fn = streamCompletion,
+    .build_request_fn = buildRequestForProvider,
 };
 
 fn validateModel(model: []const u8) !void {
@@ -108,6 +109,14 @@ pub fn buildRequest(
     return out.toOwnedSlice();
 }
 
+fn buildRequestForProvider(
+    _: ?*anyopaque,
+    alloc: Allocator,
+    request: stream_provider.RequestData,
+) anyerror![]u8 {
+    return buildRequest(alloc, request);
+}
+
 fn writeResponsesInput(
     writer: *std.Io.Writer,
     alloc: Allocator,
@@ -138,14 +147,39 @@ fn streamCompletion(
         return stream_provider.failResult(error.CodexSubscriptionCredentialRequired);
     }
     try validateModel(request.model);
-    const payload = try buildRequest(alloc, request.data());
-    defer alloc.free(payload);
-    return streamPrepared(alloc, request, payload) catch |err| {
+    const payload = request.prepared_request_body orelse
+        try buildRequest(alloc, request.data());
+    defer if (request.prepared_request_body == null) alloc.free(payload);
+    var operation = PreparedStreamOperation{
+        .alloc = alloc,
+        .request = request,
+        .payload = payload,
+    };
+    return (if (request.deadline) |deadline|
+        gateway_client.runBoundedHttpOperation(
+            stream_provider.Result,
+            alloc,
+            request.cancel_flag,
+            deadline,
+            &operation,
+        )
+    else
+        operation.run()) catch |err| {
         if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
         request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(err, request.delivery.load());
         return err;
     };
 }
+
+const PreparedStreamOperation = struct {
+    alloc: Allocator,
+    request: stream_provider.ModelRequest,
+    payload: []const u8,
+
+    pub fn run(self: *@This()) !stream_provider.Result {
+        return streamPrepared(self.alloc, self.request, self.payload);
+    }
+};
 
 const OpenedRequest = struct {
     request: ?std.http.Client.Request,

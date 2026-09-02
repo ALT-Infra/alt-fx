@@ -338,6 +338,10 @@ const AcpContext = struct {
             .max_tool_result_bytes = session.max_tool_result_bytes,
             .api_key = session.api_key,
             .agent_stream_provider = server.streamProviderFor(self.state, session.provider),
+            .compaction_route = self.state.cfg.provider_set.compactionRoute(
+                session.provider,
+                session.credential_source,
+            ),
             .credential_source = session.credential_source,
             .account_id = session.account_id,
             .provider = session.provider,
@@ -773,7 +777,7 @@ pub fn handlePrompt(
     if (explicit_skills.diagnostic_notice) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
 
     session.session_rt.setConversationLanguageFromUserMessage(owned_prompt);
-    const context_history = try session.session_rt.snapshotContextHistory(alloc);
+    const context_history = try session.session_rt.snapshotHistory(alloc);
     defer types.freeHistoryTurnSlice(alloc, context_history);
     var context_snapshot = try state.context_snapshot.dupe(alloc);
     defer context_snapshot.deinit(alloc);
@@ -801,6 +805,8 @@ pub fn handlePrompt(
         .gateway_team = state.gateway_team,
         .permission_mode = captured_permission_mode,
         .history = context_history,
+        .context_history_start = session.session_rt.contextHistoryStart(),
+        .unversioned_history_count = session.session_rt.unversionedHistoryEnd(),
         .root_user_intent_context = root_user_intent_context,
         .grants = session.session_grants,
         .context_snapshot = context_snapshot,
@@ -1311,6 +1317,10 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
     return .{
         .ctx = @ptrCast(ctx),
         .agent_stream_provider = server.streamProviderFor(ctx.state, ctx.state.active_session.?.provider),
+        .compaction_route = ctx.state.cfg.provider_set.compactionRoute(
+            ctx.state.active_session.?.provider,
+            ctx.state.active_session.?.credential_source,
+        ),
         .flush_assistant_stream_per_content_chunk = host_target.is_wasm,
         .tool_registry = ctx.toolRegistry(),
         .context_registry = ctx.state.cfg.context_registry,

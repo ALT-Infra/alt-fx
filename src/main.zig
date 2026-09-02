@@ -162,6 +162,7 @@ const ToolPermissionDecision = types.ToolPermissionDecision;
 const PermissionGrant = types.PermissionGrant;
 const PermissionEngine = permissions.PermissionEngine;
 const QueuedPrompt = worker_runtime.QueuedPrompt;
+const WorkItem = worker_runtime.WorkItem;
 const WorkerRuntime = worker_runtime.WorkerRuntime;
 const SessionRuntime = session_runtime.SessionRuntime;
 const PromptHistoryRuntime = prompt_history_runtime.PromptHistoryRuntime;
@@ -1430,7 +1431,7 @@ const App = struct {
         );
         errdefer types.freeImageAttachmentSlice(std.heap.c_allocator, authorized_image_catalog);
 
-        const history_copy = try self.session.snapshotContextHistory(std.heap.c_allocator);
+        const history_copy = try self.session.snapshotHistory(std.heap.c_allocator);
         errdefer types.freeHistoryTurnSlice(std.heap.c_allocator, history_copy);
         const root_user_intent_context = try auto_classifier_context.buildCanonicalRootUserContext(
             std.heap.c_allocator,
@@ -1493,6 +1494,8 @@ const App = struct {
             .account_id = account_id_copy,
             .permission_mode = self.permission_engine.mode,
             .history = history_copy,
+            .context_history_start = self.session.contextHistoryStart(),
+            .unversioned_history_count = self.session.unversionedHistoryEnd(),
             .root_user_intent_context = root_user_intent_context,
             .grants = grants_copy,
             .skill_bindings = skill_bindings,
@@ -1503,6 +1506,45 @@ const App = struct {
             .recovery_source_already_presented = recovery_checkpoint != null,
             .user_prompt_already_presented = user_prompt_already_presented,
         };
+    }
+
+    pub fn enqueueContextCompaction(self: *App) !bool {
+        if (self.worker.isProcessing() or self.worker.queuedPromptCount() > 0) return false;
+        const selection = self.provider_selection.selection();
+        const model = try std.heap.c_allocator.dupe(u8, selection.model);
+        errdefer std.heap.c_allocator.free(model);
+        const credential = self.auth.gatewayCredential() orelse return error.MissingApiKey;
+        const api_key = try std.heap.c_allocator.dupe(u8, credential.api_key);
+        errdefer secret.zeroAndFree(std.heap.c_allocator, api_key);
+        const gateway_team = if (credential.gateway_team) |team|
+            try std.heap.c_allocator.dupe(u8, team)
+        else
+            null;
+        errdefer if (gateway_team) |team| std.heap.c_allocator.free(team);
+        const account_id = if (self.auth.accountId()) |id|
+            try std.heap.c_allocator.dupe(u8, id)
+        else
+            null;
+        errdefer if (account_id) |id| std.heap.c_allocator.free(id);
+        const history = try self.session.snapshotHistory(std.heap.c_allocator);
+        errdefer types.freeHistoryTurnSlice(std.heap.c_allocator, history);
+
+        try self.worker.enqueueContextCompaction(.{
+            .model = model,
+            .provider = selection.provider,
+            .api_key = api_key,
+            .gateway_team = gateway_team,
+            .credential_source = credential.source,
+            .account_id = account_id,
+            .history = history,
+            .unversioned_history_count = self.session.unversionedHistoryEnd(),
+        });
+        HerdrAppRuntime.reportWorking(self);
+        return true;
+    }
+
+    pub fn hasContextToCompact(self: *const App) bool {
+        return self.session.hasContextToCompact();
     }
 
     pub fn installInitialMcpRuntime(self: *App, runtime: ?*mcp_runtime_mod.McpRuntime) void {
@@ -2195,13 +2237,21 @@ const App = struct {
         }
     }
 
-    pub fn processQueuedPrompt(self: *App, job: QueuedPrompt) !void {
-        AgentAppRuntime.processQueuedPrompt(
-            self,
-            job,
-            builtin_gateway.retry_count,
-            builtin_gateway.defaultChatUrl(),
-        ) catch |err| {
+    pub fn processQueuedWork(self: *App, work: WorkItem) !void {
+        const result = switch (work) {
+            .prompt => |job| AgentAppRuntime.processQueuedPrompt(
+                self,
+                job,
+                builtin_gateway.retry_count,
+                builtin_gateway.defaultChatUrl(),
+            ),
+            .compact_context => |task| AgentAppRuntime.processContextCompaction(
+                self,
+                task,
+                builtin_gateway.retry_count,
+            ),
+        };
+        result catch |err| {
             if (err == error.TurnFinalizationDeliveryFailed) return;
             return err;
         };
