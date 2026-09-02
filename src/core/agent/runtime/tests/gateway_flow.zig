@@ -4006,6 +4006,40 @@ test "processQueuedPrompt retries replay-safe provider errors before success" {
     try expectRouteStatus(&hooks, 4, .auto_recovered, "✓ recovered · succeeded on attempt 3/3");
 }
 
+test "processQueuedPrompt pauses gateway stream timeout without retry" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{
+        .finish_reason = .provider_error,
+        .provider_failure_cause = .gateway_stream_timeout,
+        .provider_failure_detail = "gateway_stream_timeout: stream exceeded maximum duration",
+    }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.enable_recovery_checkpoint = true;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.paused, hooks.finalized_outcome.?);
+    try std.testing.expect(hooks.recovery_checkpoints.items.len > 0);
+    const checkpoint = hooks.recovery_checkpoints.items[hooks.recovery_checkpoints.items.len - 1];
+    try std.testing.expectEqual(
+        types.ModelRecoveryCause.provider_stream_timeout,
+        checkpoint.cause,
+    );
+    try std.testing.expectEqual(@as(usize, 1), checkpoint.consumed_provider_attempts);
+    try std.testing.expect(!checkpoint.outstanding_reservation);
+    try expectRouteStatus(
+        &hooks,
+        0,
+        .terminal_provider_error,
+        "⚠ Gateway stream timed out · gateway_stream_timeout: stream exceeded maximum duration · automatic retry paused · attempt 1/10",
+    );
+}
+
 test "processQueuedPrompt keeps recovery system last after post-tool provider error" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"a\"}")};

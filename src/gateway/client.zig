@@ -2536,6 +2536,43 @@ fn jsonValueString(value: std.json.Value) ?[]const u8 {
     return if (value == .string and value.string.len > 0) value.string else null;
 }
 
+fn isGatewayStreamTimeoutCode(value: std.json.Value) bool {
+    const text = jsonValueString(value) orelse return false;
+    return std.mem.eql(u8, text, "gateway_stream_timeout");
+}
+
+fn objectHasGatewayStreamTimeout(object: std.json.ObjectMap) bool {
+    if (object.get("code")) |value| {
+        if (isGatewayStreamTimeoutCode(value)) return true;
+    }
+    if (object.get("type")) |value| {
+        if (isGatewayStreamTimeoutCode(value)) return true;
+    }
+    return false;
+}
+
+fn providerFailureCause(root: std.json.Value) ?types.ProviderFailureCause {
+    if (root != .object) return null;
+    const object = root.object;
+    if (objectHasGatewayStreamTimeout(object)) return .gateway_stream_timeout;
+
+    inline for (.{ "error", "providerError" }) |key| {
+        if (object.get(key)) |value| {
+            if (value == .object and objectHasGatewayStreamTimeout(value.object)) {
+                return .gateway_stream_timeout;
+            }
+        }
+    }
+    if (object.get("finishReason")) |value| {
+        if (value == .object) {
+            if (value.object.get("raw")) |raw| {
+                if (isGatewayStreamTimeoutCode(raw)) return .gateway_stream_timeout;
+            }
+        }
+    }
+    return null;
+}
+
 fn captureProviderFailureObject(
     alloc: std.mem.Allocator,
     current: *?[]u8,
@@ -3056,6 +3093,7 @@ fn consumeSseStreamTraced(
     var response_timestamp_invalid = false;
     var generation_metadata_invalid = false;
     var provider_result_identity_failure: ?types.ProviderResultIdentityFailure = null;
+    var provider_failure_cause: ?types.ProviderFailureCause = null;
     var provider_failure_detail: ?[]u8 = null;
     defer if (provider_failure_detail) |detail| alloc.free(detail);
     var data_event_count: usize = 0;
@@ -3160,6 +3198,7 @@ fn consumeSseStreamTraced(
                 }
             }
         } else if (std.mem.eql(u8, event_type, "error")) {
+            provider_failure_cause = provider_failure_cause orelse providerFailureCause(root);
             try captureProviderFailureDetail(alloc, &provider_failure_detail, root);
         } else if (std.mem.eql(u8, event_type, "text-delta")) {
             if (root.object.get("delta")) |delta_val| {
@@ -3467,6 +3506,7 @@ fn consumeSseStreamTraced(
             acc.provider_result = owned_result;
             acc.provider_result_state = if (preliminary) .preliminary else .final;
         } else if (std.mem.eql(u8, event_type, "finish")) {
+            provider_failure_cause = provider_failure_cause orelse providerFailureCause(root);
             const finish_event = parseSseFinishEvent(alloc, root, &provider_failure_detail) catch |err| {
                 switch (err) {
                     error.UnknownProviderFinishReason => {
@@ -3509,6 +3549,7 @@ fn consumeSseStreamTraced(
     completion.tool_calls = try materializeToolCalls(alloc, tool_accumulators.items);
 
     completion.provider_result_identity_failure = provider_result_identity_failure;
+    completion.provider_failure_cause = provider_failure_cause;
     completion.provider_failure_detail = provider_failure_detail;
     provider_failure_detail = null;
     completion.generation_id = generation_id;
@@ -3715,6 +3756,60 @@ test "consumeSseStream preserves provider error detail" {
     try std.testing.expectEqualStrings("provider_down: wafer route unavailable", completion.provider_failure_detail.?);
     try std.testing.expectEqual(@as(u64, 1), completion.usage.input_tokens.?);
     try std.testing.expectEqual(@as(u64, 1), completion.usage.output_tokens.?);
+}
+
+test "consumeSseStream classifies gateway stream timeout by structured code" {
+    const payload =
+        "data: {\"type\":\"error\",\"error\":{\"code\":\"gateway_stream_timeout\",\"message\":\"stream exceeded maximum duration\"}}\n" ++
+        "\n";
+
+    var reader = std.Io.Reader.fixed(payload);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+
+    var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
+    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+
+    try std.testing.expectEqual(types.ProviderFailureCause.gateway_stream_timeout, completion.provider_failure_cause.?);
+    try std.testing.expectEqualStrings(
+        "gateway_stream_timeout: stream exceeded maximum duration",
+        completion.provider_failure_detail.?,
+    );
+}
+
+test "consumeSseStream classifies finish-only gateway stream timeout" {
+    const payload =
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\",\"raw\":\"gateway_stream_timeout\"}}\n" ++
+        "\n";
+
+    var reader = std.Io.Reader.fixed(payload);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+
+    var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
+    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+
+    try std.testing.expectEqual(types.ProviderFinishReason.provider_error, completion.finish_reason.?);
+    try std.testing.expectEqual(types.ProviderFailureCause.gateway_stream_timeout, completion.provider_failure_cause.?);
+}
+
+test "providerFailureCause ignores matching prose without the structured code" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"type\":\"error\",\"error\":{\"code\":\"provider_error\",\"message\":\"gateway_stream_timeout\"}}",
+        .{},
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(?types.ProviderFailureCause, null), providerFailureCause(parsed.value));
 }
 
 test "consumeSseStream assigns a fallback identity to message-only provider errors" {

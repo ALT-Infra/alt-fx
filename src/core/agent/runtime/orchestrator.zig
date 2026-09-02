@@ -2748,6 +2748,7 @@ fn restoredRecoveryCause(
     return switch (cause) {
         .network_interrupted => .transport_interrupted,
         .response_interrupted => .response_interrupted,
+        .provider_stream_timeout => .provider_stream_timeout,
         .provider_unavailable => .provider_unavailable,
         .rate_limited => .rate_limited,
         .system_resumed => .system_resumed,
@@ -2907,6 +2908,7 @@ fn checkpointCause(
     return switch (cause) {
         .transport_interrupted => .network_interrupted,
         .response_interrupted => .response_interrupted,
+        .provider_stream_timeout => .provider_stream_timeout,
         .provider_unavailable => .provider_unavailable,
         .rate_limited => .rate_limited,
         .system_resumed => .system_resumed,
@@ -3324,6 +3326,7 @@ fn auto_retry_status(
         .cause = switch (cause) {
             .transport_interrupted => .network_interrupted,
             .response_interrupted => .response_interrupted,
+            .provider_stream_timeout => .provider_stream_timeout,
             .provider_unavailable => .provider_unavailable,
             .rate_limited => .rate_limited,
             .system_resumed => .system_resumed,
@@ -3534,7 +3537,12 @@ fn traceRouteFailure(
     stream_ctx: *const runtime_assistant_stream.StreamChunkContext,
     retry: bool,
 ) void {
-    const reason = completion.finish_reason orelse return;
+    const reason = if (completion.finish_reason) |value|
+        value.label()
+    else if (completion.provider_failure_cause == .gateway_stream_timeout)
+        "error"
+    else
+        return;
     debug_trace.eventf(
         "agent",
         "route_failure",
@@ -3546,7 +3554,7 @@ fn traceRouteFailure(
             if (fast_mode) "true" else "false",
             semantic_attempt,
             semantic_limit,
-            reason.label(),
+            reason,
             if (stream_ctx.saw_visible_text or completionContentBytes(completion) > 0) "true" else "false",
             if (stream_ctx.saw_tool_start) "true" else "false",
             if (retry) "true" else "false",
@@ -5449,7 +5457,9 @@ fn processQueuedPromptLoop(
                     attempt_disposition == .provider_failure))
             {
                 const finish_reason = attempt_completion.finish_reason;
-                const cause: model_response_recovery.FailureCause = if (attempt_disposition == .interrupted)
+                const cause: model_response_recovery.FailureCause = if (attempt_completion.provider_failure_cause == .gateway_stream_timeout)
+                    .provider_stream_timeout
+                else if (attempt_disposition == .interrupted)
                     .response_interrupted
                 else if (finish_reason.? == .content_filter)
                     .content_filter
@@ -5475,7 +5485,9 @@ fn processQueuedPromptLoop(
                     ),
                     .cancelled = config.cancel_flag.load(.seq_cst),
                 });
-                if (attempt_disposition == .provider_failure) {
+                if (attempt_disposition == .provider_failure or
+                    attempt_completion.provider_failure_cause == .gateway_stream_timeout)
+                {
                     traceRouteFailure(
                         step_ctx,
                         job.model,
