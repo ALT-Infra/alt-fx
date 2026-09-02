@@ -427,26 +427,78 @@ pub fn executeToolCallAuthorized(
             .name = request.call.name,
             .arguments_json = request.call.arguments_json,
             .model_output = "",
-            .ok = false,
+            .outcome = classifyToolExecutionError(err),
             .started_at_ms = started_at_ms,
         });
         return if (err == error.CancelledBeforeExecution) error.Cancelled else err;
-    };
-    const ok = switch (result.status) {
-        .success => true,
-        else => false,
     };
     diagnostics.recordToolCallResult(.{
         .name = request.call.name,
         .arguments_json = request.call.arguments_json,
         .model_output = result.model_output,
-        .ok = ok,
+        .outcome = classifyReturnedToolCallOutcome(
+            uses_file_mutation_contract,
+            result,
+        ),
         .started_at_ms = started_at_ms,
     });
     if (request.command_replay_capture) |continued| {
         replay_continuation_transferred = result.command_replay_capture == continued;
     }
     return result;
+}
+
+fn classifyToolExecutionError(err: anyerror) diagnostics.ToolCallOutcome {
+    return if (err == error.CancelledBeforeExecution)
+        .rejected
+    else
+        .runtime_failed;
+}
+
+fn classifyReturnedToolCallOutcome(
+    uses_file_mutation_contract: bool,
+    result: ToolExecutionResult,
+) diagnostics.ToolCallOutcome {
+    if (result.status == .success) return .succeeded;
+    if (result.command_result_json != null) return .command_failed;
+    if (uses_file_mutation_contract) return .rejected;
+    return .tool_failed;
+}
+
+test "returned tool results retain diagnostic outcome identity" {
+    const success = ToolExecutionResult{ .model_output = "ok" };
+    const rejection = ToolExecutionResult{ .model_output = "rejected", .status = .failure };
+    const command_failure = ToolExecutionResult{
+        .model_output = "exit 7",
+        .status = .failure,
+        .command_result_json = "{\"exit_code\":7}",
+    };
+    const tool_failure = ToolExecutionResult{ .model_output = "missing", .status = .failure };
+
+    try std.testing.expectEqual(
+        diagnostics.ToolCallOutcome.succeeded,
+        classifyReturnedToolCallOutcome(false, success),
+    );
+    try std.testing.expectEqual(
+        diagnostics.ToolCallOutcome.rejected,
+        classifyReturnedToolCallOutcome(true, rejection),
+    );
+    try std.testing.expectEqual(
+        diagnostics.ToolCallOutcome.command_failed,
+        classifyReturnedToolCallOutcome(false, command_failure),
+    );
+    try std.testing.expectEqual(
+        diagnostics.ToolCallOutcome.tool_failed,
+        classifyReturnedToolCallOutcome(false, tool_failure),
+    );
+    try std.testing.expectEqual(
+        diagnostics.ToolCallOutcome.rejected,
+        classifyToolExecutionError(error.CancelledBeforeExecution),
+    );
+    try std.testing.expectEqual(
+        diagnostics.ToolCallOutcome.runtime_failed,
+        classifyToolExecutionError(error.Unexpected),
+    );
 }
 
 pub fn executeHostToolCallAuthorized(
@@ -3431,7 +3483,7 @@ test "parent web_fetch tool-call metric omits URL and fetched result content" {
     const n = diagnostics.snapshotToolCalls(&buf);
     try std.testing.expectEqual(@as(usize, 1), n);
     try std.testing.expectEqualStrings("web_fetch", buf[0].name());
-    try std.testing.expect(buf[0].ok);
+    try std.testing.expectEqual(diagnostics.ToolCallOutcome.succeeded, buf[0].outcome);
     try std.testing.expectEqualStrings("", buf[0].args());
     try std.testing.expectEqualStrings("", buf[0].result());
     try std.testing.expectEqual(@as(u32, 0), buf[0].args_total_bytes);
@@ -3447,7 +3499,7 @@ test "non-web_fetch tool-call metrics retain bounded args and result" {
         .name = "read_file",
         .arguments_json = "{\"path\":\"README.md\"}",
         .model_output = "<path>README.md</path>\n<content>\n# fx\nnormal result\n</content>",
-        .ok = true,
+        .outcome = .succeeded,
         .started_at_ms = 1000,
     });
 

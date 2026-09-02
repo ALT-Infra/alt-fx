@@ -694,7 +694,7 @@ pub fn Bindings(comptime App: type) type {
                 .name = call.name,
                 .arguments_json = call.arguments_json,
                 .model_output = model_output,
-                .ok = false,
+                .outcome = .rejected,
                 .started_at_ms = io_mod.milliTimestamp(),
             });
         }
@@ -1866,7 +1866,7 @@ test "agent deps record rejected tool calls in feedback diagnostics" {
     var buf: [1]diagnostics.ToolCallMetric = undefined;
     const n = diagnostics.snapshotToolCalls(&buf);
     try std.testing.expectEqual(@as(usize, 1), n);
-    try std.testing.expect(!buf[0].ok);
+    try std.testing.expectEqual(diagnostics.ToolCallOutcome.rejected, buf[0].outcome);
     try std.testing.expectEqualStrings("run_command", buf[0].name());
     try std.testing.expect(std.mem.find(u8, buf[0].args(), "touch /tmp/denied") != null);
     try std.testing.expect(std.mem.find(u8, buf[0].result(), "tool_permission_denied") != null);
