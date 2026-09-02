@@ -397,10 +397,13 @@ function shellResult(body: string, callId: string): ShellResult {
 }
 
 function hasCurrentToolResult(body: string, callId: string): boolean {
-  const last = gatewayRequest(body).prompt.at(-1);
-  if (!last || !Array.isArray(last.content)) return false;
-  return (last.content as Array<Record<string, unknown>>).some((part) =>
-    part.type === "tool-result" && part.toolCallId === callId
+  const prompt = gatewayRequest(body).prompt;
+  const lastUserIndex = prompt.findLastIndex((message) => message.role === "user");
+  return prompt.slice(lastUserIndex + 1).some((message) =>
+    Array.isArray(message.content) &&
+    (message.content as Array<Record<string, unknown>>).some((part) =>
+      part.type === "tool-result" && part.toolCallId === callId
+    )
   );
 }
 
