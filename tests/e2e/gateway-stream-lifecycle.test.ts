@@ -215,6 +215,20 @@ function providerErrorResponse(detail = "route temporarily unavailable"): Respon
   );
 }
 
+function gatewayStreamTimeoutResponse(): Response {
+  return sse(
+    `data: ${JSON.stringify({
+      type: "error",
+      error: {
+        code: "gateway_stream_timeout",
+        message: "stream exceeded maximum duration",
+      },
+    })}\n\n` +
+      'data: {"type":"finish","finishReason":{"unified":"error","raw":"provider_error"},"usage":{"inputTokens":{"total":1},"outputTokens":{"total":1}}}\n\n' +
+      "data: [DONE]\n\n",
+  );
+}
+
 function contentFilterResponse(): Response {
   return sse(
     'data: {"type":"finish","finishReason":{"unified":"content-filter","raw":"content_filter"}}\n\n' +
@@ -5917,6 +5931,43 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       rmSync(root.root, { recursive: true, force: true });
     }
   }, 30_000);
+
+  test("gateway stream timeout pauses without automatic retry", async () => {
+    const root = createFixtureRoot("gateway-stream-timeout");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() => gatewayStreamTimeoutResponse());
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Return the fixture response."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+      const trace = readFileSync(tracePath, "utf8");
+
+      expect(result.code).toBe(1);
+      expect(json.exit_code).toBe(1);
+      expect(gateway.requestCount()).toBe(1);
+      expect(json.recovery?.state).toBe("paused");
+      expect(json.recovery?.cause).toBe("provider_stream_timeout");
+      expect(json.recovery?.attempt).toBe(1);
+      expect(json.recovery?.attempt_limit).toBe(10);
+      expect(json.recovery?.required_action).toBe("continue_later");
+      expect(result.stderr).toContain("Gateway stream timed out");
+      expect(result.stderr).toContain("gateway_stream_timeout: stream exceeded maximum duration");
+      expect(result.stderr).toContain("automatic retry paused · attempt 1/10");
+      expect(result.stderr).not.toContain("retrying request");
+      expect(trace).toContain("event=route_failure");
+      expect(trace).toContain("retry=false");
+      expect(trace).toContain("detail=gateway_stream_timeout: stream exceeded maximum duration");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
 
   test("model response budget stops at ten real requests", async () => {
     const root = createFixtureRoot("provider-attempt-budget");

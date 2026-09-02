@@ -6,6 +6,7 @@ pub const max_retry_after_seconds: u64 = 30;
 pub const FailureCause = enum {
     transport_interrupted,
     response_interrupted,
+    provider_stream_timeout,
     provider_unavailable,
     rate_limited,
     system_resumed,
@@ -113,9 +114,14 @@ pub noinline fn decide(evidence: Evidence) Decision {
             .strategy = .stop,
             .required_action = .change_request,
         },
-        .request_limit_reached => return .{
+        .provider_stream_timeout,
+        .request_limit_reached,
+        => return .{
             .strategy = .pause,
-            .required_action = .continue_later,
+            .required_action = if (evidence.tool == .uncertain)
+                .inspect_uncertain_tool
+            else
+                .continue_later,
         },
         else => {},
     }
@@ -311,6 +317,39 @@ test "model response recovery policy is deterministic and bounded" {
     const request_limit_pause = decide(request_limit);
     try std.testing.expectEqual(Strategy.pause, request_limit_pause.strategy);
     try std.testing.expect(!request_limit_pause.reserve_provider_attempt);
+}
+
+test "gateway stream timeout pauses without reserving another attempt" {
+    const paused = decide(.{
+        .cause = .provider_stream_timeout,
+        .delivery = .possibly_sent,
+        .attempts = .{ .consumed = 1 },
+    });
+    try std.testing.expectEqual(Strategy.pause, paused.strategy);
+    try std.testing.expectEqual(RequiredAction.continue_later, paused.required_action);
+    try std.testing.expect(!paused.reserve_provider_attempt);
+    try std.testing.expectEqual(@as(u64, 0), paused.delay_ns);
+
+    const uncertain_tool = decide(.{
+        .cause = .provider_stream_timeout,
+        .delivery = .possibly_sent,
+        .attempts = .{ .consumed = 1 },
+        .tool = .uncertain,
+    });
+    try std.testing.expectEqual(Strategy.pause, uncertain_tool.strategy);
+    try std.testing.expectEqual(
+        RequiredAction.inspect_uncertain_tool,
+        uncertain_tool.required_action,
+    );
+    try std.testing.expect(!uncertain_tool.reserve_provider_attempt);
+
+    const cancelled = decide(.{
+        .cause = .provider_stream_timeout,
+        .delivery = .possibly_sent,
+        .attempts = .{ .consumed = 1 },
+        .cancelled = true,
+    });
+    try std.testing.expectEqual(Strategy.stop, cancelled.strategy);
 }
 
 test "retry after and cancellation override automatic recovery" {

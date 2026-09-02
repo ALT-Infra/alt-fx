@@ -2660,6 +2660,7 @@ fn restoredRecoveryCause(
     return switch (cause) {
         .network_interrupted => .transport_interrupted,
         .response_interrupted => .response_interrupted,
+        .provider_stream_timeout => .provider_stream_timeout,
         .provider_unavailable => .provider_unavailable,
         .rate_limited => .rate_limited,
         .system_resumed => .system_resumed,
@@ -2819,6 +2820,7 @@ fn checkpointCause(
     return switch (cause) {
         .transport_interrupted => .network_interrupted,
         .response_interrupted => .response_interrupted,
+        .provider_stream_timeout => .provider_stream_timeout,
         .provider_unavailable => .provider_unavailable,
         .rate_limited => .rate_limited,
         .system_resumed => .system_resumed,
@@ -3220,6 +3222,7 @@ fn auto_retry_status(
         .cause = switch (cause) {
             .transport_interrupted => .network_interrupted,
             .response_interrupted => .response_interrupted,
+            .provider_stream_timeout => .provider_stream_timeout,
             .provider_unavailable => .provider_unavailable,
             .rate_limited => .rate_limited,
             .system_resumed => .system_resumed,
@@ -5300,6 +5303,8 @@ fn processQueuedPromptLoop(
                 const finish_reason = attempt_completion.finish_reason;
                 const cause: model_response_recovery.FailureCause = if (attempt_disposition == .interrupted)
                     .response_interrupted
+                else if (attempt_completion.provider_failure_cause == .gateway_stream_timeout)
+                    .provider_stream_timeout
                 else if (finish_reason.? == .content_filter)
                     .content_filter
                 else
