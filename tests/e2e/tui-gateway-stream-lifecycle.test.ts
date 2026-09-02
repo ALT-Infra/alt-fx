@@ -2935,7 +2935,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const firstResponse: HoldState = { started: false, cancelled: false };
       const visiblePrefix = "CANCELLED_RESPONSE_VISIBLE_PREFIX";
       const bufferedTail = "CANCELLED_RESPONSE_BUFFERED_TAIL";
-      const steering = "Respond with exactly STEERED_RESPONSE_FRESH.";
+      const steering = "Replace the cancelled response with the short corrected answer.";
       const finalText = "STEERED_RESPONSE_FRESH";
       mkdirSync(join(home, ".fx"), { recursive: true });
       mkdirSync(workspacePath, { recursive: true });
@@ -2979,7 +2979,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(await session.captureFullScrollback()).not.toContain(bufferedTail);
 
       await session.sendText(steering);
-      await session.waitForText(finalText, TIMEOUT);
+      await waitForScrollback(
+        session,
+        (candidate) => candidate.split("\n").some((line) => line.trim() === finalText),
+        "fresh steered assistant response",
+      );
       await waitForCondition(
         () => lateTailGateway.requests.length === 2,
         "steered response request",
