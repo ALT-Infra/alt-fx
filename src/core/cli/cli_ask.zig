@@ -2647,11 +2647,12 @@ fn appendToolCallRecord(
     var scratch_state = std.heap.ArenaAllocator.init(ctx.alloc);
     defer scratch_state.deinit();
     const scratch = scratch_state.allocator();
-    const action = if (error_category != null)
+    const is_shell = std.mem.eql(u8, call.name, "shell");
+    const action = if (is_shell and error_category != null)
         shell_action_for_call(scratch, call)
     else
         null;
-    const error_code = if (action != null and error_category != null)
+    const error_code = if (is_shell and error_category != null)
         try ctx.alloc.dupe(
             u8,
             explicit_error_code orelse shell_failure_code(
@@ -2678,7 +2679,7 @@ fn appendToolCallRecord(
         .name = name,
         .status = owned_status,
         .action = action,
-        .error_category = if (action != null) error_category else null,
+        .error_category = if (is_shell) error_category else null,
         .error_code = error_code,
         .command_result_json = command_result_json,
         .ask_question_text = ask_question_text,
@@ -8282,6 +8283,14 @@ test "fx ask JSON preserves shell action and runtime error identity" {
         .max_tool_result_bytes = 4096,
     }, error.ExecutionNotFound);
 
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    try recordToolCallRejected(@ptrCast(&ctx), arena_state.allocator(), .{
+        .id = "shell-invalid-action",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"legacy\"}",
+    }, "Invalid shell action", null);
+
     const records = try takeToolCallRecords(&ctx, alloc);
     const result = PromptRunResult{
         .exit_code = 1,
@@ -8299,6 +8308,19 @@ test "fx ask JSON preserves shell action and runtime error identity" {
     const failure = (record.get("error") orelse return error.TestExpectedEqual).object;
     try std.testing.expectEqualStrings("runtime_failed", failure.get("category").?.string);
     try std.testing.expectEqualStrings("ExecutionNotFound", failure.get("code").?.string);
+
+    const rejected = parsed.value.object.get("tool_calls").?.array.items[1].object;
+    try std.testing.expect(rejected.get("action") == null);
+    const rejected_failure = (rejected.get("error") orelse
+        return error.TestExpectedEqual).object;
+    try std.testing.expectEqualStrings(
+        "rejected",
+        rejected_failure.get("category").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "rejected",
+        rejected_failure.get("code").?.string,
+    );
 }
 
 test "shell diagnostic action projection accepts only current actions" {
