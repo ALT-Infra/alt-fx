@@ -582,6 +582,19 @@ const AuthorizationMetadataOutcome = union(enum) {
     issuer_mismatch: IssuerMismatch,
 };
 
+fn issuerWithoutTrailingSlash(issuer: []const u8) []const u8 {
+    if (issuer.len > 1 and issuer[issuer.len - 1] == '/') return issuer[0 .. issuer.len - 1];
+    return issuer;
+}
+
+/// RFC 8414 issuer identifiers are compared as exact strings, but a server can
+/// publish the same origin with and without a trailing slash across its
+/// protected-resource and authorization-server documents. Ignore that one
+/// difference; everything else still fails closed.
+fn issuersEqual(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, issuerWithoutTrailingSlash(a), issuerWithoutTrailingSlash(b));
+}
+
 fn parseAuthorizationMetadataOutcome(
     alloc: Allocator,
     bytes: []const u8,
@@ -592,7 +605,7 @@ fn parseAuthorizationMetadataOutcome(
     if (parsed.value != .object) return error.InvalidAuthorizationMetadata;
     const object = parsed.value.object;
     const issuer = try requiredString(object, "issuer");
-    if (!std.mem.eql(u8, issuer, expected_issuer)) {
+    if (!issuersEqual(issuer, expected_issuer)) {
         return .{ .issuer_mismatch = try IssuerMismatch.init(
             alloc,
             .authorization_metadata,
@@ -687,7 +700,7 @@ pub fn validateAuthorizationResponse(
         return error.AuthorizationResponseIssuerMissing;
     }
     if (response.issuer) |issuer| {
-        if (!std.mem.eql(u8, expected_issuer, issuer)) {
+        if (!issuersEqual(expected_issuer, issuer)) {
             return error.AuthorizationResponseIssuerMismatch;
         }
     }
@@ -2338,7 +2351,7 @@ test "authorization metadata mismatch retains exact issuer values and fails clos
     var outcome = try parseAuthorizationMetadataOutcome(
         alloc,
         bytes,
-        "https://login.example.com/",
+        "https://login.evil.example/",
     );
     defer switch (outcome) {
         .metadata => |*metadata| metadata.deinit(alloc),
@@ -2352,7 +2365,7 @@ test "authorization metadata mismatch retains exact issuer values and fails clos
                 mismatch.source,
             );
             try std.testing.expectEqualStrings(
-                "https://login.example.com/",
+                "https://login.evil.example/",
                 mismatch.expected,
             );
             try std.testing.expectEqualStrings(
@@ -2366,6 +2379,33 @@ test "authorization metadata mismatch retains exact issuer values and fails clos
         parseAuthorizationMetadata(
             alloc,
             bytes,
+            "https://login.evil.example/",
+        ),
+    );
+}
+
+test "authorization metadata accepts an issuer that differs only by a trailing slash" {
+    const alloc = std.testing.allocator;
+    const bytes =
+        "{\"issuer\":\"https://login.example.com\",\"authorization_endpoint\":\"https://login.example.com/authorize\",\"token_endpoint\":\"https://login.example.com/token\"}";
+
+    var metadata = try parseAuthorizationMetadata(
+        alloc,
+        bytes,
+        "https://login.example.com/",
+    );
+    defer metadata.deinit(alloc);
+
+    try std.testing.expectEqualStrings("https://login.example.com", metadata.issuer);
+}
+
+test "authorization metadata rejects an issuer whose path differs" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(
+        error.AuthorizationMetadataIssuerMismatch,
+        parseAuthorizationMetadata(
+            alloc,
+            "{\"issuer\":\"https://login.example.com/tenant\",\"authorization_endpoint\":\"https://login.example.com/authorize\",\"token_endpoint\":\"https://login.example.com/token\"}",
             "https://login.example.com/",
         ),
     );
@@ -2440,11 +2480,26 @@ test "authorization response uses exact state and issuer comparison" {
         true,
         response,
     );
+    try validateAuthorizationResponse(
+        "state-1",
+        "https://login.example.com/",
+        true,
+        response,
+    );
+    try std.testing.expectError(
+        error.OAuthStateMismatch,
+        validateAuthorizationResponse(
+            "state-2",
+            "https://login.example.com",
+            true,
+            response,
+        ),
+    );
     try std.testing.expectError(
         error.AuthorizationResponseIssuerMismatch,
         validateAuthorizationResponse(
             "state-1",
-            "https://login.example.com/",
+            "https://login.evil.example",
             true,
             response,
         ),
