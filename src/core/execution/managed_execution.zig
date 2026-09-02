@@ -450,10 +450,7 @@ const Entry = struct {
                 "managed execution became lost boundary=worker_route execution_id={s} err={s}",
                 .{ self.execution_id, @errorName(err) },
             );
-            self.state = if (err == error.Cancelled or err == error.TimeoutExpired)
-                .{ .stopped = null }
-            else
-                .lost;
+            self.state = state_for_worker_error(err);
             self.barrier.output_drained = true;
             self.mutex.unlock(zio);
             return;
@@ -1514,6 +1511,28 @@ fn statusFromResult(
     if (command.exit_code) |code| return .{ .exit_code = code };
     if (command.signal) |signal| return .{ .signal = signal };
     return .finished;
+}
+
+fn state_for_worker_error(err: anyerror) contract.State {
+    return if (err == error.TimeoutExpired)
+        .{ .stopped = null }
+    else
+        .lost;
+}
+
+test "worker errors do not turn ambiguous cancellation into success" {
+    try std.testing.expectEqual(
+        contract.State.lost,
+        state_for_worker_error(error.Cancelled),
+    );
+    try std.testing.expectEqual(
+        contract.State{ .stopped = null },
+        state_for_worker_error(error.TimeoutExpired),
+    );
+    try std.testing.expectEqual(
+        contract.State.lost,
+        state_for_worker_error(error.Unexpected),
+    );
 }
 
 fn stop_wait_expired(started_ms: i64, now_ms: i64, settle_timeout_ms: i64) bool {

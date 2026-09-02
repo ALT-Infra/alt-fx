@@ -344,20 +344,13 @@ const ChildWaiter = struct {
         future.await(self.io);
     }
 
-    fn cancel(self: *ChildWaiter) !std.process.Child.Term {
-        if (self.isReady()) return self.awaitReady();
-        var future = &self.future.?;
-        future.cancel(self.io);
-        return try self.result;
-    }
-
     fn abort(self: *ChildWaiter, pid: std.posix.pid_t) void {
         if (self.isReady()) {
             self.awaitDiscard();
             return;
         }
         signalProcess(pid, std.posix.SIG.KILL) catch {};
-        _ = self.cancel() catch {};
+        self.awaitDiscard();
     }
 };
 
@@ -2328,7 +2321,7 @@ const ProcessObserver = struct {
     ) command_contract.CommandStatus {
         debug_trace.logf(
             "core",
-            "command termination became indeterminate err={s}",
+            "command termination became indeterminate boundary=process_wait err={s}",
             .{@errorName(err)},
         );
         return .indeterminate;
@@ -2369,36 +2362,7 @@ const ProcessObserver = struct {
                 .{@errorName(err)},
             );
         };
-        _ = self.waiter.cancel() catch |err| {
-            debug_trace.logf(
-                "core",
-                "command observer cleanup wait cancelled err={s}",
-                .{@errorName(err)},
-            );
-        };
-    }
-
-    fn settle_after_deadline(
-        self: *ProcessObserver,
-        process_group_id: ?std.posix.pid_t,
-    ) command_contract.CommandStatus {
-        const pid = process_group_id orelse self.process_id;
-        signalProcessGroup(pid, std.posix.SIG.KILL) catch |err| {
-            debug_trace.logf(
-                "core",
-                "command termination deadline cleanup failed err={s}",
-                .{@errorName(err)},
-            );
-        };
-        const term = self.waiter.cancel() catch |err| {
-            debug_trace.logf(
-                "core",
-                "command termination became indeterminate boundary=post_force_wait err={s}",
-                .{@errorName(err)},
-            );
-            return .indeterminate;
-        };
-        return ProcessObserver.statusFromTerm(term);
+        self.waiter.awaitDiscard();
     }
 };
 
@@ -2489,8 +2453,6 @@ fn collectOutput(
                     if (observer.waiter.isReady()) "true" else "false",
                 },
             );
-            const settled_status = observer.settle_after_deadline(process_group_id);
-            if (leader_status.* == null) leader_status.* = settled_status;
             recordOutputDrainFailure(
                 &output_incomplete,
                 "termination_settle_deadline",
