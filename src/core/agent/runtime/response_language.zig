@@ -24,9 +24,13 @@ pub const DecisionInput = struct {
 };
 
 pub fn evidence(text: []const u8) Evidence {
+    const observed = language_script.profile_prose(text);
     const non_latin = language_script.profile_non_latin_prose(text);
+    const minimum_unexpected_share = observed.letters / 5 +
+        @as(usize, @intFromBool(observed.letters % 5 != 0));
     if (non_latin.script != null and
-        non_latin.dominant_letters >= minimum_unexpected_prose_letters)
+        non_latin.dominant_letters >= minimum_unexpected_prose_letters and
+        non_latin.dominant_letters >= minimum_unexpected_share)
     {
         return clear_evidence(
             non_latin.script.?,
@@ -34,7 +38,6 @@ pub fn evidence(text: []const u8) Evidence {
             non_latin.dominant_letters,
         );
     }
-    const observed = language_script.profile_prose(text);
     if (observed.letters < minimum_letters or observed.script == null) return .{
         .script = null,
         .letters = observed.letters,
@@ -160,6 +163,10 @@ test "response language evidence distinguishes clear scripts" {
     try std.testing.expectEqual(
         Script.han,
         evidence("我将检查 lockfile 和 dependency manifest，查找损坏问题。").script.?,
+    );
+    try std.testing.expectEqual(
+        Script.latin,
+        evidence("English transcript payload with sparse 界 markers. " ** 16).script.?,
     );
 }
 
