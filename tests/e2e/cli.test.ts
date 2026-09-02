@@ -4214,9 +4214,11 @@ describe("cli: ask success", () => {
       const gateway = startFakeGateway([
         fakeGatewayFinalText(unrelatedReply),
         fakeGatewayFinalText("first saved turn"),
+        fakeGatewayFinalText("created during contention"),
         fakeGatewayFinalText("contended exact turn"),
         fakeGatewayFinalText("contended latest turn"),
         fakeGatewayFinalText("repairing turn"),
+        fakeGatewayFinalText("repaired created turn"),
       ]);
       let lockHolder: ReturnType<typeof Bun.spawn> | null = null;
       try {
@@ -4273,6 +4275,25 @@ describe("cli: ask success", () => {
         }
         expect(existsSync(lockReady)).toBe(true);
 
+        const createdDuringContention = await runFx(
+          ["ask", "--json", "--auto", "Create a saved turn while the cache is busy."],
+          { cwd: workspaceRoot, env, timeoutMs: 60_000 },
+        );
+        expect(createdDuringContention.code).toBe(0);
+        expect(createdDuringContention.stderr).toBe("");
+        const createdDuringContentionJson = JSON.parse(createdDuringContention.stdout);
+        const createdDuringContentionId = createdDuringContentionJson.session_id as string;
+        expect(createdDuringContentionJson.output.trim()).toBe("created during contention");
+        const createdDuringContentionTokenPath = join(
+          home,
+          ".fx",
+          "sessions",
+          "latest",
+          "deferred",
+          createdDuringContentionId,
+        );
+        expect(existsSync(createdDuringContentionTokenPath)).toBe(true);
+
         const exact = await runFx(
           [
             "ask",
@@ -4310,6 +4331,10 @@ describe("cli: ask success", () => {
           history_len: 2,
         });
         expect(listedSessions[1]).toMatchObject({
+          id: createdDuringContentionId,
+          history_len: 1,
+        });
+        expect(listedSessions[2]).toMatchObject({
           id: unrelatedSessionId,
           history_len: 1,
         });
@@ -4350,6 +4375,28 @@ describe("cli: ask success", () => {
         expect(repaired.stderr).toBe("");
         expect(JSON.parse(repaired.stdout).output.trim()).toBe("repairing turn");
         expect(existsSync(tokenPath)).toBe(false);
+        const createdDuringContentionDetail = await runFx(
+          ["session", "--id", createdDuringContentionId, "--json"],
+          { cwd: workspaceRoot, env: { HOME: home }, timeoutMs: 60_000 },
+        );
+        expect(createdDuringContentionDetail.code).toBe(0);
+        expect(createdDuringContentionDetail.stderr).toBe("");
+        expect(JSON.parse(createdDuringContentionDetail.stdout).history_len).toBe(1);
+        const repairedCreated = await runFx(
+          [
+            "ask",
+            "--json",
+            "--auto",
+            "--resume-id",
+            createdDuringContentionId,
+            "Repair the newly created session.",
+          ],
+          { cwd: workspaceRoot, env, timeoutMs: 60_000 },
+        );
+        expect(repairedCreated.code).toBe(0);
+        expect(repairedCreated.stderr).toBe("");
+        expect(JSON.parse(repairedCreated.stdout).output.trim()).toBe("repaired created turn");
+        expect(existsSync(createdDuringContentionTokenPath)).toBe(false);
         const targetDetail = await runFx(
           ["session", "--id", sessionId, "--json"],
           { cwd: workspaceRoot, env: { HOME: home }, timeoutMs: 60_000 },
@@ -4364,7 +4411,7 @@ describe("cli: ask success", () => {
         expect(unrelatedDetail.code).toBe(0);
         expect(unrelatedDetail.stderr).toBe("");
         expect(JSON.parse(unrelatedDetail.stdout).history_len).toBe(1);
-        expect(gateway.requests).toHaveLength(5);
+        expect(gateway.requests).toHaveLength(7);
       } finally {
         if (lockHolder) {
           lockHolder.kill();
