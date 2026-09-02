@@ -1151,7 +1151,7 @@ fn finishPrepared(
     handoffPreparedDelivery(ctx, runtime, prepared.reservation_id) catch {
         return .{ .failure = try ctx.allocator.dupe(u8, "shell result commit failed") };
     };
-    return if (action == .command and snapshotFailed(prepared.snapshot.state))
+    return if (action == .command and snapshotFailed(prepared.snapshot))
         .{ .failure = body }
     else
         .{ .success = body };
@@ -1221,6 +1221,7 @@ fn publishSnapshotMetadata(
             .signal = projection.signal,
             .timed_out = timed_out,
             .termination_indeterminate = projection.termination_indeterminate,
+            .output_incomplete = snapshot.output_incomplete,
             .duration_ms = snapshot.duration_ms,
             .stdout_bytes = snapshot.stdout_bytes,
             .stderr_bytes = snapshot.stderr_bytes,
@@ -1406,6 +1407,12 @@ fn formatSnapshotRaw(
             .signal = null,
             .termination_indeterminate = false,
         };
+    const retry_guidance: ?[]const u8 = if (snapshot.output_incomplete)
+        "Command output is incomplete. Inspect external state and available output before retrying; do not blindly rerun a command that may have changed state."
+    else switch (snapshot.state) {
+        .lost => "Execution status is indeterminate. Inspect external state before retrying; do not blindly rerun a command that may have changed state.",
+        .running, .completed, .stopped => null,
+    };
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     try std.json.Stringify.value(.{
@@ -1414,6 +1421,7 @@ fn formatSnapshotRaw(
         .backend = @tagName(snapshot.backend),
         .persistence = @tagName(snapshot.persistence),
         .output_truncated = output_truncated,
+        .output_incomplete = snapshot.output_incomplete,
         .output_terminal_safe = true,
         .full_output_handle = snapshot.output_file,
         .exit_code = projection.exit_code,
@@ -1422,10 +1430,7 @@ fn formatSnapshotRaw(
         .duration_ms = snapshot.duration_ms,
         .accepted_bytes = accepted_bytes,
         .@"error" = snapshot.error_name,
-        .retry_guidance = switch (snapshot.state) {
-            .lost => "Execution status is indeterminate. Inspect external state before retrying; do not blindly rerun a command that may have changed state.",
-            .running, .completed, .stopped => null,
-        },
+        .retry_guidance = retry_guidance,
         .output_delta = output_delta,
     }, .{}, &out.writer);
     return try out.toOwnedSlice();
@@ -1440,8 +1445,9 @@ fn snapshotStateName(state: managed_execution.SnapshotState) []const u8 {
     };
 }
 
-fn snapshotFailed(state: managed_execution.SnapshotState) bool {
-    return switch (state) {
+fn snapshotFailed(snapshot: managed_execution.Snapshot) bool {
+    if (snapshot.output_incomplete) return true;
+    return switch (snapshot.state) {
         .running => false,
         .completed => |status| switch (status) {
             .exit_code => |code| code != 0,
@@ -1812,6 +1818,33 @@ test "lost shell snapshot preserves indeterminate execution guidance" {
     defer parsed.deinit();
     const object = parsed.value.object;
     try std.testing.expect(object.get("termination_indeterminate").?.bool);
+    try std.testing.expect(std.mem.find(
+        u8,
+        object.get("retry_guidance").?.string,
+        "do not blindly rerun",
+    ) != null);
+}
+
+test "completed shell snapshot reports incomplete output without losing status" {
+    const alloc = std.testing.allocator;
+    const body = try formatSnapshot(alloc, .{
+        .execution_id = @constCast("shell-incomplete"),
+        .command = @constCast("mutating-command"),
+        .cwd = @constCast("/tmp"),
+        .retained = false,
+        .state = .{ .completed = .{ .exit_code = 0 } },
+        .output_delta = @constCast("partial output"),
+        .output_truncated = false,
+        .output_incomplete = true,
+    }, null);
+    defer alloc.free(body);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expectEqualStrings("completed", object.get("state").?.string);
+    try std.testing.expectEqual(@as(i64, 0), object.get("exit_code").?.integer);
+    try std.testing.expect(object.get("output_incomplete").?.bool);
     try std.testing.expect(std.mem.find(
         u8,
         object.get("retry_guidance").?.string,
