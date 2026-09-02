@@ -153,15 +153,17 @@ while (pendingVisibleAt === undefined) {
   await new Promise((resolve) => setTimeout(resolve, 10));
 }
 observeZeroTimeouts = false;
-if (secondRequestAt !== undefined) throw new Error("steering started before the active response finished");
-releaseFirstStream();
-while (streamFinishedAt === undefined) {
-  if (performance.now() >= deadline) throw new Error("timed out waiting for streamed fx-term response");
+const steeringDeadline = performance.now() + 5000;
+while (
+  secondRequestAt === undefined ||
+  !streamedText.includes(steeringAnswer)
+) {
+  if (performance.now() >= steeringDeadline) throw new Error("timed out waiting for steered fx-term response");
   await new Promise((resolve) => setTimeout(resolve, 10));
 }
-const steeringDeadline = performance.now() + 5000;
-while (secondRequestAt === undefined || !streamedText.includes(steeringAnswer)) {
-  if (performance.now() >= steeringDeadline) throw new Error("timed out waiting for steered fx-term response");
+releaseFirstStream();
+while (streamFinishedAt === undefined) {
+  if (performance.now() >= steeringDeadline) throw new Error("timed out releasing held fx-term response");
   await new Promise((resolve) => setTimeout(resolve, 10));
 }
 runtime.write("/exit\r");
@@ -176,12 +178,13 @@ if (exitCode !== 0) throw new Error(`fx-term exited with code ${exitCode}`);
 if (!text.includes("𝒇x")) throw new Error("shared fx welcome frame was not observed");
 if (!text.includes("Run /help for commands")) throw new Error("shared fx welcome guidance was not observed");
 if (requestedModel !== "sdk/term-model") throw new Error(`terminal prompt did not use the host-restored model: ${requestedModel}`);
-if (!(streamStartedAt < streamFinishedAt)) throw new Error("terminal fetch did not remain active for continuous streaming");
-if (!(draftVisibleAt < streamFinishedAt)) throw new Error("terminal rendered follow-up input only after continuous streaming finished");
-if (!(pendingVisibleAt < streamFinishedAt)) throw new Error("terminal showed pending steering only after continuous streaming finished");
-if (!(secondRequestAt >= streamFinishedAt)) throw new Error("terminal started steering before continuous streaming finished");
+if (!(streamStartedAt < secondRequestAt)) throw new Error("terminal started steering before the active response");
+if (!(draftVisibleAt < secondRequestAt)) throw new Error("terminal rendered follow-up input only after steering started");
+if (!(pendingVisibleAt < secondRequestAt)) throw new Error("terminal showed pending steering only after steering started");
+if (!(secondRequestAt < streamFinishedAt)) throw new Error("terminal waited for the active response before steering");
 const steeringUser = secondRequestBody.prompt?.filter((message) => message.role === "user").at(-1);
 const steeringText = steeringUser?.content?.filter((part) => part.type === "text").map((part) => part.text);
+const steeringRequest = JSON.stringify(secondRequestBody.prompt);
 if (
   steeringText?.length !== 1 ||
   !steeringText[0].includes("<user_steering>") ||
@@ -189,6 +192,10 @@ if (
   !steeringText[0].includes(liveDraft)
 ) {
   throw new Error(`steering request changed the submitted draft or directive: ${JSON.stringify(steeringText)}`);
+}
+if (!steeringRequest.includes("hello")) throw new Error("steering request omitted the visible assistant prefix");
+if (steeringRequest.includes("<turn_aborted>") || steeringRequest.includes("The previous response ended before completion.")) {
+  throw new Error("steering request included an interruption marker");
 }
 if (requestCount !== 2) throw new Error(`terminal sent ${requestCount} requests instead of the active and steered steps`);
 if (zeroTimeoutCount !== 0) throw new Error(`terminal allocated ${zeroTimeoutCount} zero-timeout poll timer(s)`);
