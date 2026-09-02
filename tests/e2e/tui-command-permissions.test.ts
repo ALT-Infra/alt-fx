@@ -2342,7 +2342,7 @@ describe("effect-aware command permissions", () => {
       expect(gateway.classifierRequests).toHaveLength(4);
       const trace = readFileSync(tracePath, "utf8");
       expect(
-        trace.match(/decision=unavailable fallback_reason=invalid_or_unavailable/g),
+        trace.match(/decision=unavailable fallback_reason=completion_text/g),
       ).toHaveLength(4);
       expect(trace).not.toContain("event=automatic_recovery_exhausted");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -3112,6 +3112,7 @@ describe("effect-aware command permissions", () => {
           toolCall(command),
           (body) => {
             expect(body).toContain("review_unavailable");
+            expect(body).toContain('\\"review_cause\\":\\"completion_text\\"');
             return toolCall("pwd", "safe_after_malformed");
           },
           finalText("classifier recovery complete"),
@@ -3142,7 +3143,7 @@ describe("effect-aware command permissions", () => {
       expect(trace.match(/event=auto_review_transport_start/g)).toHaveLength(1);
       expect(trace.match(/event=auto_review_result/g)).toHaveLength(1);
       expect(trace).toContain("decision=unavailable");
-      expect(trace).toContain("fallback_reason=invalid_or_unavailable");
+      expect(trace).toContain("fallback_reason=completion_text");
       expect(result.stderr).not.toContain("Auto agent approved this request:");
     },
     TIMEOUT,
@@ -3159,6 +3160,7 @@ describe("effect-aware command permissions", () => {
           toolCall(command),
           (body) => {
             expect(body).toContain("review_unavailable");
+            expect(body).toContain('\\"review_cause\\":\\"completion_text\\"');
             return finalText("classifier fallback handled");
           },
         ],
@@ -3187,7 +3189,7 @@ describe("effect-aware command permissions", () => {
       expect(trace.match(/event=auto_review_transport_start/g)).toHaveLength(1);
       expect(trace.match(/event=auto_review_result/g)).toHaveLength(1);
       expect(trace).toContain("decision=unavailable");
-      expect(trace).toContain("fallback_reason=invalid_or_unavailable");
+      expect(trace).toContain("fallback_reason=completion_text");
       expect(result.stderr).not.toContain(COMMAND_APPROVAL_PROMPT);
     },
     TIMEOUT,
@@ -3204,6 +3206,7 @@ describe("effect-aware command permissions", () => {
           toolCall(command),
           (body) => {
             expect(body).toContain("review_unavailable");
+            expect(body).toContain('\\"review_cause\\":\\"transport_transient\\"');
             return finalText("provider failure handled");
           },
         ],
@@ -3237,7 +3240,10 @@ describe("effect-aware command permissions", () => {
       expect(trace.match(/event=auto_review_transport_start/g)).toHaveLength(1);
       expect(trace.match(/event=auto_review_result/g)).toHaveLength(1);
       expect(trace).toContain("decision=unavailable");
-      expect(trace).toContain("fallback_reason=invalid_or_unavailable");
+      expect(trace).toContain(
+        "event=auto_review_transport result=transient_failure http_status=502",
+      );
+      expect(trace).toContain("fallback_reason=transport_transient");
     },
     TIMEOUT,
   );

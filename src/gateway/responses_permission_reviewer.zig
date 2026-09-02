@@ -40,11 +40,15 @@ pub fn review(
     request: permission_auto_classifier.ReviewRequest,
     adapter: Adapter,
 ) !permission_auto_classifier.ParseOutcome {
-    if (input.credential.len == 0) return .invalid;
-    if (adapter.require_account and input.account_id == null) return .invalid;
+    if (input.credential.len == 0) {
+        return .{ .invalid = .provider_context_missing };
+    }
+    if (adapter.require_account and input.account_id == null) {
+        return .{ .invalid = .provider_context_missing };
+    }
     adapter.validate_fn(alloc, input) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        return .invalid;
+        return .{ .invalid = .provider_failed };
     };
     var runtime = Runtime{ .input = input, .adapter = adapter };
     return permission_auto_classifier.Reviewer.withTransportModel(
@@ -199,9 +203,19 @@ fn sendReview(
             return .permanent_failure;
         };
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        if (err == error.Cancelled or cancel_flag.load(.seq_cst)) return .cancelled;
-        if (err == error.Timeout) return .timed_out;
-        return .transient_failure;
+        const outcome: permission_auto_classifier.TransportOutcome =
+            if (err == error.Cancelled or cancel_flag.load(.seq_cst))
+                .cancelled
+            else if (err == error.Timeout)
+                .timed_out
+            else
+                .transient_failure;
+        debug_trace.logf(
+            "permission",
+            "event=auto_review_transport result={s} reason=transport_error error={s}",
+            .{ @tagName(std.meta.activeTag(outcome)), @errorName(err) },
+        );
+        return outcome;
     };
     var result_owned = true;
     defer if (result_owned) result.deinit(alloc);
@@ -221,15 +235,46 @@ fn sendReview(
         return .permanent_failure;
     };
     if (cancel_flag.load(.seq_cst)) return .cancelled;
-    if (std.meta.activeTag(result) == .failed) return switch (result.failed.kind) {
-        .rate_limited, .server_error, .bad_gateway, .unavailable, .gateway_timeout => .transient_failure,
-        else => .permanent_failure,
-    };
+    if (std.meta.activeTag(result) == .failed) {
+        const outcome: permission_auto_classifier.TransportOutcome = switch (result.failed.kind) {
+            .rate_limited, .server_error, .bad_gateway, .unavailable, .gateway_timeout => .transient_failure,
+            else => .permanent_failure,
+        };
+        debug_trace.logf(
+            "permission",
+            "event=auto_review_transport result={s} reason=provider_failure failure_kind={s}",
+            .{ @tagName(std.meta.activeTag(outcome)), @tagName(result.failed.kind) },
+        );
+        return outcome;
+    }
     if (result.completed.completion.finish_reason) |reason| switch (reason) {
-        .provider_error => return .transient_failure,
-        .content_filter => return .permanent_failure,
+        .provider_error => {
+            debug_trace.logf(
+                "permission",
+                "event=auto_review_transport result=transient_failure reason=provider_error",
+                .{},
+            );
+            return .transient_failure;
+        },
+        .content_filter => {
+            debug_trace.logf(
+                "permission",
+                "event=auto_review_transport result=permanent_failure reason=content_filter",
+                .{},
+            );
+            return .permanent_failure;
+        },
         .stop, .length, .tool_calls, .other => {},
     };
+    debug_trace.logf(
+        "permission",
+        "event=auto_review_transport result=completion finish_reason={s} tool_calls={d} content_bytes={d}",
+        .{
+            if (result.completed.completion.finish_reason) |reason| @tagName(reason) else "absent",
+            result.completed.completion.tool_calls.len,
+            if (result.completed.completion.content) |content| content.len else 0,
+        },
+    );
     const owned = try alloc.create(OwnedResult);
     owned.* = .{ .result = result };
     result_owned = false;

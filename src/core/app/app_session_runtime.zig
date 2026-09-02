@@ -6526,6 +6526,7 @@ test "execution replay preserves permission denial reasons" {
                 "run_command",
                 reason,
                 null,
+                null,
             ),
             .user_denied, .auto_denied, .policy_denied, .permission_required => try tool_result_errors.toolPermissionDeniedJson(
                 alloc,

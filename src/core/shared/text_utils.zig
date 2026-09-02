@@ -672,9 +672,12 @@ fn findSecretSpan(text: []const u8, start: usize) ?SecretSpan {
     if (matchesAwsAccessKey(text, start)) |span| return span;
     if (matchesSensitiveAssignment(text, start)) |span| return span;
     for (secret_prefixes) |prefix| {
-        if (start + prefix.len < text.len and eqlIgnoreCase(text[start .. start + prefix.len], prefix)) {
+        if ((start == 0 or !isAssignmentKeyChar(text[start - 1])) and
+            start + prefix.len < text.len and
+            eqlIgnoreCase(text[start .. start + prefix.len], prefix))
+        {
             const value_start = start + prefix.len;
-            if (secretAssignmentValueSpan(text, value_start)) |value| {
+            if (secretAssignmentValueSpan(text, start, value_start)) |value| {
                 return .{ .prefix_end = value.prefix_end, .value_len = value.value_len, .kind = "assignment" };
             }
         }
@@ -758,7 +761,7 @@ fn matchesSensitiveAssignment(text: []const u8, start: usize) ?SecretSpan {
     if (!sensitiveAssignmentKey(key)) return null;
 
     const value_start = eq + 1;
-    if (secretAssignmentValueSpan(text, value_start)) |value| {
+    if (secretAssignmentValueSpan(text, start, value_start)) |value| {
         return .{ .prefix_end = value.prefix_end, .value_len = value.value_len, .kind = "assignment" };
     }
     return null;
@@ -769,14 +772,19 @@ const AssignmentValueSpan = struct {
     value_len: usize,
 };
 
-fn secretAssignmentValueSpan(text: []const u8, value_start: usize) ?AssignmentValueSpan {
+fn secretAssignmentValueSpan(
+    text: []const u8,
+    assignment_start: usize,
+    value_start: usize,
+) ?AssignmentValueSpan {
     const value = assignmentValueSpan(text, value_start) orelse return null;
-    if (isPureSymbolicAssignment(text, value_start, value)) return null;
+    if (isPureSymbolicAssignment(text, assignment_start, value_start, value)) return null;
     return value;
 }
 
 fn isPureSymbolicAssignment(
     text: []const u8,
+    assignment_start: usize,
     value_start: usize,
     value: AssignmentValueSpan,
 ) bool {
@@ -786,7 +794,11 @@ fn isPureSymbolicAssignment(
     )) return false;
     const value_end = value.prefix_end + value.value_len;
     if (text[value_start] != '"') {
-        return value_end == text.len or isShellWordBoundary(text, value_end);
+        if (value_end == text.len or isShellWordBoundary(text, value_end)) return true;
+        if (text[value_end] != '"' or assignment_start == 0 or
+            text[assignment_start - 1] != '"') return false;
+        const next = value_end + 1;
+        return next == text.len or isShellWordBoundary(text, next);
     }
 
     const closing_quote = value_end;
@@ -1004,6 +1016,7 @@ test "maskSecrets preserves pure symbolic sensitive assignments" {
     const alloc = std.testing.allocator;
     const input =
         "AI_GATEWAY_API_KEY=\"$key\"\n" ++
+        "sandbox -e \"AI_GATEWAY_API_KEY=$key\" \"$@\"\n" ++
         "GITHUB_TOKEN=$token\n" ++
         "DATABASE_URL=\"${database_url}\"\n" ++
         "TOKEN=\"$token\"; run-next\n" ++
@@ -1021,6 +1034,9 @@ test "maskSecrets masks compound or literal sensitive assignments" {
     const alloc = std.testing.allocator;
     const input =
         "AI_GATEWAY_API_KEY=\"literal-value\"\n" ++
+        "sandbox -e \"AI_GATEWAY_API_KEY=literal-value\"\n" ++
+        "sandbox -e \"GITHUB_TOKEN=$token-suffix\"\n" ++
+        "sandbox -e \"API_KEY=$(load-key)\"\n" ++
         "GITHUB_TOKEN=\"$token-suffix\"\n" ++
         "DATABASE_URL=\"${database_url:-fallback}\"\n" ++
         "API_KEY=\"$(load-key)\"\n" ++
@@ -1039,6 +1055,9 @@ test "maskSecrets masks compound or literal sensitive assignments" {
 
     try std.testing.expectEqualStrings(
         "AI_GATEWAY_API_KEY=\"[redacted]\"\n" ++
+            "sandbox -e \"AI_GATEWAY_API_KEY=[redacted]\"\n" ++
+            "sandbox -e \"GITHUB_TOKEN=[redacted]\"\n" ++
+            "sandbox -e \"API_KEY=[redacted]\"\n" ++
             "GITHUB_TOKEN=\"[redacted]\"\n" ++
             "DATABASE_URL=\"[redacted]\"\n" ++
             "API_KEY=\"[redacted]\"\n" ++

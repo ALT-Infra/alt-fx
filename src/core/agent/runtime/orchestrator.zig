@@ -8707,6 +8707,7 @@ fn processQueuedPromptLoop(
                             result.rationale
                         else
                             null,
+                        permission_outcome.auto_review_failure,
                     ),
                     .user_denied, .auto_denied, .policy_denied, .permission_required => try tool_result_errors.toolPermissionDeniedJson(
                         arena,
