@@ -81,11 +81,12 @@ const TurnFinalizationGuard = runtime_finalization.TurnFinalizationGuard;
 const PromptFinishTrace = runtime_finalization.PromptFinishTrace;
 const ToolExecutionResult = runtime_tool_contracts.ToolExecutionResult;
 
-fn terminal_request_schema_advertised(
+fn request_union_schema_advertised(
     advertised_functions: []const model_tool_schema.FunctionSchema,
+    tool_name: []const u8,
 ) bool {
     for (advertised_functions) |function| {
-        if (!std.mem.eql(u8, function.name, "shell")) continue;
+        if (!std.mem.eql(u8, function.name, tool_name)) continue;
         return model_tool_schema.isSingleRequiredObjectUnionField(
             function.input_schema,
             "request",
@@ -105,6 +106,21 @@ fn subagent_request_schema_advertised(
         );
     }
     return false;
+}
+
+fn terminal_request_schema_advertised(
+    advertised_functions: []const model_tool_schema.FunctionSchema,
+) bool {
+    return request_union_schema_advertised(advertised_functions, "shell");
+}
+
+fn read_tool_result_request_schema_advertised(
+    advertised_functions: []const model_tool_schema.FunctionSchema,
+) bool {
+    return request_union_schema_advertised(
+        advertised_functions,
+        "read_tool_result",
+    );
 }
 
 fn terminal_request_normalization_eligible(
@@ -241,6 +257,34 @@ fn projected_terminal_request_arguments(
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     std.json.Stringify.value(.{ .request = parsed.value }, .{}, &out.writer) catch return error.OutOfMemory;
+    return try out.toOwnedSlice();
+}
+
+fn projected_read_tool_result_arguments(
+    alloc: Allocator,
+    arguments_json: []const u8,
+) Allocator.Error!?[]u8 {
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        arguments_json,
+        .{},
+    ) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => null,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    if (parsed.value.object.count() == 1 and
+        parsed.value.object.get("request") != null)
+    {
+        return null;
+    }
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    std.json.Stringify.value(.{ .request = parsed.value }, .{}, &out.writer) catch
+        return error.OutOfMemory;
     return try out.toOwnedSlice();
 }
 
@@ -882,6 +926,39 @@ test "subagent history projection cleans every partial allocation failure" {
     );
 }
 
+fn project_read_tool_result_request_messages(
+    arena: Allocator,
+    eligible: bool,
+    source: []const ChatMessage,
+) Allocator.Error![]const ChatMessage {
+    if (!eligible) return source;
+
+    var projected: ?[]ChatMessage = null;
+    for (source, 0..) |message, message_index| {
+        if (message.role != .assistant) continue;
+        for (message.tool_calls, 0..) |call, call_index| {
+            if (call.argument_integrity != .valid or
+                !std.mem.eql(u8, call.name, "read_tool_result")) continue;
+            const arguments_json = try projected_read_tool_result_arguments(
+                arena,
+                call.arguments_json,
+            ) orelse continue;
+            if (projected == null) {
+                projected = try arena.dupe(ChatMessage, source);
+            }
+            if (projected.?[message_index].tool_calls.ptr == message.tool_calls.ptr) {
+                projected.?[message_index].tool_calls = try arena.dupe(
+                    ToolCall,
+                    message.tool_calls,
+                );
+            }
+            @constCast(projected.?[message_index].tool_calls)[call_index].arguments_json =
+                arguments_json;
+        }
+    }
+    return projected orelse source;
+}
+
 fn normalized_terminal_request_arguments(
     alloc: Allocator,
     arguments_json: []const u8,
@@ -1299,6 +1376,49 @@ test "shell request projection wraps eligible flat objects without changing sour
     const idempotent = try project_terminal_request_messages(arena, registry, true, projected);
     try std.testing.expectEqual(projected.ptr, idempotent.ptr);
     const ineligible = try project_terminal_request_messages(arena, registry, false, &messages);
+    try std.testing.expectEqual(messages[0..].ptr, ineligible.ptr);
+}
+
+test "legacy read_tool_result history gains one nested request wrapper" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const calls = [_]ToolCall{
+        .{ .id = "legacy", .name = "read_tool_result", .arguments_json = "{\"handle\":\"legacy.bin\",\"start_byte\":1,\"byte_count\":160}" },
+        .{ .id = "nested", .name = "read_tool_result", .arguments_json = "{\"request\":{\"handle\":\"new.bin\",\"query\":\"needle\"}}" },
+    };
+    const messages = [_]ChatMessage{.{ .role = .assistant, .tool_calls = &calls }};
+
+    const projected = try project_read_tool_result_request_messages(
+        arena,
+        true,
+        &messages,
+    );
+    try std.testing.expect(projected.ptr != messages[0..].ptr);
+    try std.testing.expectEqualStrings(
+        "{\"request\":{\"handle\":\"legacy.bin\",\"start_byte\":1,\"byte_count\":160}}",
+        projected[0].tool_calls[0].arguments_json,
+    );
+    try std.testing.expectEqualStrings(
+        calls[1].arguments_json,
+        projected[0].tool_calls[1].arguments_json,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"handle\":\"legacy.bin\",\"start_byte\":1,\"byte_count\":160}",
+        messages[0].tool_calls[0].arguments_json,
+    );
+
+    const idempotent = try project_read_tool_result_request_messages(
+        arena,
+        true,
+        projected,
+    );
+    try std.testing.expectEqual(projected.ptr, idempotent.ptr);
+    const ineligible = try project_read_tool_result_request_messages(
+        arena,
+        false,
+        &messages,
+    );
     try std.testing.expectEqual(messages[0..].ptr, ineligible.ptr);
 }
 
@@ -3596,6 +3716,10 @@ fn processQueuedPromptInner(
     const base_nested_subagent_advertised = subagent_request_schema_advertised(
         config.advertised_functions,
     );
+    const base_nested_read_tool_result_advertised =
+        read_tool_result_request_schema_advertised(
+            config.advertised_functions,
+        );
 
     var stable_prefix: std.ArrayList(ChatMessage) = .empty;
     defer stable_prefix.deinit(arena);
@@ -3731,6 +3855,7 @@ fn processQueuedPromptInner(
         request_capabilities,
         base_nested_terminal_advertised,
         base_nested_subagent_advertised,
+        base_nested_read_tool_result_advertised,
         finalization,
         arena,
         turn_id,
@@ -3989,6 +4114,7 @@ fn processQueuedPromptLoop(
     request_capabilities: model_capabilities.Capabilities,
     base_nested_terminal_advertised: bool,
     base_nested_subagent_advertised: bool,
+    base_nested_read_tool_result_advertised: bool,
     finalization: *TurnFinalizationGuard,
     arena: Allocator,
     turn_id: u64,
@@ -4428,17 +4554,27 @@ fn processQueuedPromptLoop(
                 base_nested_subagent_advertised,
                 vision_mode,
             );
+            const read_tool_result_request_eligible =
+                terminal_request_normalization_eligible(
+                    base_nested_read_tool_result_advertised,
+                    vision_mode,
+                );
             const terminal_request_messages = try project_terminal_request_messages(
                 overlay_arena,
                 deps.tool_registry,
                 terminal_request_eligible,
                 projected_request_messages,
             );
-            const request_messages = try project_subagent_request_messages(
+            const subagent_request_messages = try project_subagent_request_messages(
                 overlay_arena,
                 deps.tool_registry,
                 subagent_request_eligible,
                 terminal_request_messages,
+            );
+            const request_messages = try project_read_tool_result_request_messages(
+                overlay_arena,
+                read_tool_result_request_eligible,
+                subagent_request_messages,
             );
             last_gateway_message_count = request_messages.len;
             const provider_opts = model_capabilities.resolveProviderOptionsForCapabilities(request_capabilities, config.effort, route_fast_mode);
