@@ -458,6 +458,23 @@ pub const CommitLifecycle = struct {
         }
     }
 
+    fn prepareRequired(
+        self: *CommitLifecycle,
+        alloc: Allocator,
+        session_id: []const u8,
+        workspace_root: []const u8,
+        commit_lock_deadline_ms: u64,
+    ) !bool {
+        try self.prepare(
+            alloc,
+            session_id,
+            workspace_root,
+            workspace_root,
+            commit_lock_deadline_ms,
+        );
+        return false;
+    }
+
     fn prepareOpportunistic(
         self: *CommitLifecycle,
         alloc: Allocator,
@@ -1184,14 +1201,23 @@ pub const Root = struct {
         };
         var writable_owned = true;
         errdefer if (writable_owned) writable.deinit(alloc);
+        var cache_deferred = false;
         if (lifecycle_value) |*value| {
-            value.prepare(
-                alloc,
-                initial_state.id,
-                initial_state.workspace_root,
-                initial_state.workspace_root,
-                options.commit_lock_deadline_ms,
-            ) catch |err| {
+            const preparation = if (initial_state.history.len == 0)
+                value.prepareOpportunistic(
+                    alloc,
+                    initial_state.id,
+                    initial_state.workspace_root,
+                    options.commit_lock_deadline_ms,
+                )
+            else
+                value.prepareRequired(
+                    alloc,
+                    initial_state.id,
+                    initial_state.workspace_root,
+                    options.commit_lock_deadline_ms,
+                );
+            cache_deferred = preparation catch |err| {
                 writable.deinit(alloc);
                 writable_owned = false;
                 sessions.dir.deleteTree(io_mod.getIo(), initial_state.id) catch |cleanup_err| {
@@ -1220,11 +1246,38 @@ pub const Root = struct {
             options,
         );
         writable_owned = false;
-        errdefer created.deinit(alloc);
+        var created_owned = true;
+        errdefer if (created_owned) created.deinit(alloc);
         if (lifecycle_value) |value| {
             try created.installCommitLifecycle(value);
             lifecycle_value = null;
-            if (!created.publishCommitLifecycle(alloc)) {
+            if (cache_deferred) {
+                created.writeDeferredCommitLifecycle(
+                    alloc,
+                    created.position,
+                ) catch |err| {
+                    created.deinit(alloc);
+                    created_owned = false;
+                    sessions.dir.deleteTree(io_mod.getIo(), initial_state.id) catch |cleanup_err| {
+                        debug_trace.logf(
+                            "session",
+                            "event=deferred_session_cleanup_failed err={s}",
+                            .{@errorName(cleanup_err)},
+                        );
+                        return cleanup_err;
+                    };
+                    io_mod.syncVerifiedDir(sessions.dir) catch |cleanup_err| {
+                        debug_trace.logf(
+                            "session",
+                            "event=deferred_session_cleanup_sync_failed err={s}",
+                            .{@errorName(cleanup_err)},
+                        );
+                        return cleanup_err;
+                    };
+                    return err;
+                };
+                created.state_replacement_pending = true;
+            } else if (!created.publishCommitLifecycle(alloc)) {
                 created.state_replacement_pending = true;
             }
         }
