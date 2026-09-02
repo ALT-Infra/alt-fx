@@ -159,6 +159,7 @@ pub const SolveInput = struct {
     footer: FooterMeasurement,
     transcript: TranscriptFlowPreview,
     activity: ActivityState = .none,
+    minimum_content_rows: u16 = 0,
     body_mode: BodyMode = .transcript,
     prior: CommittedLayoutSnapshot = .{},
     placement_policy: FramePlacementPolicy = .compact_until_full,
@@ -249,11 +250,14 @@ pub fn solve(input: SolveInput) FrameLayout {
         .transcript, .subagent_panel => input.transcript.natural_visual_rows,
     };
     const transcript_height = @min(natural_body_rows, body_capacity);
-    const solved_frame_height = @min(available_rows, transcript_height +| reserved_activity_rows +| footer_height);
+    const natural_content_rows = transcript_height +| reserved_activity_rows +| footer_height;
+    const minimum_content_rows = if (reservation.activity_rows == 0) input.minimum_content_rows else 0;
+    const solved_frame_height = @min(available_rows, @max(natural_content_rows, minimum_content_rows));
+    const neutral_rows = solved_frame_height -| natural_content_rows;
     const owned_band = rectFromTopHeight(owned_top, solved_frame_height);
     const transcript_area = rectFromTopHeight(owned_top, transcript_height);
     const blank_top = if (transcript_area.isEmpty()) owned_top else transcript_area.bottom + 1;
-    const blank_area = rectFromTopHeight(blank_top, reservation.boundary_gap);
+    const blank_area = rectFromTopHeight(blank_top, reservation.boundary_gap +| neutral_rows);
     const activity_row: ?u16 = if (reservation.activity_rows > 0)
         if (reservation.tool_before_activity)
             blank_top + reservation.boundary_gap + 2
@@ -306,6 +310,7 @@ pub fn solveWithPreservedRowRelease(input: SolveInput, release_floor_rows: u16) 
 
     var maximum_input = input;
     maximum_input.owned_top = 1;
+    maximum_input.minimum_content_rows = 0;
     const maximum = solve(maximum_input);
     const geometry_top = if (maximum.solved_frame_height == 0)
         initial.owned_top
@@ -699,6 +704,93 @@ test "layout id ignores non layout-affecting cursor column changes" {
 
     try std.testing.expect(base.layout_id != 0);
     try std.testing.expectEqual(base.layout_id, repaint.layout_id);
+}
+
+test "minimum content rows keep a neutral transition aligned with thinking" {
+    const idle = solve(.{
+        .terminal = testLayout(24, 80),
+        .owned_top = 1,
+        .footer = testFooter(3),
+        .transcript = .{ .natural_visual_rows = 5 },
+        .minimum_content_rows = 13,
+    });
+    const pending = solve(.{
+        .terminal = testLayout(24, 80),
+        .owned_top = 1,
+        .footer = testFooter(3),
+        .transcript = .{ .natural_visual_rows = 8 },
+        .minimum_content_rows = 13,
+    });
+    const adopted = solve(.{
+        .terminal = testLayout(24, 80),
+        .owned_top = 1,
+        .footer = testFooter(3),
+        .transcript = .{ .natural_visual_rows = 7 },
+        .minimum_content_rows = 13,
+    });
+    const thinking = solve(.{
+        .terminal = testLayout(24, 80),
+        .owned_top = 1,
+        .footer = testFooter(3),
+        .transcript = .{ .natural_visual_rows = 7 },
+        .activity = .{ .thinking = .{ .gap_above_activity = 1, .footer_gap_after_activity = 1 } },
+    });
+
+    inline for (.{ idle, pending, adopted, thinking }) |layout| {
+        try std.testing.expectEqual(FrameRect{ .top = 11, .bottom = 13 }, layout.footer_area);
+        try std.testing.expectEqual(@as(u16, 13), layout.solved_frame_height);
+    }
+    try std.testing.expectEqual(@as(?u16, null), idle.activity_row);
+    try std.testing.expectEqual(@as(u16, 5), idle.blank_area.height());
+    try std.testing.expectEqual(@as(?u16, null), pending.activity_row);
+    try std.testing.expectEqual(@as(u16, 2), pending.blank_area.height());
+    try std.testing.expectEqual(@as(?u16, null), adopted.activity_row);
+    try std.testing.expectEqual(@as(u16, 3), adopted.blank_area.height());
+    try std.testing.expectEqual(@as(?u16, 9), thinking.activity_row);
+}
+
+test "real activity supersedes neutral minimum content rows" {
+    const layout = solve(.{
+        .terminal = testLayout(24, 80),
+        .owned_top = 1,
+        .footer = testFooter(3),
+        .transcript = .{ .natural_visual_rows = 7 },
+        .activity = .{ .thinking = .{ .gap_above_activity = 1, .footer_gap_after_activity = 1 } },
+        .minimum_content_rows = 20,
+    });
+
+    try std.testing.expectEqual(@as(?u16, 9), layout.activity_row);
+    try std.testing.expectEqual(FrameRect{ .top = 11, .bottom = 13 }, layout.footer_area);
+    try std.testing.expectEqual(@as(u16, 13), layout.solved_frame_height);
+}
+
+test "minimum content rows do not release preserved shell rows" {
+    const input = SolveInput{
+        .terminal = testLayout(24, 80),
+        .owned_top = 6,
+        .footer = testFooter(3),
+        .transcript = .{ .natural_visual_rows = 2 },
+        .minimum_content_rows = 13,
+    };
+    const plan = solveWithPreservedRowRelease(input, 0);
+
+    try std.testing.expectEqual(@as(u16, 6), plan.layout.owned_top);
+    try std.testing.expectEqual(@as(u16, 0), plan.released_rows);
+}
+
+test "minimum content rows clamp without displacing visible content" {
+    const layout = solve(.{
+        .terminal = testLayout(8, 80),
+        .owned_top = 1,
+        .footer = testFooter(3),
+        .transcript = .{ .natural_visual_rows = 6 },
+        .minimum_content_rows = 13,
+    });
+
+    try std.testing.expectEqual(@as(u16, 8), layout.solved_frame_height);
+    try std.testing.expectEqual(@as(u16, 5), layout.transcript_area.height());
+    try std.testing.expectEqual(@as(u16, 0), layout.blank_area.height());
+    try std.testing.expectEqual(FrameRect{ .top = 6, .bottom = 8 }, layout.footer_area);
 }
 
 test "thinking activity owns a deterministic leading blank gap without moving footer separately" {

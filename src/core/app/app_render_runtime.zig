@@ -1307,6 +1307,14 @@ pub fn Runtime(comptime App: type) type {
                     measurement.activity_projection
                 else
                     .{ .turn_thinking = .{ .label = footer_frame.label() } };
+                const minimum_content_rows = turnTransitionMinimumContentRows(
+                    app,
+                    presentation_shell,
+                    canonical_transcript_preview,
+                    pending_card,
+                    if (footer_measurement) |*measurement| measurement else null,
+                    frame_activity,
+                );
                 var fixed_point_ctx = FixedPointTranscriptContext(App){
                     .app = app,
                     .presentation_shell = presentation_shell,
@@ -1339,6 +1347,7 @@ pub fn Runtime(comptime App: type) type {
                         .footer = neutral_footer,
                         .transcript = transcript_preview,
                         .activity = frame_activity,
+                        .minimum_content_rows = minimum_content_rows,
                         .body_mode = .transcript,
                         .prior = active_committed_layout,
                     },
@@ -2225,6 +2234,46 @@ fn validatePreparedTranscriptFitsPlan(
         );
         return error.InvalidPaintPlan;
     }
+}
+
+fn turnTransitionMinimumContentRows(
+    app: anytype,
+    shell: *const transcript_runtime.TranscriptRuntime,
+    canonical_preview: render_engine.frame_layout.TranscriptFlowPreview,
+    pending_card: ?PendingCardProjection,
+    footer_measurement: ?*const surface_frame.SurfaceFooterMeasurement,
+    frame_activity: render_engine.frame_layout.ActivityState,
+) u16 {
+    if (frame_activity != .none) return 0;
+    const measurement = footer_measurement orelse return 0;
+    if (!measurement.input_visible or
+        measurement.show_picker or
+        measurement.picker_rows > 0 or
+        measurement.banner_active or
+        measurement.footer_gap_active or
+        app.stream.active or
+        shell.fullTranscriptActive()) return 0;
+    if (comptime @hasField(@TypeOf(app.*), "skills")) {
+        if (comptime @hasDecl(@TypeOf(app.skills), "menuVisible")) {
+            if (app.skills.menuVisible()) return 0;
+        }
+    }
+
+    const future_activity_rows = render_engine.transcript_blocks.blockGapRowsBetween(.user_turn, .assistant_turn) +| 1 +|
+        render_engine.transcript_blocks.footerBoundaryGapRowsForTail(.turn_summary);
+    const footer_rows = measurement.frameLayoutMeasurement().natural_rows;
+    const pending_submission_active = if (comptime @hasField(@TypeOf(app.*), "submission"))
+        app.submission.pending != null
+    else
+        false;
+    if (pending_card != null or pending_submission_active) {
+        const canonical_rows = if (pending_card) |card|
+            canonical_preview.natural_visual_rows +| (card.row_count -| 1)
+        else
+            canonical_preview.natural_visual_rows;
+        return canonical_rows +| future_activity_rows +| footer_rows;
+    }
+    return 0;
 }
 
 fn footerMeasurementFromRows(rows: render_engine.footer_layout.FooterRows) render_engine.frame_layout.FooterMeasurement {

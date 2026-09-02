@@ -2719,6 +2719,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.waitForComposer(TIMEOUT);
       await session.sendLiteral(submittedPrompt);
+      const preEnterGrid = await session.capturePaneGrid();
       session.sendKeysImmediate(["Enter"]);
       session.sendLiteralImmediate(newerDraft);
       await waitForCondition(
@@ -2727,6 +2728,12 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
       await session.waitForText("Thinking", TIMEOUT);
       await Bun.sleep(250);
+      const thinkingGrid = await session.capturePaneGrid();
+      const rowContaining = (grid: string[], needle: string) =>
+        grid.findIndex((row) => row.includes(needle));
+      expect(rowContaining(thinkingGrid, submittedPrompt)).toBe(
+        rowContaining(preEnterGrid, submittedPrompt),
+      );
       await session.sendKeys("C-c");
       const cancelledPane = await session.waitForText("cancelled", TIMEOUT);
 
