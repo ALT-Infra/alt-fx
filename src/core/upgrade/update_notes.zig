@@ -39,6 +39,14 @@ pub const Destination = struct {
             },
         }
     }
+
+    pub fn writeHyperlinkLabel(self: Destination, writer: *std.Io.Writer) !void {
+        try writer.writeAll("\x1b]8;;");
+        try self.writeUrl(writer);
+        try writer.writeAll("\x1b\\\x1b[4m(");
+        try writeLabel(self.kind, writer);
+        try writer.writeAll(")\x1b[24m\x1b]8;;\x1b\\");
+    }
 };
 
 pub fn destination(
@@ -132,6 +140,20 @@ test "dev destination treats a short previous revision as the same commit" {
     try value.writeUrl(&out.writer);
     try std.testing.expectEqualStrings(
         "https://github.com/vercel-labs/fx/commit/abcdef0123456789abcdef0123456789abcdef01",
+        out.writer.buffered(),
+    );
+}
+
+test "destination writes a compact OSC 8 hyperlink label" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+
+    const value = destination(.stable, "0.0.8", "", "") orelse
+        return error.TestExpectedDestination;
+    try value.writeHyperlinkLabel(&out.writer);
+    try std.testing.expectEqualStrings(
+        "\x1b]8;;https://fx.sh/changelog#v0.0.8\x1b\\" ++
+            "\x1b[4m(notes)\x1b[24m\x1b]8;;\x1b\\",
         out.writer.buffered(),
     );
 }

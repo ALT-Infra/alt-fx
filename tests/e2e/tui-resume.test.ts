@@ -5169,11 +5169,14 @@ test.skipIf(!tmuxAvailable())(
       const version = (await runFx(["--version"])).stdout.trim();
       await active.sendHexBytes(["07"]);
 
-      const updatedNotice = `● fx has been updated to v${version}\n  notes: https://fx.sh/changelog#v${version}`;
+      const updatedNotice = `● fx has been updated to v${version} (notes)`;
       await active.waitForText(updatedNotice, TIMEOUT);
       const resumed = await waitForScrollback(active, "UPGRADE_CTRL_G_INITIAL_DONE");
       expect(resumed).toContain("UPGRADE_CTRL_G_INITIAL_DONE");
       expect(resumed).toContain(updatedNotice);
+      expect(await active.capturePaneEscapes()).toContain(
+        `\x1b[4m\x1b]8;;https://fx.sh/changelog#v${version}\x1b\\(notes)\x1b]8;;\x1b\\`,
+      );
       expect(resumed).not.toContain("● Session resumed:");
       expect(resumed).not.toContain("● Session: resumed:");
 
@@ -5268,7 +5271,7 @@ test.skipIf(!tmuxAvailable())(
       await active.sendHexBytes(["07"]);
 
       await active.waitForText(
-        `● fx has been updated to v${version}\n  notes: https://fx.sh/changelog#v${version}`,
+        `● fx has been updated to v${version} (notes)`,
         TIMEOUT,
       );
       const resumed = await waitForScrollback(
