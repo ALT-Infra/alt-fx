@@ -944,6 +944,12 @@ fn nonAllowAutoReviewOutcome(
     request: permission_auto_classifier.ReviewRequest,
     review: permission_auto_classifier.ParseOutcome,
 ) !?command_admission.PermissionOutcome {
+    if (review == .evidence_incomplete) {
+        return .{
+            .decision = .deny,
+            .denial_reason = .review_evidence_incomplete,
+        };
+    }
     return switch (permission_auto_classifier.validatedHostDisposition(
         request,
         review,
@@ -976,7 +982,7 @@ fn nonAllowAutoReviewOutcome(
                     },
                 };
             },
-            .invalid => unreachable,
+            .evidence_incomplete, .invalid => unreachable,
         },
     };
 }
@@ -1056,6 +1062,11 @@ fn runAutomaticReview(
             "permission",
             "event=auto_review_result tool_name={s} decision={s} fallback_reason=none elapsed_ms={d} execution_started=false call_id={s}",
             .{ call.name, @tagName(result.decision), io_mod.milliTimestamp() - started_ms, call.id },
+        ),
+        .evidence_incomplete => debug_trace.logf(
+            "permission",
+            "event=auto_review_result tool_name={s} decision=held fallback_reason=review_evidence_incomplete recovery=agent_replan elapsed_ms={d} execution_started=false call_id={s}",
+            .{ call.name, io_mod.milliTimestamp() - started_ms, call.id },
         ),
         .invalid => debug_trace.logf(
             "permission",

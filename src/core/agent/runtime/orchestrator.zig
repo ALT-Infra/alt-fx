@@ -7522,12 +7522,12 @@ fn processQueuedPromptLoop(
                 turn_file_mutation_denials.preservedOutcome(identity)
             else
                 null;
-            const preserved_review_caution = if (action_permission_mode == .auto)
-                turn_review_cache.cachedCaution(execution_call)
+            const preserved_review_hold = if (action_permission_mode == .auto)
+                turn_review_cache.cached(execution_call)
             else
                 null;
             const effective_preserved_denial = preserved_denial orelse
-                preserved_review_caution;
+                preserved_review_hold;
             if (effective_preserved_denial != null) {
                 debug_trace.eventf(
                     "permission",
@@ -7778,13 +7778,13 @@ fn processQueuedPromptLoop(
                 }
                 const reason = permission_outcome.denial_reason orelse
                     decision.denialReason() orelse .user_denied;
-                try turn_review_cache.rememberCaution(
+                try turn_review_cache.remember(
                     arena,
                     tool_call,
                     permission_outcome,
                 );
                 const denied_output = switch (reason) {
-                    .review_caution, .review_unavailable => try tool_result_errors.toolReviewHeldJson(
+                    .review_caution, .review_evidence_incomplete, .review_unavailable => try tool_result_errors.toolReviewHeldJson(
                         arena,
                         tool_call.name,
                         reason,

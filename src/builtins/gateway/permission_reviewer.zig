@@ -438,7 +438,7 @@ test "gateway automatic reviewer transport is single-attempt" {
 
     switch (outcome) {
         .valid => |result| try std.testing.expectEqual(permission_auto_classifier.Decision.clear, result.decision),
-        .invalid => return error.TestExpectedEqual,
+        .evidence_incomplete, .invalid => return error.TestExpectedEqual,
     }
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expect(fake.saw_single_attempt_only);
