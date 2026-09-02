@@ -636,6 +636,9 @@ pub const WorkerRuntime = struct {
     active_turn_id: u64 = 0,
     active_tool_calls: std.StringHashMapUnmanaged(void) = .empty,
     active_tool_allocator: ?std.mem.Allocator = null,
+    /// Retains the tool-producing step so later text from that same step cannot
+    /// reopen immediate steering before authoritative lifecycle IDs exist.
+    tool_phase_step_id: ?u64 = null,
     worker_stop_requested: bool = false,
     finalization_failure: ?FinalizationFailure = null,
     worker_cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -793,6 +796,7 @@ pub const WorkerRuntime = struct {
         errdefer tool_transition.deinit(alloc);
         self.worker_events.appendAssumeCapacity(event);
         self.applyActiveToolTransitionLocked(tool_transition);
+        self.applyToolBoundaryPhaseLocked(event);
         self.applyRecoveryStateEvent(event);
         self.worker_cond.broadcast(io_mod.getIo());
     }
@@ -1013,7 +1017,7 @@ pub const WorkerRuntime = struct {
         var interrupt_after_admission = false;
         if (steer_if_active and self.worker_processing and self.active_turn_id != 0) {
             queued.delivery = .{ .active_turn = self.active_turn_id };
-            interrupt_after_admission = self.active_tool_calls.count() == 0;
+            interrupt_after_admission = !self.hasActiveToolBoundaryLocked();
         }
         try self.enqueuePromptLocked(alloc, queued);
         if (interrupt_after_admission) {
@@ -1376,6 +1380,7 @@ pub const WorkerRuntime = struct {
         {
             self.worker_processing = false;
             self.active_turn_id = 0;
+            self.tool_phase_step_id = null;
             self.worker_cond.wait(io_mod.getIo(), &self.worker_mutex) catch break;
         }
         return self.takeNextPromptLocked(alloc);
@@ -1392,6 +1397,7 @@ pub const WorkerRuntime = struct {
         {
             self.worker_processing = false;
             self.active_turn_id = 0;
+            self.tool_phase_step_id = null;
             self.worker_cond.wait(io_mod.getIo(), &self.worker_mutex) catch break;
         }
         return self.takeNextWorkLocked(alloc);
@@ -1436,6 +1442,7 @@ pub const WorkerRuntime = struct {
             self.recovery_continuation_ready = false;
             self.worker_processing = true;
             self.active_turn_id = task.turn_id;
+            self.tool_phase_step_id = null;
             self.active_context_compaction = true;
             debug_trace.eventf(
                 "worker",
@@ -1489,6 +1496,7 @@ pub const WorkerRuntime = struct {
         self.recovery_continuation_ready = false;
         self.worker_processing = true;
         self.active_turn_id = job.turn_id;
+        self.tool_phase_step_id = null;
         if (job.delivery.isContinuation()) {
             for (self.queued_prompts.items) |*prompt| {
                 if (!prompt.delivery.isContinuation() or !sameTurnSteeringEligible(prompt.*)) continue;
@@ -1526,6 +1534,7 @@ pub const WorkerRuntime = struct {
         self.active_turn_id = 0;
         self.steering_cancel_turn_id = null;
         self.clearActiveToolCallsLocked();
+        self.tool_phase_step_id = null;
         self.active_context_compaction = false;
         self.worker_connectivity_wait_active.store(false, .seq_cst);
         self.worker_cond.broadcast(io_mod.getIo());
@@ -1544,6 +1553,7 @@ pub const WorkerRuntime = struct {
         self.worker_connectivity_wait_active.store(false, .seq_cst);
         self.worker_processing = true;
         self.active_turn_id = turn_id;
+        self.tool_phase_step_id = null;
         return true;
     }
 
@@ -1612,6 +1622,24 @@ pub const WorkerRuntime = struct {
             },
             .clear => self.clearActiveToolCallsLocked(),
         }
+    }
+
+    fn applyToolBoundaryPhaseLocked(self: *WorkerRuntime, event: WorkerEvent) void {
+        switch (event) {
+            .turn_phase_update => |update| if (update.turn_id == self.active_turn_id) {
+                switch (update.phase) {
+                    .running => self.tool_phase_step_id = update.step_id,
+                    .thinking, .generating => if (self.tool_phase_step_id != update.step_id) {
+                        self.tool_phase_step_id = null;
+                    },
+                }
+            },
+            else => {},
+        }
+    }
+
+    fn hasActiveToolBoundaryLocked(self: *const WorkerRuntime) bool {
+        return self.tool_phase_step_id != null or self.active_tool_calls.count() > 0;
     }
 
     fn clearActiveToolCallsLocked(self: *WorkerRuntime) void {
@@ -1708,7 +1736,7 @@ pub const WorkerRuntime = struct {
         }
         var snapshot: QueuePresentationSnapshot = .{
             .ordinary_count = queued_count -| steering_count,
-            .steering_waits_for_tool = steering_count > 0 and self.active_tool_calls.count() > 0,
+            .steering_waits_for_tool = steering_count > 0 and self.hasActiveToolBoundaryLocked(),
             .paused = self.queue_admission != null,
         };
         if (steering_count == 0) return snapshot;
@@ -3877,6 +3905,49 @@ test "tool lifecycle decides whether interactive steering interrupts immediately
         .outcome = .{ .kind = .completed, .summary = "completed" },
     } } });
     try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "interrupt generation", "model"));
+    try std.testing.expect(runtime.isCancelRequested());
+}
+
+test "tool handoff phase holds steering only through its model step" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 41;
+
+    try runtime.pushEvent(alloc, .{ .turn_phase_update = .{
+        .turn_id = 41,
+        .step_id = 7,
+        .phase = .running,
+    } });
+    try runtime.pushEvent(alloc, .{ .turn_phase_update = .{
+        .turn_id = 41,
+        .step_id = 7,
+        .phase = .generating,
+    } });
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "wait for pending tools", "model"));
+
+    try std.testing.expect(!runtime.isCancelRequested());
+    try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
+    var snapshot = try runtime.snapshotQueuePresentation(alloc);
+    defer snapshot.deinit(alloc);
+    try std.testing.expect(snapshot.steering_waits_for_tool);
+
+    const guidance = try expectContinuedSteering(
+        try runtime.takeSteeringBoundary(alloc, 41, .model),
+    );
+    defer {
+        for (guidance) |text| alloc.free(text);
+        alloc.free(guidance);
+    }
+    try std.testing.expectEqualStrings("wait for pending tools", guidance[0]);
+
+    try runtime.pushEvent(alloc, .{ .turn_phase_update = .{
+        .turn_id = 41,
+        .step_id = 8,
+        .phase = .thinking,
+    } });
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "interrupt next model step", "model"));
     try std.testing.expect(runtime.isCancelRequested());
 }
 
