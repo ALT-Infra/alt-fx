@@ -133,7 +133,7 @@ This restriction is a security boundary. New tools or host effects must not be e
 
 ## Gateway endpoint policy
 
-The Gateway URL is validated independently in JavaScript and Zig. This duplication is intentional defense in depth because callers can load and call `libfx.node` directly, bypassing `sdk/node.js`.
+The Gateway URL is validated independently in JavaScript and Zig. This duplication is intentional defense in depth because callers can load and call `libfx.node` directly, bypassing `sdk/fx-sdk.js`.
 
 Accepted endpoints are:
 
@@ -142,7 +142,7 @@ Accepted endpoints are:
 
 URLs with embedded credentials or fragments are rejected. Arbitrary HTTPS hosts, non-loopback HTTP hosts, and other schemes are rejected. Loopback HTTP exists only for local development and deterministic tests.
 
-Keep the validation in `sdk/node.js`, `src/napi_core_main.zig`, and `streamable_http.validateEndpoint()` aligned. Loosening only one layer creates inconsistent behavior and may create a server-side request forgery path for callers using the low-level addon directly.
+Keep the validation in `sdk/fx-sdk.js`, `src/napi_core_main.zig`, and `streamable_http.validateEndpoint()` aligned. Loosening only one layer creates inconsistent behavior and may create a server-side request forgery path for callers using the low-level addon directly.
 
 ## Resource limits and backpressure
 

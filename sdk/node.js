@@ -67,9 +67,8 @@ function validateNativeBackend(backend) {
     const actualVersion = backend.libfxApiVersion ?? "missing";
     throw new Error(`native addon API version ${actualVersion} is incompatible with libfx API version ${libfxApiVersion}`);
   }
-  if (typeof backend.createFxAgent !== "function" && typeof backend.createCore !== "function" &&
-    typeof backend.createFxTerminal !== "function") {
-    throw new Error("native addon must export createFxAgent(), createCore(), or createFxTerminal()");
+  if (typeof backend.createCore !== "function" && typeof backend.createFxTerminal !== "function") {
+    throw new Error("native addon must export createCore() or createFxTerminal()");
   }
   return backend;
 }
@@ -249,14 +248,11 @@ async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWas
   if (backend !== "wasm") {
     const native = await resolveNativeBackend(nativeAddon);
     nativeError = native.error;
-    if (typeof native.backend?.[nativeMethod] === "function" ||
-      (surface === "agent" && typeof native.backend?.createCore === "function")) {
+    if (typeof native.backend?.[nativeMethod] === "function") {
       nativeAttempted = true;
       try {
-        if (typeof native.backend?.[nativeMethod] === "function") {
-          return await native.backend[nativeMethod](runtimeOptions);
-        }
-        return await createNativeAgent(native.backend, runtimeOptions);
+        if (surface === "agent") return await createNativeAgent(native.backend, runtimeOptions);
+        return await native.backend[nativeMethod](runtimeOptions);
       } catch (error) {
         nativeError = error;
         if (backend === "native") throw error;
@@ -285,7 +281,7 @@ export async function createFxAgent(options = {}) {
   }
   return createWithFallback(
     "agent",
-    "createFxAgent",
+    "createCore",
     createWasmAgent,
     defaultCoreWasm,
     options,
