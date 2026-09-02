@@ -148,7 +148,7 @@ pub fn run(
         admission.provider,
         config.tool_context.credential_source,
     )) {
-        var preparation = auth_runtime.prepareCredential(
+        routed_credential = auth_runtime.prepareCredential(
             turn.alloc,
             config.tool_context.oauth_transport,
             config.tool_context.secret_store,
@@ -160,8 +160,6 @@ pub fn run(
                 return error.OutOfMemory;
             return error.ProviderFailed;
         };
-        defer preparation.deinit(turn.alloc);
-        routed_credential = preparation.takeReady();
         const credential = if (routed_credential) |*value| value else {
             turn.setFailureDiagnostic("model_credential_missing", admission.model) catch
                 return error.OutOfMemory;

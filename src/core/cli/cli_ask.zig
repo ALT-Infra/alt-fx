@@ -1544,15 +1544,13 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     const credential: *const credentials.Credential = if (startup_credential_is_final)
         &startup.credential.?
     else routed: {
-        var preparation = try auth_runtime.prepareCredential(
+        routed_credential = try auth_runtime.prepareCredential(
             alloc,
             cfg.gateway_provider.oauth_transport,
             cfg.secret_store,
             ctx.provider,
             if (ctx.provider == .gateway) startup.credential_source_preference else null,
         );
-        defer preparation.deinit(alloc);
-        routed_credential = preparation.takeReady();
         if (routed_credential == null) {
             return missingCredentialResult(alloc, options, ctx.provider);
         }

@@ -25,7 +25,6 @@ pub const CliModelCatalogInput = struct {
     access: credentials.CatalogAccess = .{ .public_only = .no_credential },
     endpoint: []const u8,
     cancel_flag: ?*std.atomic.Value(bool) = null,
-    allow_public_fallback: bool = true,
 };
 
 pub const CliModelCatalogResult = union(enum) {
