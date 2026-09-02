@@ -1,4 +1,5 @@
 const std = @import("std");
+const kernel_agent = @import("../agent/runtime/agent.zig");
 const core_types = @import("../shared/types.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
@@ -1600,7 +1601,7 @@ pub const WebFetchArtifactState = union(enum) {
 };
 
 pub const SessionRuntime = struct {
-    history: std.ArrayList(HistoryTurn) = .empty,
+    agent: kernel_agent.Agent = .{},
     context_notice_hashes: std.AutoHashMapUnmanaged(u64, void) = .empty,
     context_notice_lock: std.Io.Mutex = .init,
     web_fetch_artifacts: WebFetchArtifactState = .none,
@@ -1641,8 +1642,7 @@ pub const SessionRuntime = struct {
         self.usage.deinit(alloc);
         self.profile_usage.deinit(alloc);
         self.permission_state.deinit(alloc);
-        self.clearHistory(alloc);
-        self.history.deinit(alloc);
+        self.agent.deinit(alloc);
         self.context_notice_hashes.deinit(alloc);
     }
 
@@ -1842,15 +1842,12 @@ pub const SessionRuntime = struct {
     }
 
     pub fn clearHistory(self: *SessionRuntime, alloc: Allocator) void {
-        for (self.history.items) |turn| {
-            freeHistoryTurn(alloc, turn);
-        }
-        self.history.clearRetainingCapacity();
+        self.agent.clearHistory(alloc);
         self.context_history_start = 0;
     }
 
     pub fn historyLen(self: *const SessionRuntime) usize {
-        return self.history.items.len;
+        return self.agent.history.items.len;
     }
 
     pub fn contextHistoryStart(self: *const SessionRuntime) usize {
@@ -1858,31 +1855,23 @@ pub const SessionRuntime = struct {
     }
 
     pub fn compactedTurnCount(self: *const SessionRuntime) usize {
-        if (self.history.items.len == 0) return 0;
-        return switch (self.history.items[0]) {
+        if (self.agent.history.items.len == 0) return 0;
+        return switch (self.agent.history.items[0]) {
             .compacted_summary => |entry| entry.removed_turn_count,
             else => 0,
         };
     }
 
     pub fn compactionCount(self: *const SessionRuntime) usize {
-        if (self.history.items.len == 0) return 0;
-        return switch (self.history.items[0]) {
+        if (self.agent.history.items.len == 0) return 0;
+        return switch (self.agent.history.items[0]) {
             .compacted_summary => |entry| entry.compaction_count,
             else => 0,
         };
     }
 
     pub fn snapshotHistory(self: *const SessionRuntime, alloc: Allocator) ![]HistoryTurn {
-        var copy: std.ArrayList(HistoryTurn) = .empty;
-        errdefer {
-            for (copy.items) |turn| {
-                freeHistoryTurn(alloc, turn);
-            }
-            copy.deinit(alloc);
-        }
-        try appendHistoryCopies(alloc, &copy, self.history.items);
-        return copy.toOwnedSlice(alloc);
+        return self.agent.snapshotHistory(alloc);
     }
 
     pub fn snapshotImageCatalog(
@@ -1890,25 +1879,20 @@ pub const SessionRuntime = struct {
         alloc: Allocator,
         current_images: []const ImageAttachment,
     ) ![]ImageAttachment {
-        return collect_image_catalog(alloc, self.history.items, current_images);
+        return collect_image_catalog(alloc, self.agent.history.items, current_images);
     }
 
     pub fn snapshotContextHistory(self: *const SessionRuntime, alloc: Allocator) ![]HistoryTurn {
         return snapshotOwnedContextHistory(
             alloc,
-            self.history.items,
+            self.agent.history.items,
             self.context_history_start,
             self.max_history_turns,
         );
     }
 
     pub fn appendHistoryEntry(self: *SessionRuntime, alloc: Allocator, turn: HistoryTurn) !void {
-        const copy = try dupeHistoryTurn(alloc, turn);
-        var owns_copy = true;
-        errdefer if (owns_copy) freeHistoryTurn(alloc, copy);
-
-        try self.history.append(alloc, copy);
-        owns_copy = false;
+        return self.agent.appendHistoryEntry(alloc, turn);
     }
 
     pub fn appendAssistantHistoryTurn(self: *SessionRuntime, alloc: Allocator, user: []const u8, assistant: []const u8) !void {
@@ -1916,7 +1900,7 @@ pub const SessionRuntime = struct {
         var owns_turn = true;
         errdefer if (owns_turn) freeHistoryTurn(alloc, turn);
 
-        try self.history.append(alloc, turn);
+        try self.agent.history.append(alloc, turn);
         owns_turn = false;
     }
 
@@ -1949,10 +1933,10 @@ pub const SessionRuntime = struct {
     }
 
     pub fn lastAssistantReply(self: *const SessionRuntime) ?[]const u8 {
-        var i = self.history.items.len;
+        var i = self.agent.history.items.len;
         while (i > 0) {
             i -= 1;
-            switch (self.history.items[i]) {
+            switch (self.agent.history.items[i]) {
                 .assistant => |entry| {
                     if (entry.assistant.len > 0) return entry.assistant;
                 },
@@ -1963,7 +1947,7 @@ pub const SessionRuntime = struct {
     }
 
     pub fn lastSummary(self: *const SessionRuntime) ?[]const u8 {
-        for (self.history.items) |turn| {
+        for (self.agent.history.items) |turn| {
             switch (turn) {
                 .compacted_summary => |entry| return entry.summary,
                 else => {},
@@ -1973,8 +1957,8 @@ pub const SessionRuntime = struct {
     }
 
     pub fn forceCompaction(self: *SessionRuntime) void {
-        if (self.history.items.len <= 1) return;
-        self.context_history_start = self.history.items.len - 1;
+        if (self.agent.history.items.len <= 1) return;
+        self.context_history_start = self.agent.history.items.len - 1;
     }
 
     fn setConversationLanguage(self: *SessionRuntime, language: ConversationLanguage) void {
@@ -4306,11 +4290,11 @@ test "context compaction summary preserves large result handle without dropping 
     try std.testing.expectEqual(@as(usize, 3), runtime.historyLen());
     try std.testing.expectEqualStrings(
         "call_large",
-        runtime.history.items[0].assistant.execution.tool_steps[0].tool_calls[0].id,
+        runtime.agent.history.items[0].assistant.execution.tool_steps[0].tool_calls[0].id,
     );
     try std.testing.expectEqualStrings(
         "result-call_large-abc.txt",
-        runtime.history.items[0].assistant.execution.tool_steps[0].tool_results[0].output_handle.?,
+        runtime.agent.history.items[0].assistant.execution.tool_steps[0].tool_results[0].output_handle.?,
     );
 
     const context = try runtime.snapshotContextHistory(alloc);
@@ -4585,12 +4569,12 @@ test "SessionRuntime.restore replaces history, updates language, and preserves e
 
     try std.testing.expectEqual(ConversationLanguage.literal("es"), runtime.languageSnapshot());
     try std.testing.expectEqual(@as(usize, 3), runtime.historyLen());
-    try std.testing.expectEqualStrings("one", runtime.history.items[0].assistant.user.text);
-    try std.testing.expectEqualStrings("reply one", runtime.history.items[0].assistant.assistant);
-    try std.testing.expectEqualStrings("three", runtime.history.items[2].assistant.user.text);
-    try std.testing.expectEqualStrings("reply three", runtime.history.items[2].assistant.assistant);
-    try std.testing.expect(runtime.history.items[0].assistant.user.text.ptr != restore_history[0].assistant.user.text.ptr);
-    try std.testing.expect(runtime.history.items[2].assistant.assistant.ptr != restore_history[2].assistant.assistant.ptr);
+    try std.testing.expectEqualStrings("one", runtime.agent.history.items[0].assistant.user.text);
+    try std.testing.expectEqualStrings("reply one", runtime.agent.history.items[0].assistant.assistant);
+    try std.testing.expectEqualStrings("three", runtime.agent.history.items[2].assistant.user.text);
+    try std.testing.expectEqualStrings("reply three", runtime.agent.history.items[2].assistant.assistant);
+    try std.testing.expect(runtime.agent.history.items[0].assistant.user.text.ptr != restore_history[0].assistant.user.text.ptr);
+    try std.testing.expect(runtime.agent.history.items[2].assistant.assistant.ptr != restore_history[2].assistant.assistant.ptr);
 }
 
 test "SessionRuntime.restore may retain earlier restored turns after later append failure" {
@@ -4613,7 +4597,7 @@ test "SessionRuntime.restore may retain earlier restored turns after later appen
     try std.testing.expectError(error.OutOfMemory, runtime.restore(alloc, ConversationLanguage.literal("fr"), &restore_history));
     try std.testing.expectEqual(ConversationLanguage.literal("fr"), runtime.languageSnapshot());
     try std.testing.expectEqual(@as(usize, 1), runtime.historyLen());
-    try std.testing.expectEqualStrings("first", runtime.history.items[0].assistant.user.text);
+    try std.testing.expectEqualStrings("first", runtime.agent.history.items[0].assistant.user.text);
 }
 
 test "SessionRuntime.reset clears history and restores default language" {
@@ -4737,8 +4721,8 @@ test "SessionRuntime preserves canonical turns and derives a bounded request win
     try runtime.appendAssistantHistoryTurn(alloc, "five", "reply five");
 
     try std.testing.expectEqual(@as(usize, 5), runtime.historyLen());
-    try std.testing.expectEqualStrings("one", runtime.history.items[0].assistant.user.text);
-    try std.testing.expectEqualStrings("five", runtime.history.items[4].assistant.user.text);
+    try std.testing.expectEqualStrings("one", runtime.agent.history.items[0].assistant.user.text);
+    try std.testing.expectEqualStrings("five", runtime.agent.history.items[4].assistant.user.text);
     try std.testing.expectEqualStrings("reply five", runtime.lastAssistantReply().?);
 
     const context = try runtime.snapshotContextHistory(alloc);
@@ -4790,7 +4774,7 @@ test "SessionRuntime manual compaction summarizes the canonical prefix" {
     try std.testing.expectEqual(@as(usize, 2), runtime.historyLen());
     try std.testing.expectEqualStrings(
         "first prompt sentinel",
-        runtime.history.items[0].assistant.user.text,
+        runtime.agent.history.items[0].assistant.user.text,
     );
 }
 
@@ -4872,7 +4856,7 @@ test "SessionRuntime manual compaction merges an existing prefix summary" {
     try std.testing.expectEqual(@as(usize, 3), runtime.historyLen());
     try std.testing.expectEqualStrings(
         "prior summary sentinel",
-        runtime.history.items[0].compacted_summary.summary,
+        runtime.agent.history.items[0].compacted_summary.summary,
     );
 }
 
@@ -4896,11 +4880,11 @@ test "SessionRuntime context snapshot allocation failure preserves canonical sta
     try std.testing.expectEqual(context_history_start, runtime.contextHistoryStart());
     try std.testing.expectEqualStrings(
         "first prompt",
-        runtime.history.items[0].assistant.user.text,
+        runtime.agent.history.items[0].assistant.user.text,
     );
     try std.testing.expectEqualStrings(
         "second prompt",
-        runtime.history.items[1].assistant.user.text,
+        runtime.agent.history.items[1].assistant.user.text,
     );
 }
 
@@ -5247,7 +5231,7 @@ test "owned prompt history selection matches SessionRuntime context snapshot" {
 
     const direct = try snapshotOwnedContextHistory(
         alloc,
-        runtime.history.items,
+        runtime.agent.history.items,
         runtime.context_history_start,
         runtime.max_history_turns,
     );
@@ -5310,11 +5294,11 @@ test "SessionRuntime context projection preserves nine typed canonical turns" {
     try std.testing.expectEqual(@as(usize, 9), runtime.historyLen());
     try std.testing.expectEqualStrings(
         "call_first",
-        runtime.history.items[0].assistant.execution.tool_steps[0].tool_calls[0].id,
+        runtime.agent.history.items[0].assistant.execution.tool_steps[0].tool_calls[0].id,
     );
     try std.testing.expectEqualStrings(
         "first result sentinel",
-        runtime.history.items[0].assistant.execution.tool_steps[0].tool_results[0].output,
+        runtime.agent.history.items[0].assistant.execution.tool_steps[0].tool_results[0].output,
     );
 
     const context = try runtime.snapshotContextHistory(alloc);
@@ -5328,7 +5312,7 @@ test "SessionRuntime context projection preserves nine typed canonical turns" {
     try std.testing.expectEqual(@as(usize, 9), runtime.historyLen());
     try std.testing.expectEqualStrings(
         "call_first",
-        runtime.history.items[0].assistant.execution.tool_steps[0].tool_calls[0].id,
+        runtime.agent.history.items[0].assistant.execution.tool_steps[0].tool_calls[0].id,
     );
 }
 
@@ -5343,8 +5327,8 @@ test "SessionRuntime.snapshotHistory returns deep copy that outlives runtime his
     const snapshot = try runtime.snapshotHistory(alloc);
     defer freeHistoryTurnSlice(alloc, snapshot);
 
-    try std.testing.expect(snapshot[0].assistant.user.text.ptr != runtime.history.items[0].assistant.user.text.ptr);
-    try std.testing.expect(snapshot[1].assistant.assistant.ptr != runtime.history.items[1].assistant.assistant.ptr);
+    try std.testing.expect(snapshot[0].assistant.user.text.ptr != runtime.agent.history.items[0].assistant.user.text.ptr);
+    try std.testing.expect(snapshot[1].assistant.assistant.ptr != runtime.agent.history.items[1].assistant.assistant.ptr);
 
     runtime.clearHistory(alloc);
 
@@ -5367,7 +5351,7 @@ test "work provenance survives owned runtime snapshots without entering model co
     defer freeHistoryTurnSlice(alloc, snapshot);
     try std.testing.expectEqualStrings("work-λ", snapshot[0].assistant.user.work_id.?);
     try std.testing.expect(snapshot[0].assistant.user.work_id.?.ptr != source.assistant.user.work_id.?.ptr);
-    try std.testing.expect(snapshot[0].assistant.user.work_id.?.ptr != runtime.history.items[0].assistant.user.work_id.?.ptr);
+    try std.testing.expect(snapshot[0].assistant.user.work_id.?.ptr != runtime.agent.history.items[0].assistant.user.work_id.?.ptr);
     try std.testing.expect(snapshot[1].assistant.user.work_id == null);
 
     var messages: std.ArrayList(message.Message) = .empty;
@@ -5692,8 +5676,8 @@ test "SessionRuntime.lastAssistantReply and lastSummary return borrowed stored s
     const summary = runtime.lastSummary().?;
     try std.testing.expectEqualStrings("two", reply);
     try std.testing.expectEqualStrings("first summary", summary);
-    try std.testing.expect(reply.ptr == runtime.history.items[3].assistant.assistant.ptr);
-    try std.testing.expect(summary.ptr == runtime.history.items[0].compacted_summary.summary.ptr);
+    try std.testing.expect(reply.ptr == runtime.agent.history.items[3].assistant.assistant.ptr);
+    try std.testing.expect(summary.ptr == runtime.agent.history.items[0].compacted_summary.summary.ptr);
 }
 
 test "SessionRuntime.forceCompaction advances context without deleting canonical history" {

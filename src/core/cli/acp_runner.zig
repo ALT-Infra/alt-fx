@@ -41,6 +41,7 @@ pub const Config = struct {
     saved_directories_suppressed: bool = false,
     allow_acp_mcp: bool = true,
     allow_native_tools: bool = true,
+    minimal_kernel: bool = false,
 };
 
 pub const RunFn = *const fn (?*anyopaque, Allocator, Config) anyerror!void;

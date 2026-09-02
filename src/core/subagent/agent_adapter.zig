@@ -256,6 +256,7 @@ pub fn run(
     );
     const deps = runtimeDeps(&context);
     execution.runNormalAgentTurn(
+        &turn.sessionRuntime().agent,
         &deps,
         null,
         .{

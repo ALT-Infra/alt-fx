@@ -47,6 +47,7 @@ const image_attachments = @import("../../images/image_attachments.zig");
 const runtime_assistant_stream = @import("assistant_stream.zig");
 const runtime_tool_presentation = @import("tool_presentation.zig");
 const runtime_execution_memory = @import("execution_memory.zig");
+const runtime_agent = @import("agent.zig");
 const runtime_tool_admission = @import("tool_admission.zig");
 const runtime_interruption = @import("interruption.zig");
 const runtime_parallel_execution = @import("parallel_execution.zig");
@@ -3553,7 +3554,8 @@ fn traceRouteFailure(
     );
 }
 
-pub fn processQueuedPrompt(
+pub fn processAgentPrompt(
+    agent: *runtime_agent.Agent,
     deps: *const AgentRuntimeDeps,
     semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink,
     lifecycle: LifecycleContext,
@@ -3575,6 +3577,7 @@ pub fn processQueuedPrompt(
     {
         effective_lifecycle.scope.subagent_id = effective_config.subagent_id;
     }
+    agent.startTurn();
     var finalization = TurnFinalizationGuard.init(
         deps,
         effective_job.turn_id,
@@ -3582,7 +3585,7 @@ pub fn processQueuedPrompt(
     );
     defer finalization.deinit();
 
-    processQueuedPromptInner(deps, semantic_presentation, effective_lifecycle, effective_config, effective_job, &finalization) catch |err| {
+    processQueuedPromptInner(deps, semantic_presentation, effective_lifecycle, effective_config, effective_job, &finalization, agent) catch |err| {
         if (finalization.state == .open) {
             finalization.finish(.failed, null, null) catch |finalization_err| return finalization_err;
         }
@@ -3691,6 +3694,7 @@ fn processQueuedPromptInner(
     config: Config,
     job: QueuedPrompt,
     finalization: *TurnFinalizationGuard,
+    agent: *runtime_agent.Agent,
 ) !void {
     var summary_accumulator = runtime_telemetry.TurnSummaryAccumulator.init(
         io_mod.milliTimestamp(),
@@ -3870,6 +3874,7 @@ fn processQueuedPromptInner(
         &interrupted_persisted,
         current_user_message,
         &stop_state,
+        agent,
     ) catch |err| {
         if (stop_state.retained_candidate != null and
             !stop_state.terminal_materializing and
@@ -4129,6 +4134,7 @@ fn processQueuedPromptLoop(
     interrupted_persisted_ptr: *bool,
     current_user_message: ChatMessage,
     stop_state: *CommonStopState,
+    agent: *runtime_agent.Agent,
 ) !void {
     var stable_prefix = stable_prefix_ptr.*;
     defer stable_prefix_ptr.* = stable_prefix;
@@ -4199,6 +4205,12 @@ fn processQueuedPromptLoop(
     var last_gateway_message_count: usize = stable_prefix.items.len + history_messages.items.len + 1;
     var selected_dynamic_tool_names: std.ArrayList([]const u8) = .empty;
     var selected_dynamic_tools: std.ArrayList(agent_stream_provider.DynamicFunctionTool) = .empty;
+    try selected_dynamic_tool_names.ensureTotalCapacity(arena, config.initial_dynamic_tools.len);
+    try selected_dynamic_tools.ensureTotalCapacity(arena, config.initial_dynamic_tools.len);
+    for (config.initial_dynamic_tools) |tool| {
+        selected_dynamic_tool_names.appendAssumeCapacity(tool.name);
+        selected_dynamic_tools.appendAssumeCapacity(tool);
+    }
     const current_user_effective = current_user_message;
     const initial_pending_image_ids = try arena.alloc(usize, job.images.len);
     for (job.images, 0..) |attachment, index| initial_pending_image_ids[index] = attachment.id;
@@ -5876,6 +5888,7 @@ fn processQueuedPromptLoop(
                 report_fn(deps.ctx, completion.usage);
             }
         }
+        agent.observeUsage(completion.usage);
 
         if (disposition == .completed and completion.tool_calls.len > 0) {
             const admission = types.authoritativeToolAdmission(completion);
