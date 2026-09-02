@@ -449,10 +449,11 @@ pub fn executeToolCallAuthorized(
 }
 
 fn classifyToolExecutionError(err: anyerror) diagnostics.ToolCallOutcome {
-    return if (err == error.CancelledBeforeExecution)
-        .rejected
-    else
-        .runtime_failed;
+    return switch (err) {
+        error.CancelledBeforeExecution => .rejected,
+        error.Cancelled => .tool_failed,
+        else => .runtime_failed,
+    };
 }
 
 fn classifyReturnedToolCallOutcome(
@@ -494,6 +495,10 @@ test "returned tool results retain diagnostic outcome identity" {
     try std.testing.expectEqual(
         diagnostics.ToolCallOutcome.rejected,
         classifyToolExecutionError(error.CancelledBeforeExecution),
+    );
+    try std.testing.expectEqual(
+        diagnostics.ToolCallOutcome.tool_failed,
+        classifyToolExecutionError(error.Cancelled),
     );
     try std.testing.expectEqual(
         diagnostics.ToolCallOutcome.runtime_failed,
