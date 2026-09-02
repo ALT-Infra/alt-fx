@@ -733,7 +733,7 @@ test "processQueuedPrompt recovers when a model rejects post-Vision assistant pr
     try expectGatewayPromptTailText(
         &gateway,
         2,
-        .user,
+        .system,
         "Use the response language requested by the current external human.",
     );
     try expectGatewayPromptTailText(
@@ -3796,8 +3796,8 @@ test "processQueuedPrompt keeps supplied system prompt components in stable orde
     try runFakePrompt(&gateway, &hooks, config, job);
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
-    const first_roles = [_]types.ChatRole{ .system, .system, .system, .system, .system, .system, .user, .assistant, .user };
-    const second_roles = [_]types.ChatRole{ .system, .system, .system, .system, .system, .system, .user, .assistant, .user, .assistant, .tool, .user };
+    const first_roles = [_]types.ChatRole{ .system, .system, .system, .system, .system, .system, .user, .assistant, .system, .user };
+    const second_roles = [_]types.ChatRole{ .system, .system, .system, .system, .system, .system, .user, .assistant, .user, .assistant, .tool, .system };
     try expectGatewayPromptRoles(&gateway, 0, &first_roles);
     try expectGatewayPromptRoles(&gateway, 1, &second_roles);
     inline for (&.{ @as(usize, 0), @as(usize, 1) }) |request_index| {
@@ -3841,7 +3841,7 @@ test "processQueuedPrompt omits an empty custom tool guidance message" {
 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
-    const roles = [_]types.ChatRole{ .system, .user };
+    const roles = [_]types.ChatRole{ .system, .system, .user };
     try expectGatewayPromptRoles(&gateway, 0, &roles);
     try expectGatewayPromptStringEntry(&gateway, 0, 0, "system");
 }
@@ -3871,8 +3871,8 @@ test "processQueuedPrompt refreshes runtime overlay each step and preserves turn
     try expectBodyContains(&gateway, 1, "Checking.");
     try expectBodyContains(&gateway, 1, "\"toolName\":\"read_file\"");
     try expectBodyContains(&gateway, 1, "\"value\":\"ok\"");
-    const first_request_roles = [_]types.ChatRole{ .system, .system, .user };
-    const second_request_roles = [_]types.ChatRole{ .system, .system, .user, .assistant, .tool, .user };
+    const first_request_roles = [_]types.ChatRole{ .system, .system, .system, .user };
+    const second_request_roles = [_]types.ChatRole{ .system, .system, .user, .assistant, .tool, .system };
     try expectGatewayPromptRoles(&gateway, 0, &first_request_roles);
     try expectGatewayPromptRoles(&gateway, 1, &second_request_roles);
     const second_request_order = [_][]const u8{ "runtime overlay step two", "user prompt", "Checking.", "\"value\":\"ok\"" };
@@ -4056,8 +4056,8 @@ test "processQueuedPrompt projects history exactly once into each gateway reques
     try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
-    const first_request_roles = [_]types.ChatRole{ .system, .user, .assistant, .user };
-    const second_request_roles = [_]types.ChatRole{ .system, .user, .assistant, .user, .assistant, .tool, .user };
+    const first_request_roles = [_]types.ChatRole{ .system, .user, .assistant, .system, .user };
+    const second_request_roles = [_]types.ChatRole{ .system, .user, .assistant, .user, .assistant, .tool, .system };
     try expectGatewayPromptRoles(&gateway, 0, &first_request_roles);
     try expectGatewayPromptRoles(&gateway, 1, &second_request_roles);
     for (0..gateway.request_bodies.items.len) |i| {
@@ -4086,7 +4086,7 @@ test "processQueuedPrompt keeps completed history before the final current user 
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
-    const expected_roles = [_]types.ChatRole{ .system, .system, .user, .assistant, .user };
+    const expected_roles = [_]types.ChatRole{ .system, .system, .user, .assistant, .system, .user };
     try expectGatewayPromptRoles(&gateway, 0, &expected_roles);
     try expectGatewayPromptTextCount(&gateway, 0, "prior user structural needle", 1);
     try expectGatewayPromptTextCount(&gateway, 0, "prior assistant structural needle", 1);
@@ -4113,12 +4113,13 @@ test "processQueuedPrompt projects response language authority only for root tur
     defer root_hooks.deinit();
     var root_fixture = PromptFixture{};
     try runFakePrompt(&root_gateway, &root_hooks, root_fixture.config(), root_fixture.job());
-    try expectGatewayPromptTailText(
+    try expectGatewayPromptTextCount(
         &root_gateway,
         0,
-        .user,
         "Use the response language requested by the current external human.",
+        1,
     );
+    try expectGatewayPromptFinalUserText(&root_gateway, 0, "user prompt");
 
     var subagent_gateway = FakeGateway.init(alloc, &completions);
     defer subagent_gateway.deinit();
@@ -4191,12 +4192,13 @@ test "processQueuedPrompt retries one clear language mismatch without publishing
     try runFakePrompt(&gateway, &hooks, config, job);
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
-    try expectGatewayPromptTailText(
+    try expectGatewayPromptTextCount(
         &gateway,
         1,
-        .user,
         "The previous candidate used a different language",
+        1,
     );
+    try expectGatewayPromptFinalUserText(&gateway, 1, "The lockfile is broken again.");
     try std.testing.expectEqual(@as(usize, 1), hooks.assistant_sources.items.len);
     try std.testing.expectEqualStrings(accepted_chunks[0], hooks.assistant_sources.items[0]);
     for (hooks.texts.items) |text| {
@@ -4288,9 +4290,11 @@ test "processQueuedPrompt does not language-retry a tool-bearing response" {
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
     try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
     try std.testing.expectEqualStrings("read_file", hooks.executed_names.items[0]);
-    try std.testing.expectEqual(@as(usize, 2), hooks.assistant_sources.items.len);
-    try std.testing.expectEqualStrings(tool_chunks[0], hooks.assistant_sources.items[0]);
-    try std.testing.expectEqualStrings(final_chunks[0], hooks.assistant_sources.items[1]);
+    try std.testing.expectEqual(@as(usize, 1), hooks.assistant_sources.items.len);
+    try std.testing.expectEqualStrings(final_chunks[0], hooks.assistant_sources.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items[0].assistant.execution.tool_steps.len);
+    try std.testing.expect(hooks.history_turns.items[0].assistant.execution.tool_steps[0].assistant == null);
 }
 
 test "processQueuedPrompt reconciles provider error before tool execution" {
@@ -4670,7 +4674,7 @@ test "processQueuedPrompt keeps recovery system last after post-tool provider er
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
-    const retry_roles = [_]types.ChatRole{ .system, .user, .assistant, .tool, .user, .system };
+    const retry_roles = [_]types.ChatRole{ .system, .user, .assistant, .tool, .system, .system };
     try expectGatewayPromptRoles(&gateway, 2, &retry_roles);
     try expectGatewayPromptTailText(&gateway, 2, .system, "<network_recovery>");
     try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);

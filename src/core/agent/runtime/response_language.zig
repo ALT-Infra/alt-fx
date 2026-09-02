@@ -8,6 +8,7 @@ pub const Evidence = language_script.Profile;
 
 pub const Decision = enum {
     accept,
+    accept_without_prose,
     retry_once,
     fail_without_commit,
     undecidable,
@@ -43,10 +44,10 @@ pub fn infer_expectation(prompt: []const u8) ?Script {
 
 pub fn decide(input: DecisionInput) Decision {
     if (input.cancelled) return .undecidable;
-    if (input.has_tool_calls) return .accept;
     const expected = input.expected orelse return .undecidable;
     const actual = input.candidate.script orelse return .undecidable;
     if (actual == expected) return .accept;
+    if (input.has_tool_calls) return .accept_without_prose;
     return if (input.correction_attempted) .fail_without_commit else .retry_once;
 }
 
@@ -177,7 +178,7 @@ test "response language decision is pure conservative and bounded" {
         .candidate = mismatching,
         .correction_attempted = true,
     }));
-    try std.testing.expectEqual(Decision.accept, decide(.{
+    try std.testing.expectEqual(Decision.accept_without_prose, decide(.{
         .expected = expected,
         .candidate = mismatching,
         .has_tool_calls = true,

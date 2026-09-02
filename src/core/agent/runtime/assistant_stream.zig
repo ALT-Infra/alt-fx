@@ -344,7 +344,6 @@ pub fn onStreamToolStart(ctx: *anyopaque, tool_id: []const u8, tool_name: []cons
 
 pub fn recordStreamToolStart(ctx: *anyopaque, tool_name: []const u8) void {
     const stream_ctx: *StreamChunkContext = @ptrCast(@alignCast(ctx));
-    stream_ctx.accept_staged_response_language() catch {};
     stream_ctx.saw_tool_start = true;
     if (runtime_tool_presentation.streamStartMayHaveExecutedAtProvider(
         stream_ctx.hooks.tool_registry,

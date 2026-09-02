@@ -2786,6 +2786,11 @@ fn appendReadFailureRecoveryContext(
     return projected;
 }
 
+const GatewayMessageProjection = struct {
+    messages: std.ArrayList(ChatMessage),
+    current_user_index: usize,
+};
+
 fn build_gateway_messages_with_response_language_control(
     alloc: Allocator,
     stable_prefix: []const ChatMessage,
@@ -2798,7 +2803,7 @@ fn build_gateway_messages_with_response_language_control(
     compaction_handoff: ?[]const u8,
     compaction_history_tail: []const ChatMessage,
     compacted_suffix_len: usize,
-) !std.ArrayList(ChatMessage) {
+) !GatewayMessageProjection {
     var messages = try buildGatewayMessagesForCompactionWindow(
         alloc,
         stable_prefix,
@@ -2811,26 +2816,39 @@ fn build_gateway_messages_with_response_language_control(
         compacted_suffix_len,
     );
     errdefer messages.deinit(alloc);
-    if (origin != .root) return messages;
+    var current_user_index = stable_prefix.len + ephemeral_overlay.len +
+        if (compaction_handoff == null) durable_history.len else 0;
+    if (origin != .root) return .{
+        .messages = messages,
+        .current_user_index = current_user_index,
+    };
 
     const control = if (correction_attempted)
         response_language_correction_control
     else
         response_language_control;
     if (messages.items.len > 0 and messages.items[messages.items.len - 1].role == .user) {
-        const tail = &messages.items[messages.items.len - 1];
-        if (tail.content) |content| {
-            tail.content = try std.fmt.allocPrint(alloc, "{s}\n\n{s}", .{ content, control });
-            tail.cache_policy = .no_cache;
-            return messages;
-        }
+        const insertion_index = messages.items.len - 1;
+        try messages.insert(alloc, insertion_index, .{
+            .role = .system,
+            .content = control,
+            .cache_policy = .no_cache,
+        });
+        if (insertion_index <= current_user_index) current_user_index += 1;
+        return .{
+            .messages = messages,
+            .current_user_index = current_user_index,
+        };
     }
     try messages.append(alloc, .{
-        .role = .user,
+        .role = .system,
         .content = control,
         .cache_policy = .no_cache,
     });
-    return messages;
+    return .{
+        .messages = messages,
+        .current_user_index = current_user_index,
+    };
 }
 
 fn recoveryToolEvidence(
@@ -3219,9 +3237,8 @@ fn isPostVisionAssistantPrefillRejection(
     if (status != .bad_request or messages.len == 0) return false;
     var tail_index = messages.len - 1;
     const final_message = messages[tail_index];
-    if (final_message.role == .user and
-        (std.mem.endsWith(u8, final_message.content orelse "", response_language_control) or
-            std.mem.endsWith(u8, final_message.content orelse "", response_language_correction_control)))
+    if (std.mem.eql(u8, final_message.content orelse "", response_language_control) or
+        std.mem.eql(u8, final_message.content orelse "", response_language_correction_control))
     {
         if (tail_index == 0) return false;
         tail_index -= 1;
@@ -4830,7 +4847,7 @@ fn processQueuedPromptLoop(
             overlay_arena,
             &ephemeral_overlay,
         );
-        var gateway_messages = try build_gateway_messages_with_response_language_control(
+        var gateway_projection = try build_gateway_messages_with_response_language_control(
             overlay_arena,
             stable_prefix.items,
             ephemeral_overlay.items,
@@ -4843,13 +4860,10 @@ fn processQueuedPromptLoop(
             active_compaction_history_tail,
             compacted_suffix_len,
         );
+        var gateway_messages = gateway_projection.messages;
         const initial_decision_pending = recovery_strategy == .continue_after_confirmed_tool;
         last_gateway_message_count = gateway_messages.items.len + @intFromBool(initial_decision_pending);
-        const history_start_index = stable_prefix.items.len + ephemeral_overlay.items.len;
-        const current_user_message_index = history_start_index + if (active_compaction_handoff == null)
-            history_messages.items.len
-        else
-            0;
+        var current_user_message_index = gateway_projection.current_user_index;
 
         debug_trace.logf("agent", "step start step={d} limit={d} messages={d}", .{ current_step_index, config.agent_step_limit, gateway_messages.items.len });
         debug_trace.eventf("agent", "step_begin", step_ctx, "step_index={d} step_limit={d} gateway_messages={d}", .{ current_step_index, config.agent_step_limit, gateway_messages.items.len });
@@ -5014,7 +5028,7 @@ fn processQueuedPromptLoop(
                     step_ctx,
                 );
             }
-            gateway_messages = try build_gateway_messages_with_response_language_control(
+            gateway_projection = try build_gateway_messages_with_response_language_control(
                 overlay_arena,
                 stable_prefix.items,
                 ephemeral_overlay.items,
@@ -5027,6 +5041,8 @@ fn processQueuedPromptLoop(
                 active_compaction_history_tail,
                 compacted_suffix_len,
             );
+            gateway_messages = gateway_projection.messages;
+            current_user_message_index = gateway_projection.current_user_index;
             debug_trace.eventf("agent", "before_provider_preflight", step_ctx, "model={s} messages={d}", .{ gateway_model, gateway_messages.items.len });
             const vision_policy = visionPolicy(
                 request_capabilities.image_input_support,
@@ -6233,6 +6249,25 @@ fn processQueuedPromptLoop(
                 });
                 switch (language_decision) {
                     .accept, .undecidable => try stream_ctx.accept_staged_response_language(),
+                    .accept_without_prose => {
+                        debug_trace.eventf(
+                            "agent",
+                            "response_language_mismatch",
+                            step_ctx,
+                            "expected={s} observed={s} model={s} attempt={d}/{d} retry=false tool_calls=true prose_discarded=true",
+                            .{
+                                @tagName(response_language_expectation.?),
+                                @tagName(candidate_language.script.?),
+                                gateway_model,
+                                semantic_attempt + 1,
+                                semantic_limit,
+                            },
+                        );
+                        stream_ctx.drop_staged_response_language_candidate();
+                        if (streamCompletionPtr(&stream_result)) |candidate| {
+                            candidate.content = null;
+                        }
+                    },
                     .retry_once, .fail_without_commit => {
                         const observed = candidate_language.script.?;
                         const can_retry = language_decision == .retry_once and
@@ -6279,7 +6314,7 @@ fn processQueuedPromptLoop(
             try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
 
             const partial_assistant = if (attempt_disposition == .completed)
-                response_language_candidate
+                stream_ctx.accepted_source_or(attempt_completion.content orelse "")
             else
                 accepted_partial_assistant;
             if (stop_state.retained_candidate != null) {
