@@ -108,7 +108,6 @@ pub const AuthReplayFacts = struct {
     authentication_rejected: bool,
     refreshable: bool,
     delivery_safe: bool,
-    authority_stable: bool,
     already_replayed: bool,
 };
 
@@ -121,7 +120,6 @@ pub fn decideAuthReplay(facts: AuthReplayFacts) AuthReplayDecision {
     if (!facts.authentication_rejected or
         !facts.refreshable or
         !facts.delivery_safe or
-        !facts.authority_stable or
         facts.already_replayed)
     {
         return .fail;
@@ -220,12 +218,11 @@ test "credential change distinguishes secret rotation from authority replacement
     );
 }
 
-test "auth replay is one safe same-authority refresh outside semantic policy" {
+test "auth replay is one delivery-safe refresh outside semantic policy" {
     const eligible = AuthReplayFacts{
         .authentication_rejected = true,
         .refreshable = true,
         .delivery_safe = true,
-        .authority_stable = true,
         .already_replayed = false,
     };
     try std.testing.expectEqual(AuthReplayDecision.refresh_and_replay, decideAuthReplay(eligible));
@@ -235,8 +232,5 @@ test "auth replay is one safe same-authority refresh outside semantic policy" {
     try std.testing.expectEqual(AuthReplayDecision.fail, decideAuthReplay(blocked));
     blocked = eligible;
     blocked.delivery_safe = false;
-    try std.testing.expectEqual(AuthReplayDecision.fail, decideAuthReplay(blocked));
-    blocked = eligible;
-    blocked.authority_stable = false;
     try std.testing.expectEqual(AuthReplayDecision.fail, decideAuthReplay(blocked));
 }

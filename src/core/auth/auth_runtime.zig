@@ -167,31 +167,8 @@ fn loadCredentialForRefresh(
     };
 }
 
-pub const CredentialPreparation = union(enum) {
-    ready: credentials.Credential,
-    blocked,
-
-    pub fn deinit(self: *CredentialPreparation, alloc: Allocator) void {
-        switch (self.*) {
-            .ready => |*credential| credential.deinit(alloc),
-            .blocked => {},
-        }
-        self.* = undefined;
-    }
-
-    pub fn takeReady(self: *CredentialPreparation) ?credentials.Credential {
-        return switch (self.*) {
-            .ready => |credential| blk: {
-                self.* = .blocked;
-                break :blk credential;
-            },
-            .blocked => null,
-        };
-    }
-};
-
-/// Resolves and refreshes one provider credential. The returned ready value is
-/// owned by the caller and must be released with `CredentialPreparation.deinit`.
+/// Resolves and refreshes one provider credential. The returned value is owned
+/// by the caller and must be released with `Credential.deinit`.
 /// Non-null `preferred` is exact; only null permits Gateway precedence.
 pub fn prepareCredential(
     alloc: Allocator,
@@ -199,7 +176,7 @@ pub fn prepareCredential(
     secret_store: host.SecretStore,
     provider: model_provider.ProviderId,
     preferred: ?credentials.Source,
-) Allocator.Error!CredentialPreparation {
+) Allocator.Error!?credentials.Credential {
     var resolution = credentials.resolveForProvider(
         alloc,
         transport,
@@ -218,7 +195,7 @@ pub fn prepareCredential(
                 @errorName(err),
             },
         );
-        return .blocked;
+        return null;
     };
     return prepareResolvedCredential(
         alloc,
@@ -233,8 +210,8 @@ fn prepareResolvedCredential(
     provider: model_provider.ProviderId,
     now_ms: i64,
     resolution: *credentials.Resolution,
-) CredentialPreparation {
-    var credential = resolution.credential orelse return .blocked;
+) ?credentials.Credential {
+    var credential = resolution.credential orelse return null;
     resolution.credential = null;
 
     const blocked = credential.token.len == 0 or
@@ -249,9 +226,9 @@ fn prepareResolvedCredential(
 
     if (blocked) {
         credential.deinit(alloc);
-        return .blocked;
+        return null;
     }
-    return .{ .ready = credential };
+    return credential;
 }
 
 fn requestedSource(
@@ -267,18 +244,13 @@ fn requestedSource(
 
 test "credential preparation blocks an unavailable explicit source" {
     var resolution = credentials.Resolution{ .fx_login_status = .unavailable };
-    var prepared = prepareResolvedCredential(
+    const prepared = prepareResolvedCredential(
         std.testing.allocator,
         .gateway,
         100,
         &resolution,
     );
-    defer prepared.deinit(std.testing.allocator);
-
-    switch (prepared) {
-        .blocked => {},
-        .ready => return error.TestExpectedBlockedCredential,
-    }
+    try std.testing.expect(prepared == null);
 }
 
 test "credential preparation moves one fresh provider-authorized credential" {
@@ -288,21 +260,18 @@ test "credential preparation moves one fresh provider-authorized credential" {
         .team_id = try std.testing.allocator.dupe(u8, "team_123"),
         .refresh_after_ms = 200,
     } };
-    var prepared = prepareResolvedCredential(
+    var credential = prepareResolvedCredential(
         std.testing.allocator,
         .gateway,
         100,
         &resolution,
-    );
-    defer prepared.deinit(std.testing.allocator);
+    ) orelse return error.TestExpectedPreparedCredential;
+    defer credential.deinit(std.testing.allocator);
 
     try std.testing.expect(resolution.credential == null);
-    var credential = prepared.takeReady() orelse return error.TestExpectedPreparedCredential;
-    defer credential.deinit(std.testing.allocator);
     try std.testing.expectEqual(credentials.Source.fx_login, credential.source);
     try std.testing.expectEqualStrings("fresh-token", credential.token);
     try std.testing.expectEqualStrings("team_123", credential.gatewayTeam().?);
-    try std.testing.expect(prepared.takeReady() == null);
 }
 
 test "credential preparation rejects refresh-due and provider-mismatched credentials" {
@@ -335,11 +304,8 @@ test "credential preparation rejects refresh-due and provider-mismatched credent
             100,
             &resolution,
         );
-        defer prepared.deinit(std.testing.allocator);
-        switch (prepared) {
-            .blocked => {},
-            .ready => return error.TestExpectedBlockedCredential,
-        }
+        defer if (prepared) |*credential| credential.deinit(std.testing.allocator);
+        try std.testing.expect(prepared == null);
     }
 }
 

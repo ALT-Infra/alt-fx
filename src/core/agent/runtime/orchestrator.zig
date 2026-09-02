@@ -5076,7 +5076,6 @@ fn processQueuedPromptLoop(
                 .delivery_safe = stream_ctx.raw_text.items.len == 0 and
                     !stream_ctx.saw_tool_start and
                     streamCompletion(stream_result).tool_calls.len == 0,
-                .authority_stable = true,
                 .already_replayed = auth_retry_used,
             });
             if (auth_replay == .refresh_and_replay) {

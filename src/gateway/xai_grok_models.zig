@@ -35,7 +35,6 @@ fn fetchCliModelCatalog(
         .endpoint = input.endpoint,
         .cancel_flag = input.cancel_flag,
         .view = .full,
-        .allow_public_fallback = input.allow_public_fallback,
     })) {
         .loaded => |loaded| blk: {
             var catalog = loaded.catalog;
