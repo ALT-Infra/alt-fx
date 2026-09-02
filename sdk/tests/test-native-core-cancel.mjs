@@ -27,11 +27,9 @@ try {
       fetchStartedResolve();
       return fetch(input, init);
     },
-    env: {
-      AI_GATEWAY_API_KEY: "native-core-cancel-key",
-      FX_GATEWAY_CHAT_URL: `http://127.0.0.1:${port}/stall`,
-      FX_MODEL: "native/test-model",
-    },
+    apiKey: "native-core-cancel-key",
+    gatewayChatUrl: `http://127.0.0.1:${port}/stall`,
+    model: "native/test-model",
   });
   const turn = agent.prompt("stall");
   await Promise.race([fetchStarted, timeout("stalled gateway fetch")]);

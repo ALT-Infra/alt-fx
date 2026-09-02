@@ -62,11 +62,9 @@ const options = (wasm = wasmPath) => ({
   backend: "wasm",
   wasm,
   fetch,
-  env: {
-    AI_GATEWAY_API_KEY: "wasm-cache-key",
-    FX_GATEWAY_CHAT_URL: `http://127.0.0.1:${server.address().port}/chat`,
-    FX_MODEL: "cache/model",
-  },
+  apiKey: "wasm-cache-key",
+  gatewayChatUrl: `http://127.0.0.1:${server.address().port}/chat`,
+  model: "cache/model",
 });
 
 async function create(wasm = wasmPath) {

@@ -60,11 +60,9 @@ const agent = await createFxAgent({
       return `bridge:${input.value}`;
     },
   }],
-  env: {
-    AI_GATEWAY_API_KEY: "bridge-key",
-    FX_GATEWAY_CHAT_URL: `http://127.0.0.1:${server.address().port}/chat`,
-    FX_MODEL: "bridge/model",
-  },
+  apiKey: "bridge-key",
+  gatewayChatUrl: `http://127.0.0.1:${server.address().port}/chat`,
+  model: "bridge/model",
 });
 
 try {
