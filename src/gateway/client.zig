@@ -201,6 +201,8 @@ const e2e_gateway_models_url_env = "FX_E2E_GATEWAY_MODELS_URL";
 const e2e_gateway_credits_url_env = "FX_E2E_GATEWAY_CREDITS_URL";
 const default_gateway_base_url = "https://ai-gateway.vercel.sh";
 pub const vercel_ai_gateway_team_header = "x-vercel-ai-gateway-team";
+pub const vercel_gateway_extended_time_header = "x-vercel-gateway-extended-time";
+pub const vercel_gateway_extended_time_value = "true";
 /// Identifies fx on every AI Gateway request; the zig std.http default
 /// (`zig/<version> (std.http)`) is never sent to the gateway.
 pub const user_agent = "fx/" ++ build_options.app_version;
@@ -639,6 +641,7 @@ pub fn postGatewayCompletion(
             .{ .name = "HTTP-Referer", .value = "https://github.com/vercel-labs/fx" },
             .{ .name = "X-Title", .value = "fx" },
             .{ .name = "Accept", .value = "application/json" },
+            .{ .name = vercel_gateway_extended_time_header, .value = vercel_gateway_extended_time_value },
             .{ .name = "ai-gateway-protocol-version", .value = "0.0.1" },
             .{ .name = "ai-language-model-specification-version", .value = "4" },
             .{ .name = "ai-language-model-id", .value = model },
@@ -1394,7 +1397,7 @@ fn streamGatewayCompletionCoreWithOptions(
     const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.api_key});
     defer alloc.free(auth_header);
 
-    var extra_headers_buf: [9]std.http.Header = undefined;
+    var extra_headers_buf: [10]std.http.Header = undefined;
     const extra_headers = gatewayExtraHeaders(
         &extra_headers_buf,
         model,
@@ -1703,11 +1706,13 @@ fn gatewayExtraHeaders(
     team: ?[]const u8,
     session_id: ?[]const u8,
 ) []const std.http.Header {
-    std.debug.assert(buf.len >= 9);
+    std.debug.assert(buf.len >= 10);
     var len: usize = 0;
     buf[len] = .{ .name = "HTTP-Referer", .value = "https://github.com/vercel-labs/fx" };
     len += 1;
     buf[len] = .{ .name = "X-Title", .value = "fx" };
+    len += 1;
+    buf[len] = .{ .name = vercel_gateway_extended_time_header, .value = vercel_gateway_extended_time_value };
     len += 1;
     buf[len] = .{ .name = "ai-gateway-protocol-version", .value = "0.0.1" };
     len += 1;
@@ -1746,8 +1751,17 @@ fn gatewayModelCatalogExtraHeaders(buf: []std.http.Header, team: ?[]const u8) []
     return buf[0..len];
 }
 
+test "gateway extra headers request extended execution time" {
+    var buf: [10]std.http.Header = undefined;
+    const headers = gatewayExtraHeaders(&buf, "test/model", null, null);
+    try std.testing.expectEqualStrings(
+        vercel_gateway_extended_time_value,
+        headerValue(headers, vercel_gateway_extended_time_header).?,
+    );
+}
+
 test "gateway extra headers include selected team" {
-    var buf: [9]std.http.Header = undefined;
+    var buf: [10]std.http.Header = undefined;
     const headers = gatewayExtraHeaders(&buf, "test/model", "team_123", null);
     try std.testing.expectEqualStrings("team_123", headerValue(headers, vercel_ai_gateway_team_header).?);
     try std.testing.expectEqualStrings("test/model", headerValue(headers, "ai-language-model-id").?);
@@ -1757,7 +1771,7 @@ test "gateway extra headers include selected team" {
 }
 
 test "gateway extra headers derive session identity and affinity together" {
-    var buf: [9]std.http.Header = undefined;
+    var buf: [10]std.http.Header = undefined;
     const cases = [_]struct {
         session_id: ?[]const u8,
         expected: ?[]const u8,
@@ -7828,7 +7842,34 @@ test "direct gateway core callbacks stay on the invoking thread" {
     try std.testing.expectEqual(capture.expected_thread, capture.observed_thread.?);
 }
 
-test "gateway chat request sends fx user agent and attribution headers" {
+test "non-streaming gateway request sends extended time header" {
+    var fixture = try LoopbackGatewayFixture.init(.success_capture, 0);
+    defer fixture.deinit();
+    try fixture.start();
+    try std.testing.expect(fixture.waitForAcceptStart(5000));
+
+    const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/chat", .{fixture.port()});
+    defer std.testing.allocator.free(url);
+
+    var result = try postGatewayCompletion(
+        std.testing.allocator,
+        "test-key",
+        "test/model",
+        1,
+        url,
+        "{}",
+    );
+    defer result.deinit(std.testing.allocator);
+    fixture.deinit();
+
+    if (fixture.failure) |err| return err;
+    try std.testing.expectEqualStrings(
+        vercel_gateway_extended_time_value,
+        fixture.capturedHeaderValue(vercel_gateway_extended_time_header).?,
+    );
+}
+
+test "gateway chat request sends extended time and attribution headers" {
     var fixture = try LoopbackGatewayFixture.init(.success_capture, 0);
     defer fixture.deinit();
     try fixture.start();
@@ -7866,6 +7907,10 @@ test "gateway chat request sends fx user agent and attribution headers" {
     try std.testing.expectEqualStrings(user_agent, fixture.capturedHeaderValue("user-agent").?);
     try std.testing.expectEqualStrings("https://github.com/vercel-labs/fx", fixture.capturedHeaderValue("http-referer").?);
     try std.testing.expectEqualStrings("fx", fixture.capturedHeaderValue("x-title").?);
+    try std.testing.expectEqualStrings(
+        vercel_gateway_extended_time_value,
+        fixture.capturedHeaderValue(vercel_gateway_extended_time_header).?,
+    );
     try std.testing.expectEqualStrings("session_wire_123", fixture.capturedHeaderValue("x-session-id").?);
     try std.testing.expectEqualStrings("session_wire_123", fixture.capturedHeaderValue("x-session-affinity").?);
     try std.testing.expect(std.mem.find(u8, fixture.capturedHeaderValue("user-agent").?, "zig") == null);
