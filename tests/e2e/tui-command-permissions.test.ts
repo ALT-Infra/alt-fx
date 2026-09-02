@@ -1623,6 +1623,69 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
+    "TUI trace distinguishes rejected edits from failed commands",
+    async () => {
+      const root = createIsolatedRoot();
+      const fixturePath = join(root.workspace, "duplicate.txt");
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(fixturePath, "same twice same\n");
+      writeFileSync(stderrPath, "");
+      installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+      const gateway = startFakeGateway([
+        gatewayToolCall("edit_file", {
+          path: "duplicate.txt",
+          old_string: "same",
+          new_string: "new",
+        }, "trace_edit_rejected"),
+        toolCall("exit 7", {}, "trace_command_failed"),
+        finalText("diagnostic fixture complete"),
+      ]);
+
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, {
+          PATH: hostilePath(root),
+          TMPDIR: root.root,
+          FX_PERMISSION_MODE: "yolo",
+        }),
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText("Run the diagnostic outcome fixture.");
+      await activeSession.waitForText("diagnostic fixture complete", TIMEOUT);
+      expect(readFileSync(fixturePath, "utf8")).toBe("same twice same\n");
+
+      await activeSession.sendText("/trace");
+      await activeSession.waitForText(
+        process.platform === "darwin"
+          ? "Clipboard copy failed"
+          : "Trace saved at",
+        TIMEOUT,
+      );
+      const report = readFileSync(latestTraceReportPath(root), "utf8");
+
+      expect(gateway.requests).toHaveLength(3);
+      expect(report).toContain(
+        "last=2 succeeded=0 rejected=1 command_failed=1 tool_failed=0 runtime_failed=0",
+      );
+      expect(report).toContain("name=edit_file outcome=rejected");
+      expect(report).toContain("name=shell outcome=command_failed");
+      expect(report).not.toContain("name=edit_file outcome=runtime_failed");
+      expect(report).not.toContain("name=shell outcome=runtime_failed");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
     "TUI writes Gateway schema diagnostics to a trace after Gateway 400",
     async () => {
       const root = createIsolatedRoot();
