@@ -5503,9 +5503,10 @@ test "fx ask automatic review observes worker cancellation" {
             input: permission_auto_classifier.ProviderInput,
             _: permission_auto_classifier.ReviewRequest,
         ) anyerror!permission_auto_classifier.ParseOutcome {
-            const cancel_flag = input.cancel_flag orelse return .invalid;
+            const cancel_flag = input.cancel_flag orelse
+                return .{ .invalid = .provider_context_missing };
             if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-            return .invalid;
+            return .{ .invalid = .provider_failed };
         }
     };
 
