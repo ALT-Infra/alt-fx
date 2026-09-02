@@ -58,9 +58,6 @@ pub fn Runtime(comptime App: type) type {
                     return true;
                 },
                 .close => {
-                    if (childPresentationShell(app)) |child| {
-                        if (child.cancelPendingFullTranscriptOpen()) return true;
-                    }
                     if (comptime @hasDecl(
                         @TypeOf(app.shell),
                         "cancelPendingFullTranscriptOpen",
@@ -74,9 +71,6 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn cancelPendingOpenForInput(app: *App) bool {
-            if (childPresentationShell(app)) |child| {
-                if (child.cancelPendingFullTranscriptOpen()) return true;
-            }
             if (comptime @hasDecl(
                 @TypeOf(app.shell),
                 "cancelPendingFullTranscriptOpen",

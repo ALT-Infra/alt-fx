@@ -315,9 +315,11 @@ pub fn resumeAdmittedForExternalPrompt(
 /// child history internally, so an externally resumed ordinary session has no
 /// subagent root-user evidence to retain.
 pub fn retainExternalRootUserTurn(
+    _: ?session_store.Store,
     _: Allocator,
     _: *session_store.LoadedWritableSession,
     _: session.HistoryTurn,
+    _: bool,
 ) !void {}
 
 fn ensureExternalPromptAllowed(

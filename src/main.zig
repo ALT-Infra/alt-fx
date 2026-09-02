@@ -1012,10 +1012,7 @@ const App = struct {
     }
 
     fn fullTranscriptFocusedWorkActive(self: *App) bool {
-        if (self.shell.fullTranscriptFocusedWorkActive()) return true;
-        const child = self.subagents.childConversationRuntime() orelse
-            return false;
-        return child.fullTranscriptFocusedWorkActive();
+        return self.shell.fullTranscriptFocusedWorkActive();
     }
 
     fn processNextCooperativePrompt(self: *App) !void {
