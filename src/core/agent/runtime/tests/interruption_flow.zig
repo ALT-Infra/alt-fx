@@ -262,6 +262,30 @@ test "streamed presentation preserves raw partial through cancellation" {
     }
 }
 
+test "clear language mismatch is absent from cancelled history" {
+    const alloc = std.testing.allocator;
+    const chunks = [_][]const u8{"我会先检查锁文件和依赖清单。"};
+    const completions = [_]FakeCompletion{.{
+        .chunks = &chunks,
+        .cancel_after_chunks = true,
+    }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.prompt = @constCast("The lockfile is broken again.");
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expect(hooks.history_turns.items[0] == .interrupted);
+    try std.testing.expect(hooks.history_turns.items[0].interrupted.assistant == null);
+    try std.testing.expectEqual(@as(usize, 0), hooks.assistant_sources.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.texts.items.len);
+}
+
 test "processQueuedPrompt cancellation after valid tool finish settles streamed calls" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{

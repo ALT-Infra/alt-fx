@@ -2769,6 +2769,96 @@ describe("gateway stream lifecycle", () => {
     }
   });
 
+  test("saved ask retries a clear response language mismatch without persisting it", async () => {
+    const root = createFixtureRoot("response-language-retry");
+    const firstTracePath = join(root.root, "first-trace.log");
+    const resumeTracePath = join(root.root, "resume-trace.log");
+    const rejected = "我会先检查锁文件和依赖清单。";
+    const accepted = "I will inspect the lockfile next.";
+    const resumedText = "The saved session contains only accepted English output.";
+    const responses = [
+      fakeGatewayFinalText(rejected),
+      fakeGatewayFinalText(accepted),
+      fakeGatewayFinalText(resumedText),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+
+    try {
+      const first = await runFx(
+        [
+          "ask",
+          "--json",
+          "--auto",
+          "The lockfile is broken again. Say what you will inspect next.",
+        ],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, firstTracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const firstJson = parseAskJson(first.stdout) as ReturnType<typeof parseAskJson> & {
+        session_id: string;
+      };
+      const sessionPath = join(
+        root.home,
+        ".fx",
+        "sessions",
+        firstJson.session_id,
+        "session.json",
+      );
+      const eventsPath = join(
+        root.home,
+        ".fx",
+        "sessions",
+        firstJson.session_id,
+        "events.jsonl",
+      );
+
+      expect(first.code).toBe(0);
+      expect(first.stderr).toBe("");
+      expect(firstJson.output).toContain(accepted);
+      expect(firstJson.output).not.toContain(rejected);
+      expect(gateway.requestCount()).toBe(2);
+      expect(gateway.requests[0]!.body).toContain(
+        "Use the response language requested by the current external human.",
+      );
+      expect(gateway.requests[1]!.body).toContain(
+        "The previous candidate used a different language",
+      );
+      expect(readFileSync(sessionPath, "utf8")).not.toContain(rejected);
+      expect(readFileSync(eventsPath, "utf8")).not.toContain(rejected);
+
+      const resumed = await runFx(
+        [
+          "ask",
+          "--json",
+          "--auto",
+          "--resume-id",
+          firstJson.session_id,
+          "Confirm what the saved session contains.",
+        ],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, resumeTracePath),
+          timeoutMs: 15_000,
+        },
+      );
+
+      expect(resumed.code).toBe(0);
+      expect(resumed.stderr).toBe("");
+      expect(parseAskJson(resumed.stdout).output).toContain(resumedText);
+      expect(gateway.requestCount()).toBe(3);
+      expect(gateway.requests[2]!.body).toContain(accepted);
+      expect(gateway.requests[2]!.body).not.toContain(rejected);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
   test("saved malformed recovery resumes without re-executing the historical call", async () => {
     const root = createFixtureRoot("malformed-arguments-resume");
     const firstTracePath = join(root.root, "first-trace.log");
