@@ -153,13 +153,22 @@ pub const CommittedLayoutSnapshot = struct {
     }
 };
 
+pub const TransitionReservation = struct {
+    transcript_rows: u16 = 0,
+    activity: ActivityState = .none,
+
+    pub fn active(self: TransitionReservation) bool {
+        return self.transcript_rows > 0 and self.activity != .none;
+    }
+};
+
 pub const SolveInput = struct {
     terminal: Layout,
     owned_top: u16,
     footer: FooterMeasurement,
     transcript: TranscriptFlowPreview,
     activity: ActivityState = .none,
-    minimum_content_rows: u16 = 0,
+    transition: TransitionReservation = .{},
     body_mode: BodyMode = .transcript,
     prior: CommittedLayoutSnapshot = .{},
     placement_policy: FramePlacementPolicy = .compact_until_full,
@@ -251,8 +260,8 @@ pub fn solve(input: SolveInput) FrameLayout {
     };
     const transcript_height = @min(natural_body_rows, body_capacity);
     const natural_content_rows = transcript_height +| reserved_activity_rows +| footer_height;
-    const minimum_content_rows = if (reservation.activity_rows == 0) input.minimum_content_rows else 0;
-    const solved_frame_height = @min(available_rows, @max(natural_content_rows, minimum_content_rows));
+    const transition_rows = solveTransitionReservation(input, footer_height, available_rows);
+    const solved_frame_height = @min(available_rows, @max(natural_content_rows, transition_rows));
     const neutral_rows = solved_frame_height -| natural_content_rows;
     const owned_band = rectFromTopHeight(owned_top, solved_frame_height);
     const transcript_area = rectFromTopHeight(owned_top, transcript_height);
@@ -310,7 +319,7 @@ pub fn solveWithPreservedRowRelease(input: SolveInput, release_floor_rows: u16) 
 
     var maximum_input = input;
     maximum_input.owned_top = 1;
-    maximum_input.minimum_content_rows = 0;
+    maximum_input.transition = .{};
     const maximum = solve(maximum_input);
     const geometry_top = if (maximum.solved_frame_height == 0)
         initial.owned_top
@@ -325,6 +334,20 @@ pub fn solveWithPreservedRowRelease(input: SolveInput, release_floor_rows: u16) 
         .layout = final,
         .released_rows = initial.owned_top -| final.owned_top,
     };
+}
+
+fn solveTransitionReservation(input: SolveInput, footer_height: u16, available_rows: u16) u16 {
+    if (input.activity != .none or !input.transition.active()) return 0;
+    var transition_input = input;
+    transition_input.transcript.natural_visual_rows = input.transition.transcript_rows;
+    transition_input.activity = input.transition.activity;
+    transition_input.transition = .{};
+    const reservation = solveActivityReservation(transition_input, footer_height, available_rows);
+    return input.transition.transcript_rows +|
+        reservation.boundary_gap +|
+        reservation.activity_rows +|
+        reservation.footer_gap +|
+        footer_height;
 }
 
 const ActivityReservation = struct {
@@ -712,21 +735,21 @@ test "minimum content rows keep a neutral transition aligned with thinking" {
         .owned_top = 1,
         .footer = testFooter(3),
         .transcript = .{ .natural_visual_rows = 5 },
-        .minimum_content_rows = 13,
+        .transition = .{ .transcript_rows = 7, .activity = .{ .thinking = .{ .gap_above_activity = 1, .footer_gap_after_activity = 1 } } },
     });
     const pending = solve(.{
         .terminal = testLayout(24, 80),
         .owned_top = 1,
         .footer = testFooter(3),
         .transcript = .{ .natural_visual_rows = 8 },
-        .minimum_content_rows = 13,
+        .transition = .{ .transcript_rows = 7, .activity = .{ .thinking = .{ .gap_above_activity = 1, .footer_gap_after_activity = 1 } } },
     });
     const adopted = solve(.{
         .terminal = testLayout(24, 80),
         .owned_top = 1,
         .footer = testFooter(3),
         .transcript = .{ .natural_visual_rows = 7 },
-        .minimum_content_rows = 13,
+        .transition = .{ .transcript_rows = 7, .activity = .{ .thinking = .{ .gap_above_activity = 1, .footer_gap_after_activity = 1 } } },
     });
     const thinking = solve(.{
         .terminal = testLayout(24, 80),
@@ -756,7 +779,7 @@ test "real activity supersedes neutral minimum content rows" {
         .footer = testFooter(3),
         .transcript = .{ .natural_visual_rows = 7 },
         .activity = .{ .thinking = .{ .gap_above_activity = 1, .footer_gap_after_activity = 1 } },
-        .minimum_content_rows = 20,
+        .transition = .{ .transcript_rows = 20, .activity = .{ .thinking = .{ .gap_above_activity = 1, .footer_gap_after_activity = 1 } } },
     });
 
     try std.testing.expectEqual(@as(?u16, 9), layout.activity_row);
@@ -770,7 +793,7 @@ test "minimum content rows do not release preserved shell rows" {
         .owned_top = 6,
         .footer = testFooter(3),
         .transcript = .{ .natural_visual_rows = 2 },
-        .minimum_content_rows = 13,
+        .transition = .{ .transcript_rows = 7, .activity = .{ .thinking = .{ .gap_above_activity = 1, .footer_gap_after_activity = 1 } } },
     };
     const plan = solveWithPreservedRowRelease(input, 0);
 
@@ -784,7 +807,7 @@ test "minimum content rows clamp without displacing visible content" {
         .owned_top = 1,
         .footer = testFooter(3),
         .transcript = .{ .natural_visual_rows = 6 },
-        .minimum_content_rows = 13,
+        .transition = .{ .transcript_rows = 7, .activity = .{ .thinking = .{ .gap_above_activity = 1, .footer_gap_after_activity = 1 } } },
     });
 
     try std.testing.expectEqual(@as(u16, 8), layout.solved_frame_height);

@@ -1307,7 +1307,7 @@ pub fn Runtime(comptime App: type) type {
                     measurement.activity_projection
                 else
                     .{ .turn_thinking = .{ .label = footer_frame.label() } };
-                const minimum_content_rows = turnTransitionMinimumContentRows(
+                const transition_reservation = turnTransitionReservation(
                     app,
                     presentation_shell,
                     canonical_transcript_preview,
@@ -1347,7 +1347,7 @@ pub fn Runtime(comptime App: type) type {
                         .footer = neutral_footer,
                         .transcript = transcript_preview,
                         .activity = frame_activity,
-                        .minimum_content_rows = minimum_content_rows,
+                        .transition = transition_reservation,
                         .body_mode = .transcript,
                         .prior = active_committed_layout,
                     },
@@ -2236,32 +2236,33 @@ fn validatePreparedTranscriptFitsPlan(
     }
 }
 
-fn turnTransitionMinimumContentRows(
+fn turnTransitionReservation(
     app: anytype,
     shell: *const transcript_runtime.TranscriptRuntime,
     canonical_preview: render_engine.frame_layout.TranscriptFlowPreview,
     pending_card: ?PendingCardProjection,
     footer_measurement: ?*const surface_frame.SurfaceFooterMeasurement,
     frame_activity: render_engine.frame_layout.ActivityState,
-) u16 {
-    if (frame_activity != .none) return 0;
-    const measurement = footer_measurement orelse return 0;
+) render_engine.frame_layout.TransitionReservation {
+    if (frame_activity != .none) return .{};
+    const measurement = footer_measurement orelse return .{};
     if (!measurement.input_visible or
         measurement.show_picker or
         measurement.picker_rows > 0 or
         measurement.banner_active or
         measurement.footer_gap_active or
         app.stream.active or
-        shell.fullTranscriptActive()) return 0;
+        shell.fullTranscriptActive()) return .{};
     if (comptime @hasField(@TypeOf(app.*), "skills")) {
         if (comptime @hasDecl(@TypeOf(app.skills), "menuVisible")) {
-            if (app.skills.menuVisible()) return 0;
+            if (app.skills.menuVisible()) return .{};
         }
     }
 
-    const future_activity_rows = render_engine.transcript_blocks.blockGapRowsBetween(.user_turn, .assistant_turn) +| 1 +|
-        render_engine.transcript_blocks.footerBoundaryGapRowsForTail(.turn_summary);
-    const footer_rows = measurement.frameLayoutMeasurement().natural_rows;
+    const future_activity = render_engine.frame_layout.ActivityState{ .thinking = .{
+        .gap_above_activity = render_engine.transcript_blocks.blockGapRowsBetween(.user_turn, .assistant_turn),
+        .footer_gap_after_activity = render_engine.transcript_blocks.footerBoundaryGapRowsForTail(.turn_summary),
+    } };
     const pending_submission_active = if (comptime @hasField(@TypeOf(app.*), "submission"))
         app.submission.pending != null
     else
@@ -2271,9 +2272,9 @@ fn turnTransitionMinimumContentRows(
             canonical_preview.natural_visual_rows +| (card.row_count -| 1)
         else
             canonical_preview.natural_visual_rows;
-        return canonical_rows +| future_activity_rows +| footer_rows;
+        return .{ .transcript_rows = canonical_rows, .activity = future_activity };
     }
-    return 0;
+    return .{};
 }
 
 fn footerMeasurementFromRows(rows: render_engine.footer_layout.FooterRows) render_engine.frame_layout.FooterMeasurement {
