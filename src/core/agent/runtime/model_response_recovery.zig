@@ -114,14 +114,16 @@ pub noinline fn decide(evidence: Evidence) Decision {
             .strategy = .stop,
             .required_action = .change_request,
         },
-        .provider_stream_timeout,
-        .request_limit_reached,
-        => return .{
+        .provider_stream_timeout => return .{
             .strategy = .pause,
             .required_action = if (evidence.tool == .uncertain)
                 .inspect_uncertain_tool
             else
                 .continue_later,
+        },
+        .request_limit_reached => return .{
+            .strategy = .pause,
+            .required_action = .continue_later,
         },
         else => {},
     }

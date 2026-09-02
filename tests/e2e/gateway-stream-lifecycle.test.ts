@@ -227,6 +227,20 @@ function gatewayStreamTimeoutResponse(): Response {
   );
 }
 
+function gatewayStreamTimeoutWithFinishResponse(): Response {
+  return sse(
+    `data: ${JSON.stringify({
+      type: "error",
+      error: {
+        code: "gateway_stream_timeout",
+        message: "stream exceeded maximum duration",
+      },
+    })}\n\n` +
+      'data: {"type":"finish","finishReason":{"unified":"error","raw":"gateway_stream_timeout"}}\n\n' +
+      "data: [DONE]\n\n",
+  );
+}
+
 function finishOnlyGatewayStreamTimeoutResponse(): Response {
   return sse(
     'data: {"type":"finish","finishReason":{"unified":"error","raw":"gateway_stream_timeout"}}\n\n',
@@ -6002,6 +6016,73 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(trace).toContain("event=route_failure");
       expect(trace).toContain("http_status=200");
       expect(trace).toContain("retry=false");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("saved gateway stream timeout reloads and continues explicitly", async () => {
+    const root = createFixtureRoot("saved-gateway-stream-timeout");
+    const tracePath = join(root.root, "trace.log");
+    let continued = false;
+    const gateway = startGateway(() =>
+      continued
+        ? fakeGatewayFinalText("Recovered after explicit timeout continuation.")
+        : gatewayStreamTimeoutWithFinishResponse()
+    );
+    try {
+      const first = await runFx(
+        ["ask", "--json", "--auto", "Pause on the fixture timeout."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const paused = parseAskJson(first.stdout);
+
+      expect(first.code).toBe(1);
+      expect(gateway.requestCount()).toBe(1);
+      expect(paused.recovery?.state).toBe("paused");
+      expect(paused.recovery?.cause).toBe("provider_stream_timeout");
+      expect(paused.recovery?.required_action).toBe("continue_later");
+      expect(paused.recovery?.durable).toBe(true);
+      expect(paused.recovery?.message).toContain(
+        "gateway_stream_timeout: stream exceeded maximum duration",
+      );
+
+      const detail = await runFx(
+        ["session", "--id", paused.session_id, "--json"],
+        { cwd: root.workspace, env: { HOME: root.home } },
+      );
+      expect(detail.code).toBe(0);
+      expect(gateway.requestCount()).toBe(1);
+
+      continued = true;
+      const resumed = await runFx(
+        [
+          "ask",
+          "--json",
+          "--auto",
+          "--resume-id",
+          paused.session_id,
+          "--continue-recovery",
+        ],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const recovered = parseAskJson(resumed.stdout);
+
+      expect(resumed.code).toBe(0);
+      expect(recovered.output).toContain(
+        "Recovered after explicit timeout continuation.",
+      );
+      expect(gateway.requestCount()).toBe(2);
+      expect(gateway.requests[1]!.body).toContain("Pause on the fixture timeout.");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
