@@ -1307,7 +1307,7 @@ pub fn Runtime(comptime App: type) type {
                     measurement.activity_projection
                 else
                     .{ .turn_thinking = .{ .label = footer_frame.label() } };
-                const transition_reservation = turnTransitionReservation(
+                const prompt_turn_reservation = promptTurnReservation(
                     app,
                     presentation_shell,
                     canonical_transcript_preview,
@@ -1347,7 +1347,7 @@ pub fn Runtime(comptime App: type) type {
                         .footer = neutral_footer,
                         .transcript = transcript_preview,
                         .activity = frame_activity,
-                        .transition = transition_reservation,
+                        .prompt_turn = prompt_turn_reservation,
                         .body_mode = .transcript,
                         .prior = active_committed_layout,
                     },
@@ -1359,7 +1359,7 @@ pub fn Runtime(comptime App: type) type {
                 scroll_plan = fixed_point.scroll_plan;
                 debug_trace.logf(
                     "frame_layout",
-                    "layout_id={x} solved_frame_height={d} footer_height={d} footer_top={d} owned_top={d} owned_bottom={d} scroll_rows={d}",
+                    "layout_id={x} solved_frame_height={d} footer_height={d} footer_top={d} owned_top={d} owned_bottom={d} prompt_turn_transcript_rows={d} prompt_turn_active={s} scroll_rows={d}",
                     .{
                         solved.layout_id,
                         solved.solved_frame_height,
@@ -1367,6 +1367,8 @@ pub fn Runtime(comptime App: type) type {
                         solved.footer_area.top,
                         solved.owned_top,
                         solved.owned_band.bottom,
+                        prompt_turn_reservation.transcript_rows,
+                        if (prompt_turn_reservation.active()) "true" else "false",
                         scroll_plan.terminal_scroll_rows,
                     },
                 );
@@ -2236,14 +2238,14 @@ fn validatePreparedTranscriptFitsPlan(
     }
 }
 
-fn turnTransitionReservation(
+fn promptTurnReservation(
     app: anytype,
     shell: *const transcript_runtime.TranscriptRuntime,
     canonical_preview: render_engine.frame_layout.TranscriptFlowPreview,
     pending_card: ?PendingCardProjection,
     footer_measurement: ?*const surface_frame.SurfaceFooterMeasurement,
     frame_activity: render_engine.frame_layout.ActivityState,
-) render_engine.frame_layout.TransitionReservation {
+) render_engine.frame_layout.PromptTurnReservation {
     if (frame_activity != .none) return .{};
     const measurement = footer_measurement orelse return .{};
     if (!measurement.input_visible or
@@ -2259,10 +2261,7 @@ fn turnTransitionReservation(
         }
     }
 
-    const future_activity = render_engine.frame_layout.ActivityState{ .thinking = .{
-        .gap_above_activity = render_engine.transcript_blocks.blockGapRowsBetween(.user_turn, .assistant_turn),
-        .footer_gap_after_activity = render_engine.transcript_blocks.footerBoundaryGapRowsForTail(.turn_summary),
-    } };
+    const future_activity = render_engine.frame_layout.ActivityState.thinkingAfterUserTurn();
     const pending_submission_active = if (comptime @hasField(@TypeOf(app.*), "submission"))
         app.submission.pending != null
     else

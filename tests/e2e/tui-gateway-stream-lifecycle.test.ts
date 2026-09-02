@@ -2729,8 +2729,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForText("Thinking", TIMEOUT);
       await Bun.sleep(250);
       const thinkingGrid = await session.capturePaneGrid();
-      const rowContaining = (grid: string[], needle: string) =>
-        grid.findIndex((row) => row.includes(needle));
+      const rowContaining = (grid: string[], needle: string) => {
+        const row = grid.findIndex((line) => line.includes(needle));
+        expect(row).toBeGreaterThanOrEqual(0);
+        return row;
+      };
       expect(rowContaining(thinkingGrid, submittedPrompt)).toBe(
         rowContaining(preEnterGrid, submittedPrompt),
       );

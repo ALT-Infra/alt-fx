@@ -68,6 +68,13 @@ pub const ActivityState = union(enum) {
     thinking: Thinking,
     overlay_entry: u16,
 
+    pub fn thinkingAfterUserTurn() ActivityState {
+        return .{ .thinking = .{
+            .gap_above_activity = transcript_blocks.blockGapRowsBetween(.user_turn, .assistant_turn),
+            .footer_gap_after_activity = transcript_blocks.footerBoundaryGapRowsForTail(.turn_summary),
+        } };
+    }
+
     pub const Thinking = struct {
         gap_above_activity: u16,
         activity_rows: u16 = 1,
@@ -153,11 +160,11 @@ pub const CommittedLayoutSnapshot = struct {
     }
 };
 
-pub const TransitionReservation = struct {
+pub const PromptTurnReservation = struct {
     transcript_rows: u16 = 0,
     activity: ActivityState = .none,
 
-    pub fn active(self: TransitionReservation) bool {
+    pub fn active(self: PromptTurnReservation) bool {
         return self.transcript_rows > 0 and self.activity != .none;
     }
 };
@@ -168,7 +175,7 @@ pub const SolveInput = struct {
     footer: FooterMeasurement,
     transcript: TranscriptFlowPreview,
     activity: ActivityState = .none,
-    transition: TransitionReservation = .{},
+    prompt_turn: PromptTurnReservation = .{},
     body_mode: BodyMode = .transcript,
     prior: CommittedLayoutSnapshot = .{},
     placement_policy: FramePlacementPolicy = .compact_until_full,
@@ -260,7 +267,7 @@ pub fn solve(input: SolveInput) FrameLayout {
     };
     const transcript_height = @min(natural_body_rows, body_capacity);
     const natural_content_rows = transcript_height +| reserved_activity_rows +| footer_height;
-    const transition_rows = solveTransitionReservation(input, footer_height, available_rows);
+    const transition_rows = solvePromptTurnReservation(input, footer_height, available_rows);
     const solved_frame_height = @min(available_rows, @max(natural_content_rows, transition_rows));
     const neutral_rows = solved_frame_height -| natural_content_rows;
     const owned_band = rectFromTopHeight(owned_top, solved_frame_height);
@@ -319,7 +326,7 @@ pub fn solveWithPreservedRowRelease(input: SolveInput, release_floor_rows: u16) 
 
     var maximum_input = input;
     maximum_input.owned_top = 1;
-    maximum_input.transition = .{};
+    if (input.owned_top == 1) maximum_input.prompt_turn = .{};
     const maximum = solve(maximum_input);
     const geometry_top = if (maximum.solved_frame_height == 0)
         initial.owned_top
@@ -336,14 +343,14 @@ pub fn solveWithPreservedRowRelease(input: SolveInput, release_floor_rows: u16) 
     };
 }
 
-fn solveTransitionReservation(input: SolveInput, footer_height: u16, available_rows: u16) u16 {
-    if (input.activity != .none or !input.transition.active()) return 0;
-    var transition_input = input;
-    transition_input.transcript.natural_visual_rows = input.transition.transcript_rows;
-    transition_input.activity = input.transition.activity;
-    transition_input.transition = .{};
-    const reservation = solveActivityReservation(transition_input, footer_height, available_rows);
-    return input.transition.transcript_rows +|
+fn solvePromptTurnReservation(input: SolveInput, footer_height: u16, available_rows: u16) u16 {
+    if (input.activity != .none or !input.prompt_turn.active()) return 0;
+    var prompt_turn_input = input;
+    prompt_turn_input.transcript.natural_visual_rows = input.prompt_turn.transcript_rows;
+    prompt_turn_input.activity = input.prompt_turn.activity;
+    prompt_turn_input.prompt_turn = .{};
+    const reservation = solveActivityReservation(prompt_turn_input, footer_height, available_rows);
+    return input.prompt_turn.transcript_rows +|
         reservation.boundary_gap +|
         reservation.activity_rows +|
         reservation.footer_gap +|
@@ -729,27 +736,27 @@ test "layout id ignores non layout-affecting cursor column changes" {
     try std.testing.expectEqual(base.layout_id, repaint.layout_id);
 }
 
-test "minimum content rows keep a neutral transition aligned with thinking" {
+test "prompt turn reservation aligns pending frames with thinking" {
     const idle = solve(.{
         .terminal = testLayout(24, 80),
         .owned_top = 1,
         .footer = testFooter(3),
         .transcript = .{ .natural_visual_rows = 5 },
-        .transition = .{ .transcript_rows = 7, .activity = .{ .thinking = .{ .gap_above_activity = 1, .footer_gap_after_activity = 1 } } },
+        .prompt_turn = .{ .transcript_rows = 7, .activity = .{ .thinking = .{ .gap_above_activity = 1, .footer_gap_after_activity = 1 } } },
     });
     const pending = solve(.{
         .terminal = testLayout(24, 80),
         .owned_top = 1,
         .footer = testFooter(3),
         .transcript = .{ .natural_visual_rows = 8 },
-        .transition = .{ .transcript_rows = 7, .activity = .{ .thinking = .{ .gap_above_activity = 1, .footer_gap_after_activity = 1 } } },
+        .prompt_turn = .{ .transcript_rows = 7, .activity = .{ .thinking = .{ .gap_above_activity = 1, .footer_gap_after_activity = 1 } } },
     });
     const adopted = solve(.{
         .terminal = testLayout(24, 80),
         .owned_top = 1,
         .footer = testFooter(3),
         .transcript = .{ .natural_visual_rows = 7 },
-        .transition = .{ .transcript_rows = 7, .activity = .{ .thinking = .{ .gap_above_activity = 1, .footer_gap_after_activity = 1 } } },
+        .prompt_turn = .{ .transcript_rows = 7, .activity = .{ .thinking = .{ .gap_above_activity = 1, .footer_gap_after_activity = 1 } } },
     });
     const thinking = solve(.{
         .terminal = testLayout(24, 80),
@@ -772,14 +779,14 @@ test "minimum content rows keep a neutral transition aligned with thinking" {
     try std.testing.expectEqual(@as(?u16, 9), thinking.activity_row);
 }
 
-test "real activity supersedes neutral minimum content rows" {
+test "real activity supersedes prompt turn reservation" {
     const layout = solve(.{
         .terminal = testLayout(24, 80),
         .owned_top = 1,
         .footer = testFooter(3),
         .transcript = .{ .natural_visual_rows = 7 },
         .activity = .{ .thinking = .{ .gap_above_activity = 1, .footer_gap_after_activity = 1 } },
-        .transition = .{ .transcript_rows = 20, .activity = .{ .thinking = .{ .gap_above_activity = 1, .footer_gap_after_activity = 1 } } },
+        .prompt_turn = .{ .transcript_rows = 20, .activity = .{ .thinking = .{ .gap_above_activity = 1, .footer_gap_after_activity = 1 } } },
     });
 
     try std.testing.expectEqual(@as(?u16, 9), layout.activity_row);
@@ -787,27 +794,28 @@ test "real activity supersedes neutral minimum content rows" {
     try std.testing.expectEqual(@as(u16, 13), layout.solved_frame_height);
 }
 
-test "minimum content rows do not release preserved shell rows" {
+test "prompt turn reservation participates in preserved row release" {
     const input = SolveInput{
-        .terminal = testLayout(24, 80),
-        .owned_top = 6,
+        .terminal = testLayout(10, 80),
+        .owned_top = 5,
         .footer = testFooter(3),
         .transcript = .{ .natural_visual_rows = 2 },
-        .transition = .{ .transcript_rows = 7, .activity = .{ .thinking = .{ .gap_above_activity = 1, .footer_gap_after_activity = 1 } } },
+        .prompt_turn = .{ .transcript_rows = 7, .activity = .{ .thinking = .{ .gap_above_activity = 1, .footer_gap_after_activity = 1 } } },
     };
     const plan = solveWithPreservedRowRelease(input, 0);
 
-    try std.testing.expectEqual(@as(u16, 6), plan.layout.owned_top);
-    try std.testing.expectEqual(@as(u16, 0), plan.released_rows);
+    try std.testing.expectEqual(@as(u16, 1), plan.layout.owned_top);
+    try std.testing.expectEqual(@as(u16, 4), plan.released_rows);
+    try std.testing.expectEqual(FrameRect{ .top = 8, .bottom = 10 }, plan.layout.footer_area);
 }
 
-test "minimum content rows clamp without displacing visible content" {
+test "prompt turn reservation clamps to terminal height" {
     const layout = solve(.{
         .terminal = testLayout(8, 80),
         .owned_top = 1,
         .footer = testFooter(3),
         .transcript = .{ .natural_visual_rows = 6 },
-        .transition = .{ .transcript_rows = 7, .activity = .{ .thinking = .{ .gap_above_activity = 1, .footer_gap_after_activity = 1 } } },
+        .prompt_turn = .{ .transcript_rows = 7, .activity = .{ .thinking = .{ .gap_above_activity = 1, .footer_gap_after_activity = 1 } } },
     });
 
     try std.testing.expectEqual(@as(u16, 8), layout.solved_frame_height);
