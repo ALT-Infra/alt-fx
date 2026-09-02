@@ -82,6 +82,7 @@ pub const StreamChunkContext = struct {
     provisional_statuses: runtime_tool_presentation.ProvisionalToolStatuses = .{},
     response_language_expected: ?response_language.Script = null,
     response_language_accepted: bool = false,
+    response_language_hold_until_completion: bool = false,
     response_language_next_probe_bytes: usize = 5,
 
     fn markModelOutput(self: *StreamChunkContext) void {
@@ -370,6 +371,7 @@ fn streamAssistantChunkResolved(stream_ctx: *StreamChunkContext, chunk: []const 
     const alloc = stream_ctx.alloc;
     try stream_ctx.raw_text.appendSlice(alloc, chunk);
     if (stream_ctx.response_language_staging()) {
+        if (stream_ctx.response_language_hold_until_completion) return;
         if (stream_ctx.raw_text.items.len >= stream_ctx.response_language_next_probe_bytes) {
             const prefix_len = @min(
                 stream_ctx.raw_text.items.len,

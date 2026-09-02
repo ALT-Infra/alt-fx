@@ -2809,10 +2809,7 @@ fn build_gateway_messages_with_response_language_control(
         @memcpy(projected[0..ephemeral_overlay.len], ephemeral_overlay);
         projected[ephemeral_overlay.len] = .{
             .role = .system,
-            .content = if (correction_attempted)
-                response_language_correction_control
-            else
-                response_language_control,
+            .content = response_language_control,
             .cache_policy = .no_cache,
         };
         break :blk projected;
@@ -2829,11 +2826,33 @@ fn build_gateway_messages_with_response_language_control(
         compacted_suffix_len,
     );
     errdefer messages.deinit(alloc);
+    if (origin == .root and correction_attempted) {
+        try messages.append(alloc, .{
+            .role = .user,
+            .content = response_language_correction_control,
+            .cache_policy = .no_cache,
+        });
+    }
     return .{
         .messages = messages,
         .current_user_index = stable_prefix.len + effective_overlay.len +
             if (compaction_handoff == null) durable_history.len else 0,
     };
+}
+
+fn response_language_context_conflicts(
+    expected: ?response_language.Script,
+    messages: []const ChatMessage,
+) bool {
+    const expected_script = expected orelse return false;
+    for (messages) |message| {
+        if (message.role == .user) continue;
+        const content = message.content orelse continue;
+        const probe = content[0..@min(content.len, 4096)];
+        const actual = response_language.evidence(probe).script orelse continue;
+        if (actual != expected_script) return true;
+    }
+    return false;
 }
 
 fn recoveryToolEvidence(
@@ -4841,6 +4860,11 @@ fn processQueuedPromptLoop(
         const initial_decision_pending = recovery_strategy == .continue_after_confirmed_tool;
         last_gateway_message_count = gateway_messages.items.len + @intFromBool(initial_decision_pending);
         var current_user_message_index = gateway_projection.current_user_index;
+        const response_language_hold_until_completion =
+            response_language_context_conflicts(response_language_expectation, stable_prefix.items) or
+            response_language_context_conflicts(response_language_expectation, ephemeral_overlay.items) or
+            response_language_context_conflicts(response_language_expectation, history_messages.items) or
+            response_language_context_conflicts(response_language_expectation, within_turn_suffix.items);
 
         debug_trace.logf("agent", "step start step={d} limit={d} messages={d}", .{ current_step_index, config.agent_step_limit, gateway_messages.items.len });
         debug_trace.eventf("agent", "step_begin", step_ctx, "step_index={d} step_limit={d} gateway_messages={d}", .{ current_step_index, config.agent_step_limit, gateway_messages.items.len });
@@ -4853,6 +4877,7 @@ fn processQueuedPromptLoop(
             .turn_id = turn_id,
             .step_id = step_ctx.step_id,
             .response_language_expected = response_language_expectation,
+            .response_language_hold_until_completion = response_language_hold_until_completion,
             .provisional_statuses = .{
                 .presentation_group_id = presentation_group_id,
             },

@@ -40,11 +40,15 @@ const Counts = struct {
 };
 
 pub fn profile(text: []const u8) Profile {
-    return profile_with_filter(text, false);
+    return profile_with_filter(text, false, true);
 }
 
 pub fn profile_prose(text: []const u8) Profile {
-    return profile_with_filter(text, true);
+    return profile_with_filter(text, true, true);
+}
+
+pub fn profile_non_latin_prose(text: []const u8) Profile {
+    return profile_with_filter(text, true, false);
 }
 
 const Quote = enum {
@@ -54,7 +58,7 @@ const Quote = enum {
     curly_double,
 };
 
-fn profile_with_filter(text: []const u8, prose_only: bool) Profile {
+fn profile_with_filter(text: []const u8, prose_only: bool, include_latin: bool) Profile {
     var counts: Counts = .{};
     var index: usize = 0;
     var in_code = false;
@@ -118,7 +122,9 @@ fn profile_with_filter(text: []const u8, prose_only: bool) Profile {
                 continue;
             }
         }
-        classify_codepoint(&counts, codepoint);
+        if (include_latin or !is_latin_codepoint(codepoint)) {
+            classify_codepoint(&counts, codepoint);
+        }
         index += width;
     }
 
@@ -280,4 +286,10 @@ test "language script prose profile excludes code identifiers and quoted data" {
     const english_after_code =
         "```zig\nconst причина = true;\n```\nI will inspect the lockfile next.";
     try std.testing.expectEqual(Script.latin, profile_prose(english_after_code).script.?);
+
+    const chinese_with_identifiers =
+        "我将检查 lockfile 和 dependency manifest，查找损坏问题。";
+    const non_latin = profile_non_latin_prose(chinese_with_identifiers);
+    try std.testing.expectEqual(Script.han, non_latin.script.?);
+    try std.testing.expect(non_latin.dominant_letters >= 8);
 }

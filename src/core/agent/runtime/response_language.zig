@@ -2,6 +2,7 @@ const std = @import("std");
 const language_script = @import("../../shared/language_script.zig");
 
 const minimum_letters: usize = 5;
+const minimum_unexpected_prose_letters: usize = 8;
 
 pub const Script = language_script.Script;
 pub const Evidence = language_script.Profile;
@@ -23,6 +24,16 @@ pub const DecisionInput = struct {
 };
 
 pub fn evidence(text: []const u8) Evidence {
+    const non_latin = language_script.profile_non_latin_prose(text);
+    if (non_latin.script != null and
+        non_latin.dominant_letters >= minimum_unexpected_prose_letters)
+    {
+        return clear_evidence(
+            non_latin.script.?,
+            non_latin.letters,
+            non_latin.dominant_letters,
+        );
+    }
     const observed = language_script.profile_prose(text);
     if (observed.letters < minimum_letters or observed.script == null) return .{
         .script = null,
@@ -146,6 +157,10 @@ test "response language evidence distinguishes clear scripts" {
         Script.han,
         evidence("接下来我将检查项目中的锁文件（如 package-lock.json、Cargo.lock、Pipfile.lock 等）及其对应的清单文件。").script.?,
     );
+    try std.testing.expectEqual(
+        Script.han,
+        evidence("我将检查 lockfile 和 dependency manifest，查找损坏问题。").script.?,
+    );
 }
 
 test "response language expectation follows the current human unless a switch may be explicit" {
@@ -163,7 +178,7 @@ test "response language decision is pure conservative and bounded" {
     const expected = infer_expectation("The lockfile is broken again.");
     const matching = evidence("I will inspect the lockfile next.");
     const mismatching = evidence("我会先检查锁文件和依赖清单。");
-    const mixed = evidence("错误：锁文件已经损坏并且依赖清单无法读取。 The error stays.");
+    const mixed = evidence("abcd锁文件坏");
 
     try std.testing.expectEqual(Decision.accept, decide(.{
         .expected = expected,

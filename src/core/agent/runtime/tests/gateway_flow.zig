@@ -4136,9 +4136,9 @@ test "processQueuedPrompt projects response language authority only for root tur
     );
 }
 
-test "processQueuedPrompt releases a matching staged prefix without changing source bytes" {
+test "processQueuedPrompt holds matching output to completion after conflicting history" {
     const alloc = std.testing.allocator;
-    const chunks = [_][]const u8{ "I ", "will inspect the lockfile next." };
+    const chunks = [_][]const u8{ "I will inspect ", "the lockfile next." };
     const completions = [_]FakeCompletion{.{
         .chunks = &chunks,
         .content = "I will inspect the lockfile next.",
@@ -4148,8 +4148,13 @@ test "processQueuedPrompt releases a matching staged prefix without changing sou
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
     var fixture = PromptFixture{};
+    var history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("Answer in Chinese.") },
+        .assistant = @constCast("我会先检查锁文件和依赖清单。"),
+    } }};
     var job = fixture.job();
     job.prompt = @constCast("The lockfile is broken again.");
+    job.history = &history;
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
@@ -4193,7 +4198,13 @@ test "processQueuedPrompt retries one clear language mismatch without publishing
         "The previous candidate used a different language",
         1,
     );
-    try expectGatewayPromptFinalUserText(&gateway, 1, "The lockfile is broken again.");
+    try expectGatewayPromptTailText(
+        &gateway,
+        1,
+        .user,
+        "The previous candidate used a different language",
+    );
+    try expectGatewayPromptTextCount(&gateway, 1, "The lockfile is broken again.", 1);
     try std.testing.expectEqual(@as(usize, 1), hooks.assistant_sources.items.len);
     try std.testing.expectEqualStrings(accepted_chunks[0], hooks.assistant_sources.items[0]);
     for (hooks.texts.items) |text| {
