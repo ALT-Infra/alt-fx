@@ -587,11 +587,10 @@ fn issuerWithoutTrailingSlash(issuer: []const u8) []const u8 {
     return issuer;
 }
 
-/// RFC 8414 issuer identifiers are compared as exact strings, but a server can
-/// publish the same origin with and without a trailing slash across its
-/// protected-resource and authorization-server documents. Ignore that one
-/// difference; everything else still fails closed.
-fn issuersEqual(a: []const u8, b: []const u8) bool {
+/// Accept a trailing-slash discrepancy between protected-resource discovery
+/// and authorization-server metadata. Authorization responses still require
+/// the exact metadata issuer required by RFC 9207.
+fn authorizationMetadataIssuersEqual(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, issuerWithoutTrailingSlash(a), issuerWithoutTrailingSlash(b));
 }
 
@@ -605,7 +604,7 @@ fn parseAuthorizationMetadataOutcome(
     if (parsed.value != .object) return error.InvalidAuthorizationMetadata;
     const object = parsed.value.object;
     const issuer = try requiredString(object, "issuer");
-    if (!issuersEqual(issuer, expected_issuer)) {
+    if (!authorizationMetadataIssuersEqual(issuer, expected_issuer)) {
         return .{ .issuer_mismatch = try IssuerMismatch.init(
             alloc,
             .authorization_metadata,
@@ -700,7 +699,7 @@ pub fn validateAuthorizationResponse(
         return error.AuthorizationResponseIssuerMissing;
     }
     if (response.issuer) |issuer| {
-        if (!issuersEqual(expected_issuer, issuer)) {
+        if (!std.mem.eql(u8, expected_issuer, issuer)) {
             return error.AuthorizationResponseIssuerMismatch;
         }
     }
@@ -2395,8 +2394,15 @@ test "authorization metadata accepts an issuer that differs only by a trailing s
         "https://login.example.com/",
     );
     defer metadata.deinit(alloc);
-
     try std.testing.expectEqualStrings("https://login.example.com", metadata.issuer);
+
+    var reverse = try parseAuthorizationMetadata(
+        alloc,
+        "{\"issuer\":\"https://login.example.com/\",\"authorization_endpoint\":\"https://login.example.com/authorize\",\"token_endpoint\":\"https://login.example.com/token\"}",
+        "https://login.example.com",
+    );
+    defer reverse.deinit(alloc);
+    try std.testing.expectEqualStrings("https://login.example.com/", reverse.issuer);
 }
 
 test "authorization metadata rejects an issuer whose path differs" {
@@ -2480,11 +2486,14 @@ test "authorization response uses exact state and issuer comparison" {
         true,
         response,
     );
-    try validateAuthorizationResponse(
-        "state-1",
-        "https://login.example.com/",
-        true,
-        response,
+    try std.testing.expectError(
+        error.AuthorizationResponseIssuerMismatch,
+        validateAuthorizationResponse(
+            "state-1",
+            "https://login.example.com/",
+            true,
+            response,
+        ),
     );
     try std.testing.expectError(
         error.OAuthStateMismatch,
