@@ -4117,6 +4117,9 @@ describe("cli: ask success", () => {
           firstJson.session_id,
         );
         expect(
+          gateway.requests[0]?.headers.get("x-vercel-gateway-extended-time"),
+        ).toBe("true");
+        expect(
           existsSync(
             join(savedHome, ".fx", "sessions", firstJson.session_id),
           ),
