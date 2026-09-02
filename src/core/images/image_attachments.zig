@@ -482,7 +482,7 @@ pub fn captureInlineImageBytes(
 ) !types.ImageAttachment {
     if (image_id == 0) return error.InvalidImageId;
     if (bytes.len == 0 or declared_media_type.len == 0) return error.UnsupportedImageType;
-    if (bytes.len > max_image_bytes) return error.ImageTooLarge;
+    if (bytes.len > max_image_bytes or !fitsEncodedLimit(bytes.len)) return error.ImageTooLarge;
 
     var snapshot_dir_handle = try openOrCreateSnapshotDirectoryNoFollow(snapshot_dir);
     defer snapshot_dir_handle.close(io_mod.getIo());
@@ -2763,6 +2763,25 @@ test "encoded image limit uses exact padded base64 length" {
 
     try std.testing.expect(fitsEncodedLimit(largest_fitting_raw_image));
     try std.testing.expect(!fitsEncodedLimit(largest_fitting_raw_image + 1));
+}
+
+test "inline capture rejects one byte beyond encoded limit before directory effects" {
+    const alloc = std.testing.allocator;
+    const largest_fitting_raw_image = (max_encoded_image_bytes / 4) * 3;
+    const bytes = try alloc.alloc(u8, largest_fitting_raw_image + 1);
+    defer alloc.free(bytes);
+    @memset(bytes, 0);
+
+    try std.testing.expectError(
+        error.ImageTooLarge,
+        captureInlineImageBytes(
+            alloc,
+            1,
+            "image/png",
+            bytes,
+            "/path/that/does/not/exist",
+        ),
+    );
 }
 
 test "capture rejection distinguishes source size from preparation failure" {

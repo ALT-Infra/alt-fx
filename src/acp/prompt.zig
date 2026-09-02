@@ -109,6 +109,18 @@ fn promptInputFailure(err: anyerror) anyerror!TerminalOutcome {
     };
 }
 
+fn promptExecutionFailure(err: anyerror) anyerror!TerminalOutcome {
+    return switch (err) {
+        error.ModelImageCapabilityUnavailable,
+        error.SubscriptionNativeImageUnavailable,
+        => .{ .rpc_error = .{
+            .code = ErrorCode.invalid_params,
+            .message = "Image prompts are unavailable for the selected model",
+        } },
+        else => err,
+    };
+}
+
 const ProviderTerminalPublication = enum {
     not_applicable,
     pending,
@@ -751,7 +763,7 @@ pub fn handlePrompt(
         if (err == error.NonInteractivePermissionRequired) {
             ctx.stop_reason = .refused;
         } else {
-            return err;
+            return promptExecutionFailure(err);
         }
     };
     prompt_input.retainImageSnapshots();
@@ -2834,6 +2846,27 @@ test "mapToolKind maps common tools" {
     try std.testing.expectEqual(acp_types.ToolCallKind.search, mapToolKind("exa_search"));
     try std.testing.expectEqual(acp_types.ToolCallKind.execute, mapToolKind("run_command"));
     try std.testing.expectEqual(acp_types.ToolCallKind.other, mapToolKind("unknown_tool"));
+}
+
+test "ACP maps selected-model image capability failures to one stable error" {
+    const failures = [_]anyerror{
+        error.ModelImageCapabilityUnavailable,
+        error.SubscriptionNativeImageUnavailable,
+    };
+    for (failures) |failure| {
+        const outcome = try promptExecutionFailure(failure);
+        switch (outcome) {
+            .rpc_error => |rpc_error| {
+                try std.testing.expectEqual(ErrorCode.invalid_params, rpc_error.code);
+                try std.testing.expectEqualStrings(
+                    "Image prompts are unavailable for the selected model",
+                    rpc_error.message,
+                );
+            },
+            .stop_reason => return error.UnexpectedStopReason,
+        }
+    }
+    try std.testing.expectError(error.OutOfMemory, promptExecutionFailure(error.OutOfMemory));
 }
 
 test "provider terminal status maps only terminal outcomes" {

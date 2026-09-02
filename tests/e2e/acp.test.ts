@@ -5029,6 +5029,231 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "image-only prompt publishes and reloads the shared image title",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-image-only-title-");
+      const imageData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9WlXYX0AAAAASUVORK5CYII=";
+      const gateway = startFakeGateway(
+        [finalText("image-only prompt complete")],
+        {
+          models: [{
+            id: FAKE_GATEWAY_MODEL,
+            type: "language",
+            tags: ["vision", "file-input", "tool-use"],
+          }],
+        },
+      );
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        const sessionId = await startCodeSession(client);
+        const prompted = await runPromptBlocks(
+          client,
+          [{ type: "image", data: imageData, mimeType: "image/png" }],
+          TIMEOUT,
+        );
+        expect(prompted.promptResult.result.stopReason).toBe("end_turn");
+        expect(prompted.messages.find((message) =>
+          message.params?.update?.sessionUpdate === "session_info_update"
+        )?.params.update.title).toBe("Image session");
+        expect(gateway.requests).toHaveLength(1);
+        await client.close();
+
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 97);
+        client.send({
+          jsonrpc: "2.0",
+          id: 98,
+          method: "session/load",
+          params: { sessionId, cwd: root.workspace, mcpServers: [] },
+        });
+        const replay: any[] = [];
+        let loadResponse: any = null;
+        while (loadResponse === null) {
+          const message = await client.readLine() as any;
+          if (message.id === 98) loadResponse = message;
+          else replay.push(message);
+        }
+
+        expect(loadResponse.error).toBeUndefined();
+        expect(replay.find((message) =>
+          message.params?.update?.sessionUpdate === "session_info_update"
+        )?.params.update.title).toBe("Image session");
+        const userChunks = replay.filter((message) =>
+          message.params?.update?.sessionUpdate === "user_message_chunk"
+        );
+        expect(userChunks.map((message) => message.params.update.content.type)).toEqual([
+          "text",
+          "image",
+        ]);
+        expect(userChunks[0]?.params.update.content.text).toBe("[Image #1]");
+        expect(new Set(userChunks.map((message) => message.params.update.messageId)).size).toBe(1);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "inline image above the portable encoded limit fails before effects",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-inline-image-limit-");
+      const maxEncodedImageBytes = 5 * 1024 * 1024;
+      const largestFittingRawImage = Math.floor(maxEncodedImageBytes / 4) * 3;
+      const oversized = Buffer.alloc(largestFittingRawImage + 1);
+      Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).copy(oversized);
+      const imageData = oversized.toString("base64");
+      expect(Buffer.byteLength(imageData)).toBe(maxEncodedImageBytes + 4);
+      const gateway = startFakeGateway(
+        [finalText("ACP image size recovery complete")],
+        {
+          models: [{
+            id: FAKE_GATEWAY_MODEL,
+            type: "language",
+            tags: ["vision", "file-input", "tool-use"],
+          }],
+        },
+      );
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        const sessionId = await startCodeSession(client);
+        client.send({
+          jsonrpc: "2.0",
+          id: 99,
+          method: "session/prompt",
+          params: {
+            prompt: [{
+              type: "image",
+              data: imageData,
+              mimeType: "image/png",
+            }],
+          },
+        });
+
+        const rejected = await readResponse(client, 99, LIVE_TIMEOUT);
+        expect(rejected.error).toEqual({
+          code: -32602,
+          message: "Image prompt exceeds size limit",
+        });
+        expect(gateway.requests).toHaveLength(0);
+        const imageDir = join(root.home, ".fx", "sessions", sessionId, "images");
+        if (existsSync(imageDir)) expect(readdirSync(imageDir)).toEqual([]);
+
+        const recovered = await runPrompt(
+          client,
+          "Confirm the ACP connection remains usable after image size rejection.",
+          TIMEOUT,
+        );
+        expect(recovered.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(1);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    "selected text-only model rejects images without leaking an internal error",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-image-model-capability-");
+      const imageData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9WlXYX0AAAAASUVORK5CYII=";
+      const gateway = startFakeGateway([]);
+      const codex = startAcpFakeCodex();
+      writeSeededAcpChatGptLogin(root.home, codex.accessToken);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+            FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+            FX_E2E_CHATGPT_TOKEN_URL: codex.tokenUrl,
+          },
+        });
+        const initialized = await client.request(
+          "initialize",
+          { protocolVersion: 1 },
+          1,
+        ) as any;
+        expect(initialized.result.agentCapabilities.promptCapabilities.image).toBe(true);
+        const created = await client.request(
+          "session/new",
+          { mcpServers: [] },
+          2,
+        ) as any;
+        await client.readLine();
+        const sessionId = created.result.sessionId as string;
+        await client.request("session/set_mode", { modeId: "code" }, 3);
+        await client.request("session/set_config_option", {
+          configId: "provider",
+          value: "codex",
+        }, 4);
+        await client.request("session/set_config_option", {
+          configId: "model",
+          value: "gpt-5.4-mini",
+        }, 5);
+
+        client.send({
+          jsonrpc: "2.0",
+          id: 100,
+          method: "session/prompt",
+          params: {
+            prompt: [{ type: "image", data: imageData, mimeType: "image/png" }],
+          },
+        });
+        const rejected = await readResponse(client, 100);
+        expect(rejected.error).toEqual({
+          code: -32602,
+          message: "Image prompts are unavailable for the selected model",
+        });
+        expect(codex.requests).toHaveLength(0);
+        expect(gateway.requests).toHaveLength(0);
+        const imageDir = join(root.home, ".fx", "sessions", sessionId, "images");
+        if (existsSync(imageDir)) expect(readdirSync(imageDir)).toEqual([]);
+
+        const rejectedDetail = await runFx(["session", "--id", sessionId, "--json"], {
+          cwd: root.workspace,
+          env: { HOME: root.home },
+          timeoutMs: TIMEOUT,
+        });
+        expect(rejectedDetail.code).toBe(0);
+        expect(JSON.parse(rejectedDetail.stdout).history_len).toBe(0);
+
+        const recovered = await runPrompt(
+          client,
+          "Confirm the ACP connection remains usable after image rejection.",
+          TIMEOUT,
+        );
+        expect(recovered.promptResult.result.stopReason).toBe("end_turn");
+        expect(codex.requests).toHaveLength(1);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        codex.stop();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "image prompt MIME mismatch fails before the Gateway without an orphaned snapshot",
     async () => {
       const root = createIsolatedRoot("fx-acp-image-mime-mismatch-");
