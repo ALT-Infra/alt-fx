@@ -3080,6 +3080,8 @@ describe("gateway stream lifecycle", () => {
         tool_calls: Array<{
           name: string;
           status: string;
+          action?: string;
+          error?: { category?: string; code?: string };
           command_result?: { termination_indeterminate?: boolean };
         }>;
       };
@@ -3099,6 +3101,11 @@ describe("gateway stream lifecycle", () => {
       expect(json.tool_calls[0]).toMatchObject({
         name: "shell",
         status: "error",
+        action: "run",
+        error: {
+          category: "command_failed",
+          code: "termination_indeterminate",
+        },
         command_result: { termination_indeterminate: true },
       });
       expect(readFileSync(tracePath, "utf8")).toContain(
@@ -3185,6 +3192,60 @@ describe("gateway stream lifecycle", () => {
       expect(readFileSync(tracePath, "utf8")).toContain(
         "command output drain incomplete reason=injected_after_exit",
       );
+      expect(result.stderr).not.toContain("Unexpected");
+      expect(result.stderr).not.toContain("error.Unexpected");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("shell runtime failure keeps action and typed JSON diagnostics", async () => {
+    const root = createFixtureRoot("shell-runtime-diagnostic");
+    const tracePath = join(root.root, "trace.log");
+    const callId = "shell_runtime_diagnostic_1";
+    let step = 0;
+    const gateway = startGateway(() => {
+      switch (step++) {
+        case 0:
+          return fakeGatewayToolCall(callId, "shell", {
+            request: {
+              action: "interact",
+              session_id: "shell-missing",
+            },
+          });
+        case 1:
+          return fakeGatewayFinalText("Shell failure recorded.");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "--no-save", "Observe the missing shell handle."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = JSON.parse(result.stdout) as {
+        tool_calls: Array<Record<string, unknown>>;
+      };
+
+      expect(result.code).toBe(0);
+      expect(gateway.requestCount()).toBe(2);
+      expect(json.tool_calls).toHaveLength(1);
+      expect(json.tool_calls[0]).toMatchObject({
+        name: "shell",
+        status: "error",
+        action: "interact",
+        error: {
+          category: "tool_failed",
+          code: "ExecutionNotFound",
+        },
+      });
       expect(result.stderr).not.toContain("Unexpected");
       expect(result.stderr).not.toContain("error.Unexpected");
     } finally {
