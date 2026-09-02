@@ -2721,6 +2721,10 @@ fn appendExecutionMemoryMessages(
         errdefer alloc.free(text);
         try messages.append(alloc, message.Message.userOwned(text));
     }
+    for (execution.steering) |text| {
+        if (text.len == 0) continue;
+        try messages.append(alloc, message.Message.userText(text));
+    }
 }
 
 pub fn appendExecutionMemoryChatMessages(
@@ -2753,6 +2757,10 @@ pub fn appendExecutionMemoryChatMessages(
     if (execution.files.len > 0) {
         const text = try formatExecutionFileContext(alloc, execution.files);
         errdefer alloc.free(text);
+        try messages.append(alloc, .{ .role = .user, .content = text });
+    }
+    for (execution.steering) |text| {
+        if (text.len == 0) continue;
         try messages.append(alloc, .{ .role = .user, .content = text });
     }
 }
@@ -3774,6 +3782,46 @@ test "history projection keeps system role only for leading summaries" {
     try std.testing.expectEqual(.system, budgeted_messages.items[0].role);
     try std.testing.expect(saw_nonleading_summary);
     try std.testing.expect(saw_interruption_marker);
+}
+
+test "resume history projects steering before the final assistant" {
+    const alloc = std.testing.allocator;
+    var steering = [_][]u8{
+        @constCast("use file B instead"),
+        @constCast("keep the result concise"),
+    };
+    const history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("modify file A") },
+        .assistant = @constCast("updated file B"),
+        .execution = .{ .steering = steering[0..] },
+    } }};
+
+    var messages: std.ArrayList(message.Message) = .empty;
+    defer deinitMessages(alloc, &messages);
+    try appendHistoryMessages(alloc, &messages, &history);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var chat_messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    defer chat_messages.deinit(arena);
+    try appendHistoryChatMessages(arena, &chat_messages, &history);
+
+    try std.testing.expectEqual(@as(usize, 4), messages.items.len);
+    try std.testing.expectEqual(messages.items.len, chat_messages.items.len);
+    const expected_roles = [_]message.Role{ .user, .user, .user, .assistant };
+    const expected_text = [_][]const u8{
+        "modify file A",
+        "use file B instead",
+        "keep the result concise",
+        "updated file B",
+    };
+    for (messages.items, chat_messages.items, expected_roles, expected_text) |projected, chat, role, text| {
+        try std.testing.expectEqual(role, projected.role);
+        try std.testing.expectEqualStrings(@tagName(role), @tagName(chat.role));
+        try std.testing.expectEqualStrings(text, projected.content.?.asText());
+        try std.testing.expectEqualStrings(text, chat.content.?);
+    }
 }
 
 test "resume projection replays assistant tool execution memory before final answer" {

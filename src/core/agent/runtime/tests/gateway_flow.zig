@@ -243,6 +243,30 @@ test "terminal assistant completion continues with steering admitted during the 
     const execution = hooks.history_turns.items[0].assistant.execution;
     try std.testing.expectEqual(@as(usize, 1), execution.steering.len);
     try std.testing.expectEqualStrings("change direction", execution.steering[0]);
+
+    const resumed_completions = [_]FakeCompletion{.{ .content = "Follow-up answer" }};
+    var resumed_gateway = FakeGateway.init(alloc, &resumed_completions);
+    defer resumed_gateway.deinit();
+    var resumed_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer resumed_hooks.deinit();
+    var resumed_fixture = PromptFixture{};
+    var resumed_job = resumed_fixture.job();
+    resumed_job.prompt = @constCast("follow up");
+    resumed_job.history = hooks.history_turns.items;
+
+    try runFakePrompt(
+        &resumed_gateway,
+        &resumed_hooks,
+        resumed_fixture.config(),
+        resumed_job,
+    );
+
+    try expectBodyContainsInOrder(&resumed_gateway, 0, &.{
+        "user prompt",
+        "change direction",
+        "Updated answer",
+        "follow up",
+    });
 }
 
 test "promoted steering remains model marked across the worker handoff" {
