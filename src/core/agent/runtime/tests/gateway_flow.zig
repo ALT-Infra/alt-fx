@@ -2997,10 +2997,28 @@ test "processQueuedPrompt semantically compacts history at eighty percent and co
     config.tool_result_dir = result_dir;
     var job = fixture.job();
     job.model = @constCast(model);
+    var restored_calls = [_]ToolCall{toolCall(
+        "auto_restored_1",
+        "read_file",
+        "{\"path\":\"restored.txt\"}",
+    )};
+    var restored_results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("auto_restored_1"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("AUTO_RESTORED_RESULT_SENTINEL"),
+        .output_bytes = 29,
+        .stored_output_bytes = 29,
+    }};
+    var restored_steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = &restored_calls,
+        .tool_results = &restored_results,
+    }};
     var history = [_]HistoryTurn{
         .{ .assistant = .{
             .user = .{ .text = @constCast("AUTO_HISTORY_USER_SENTINEL") },
             .assistant = @constCast("AUTO_HISTORY_ASSISTANT_SENTINEL\n" ++ ("h" ** 200_000)),
+            .execution = .{ .tool_steps = &restored_steps },
         } },
         .{ .assistant = .{
             .user = .{ .text = @constCast("AUTO_RECENT_USER") },
@@ -3008,6 +3026,7 @@ test "processQueuedPrompt semantically compacts history at eighty percent and co
         } },
     };
     job.history = &history;
+    job.unversioned_history_count = history.len;
 
     try runFakePrompt(&gateway, &hooks, config, job);
 

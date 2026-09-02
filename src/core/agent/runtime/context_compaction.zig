@@ -63,7 +63,9 @@ pub fn validateUnversionedHistoryResults(
         };
         for (execution.tool_steps) |step| {
             for (step.tool_results) |result| {
-                if (result.output_handle == null) return error.AmbiguousCompactionResult;
+                if (result.output_handle == null and result.truncated) {
+                    return error.AmbiguousCompactionResult;
+                }
             }
         }
     }
@@ -631,21 +633,33 @@ fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
     return count;
 }
 
-test "compaction result retention promotes only corrected history" {
+test "compaction result retention promotes complete unversioned history" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(result_dir);
 
-    var results = [_]types.PersistedToolResult{.{
-        .tool_call_id = @constCast("call-promote"),
-        .tool_name = @constCast("read_file"),
-        .status = .success,
-        .output = @constCast("complete redacted output"),
-        .output_bytes = 24,
-        .stored_output_bytes = 24,
-    }};
+    var results = [_]types.PersistedToolResult{
+        .{
+            .tool_call_id = @constCast("call-promote"),
+            .tool_name = @constCast("read_file"),
+            .status = .success,
+            .output = @constCast("complete redacted output"),
+            .output_bytes = 24,
+            .stored_output_bytes = 24,
+        },
+        .{
+            .tool_call_id = @constCast("call-handled"),
+            .tool_name = @constCast("grep_files"),
+            .status = .success,
+            .output = @constCast("truncated preview"),
+            .output_handle = @constCast("result-call-handled-grep_files.txt"),
+            .output_bytes = 128,
+            .stored_output_bytes = 128,
+            .truncated = true,
+        },
+    };
     var steps = [_]types.ToolExecutionStep{.{ .tool_results = &results }};
     var history = [_]types.HistoryTurn{.{ .assistant = .{
         .user = .{ .text = @constCast("read it") },
@@ -653,7 +667,7 @@ test "compaction result retention promotes only corrected history" {
         .execution = .{ .tool_steps = &steps },
     } }};
 
-    try validateUnversionedHistoryResults(&history, 0);
+    try validateUnversionedHistoryResults(&history, 1);
     var messages = [_]types.ChatMessage{.{
         .role = .tool,
         .content = results[0].output,
@@ -671,6 +685,7 @@ test "compaction result retention promotes only corrected history" {
     defer alloc.free(stored);
     try std.testing.expect(std.mem.find(u8, stored, "complete redacted output") != null);
 
+    results[0].truncated = true;
     try std.testing.expectError(
         error.AmbiguousCompactionResult,
         validateUnversionedHistoryResults(&history, 1),
