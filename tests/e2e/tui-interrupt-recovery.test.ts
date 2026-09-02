@@ -134,6 +134,11 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       expect(gateway.requests[1]!.body).toContain(
         "Apply this live user update to the current task.",
       );
+      expect(gateway.requests[1]!.body).toContain("ACTIVE_RESPONSE_HELD");
+      expect(gateway.requests[1]!.body).not.toContain("<turn_aborted>");
+      expect(gateway.requests[1]!.body).not.toContain(
+        "The previous response ended before completion.",
+      );
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(session.isAlive()).toBe(true);
       expect(session.isPaneAlive()).toBe(true);
@@ -148,10 +153,11 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
         return eventsPath !== undefined;
       }, "steering history persistence");
       const events = readFileSync(eventsPath!, "utf8");
-      expect(events).toContain('"kind":"interrupted"');
+      expect(events).not.toContain('"kind":"interrupted"');
       expect(events).toContain(steeringText);
       const scrollback = await session.captureFullScrollback();
       expect(countOccurrences(scrollback, steeringText)).toBe(1);
+      expect(countOccurrences(scrollback, "ACTIVE_RESPONSE_HELD")).toBe(1);
       expect(scrollback).not.toContain("cancelled");
     },
     TIMEOUT * 2,

@@ -107,6 +107,46 @@ fn append_pending_steering_after_assistant(
     return true;
 }
 
+fn append_immediate_steering_after_cancel(
+    deps: *const AgentRuntimeDeps,
+    arena: Allocator,
+    within_turn_suffix: *std.ArrayList(ChatMessage),
+    turn_id: u64,
+    assistant_text: []const u8,
+) !bool {
+    const take_immediate_steering = deps.take_immediate_steering orelse return false;
+    const guidance = try take_immediate_steering(deps.ctx, arena, turn_id);
+    if (guidance.len == 0) return false;
+
+    if (assistant_text.len > 0) {
+        try within_turn_suffix.append(arena, .{
+            .role = .assistant,
+            .content = try arena.dupe(u8, assistant_text),
+        });
+    }
+    for (guidance) |text| {
+        try within_turn_suffix.append(arena, .{
+            .role = .user,
+            .content = try runtime_execution_memory.steeringMessage(arena, text),
+        });
+    }
+    return true;
+}
+
+fn reset_recovery_after_immediate_steering(
+    latest_diagnostic: *?types.ModelFailureDiagnostic,
+    strategy: *?model_response_recovery.Strategy,
+    cause: *model_response_recovery.FailureCause,
+    pacing: *model_response_recovery.RetryPacingState,
+    tool_evidence: *model_response_recovery.ToolEvidence,
+) void {
+    latest_diagnostic.* = null;
+    strategy.* = null;
+    cause.* = .transport_interrupted;
+    pacing.* = .idle;
+    tool_evidence.* = .none;
+}
+
 fn request_union_schema_advertised(
     advertised_functions: []const model_tool_schema.FunctionSchema,
     tool_name: []const u8,
@@ -3821,8 +3861,45 @@ fn processQueuedPromptInner(
         config.fast_mode,
         request_capabilities,
     )) {
-        request_capabilities = deps.resolve_model_capabilities(deps.ctx, arena, job.model) catch |err| {
-            if (err != error.Cancelled) return err;
+        resolve_capabilities: while (true) {
+            request_capabilities = deps.resolve_model_capabilities(deps.ctx, arena, job.model) catch |err| {
+                if (err != error.Cancelled) return err;
+                if (try append_immediate_steering_after_cancel(
+                    deps,
+                    arena,
+                    &within_turn_suffix,
+                    turn_id,
+                    "",
+                )) continue :resolve_capabilities;
+                runtime_telemetry.traceCancelObserved(finish_trace.ctx, false);
+                var terminal_materializing = false;
+                try runtime_interruption.persistInterruptedTurnOnce(
+                    deps,
+                    finalization,
+                    job,
+                    null,
+                    null,
+                    completed_tool_names.items,
+                    &interrupted_persisted,
+                    finish_trace.ctx,
+                    within_turn_suffix.items,
+                    null,
+                    &terminal_materializing,
+                );
+                finish_trace.finish("interrupted");
+                return;
+            };
+            break :resolve_capabilities;
+        }
+    }
+    if (config.cancel_flag.load(.seq_cst)) {
+        if (!try append_immediate_steering_after_cancel(
+            deps,
+            arena,
+            &within_turn_suffix,
+            turn_id,
+            "",
+        )) {
             runtime_telemetry.traceCancelObserved(finish_trace.ctx, false);
             var terminal_materializing = false;
             try runtime_interruption.persistInterruptedTurnOnce(
@@ -3840,26 +3917,7 @@ fn processQueuedPromptInner(
             );
             finish_trace.finish("interrupted");
             return;
-        };
-    }
-    if (config.cancel_flag.load(.seq_cst)) {
-        runtime_telemetry.traceCancelObserved(finish_trace.ctx, false);
-        var terminal_materializing = false;
-        try runtime_interruption.persistInterruptedTurnOnce(
-            deps,
-            finalization,
-            job,
-            null,
-            null,
-            completed_tool_names.items,
-            &interrupted_persisted,
-            finish_trace.ctx,
-            within_turn_suffix.items,
-            null,
-            &terminal_materializing,
-        );
-        finish_trace.finish("interrupted");
-        return;
+        }
     }
     const history_messages_before = stable_prefix.items.len;
     const interrupted_turns = runtime_interruption.countInterruptedHistory(job.history);
@@ -3872,12 +3930,21 @@ fn processQueuedPromptInner(
         "history_turns={d} gateway_messages_before={d} interrupted_turns={d} history_turn_kinds={s}",
         .{ job.history.len, history_messages_before, interrupted_turns, history_turn_kinds },
     );
-    try session_runtime.appendHistoryChatMessagesBudgeted(
-        arena,
-        &history_messages,
-        job.history,
-        .{ .max_tokens = runtime_prompt_context.historyContextBudgetTokensForCapabilities(request_capabilities) },
-    );
+    if (job.steering_continuation) {
+        try session_runtime.appendSteeringContinuationHistoryChatMessagesBudgeted(
+            arena,
+            &history_messages,
+            job.history,
+            .{ .max_tokens = runtime_prompt_context.historyContextBudgetTokensForCapabilities(request_capabilities) },
+        );
+    } else {
+        try session_runtime.appendHistoryChatMessagesBudgeted(
+            arena,
+            &history_messages,
+            job.history,
+            .{ .max_tokens = runtime_prompt_context.historyContextBudgetTokensForCapabilities(request_capabilities) },
+        );
+    }
     const projected_roles = try runtime_telemetry.formatMessageRoles(arena, history_messages.items);
     debug_trace.eventf(
         "history",
@@ -4349,7 +4416,7 @@ fn processQueuedPromptLoop(
         .none;
     var restore_recovery_source = job.recovery_checkpoint != null;
     var step: usize = 0;
-    while (agent_steps.allowsStep(config.agent_step_limit, step)) : (step += 1) {
+    agent_steps_loop: while (agent_steps.allowsStep(config.agent_step_limit, step)) : (step += 1) {
         current_step_index = step + 1;
         const step_ctx: TraceContext = .{ .turn_id = turn_id, .step_id = debug_trace.nextStepId(), .subagent_id = config.subagent_id };
         const presentation_group_id = runtime_tool_presentation.presentationGroupForStep(
@@ -4359,6 +4426,13 @@ fn processQueuedPromptLoop(
         );
         last_step_ctx = step_ctx;
         if (config.cancel_flag.load(.seq_cst)) {
+            if (try append_immediate_steering_after_cancel(
+                deps,
+                arena,
+                &within_turn_suffix,
+                turn_id,
+                "",
+            )) continue :agent_steps_loop;
             runtime_telemetry.traceCancelObserved(step_ctx, false);
             try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, null, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
             finish_trace.finish("interrupted");
@@ -5000,6 +5074,26 @@ fn processQueuedPromptLoop(
                         arena,
                         turn_id,
                     );
+                    try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
+                    if (try append_immediate_steering_after_cancel(
+                        deps,
+                        arena,
+                        &within_turn_suffix,
+                        turn_id,
+                        stream_ctx.raw_text.items,
+                    )) {
+                        reset_recovery_after_immediate_steering(
+                            &latest_recovery_diagnostic,
+                            &recovery_strategy,
+                            &recovery_cause,
+                            &retry_pacing,
+                            &preserved_tool_evidence,
+                        );
+                        if (stream_ctx.raw_text.items.len > 0) {
+                            try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+                        }
+                        continue :agent_steps_loop;
+                    }
                     try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, stream_ctx.raw_text.items, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                     finish_trace.finish("interrupted");
                     return;
@@ -5461,6 +5555,25 @@ fn processQueuedPromptLoop(
                             response_completion.tool_calls,
                             advertised_dynamic_tool_names,
                         );
+                        if (try append_immediate_steering_after_cancel(
+                            deps,
+                            arena,
+                            &within_turn_suffix,
+                            turn_id,
+                            stream_ctx.raw_text.items,
+                        )) {
+                            reset_recovery_after_immediate_steering(
+                                &latest_recovery_diagnostic,
+                                &recovery_strategy,
+                                &recovery_cause,
+                                &retry_pacing,
+                                &preserved_tool_evidence,
+                            );
+                            if (stream_ctx.raw_text.items.len > 0) {
+                                try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+                            }
+                            continue :agent_steps_loop;
+                        }
                         try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, stream_ctx.raw_text.items, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                         finish_trace.finish("interrupted");
                         return;
@@ -5495,6 +5608,25 @@ fn processQueuedPromptLoop(
                     attempt_completion.tool_calls,
                     advertised_dynamic_tool_names,
                 );
+                if (try append_immediate_steering_after_cancel(
+                    deps,
+                    arena,
+                    &within_turn_suffix,
+                    turn_id,
+                    partial_assistant,
+                )) {
+                    reset_recovery_after_immediate_steering(
+                        &latest_recovery_diagnostic,
+                        &recovery_strategy,
+                        &recovery_cause,
+                        &retry_pacing,
+                        &preserved_tool_evidence,
+                    );
+                    if (partial_assistant.len > 0) {
+                        try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+                    }
+                    continue :agent_steps_loop;
+                }
                 try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                 finish_trace.finish("interrupted");
                 return;
@@ -5671,6 +5803,25 @@ fn processQueuedPromptLoop(
                             attempt_completion.tool_calls,
                             advertised_dynamic_tool_names,
                         );
+                        if (try append_immediate_steering_after_cancel(
+                            deps,
+                            arena,
+                            &within_turn_suffix,
+                            turn_id,
+                            partial_assistant,
+                        )) {
+                            reset_recovery_after_immediate_steering(
+                                &latest_recovery_diagnostic,
+                                &recovery_strategy,
+                                &recovery_cause,
+                                &retry_pacing,
+                                &preserved_tool_evidence,
+                            );
+                            if (partial_assistant.len > 0) {
+                                try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+                            }
+                            continue :agent_steps_loop;
+                        }
                         try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, null, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                         finish_trace.finish("interrupted");
                         return;
@@ -6196,6 +6347,17 @@ fn processQueuedPromptLoop(
                 },
             ) catch |err| switch (err) {
                 error.Cancelled => {
+                    if (try append_immediate_steering_after_cancel(
+                        deps,
+                        arena,
+                        &within_turn_suffix,
+                        turn_id,
+                        history_text,
+                    )) {
+                        stop_state.retained_candidate = null;
+                        stop_state.latest_partial = null;
+                        continue :agent_steps_loop;
+                    }
                     runtime_telemetry.traceCancelObserved(step_ctx, false);
                     try runtime_interruption.persistInterruptedTurnOnce(
                         deps,

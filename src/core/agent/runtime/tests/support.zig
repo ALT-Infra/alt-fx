@@ -663,6 +663,9 @@ pub const FakeAgentRuntimeDeps = struct {
     steering_messages: []const []const u8 = &.{},
     steering_take_at: usize = 1,
     steering_take_count: usize = 0,
+    immediate_steering_messages: []const []const u8 = &.{},
+    immediate_steering_cancel_flag: ?*std.atomic.Value(bool) = null,
+    immediate_steering_take_count: usize = 0,
 
     pub fn init(alloc: Allocator) FakeAgentRuntimeDeps {
         return .{ .alloc = alloc };
@@ -778,6 +781,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .available_model_capabilities = availableModelCapabilities,
             .resolve_model_capabilities = resolveModelCapabilities,
             .take_steering = if (self.steering_messages.len > 0) takeSteering else null,
+            .take_immediate_steering = if (self.immediate_steering_messages.len > 0) takeImmediateSteering else null,
             .format_tool_execution_error = formatError,
             .record_tool_call_rejected = recordRejected,
             .report_inner_tool_usage = reportCapturedInnerToolUsage,
@@ -864,6 +868,16 @@ pub const FakeAgentRuntimeDeps = struct {
         if (self.steering_take_count != self.steering_take_at) return &.{};
         const messages = try arena.alloc([]const u8, self.steering_messages.len);
         @memcpy(messages, self.steering_messages);
+        return messages;
+    }
+
+    fn takeImmediateSteering(raw: *anyopaque, arena: Allocator, _: u64) ![]const []const u8 {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        self.immediate_steering_take_count += 1;
+        if (self.immediate_steering_take_count != 1) return &.{};
+        const messages = try arena.alloc([]const u8, self.immediate_steering_messages.len);
+        @memcpy(messages, self.immediate_steering_messages);
+        if (self.immediate_steering_cancel_flag) |flag| flag.store(false, .seq_cst);
         return messages;
     }
 

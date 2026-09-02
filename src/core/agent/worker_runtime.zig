@@ -558,6 +558,9 @@ pub const WorkerRuntime = struct {
     worker_stop_requested: bool = false,
     finalization_failure: ?FinalizationFailure = null,
     worker_cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// The active turn whose text steering admission owns the cancel flag.
+    /// Guarded by `worker_mutex`; explicit cancellation clears this ownership.
+    steering_cancel_turn_id: ?u64 = null,
     worker_recovery_pause_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     worker_connectivity_wait_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Set under `worker_mutex` once the active turn publishes its terminal
@@ -613,14 +616,14 @@ pub const WorkerRuntime = struct {
     }
 
     pub fn requestShutdown(self: *WorkerRuntime) void {
-        self.worker_cancel_requested.store(true, .seq_cst);
+        self.markExplicitCancellation();
         self.requestStop();
     }
 
     pub fn requestCancel(self: *WorkerRuntime) void {
         debug_trace.logf("worker", "cancel requested processing={s} queued={d}", .{ if (self.worker_processing) "true" else "false", self.queuedPromptCount() });
         debug_trace.eventf("interrupt", "cancel_requested", .{}, "processing={s} queued={d} active_tool_known=false", .{ if (self.worker_processing) "true" else "false", self.queuedPromptCount() });
-        self.worker_cancel_requested.store(true, .seq_cst);
+        self.markExplicitCancellation();
     }
 
     /// Interrupt the current gateway wait while preserving its recovery
@@ -629,6 +632,13 @@ pub const WorkerRuntime = struct {
     pub fn requestRecoveryPause(self: *WorkerRuntime) void {
         debug_trace.eventf("recovery", "pause_requested", .{}, "source=interactive_try_later", .{});
         self.worker_recovery_pause_requested.store(true, .seq_cst);
+        self.markExplicitCancellation();
+    }
+
+    fn markExplicitCancellation(self: *WorkerRuntime) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.steering_cancel_turn_id = null;
         self.worker_cancel_requested.store(true, .seq_cst);
     }
 
@@ -656,6 +666,7 @@ pub const WorkerRuntime = struct {
             if (steering_pending) "true" else "false",
             if (paused) "true" else "false",
         });
+        self.steering_cancel_turn_id = null;
         self.worker_cancel_requested.store(true, .seq_cst);
         return paused;
     }
@@ -665,6 +676,7 @@ pub const WorkerRuntime = struct {
         defer self.worker_mutex.unlock(io_mod.getIo());
 
         _ = self.beginQueueReviewLocked(.post_cancel);
+        self.steering_cancel_turn_id = null;
         self.worker_cancel_requested.store(true, .seq_cst);
         _ = self.resolvePendingPermissionLocked(
             permission_request.OwnedPermissionResponse.init(
@@ -780,6 +792,7 @@ pub const WorkerRuntime = struct {
             );
         }
         self.worker_stop_requested = true;
+        self.steering_cancel_turn_id = null;
         self.worker_cancel_requested.store(true, .seq_cst);
         self.worker_cond.broadcast(io_mod.getIo());
     }
@@ -850,6 +863,9 @@ pub const WorkerRuntime = struct {
         }
         try self.enqueuePromptLocked(alloc, queued);
         if (interrupt_after_admission) {
+            if (sameTurnSteeringEligible(queued)) {
+                self.steering_cancel_turn_id = self.active_turn_id;
+            }
             self.worker_cancel_requested.store(true, .seq_cst);
         }
     }
@@ -906,6 +922,31 @@ pub const WorkerRuntime = struct {
             return &.{};
         }
 
+        return self.takeSteeringLocked(alloc, turn_id);
+    }
+
+    /// Consumes only text steering that owns the current provider cancellation.
+    /// A successful drain atomically returns the cancel flag to the active turn.
+    pub fn takeImmediateSteering(self: *WorkerRuntime, alloc: std.mem.Allocator, turn_id: u64) ![][]u8 {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (!self.worker_processing or
+            self.active_turn_id != turn_id or
+            self.queue_admission != null or
+            self.steering_cancel_turn_id != turn_id or
+            !self.worker_cancel_requested.load(.seq_cst))
+        {
+            return &.{};
+        }
+
+        const messages = try self.takeSteeringLocked(alloc, turn_id);
+        if (messages.len == 0) return &.{};
+        self.steering_cancel_turn_id = null;
+        self.worker_cancel_requested.store(false, .seq_cst);
+        return messages;
+    }
+
+    fn takeSteeringLocked(self: *WorkerRuntime, alloc: std.mem.Allocator, turn_id: u64) ![][]u8 {
         var steering_count: usize = 0;
         for (self.queued_prompts.items) |prompt| {
             if (prompt.steer_target_turn_id != turn_id) continue;
@@ -1238,6 +1279,7 @@ pub const WorkerRuntime = struct {
         freeQueueReviewDraftOpt(alloc, job.review_draft);
         job.review_draft = null;
         if (self.queued_prompt_count > 0) self.queued_prompt_count -= 1;
+        self.steering_cancel_turn_id = null;
         self.worker_cancel_requested.store(false, .seq_cst);
         self.worker_recovery_pause_requested.store(false, .seq_cst);
         self.worker_connectivity_wait_active.store(false, .seq_cst);
@@ -1280,6 +1322,7 @@ pub const WorkerRuntime = struct {
         }
         self.worker_processing = false;
         self.active_turn_id = 0;
+        self.steering_cancel_turn_id = null;
         self.clearActiveToolCallsLocked();
         self.worker_connectivity_wait_active.store(false, .seq_cst);
         self.worker_cond.broadcast(io_mod.getIo());
@@ -3353,6 +3396,45 @@ test "active prompt admission drains steering in FIFO order" {
     try std.testing.expectEqual(@as(usize, 2), runtime.worker_events.items.len);
     try std.testing.expectEqualStrings("first", runtime.worker_events.items[0].append_user_feedback);
     try std.testing.expectEqualStrings("second", runtime.worker_events.items[1].append_user_feedback);
+}
+
+test "immediate steering owns and clears only its cancellation" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 41;
+
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "first", "model"));
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "second", "model"));
+    try std.testing.expect(runtime.isCancelRequested());
+
+    const guidance = try runtime.takeImmediateSteering(alloc, 41);
+    defer {
+        for (guidance) |text| alloc.free(text);
+        alloc.free(guidance);
+    }
+    try std.testing.expectEqual(@as(usize, 2), guidance.len);
+    try std.testing.expectEqualStrings("first", guidance[0]);
+    try std.testing.expectEqualStrings("second", guidance[1]);
+    try std.testing.expect(!runtime.isCancelRequested());
+    try std.testing.expectEqual(@as(usize, 0), runtime.queuedPromptCount());
+}
+
+test "explicit interrupt overrides immediate steering cancellation" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 41;
+
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "steer", "model"));
+    _ = runtime.requestInteractiveCancel();
+
+    const guidance = try runtime.takeImmediateSteering(alloc, 41);
+    try std.testing.expectEqual(@as(usize, 0), guidance.len);
+    try std.testing.expect(runtime.isCancelRequested());
+    try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
 }
 
 test "tool lifecycle decides whether interactive steering interrupts immediately" {

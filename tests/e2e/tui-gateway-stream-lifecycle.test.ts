@@ -3112,6 +3112,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(continuedBody).toContain("RICH_STEERING_TOOL_DONE");
       expect(continuedBody).toContain("<user_steering>");
       expect(continuedBody).toContain(steering);
+      expect(continuedBody).not.toContain("<turn_aborted>");
+      expect(continuedBody).not.toContain(
+        "The previous response ended before completion.",
+      );
+      expect(continuedBody).not.toContain("Interrupted by user after completing");
       const trace = readFileSync(tracePath, "utf8");
       expect(trace).toContain("outcome_kind=steering_handoff");
       expect(trace).not.toContain("event=queue_review_started");
@@ -3397,6 +3402,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         data: expectedImageData,
       }]);
       expect(steeringBody).toContain("<user_steering>");
+      expect(steeringBody).not.toContain("<turn_aborted>");
+      expect(steeringBody).not.toContain(
+        "The previous response ended before completion.",
+      );
       expect(countOccurrences(steeringBody, oldGlobalRule)).toBe(1);
       expect(countOccurrences(steeringBody, oldAncestorRule)).toBe(1);
       expect(countOccurrences(steeringBody, oldRootRule)).toBe(1);
