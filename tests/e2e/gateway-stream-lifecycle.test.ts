@@ -223,9 +223,7 @@ function gatewayStreamTimeoutResponse(): Response {
         code: "gateway_stream_timeout",
         message: "stream exceeded maximum duration",
       },
-    })}\n\n` +
-      'data: {"type":"finish","finishReason":{"unified":"error","raw":"provider_error"},"usage":{"inputTokens":{"total":1},"outputTokens":{"total":1}}}\n\n' +
-      "data: [DONE]\n\n",
+    })}\n\n`,
   );
 }
 

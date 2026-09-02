@@ -3747,8 +3747,6 @@ test "consumeSseStream preserves provider error detail" {
 test "consumeSseStream classifies gateway stream timeout by structured code" {
     const payload =
         "data: {\"type\":\"error\",\"error\":{\"code\":\"gateway_stream_timeout\",\"message\":\"stream exceeded maximum duration\"}}\n" ++
-        "\n" ++
-        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\",\"raw\":\"provider_error\"}}\n" ++
         "\n";
 
     var reader = std.Io.Reader.fixed(payload);
