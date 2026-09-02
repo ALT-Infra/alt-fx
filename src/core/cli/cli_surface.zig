@@ -1332,7 +1332,8 @@ fn runNonInteractiveWithDeps(
                     return .handled_success;
                 },
                 .id => |id| {
-                    var detail = store.loadReadOnlyDetail(
+                    var detail = subagent_resume_admission.loadVisibleReadOnlyDetail(
+                        store,
                         alloc,
                         id,
                         .{},

@@ -3624,6 +3624,73 @@ describe("cli: session", () => {
     },
     TIMEOUT,
   );
+
+  test(
+    "fx session exact id hides managed child detail",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-private-child-detail-"));
+      try {
+        const home = join(root, "home");
+        const workspace = join(root, "workspace");
+        mkdirSync(join(home, ".fx", "sessions"), {
+          recursive: true,
+          mode: 0o700,
+        });
+        mkdirSync(workspace);
+        const workspaceRoot = realpathSync(workspace);
+        const parentId = "visible-parent";
+        const childId = "private-child";
+
+        writeLegacySession(home, workspaceRoot, parentId);
+        writeLegacySession(home, workspaceRoot, childId);
+        const childControl = join(
+          home,
+          ".fx",
+          "sessions",
+          childId,
+          "subagent",
+        );
+        mkdirSync(childControl, { recursive: true, mode: 0o700 });
+        writeFileSync(
+          join(childControl, "owner.json"),
+          JSON.stringify({ schema_version: 1, parent_id: parentId }),
+          { mode: 0o600 },
+        );
+
+        const parent = await runFx(
+          ["session", "--id", parentId, "--json"],
+          {
+            cwd: workspaceRoot,
+            env: { HOME: home, FX_DISABLE_KEYCHAIN: "1" },
+          },
+        );
+        expect(parent).toMatchObject({ code: 0, stderr: "" });
+        expect(JSON.parse(parent.stdout)).toMatchObject({
+          kind: "session_detail",
+          id: parentId,
+        });
+
+        const child = await runFx(
+          ["session", "--id", childId, "--json"],
+          {
+            cwd: workspaceRoot,
+            env: { HOME: home, FX_DISABLE_KEYCHAIN: "1" },
+          },
+        );
+        expect(child.code).toBe(1);
+        expect(child.stderr).toBe("");
+        expect(JSON.parse(child.stdout)).toEqual({
+          kind: "session",
+          error: "record not found",
+          code: "SessionNotFound",
+        });
+        expect(child.stdout).not.toContain(childId);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
 });
 
 describe("cli: interactive startup", () => {
