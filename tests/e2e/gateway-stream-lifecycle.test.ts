@@ -2994,6 +2994,7 @@ describe("gateway stream lifecycle", () => {
     const tracePath = join(root.root, "trace.log");
     const readFileCallId = "suffixless_handle_read_file_1";
     const readResultCallId = "suffixless_handle_read_result_1";
+    const readRangeCallId = "suffixless_handle_read_range_1";
     const needle = "E2E_SUFFIX_NEEDLE";
     const lines = Array.from(
       { length: 500 },
@@ -3005,6 +3006,8 @@ describe("gateway stream lifecycle", () => {
     let step = 0;
     let canonicalHandle = "";
     let suffixlessHandle = "";
+    let projectedQueryInput: unknown = null;
+    let projectedRangeInput: unknown = null;
     const gateway = startGateway((body) => {
       switch (step++) {
         case 0:
@@ -3020,8 +3023,10 @@ describe("gateway stream lifecycle", () => {
           expect(canonicalHandle.endsWith(".txt")).toBe(true);
           suffixlessHandle = canonicalHandle.slice(0, -4);
           return fakeGatewayToolCall(readResultCallId, "read_tool_result", {
-            handle: suffixlessHandle,
-            query: needle,
+            request: {
+              handle: suffixlessHandle,
+              query: needle,
+            },
           });
         }
         case 2: {
@@ -3030,6 +3035,35 @@ describe("gateway stream lifecycle", () => {
           expect(output).toContain(
             `<tool_result_query handle="${canonicalHandle}">`,
           );
+          const request = JSON.parse(body) as {
+            prompt: Array<{ content?: Array<Record<string, unknown>> }>;
+          };
+          const parts = request.prompt.flatMap((message) => message.content ?? []);
+          projectedQueryInput = parts.find((part) =>
+            part.type === "tool-call" &&
+            part.toolCallId === readResultCallId &&
+            part.toolName === "read_tool_result"
+          )?.input;
+          return fakeGatewayToolCall(readRangeCallId, "read_tool_result", {
+            request: {
+              handle: suffixlessHandle,
+              start_byte: 1,
+              byte_count: 512,
+            },
+          });
+        }
+        case 3: {
+          const output = toolResultOutput(body, readRangeCallId);
+          expect(output).toContain("fixture line 000");
+          const request = JSON.parse(body) as {
+            prompt: Array<{ content?: Array<Record<string, unknown>> }>;
+          };
+          const parts = request.prompt.flatMap((message) => message.content ?? []);
+          projectedRangeInput = parts.find((part) =>
+            part.type === "tool-call" &&
+            part.toolCallId === readRangeCallId &&
+            part.toolName === "read_tool_result"
+          )?.input;
           return fakeGatewayFinalText("Suffixless result handle inspected.");
         }
         default:
@@ -3052,17 +3086,31 @@ describe("gateway stream lifecycle", () => {
       expect(result.code).toBe(0);
       expect(json.error).toBeUndefined();
       expect(json.output).toContain("Suffixless result handle inspected.");
-      expect(gateway.requestCount()).toBe(3);
+      expect(gateway.requestCount()).toBe(4);
       expect(json.tool_calls).toContainEqual({ name: "read_file", status: "success" });
       expect(json.tool_calls).toContainEqual({
         name: "read_tool_result",
         status: "success",
       });
+      expect(json.tool_calls.filter((call) => call.name === "read_tool_result")).toHaveLength(2);
       expect(existsSync(join(sessionRoot, "tool-results", canonicalHandle))).toBe(true);
       const sessionEvents = readFileSync(join(sessionRoot, "events.jsonl"), "utf8");
       expect(sessionEvents).toContain(suffixlessHandle);
       expect(sessionEvents).toContain(canonicalHandle);
       expect(sessionEvents).toContain(needle);
+      expect(projectedQueryInput).toEqual({
+        request: {
+          handle: suffixlessHandle,
+          query: needle,
+        },
+      });
+      expect(projectedRangeInput).toEqual({
+        request: {
+          handle: suffixlessHandle,
+          start_byte: 1,
+          byte_count: 512,
+        },
+      });
       expect(result.stderr).not.toContain("ResultHandleNotFound");
     } finally {
       gateway.stop();
