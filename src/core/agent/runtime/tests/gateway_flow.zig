@@ -730,12 +730,8 @@ test "processQueuedPrompt recovers when a model rejects post-Vision assistant pr
     try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
     try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
-    try expectGatewayPromptTailText(
-        &gateway,
-        2,
-        .tool,
-        "FX logo",
-    );
+    try expectGatewayPromptTextCount(&gateway, 2, "FX logo", 1);
+    try expectGatewayPromptTailText(&gateway, 2, .tool, "FX logo");
     try expectGatewayPromptTailText(
         &gateway,
         3,
@@ -3796,8 +3792,8 @@ test "processQueuedPrompt keeps supplied system prompt components in stable orde
     try runFakePrompt(&gateway, &hooks, config, job);
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
-    const first_roles = [_]types.ChatRole{ .system, .system, .system, .system, .system, .system, .user, .assistant, .user };
-    const second_roles = [_]types.ChatRole{ .system, .system, .system, .system, .system, .system, .user, .assistant, .user, .assistant, .tool };
+    const first_roles = [_]types.ChatRole{ .system, .system, .system, .system, .system, .system, .system, .user, .assistant, .user };
+    const second_roles = [_]types.ChatRole{ .system, .system, .system, .system, .system, .system, .system, .user, .assistant, .user, .assistant, .tool };
     try expectGatewayPromptRoles(&gateway, 0, &first_roles);
     try expectGatewayPromptRoles(&gateway, 1, &second_roles);
     inline for (&.{ @as(usize, 0), @as(usize, 1) }) |request_index| {
@@ -3841,7 +3837,7 @@ test "processQueuedPrompt omits an empty custom tool guidance message" {
 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
-    const roles = [_]types.ChatRole{ .system, .user };
+    const roles = [_]types.ChatRole{ .system, .system, .user };
     try expectGatewayPromptRoles(&gateway, 0, &roles);
     try expectGatewayPromptStringEntry(&gateway, 0, 0, "system");
 }
@@ -3871,8 +3867,8 @@ test "processQueuedPrompt refreshes runtime overlay each step and preserves turn
     try expectBodyContains(&gateway, 1, "Checking.");
     try expectBodyContains(&gateway, 1, "\"toolName\":\"read_file\"");
     try expectBodyContains(&gateway, 1, "\"value\":\"ok\"");
-    const first_request_roles = [_]types.ChatRole{ .system, .system, .user };
-    const second_request_roles = [_]types.ChatRole{ .system, .system, .user, .assistant, .tool };
+    const first_request_roles = [_]types.ChatRole{ .system, .system, .system, .user };
+    const second_request_roles = [_]types.ChatRole{ .system, .system, .system, .user, .assistant, .tool };
     try expectGatewayPromptRoles(&gateway, 0, &first_request_roles);
     try expectGatewayPromptRoles(&gateway, 1, &second_request_roles);
     const second_request_order = [_][]const u8{ "runtime overlay step two", "user prompt", "Checking.", "\"value\":\"ok\"" };
@@ -4056,8 +4052,8 @@ test "processQueuedPrompt projects history exactly once into each gateway reques
     try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
-    const first_request_roles = [_]types.ChatRole{ .system, .user, .assistant, .user };
-    const second_request_roles = [_]types.ChatRole{ .system, .user, .assistant, .user, .assistant, .tool };
+    const first_request_roles = [_]types.ChatRole{ .system, .system, .user, .assistant, .user };
+    const second_request_roles = [_]types.ChatRole{ .system, .system, .user, .assistant, .user, .assistant, .tool };
     try expectGatewayPromptRoles(&gateway, 0, &first_request_roles);
     try expectGatewayPromptRoles(&gateway, 1, &second_request_roles);
     for (0..gateway.request_bodies.items.len) |i| {
@@ -4086,7 +4082,7 @@ test "processQueuedPrompt keeps completed history before the final current user 
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
-    const expected_roles = [_]types.ChatRole{ .system, .system, .user, .assistant, .user };
+    const expected_roles = [_]types.ChatRole{ .system, .system, .system, .user, .assistant, .user };
     try expectGatewayPromptRoles(&gateway, 0, &expected_roles);
     try expectGatewayPromptTextCount(&gateway, 0, "prior user structural needle", 1);
     try expectGatewayPromptTextCount(&gateway, 0, "prior assistant structural needle", 1);
@@ -4101,6 +4097,211 @@ test "processQueuedPrompt keeps completed history before the final current user 
     try expectGatewayPromptFinalUserText(&gateway, 0, "current structural prompt needle");
     try expectGatewayPromptTextCount(&gateway, 0, "Earlier messages are session history from previous turns.", 0);
     try expectGatewayPromptTextCount(&gateway, 0, "Do not re-run, re-answer, or continue earlier user turns", 0);
+}
+
+test "processQueuedPrompt projects response language authority only for root turns" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .content = "Done" }};
+
+    var root_gateway = FakeGateway.init(alloc, &completions);
+    defer root_gateway.deinit();
+    var root_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer root_hooks.deinit();
+    var root_fixture = PromptFixture{};
+    try runFakePrompt(&root_gateway, &root_hooks, root_fixture.config(), root_fixture.job());
+    try expectGatewayPromptTextCount(
+        &root_gateway,
+        0,
+        "Use the response language requested by the current external human.",
+        1,
+    );
+    try expectGatewayPromptFinalUserText(&root_gateway, 0, "user prompt");
+
+    var subagent_gateway = FakeGateway.init(alloc, &completions);
+    defer subagent_gateway.deinit();
+    var subagent_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer subagent_hooks.deinit();
+    var subagent_fixture = PromptFixture{};
+    var subagent_config = subagent_fixture.config();
+    subagent_config.origin = .subagent;
+    try runFakePrompt(
+        &subagent_gateway,
+        &subagent_hooks,
+        subagent_config,
+        subagent_fixture.job(),
+    );
+    try expectBodyNotContains(
+        &subagent_gateway,
+        0,
+        "Use the response language requested by the current external human.",
+    );
+}
+
+test "processQueuedPrompt holds matching output to completion after conflicting history" {
+    const alloc = std.testing.allocator;
+    const chunks = [_][]const u8{ "I will inspect ", "the lockfile next." };
+    const completions = [_]FakeCompletion{.{
+        .chunks = &chunks,
+        .content = "I will inspect the lockfile next.",
+    }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("Answer in Chinese.") },
+        .assistant = @constCast("我会先检查锁文件和依赖清单。"),
+    } }};
+    var job = fixture.job();
+    job.prompt = @constCast("The lockfile is broken again.");
+    job.history = &history;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.assistant_sources.items.len);
+    try std.testing.expectEqualStrings(
+        "I will inspect the lockfile next.",
+        hooks.assistant_sources.items[0],
+    );
+    try std.testing.expectEqualStrings(
+        "I will inspect the lockfile next.",
+        hooks.history_turns.items[0].assistant.assistant,
+    );
+}
+
+test "processQueuedPrompt retries one clear language mismatch without publishing or persisting it" {
+    const alloc = std.testing.allocator;
+    const rejected_chunks = [_][]const u8{"我会先检查锁文件和依赖清单。"};
+    const accepted_chunks = [_][]const u8{"I will inspect the lockfile next."};
+    const completions = [_]FakeCompletion{
+        .{ .chunks = &rejected_chunks, .content = rejected_chunks[0] },
+        .{ .chunks = &accepted_chunks, .content = accepted_chunks[0] },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.enable_recovery_checkpoint = true;
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.max_provider_attempts = 2;
+    var job = fixture.job();
+    job.prompt = @constCast("The lockfile is broken again.");
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try expectGatewayPromptTextCount(
+        &gateway,
+        1,
+        "The previous candidate used a different language",
+        1,
+    );
+    try expectGatewayPromptTailText(
+        &gateway,
+        1,
+        .user,
+        "The previous candidate used a different language",
+    );
+    try expectGatewayPromptTextCount(&gateway, 1, "The lockfile is broken again.", 1);
+    try std.testing.expectEqual(@as(usize, 1), hooks.assistant_sources.items.len);
+    try std.testing.expectEqualStrings(accepted_chunks[0], hooks.assistant_sources.items[0]);
+    for (hooks.texts.items) |text| {
+        try std.testing.expect(std.mem.find(u8, text, rejected_chunks[0]) == null);
+    }
+    for (hooks.recovery_checkpoints.items) |checkpoint| {
+        try std.testing.expect(std.mem.find(u8, checkpoint.assistant_source, rejected_chunks[0]) == null);
+    }
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expectEqualStrings(
+        accepted_chunks[0],
+        hooks.history_turns.items[0].assistant.assistant,
+    );
+}
+
+test "processQueuedPrompt fails a second clear language mismatch without assistant history" {
+    const alloc = std.testing.allocator;
+    const first_chunks = [_][]const u8{"我会先检查锁文件和依赖清单。"};
+    const second_chunks = [_][]const u8{"Сначала я проверю файл блокировки и манифест."};
+    const completions = [_]FakeCompletion{
+        .{ .chunks = &first_chunks, .content = first_chunks[0] },
+        .{ .chunks = &second_chunks, .content = second_chunks[0] },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.max_provider_attempts = 2;
+    var job = fixture.job();
+    job.prompt = @constCast("The lockfile is broken again.");
+
+    try std.testing.expectError(
+        error.ResponseLanguageMismatch,
+        runFakePrompt(&gateway, &hooks, config, job),
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.assistant_sources.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.history_turns.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.system_notices.items.len);
+    try std.testing.expect(std.mem.find(
+        u8,
+        hooks.system_notices.items[0],
+        "different language",
+    ) != null);
+}
+
+test "processQueuedPrompt preserves explicit language switches without runtime correction" {
+    const alloc = std.testing.allocator;
+    const chunks = [_][]const u8{"次にロックファイルを確認します。"};
+    const completions = [_]FakeCompletion{.{ .chunks = &chunks, .content = chunks[0] }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.prompt = @constCast("Answer in Japanese and keep it short.");
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.assistant_sources.items.len);
+    try std.testing.expectEqualStrings(chunks[0], hooks.assistant_sources.items[0]);
+    try std.testing.expectEqualStrings(chunks[0], hooks.history_turns.items[0].assistant.assistant);
+}
+
+test "processQueuedPrompt does not language-retry a tool-bearing response" {
+    const alloc = std.testing.allocator;
+    const tool_chunks = [_][]const u8{"我会先检查锁文件。"};
+    const final_chunks = [_][]const u8{"I inspected the lockfile."};
+    const calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .chunks = &tool_chunks, .content = tool_chunks[0], .tool_calls = &calls },
+        .{ .chunks = &final_chunks, .content = final_chunks[0] },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.prompt = @constCast("The lockfile is broken again.");
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try std.testing.expectEqualStrings("read_file", hooks.executed_names.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), hooks.assistant_sources.items.len);
+    try std.testing.expectEqualStrings(final_chunks[0], hooks.assistant_sources.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items[0].assistant.execution.tool_steps.len);
+    try std.testing.expect(hooks.history_turns.items[0].assistant.execution.tool_steps[0].assistant == null);
 }
 
 test "processQueuedPrompt reconciles provider error before tool execution" {
@@ -4480,7 +4681,7 @@ test "processQueuedPrompt keeps recovery system last after post-tool provider er
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
-    const retry_roles = [_]types.ChatRole{ .system, .user, .assistant, .tool, .system };
+    const retry_roles = [_]types.ChatRole{ .system, .system, .user, .assistant, .tool, .system };
     try expectGatewayPromptRoles(&gateway, 2, &retry_roles);
     try expectGatewayPromptTailText(&gateway, 2, .system, "<network_recovery>");
     try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);

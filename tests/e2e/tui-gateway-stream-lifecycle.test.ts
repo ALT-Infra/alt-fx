@@ -1392,6 +1392,43 @@ async function launchRouteRecoveryTui(
 
 describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   test(
+    "clear response language mismatch never reaches TUI scrollback",
+    async () => {
+      const rejected = "我会先检查锁文件和依赖清单。";
+      const accepted = "I will inspect the lockfile next.";
+      const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+        "fx-tui-response-language-retry-",
+        [
+          fakeGatewayFinalText(rejected),
+          fakeGatewayFinalText(accepted),
+        ],
+      );
+
+      await session!.sendText(
+        "The lockfile is broken again. Say what you will inspect next.",
+      );
+      await session!.waitForText(accepted, TIMEOUT);
+      await session!.waitForComposer(TIMEOUT);
+
+      const scrollback = await session!.captureFullScrollback();
+      expect(scrollback).toContain(accepted);
+      expect(scrollback).not.toContain(rejected);
+      expect(queuedGateway.requests).toHaveLength(2);
+      expect(queuedGateway.requests[1]!.body).toContain(
+        "The previous candidate used a different language",
+      );
+      expect(session!.isAlive()).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await session!.sendText("/quit");
+      expect(await session!.waitForSessionEnd(TIMEOUT)).toBe(true);
+      await session!.kill();
+      session = null;
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "full-window output limit is omitted from the agent request",
     async () => {
       const model = "meta/muse-spark-1.2-contributor";
