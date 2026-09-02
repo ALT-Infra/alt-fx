@@ -147,6 +147,17 @@ async function waitForFileText(
   return existsSync(path) && readFileSync(path, "utf8").includes(expected);
 }
 
+function unusedCallbackPort(): number {
+  const listener = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch: () => new Response("reserved"),
+  });
+  const port = listener.port;
+  listener.stop(true);
+  return port;
+}
+
 afterEach(async () => {
   const activeTui = tui;
   const activeGateway = gateway;
@@ -904,6 +915,79 @@ describe("MCP remote authentication lifecycle", () => {
     expect(existsSync(credentialPath)).toBe(false);
     expect(auth.revocations).toBe(2);
   }, 30_000);
+
+  test("pinned localhost callback reuses one port without aborting", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth, true, "http", auth.url, false);
+    const callbackPort = unusedCallbackPort();
+    const profilePath = join(root.home, ".fx", "mcp.json");
+    const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+    profile.mcp.fixture.oauth.callback_port = callbackPort;
+    writeFileSync(profilePath, JSON.stringify(profile));
+    const env = {
+      ...baseEnv(root),
+      AI_GATEWAY_API_KEY: undefined,
+    };
+
+    const attempts = 12;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      rmSync(root.openLog, { force: true });
+      const authentication = runFx(["mcp", "auth", "fixture"], {
+        cwd: root.workspace,
+        env,
+        timeoutMs: 20_000,
+      });
+      const opened = await waitForFileText(root.openLog, "http", 5_000);
+      let callbackStatus: number | null = null;
+      let callbackBody = "";
+      let callbackError: unknown = null;
+      if (opened) {
+        try {
+          const authorizationUrl = readFileSync(root.openLog, "utf8").trim();
+          const authorizationResponse = await fetch(authorizationUrl, {
+            redirect: "manual",
+          });
+          const callbackUrl = authorizationResponse.headers.get("location");
+          if (!callbackUrl) throw new Error("authorization redirect is missing");
+          const callbackResponse = await fetch(callbackUrl);
+          callbackStatus = callbackResponse.status;
+          callbackBody = await callbackResponse.text();
+        } catch (error) {
+          callbackError = error;
+        }
+      }
+      const authenticated = await authentication;
+      if (
+        !opened ||
+        callbackError !== null ||
+        callbackStatus !== 200 ||
+        authenticated.code !== 0 ||
+        authenticated.stderr !== ""
+      ) {
+        throw new Error(JSON.stringify({
+          attempt,
+          callbackPort,
+          opened,
+          callbackStatus,
+          callbackError: callbackError === null ? null : String(callbackError),
+          authenticated,
+        }, null, 2));
+      }
+      expect(callbackBody).toContain("Authorization complete");
+      expect(authenticated.stdout).toContain("Authenticated MCP server 'fixture'");
+
+      const loggedOut = await runFx(["mcp", "logout", "fixture"], {
+        cwd: root.workspace,
+        env,
+        timeoutMs: 20_000,
+      });
+      expect(loggedOut.code).toBe(0);
+      expect(loggedOut.stderr).toBe("");
+    }
+    expect(auth.authorizationRequests).toBe(attempts);
+    expect(auth.tokenExchanges).toBe(attempts);
+  }, 90_000);
 
   test("rejected stored credentials report required auth without discovery fallback", async () => {
     upstream = startModernMcpHttpFixture("json");
