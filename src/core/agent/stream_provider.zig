@@ -148,13 +148,6 @@ pub const ToolSelection = struct {
     }
 };
 
-pub const CredentialLease = struct {
-    secret: []const u8,
-    source: ?types.CredentialSource = null,
-    account_id: ?[]const u8 = null,
-    tenant: ?[]const u8 = null,
-};
-
 /// Pure provider input used by request serializers and permission reviewers.
 /// Every slice and JSON value is borrowed for the call.
 pub const RequestData = struct {
@@ -173,7 +166,7 @@ pub const RequestData = struct {
 /// Borrowed typed request. Providers own validation, wire serialization,
 /// endpoint selection, headers, HTTP, and stream reduction.
 pub const ModelRequest = struct {
-    credential: CredentialLease,
+    credential: types.CredentialLease,
     session_id: ?[]const u8 = null,
     model: []const u8,
     retry_count: usize,

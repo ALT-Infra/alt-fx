@@ -191,6 +191,7 @@ pub const ActiveSessionState = struct {
     workspace_root: []const u8,
     api_key: []const u8,
     credential_source: ?types.CredentialSource = null,
+    credential_refresh_after_ms: ?i64 = null,
     account_id: ?[]const u8 = null,
     agent_step_limit: usize,
     max_tool_result_bytes: usize,
@@ -253,6 +254,8 @@ pub const ServerState = struct {
     workspace_access: workspace_access.WorkspaceAccess = .{},
     api_key: []u8 = &.{},
     credential_source: ?types.CredentialSource = null,
+    gateway_source_preference: ?types.CredentialSource = null,
+    credential_refresh_after_ms: ?i64 = null,
     account_id: ?[]u8 = null,
     gateway_team: ?[]u8 = null,
     selected_model: []u8 = &.{},
@@ -338,6 +341,21 @@ fn credentialMatchesProvider(
     return model_provider.authorizesCredential(provider, source);
 }
 
+fn credentialReadyAt(
+    source: ?types.CredentialSource,
+    token: []const u8,
+    refresh_after_ms: ?i64,
+    now_ms: i64,
+) bool {
+    if (source == null or token.len == 0) return false;
+    if (credentials.sourceRefreshable(source.?) and
+        refresh_after_ms != null and refresh_after_ms.? <= now_ms)
+    {
+        return false;
+    }
+    return true;
+}
+
 fn adoptServerCredential(state: *ServerState, credential: *credentials.Credential) void {
     if (state.active_session) |*active| active.api_key = &.{};
     if (state.api_key.len > 0) secret.zeroAndFree(state.alloc, state.api_key);
@@ -347,6 +365,7 @@ fn adoptServerCredential(state: *ServerState, credential: *credentials.Credentia
     state.api_key = credential.token;
     credential.token = &.{};
     state.credential_source = credential.source;
+    state.credential_refresh_after_ms = credential.refresh_after_ms;
     state.account_id = credential.account_id;
     credential.account_id = null;
     state.gateway_team = if (credential.team_id) |team| team else credential.team_slug;
@@ -360,6 +379,7 @@ fn adoptServerCredential(state: *ServerState, credential: *credentials.Credentia
     if (state.active_session) |*active| {
         active.api_key = state.api_key;
         active.credential_source = state.credential_source;
+        active.credential_refresh_after_ms = state.credential_refresh_after_ms;
         active.account_id = state.account_id;
         if (comptime !host_target.is_wasm) {
             if (state.credential_source == .chatgpt_subscription or state.credential_source == .grok_subscription) {
@@ -375,10 +395,23 @@ pub fn selectCredentialForProvider(
     state: *ServerState,
     provider: model_provider.ProviderId,
 ) !bool {
+    const now_ms = io_mod.milliTimestamp();
     if (state.active_session) |active| {
-        if (credentialMatchesProvider(active.credential_source, provider)) return true;
+        if (credentialMatchesProvider(active.credential_source, provider) and
+            credentialReadyAt(
+                active.credential_source,
+                active.api_key,
+                active.credential_refresh_after_ms,
+                now_ms,
+            )) return true;
     }
-    if (credentialMatchesProvider(state.credential_source, provider) and state.api_key.len > 0) return true;
+    if (credentialMatchesProvider(state.credential_source, provider) and
+        credentialReadyAt(
+            state.credential_source,
+            state.api_key,
+            state.credential_refresh_after_ms,
+            now_ms,
+        )) return true;
 
     var credential = if (provider == .gateway and state.cfg.credential_override != null)
         credentials.Credential{
@@ -386,15 +419,15 @@ pub fn selectCredentialForProvider(
             .source = .ai_gateway_api_key,
         }
     else blk: {
-        const resolution = try credentials.resolveForProvider(
+        var preparation = try auth_runtime.prepareCredential(
             state.alloc,
             state.cfg.gateway_provider.oauth_transport,
             state.cfg.secret_store,
-            .refresh_if_needed,
             provider,
-            state.credential_source,
+            if (provider == .gateway) state.gateway_source_preference else state.credential_source,
         );
-        break :blk resolution.credential orelse return false;
+        defer preparation.deinit(state.alloc);
+        break :blk preparation.takeReady() orelse return false;
     };
     defer credential.deinit(state.alloc);
     adoptServerCredential(state, &credential);
@@ -423,43 +456,77 @@ pub fn refreshModelCredential(
     expected_account_id: ?[]const u8,
 ) !?[]u8 {
     const state: *ServerState = @ptrCast(@alignCast(raw));
-    const refreshed = try auth_runtime.refreshCredentialTokenForAccount(
+    var refreshed = (try auth_runtime.refreshCredentialForAccount(
         state.cfg.gateway_provider.oauth_transport,
-        alloc,
+        state.alloc,
         source,
         mode,
         expected_account_id,
-    ) orelse return null;
-    errdefer secret.zeroAndFree(alloc, refreshed);
-    if (source == .chatgpt_subscription or source == .grok_subscription) {
-        try publishRefreshedSubscriptionToken(state, refreshed, source, expected_account_id);
-    }
-    return refreshed;
+    )) orelse return null;
+    defer refreshed.deinit(state.alloc);
+
+    const worker_token = try alloc.dupe(u8, refreshed.token);
+    errdefer secret.zeroAndFree(alloc, worker_token);
+    try publishRefreshedCredential(
+        state,
+        &refreshed,
+        expected_account_id,
+        if (source == .fx_login) state.gateway_team else null,
+    );
+    return worker_token;
 }
 
-fn publishRefreshedSubscriptionToken(
+fn publishRefreshedCredential(
     state: *ServerState,
-    refreshed: []const u8,
-    source: types.CredentialSource,
+    refreshed: *credentials.Credential,
     expected_account_id: ?[]const u8,
+    expected_team: ?[]const u8,
 ) !void {
-    const expected = expected_account_id orelse return error.ChatGptAccountChanged;
-    const state_account = state.account_id orelse return error.ChatGptAccountChanged;
-    if (!std.mem.eql(u8, expected, state_account)) return error.ChatGptAccountChanged;
+    if (state.credential_source != refreshed.source) {
+        debug_trace.logf("auth", "ACP credential publication rejected stage=state_source", .{});
+        return error.CredentialAuthorityChanged;
+    }
+    if (expected_account_id) |expected| {
+        const refreshed_account = refreshed.accountId() orelse {
+            debug_trace.logf("auth", "ACP credential publication rejected stage=refreshed_account_missing", .{});
+            return error.ChatGptAccountChanged;
+        };
+        const state_account = state.account_id orelse {
+            debug_trace.logf("auth", "ACP credential publication rejected stage=state_account_missing", .{});
+            return error.ChatGptAccountChanged;
+        };
+        if (!std.mem.eql(u8, expected, refreshed_account)) {
+            debug_trace.logf("auth", "ACP credential publication rejected stage=refreshed_account_changed", .{});
+            return error.ChatGptAccountChanged;
+        }
+        if (!std.mem.eql(u8, expected, state_account)) {
+            debug_trace.logf("auth", "ACP credential publication rejected stage=state_account_changed", .{});
+            return error.ChatGptAccountChanged;
+        }
+    }
+    if (expected_team) |expected| {
+        const refreshed_team = refreshed.gatewayTeam() orelse return error.CredentialAuthorityChanged;
+        const state_team = state.gateway_team orelse return error.CredentialAuthorityChanged;
+        if (!std.mem.eql(u8, expected, refreshed_team) or
+            !std.mem.eql(u8, expected, state_team)) return error.CredentialAuthorityChanged;
+    }
     if (state.active_session) |active| {
-        const active_account = active.account_id orelse return error.ChatGptAccountChanged;
-        if (!std.mem.eql(u8, expected, active_account)) return error.ChatGptAccountChanged;
+        if (active.credential_source != refreshed.source) {
+            debug_trace.logf("auth", "ACP credential publication rejected stage=active_source", .{});
+            return error.CredentialAuthorityChanged;
+        }
+        if (expected_account_id) |expected| {
+            const active_account = active.account_id orelse {
+                debug_trace.logf("auth", "ACP credential publication rejected stage=active_account_missing", .{});
+                return error.ChatGptAccountChanged;
+            };
+            if (!std.mem.eql(u8, expected, active_account)) {
+                debug_trace.logf("auth", "ACP credential publication rejected stage=active_account_changed", .{});
+                return error.ChatGptAccountChanged;
+            }
+        }
     }
-
-    const owned = try state.alloc.dupe(u8, refreshed);
-    if (state.active_session) |*active| active.api_key = &.{};
-    if (state.api_key.len > 0) secret.zeroAndFree(state.alloc, state.api_key);
-    state.api_key = owned;
-    state.credential_source = source;
-    if (state.active_session) |*active| {
-        active.api_key = state.api_key;
-        active.credential_source = source;
-    }
+    adoptServerCredential(state, refreshed);
 }
 
 pub fn releaseActiveSession(state: *ServerState) !void {
@@ -1717,6 +1784,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         state.process_model_override = startup.model_source == .process_override;
     }
     state.provider = startup.provider;
+    state.gateway_source_preference = startup.credential_source_preference;
     state.configured_model = try alloc.dupe(u8, startup.configured_model);
 
     var startup_credential = startup.takeCredential();
@@ -1727,25 +1795,26 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         credentialMatchesProvider(credential.source, state.provider)
     else
         false;
+    const startup_credential_is_final = startup_matches_model and
+        !credentials.sourceRefreshable(startup_credential.?.source);
     const credential: *credentials.Credential = if (state.provider == .gateway and state.cfg.credential_override != null) override: {
         routed_credential = .{
             .token = try alloc.dupe(u8, state.cfg.credential_override.?),
             .source = .ai_gateway_api_key,
         };
         break :override &routed_credential.?;
-    } else if (startup_matches_model)
+    } else if (startup_credential_is_final)
         &startup_credential.?
     else routed: {
-        const preferred = if (startup_credential) |value| value.source else null;
-        const resolution = try credentials.resolveForProvider(
+        var preparation = try auth_runtime.prepareCredential(
             alloc,
             state.cfg.gateway_provider.oauth_transport,
             state.cfg.secret_store,
-            .refresh_if_needed,
             state.provider,
-            preferred,
+            if (state.provider == .gateway) startup.credential_source_preference else null,
         );
-        routed_credential = resolution.credential;
+        defer preparation.deinit(alloc);
+        routed_credential = preparation.takeReady();
         if (routed_credential == null) {
             return state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.invalid_request,
@@ -2035,15 +2104,15 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     .source = .ai_gateway_api_key,
                 }
             else credential: {
-                const resolution = try credentials.resolveForProvider(
+                var preparation = try auth_runtime.prepareCredential(
                     alloc,
                     state.cfg.gateway_provider.oauth_transport,
                     state.cfg.secret_store,
-                    .refresh_if_needed,
                     target,
-                    null,
+                    if (target == .gateway) state.gateway_source_preference else null,
                 );
-                break :credential resolution.credential orelse
+                defer preparation.deinit(alloc);
+                break :credential preparation.takeReady() orelse
                     return state.writer.writeError(alloc, msg.id, .{
                         .code = ErrorCode.invalid_request,
                         .message = if (target == .codex)
@@ -2894,22 +2963,44 @@ test "ACP publishes an account-bound refreshed Codex token for later prompts" {
     state.api_key = try alloc.dupe(u8, "stale-token");
     state.account_id = try alloc.dupe(u8, "acct-1");
     state.credential_source = .chatgpt_subscription;
+    state.credential_refresh_after_ms = 1;
+    state.gateway_team = null;
     var active: ActiveSessionState = undefined;
     active.api_key = state.api_key;
     active.account_id = state.account_id;
     active.credential_source = .chatgpt_subscription;
+    active.credential_refresh_after_ms = 1;
+    active.session_rt = .{ .max_history_turns = 8 };
     state.active_session = active;
     defer {
+        state.active_session.?.session_rt.deinit(alloc);
         secret.zeroAndFree(alloc, state.api_key);
         alloc.free(state.account_id.?);
     }
 
-    try publishRefreshedSubscriptionToken(&state, "fresh-token", .chatgpt_subscription, "acct-1");
+    var refreshed = credentials.Credential{
+        .token = try alloc.dupe(u8, "fresh-token"),
+        .source = .chatgpt_subscription,
+        .account_id = try alloc.dupe(u8, "acct-1"),
+        .refresh_after_ms = 100,
+    };
+    defer refreshed.deinit(alloc);
+    try publishRefreshedCredential(&state, &refreshed, "acct-1", null);
 
     try std.testing.expectEqualStrings("fresh-token", state.api_key);
     try std.testing.expectEqualStrings("fresh-token", state.active_session.?.api_key);
     try std.testing.expectEqualStrings("acct-1", state.account_id.?);
     try std.testing.expectEqualStrings("acct-1", state.active_session.?.account_id.?);
+    try std.testing.expectEqual(@as(?i64, 100), state.credential_refresh_after_ms);
+    try std.testing.expectEqual(@as(?i64, 100), state.active_session.?.credential_refresh_after_ms);
+}
+
+test "ACP credential readiness rejects refresh-due access tokens" {
+    try std.testing.expect(credentialReadyAt(.chatgpt_subscription, "token", 11, 10));
+    try std.testing.expect(!credentialReadyAt(.chatgpt_subscription, "token", 10, 10));
+    try std.testing.expect(!credentialReadyAt(.grok_subscription, "token", 1, 10));
+    try std.testing.expect(credentialReadyAt(.ai_gateway_api_key, "token", null, 10));
+    try std.testing.expect(!credentialReadyAt(.ai_gateway_api_key, "", null, 10));
 }
 
 test "ACP rejects refreshed Codex tokens for another account" {
@@ -2919,16 +3010,27 @@ test "ACP rejects refreshed Codex tokens for another account" {
     state.api_key = try alloc.dupe(u8, "stale-token");
     state.account_id = try alloc.dupe(u8, "acct-1");
     state.credential_source = .chatgpt_subscription;
+    state.credential_refresh_after_ms = 1;
+    state.gateway_team = null;
     state.active_session = null;
     defer {
         secret.zeroAndFree(alloc, state.api_key);
         alloc.free(state.account_id.?);
     }
 
-    try std.testing.expectError(
-        error.ChatGptAccountChanged,
-        publishRefreshedSubscriptionToken(&state, "wrong-token", .chatgpt_subscription, "acct-2"),
-    );
+    var refreshed = credentials.Credential{
+        .token = try alloc.dupe(u8, "wrong-token"),
+        .source = .chatgpt_subscription,
+        .account_id = try alloc.dupe(u8, "acct-2"),
+        .refresh_after_ms = 100,
+    };
+    defer refreshed.deinit(alloc);
+    try std.testing.expectError(error.ChatGptAccountChanged, publishRefreshedCredential(
+        &state,
+        &refreshed,
+        "acct-2",
+        null,
+    ));
     try std.testing.expectEqualStrings("stale-token", state.api_key);
 }
 

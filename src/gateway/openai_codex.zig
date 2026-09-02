@@ -191,6 +191,9 @@ pub fn streamPrepared(
     if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
     const account_id = try chatgpt_oauth.extractAccountId(alloc, request.credential.secret);
     defer alloc.free(account_id);
+    if (!types.validCredentialAccountId(account_id)) {
+        return stream_provider.failResult(error.InvalidChatGptSubscriptionAccount);
+    }
     const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.credential.secret});
     defer secret.zeroAndFree(alloc, auth_header);
     const request_endpoint = if (io_mod.getenv(e2e_endpoint_env)) |override| endpoint: {

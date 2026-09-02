@@ -7862,13 +7862,15 @@ describe("acp: model catalog authentication", () => {
       expectedAuthorization: `Bearer ${SEEDED_GATEWAY_TOKEN}`,
       expectedTeamId: "team_123",
       expectPrivate: true,
+      expectInitializeFailure: false,
     },
     {
-      name: "uses public model options for seeded login without a selected team",
+      name: "rejects seeded login without a selected team",
       teamId: undefined,
       expectedAuthorization: null,
       expectedTeamId: null,
       expectPrivate: false,
+      expectInitializeFailure: true,
     },
   ]) {
     test(
@@ -7900,7 +7902,14 @@ describe("acp: model catalog authentication", () => {
               FX_DISABLE_KEYCHAIN: "1",
             },
           });
-          await client.request("initialize", { protocolVersion: 1 }, 1);
+          const initialized = await client.request("initialize", { protocolVersion: 1 }, 1) as any;
+          if (scenario.expectInitializeFailure) {
+            expect(initialized.error).toBeDefined();
+            expect(initialized.error.message).toContain("fx login");
+            expect(gateway.modelRequests).toHaveLength(0);
+            return;
+          }
+          expect(initialized.error).toBeUndefined();
           const resp = await client.request("session/new", {}, 2) as any;
           expect(gateway.modelRequests).toHaveLength(1);
           const modelRequest = gateway.modelRequests[0]!;

@@ -19,6 +19,7 @@ pub const FetchInput = struct {
     endpoint: []const u8,
     cancel_flag: ?*std.atomic.Value(bool) = null,
     view: View = .full,
+    allow_public_fallback: bool = true,
 };
 
 pub const FailureCategory = enum {
@@ -187,7 +188,7 @@ fn fetchWithPublicFallbackUntraced(
             .provenance = .{ .access = .init(attempt.access) },
         } },
         .failure => |failure| {
-            if (!failure.allowsPublicFallback()) {
+            if (!attempt.allow_public_fallback or !failure.allowsPublicFallback()) {
                 return failedOutcome(attempt.access, false, failure);
             }
             attempt.access = attempt.access.publicFallbackAfterRejection() orelse
@@ -736,6 +737,25 @@ test "catalog authentication fallback is anonymous and bounded" {
     try std.testing.expect(std.mem.find(u8, trace, "test-key") == null);
     try std.testing.expect(std.mem.find(u8, trace, "team_123") == null);
     try std.testing.expect(std.mem.find(u8, trace, "/v1/models") == null);
+}
+
+test "strict authenticated catalog requests never retry anonymously" {
+    const access = credentials.catalogAccessForCredential(
+        .fx_login,
+        "test-token",
+        "team_123",
+    );
+    const rejection = Failure{ .category = .authentication, .http_status = .unauthorized };
+    var probe = FallbackProbe{ .failures = .{ rejection, null } };
+
+    const failed = fetchWithPublicFallback(probe.provider(), std.testing.allocator, .{
+        .access = access,
+        .endpoint = "/v1/models",
+        .allow_public_fallback = false,
+    }).failed;
+    try std.testing.expectEqual(AccessLevel.authenticated, failed.access.level);
+    try std.testing.expect(!failed.anonymous_fallback_used);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
 }
 
 test "catalog fallback classification stays bounded across repeated cycles" {

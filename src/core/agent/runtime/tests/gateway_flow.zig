@@ -5847,15 +5847,46 @@ test "processQueuedPrompt refreshes and retries once after fx login 401" {
     var job = fixture.job();
     job.credential_source = .fx_login;
 
-    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+    var config = fixture.config();
+    config.max_provider_attempts = 1;
+    try runFakePrompt(&gateway, &hooks, config, job);
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_api_keys.items.len);
+    try std.testing.expectEqualSlices(u8, gateway.request_bodies.items[0], gateway.request_bodies.items[1]);
     try std.testing.expectEqualStrings("still-stale", gateway.request_api_keys.items[0]);
     try std.testing.expectEqualStrings("fresh-after-401", gateway.request_api_keys.items[1]);
     try std.testing.expectEqual(@as(usize, 2), hooks.credential_refresh_modes.items.len);
     try std.testing.expectEqual(runtime_deps.CredentialRefreshMode.if_needed, hooks.credential_refresh_modes.items[0]);
     try std.testing.expectEqual(runtime_deps.CredentialRefreshMode.force, hooks.credential_refresh_modes.items[1]);
+    try std.testing.expectEqual(@as(usize, 0), hooks.route_recovery_count);
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+}
+
+test "forced auth refresh reaches later permission and tool consumers in the same turn" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall(
+        "call_read",
+        "read_file",
+        "{\"path\":\"README.md\"}",
+    )};
+    const completions = [_]FakeCompletion{
+        .{ .status = .unauthorized, .err_body = "expired" },
+        .{ .tool_calls = &calls },
+        .{ .content = "Done." },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    hooks.credential_refresh_tokens = &.{ "stale-loaded", "fresh-after-401" };
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.credential_source = .fx_login;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqualStrings("fresh-after-401", hooks.last_permission_credential.?);
+    try std.testing.expectEqualStrings("fresh-after-401", hooks.last_execute_credential.?);
 }
 
 test "processQueuedPrompt does not retry a second fx login 401" {

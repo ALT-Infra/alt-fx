@@ -96,6 +96,13 @@ pub const CredentialSource = enum {
     grok_subscription,
 };
 
+pub const CredentialLease = struct {
+    secret: []const u8 = "",
+    source: ?CredentialSource = null,
+    account_id: ?[]const u8 = null,
+    tenant: ?[]const u8 = null,
+};
+
 pub fn parseCredentialSource(text: []const u8) ?CredentialSource {
     return std.meta.stringToEnum(CredentialSource, text);
 }
@@ -1215,6 +1222,14 @@ pub fn validGatewayTeam(team: []const u8) bool {
         'a'...'z', 'A'...'Z', '0'...'9', '-', '_' => {},
         else => return false,
     };
+    return true;
+}
+
+pub fn validCredentialAccountId(account_id: []const u8) bool {
+    if (account_id.len == 0 or account_id.len > 1024) return false;
+    for (account_id) |byte| {
+        if (byte < 0x21 or byte > 0x7e) return false;
+    }
     return true;
 }
 

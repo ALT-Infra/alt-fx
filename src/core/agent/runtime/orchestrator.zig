@@ -16,6 +16,7 @@ const file_mutation_contract = @import("../../tooling/file_mutation_contract.zig
 const io_mod = @import("../../shared/io.zig");
 const host_target = @import("../../hosts/target.zig");
 const secret = @import("../../auth/secret.zig");
+const auth_transition = @import("../../auth/auth_transition.zig");
 const credentials = @import("../../auth/credentials.zig");
 const credential_authority = @import("../../auth/credential_authority.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
@@ -3692,10 +3693,23 @@ fn processQueuedPromptInner(
     semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink,
     lifecycle: LifecycleContext,
     config: Config,
-    job: QueuedPrompt,
+    borrowed_job: QueuedPrompt,
     finalization: *TurnFinalizationGuard,
     agent: *runtime_agent.Agent,
 ) !void {
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var job = borrowed_job;
+    job.account_id = if (borrowed_job.account_id) |account_id|
+        try arena.dupe(u8, account_id)
+    else
+        null;
+    job.gateway_team = if (borrowed_job.gateway_team) |gateway_team|
+        try arena.dupe(u8, gateway_team)
+    else
+        null;
+
     var summary_accumulator = runtime_telemetry.TurnSummaryAccumulator.init(
         io_mod.milliTimestamp(),
         if (config.origin == .root) job.prompt else "",
@@ -3711,9 +3725,6 @@ fn processQueuedPromptInner(
         }
     }
 
-    var arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
     const base_nested_terminal_advertised = terminal_request_schema_advertised(
         config.advertised_functions,
     );
@@ -3969,6 +3980,7 @@ fn buildReviewTurnContext(
     root_user_intent_context: []const u8,
     current_turn_messages: []const ChatMessage,
     pending_assistant: ChatMessage,
+    credential: types.CredentialLease,
     target_call_id: []const u8,
 ) permission_auto_classifier.ReviewTurnContext {
     const trusted_root_context = auto_classifier_context.rootUserRequestContext(
@@ -3977,6 +3989,7 @@ fn buildReviewTurnContext(
     return .{
         .model = model,
         .pending_assistant = pending_assistant,
+        .credential = credential,
         .target_call_id = target_call_id,
         .origin = switch (config.origin) {
             .root => .root,
@@ -3984,6 +3997,18 @@ fn buildReviewTurnContext(
         },
         .trusted_root_context = trusted_root_context,
         .current_turn_untrusted_messages = current_turn_messages,
+    };
+}
+
+fn activeCredentialLease(
+    secret_value: []const u8,
+    job: QueuedPrompt,
+) types.CredentialLease {
+    return .{
+        .secret = secret_value,
+        .source = job.credential_source,
+        .account_id = job.account_id,
+        .tenant = job.gateway_team,
     };
 }
 
@@ -5037,13 +5062,16 @@ fn processQueuedPromptLoop(
             );
             stream_result_set = true;
             const first_failure = streamFailure(stream_result);
-            if (job.provider != .gateway and
-                first_failure != null and first_failure.?.kind == .unauthorized and
-                !auth_retry_used and
-                stream_ctx.raw_text.items.len == 0 and
-                !stream_ctx.saw_tool_start and
-                streamCompletion(stream_result).tool_calls.len == 0)
-            {
+            const auth_replay = auth_transition.decideAuthReplay(.{
+                .authentication_rejected = first_failure != null and first_failure.?.kind == .unauthorized,
+                .refreshable = if (job.credential_source) |source| credentials.sourceRefreshable(source) else false,
+                .delivery_safe = stream_ctx.raw_text.items.len == 0 and
+                    !stream_ctx.saw_tool_start and
+                    streamCompletion(stream_result).tool_calls.len == 0,
+                .authority_stable = true,
+                .already_replayed = auth_retry_used,
+            });
+            if (auth_replay == .refresh_and_replay) {
                 if (try refreshGatewayCredentialForJob(
                     deps,
                     std.heap.c_allocator,
@@ -5073,7 +5101,7 @@ fn processQueuedPromptLoop(
                     );
                     debug_trace.eventf(
                         "auth",
-                        "subscription_request_replayed",
+                        "authenticated_request_replayed",
                         step_ctx,
                         "semantic_attempt={d}",
                         .{semantic_attempt + 1},
@@ -5196,32 +5224,6 @@ fn processQueuedPromptLoop(
             runtime_assistant_stream.pushTokenProgressUpdate(&stream_ctx, summary_accumulator.reconcileTokenRequest(response_completion.usage, response_completion.delivery_ambiguous)) catch |progress_err| {
                 debug_trace.logf("agent", "token progress publication failed source=gateway_usage err={s}", .{@errorName(progress_err)});
             };
-            if (response_failure != null and response_failure.?.kind == .unauthorized and
-                job.provider == .gateway and
-                !auth_retry_used and
-                semantic_attempt + 1 < semantic_limit)
-            {
-                if (try refreshGatewayCredentialForJob(
-                    deps,
-                    std.heap.c_allocator,
-                    job,
-                    .force,
-                    &active_api_key,
-                    &owned_refreshed_api_key,
-                    step_ctx,
-                )) {
-                    auth_retry_used = true;
-                    stream_result.deinit(arena);
-                    stream_result_set = false;
-                    semantic_attempt += 1;
-                    recovery_strategy = .retry_request;
-                    recovery_cause = .authentication;
-                    retry_pacing = .idle;
-                    reset_stream_for_next_attempt = true;
-                    skip_next_preflight_refresh = true;
-                    continue;
-                }
-            }
             const gateway_wait_finished_ms = io_mod.milliTimestamp();
             summary_accumulator.addThinkingWait(gateway_wait_started_ms, stream_ctx.first_model_output_at_ms orelse gateway_wait_finished_ms);
 
@@ -6717,6 +6719,7 @@ fn processQueuedPromptLoop(
                         root_user_intent_context,
                         within_turn_suffix.items,
                         pending_assistant,
+                        activeCredentialLease(active_api_key, job),
                         parallel_call.id,
                     );
                     const maybe_parallel_permission: ?command_admission.PermissionOutcome = runtime_tool_admission.requestToolPermissionTraced(deps, arena, parallel_call, parallel_review_context, root_action_permission_mode, local_grants.items, null, null, advertised_dynamic_tool_names, config.workspace_root, step_ctx) catch |err| blk: {
@@ -7654,6 +7657,7 @@ fn processQueuedPromptLoop(
                 root_user_intent_context,
                 within_turn_suffix.items,
                 pending_assistant,
+                activeCredentialLease(active_api_key, job),
                 execution_call.id,
             );
             const tool_execution_root_user_context = try buildToolExecutionRootUserContext(
@@ -8176,6 +8180,7 @@ fn processQueuedPromptLoop(
                 .result_allocator = arena,
                 .call = execution_call,
                 .authority = execution_authority,
+                .credential = activeCredentialLease(active_api_key, job),
                 .permission_mode = action_permission_mode,
                 .root_user_intent_context = tool_execution_root_user_context,
                 .root_user_messages = &.{},

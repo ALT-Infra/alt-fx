@@ -116,8 +116,10 @@ pub const StartupState = struct {
     workspace_root: []u8 = &.{},
     workspace_access: workspace_access.WorkspaceAccess = .{},
     credential: ?credentials.Credential = null,
+    credential_source_preference: ?credentials.Source = null,
     credential_onboarding_skipped: bool = false,
     stored_key_status: credentials.StoredKeyReadStatus = .not_attempted,
+    fx_login_status: credentials.FxLoginReadStatus = .not_attempted,
     provider: model_provider.ProviderId = .gateway,
     selected_model: []u8 = &.{},
     configured_model: []u8 = &.{},
@@ -427,6 +429,7 @@ fn loadStartupStateFromOwnedWorkspace(
     detailed.diagnostics = &.{};
     state.prompt_history_enabled = settings.prompt_history_enabled orelse true;
     state.prompt_history_store_allowed = detailed.prompt_history_store_allowed;
+    state.credential_source_preference = settings.credential_source;
     if (credential_mode) |mode| {
         const resolution = try credentials.resolveForProvider(
             alloc,
@@ -438,6 +441,7 @@ fn loadStartupStateFromOwnedWorkspace(
         );
         state.credential = resolution.credential;
         state.stored_key_status = resolution.stored_key_status;
+        state.fx_login_status = resolution.fx_login_status;
     }
     state.permission_mode = loadPermissionMode(settings.permission_mode);
     state.yolo_acknowledged = settings.yolo_acknowledged orelse false;

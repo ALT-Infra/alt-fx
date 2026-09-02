@@ -3312,14 +3312,15 @@ describe("cli: models", () => {
         "requested_access=authenticated credential_source=fx_login effective_access=authenticated public_only_reason=none anonymous_fallback=false outcome=loaded failure_category=none http_status=none retryable=none",
     },
     {
-      name: "uses public access for an expired fx login without refreshing it",
+      name: "refreshes an expired fx login before loading the selected team catalog",
       seedFxLogin: true,
       expiredFxLogin: true,
       authEnv: {},
-      expectAuthHeader: false,
-      expectPrivate: false,
+      expectAuthHeader: true,
+      expectPrivate: true,
+      expectedTeamQuery: "team_123",
       expectedTrace:
-        "requested_access=public_only credential_source=fx_login effective_access=public_only public_only_reason=fx_login_refresh_required anonymous_fallback=false outcome=loaded failure_category=none http_status=none retryable=none",
+        "requested_access=authenticated credential_source=fx_login effective_access=authenticated public_only_reason=none anonymous_fallback=false outcome=loaded failure_category=none http_status=none retryable=none",
     },
     {
       name: "sends an API key so the catalog includes team-private models",
@@ -3347,12 +3348,33 @@ describe("cli: models", () => {
       async () => {
         const root = mkdtempSync(join(tmpdir(), "fx-e2e-team-models-"));
         const requests: Array<{ headers: Headers; teamId: string | null }> = [];
+        const oauthRequests: string[] = [];
         const server = Bun.serve({
           hostname: "127.0.0.1",
           port: 0,
-          fetch(request) {
+          async fetch(request) {
             const headers = new Headers(request.headers);
             const url = new URL(request.url);
+            if (url.pathname === "/.well-known/openid-configuration") {
+              oauthRequests.push(url.pathname);
+              return Response.json({
+                issuer: `http://127.0.0.1:${server.port}`,
+                device_authorization_endpoint: `http://127.0.0.1:${server.port}/oauth/device`,
+                token_endpoint: `http://127.0.0.1:${server.port}/oauth/token`,
+                revocation_endpoint: `http://127.0.0.1:${server.port}/oauth/revoke`,
+              });
+            }
+            if (url.pathname === "/oauth/token") {
+              oauthRequests.push(url.pathname);
+              await request.text();
+              return Response.json({
+                access_token: SEEDED_GATEWAY_TOKEN,
+                refresh_token: "rotated-refresh-token",
+                expires_in: 3600,
+                scope: "openid",
+                token_type: "Bearer",
+              });
+            }
             requests.push({ headers, teamId: url.searchParams.get("teamId") });
             const seededAuth =
               headers.get("authorization") === `Bearer ${SEEDED_GATEWAY_TOKEN}` &&
@@ -3405,13 +3427,6 @@ describe("cli: models", () => {
           expect(r.stderr).toBe("");
           const json = JSON.parse(r.stdout.trim());
           expect(json.kind).toBe("models");
-          expect(json.ids).toContain("public/sentinel");
-          if (scenario.expectPrivate) {
-            expect(json.ids).toContain("private/blue-hornbill");
-          } else {
-            expect(json.ids).not.toContain("private/blue-hornbill");
-          }
-          expect(json.private_models_hidden).toBe(!scenario.expectPrivate);
           expect(requests).toHaveLength(1);
           if (scenario.expectAuthHeader) {
             expect(requests[0]!.headers.get("authorization")).toBe(`Bearer ${SEEDED_GATEWAY_TOKEN}`);
@@ -3420,6 +3435,18 @@ describe("cli: models", () => {
             expect(requests[0]!.headers.get("x-vercel-ai-gateway-team")).toBeNull();
           }
           expect(requests[0]!.teamId).toBe(scenario.expectedTeamQuery ?? null);
+          expect(oauthRequests).toEqual(
+            scenario.expiredFxLogin
+              ? ["/.well-known/openid-configuration", "/oauth/token"]
+              : [],
+          );
+          expect(json.ids).toContain("public/sentinel");
+          if (scenario.expectPrivate) {
+            expect(json.ids).toContain("private/blue-hornbill");
+          } else {
+            expect(json.ids).not.toContain("private/blue-hornbill");
+          }
+          expect(json.private_models_hidden).toBe(!scenario.expectPrivate);
           if (scenario.seedFxLogin && !scenario.expiredFxLogin) {
             expect(requests[0]!.headers.get("x-vercel-ai-gateway-team")).toBeNull();
           }

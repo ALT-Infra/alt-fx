@@ -7,6 +7,7 @@ const app_lifecycle = @import("../app/app_lifecycle.zig");
 const app_runtime_setup = @import("../app/app_runtime_setup.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
+const secret = @import("../auth/secret.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const terminal_client_runtime = @import("../terminal/client.zig");
 const managed_execution = @import("../execution/managed_execution.zig");
@@ -521,6 +522,7 @@ const AskContext = struct {
     gateway_team: ?[]const u8 = null,
     credential_source: ?types.CredentialSource = null,
     account_id: ?[]const u8 = null,
+    refreshed_credential: ?credentials.Credential = null,
     provider: model_provider.ProviderId = .gateway,
     model_catalog_access: credentials.CatalogAccess = .{ .public_only = .no_credential },
     model: []const u8 = "",
@@ -717,6 +719,7 @@ const AskContext = struct {
         }
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
+        if (self.refreshed_credential) |*credential| credential.deinit(self.alloc);
         self.capability_resolver.deinit(self.alloc);
         self.lifecycle_runtime.deinit();
         if (self.writable) |*writable| writable.deinit(self.alloc);
@@ -1536,19 +1539,20 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         model_provider.authorizesCredential(ctx.provider, credential.source)
     else
         false;
-    const credential: *const credentials.Credential = if (startup_matches_final_model)
+    const startup_credential_is_final = startup_matches_final_model and
+        !credentials.sourceRefreshable(startup.credential.?.source);
+    const credential: *const credentials.Credential = if (startup_credential_is_final)
         &startup.credential.?
     else routed: {
-        const preferred = if (startup.credential) |value| value.source else null;
-        const resolution = try credentials.resolveForProvider(
+        var preparation = try auth_runtime.prepareCredential(
             alloc,
             cfg.gateway_provider.oauth_transport,
             cfg.secret_store,
-            .refresh_if_needed,
             ctx.provider,
-            preferred,
+            if (ctx.provider == .gateway) startup.credential_source_preference else null,
         );
-        routed_credential = resolution.credential;
+        defer preparation.deinit(alloc);
+        routed_credential = preparation.takeReady();
         if (routed_credential == null) {
             return missingCredentialResult(alloc, options, ctx.provider);
         }
@@ -1985,13 +1989,55 @@ fn refreshGatewayCredential(
     expected_account_id: ?[]const u8,
 ) !?[]u8 {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    return auth_runtime.refreshCredentialTokenForAccount(
+    var refreshed = (try auth_runtime.refreshCredentialForAccount(
         ctx.cfg.gateway_provider.oauth_transport,
-        alloc,
+        ctx.alloc,
         source,
         mode,
         expected_account_id,
+    )) orelse return null;
+    defer refreshed.deinit(ctx.alloc);
+    return try adoptRefreshedAskCredential(ctx, alloc, &refreshed);
+}
+
+fn adoptRefreshedAskCredential(
+    ctx: *AskContext,
+    worker_alloc: Allocator,
+    refreshed: *credentials.Credential,
+) ![]u8 {
+    if (ctx.credential_source != refreshed.source) return error.CredentialAuthorityChanged;
+    if (!optionalCredentialFieldEqual(ctx.account_id, refreshed.accountId()) or
+        !optionalCredentialFieldEqual(ctx.gateway_team, refreshed.gatewayTeam()))
+    {
+        return error.CredentialAuthorityChanged;
+    }
+
+    const worker_token = try worker_alloc.dupe(u8, refreshed.token);
+    errdefer secret.zeroAndFree(worker_alloc, worker_token);
+    if (ctx.refreshed_credential) |*current| current.deinit(ctx.alloc);
+    ctx.refreshed_credential = refreshed.*;
+    refreshed.token = &.{};
+    refreshed.account_id = null;
+    refreshed.team_id = null;
+    refreshed.team_slug = null;
+
+    const current = &ctx.refreshed_credential.?;
+    ctx.api_key = current.token;
+    ctx.credential_source = current.source;
+    ctx.account_id = current.accountId();
+    ctx.gateway_team = current.gatewayTeam();
+    ctx.model_catalog_access = credentials.catalogAccessForCredentialAndAccount(
+        current.source,
+        current.token,
+        current.gatewayTeam(),
+        current.accountId(),
     );
+    return worker_token;
+}
+
+fn optionalCredentialFieldEqual(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, left.?, right.?);
 }
 
 fn persistUsageCheckpoint(
@@ -4743,6 +4789,43 @@ test "CLI prompt projection configures web search then blocks native execution" 
     try std.testing.expectEqualStrings(ctx.cfg.gateway_chat_url, ctx.web_search_runtime.gateway_chat_url);
     try std.testing.expectEqual(.failure, execution.status);
     try std.testing.expectEqual(@as(usize, 0), provider_state.calls);
+}
+
+test "fx ask publishes a complete refreshed credential before later consumers" {
+    const alloc = std.testing.allocator;
+    var stdout_capture = TestCapture{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture = TestCapture{};
+    defer stderr_capture.deinit(alloc);
+    var ctx = AskContext.init(
+        alloc,
+        testConfig(),
+        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+        "/tmp/workspace",
+    );
+    defer ctx.deinit();
+    ctx.api_key = "stale-token";
+    ctx.credential_source = .fx_login;
+    ctx.gateway_team = "team_123";
+
+    var refreshed = credentials.Credential{
+        .token = try alloc.dupe(u8, "fresh-token"),
+        .source = .fx_login,
+        .team_id = try alloc.dupe(u8, "team_123"),
+        .refresh_after_ms = 100,
+    };
+    defer refreshed.deinit(alloc);
+    const worker_token = try adoptRefreshedAskCredential(&ctx, alloc, &refreshed);
+    defer secret.zeroAndFree(alloc, worker_token);
+
+    try std.testing.expectEqualStrings("fresh-token", worker_token);
+    try std.testing.expectEqualStrings("fresh-token", ctx.api_key);
+    try std.testing.expectEqual(credentials.Source.fx_login, ctx.credential_source.?);
+    try std.testing.expectEqualStrings("team_123", ctx.gateway_team.?);
+    try std.testing.expectEqualStrings(
+        "fresh-token",
+        ctx.model_catalog_access.authorizationCredential().?,
+    );
 }
 
 test "fx ask ChatGPT route disables Gateway-backed auxiliary providers" {
