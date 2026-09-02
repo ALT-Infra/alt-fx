@@ -2914,7 +2914,7 @@ fn settlePendingToolProgress(ctx: *AskContext, call_id: []const u8, outcome: typ
     var pending = takePendingToolProgressLocked(ctx, call_id) orelse return;
     defer pending.deinit(ctx.alloc);
     const context_deferred = outcome.kind == .deferred and
-        std.mem.startsWith(u8, outcome.summary, types.context_deferred_tool_status_label ++ ": ");
+        std.mem.startsWith(u8, outcome.summary, types.context_deferred_tool_status_label ++ " ");
     const legacy_deferred = outcome.kind == .denied and
         std.mem.startsWith(u8, outcome.summary, types.deferred_tool_result_output ++ ": ");
     if (!context_deferred and !legacy_deferred) return;
@@ -8873,7 +8873,7 @@ test "CLI command output completion terminates only an open display line" {
     );
 }
 
-test "CLI nonterminal progress preserves distinct deferred labels without duplicates" {
+test "CLI nonterminal progress preserves distinct not-run labels without duplicates" {
     const alloc = std.testing.allocator;
     var stdout_capture: TestCapture = .{};
     defer stdout_capture.deinit(alloc);
@@ -8901,7 +8901,7 @@ test "CLI nonterminal progress preserves distinct deferred labels without duplic
     } });
     try deps.push_tool_lifecycle(deps.ctx, .{ .terminal = .{
         .id = .{ .turn_id = 1, .call_id = "deferred_write" },
-        .outcome = .{ .kind = .deferred, .summary = "Context updated: Writing file" },
+        .outcome = .{ .kind = .deferred, .summary = "Not run — project instructions changed: Writing file" },
     } });
     try std.testing.expectEqualStrings("Writing file\n", stderr_capture.bytes.items);
 
@@ -8918,7 +8918,7 @@ test "CLI nonterminal progress preserves distinct deferred labels without duplic
     try std.testing.expectEqualStrings("Writing file\n", stderr_capture.bytes.items);
     try deps.push_tool_lifecycle(deps.ctx, .{ .terminal = .{
         .id = .{ .turn_id = 2, .call_id = "retry_write" },
-        .outcome = .{ .kind = .deferred, .summary = "Context updated: Writing file" },
+        .outcome = .{ .kind = .deferred, .summary = "Not run — project instructions changed: Writing file" },
     } });
 
     try deps.push_tool_lifecycle(deps.ctx, .{ .authoritative_started = .{
