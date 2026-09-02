@@ -2926,10 +2926,13 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const thirdSteering = "THIRD_BEGIN mention the completed command before the conclusion THIRD_END";
       const finalText = "COOPERATIVE_STEERING_COMPLETE";
       const steeringGateway = startFakeGateway([
-        fakeGatewayToolCall("cooperative_steering_tool", "terminal", {
-          action: "exec",
-          timeout_ms: 600_000,
-          command,
+        fakeGatewayToolCall("cooperative_steering_tool", "shell", {
+          request: {
+            action: "run",
+            yield_time_ms: 30_000,
+            timeout_ms: 600_000,
+            command,
+          },
         }),
         fakeGatewayFinalText(finalText),
       ]);
@@ -3045,10 +3048,13 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const steering = "Use the attached image after this command finishes.";
       const finalText = "RICH_STEERING_HANDOFF_COMPLETE";
       const steeringGateway = startFakeGateway([
-        fakeGatewayToolCall("rich_steering_tool", "terminal", {
-          action: "exec",
-          timeout_ms: 600_000,
-          command,
+        fakeGatewayToolCall("rich_steering_tool", "shell", {
+          request: {
+            action: "run",
+            yield_time_ms: 30_000,
+            timeout_ms: 600_000,
+            command,
+          },
         }),
         fakeGatewayFinalText(finalText),
       ], {
@@ -3146,10 +3152,13 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         "printf FAILED_TOOL_STEERING_RESULT; exit 7";
       const steering = "Respond exactly FAILED_TOOL_STEERING_COMPLETE.";
       const steeringGateway = startFakeGateway([
-        fakeGatewayToolCall("failed_steering_tool", "terminal", {
-          action: "exec",
-          timeout_ms: 600_000,
-          command,
+        fakeGatewayToolCall("failed_steering_tool", "shell", {
+          request: {
+            action: "run",
+            yield_time_ms: 30_000,
+            timeout_ms: 600_000,
+            command,
+          },
         }),
         fakeGatewayFinalText("FAILED_TOOL_STEERING_COMPLETE"),
       ]);
@@ -3220,10 +3229,13 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const steering = "Apply IMMEDIATE_STEERING_SENTINEL now.";
       const finalText = "IMMEDIATE_STEERING_COMPLETE";
       const steeringGateway = startFakeGateway([
-        fakeGatewayToolCall("immediate_steering_tool", "terminal", {
-          action: "exec",
-          timeout_ms: 600_000,
-          command: "sleep 30",
+        fakeGatewayToolCall("immediate_steering_tool", "shell", {
+          request: {
+            action: "run",
+            yield_time_ms: 30_000,
+            timeout_ms: 600_000,
+            command: "sleep 30",
+          },
         }),
         fakeGatewayFinalText(finalText),
       ]);
