@@ -272,6 +272,15 @@ pub fn Bindings(comptime App: type) type {
                     app.agentStreamProvider()
                 else
                     agent_stream_provider.unavailable_provider,
+                .compaction_route = if (comptime @hasDecl(App, "compactionRoute"))
+                    app.compactionRoute()
+                else if (comptime @hasDecl(App, "providerSet") and @hasField(App, "auth"))
+                    app.providerSet().compactionRoute(
+                        provider_runtime.provider(app),
+                        app.auth.credentialSource(),
+                    )
+                else
+                    .{ .unavailable = .missing_policy },
                 .cooperative_transport_pulse = if (comptime @hasDecl(App, "cooperativeTransportPulse")) .{
                     .ctx = @ptrCast(app),
                     .run = cooperativeTransportPulse,
@@ -304,6 +313,7 @@ pub fn Bindings(comptime App: type) type {
                 .execute_tool_call = agentExecuteToolCall,
                 .publish_committed_file_handoff = agentPublishCommittedFileHandoff,
                 .propagate_history_turn = agentPropagateHistoryTurn,
+                .commit_context_compaction = .{ .commit = agentCommitContextCompaction },
                 .recovery_checkpoint = if (comptime @hasField(App, "session_persistence"))
                     if (app.session_persistence.writable != null)
                         .{
@@ -435,6 +445,7 @@ pub fn Bindings(comptime App: type) type {
                 .command_output = workerBridgeCommandOutput,
                 .command_output_complete = workerBridgeCommandOutputComplete,
                 .diff_block = workerBridgeDiffBlock,
+                .context_compaction = workerBridgeContextCompaction,
                 .append_history_turn = workerBridgeAppendHistoryTurn,
                 .session_grant = workerBridgeSessionGrant,
                 .error_text = workerBridgeErrorText,
@@ -789,6 +800,19 @@ pub fn Bindings(comptime App: type) type {
             try app_worker_runtime.Runtime(App).propagateHistoryTurn(app, turn, app.session.max_history_turns);
         }
 
+        fn agentCommitContextCompaction(
+            ctx: *anyopaque,
+            summary: types.CompactedSummaryHistoryTurn,
+        ) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            const turn = types.HistoryTurn{ .compacted_summary = summary };
+            try app_worker_runtime.Runtime(App).commitContextCompaction(
+                app,
+                turn,
+                app.session.max_history_turns,
+            );
+        }
+
         fn agentSetRecoveryCheckpoint(
             ctx: *anyopaque,
             checkpoint: session_codec.RecoveryCheckpoint,
@@ -1136,6 +1160,11 @@ pub fn Bindings(comptime App: type) type {
         fn workerBridgeDiffBlock(ctx: *anyopaque, payload: diff_mod.DiffEntryPayload) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try app.registerAndEmitDiffBlock(payload);
+        }
+
+        fn workerBridgeContextCompaction(ctx: *anyopaque, turn: types.HistoryTurn) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try app_session_runtime.Runtime(App).appendHistoryTurn(app, turn);
         }
 
         fn workerBridgeAppendHistoryTurn(ctx: *anyopaque, finished: types.FinishedPrompt) !void {

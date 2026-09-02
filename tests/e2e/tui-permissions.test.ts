@@ -1697,6 +1697,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
 
       expect(statSync(target).size).toBe(content.length);
       expect(fileHash(target)).toBe(expectedHash);
+      expect(gateway.requests).toHaveLength(2);
       expectCleanStderr(stderrPath);
     },
     MAXIMUM_WRITE_TIMEOUT + 30_000,
@@ -1724,7 +1725,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       expect(existsSync(target)).toBe(false);
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.requests[1]!.body).toContain(
-        "write_file failed: content exceeds the 4 MiB preparation limit",
+        'call_id=\\"oversized_write\\" tool=\\"write_file\\" status=failure',
       );
       expectCleanStderr(stderrPath);
     },

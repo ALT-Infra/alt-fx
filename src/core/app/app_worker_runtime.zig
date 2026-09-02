@@ -56,6 +56,7 @@ fn discardCodeBlock(_: *anyopaque, block: assistant_presentation.CodeBlockPayloa
 }
 
 fn discardThematicRule(_: *anyopaque) !void {}
+fn discardContextCompaction(_: *anyopaque, _: types.HistoryTurn) !void {}
 fn discardCredentialRefresh(_: *anyopaque, _: credentials.Credential) !void {}
 
 pub const WorkerEventHandlers = struct {
@@ -74,6 +75,7 @@ pub const WorkerEventHandlers = struct {
     command_output: *const fn (*anyopaque, ?types.ToolLifecycleId, command_output_content.Stream, []const u8) anyerror!void,
     command_output_complete: *const fn (*anyopaque, ?types.ToolLifecycleId) anyerror!void,
     diff_block: *const fn (*anyopaque, diff_mod.DiffEntryPayload) anyerror!void,
+    context_compaction: *const fn (*anyopaque, types.HistoryTurn) anyerror!void = discardContextCompaction,
     append_history_turn: *const fn (*anyopaque, types.FinishedPrompt) anyerror!void,
     session_grant: *const fn (*anyopaque, types.PermissionGrant) anyerror!void,
     error_text: *const fn (*anyopaque, types.SemanticNotice) anyerror!void,
@@ -218,6 +220,7 @@ pub fn Runtime(comptime App: type) type {
                 .question_requested,
                 .clear_route_recovery_status,
                 .api_status_text,
+                .context_compaction,
                 .credential_refreshed,
                 .finish_prompt,
                 .session_grant,
@@ -280,6 +283,23 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
             try app.worker.propagateHistoryTurn(std.heap.c_allocator, turn, max_history_turns);
+        }
+
+        pub fn commitContextCompaction(
+            app: *App,
+            turn: types.HistoryTurn,
+            max_history_turns: usize,
+        ) !void {
+            if (comptime @hasDecl(@TypeOf(app.worker), "commitContextCompaction")) {
+                try app.worker.commitContextCompaction(
+                    std.heap.c_allocator,
+                    turn,
+                    max_history_turns,
+                );
+                return;
+            }
+            try propagateHistoryTurn(app, turn, max_history_turns);
+            try pushEvent(app, .{ .context_compaction = turn });
         }
 
         pub fn propagateGrant(app: *App, tool_name: []const u8, target_path: []const u8) !void {
@@ -847,6 +867,9 @@ pub fn Runtime(comptime App: type) type {
                     .diff_block => |payload| {
                         drain_owns_current = false;
                         try handlers.diff_block(handlers.ctx, payload);
+                    },
+                    .context_compaction => |turn| {
+                        try handlers.context_compaction(handlers.ctx, turn);
                     },
                     .tool_lifecycle => |lifecycle| {
                         switch (lifecycle) {

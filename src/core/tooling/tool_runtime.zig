@@ -127,6 +127,7 @@ pub const Context = struct {
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     api_key: []const u8,
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
+    compaction_route: provider_set.CompactionRouteDecision = .{ .unavailable = .missing_policy },
     gateway_team: ?[]const u8 = null,
     credential_source: ?types.CredentialSource = null,
     account_id: ?[]const u8 = null,
@@ -2096,6 +2097,9 @@ fn testReviewTurn() permission_auto_classifier.ReviewTurnContext {
 
 const TestRuntime = struct {
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
+    compaction_route: provider_set.CompactionRouteDecision = .{
+        .ready = .{ .provider = .gateway, .model = "openai/gpt-5.6-luna" },
+    },
     tool_registry: tool_dispatch.Registry = test_tool_registry,
     worker: WorkerRuntime = .{},
     session: SessionRuntime = .{ .max_history_turns = 8 },
@@ -2168,6 +2172,7 @@ const TestRuntime = struct {
             .max_tool_result_bytes = self.max_tool_result_bytes,
             .api_key = self.api_key,
             .agent_stream_provider = self.agent_stream_provider,
+            .compaction_route = self.compaction_route,
             .gateway_team = self.gateway_team,
             .provider = self.provider,
             .provider_capabilities = self.provider_capabilities,

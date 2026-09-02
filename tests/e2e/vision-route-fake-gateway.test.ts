@@ -1482,7 +1482,7 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
-    "text-only non-native ask resolves capability and exposes Vision",
+    "text-only GLM ask resolves context capacity and exposes Vision without Vision IO",
     async () => {
       const root = createIsolatedRoot();
       const gateway = startImageGateway([sseText("text only answer")]);

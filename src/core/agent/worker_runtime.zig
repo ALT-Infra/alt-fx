@@ -74,6 +74,14 @@ pub const QueuedPrompt = struct {
     account_id: ?[]u8 = null,
     permission_mode: types.PermissionMode,
     history: []types.HistoryTurn,
+    /// Active model-context boundary within the complete owned canonical
+    /// history snapshot. Compaction reads raw turns before this boundary;
+    /// ordinary provider projection does not.
+    context_history_start: usize = 0,
+    /// Absolute end of the leading canonical-history range loaded without
+    /// corrected result provenance. The conservative default protects callers
+    /// that do not own a SessionRuntime snapshot.
+    unversioned_history_count: usize = std.math.maxInt(usize),
     root_user_intent_context: []u8 = &.{},
     grants: []types.PermissionGrant,
     skill_bindings: []SkillBinding = &.{},
@@ -93,6 +101,29 @@ pub const QueuedPrompt = struct {
     /// Worker begin publishes only its identity so the UI can consume the
     /// pending owner without painting a duplicate card.
     user_prompt_already_presented: bool = false,
+};
+
+pub const ContextCompactionTask = struct {
+    turn_id: u64 = 0,
+    model: []u8,
+    provider: model_provider.ProviderId = .gateway,
+    api_key: []u8,
+    gateway_team: ?[]u8 = null,
+    credential_source: ?types.CredentialSource = null,
+    account_id: ?[]u8 = null,
+    history: []types.HistoryTurn,
+    unversioned_history_count: usize = std.math.maxInt(usize),
+};
+
+pub const ContextCompactionStatus = enum {
+    idle,
+    queued,
+    running,
+};
+
+pub const WorkItem = union(enum) {
+    prompt: QueuedPrompt,
+    compact_context: ContextCompactionTask,
 };
 
 pub const ActivePromptSnapshotOwnership = struct {
@@ -299,6 +330,7 @@ const PreparedQueuedPromptDraft = struct {
 
 const PreparedHistoryPropagation = struct {
     history: []types.HistoryTurn,
+    context_history_start: usize,
     root_user_intent_context: []u8,
     authorized_image_catalog: []types.ImageAttachment,
     snapshot_file_ownerships: ?[]types.SnapshotFileOwnership,
@@ -535,6 +567,7 @@ pub const WorkerEvent = union(enum) {
     turn_token_update: types.TurnTokenProgress,
     turn_phase_update: types.TurnPhaseUpdate,
     diff_block: diff_mod.DiffEntryPayload,
+    context_compaction: types.HistoryTurn,
     finish_prompt: types.FinishedPrompt,
     session_grant: types.PermissionGrant,
     error_text: types.SemanticNotice,
@@ -551,6 +584,8 @@ pub const WorkerRuntime = struct {
     /// One admission-ordered queue for ordinary prompts and steering. Steering
     /// remains in place until its target turn consumes or demotes it.
     queued_prompts: std.ArrayList(QueuedPrompt) = .empty,
+    queued_context_compaction: ?ContextCompactionTask = null,
+    active_context_compaction: bool = false,
     worker_events: std.ArrayList(WorkerEvent) = .empty,
     worker_processing: bool = false,
     active_turn_id: u64 = 0,
@@ -571,7 +606,7 @@ pub const WorkerRuntime = struct {
     queued_prompt_count: usize = 0,
     /// `null` means admission is open; otherwise queue take is paused for review.
     queue_admission: ?QueueReviewReason = null,
-    /// When true, `waitAndTakeNextPrompt` will not start a turn.
+    /// When true, queued work will not start.
     turn_start_held: bool = false,
     next_permission_request_id: u64 = 1,
     pending_permission_response: ?permission_request.OwnedPermissionResponse = null,
@@ -602,6 +637,7 @@ pub const WorkerRuntime = struct {
 
         for (self.queued_prompts.items) |prompt| discardQueuedPrompt(alloc, prompt, &.{});
         self.queued_prompts.deinit(alloc);
+        if (self.queued_context_compaction) |task| freeContextCompactionTask(alloc, task);
 
         self.clearActiveToolCallsLocked();
 
@@ -832,8 +868,80 @@ pub const WorkerRuntime = struct {
         try self.admitPrompt(alloc, prompt, true);
     }
 
-    /// Targets eligible interactive input to the active turn. Other input
-    /// remains in the ordinary FIFO.
+    pub fn enqueueContextCompaction(
+        self: *WorkerRuntime,
+        task: ContextCompactionTask,
+    ) !void {
+        var queued = task;
+        if (queued.turn_id == 0) queued.turn_id = debug_trace.nextTurnId();
+
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (self.finalization_failure != null) return error.TurnFinalizationDeliveryFailed;
+        if (self.worker_stop_requested) return error.WorkerStopped;
+        if (self.worker_processing or self.queued_prompt_count > 0 or
+            self.queued_context_compaction != null)
+        {
+            return error.WorkerBusy;
+        }
+        self.queued_context_compaction = queued;
+        self.queued_prompt_count = 1;
+        debug_trace.eventf(
+            "worker",
+            "context_compaction_enqueue",
+            .{ .turn_id = queued.turn_id },
+            "queue_depth=1",
+            .{},
+        );
+        self.worker_cond.broadcast(io_mod.getIo());
+    }
+
+    pub fn contextCompactionStatus(self: *WorkerRuntime) ContextCompactionStatus {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (self.active_context_compaction) return .running;
+        if (self.queued_context_compaction != null) return .queued;
+        return .idle;
+    }
+
+    pub fn cancelContextCompaction(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+    ) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        if (self.queued_context_compaction) |task| {
+            self.queued_context_compaction = null;
+            if (self.queued_prompt_count > 0) self.queued_prompt_count -= 1;
+            self.worker_cond.broadcast(io_mod.getIo());
+            self.worker_mutex.unlock(io_mod.getIo());
+            freeContextCompactionTask(alloc, task);
+            debug_trace.eventf(
+                "context_compaction",
+                "cancelled",
+                .{},
+                "phase=queued",
+                .{},
+            );
+            return true;
+        }
+        if (self.active_context_compaction) {
+            self.worker_cancel_requested.store(true, .seq_cst);
+            self.worker_mutex.unlock(io_mod.getIo());
+            debug_trace.eventf(
+                "context_compaction",
+                "cancel_requested",
+                .{},
+                "phase=running",
+                .{},
+            );
+            return true;
+        }
+        self.worker_mutex.unlock(io_mod.getIo());
+        return false;
+    }
+
+    /// Transfers `prompt` to the active turn when steering is requested and the
+    /// turn still accepts guidance. Otherwise it enters the ordinary FIFO.
     fn admitPrompt(
         self: *WorkerRuntime,
         alloc: std.mem.Allocator,
@@ -1233,6 +1341,22 @@ pub const WorkerRuntime = struct {
         return self.takeNextPromptLocked(alloc);
     }
 
+    pub fn waitAndTakeNextWork(self: *WorkerRuntime, alloc: std.mem.Allocator) !?WorkItem {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+
+        while (((self.queued_prompts.items.len == 0 and
+            self.queued_context_compaction == null) or
+            self.queue_admission != null or self.turn_start_held) and
+            !self.worker_stop_requested)
+        {
+            self.worker_processing = false;
+            self.active_turn_id = 0;
+            self.worker_cond.wait(io_mod.getIo(), &self.worker_mutex) catch break;
+        }
+        return self.takeNextWorkLocked(alloc);
+    }
+
     /// Nonblocking queue take for single-threaded hosts. Returns null while the
     /// queue is empty, paused for review, held, or stopped.
     pub fn tryTakeNextPrompt(self: *WorkerRuntime, alloc: std.mem.Allocator) !?QueuedPrompt {
@@ -1246,6 +1370,44 @@ pub const WorkerRuntime = struct {
             return null;
         }
         return self.takeNextPromptLocked(alloc);
+    }
+
+    pub fn tryTakeNextWork(self: *WorkerRuntime, alloc: std.mem.Allocator) !?WorkItem {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if ((self.queued_prompts.items.len == 0 and
+            self.queued_context_compaction == null) or
+            self.queue_admission != null or self.turn_start_held or
+            self.worker_stop_requested)
+        {
+            return null;
+        }
+        return self.takeNextWorkLocked(alloc);
+    }
+
+    fn takeNextWorkLocked(self: *WorkerRuntime, alloc: std.mem.Allocator) !?WorkItem {
+        if (self.worker_stop_requested) return null;
+        if (self.queued_context_compaction) |task| {
+            self.queued_context_compaction = null;
+            if (self.queued_prompt_count > 0) self.queued_prompt_count -= 1;
+            self.worker_cancel_requested.store(false, .seq_cst);
+            self.worker_recovery_pause_requested.store(false, .seq_cst);
+            self.worker_connectivity_wait_active.store(false, .seq_cst);
+            self.recovery_continuation_ready = false;
+            self.worker_processing = true;
+            self.active_turn_id = task.turn_id;
+            self.active_context_compaction = true;
+            debug_trace.eventf(
+                "worker",
+                "context_compaction_begin",
+                .{ .turn_id = task.turn_id },
+                "remaining_queue={d} cancel_reset=true",
+                .{self.queued_prompt_count},
+            );
+            return .{ .compact_context = task };
+        }
+        const prompt = (try self.takeNextPromptLocked(alloc)) orelse return null;
+        return .{ .prompt = prompt };
     }
 
     fn takeNextPromptLocked(self: *WorkerRuntime, alloc: std.mem.Allocator) !?QueuedPrompt {
@@ -1294,6 +1456,7 @@ pub const WorkerRuntime = struct {
                 prompt.steering_continuation = false;
             }
         }
+        self.active_context_compaction = false;
         debug_trace.logf(
             "worker",
             "begin prompt bytes={d} remaining_queue={d} fast_mode={s} effort={s}",
@@ -1325,6 +1488,7 @@ pub const WorkerRuntime = struct {
         self.active_turn_id = 0;
         self.steering_cancel_turn_id = null;
         self.clearActiveToolCallsLocked();
+        self.active_context_compaction = false;
         self.worker_connectivity_wait_active.store(false, .seq_cst);
         self.worker_cond.broadcast(io_mod.getIo());
         self.worker_mutex.unlock(io_mod.getIo());
@@ -1575,6 +1739,10 @@ pub const WorkerRuntime = struct {
             discardQueuedPrompt(alloc, prompt, retained_images);
         }
         self.queued_prompts.clearRetainingCapacity();
+        if (self.queued_context_compaction) |task| {
+            freeContextCompactionTask(alloc, task);
+            self.queued_context_compaction = null;
+        }
         self.queued_prompt_count = 0;
         self.queue_admission = null;
         self.worker_cond.broadcast(io_mod.getIo());
@@ -1651,6 +1819,38 @@ pub const WorkerRuntime = struct {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
 
+        try self.propagateHistoryTurnLocked(alloc, turn, max_history_turns);
+    }
+
+    pub fn commitContextCompaction(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        turn: types.HistoryTurn,
+        max_history_turns: usize,
+    ) !void {
+        std.debug.assert(turn == .compacted_summary);
+        const owned_event = try dupeWorkerEvent(alloc, .{
+            .context_compaction = turn,
+        });
+        var owns_event = true;
+        defer if (owns_event) freeWorkerEvent(alloc, owned_event);
+
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        try self.worker_events.ensureUnusedCapacity(alloc, 1);
+        try self.propagateHistoryTurnLocked(alloc, turn, max_history_turns);
+        self.worker_events.appendAssumeCapacity(owned_event);
+        owns_event = false;
+        self.applyRecoveryStateEvent(owned_event);
+        self.worker_cond.broadcast(io_mod.getIo());
+    }
+
+    fn propagateHistoryTurnLocked(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        turn: types.HistoryTurn,
+        max_history_turns: usize,
+    ) !void {
         if (self.queued_prompts.items.len == 0) return;
         const active_ownership = if (self.active_prompt_snapshot_ownership) |ownership|
             try ownership.ensureSharedOwnership(alloc)
@@ -1720,6 +1920,10 @@ pub const WorkerRuntime = struct {
 
             prepared[prepared_count] = .{
                 .history = next_history,
+                .context_history_start = if (turn == .compacted_summary)
+                    next_history.len - 1
+                else
+                    prompt.context_history_start,
                 .root_user_intent_context = next_root_user_intent_context,
                 .authorized_image_catalog = next_image_catalog,
                 .snapshot_file_ownerships = next_snapshot_file_ownerships,
@@ -1733,6 +1937,8 @@ pub const WorkerRuntime = struct {
         for (self.queued_prompts.items, prepared) |*prompt, next| {
             types.freeHistoryTurnSlice(alloc, prompt.history);
             prompt.history = next.history;
+            prompt.context_history_start = next.context_history_start;
+            if (turn == .compacted_summary) prompt.unversioned_history_count = 0;
             if (prompt.root_user_intent_context.len > 0) alloc.free(prompt.root_user_intent_context);
             prompt.root_user_intent_context = next.root_user_intent_context;
             types.freeImageAttachmentSlice(alloc, prompt.authorized_image_catalog);
@@ -2387,18 +2593,17 @@ fn appendHistoryTurnProjection(
     turn: types.HistoryTurn,
     max_history_turns: usize,
 ) ![]types.HistoryTurn {
-    const combined_len = std.math.add(usize, current.len, 1) catch
-        return error.OutOfMemory;
-    const combined = try alloc.alloc(types.HistoryTurn, combined_len);
-    defer alloc.free(combined);
-    std.mem.copyForwards(types.HistoryTurn, combined[0..current.len], current);
-    combined[current.len] = turn;
-    return session_runtime.snapshotOwnedContextHistory(
-        alloc,
-        combined,
-        0,
-        max_history_turns,
-    );
+    _ = max_history_turns;
+    const next = try alloc.alloc(types.HistoryTurn, current.len + 1);
+    errdefer alloc.free(next);
+    var copied: usize = 0;
+    errdefer for (next[0..copied]) |owned| types.freeHistoryTurn(alloc, owned);
+    for (current, 0..) |entry, index| {
+        next[index] = try types.dupeHistoryTurn(alloc, entry);
+        copied += 1;
+    }
+    next[current.len] = try types.dupeHistoryTurn(alloc, turn);
+    return next;
 }
 
 pub fn freeQueuedPrompt(alloc: std.mem.Allocator, prompt: QueuedPrompt) void {
@@ -2424,6 +2629,24 @@ pub fn freeQueuedPrompt(alloc: std.mem.Allocator, prompt: QueuedPrompt) void {
     if (prompt.recovery_checkpoint) |checkpoint| {
         var owned = checkpoint;
         owned.deinit(alloc);
+    }
+}
+
+pub fn freeContextCompactionTask(
+    alloc: std.mem.Allocator,
+    task: ContextCompactionTask,
+) void {
+    alloc.free(task.model);
+    secret.zeroAndFree(alloc, task.api_key);
+    if (task.gateway_team) |team| alloc.free(team);
+    if (task.account_id) |account_id| alloc.free(account_id);
+    types.freeHistoryTurnSlice(alloc, task.history);
+}
+
+pub fn freeWorkItem(alloc: std.mem.Allocator, work: WorkItem) void {
+    switch (work) {
+        .prompt => |prompt| freeQueuedPrompt(alloc, prompt),
+        .compact_context => |task| freeContextCompactionTask(alloc, task),
     }
 }
 
@@ -2531,6 +2754,65 @@ test "session transfer preserves active and finished prompt snapshots" {
         try std.Io.Dir.accessAbsolute(std.testing.io, path, .{});
         try std.Io.Dir.deleteFileAbsolute(std.testing.io, path);
     }
+}
+
+test "manual compaction is a typed worker item and not a prompt" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+
+    const task = ContextCompactionTask{
+        .model = try alloc.dupe(u8, "provider/model"),
+        .api_key = try alloc.dupe(u8, "key"),
+        .history = try alloc.alloc(types.HistoryTurn, 0),
+    };
+    try runtime.enqueueContextCompaction(task);
+
+    const taken = (try runtime.tryTakeNextWork(alloc)) orelse
+        return error.TestExpectedQueuedWork;
+    defer freeWorkItem(alloc, taken);
+    try std.testing.expect(taken == .compact_context);
+}
+
+test "queued manual compaction can be cancelled before worker execution" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+
+    const task = ContextCompactionTask{
+        .model = try alloc.dupe(u8, "provider/model"),
+        .api_key = try alloc.dupe(u8, "key"),
+        .history = try alloc.alloc(types.HistoryTurn, 0),
+    };
+    try runtime.enqueueContextCompaction(task);
+
+    try std.testing.expectEqual(ContextCompactionStatus.queued, runtime.contextCompactionStatus());
+    try std.testing.expect(runtime.cancelContextCompaction(alloc));
+    try std.testing.expectEqual(ContextCompactionStatus.idle, runtime.contextCompactionStatus());
+    try std.testing.expectEqual(@as(usize, 0), runtime.queuedPromptCount());
+    try std.testing.expect((try runtime.tryTakeNextWork(alloc)) == null);
+}
+
+test "running manual compaction cancellation uses the worker cancel flag" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+
+    const task = ContextCompactionTask{
+        .model = try alloc.dupe(u8, "provider/model"),
+        .api_key = try alloc.dupe(u8, "key"),
+        .history = try alloc.alloc(types.HistoryTurn, 0),
+    };
+    try runtime.enqueueContextCompaction(task);
+    const taken = (try runtime.tryTakeNextWork(alloc)) orelse
+        return error.TestExpectedQueuedWork;
+    defer freeWorkItem(alloc, taken);
+
+    try std.testing.expectEqual(ContextCompactionStatus.running, runtime.contextCompactionStatus());
+    try std.testing.expect(runtime.cancelContextCompaction(alloc));
+    try std.testing.expect(runtime.isCancelRequested());
+    runtime.finishProcessing();
+    try std.testing.expectEqual(ContextCompactionStatus.idle, runtime.contextCompactionStatus());
 }
 
 test "session transfer discards mismatched active prompt snapshots" {
@@ -2855,6 +3137,57 @@ test "multi-queue history propagation is allocation-failure atomic" {
     return error.TestUnexpectedResult;
 }
 
+fn checkContextCompactionCommitAllocation(
+    alloc: std.mem.Allocator,
+    fail_index: usize,
+) !bool {
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    const prompt = try makePrompt(alloc, "queued", "model");
+    var owns_prompt = true;
+    errdefer if (owns_prompt) freeQueuedPrompt(alloc, prompt);
+    try runtime.enqueuePrompt(alloc, prompt);
+    owns_prompt = false;
+
+    const turn: types.HistoryTurn = .{ .compacted_summary = .{
+        .summary = @constCast("<context_handoff>checkpoint</context_handoff>"),
+        .removed_turn_count = 1,
+        .compaction_count = 1,
+    } };
+    var failing = std.testing.FailingAllocator.init(
+        alloc,
+        .{ .fail_index = fail_index },
+    );
+    runtime.commitContextCompaction(failing.allocator(), turn, 8) catch |err| {
+        if (!failing.has_induced_failure) return err;
+        try std.testing.expectEqual(
+            @as(usize, 0),
+            runtime.queued_prompts.items[0].history.len,
+        );
+        try std.testing.expectEqual(@as(usize, 0), runtime.worker_events.items.len);
+        return false;
+    };
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        runtime.queued_prompts.items[0].history.len,
+    );
+    try std.testing.expectEqual(@as(usize, 1), runtime.worker_events.items.len);
+    try std.testing.expect(runtime.worker_events.items[0] == .context_compaction);
+    return true;
+}
+
+test "context compaction commit is allocation-failure atomic" {
+    var fail_index: usize = 0;
+    while (fail_index < 128) : (fail_index += 1) {
+        if (try checkContextCompactionCommitAllocation(
+            std.testing.allocator,
+            fail_index,
+        )) return;
+    }
+    return error.TestUnexpectedResult;
+}
+
 test "finish ownership handoff deletes snapshots after its last unaccepted release" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3119,6 +3452,9 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
                 .full = full,
             } };
         },
+        .context_compaction => |turn| .{
+            .context_compaction = try types.dupeHistoryTurn(alloc, turn),
+        },
         .finish_prompt => |finished| .{ .finish_prompt = try types.dupeFinishedPrompt(alloc, finished) },
         .session_grant => |grant| blk: {
             const tool_name = try alloc.dupe(u8, grant.tool_name);
@@ -3166,6 +3502,7 @@ pub fn freeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) void {
         },
         .tool_lifecycle => |lifecycle| freeToolLifecycleEvent(alloc, lifecycle),
         .diff_block => |payload| diff_mod.freeDiffEntryPayload(alloc, payload),
+        .context_compaction => |turn| types.freeHistoryTurn(alloc, turn),
         .finish_prompt => |finished| types.freeFinishedPrompt(alloc, finished),
         .session_grant => |grant| {
             alloc.free(grant.tool_name);
@@ -3934,9 +4271,11 @@ test "queue, event, snapshot, sync, history, and grant behavior" {
     } };
     defer types.freeHistoryTurn(alloc, turn);
     try runtime.propagateHistoryTurn(alloc, turn, 1);
-    try std.testing.expectEqual(@as(usize, 1), runtime.queued_prompts.items[0].history.len);
-    try std.testing.expect(runtime.queued_prompts.items[0].history[0] == .compacted_summary);
-    try std.testing.expectEqualStrings("summary", runtime.queued_prompts.items[0].history[0].compacted_summary.summary);
+    try std.testing.expectEqual(@as(usize, 2), runtime.queued_prompts.items[0].history.len);
+    try std.testing.expect(runtime.queued_prompts.items[0].history[1] == .compacted_summary);
+    try std.testing.expectEqualStrings("summary", runtime.queued_prompts.items[0].history[1].compacted_summary.summary);
+    try std.testing.expectEqual(@as(usize, 1), runtime.queued_prompts.items[0].context_history_start);
+    try std.testing.expectEqual(@as(usize, 0), runtime.queued_prompts.items[0].unversioned_history_count);
 
     try runtime.propagateGrant(alloc, "read_file", "/tmp/a");
     try std.testing.expectEqual(@as(usize, 1), runtime.queued_prompts.items[0].grants.len);

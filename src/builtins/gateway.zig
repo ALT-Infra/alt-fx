@@ -148,10 +148,12 @@ pub const generation_usage_provider = gateway_generation_usage.provider;
 
 pub const agent_stream_provider = agent_stream_provider_contract.Provider{
     .stream_fn = streamAgentCompletion,
+    .build_request_fn = buildAgentRequestForProvider,
 };
 
 pub const provider_bundle = provider_set.Bundle{
     .capabilities = .{ .fx_search = true, .vision_fallback = true },
+    .compaction_model = "openai/gpt-5.6-luna",
     .presentation = provider_catalog.find(.gateway),
     .auth_strategy = .vercel,
     .fallback_model_capabilities_fn = vercel_model_policy.capabilitiesForModel,
@@ -248,6 +250,14 @@ pub fn buildAgentRequest(
     }
 
     unreachable;
+}
+
+fn buildAgentRequestForProvider(
+    _: ?*anyopaque,
+    alloc: Allocator,
+    request: agent_stream_provider_contract.RequestData,
+) anyerror![]u8 {
+    return buildAgentRequest(alloc, request);
 }
 
 fn resolveGatewayProviderOptions(
@@ -522,35 +532,48 @@ fn streamAgentCompletion(
             error.SubscriptionCredentialCannotAuthorizeGateway,
         );
     }
-    const payload = try buildAgentRequest(alloc, request.data());
-    defer alloc.free(payload);
+    const payload = request.prepared_request_body orelse
+        try buildAgentRequest(alloc, request.data());
+    defer if (request.prepared_request_body == null) alloc.free(payload);
     var events = request.events;
-    const result = gateway_client.streamGatewayCompletion(
-        alloc,
-        .{
-            .api_key = request.credential.secret,
-            .team = request.credential.tenant,
-            .session_id = request.session_id,
-            .model = request.model,
-            .retry_count = request.retry_count,
-            .chat_url = agentChatUrl(),
-            .payload = payload,
-            .trace_ctx = request.trace_ctx,
-            .content_capture_limit = request.content_capture_limit,
-            .delivery = request.delivery,
-            .admission = request.admission,
-            .on_reasoning_chunk = EventBridge.reasoning,
-            .on_tool_input_chunk = EventBridge.toolInput,
-            .provider_attempt_owner = switch (request.provider_attempt_owner) {
-                .transport => .transport,
-                .agent => .agent,
-            },
+    const stream_request = gateway_client.StreamRequest{
+        .api_key = request.credential.secret,
+        .team = request.credential.tenant,
+        .session_id = request.session_id,
+        .model = request.model,
+        .retry_count = request.retry_count,
+        .chat_url = agentChatUrl(),
+        .payload = payload,
+        .trace_ctx = request.trace_ctx,
+        .content_capture_limit = request.content_capture_limit,
+        .delivery = request.delivery,
+        .admission = request.admission,
+        .on_reasoning_chunk = EventBridge.reasoning,
+        .on_tool_input_chunk = EventBridge.toolInput,
+        .provider_attempt_owner = switch (request.provider_attempt_owner) {
+            .transport => .transport,
+            .agent => .agent,
         },
-        &events,
-        EventBridge.content,
-        EventBridge.toolStart,
-        request.cancel_flag,
-    ) catch |err| {
+    };
+    const result = (if (request.deadline) |deadline|
+        gateway_client.streamGatewayCompletionBounded(
+            alloc,
+            stream_request,
+            &events,
+            EventBridge.content,
+            EventBridge.toolStart,
+            deadline,
+            request.cancel_flag,
+        )
+    else
+        gateway_client.streamGatewayCompletion(
+            alloc,
+            stream_request,
+            &events,
+            EventBridge.content,
+            EventBridge.toolStart,
+            request.cancel_flag,
+        )) catch |err| {
         request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(
             err,
             request.delivery.load(),

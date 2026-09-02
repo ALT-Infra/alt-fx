@@ -39,12 +39,14 @@ pub const dispatchAttentionRequiredCheckpoint = runtime_lifecycle.dispatchAttent
 pub const TurnFinalizationGuard = runtime_finalization.TurnFinalizationGuard;
 pub const Config = runtime_config.Config;
 pub const processAgentPrompt = runtime_orchestrator.processAgentPrompt;
+pub const compactContextTransaction = runtime_orchestrator.compactContextTransaction;
 pub const persistedStatusForCurrentFxLocalResult = runtime_execution_memory.persistedStatusForCurrentFxLocalResult;
 pub const classifyProviderExecutedResultStatus = runtime_execution_memory.classifyProviderExecutedResultStatus;
 pub const normalizeAssistantTextForDisplay = runtime_assistant_stream.normalizeAssistantTextForDisplay;
 
 test {
     _ = @import("stream_provider.zig");
+    _ = @import("runtime/context_compaction.zig");
     _ = @import("runtime/tests/gateway_flow.zig");
     _ = @import("runtime/tests/tool_flow.zig");
     _ = @import("runtime/tests/interruption_flow.zig");
