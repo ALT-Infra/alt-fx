@@ -1452,11 +1452,6 @@ fn surfaceTestContext(input: *InputRuntime) RenderContext {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .input = input,
     };
 }
@@ -1558,11 +1553,6 @@ test "surface footer measurement preserves the narrow tool activity projection" 
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .activity = .{ .tool_slot = .{
             .entry_id = 123,
             .fallback_label = "reading src/main.zig",
@@ -1599,11 +1589,6 @@ test "surface footer measurement preserves route recovery status tone" {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .activity = .{ .turn_thinking = .{
             .label = "⚠ blocked · content filter",
             .tone = .danger,
@@ -1668,11 +1653,6 @@ test "surface footer measurement keeps clipped command status transcript-owned" 
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .activity = .{ .tool_slot = .{
             .entry_id = status_id,
             .fallback_label = "running read-only tools",
@@ -2985,12 +2965,7 @@ test "file approval reservation-only sizing matches measured subagent view" {
     };
     defer shell.deinit(alloc);
 
-    var ctx = surfaceTestContext(&input);
-    ctx.subagent_count = 1;
-    ctx.subagent_view_active = true;
-    ctx.selected_subagent_id = 7;
-    ctx.selected_subagent_label = "reviewer";
-    ctx.selected_subagent_status = .running;
+    const ctx = surfaceTestContext(&input);
 
     var measured = try measureSurfaceFooter(
         alloc,
@@ -3054,12 +3029,7 @@ test "file approval preparation over active subagent view keeps a valid footer i
         .hint = 40,
     };
 
-    var ctx = surfaceTestContext(&input);
-    ctx.subagent_count = 1;
-    ctx.subagent_view_active = true;
-    ctx.selected_subagent_id = 7;
-    ctx.selected_subagent_label = "reviewer";
-    ctx.selected_subagent_status = .completed;
+    const ctx = surfaceTestContext(&input);
 
     var metrics = Metrics{};
     var force_redraw = false;

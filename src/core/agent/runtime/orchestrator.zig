@@ -555,7 +555,6 @@ fn project_terminal_request_messages(
 
 const SubagentHistoryDisposition = enum {
     current,
-    mapped,
     inert,
 };
 
@@ -593,81 +592,6 @@ fn legacy_subagent_action(arguments_json: []const u8) ?[]const u8 {
     return "unknown";
 }
 
-fn project_legacy_subagent_arguments(
-    alloc: Allocator,
-    arguments_json: []const u8,
-) Allocator.Error!?[]u8 {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, arguments_json, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return null,
-    };
-    defer parsed.deinit();
-    if (parsed.value != .object) return null;
-    const command = parsed.value.object.get("command") orelse return null;
-    if (command != .object or command.object.count() != 1) return null;
-    const arena = parsed.arena.allocator();
-    const branch_name = command.object.keys()[0];
-    const branch = command.object.values()[0];
-    if (branch != .object) return null;
-
-    var request = std.json.Value{ .object = .empty };
-    if (std.mem.eql(u8, branch_name, "create")) {
-        const task = branch.object.get("prompt") orelse return null;
-        if (task != .string or task.string.len == 0) return null;
-        try request.object.put(arena, "action", .{ .string = "run" });
-        try request.object.put(arena, "task", task);
-        for ([_][]const u8{ "model", "effort" }) |name| {
-            if (branch.object.get(name)) |value| {
-                if (value != .string) return null;
-                try request.object.put(arena, name, value);
-            }
-        }
-    } else if (std.mem.eql(u8, branch_name, "inspect")) {
-        const child_id = branch.object.get("id") orelse return null;
-        const sections = branch.object.get("sections") orelse return null;
-        const wait = branch.object.get("wait") orelse return null;
-        if (child_id != .string or sections != .array or
-            sections.array.items.len != 1 or sections.array.items[0] != .string or
-            !std.mem.eql(u8, sections.array.items[0].string, "status") or
-            wait != .object or branch.object.get("cursor") != null)
-        {
-            return null;
-        }
-        const until = wait.object.get("until") orelse return null;
-        if (until != .string or !std.mem.eql(u8, until.string, "settled")) return null;
-        try request.object.put(arena, "action", .{ .string = "wait" });
-        try request.object.put(arena, "child_id", child_id);
-    } else if (std.mem.eql(u8, branch_name, "message")) {
-        if (branch.object.count() != 1) return null;
-        const send = branch.object.get("send") orelse return null;
-        if (send != .object) return null;
-        const child_id = send.object.get("id") orelse return null;
-        const message = send.object.get("content") orelse return null;
-        if (child_id != .string or message != .string) return null;
-        try request.object.put(arena, "action", .{ .string = "send" });
-        try request.object.put(arena, "child_id", child_id);
-        try request.object.put(arena, "message", message);
-    } else if (std.mem.eql(u8, branch_name, "lifecycle")) {
-        const child_id = branch.object.get("id") orelse return null;
-        const action = branch.object.get("action") orelse return null;
-        if (child_id != .string or action != .string or
-            !std.mem.eql(u8, action.string, "cancel"))
-        {
-            return null;
-        }
-        try request.object.put(arena, "action", .{ .string = "stop" });
-        try request.object.put(arena, "child_id", child_id);
-    } else {
-        return null;
-    }
-
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    std.json.Stringify.value(.{ .request = request }, .{}, &out.writer) catch
-        return error.OutOfMemory;
-    return try out.toOwnedSlice();
-}
-
 fn project_subagent_result_content(
     alloc: Allocator,
     content: []const u8,
@@ -679,37 +603,25 @@ fn project_subagent_result_content(
     defer parsed.deinit();
     if (parsed.value != .object) return null;
     const object = parsed.value.object;
-    if (object.count() == 5 and object.get("operation_id") == null and
-        object.get("requested") == null and object.get("cursor") == null)
+    if (object.count() == 3 and object.get("ok") != null and
+        object.get("result") != null and object.get("error_code") != null)
     {
         return null;
     }
     const ok = object.get("ok") orelse return null;
-    const child_id = object.get("child_id") orelse return null;
-    const status = object.get("status") orelse return null;
     const error_code = object.get("error_code") orelse return null;
-    const retryable = object.get("retryable") orelse return null;
-    if (ok != .bool or (child_id != .null and child_id != .string) or
-        status != .string or (error_code != .null and error_code != .string) or
-        retryable != .bool)
+    const result = object.get("result") orelse .null;
+    if (ok != .bool or (error_code != .null and error_code != .string) or
+        (result != .null and result != .string))
     {
         return null;
     }
 
     const arena = parsed.arena.allocator();
-    const model_child_id = if (child_id == .string)
-        std.json.Value{ .string = try subagent_model_contract.modelChildIdAlloc(
-            arena,
-            child_id.string,
-        ) }
-    else
-        child_id;
     var compact = std.json.Value{ .object = .empty };
     try compact.object.put(arena, "ok", ok);
-    try compact.object.put(arena, "child_id", model_child_id);
-    try compact.object.put(arena, "status", status);
+    try compact.object.put(arena, "result", result);
     try compact.object.put(arena, "error_code", error_code);
-    try compact.object.put(arena, "retryable", retryable);
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     std.json.Stringify.value(compact, .{}, &out.writer) catch return error.OutOfMemory;
@@ -757,15 +669,10 @@ fn project_subagent_request_messages(
                 continue;
             }
             if (legacy_subagent_action(call.arguments_json)) |action| {
-                const projected = try project_legacy_subagent_arguments(
-                    alloc,
-                    call.arguments_json,
-                );
-                if (projected) |arguments| alloc.free(arguments);
                 try calls.append(alloc, .{
                     .id = call.id,
                     .action = action,
-                    .disposition = if (projected != null) .mapped else .inert,
+                    .disposition = .inert,
                 });
                 needs_projection = true;
                 continue;
@@ -820,6 +727,7 @@ fn project_subagent_request_messages(
             if (find_subagent_history_call(calls.items, message.tool_call_id.?)) |call| {
                 if (call.disposition == .inert) {
                     if (target.content) |content| alloc.free(@constCast(content));
+                    target.content = null;
                     target.role = .assistant;
                     target.content = try subagent_history_summary(
                         alloc,
@@ -850,13 +758,10 @@ fn project_subagent_request_messages(
                     null;
                 if (history_call) |known| {
                     if (known.disposition == .inert) continue;
-                    const arguments = if (known.disposition == .mapped)
-                        (try project_legacy_subagent_arguments(alloc, call.arguments_json)).?
-                    else
-                        (try normalized_subagent_request_arguments(
-                            alloc,
-                            call.arguments_json,
-                        )) orelse try alloc.dupe(u8, call.arguments_json);
+                    const arguments = (try normalized_subagent_request_arguments(
+                        alloc,
+                        call.arguments_json,
+                    )) orelse try alloc.dupe(u8, call.arguments_json);
                     var copied = call;
                     copied.arguments_json = arguments;
                     projected_calls.append(alloc, copied) catch |err| {
@@ -879,14 +784,14 @@ fn project_subagent_request_messages(
         {
             target.content = try alloc.dupe(
                 u8,
-                "Prior subagent manager actions are represented as completed history summaries below.",
+                "Prior removed subagent actions are represented as completed history summaries below.",
             );
         }
     }
     return projected;
 }
 
-test "subagent history maps representable manager calls and makes removed actions inert" {
+test "subagent history makes every removed manager action inert" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -934,17 +839,13 @@ test "subagent history maps representable manager calls and makes removed action
         &messages,
     );
     try std.testing.expect(projected.ptr != messages[0..].ptr);
-    try std.testing.expectEqual(@as(usize, 2), projected[0].tool_calls.len);
-    try std.testing.expectEqualStrings(
-        "{\"request\":{\"action\":\"run\",\"task\":\"do it\"}}",
-        projected[0].tool_calls[0].arguments_json,
-    );
-    try std.testing.expectEqualStrings(calls[2].arguments_json, projected[0].tool_calls[1].arguments_json);
-    try std.testing.expect(std.mem.find(u8, projected[1].content.?, "operation_id") == null);
+    try std.testing.expectEqual(@as(usize, 1), projected[0].tool_calls.len);
+    try std.testing.expectEqualStrings(calls[2].arguments_json, projected[0].tool_calls[0].arguments_json);
+    try std.testing.expectEqual(types.ChatRole.assistant, projected[1].role);
     try std.testing.expect(std.mem.find(
         u8,
         projected[1].content.?,
-        "1788212822437-350000-0924a40611358d88",
+        "Prior subagent create action completed",
     ) != null);
     try std.testing.expectEqual(types.ChatRole.assistant, projected[2].role);
     try std.testing.expect(std.mem.find(
@@ -1039,8 +940,7 @@ fn normalized_terminal_request_arguments(
 }
 
 fn managed_subagent_action(action: []const u8) ?[]const u8 {
-    if (std.mem.eql(u8, action, "cancel")) return "stop";
-    for ([_][]const u8{ "run", "wait", "send", "stop" }) |known| {
+    for ([_][]const u8{ "run", "message" }) |known| {
         if (std.mem.eql(u8, action, known)) return known;
     }
     return null;
@@ -1246,9 +1146,9 @@ test "subagent request normalization follows effective attempt advertisement" {
     };
     const registry = tool_dispatch.Registry{ .tools = &.{nested} };
     const calls = [_]ToolCall{
-        .{ .id = "flat", .name = "subagent", .arguments_json = "{\"action\":\"wait\",\"child_id\":\"child-1\"}" },
-        .{ .id = "cancel", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"cancel\",\"child_id\":\"child-2\"}}" },
-        .{ .id = "canonical", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"stop\",\"child_id\":\"child-3\"}}" },
+        .{ .id = "flat", .name = "subagent", .arguments_json = "{\"action\":\"run\",\"task\":\"review\"}" },
+        .{ .id = "message", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"review\"}}" },
+        .{ .id = "canonical", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"run\",\"task\":\"canonical\"}}" },
         .{ .id = "legacy", .name = "subagent", .arguments_json = "{\"command\":{\"lifecycle\":{\"id\":\"child-4\",\"action\":\"cancel\"}}}" },
     };
 
@@ -1263,11 +1163,11 @@ test "subagent request normalization follows effective attempt advertisement" {
     );
     try std.testing.expect(normalized.ptr != calls[0..].ptr);
     try std.testing.expectEqualStrings(
-        "{\"request\":{\"action\":\"wait\",\"child_id\":\"child-1\"}}",
+        "{\"request\":{\"action\":\"run\",\"task\":\"review\"}}",
         normalized[0].arguments_json,
     );
     try std.testing.expectEqualStrings(
-        "{\"request\":{\"action\":\"stop\",\"child_id\":\"child-2\"}}",
+        calls[1].arguments_json,
         normalized[1].arguments_json,
     );
     try std.testing.expectEqual(calls[2].arguments_json.ptr, normalized[2].arguments_json.ptr);
@@ -6506,11 +6406,23 @@ fn processQueuedPromptLoop(
                 null,
             );
 
-            const parallel_candidate_len = if (successful_vision_mode != .required and
+            const parallel_group = if (successful_vision_mode != .required and
                 !context_delta and
-                (root_action_permission_mode == .auto or root_action_permission_mode == .yolo) and
                 deps.live_tool_authority == null)
-                runtime_parallel_execution.parallelReadOnlyPrefixLen(deps.tool_registry, effective_tool_calls[tool_call_index..])
+                runtime_parallel_execution.leadingParallelGroup(
+                    deps.tool_registry,
+                    effective_tool_calls[tool_call_index..],
+                )
+            else
+                runtime_parallel_execution.LeadingGroup{};
+            const parallel_permission_eligible = switch (parallel_group.kind) {
+                .none => false,
+                .read_only => root_action_permission_mode == .auto or
+                    root_action_permission_mode == .yolo,
+                .subagent => true,
+            };
+            const parallel_candidate_len = if (parallel_permission_eligible)
+                parallel_group.len
             else
                 0;
             const parallel_len = if (parallel_candidate_len > 1) parallel: {
@@ -6799,7 +6711,13 @@ fn processQueuedPromptLoop(
                             };
                         }
                     }
-                    debug_trace.eventf("tool", "parallel_read_only_start", step_ctx, "count={d}", .{executable_calls.items.len});
+                    debug_trace.eventf(
+                        "tool",
+                        "parallel_tool_group_start",
+                        step_ctx,
+                        "kind={s} count={d}",
+                        .{ @tagName(parallel_group.kind), executable_calls.items.len },
+                    );
                     const parallel_execution_root_user_context = try buildToolExecutionRootUserContext(
                         arena,
                         root_user_intent_context,
@@ -6818,7 +6736,7 @@ fn processQueuedPromptLoop(
                         .classification_complete = executable_classification_complete.items,
                     };
                     if (comptime host_target.is_wasm) {
-                        parallel_run = try runtime_parallel_execution.runSequentialReadOnlyCalls(arena, executable_calls.items, .{
+                        parallel_run = try runtime_parallel_execution.runSequentialCalls(arena, executable_calls.items, .{
                             .exec_ctx = &parallel_exec_ctx,
                             .execute = runtime_parallel_execution.parallelHookExecute,
                             .format_ctx = &parallel_exec_ctx,
@@ -6826,7 +6744,7 @@ fn processQueuedPromptLoop(
                             .cancel_flag = config.cancel_flag,
                         });
                     } else {
-                        parallel_run = try runtime_parallel_execution.runParallelReadOnlyCalls(arena, executable_calls.items, .{
+                        parallel_run = try runtime_parallel_execution.runParallelCalls(arena, executable_calls.items, .{
                             .exec_ctx = &parallel_exec_ctx,
                             .execute = runtime_parallel_execution.parallelHookExecute,
                             .format_ctx = &parallel_exec_ctx,
@@ -6874,10 +6792,13 @@ fn processQueuedPromptLoop(
                 );
                 debug_trace.eventf(
                     "tool",
-                    "parallel_read_only_finish",
+                    "parallel_tool_group_finish",
                     step_ctx,
-                    "count={d}",
-                    .{if (parallel_run) |run| run.attempts.len else 0},
+                    "kind={s} count={d}",
+                    .{
+                        @tagName(parallel_group.kind),
+                        if (parallel_run) |run| run.attempts.len else 0,
+                    },
                 );
                 if (config.cancel_flag.load(.seq_cst)) {
                     runtime_telemetry.traceCancelObserved(step_ctx, true);

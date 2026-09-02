@@ -190,36 +190,23 @@ const ask_user_question_question_schema = model_tool_schema.ObjectSchema{
 };
 
 const subagent_description =
-    "Delegate independent work to one managed child. Use run with a task; fx returns the child ID. Omit model and effort to inherit the current settings; never invent a model ID. Use wait only when the current turn needs the child settled, send for one follow-up to that exact child, and stop to cancel owned active work. Child persistence, inspection, notification, relationship, permission, and lifecycle mechanics are owned by fx.";
+    "Delegate work and receive one terminal child result. Use run for one temporary child and one task. Use message with a stable name to create or continue a persistent conversation in this parent session. Optional instructions replace only that child's system overlay; fx preserves its trusted base prompt. fx owns timing, worker identities, cancellation, permissions, persistence, and cleanup.";
 
 const subagent_model_run_properties = [_]model_tool_schema.Property{
     .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"run"} } },
-    .{ .name = "task", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_prompt_bytes }, .description = "Complete delegated task. fx creates one persistent child and owns its lifecycle." },
-    .{ .name = "model", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_model_bytes }, .description = "Optional exact configured model ID. Omit to inherit the current model; never guess an ID." },
-    .{ .name = "effort", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = types.ReasoningEffort.max_name_bytes }, .description = "Optional reasoning effort override. Omit to inherit the current effort." },
+    .{ .name = "task", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_prompt_bytes }, .description = "One complete task for a temporary child. The child inherits the parent model and effort and accepts no follow-up." },
 };
 
-const subagent_model_wait_properties = [_]model_tool_schema.Property{
-    .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"wait"} }, .description = "Wait once for the exact child. Provide only action and child_id; fx owns the bounded wait." },
-    .{ .name = "child_id", .json_type = .string, .bounds = &.{ .min_length = 1 }, .description = "Exact child ID returned by run." },
-};
-
-const subagent_model_send_properties = [_]model_tool_schema.Property{
-    .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"send"} } },
-    .{ .name = "child_id", .json_type = .string, .bounds = &.{ .min_length = 1 }, .description = "Exact messageable child ID returned by run." },
-    .{ .name = "message", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_message_bytes }, .description = "One follow-up instruction for the same child." },
-};
-
-const subagent_model_stop_properties = [_]model_tool_schema.Property{
-    .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"stop"} }, .description = "Stop owned active work. Already-settled children remain unchanged." },
-    .{ .name = "child_id", .json_type = .string, .bounds = &.{ .min_length = 1 }, .description = "Exact child ID returned by run." },
+const subagent_model_message_properties = [_]model_tool_schema.Property{
+    .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"message"} } },
+    .{ .name = "agent", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_agent_name_bytes }, .description = "Stable lowercase name for one persistent conversation in this parent session. A new valid name creates it; later calls continue it." },
+    .{ .name = "instructions", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_instructions_bytes }, .description = "Optional persistent instructions for this child. When present, replaces its child-specific system overlay before this message; when omitted, preserves the existing overlay. Cannot replace fx's trusted base prompt or widen authority." },
+    .{ .name = "message", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_message_bytes }, .description = "Next message for that named agent. fx creates it on first use and continues it afterward." },
 };
 
 const subagent_model_action_schemas = [_]model_tool_schema.ObjectSchema{
     .{ .properties = &subagent_model_run_properties, .required = &.{ "action", "task" }, .additional_properties = false },
-    .{ .properties = &subagent_model_wait_properties, .required = &.{ "action", "child_id" }, .additional_properties = false },
-    .{ .properties = &subagent_model_send_properties, .required = &.{ "action", "child_id", "message" }, .additional_properties = false },
-    .{ .properties = &subagent_model_stop_properties, .required = &.{ "action", "child_id" }, .additional_properties = false },
+    .{ .properties = &subagent_model_message_properties, .required = &.{ "action", "agent", "message" }, .additional_properties = false },
 };
 
 const subagent_model_action_union = model_tool_schema.ObjectSchema{
@@ -930,7 +917,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "69d5b313e8f44153775b1ab28c43de48fca702d2f9e7af12d2b7147fe497a714",
+        "14209d2ea5707d98618a0e98f70b03e739074b66f48e2f59299e1d1d4376ff6e",
         &actual_hex,
     );
 }
@@ -1378,13 +1365,14 @@ test "built-in subagent owns product metadata schema and callbacks" {
     defer std.testing.allocator.free(schema_json);
 
     try std.testing.expectEqualStrings("subagent", subagent.name);
-    try std.testing.expect(std.mem.find(u8, subagent.description, "one managed child") != null);
-    try std.testing.expect(std.mem.find(u8, subagent.description, "never invent a model ID") != null);
+    try std.testing.expect(std.mem.find(u8, subagent.description, "one temporary child") != null);
+    try std.testing.expect(std.mem.find(u8, subagent.description, "stable name") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"request\":{") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"request\"]") != null);
-    for ([_][]const u8{ "run", "wait", "send", "stop" }) |action| {
+    for ([_][]const u8{ "run", "message" }) |action| {
         try std.testing.expect(std.mem.find(u8, schema_json, action) != null);
     }
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"instructions\":") != null);
     for ([_][]const u8{
         "\"command\":",
         "\"relationship\":",
@@ -1394,6 +1382,12 @@ test "built-in subagent owns product metadata schema and callbacks" {
         "\"cursor\":",
         "\"generation\":",
         "\"reopen\"",
+        "\"model\"",
+        "\"effort\"",
+        "\"send\"",
+        "\"wait\"",
+        "\"stop\"",
+        "\"child_id\"",
     }) |mechanism| {
         try std.testing.expect(std.mem.find(u8, schema_json, mechanism) == null);
     }

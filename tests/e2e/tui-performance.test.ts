@@ -59,8 +59,6 @@ const MEASURED_ACTION_NAMES = [
   "fileQuery",
   "questionNavigate",
   "approvalNavigate",
-  "hostedTerminalInput",
-  "subagentManagerOpen",
   "fullOpen",
   "fullScroll",
   "fullScrollCacheMiss",
@@ -70,12 +68,9 @@ const MEASURED_ACTION_NAMES = [
   ...LOCAL_MENU_ACTIONS.map((action) => action.name),
 ] as const;
 
-const INFORMATIONAL_PANE_ACTION_NAMES = new Set<string>([
-  "hostedTerminalInput",
-]);
+const INFORMATIONAL_PANE_ACTION_NAMES = new Set<string>();
 
 const APP_PANE_ACTION_NAMES = new Set<string>([
-  "subagentManagerOpen",
   ...LOCAL_MENU_ACTIONS.map((action) => action.name),
 ]);
 
@@ -930,16 +925,6 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
         }
       }
 
-      for (let cycle = 0; cycle < WARMUPS + SAMPLES; cycle += 1) {
-        const before = await session.capturePane();
-        const open = await measurePaneAction(
-          () => session!.sendKeysImmediate(["C-x"]),
-          () => waitForPaneText(session!, "Agents & processes", before),
-        );
-        await closeSurface(session, "Agents & processes", "C-x");
-        if (cycle >= WARMUPS) appendMeasured(samples.subagentManagerOpen, open);
-      }
-
       await session.sendText("Open the performance question.");
       await session.waitForText("Which performance path should I use?", TIMEOUT);
       for (let cycle = 0; cycle < WARMUPS + SAMPLES; cycle += 1) {
@@ -977,22 +962,6 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
       session.sendKeysImmediate(["1"]);
       await session.waitForText("PERF_TERMINAL_AGENT_READY", TIMEOUT);
       await session.waitForComposer(TIMEOUT);
-      session.sendKeysImmediate(["C-x"]);
-      await session.waitForText("Background processes", TIMEOUT);
-      session.sendKeysImmediate(["Enter"]);
-      await session.waitForText("PERF_TERMINAL_READY", TIMEOUT);
-      for (let cycle = 0; cycle < WARMUPS + SAMPLES; cycle += 1) {
-        const before = await session.capturePane();
-        const input = await measurePaneAction(
-          () => session!.sendLiteralImmediate(cycle % 2 === 0 ? "x" : "y"),
-          () => waitForPaneChange(session!, before),
-        );
-        if (cycle >= WARMUPS) appendMeasured(samples.hostedTerminalInput, input);
-      }
-      await session.sendHexBytes(["1d", "64"]);
-      await session.waitForText("Background processes", TIMEOUT);
-      session.sendKeysImmediate(["C-x"]);
-      await session.waitForComposer(TIMEOUT);
       await session.sendText("Close the performance terminal.");
       await session.waitForText("shell stop", TIMEOUT);
       session.sendKeysImmediate(["1"]);
@@ -1013,8 +982,6 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
         boundary: "recorded application stdin frame to recorded stdout frame",
         boundaryExceptions: {
           catalogMenus: "user input dispatch to changed exclusive catalog pane",
-          subagentManagerOpen: "user input dispatch to changed manager pane",
-          hostedTerminalInput: "user input dispatch to changed hosted-terminal pane",
         },
         buildMode: "ReleaseSafe",
         warmups: WARMUPS,
