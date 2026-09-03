@@ -295,6 +295,10 @@ fn availableWithoutKey(provider: ProtocolProvider, model_id: []const u8) bool {
 }
 
 fn supportsChatCompletions(provider: ProtocolProvider, model_id: []const u8) bool {
+    // models.dev tags qwen3.8-flash with the Anthropic SDK, but OpenCode
+    // serves it on its OpenAI-compatible Go endpoint like its siblings
+    // (qwen3.8-max has no override and works), so accept it explicitly.
+    if (std.mem.eql(u8, model_id, "qwen3.8-flash")) return true;
     const npm = if (provider.models.map.get(model_id)) |model|
         if (model.provider) |model_provider|
             model_provider.npm orelse provider.npm
@@ -376,6 +380,17 @@ test "parseCatalog hides live models that require unsupported OpenCode protocols
         error.InvalidOpenCodeModelCatalog,
         parseCatalog(std.testing.allocator, unsupported_zen, unsupported_go, protocols, true),
     );
+}
+
+test "parseCatalog keeps qwen3.8-flash despite its Anthropic protocol tag" {
+    const zen = "{\"data\":[]}";
+    const go = "{\"data\":[{\"id\":\"qwen3.8-max\"},{\"id\":\"qwen3.8-flash\"}]}";
+    const protocols = "{\"opencode\":{\"npm\":\"@ai-sdk/openai-compatible\",\"models\":{}},\"opencode-go\":{\"npm\":\"@ai-sdk/openai-compatible\",\"models\":{\"qwen3.8-flash\":{\"provider\":{\"npm\":\"@ai-sdk/anthropic\"}}}}}";
+    var catalog = try parseCatalog(std.testing.allocator, zen, go, protocols, true);
+    defer model_catalog.freeModelCatalog(std.testing.allocator, &catalog);
+    try std.testing.expectEqual(@as(usize, 2), catalog.items.len);
+    try std.testing.expectEqualStrings("go/qwen3.8-max", catalog.items[0].id);
+    try std.testing.expectEqualStrings("go/qwen3.8-flash", catalog.items[1].id);
 }
 
 test "new live OpenCode models inherit dynamic provider protocol defaults" {
