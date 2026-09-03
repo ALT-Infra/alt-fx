@@ -294,11 +294,20 @@ fn availableWithoutKey(provider: ProtocolProvider, model_id: []const u8) bool {
     return std.mem.endsWith(u8, model_id, "-free");
 }
 
+/// models.dev per-model SDK tags describe direct provider access, but OpenCode
+/// re-serves everything on its OpenAI-compatible endpoints, so a tag other
+/// than openai-compatible does not always mean fx cannot drive the model.
+/// Entries here are verified live through fx and stay until models.dev
+/// corrects the tag. Do not extend without a live chat-completion check.
+const chat_completions_overrides: []const []const u8 = &.{
+    // Tagged @ai-sdk/anthropic; served on the Go endpoint like its siblings.
+    "qwen3.8-flash",
+};
+
 fn supportsChatCompletions(provider: ProtocolProvider, model_id: []const u8) bool {
-    // models.dev tags qwen3.8-flash with the Anthropic SDK, but OpenCode
-    // serves it on its OpenAI-compatible Go endpoint like its siblings
-    // (qwen3.8-max has no override and works), so accept it explicitly.
-    if (std.mem.eql(u8, model_id, "qwen3.8-flash")) return true;
+    for (chat_completions_overrides) |id| {
+        if (std.mem.eql(u8, model_id, id)) return true;
+    }
     const npm = if (provider.models.map.get(model_id)) |model|
         if (model.provider) |model_provider|
             model_provider.npm orelse provider.npm
