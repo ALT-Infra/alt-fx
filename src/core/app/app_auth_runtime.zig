@@ -56,6 +56,19 @@ fn selectCatalogModel(
     return if (entries.len > 0) entries[0].id else null;
 }
 
+const TeamCatalogValidation = union(enum) {
+    rejected,
+    accepted: ?[]u8,
+
+    fn deinit(self: *TeamCatalogValidation, alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .accepted => |model| if (model) |owned| alloc.free(owned),
+            .rejected => {},
+        }
+        self.* = undefined;
+    }
+};
+
 pub fn Runtime(comptime App: type) type {
     return struct {
         fn ensurePromptCredential(app: *App) !bool {
@@ -114,9 +127,21 @@ pub fn Runtime(comptime App: type) type {
                 try beginSignIn(app, false);
                 return;
             }
-            try app.auth.refreshSourceInventory(app.alloc);
-            app.auth.openPickerForProvider(app.alloc, provider_runtime.provider(app));
-            app.shell.render_requests.request(.footer);
+            switch (app.auth.beginSourceInventoryRefresh(app.alloc, .{
+                .provider = provider_runtime.provider(app),
+            })) {
+                .started => {},
+                .busy => try writeAuthNotice(app, .{
+                    .topic = "auth",
+                    .tone = .warning,
+                    .body = "Authentication inventory refresh is already in progress.",
+                }),
+                .failed => try writeAuthNotice(app, .{
+                    .topic = "auth",
+                    .tone = .@"error",
+                    .body = "Authentication sources could not be checked. The picker remains closed.",
+                }),
+            }
         }
 
         pub fn runLogoutCommand(app: *App, target: []const u8) !void {
@@ -167,7 +192,7 @@ pub fn Runtime(comptime App: type) type {
             else
                 .gateway;
             const provider_inventory = if (comptime @hasDecl(@TypeOf(app.auth), "pickerView")) inventory: {
-                try app.auth.refreshSourceInventory(app.alloc);
+                try app.auth.refreshSourceInventoryForLogout(app.alloc);
                 break :inventory app.auth.pickerView().available_sources;
             } else @as(auth_runtime.SourceSet, .empty);
             const logout_provider = auth_transition.decideLogoutProvider(.{
@@ -300,9 +325,38 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return;
             }
-            try app.auth.refreshSourceInventory(app.alloc);
-            app.auth.openPickerForProvider(app.alloc, provider_runtime.provider(app));
-            app.shell.render_requests.request(.footer);
+            switch (app.auth.beginSourceInventoryRefresh(app.alloc, .{
+                .provider = provider_runtime.provider(app),
+            })) {
+                .started => {},
+                .busy => try writeAuthNotice(app, .{
+                    .topic = "auth",
+                    .tone = .warning,
+                    .body = "Authentication inventory refresh is already in progress.",
+                }),
+                .failed => try writeAuthNotice(app, .{
+                    .topic = "auth",
+                    .tone = .@"error",
+                    .body = "Authentication sources could not be checked. The picker remains closed.",
+                }),
+            }
+        }
+
+        pub fn collectSourceInventoryFacts(app: *App) !void {
+            const result = app.auth.takeSourceInventoryRefresh() orelse return;
+            switch (result) {
+                .ready => |action| {
+                    app.auth.openPickerForProvider(app.alloc, action.provider);
+                    app.shell.render_requests.request(.footer);
+                },
+                .failed => {
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .@"error",
+                        .body = "Authentication sources could not be checked. The picker was not opened with stale data.",
+                    });
+                },
+            }
         }
 
         fn applyLogoutResult(app: *App, result: login_flow.LogoutResult) !void {
@@ -457,26 +511,21 @@ pub fn Runtime(comptime App: type) type {
                     defer owned.deinit(app.alloc);
                     switch (owned) {
                         .vercel => |*selection| {
-                            if (!try selectCredentialSource(app, .fx_login)) {
+                            if (selection.teams.items.len == 0) {
                                 _ = app.auth.popPickerStage(app.alloc);
                                 try writeAuthNotice(app, .{
                                     .topic = "auth",
                                     .tone = .@"error",
-                                    .body = "Signed in, but the fx login credential could not be loaded.",
+                                    .body = "Signed in to Vercel, but no Vercel teams could be loaded. The current credential is unchanged.",
                                 });
                                 return;
                             }
-                            rememberCredentialSource(app, .fx_login);
-
-                            if (selection.teams.items.len > 0) {
-                                app.auth.openTeamPicker(app.alloc, selection);
-                            } else {
-                                app.auth.closePicker(app.alloc);
-                            }
+                            try app.auth.refreshSourceInventory(app.alloc);
+                            app.auth.openTeamPicker(app.alloc, selection);
                             try writeAuthNotice(app, .{
                                 .topic = "auth",
                                 .tone = .neutral,
-                                .body = "Signed in to Vercel.",
+                                .body = "Signed in to Vercel. Choose a team to finish setup.",
                             });
                         },
                         .chatgpt => {
@@ -940,13 +989,27 @@ pub fn Runtime(comptime App: type) type {
             }
             try app.flushBeforeBlockingExternalWork();
 
-            const resolution = credentials.resolveForProvider(
+            var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch |err| {
+                debug_trace.logf("provider", "settings load failed err={s}", .{@errorName(err)});
+                try app.writeDomainNotice(.{
+                    .topic = "provider",
+                    .tone = .@"error",
+                    .body = providerFailureMessage(
+                        intent,
+                        "Could not load the saved provider selection. The current provider is unchanged.",
+                        "Subscription sign-in completed, but the saved provider selection could not be loaded. The current provider is unchanged.",
+                    ),
+                }, true);
+                return;
+            };
+            defer settings.deinit(app.alloc);
+
+            var credential = (auth_runtime.prepareCredential(
                 app.alloc,
                 app.auth.oauthTransport(),
                 app.auth.secretStore(),
-                .refresh_if_needed,
                 target,
-                null,
+                if (target == .gateway) settings.credential_source else null,
             ) catch |err| {
                 debug_trace.logf("provider", "credential preparation failed provider={t} err={s}", .{ target, @errorName(err) });
                 try app.writeDomainNotice(.{
@@ -959,8 +1022,7 @@ pub fn Runtime(comptime App: type) type {
                     ),
                 }, true);
                 return;
-            };
-            var credential = resolution.credential orelse {
+            }) orelse {
                 if (target == .codex and allow_login) {
                     try beginCodexSignInForProviderSwitch(app);
                     return;
@@ -996,18 +1058,6 @@ pub fn Runtime(comptime App: type) type {
                 return;
             };
             defer credential.deinit(app.alloc);
-            if (!model_provider.authorizesCredential(target, credential.source)) {
-                try app.writeDomainNotice(.{
-                    .topic = "provider",
-                    .tone = .@"error",
-                    .body = providerFailureMessage(
-                        intent,
-                        "The target credential cannot authorize that provider. The current provider is unchanged.",
-                        "Subscription sign-in completed, but its credential cannot authorize the provider. The current provider is unchanged.",
-                    ),
-                }, true);
-                return;
-            }
 
             const access = credentials.catalogAccessForCredentialAndAccount(
                 credential.source,
@@ -1058,20 +1108,6 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
 
-            var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch |err| {
-                debug_trace.logf("provider", "settings load failed err={s}", .{@errorName(err)});
-                try app.writeDomainNotice(.{
-                    .topic = "provider",
-                    .tone = .@"error",
-                    .body = providerFailureMessage(
-                        intent,
-                        "Could not load the saved provider model. The current provider is unchanged.",
-                        "Subscription sign-in completed, but its saved provider model could not be loaded. The current provider is unchanged.",
-                    ),
-                }, true);
-                return;
-            };
-            defer settings.deinit(app.alloc);
             const saved_model = settings.models.get(target);
             const current_model = if (intent == .post_oauth and current == target)
                 provider_runtime.model(app)
@@ -1189,6 +1225,30 @@ pub fn Runtime(comptime App: type) type {
             );
             defer app.alloc.free(body);
 
+            var candidate = selection.validationCredential(app.alloc, index) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                debug_trace.logf("auth", "team validation credential failed err={s}", .{@errorName(err)});
+                app.auth.closePicker(app.alloc);
+                try app.writeDomainNotice(.{
+                    .topic = "auth",
+                    .tone = .@"error",
+                    .body = "The selected Vercel team could not be validated. The current team is unchanged.",
+                }, true);
+                return;
+            };
+            defer candidate.deinit(app.alloc);
+            var validation = try validateTeamCredential(app, candidate);
+            defer validation.deinit(app.alloc);
+            if (validation == .rejected) {
+                app.auth.closePicker(app.alloc);
+                try app.writeDomainNotice(.{
+                    .topic = "auth",
+                    .tone = .@"error",
+                    .body = "The selected Vercel team could not be validated for AI Gateway. The current team is unchanged.",
+                }, true);
+                return;
+            }
+
             var selected_team = selection.select(app.alloc, index) catch |err| {
                 debug_trace.logf("auth", "team change failed err={s}", .{@errorName(err)});
                 app.auth.closePicker(app.alloc);
@@ -1204,6 +1264,31 @@ pub fn Runtime(comptime App: type) type {
             };
             defer selected_team.deinit(app.alloc);
 
+            var model_persistence_failed = false;
+            if (comptime provider_runtime.supported(App)) {
+                if (validation.accepted) |selected_model| {
+                    try provider_runtime.replaceModel(app, selected_model);
+                    if (comptime @hasDecl(App, "persistRuntimePreferences")) {
+                        var persistence = app.persistRuntimePreferences(.{
+                            .provider = .gateway,
+                            .model = provider_runtime.model(app),
+                        });
+                        defer persistence.deinit(app.alloc);
+                        model_persistence_failed = persistence.settings_error != null or
+                            persistence.session_error != null;
+                    } else {
+                        var persistence = config_runtime.attemptUserPreferences(app.alloc, .{
+                            .model_preference = .{
+                                .provider = .gateway,
+                                .model = provider_runtime.model(app),
+                            },
+                        });
+                        defer persistence.deinit(app.alloc);
+                        model_persistence_failed = persistence == .failure;
+                    }
+                }
+            }
+
             if (app.auth.credentialSource() == .fx_login) {
                 applyCredentialChange(app, app.auth.adoptSelectedTeam(app.alloc, &selected_team));
             } else if (!try selectCredentialSource(app, .fx_login)) {
@@ -1217,11 +1302,51 @@ pub fn Runtime(comptime App: type) type {
             }
             rememberCredentialSource(app, .fx_login);
             app.auth.closePicker(app.alloc);
-            try app.writeDomainNotice(.{
+            try app.writeDomainNotice(if (model_persistence_failed) .{
+                .topic = "auth",
+                .tone = .warning,
+                .body = "The Vercel team changed and a valid model was selected for this run, but the model preference could not be saved.",
+            } else .{
                 .topic = "auth",
                 .tone = .neutral,
                 .body = body,
             }, true);
+        }
+
+        fn validateTeamCredential(
+            app: *App,
+            candidate: credentials.Credential,
+        ) std.mem.Allocator.Error!TeamCatalogValidation {
+            const access = credentials.catalogAccessAt(candidate, io_mod.milliTimestamp());
+            if (access.authorizationCredential() == null) return .rejected;
+            const fetched = app.fetchProviderCatalog(.gateway, access) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                debug_trace.logf("auth", "team catalog validation failed err={s}", .{@errorName(err)});
+                return .rejected;
+            };
+            return switch (fetched) {
+                .failure => |failure| result: {
+                    debug_trace.logf("auth", "team catalog rejected category={t}", .{failure.category});
+                    break :result .rejected;
+                },
+                .catalog => |catalog_value| result: {
+                    var catalog = catalog_value;
+                    defer model_catalog.freeModelCatalog(app.alloc, &catalog);
+                    if (catalog.items.len == 0) break :result .rejected;
+                    if (comptime provider_runtime.supported(App)) {
+                        const current_model = provider_runtime.model(app);
+                        for (catalog.items) |entry| {
+                            if (std.mem.eql(u8, entry.id, current_model)) {
+                                break :result .{ .accepted = null };
+                            }
+                        }
+                        break :result .{
+                            .accepted = try app.alloc.dupe(u8, catalog.items[0].id),
+                        };
+                    }
+                    break :result .{ .accepted = null };
+                },
+            };
         }
 
         fn beginSignIn(app: *App, from_root: bool) !void {
@@ -1259,10 +1384,11 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn refreshFxLoginCredentialIfNeeded(app: *App) !void {
-            if (!try app.auth.refreshFxLoginIfNeeded(app.alloc)) return;
+            const change = try app.auth.refreshSelectedCredentialIfNeeded(app.alloc);
+            if (change == .none) return;
             reconcileGatewayCredential(app);
             if (app.auth.modelCatalogAccess().authorizationCredential() == null) return;
-            app.model_cache.reset();
+            if (change == .authority) app.model_cache.reset();
             if (comptime @hasDecl(App, "startModelCacheWarmup")) {
                 app.startModelCacheWarmup();
             }
@@ -1362,8 +1488,6 @@ pub fn Runtime(comptime App: type) type {
         fn recoverCredentialFailure(app: *App, source: credentials.Source, err: anyerror) !bool {
             debug_trace.logf("auth", "prompt credential refresh failed source={t} err={s}", .{ source, @errorName(err) });
             if (app.auth.credentialSource() == source) app.auth.recordCredentialRefreshFailure(source);
-            try app.auth.refreshSourceInventory(app.alloc);
-            app.auth.openPickerForProvider(app.alloc, provider_runtime.provider(app));
             const failure = auth_runtime.FailureSnapshot{
                 .source = source,
                 .reason = .credential_refresh_failed,
@@ -1372,8 +1496,19 @@ pub fn Runtime(comptime App: type) type {
             defer app.alloc.free(failure_text);
             const recovery = try std.fmt.allocPrint(
                 app.alloc,
-                "{s}.\nChoose another source below.",
-                .{failure_text},
+                "{s}.\n{s}",
+                .{
+                    failure_text,
+                    switch (source) {
+                        .fx_login => "Run /login to repair this source.",
+                        .chatgpt_subscription => "Run /login and reconnect Codex to repair this source.",
+                        .grok_subscription => "Run /login and reconnect Grok to repair this source.",
+                        .cline_account => "Run /login and reconnect Cline to repair this source.",
+                        .opencode_api_key, .cline_api_key => "Choose a free model with /model, or sign in again.",
+                        .opencode_anonymous => "Choose a free model with /model to continue.",
+                        .vercel_oidc_token, .ai_gateway_api_key, .stored_key => "Run /setup to repair this source.",
+                    },
+                },
             );
             defer app.alloc.free(recovery);
             try app.writeDomainNotice(.{
@@ -1755,6 +1890,19 @@ const TestTeamSelection = struct {
     } = .{},
     select_count: usize = 0,
 
+    fn validationCredential(
+        self: *const TestTeamSelection,
+        alloc: std.mem.Allocator,
+        index: usize,
+    ) !credentials.Credential {
+        if (index >= self.teams.items.len) return error.InvalidTeamSelection;
+        return .{
+            .token = try alloc.dupe(u8, "candidate-token"),
+            .source = .fx_login,
+            .team_slug = try alloc.dupe(u8, self.teams.items[index].slug),
+        };
+    }
+
     fn select(
         self: *TestTeamSelection,
         _: std.mem.Allocator,
@@ -1770,7 +1918,7 @@ const TestAuth = struct {
     select_result: ?bool = false,
     sign_in_transition: login_flow.SignInTransition = .none,
     logout_changed: bool = false,
-    refresh_changed: bool = false,
+    refresh_change: auth_transition.CredentialChange = .none,
     refresh_error: ?anyerror = null,
     selected_source: ?credentials.Source = null,
     active_source: ?credentials.Source = .ai_gateway_api_key,
@@ -1794,6 +1942,8 @@ const TestAuth = struct {
     sign_in_code_toggle_succeeds: bool = true,
     sign_in_code_submit_count: usize = 0,
     sign_in_code_submit_succeeds: bool = true,
+    inventory_refresh_action: ?auth_runtime.InventoryRefreshAction = null,
+    inventory_refresh_fails: bool = false,
 
     fn credentialSource(self: *const TestAuth) ?credentials.Source {
         return self.active_source;
@@ -1886,11 +2036,14 @@ const TestAuth = struct {
 
     fn openTeamPicker(_: *TestAuth, _: std.mem.Allocator, _: *login_flow.TeamSelection) void {}
 
-    fn refreshFxLoginIfNeeded(self: *TestAuth, _: std.mem.Allocator) !bool {
+    fn refreshSelectedCredentialIfNeeded(
+        self: *TestAuth,
+        _: std.mem.Allocator,
+    ) !auth_transition.CredentialChange {
         self.refresh_count += 1;
         if (self.refresh_error) |err| return err;
         if (self.gateway_ready_after_refresh_count == self.refresh_count) self.gateway_ready = true;
-        return self.refresh_changed;
+        return self.refresh_change;
     }
 
     fn gatewayCredential(self: *const TestAuth) ?TestGatewayCredential {
@@ -1911,6 +2064,32 @@ const TestAuth = struct {
 
     fn refreshSourceInventory(self: *TestAuth, _: std.mem.Allocator) !void {
         self.source_inventory_refresh_count += 1;
+    }
+
+    fn refreshSourceInventoryForLogout(self: *TestAuth, _: std.mem.Allocator) !void {
+        self.source_inventory_refresh_count += 1;
+    }
+
+    fn beginSourceInventoryRefresh(
+        self: *TestAuth,
+        _: std.mem.Allocator,
+        action: auth_runtime.InventoryRefreshAction,
+    ) auth_runtime.InventoryRefreshStart {
+        if (self.inventory_refresh_action != null) return .busy;
+        self.source_inventory_refresh_count += 1;
+        self.inventory_refresh_action = action;
+        return .started;
+    }
+
+    fn takeSourceInventoryRefresh(
+        self: *TestAuth,
+    ) ?auth_runtime.InventoryRefreshResult {
+        const action = self.inventory_refresh_action orelse return null;
+        self.inventory_refresh_action = null;
+        return if (self.inventory_refresh_fails)
+            .{ .failed = action }
+        else
+            .{ .ready = action };
     }
 
     fn recordCredentialRefreshFailure(self: *TestAuth, source: credentials.Source) void {
@@ -2025,6 +2204,7 @@ const TestApp = struct {
     preference_write_count: usize = 0,
     last_preference_source: ?credentials.Source = null,
     preference_write_succeeds: bool = true,
+    team_catalog_accepted: bool = true,
     shell: struct {
         render_requests: TestRenderRequests = .{},
     } = .{},
@@ -2057,6 +2237,23 @@ const TestApp = struct {
         self.preference_write_count += 1;
         if (self.preference_write_succeeds) self.last_preference_source = source;
     }
+
+    fn fetchProviderCatalog(
+        self: *TestApp,
+        _: model_provider.ProviderId,
+        _: credentials.CatalogAccess,
+    ) !model_catalog.ProviderResult {
+        if (!self.team_catalog_accepted) {
+            return .{ .failure = .{ .category = .authentication } };
+        }
+        var entries: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
+        errdefer model_catalog.freeModelCatalog(self.alloc, &entries);
+        try entries.append(self.alloc, .{
+            .id = try self.alloc.dupe(u8, "test/model"),
+            .model_type = try self.alloc.dupe(u8, "language"),
+        });
+        return .{ .catalog = entries };
+    }
 };
 
 test "setup hub projects the selected provider into the auth picker" {
@@ -2065,8 +2262,41 @@ test "setup hub projects the selected provider into the auth picker" {
 
     try Runtime(TestApp).openSetupHub(&app);
 
+    try std.testing.expect(!app.auth.picker_opened);
+    try Runtime(TestApp).collectSourceInventoryFacts(&app);
     try std.testing.expect(app.auth.picker_opened);
     try std.testing.expectEqual(model_provider.ProviderId.codex, app.auth.picker_provider);
+}
+
+test "login opens only after its asynchronous inventory refresh completes" {
+    var app: TestApp = .{ .selected_provider = .grok };
+    defer app.deinit();
+
+    try Runtime(TestApp).runLoginCommand(&app);
+
+    try std.testing.expectEqual(@as(usize, 1), app.auth.source_inventory_refresh_count);
+    try std.testing.expect(!app.auth.picker_opened);
+    try Runtime(TestApp).collectSourceInventoryFacts(&app);
+    try std.testing.expect(app.auth.picker_opened);
+    try std.testing.expectEqual(model_provider.ProviderId.grok, app.auth.picker_provider);
+    try std.testing.expect(app.shell.render_requests.footer_requested);
+}
+
+test "login inventory failure leaves the picker closed and reports one error" {
+    var app: TestApp = .{ .selected_provider = .gateway };
+    defer app.deinit();
+    app.auth.inventory_refresh_fails = true;
+
+    try Runtime(TestApp).runLoginCommand(&app);
+    try Runtime(TestApp).collectSourceInventoryFacts(&app);
+
+    try std.testing.expect(!app.auth.picker_opened);
+    try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
+    try std.testing.expect(std.mem.find(
+        u8,
+        app.transcript.items,
+        "picker was not opened with stale data",
+    ) != null);
 }
 
 test "OAuth app gating accepts native auth or JS-host auth and rejects neither" {
@@ -2279,42 +2509,27 @@ test "team change on an active fx login updates and remembers the selected team"
     try std.testing.expectEqual(credentials.Source.fx_login, app.last_preference_source.?);
 }
 
-test "successful direct login remembers fx login after activation" {
+test "teamless direct login does not activate or persist an unvalidated authority" {
     var app: TestApp = .{};
     defer app.deinit();
     app.auth.select_result = true;
-    app.auth.sign_in_transition = .{ .succeeded = .{ .vercel = .{} } };
-
-    try Runtime(TestApp).collectSignInFacts(&app);
-
-    try std.testing.expectEqual(credentials.Source.fx_login, app.auth.active_source.?);
-    try std.testing.expectEqual(@as(usize, 1), app.preference_write_count);
-    try std.testing.expectEqual(credentials.Source.fx_login, app.last_preference_source.?);
-    try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
-}
-
-test "direct login source load failure leaves the environment preference unchanged" {
-    var app: TestApp = .{};
-    defer app.deinit();
-    app.auth.select_result = null;
     app.auth.sign_in_transition = .{ .succeeded = .{ .vercel = .{} } };
 
     try Runtime(TestApp).collectSignInFacts(&app);
 
     try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, app.auth.active_source.?);
     try std.testing.expectEqual(@as(usize, 0), app.preference_write_count);
-    try std.testing.expectEqual(@as(usize, 1), app.auth.picker_pop_count);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "could not be loaded") != null);
+    try std.testing.expectEqual(@as(?credentials.Source, null), app.last_preference_source);
+    try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "no Vercel teams") != null);
 }
 
-test "failed preference persistence keeps a successful direct login active" {
+test "failed preference persistence keeps a validated team credential active" {
     var app: TestApp = .{};
     defer app.deinit();
-    app.auth.select_result = true;
-    app.auth.sign_in_transition = .{ .succeeded = .{ .vercel = .{} } };
     app.preference_write_succeeds = false;
 
-    try Runtime(TestApp).collectSignInFacts(&app);
+    try Runtime(TestApp).applyTeamChoice(&app, 0);
 
     try std.testing.expectEqual(credentials.Source.fx_login, app.auth.active_source.?);
     try std.testing.expectEqual(@as(usize, 1), app.preference_write_count);
@@ -2372,7 +2587,20 @@ test "team source load failure preserves the environment source and preference" 
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "could not be loaded") != null);
 }
 
-test "prompt credential refresh reloads the catalog after the credential changes" {
+test "team catalog rejection preserves the previous authority before commit" {
+    var app: TestApp = .{ .team_catalog_accepted = false };
+    defer app.deinit();
+
+    try Runtime(TestApp).applyTeamChoice(&app, 0);
+
+    try std.testing.expectEqual(@as(usize, 0), app.auth.team_selection.select_count);
+    try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, app.auth.active_source.?);
+    try std.testing.expectEqual(@as(usize, 0), app.preference_write_count);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "could not be validated") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Changed Vercel team") == null);
+}
+
+test "prompt credential refresh preserves catalog for secret rotation" {
     var app: TestApp = .{};
     defer app.deinit();
     const runtime = Runtime(TestApp);
@@ -2381,12 +2609,19 @@ test "prompt credential refresh reloads the catalog after the credential changes
     try std.testing.expectEqual(@as(usize, 1), app.auth.refresh_count);
     try std.testing.expectEqual(@as(usize, 0), app.model_cache.reset_count);
 
-    app.auth.refresh_changed = true;
+    app.auth.refresh_change = .secret_only;
     try runtime.refreshFxLoginCredentialIfNeeded(&app);
     try std.testing.expectEqual(@as(usize, 2), app.auth.refresh_count);
-    try std.testing.expectEqual(@as(usize, 1), app.model_cache.reset_count);
+    try std.testing.expectEqual(@as(usize, 0), app.model_cache.reset_count);
     try std.testing.expectEqual(@as(usize, 1), app.model_cache_warmup_count);
     try std.testing.expectEqual(@as(usize, 1), app.session.usage.refresh_count);
+
+    app.auth.refresh_change = .authority;
+    try runtime.refreshFxLoginCredentialIfNeeded(&app);
+    try std.testing.expectEqual(@as(usize, 3), app.auth.refresh_count);
+    try std.testing.expectEqual(@as(usize, 1), app.model_cache.reset_count);
+    try std.testing.expectEqual(@as(usize, 2), app.model_cache_warmup_count);
+    try std.testing.expectEqual(@as(usize, 2), app.session.usage.refresh_count);
 }
 
 test "credential removal clears the reconciliation credential" {
@@ -2444,12 +2679,13 @@ test "prompt credential refresh failure is recoverable and detail-free" {
 
     try std.testing.expect(!try Runtime(TestApp).preparePromptCredential(&app));
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "fx login credential refresh failed.") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Choose another source below.") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Run /login to repair this source.") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Choose another source") == null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "OAuthRequestFailed") == null);
     try std.testing.expect(app.shell.render_requests.footer_requested);
-    try std.testing.expectEqual(@as(usize, 1), app.auth.source_inventory_refresh_count);
+    try std.testing.expectEqual(@as(usize, 0), app.auth.source_inventory_refresh_count);
     try std.testing.expect(app.auth.refresh_failure_source == null);
-    try std.testing.expect(app.auth.picker_opened);
+    try std.testing.expect(!app.auth.picker_opened);
     try std.testing.expectEqual(@as(usize, 0), app.model_cache.reset_count);
 }
 
@@ -2473,7 +2709,8 @@ test "prompt credential admission rejects a credential that remains unavailable"
     try std.testing.expect(!try Runtime(TestApp).preparePromptCredential(&app));
     try std.testing.expectEqual(@as(usize, 2), app.auth.refresh_count);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "fx login credential refresh failed.") != null);
-    try std.testing.expect(app.auth.picker_opened);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Run /login to repair this source.") != null);
+    try std.testing.expect(!app.auth.picker_opened);
 }
 
 test "prompt credential refresh allows only OutOfMemory to escape" {

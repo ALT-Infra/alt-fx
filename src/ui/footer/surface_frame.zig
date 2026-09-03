@@ -628,8 +628,6 @@ fn buildFooterSurfaceProjection(
         )
     else if (slash_menu_layout) |layout|
         layout.row_count
-    else if (show_slash_query and geometry.slash_completion_count == 0)
-        picker_presentation.pickerRowCount(0)
     else if (show_picker)
         list_picker_rows
     else
@@ -1469,11 +1467,6 @@ fn surfaceTestContext(input: *InputRuntime) RenderContext {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .input = input,
     };
 }
@@ -1575,11 +1568,6 @@ test "surface footer measurement preserves the narrow tool activity projection" 
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .activity = .{ .tool_slot = .{
             .entry_id = 123,
             .fallback_label = "reading src/main.zig",
@@ -1616,11 +1604,6 @@ test "surface footer measurement preserves route recovery status tone" {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .activity = .{ .turn_thinking = .{
             .label = "⚠ blocked · content filter",
             .tone = .danger,
@@ -1685,11 +1668,6 @@ test "surface footer measurement keeps clipped command status transcript-owned" 
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .activity = .{ .tool_slot = .{
             .entry_id = status_id,
             .fallback_label = "running read-only tools",
@@ -1828,7 +1806,7 @@ test "surface footer measures the orchestration definition manager inline" {
     try std.testing.expectEqual(@as(u16, 10), editor_measurement.picker_rows);
 }
 
-test "surface footer reserves one non-selectable row for zero slash results" {
+test "surface footer omits the picker for zero slash results" {
     const alloc = std.testing.allocator;
     var input = InputRuntime{};
     defer input.deinit(alloc);
@@ -1843,10 +1821,10 @@ test "surface footer reserves one non-selectable row for zero slash results" {
     var measurement = try measureSurfaceFooter(alloc, &shell, approval.projection(), surfaceTestContext(&input));
     defer measurement.deinit(alloc);
 
-    try std.testing.expect(measurement.show_picker);
-    try std.testing.expectEqual(PickerKind.slash, measurement.picker_kind);
+    try std.testing.expect(!measurement.show_picker);
     try std.testing.expectEqual(@as(usize, 0), measurement.slash_completion_count);
-    try std.testing.expectEqual(@as(u16, 1), measurement.picker_rows);
+    try std.testing.expectEqual(@as(u16, 0), measurement.picker_rows);
+    try std.testing.expectEqual(@as(u16, 0), measurement.footer_extra);
     try std.testing.expect(measurement.slash_menu_layout == null);
 }
 
@@ -2612,7 +2590,7 @@ test "command approval fit includes the queued prompt banner" {
         .divider_bottom_row = 10,
         .hint_row = 11,
     };
-    const label = "terminal.exec 12345678901234567";
+    const label = "shell.run 12345678901234567";
 
     try std.testing.expect(try commandApprovalFitsInline(
         std.testing.allocator,
@@ -2638,7 +2616,7 @@ test "command approval footer sizing paths use the complete command" {
     var prompt = ApprovalPrompt{};
     defer prompt.deinit(alloc);
     try std.testing.expect(try prompt.syncRequest(alloc, .{
-        .label = "terminal.exec printf 'SURFACE_COMMAND_START...",
+        .label = "shell.run printf 'SURFACE_COMMAND_START...",
         .command = command,
     }));
 
@@ -3050,12 +3028,7 @@ test "file approval reservation-only sizing matches measured subagent view" {
     };
     defer shell.deinit(alloc);
 
-    var ctx = surfaceTestContext(&input);
-    ctx.subagent_count = 1;
-    ctx.subagent_view_active = true;
-    ctx.selected_subagent_id = 7;
-    ctx.selected_subagent_label = "reviewer";
-    ctx.selected_subagent_status = .running;
+    const ctx = surfaceTestContext(&input);
 
     var measured = try measureSurfaceFooter(
         alloc,
@@ -3119,12 +3092,7 @@ test "file approval preparation over active subagent view keeps a valid footer i
         .hint = 40,
     };
 
-    var ctx = surfaceTestContext(&input);
-    ctx.subagent_count = 1;
-    ctx.subagent_view_active = true;
-    ctx.selected_subagent_id = 7;
-    ctx.selected_subagent_label = "reviewer";
-    ctx.selected_subagent_status = .completed;
+    const ctx = surfaceTestContext(&input);
 
     var metrics = Metrics{};
     var force_redraw = false;

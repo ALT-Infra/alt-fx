@@ -1,9 +1,12 @@
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host_target = @import("../hosts/target.zig");
+const host = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
+const types = @import("../shared/types.zig");
 const secret = @import("secret.zig");
+const session_presence = @import("session_presence.zig");
 
 const Allocator = std.mem.Allocator;
 const schema_version: i64 = 1;
@@ -11,20 +14,19 @@ const max_auth_file_bytes: usize = 64 * 1024;
 const expiry_skew_ms: i64 = 60 * 1000;
 const mutation_lock_file_name = "grok-auth.lock";
 const mutation_lock_deadline_ms: u64 = 2000;
-const max_account_id_bytes: usize = 1024;
 
 const auth_file_name = profile_paths.grok_auth_file_name;
+
+pub fn presence() host.SecretStorePresence {
+    return session_presence.profileFile(auth_file_name, max_auth_file_bytes);
+}
 
 pub fn refreshDeadlineMs(expires_at_ms: i64) i64 {
     return @max(expires_at_ms - expiry_skew_ms, 0);
 }
 
 pub fn validAccountId(account_id: []const u8) bool {
-    if (account_id.len == 0 or account_id.len > max_account_id_bytes) return false;
-    for (account_id) |byte| {
-        if (byte < 0x21 or byte > 0x7e) return false;
-    }
-    return true;
+    return types.validCredentialAccountId(account_id);
 }
 
 pub const Session = struct {
@@ -277,7 +279,7 @@ test "Grok account identity is bounded and safe for HTTP headers" {
     try std.testing.expect(validAccountId("acct_123"));
     try std.testing.expect(!validAccountId(""));
     try std.testing.expect(!validAccountId("acct\r\ninjected"));
-    try std.testing.expect(!validAccountId("a" ** (max_account_id_bytes + 1)));
+    try std.testing.expect(!validAccountId("a" ** 1025));
 
     const invalid =
         \\{"version":1,"access_token":"access","refresh_token":"refresh","expires_at_ms":1234,"account_id":"acct\ninjected"}

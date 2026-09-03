@@ -883,13 +883,13 @@ pub fn composePickerStatusRow(
             "unable to index files"
         else
             "no matching files",
-        .slash => "no matching slash commands",
+        .slash => unreachable,
         .skills => "no matching skills",
         .help => "no matching commands",
         .settings => "no matching settings",
         .sessions => "no matching sessions",
-        .definition_manager => "no definitions available",
         .mcp => "no MCP items available",
+        .definition_manager => "no definitions available",
         .auth => "authentication actions unavailable",
     };
 

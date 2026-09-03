@@ -8,12 +8,9 @@ const workspace_access = @import("../../workspace/workspace_access.zig");
 const model_response_recovery = @import("model_response_recovery.zig");
 const provider_set = @import("../../gateway/provider_set.zig");
 const model_tool_schema = @import("../../tooling/model_tool_schema.zig");
-const agent_stream_provider = @import("../stream_provider.zig");
+const stream_provider = @import("../stream_provider.zig");
 
 const ReasoningEffort = types.ReasoningEffort;
-
-pub const default_history_context_budget_tokens: usize = 24_000;
-pub const history_context_budget_window_divisor: usize = 4;
 
 /// Who owns the prompt driving this run. A root turn's prompt is real user
 /// input; a subagent turn's prompt is assistant-authored delegation and can
@@ -35,7 +32,8 @@ pub const Config = struct {
     gateway_chat_url: []const u8,
     advertised_tool_names: []const []const u8 = &.{},
     advertised_functions: []const model_tool_schema.FunctionSchema = &.{},
-    response_format: ?agent_stream_provider.StructuredResponseFormat = null,
+    initial_dynamic_tools: []const stream_provider.DynamicFunctionTool = &.{},
+    response_format: ?stream_provider.StructuredResponseFormat = null,
     provider_capabilities: provider_set.Bundle.Capabilities = .{
         .fx_search = true,
         .vision_fallback = true,

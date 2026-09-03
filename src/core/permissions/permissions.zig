@@ -191,7 +191,7 @@ pub fn permissionTargetForCall(
         .url => arena.dupe(u8, try tool_args.requiredStringArg(args, "url")),
         .path_optional_existing => blk: {
             const path_arg = tool_args.optionalStringArg(args, "path") orelse ".";
-            break :blk if (std.mem.eql(u8, path_arg, "."))
+            break :blk if (path_arg.len == 0 or std.mem.eql(u8, path_arg, "."))
                 arena.dupe(u8, workspace_root)
             else
                 try resolveFileToolPath(arena, workspace_root, call.name, path_arg, .existing);
@@ -2194,14 +2194,19 @@ test "permissionTargetForCall covers active target kinds" {
             .expected = src_dir,
         },
         .{
+            .call = .{ .id = "glob_root", .name = "glob_files", .arguments_json = "{\"pattern\":\"*.zig\",\"path\":\"\"}" },
+            .target_kind = .path_optional_existing,
+            .expected = workspace,
+        },
+        .{
+            .call = .{ .id = "grep_root", .name = "grep_files", .arguments_json = "{\"pattern\":\"main\"}" },
+            .target_kind = .path_optional_existing,
+            .expected = workspace,
+        },
+        .{
             .call = .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"src/app.zig\"}" },
             .target_kind = .path_existing,
             .expected = app_file,
-        },
-        .{
-            .call = .{ .id = "memory", .name = "memory", .arguments_json = "{\"action\":\"list\"}" },
-            .target_kind = .none,
-            .expected = "memory",
         },
         .{
             .call = .{ .id = "ask", .name = "ask_user_question", .arguments_json = "{}" },

@@ -1336,9 +1336,9 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       const stderrPath = join(root.root, "stderr.log");
       writeFileSync(stderrPath, "");
       activeSession = await TmuxSession.create({
-        cmd: `${FX_BIN} --record`,
+        cmd: FX_BIN,
         cwd: root.workspace,
-        env: gatewayEnv(root, gateway),
+        env: { ...gatewayEnv(root, gateway), FX_DEBUG_RECORD: "1" },
         stderrPath,
         width: 180,
         height: 40,
@@ -1528,6 +1528,37 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
   );
 
   test(
+    "search preflight failure shows the target resolution reason",
+    async () => {
+      const root = createIsolatedRoot();
+      const gateway = startFakeGateway([
+        toolCall("grep_preflight_failure", "grep_files", {
+          pattern: "upgrade",
+          path: "missing-map/behavior-index",
+        }),
+        finalText("search failure handled"),
+      ]);
+      const { session, stderrPath } = await launch(root, gateway);
+
+      await session.sendText("Search the generated map once.");
+      const settled = await session.waitForText(
+        "search failure handled",
+        TIMEOUT,
+      );
+      const scrollback = await session.captureFullScrollback();
+
+      expect(scrollback).toContain(
+        "Permission target resolution failed for grep_files: FileNotFound",
+      );
+      expect(scrollback).not.toContain("preflight failed");
+      expect(settled).not.toContain(APPLY_QUESTION);
+      expect(gateway.requests).toHaveLength(2);
+      expectCleanStderr(stderrPath);
+    },
+    TIMEOUT,
+  );
+
+  test(
     "persistent session reevaluates every write and edit turn",
     async () => {
       const root = createIsolatedRoot();
@@ -1697,6 +1728,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
 
       expect(statSync(target).size).toBe(content.length);
       expect(fileHash(target)).toBe(expectedHash);
+      expect(gateway.requests).toHaveLength(2);
       expectCleanStderr(stderrPath);
     },
     MAXIMUM_WRITE_TIMEOUT + 30_000,
@@ -1724,7 +1756,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       expect(existsSync(target)).toBe(false);
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.requests[1]!.body).toContain(
-        "write_file failed: content exceeds the 4 MiB preparation limit",
+        'call_id=\\"oversized_write\\" tool=\\"write_file\\" status=failure',
       );
       expectCleanStderr(stderrPath);
     },

@@ -73,6 +73,7 @@ const app_entry_runtime = @import("core/app/app_entry_runtime.zig");
 const acp_runner = @import("core/cli/acp_runner.zig");
 const acp_server = @import("acp/server.zig");
 const app_input_runtime = @import("core/app/app_input_runtime.zig");
+const input_full_transcript_runtime = @import("core/app/input_full_transcript_runtime.zig");
 const input_submit_runtime = @import("core/app/input_submit_runtime.zig");
 const core_input_runtime = @import("core/input/runtime.zig");
 const input_queue_runtime = @import("core/app/input_queue_runtime.zig");
@@ -80,6 +81,7 @@ const app_bootstrap_runtime = @import("core/app/app_bootstrap_runtime.zig");
 const app_notification_runtime = @import("core/app/app_notification_runtime.zig");
 const app_permission_runtime = @import("core/app/app_permission_runtime.zig");
 const app_process_runtime = @import("core/app/app_process_runtime.zig");
+const managed_execution = @import("core/execution/managed_execution.zig");
 const prompt_history_runtime = @import("core/app/prompt_history_runtime.zig");
 const app_agent_runtime = @import("core/app/app_agent_runtime.zig");
 const app_runtime_setup = @import("core/app/app_runtime_setup.zig");
@@ -186,16 +188,10 @@ const update_target = @import("core/upgrade/update_target.zig");
 
 const compiled_update_channel = update_target.Channel.parse(build_options.update_channel) orelse
     @compileError("invalid compiled update channel");
-const background_runtime = @import("core/background/background_runtime.zig");
-const background_process_provider = @import(
-    "core/execution/background_process_provider.zig",
-);
-const background_process = @import("tools/shell/background_process.zig");
-const process_supervisor = @import("core/background/process_supervisor.zig");
+const shell_process_provider = @import("tools/shell/process_provider.zig");
+const process_provider = @import("core/execution/process_provider.zig");
 const terminal_client_runtime = @import("core/terminal/client.zig");
-const terminal_direct_runtime = @import("core/terminal/direct_runtime.zig");
 const app_terminal_runtime = @import("core/app/app_terminal_runtime.zig");
-const app_terminal_takeover_runtime = @import("core/app/app_terminal_takeover_runtime.zig");
 const terminal_host = @import("core/terminal/host.zig");
 const terminal_native_session = @import("core/terminal/native_session.zig");
 const terminal_tmux_session = @import("core/terminal/tmux_session.zig");
@@ -238,7 +234,6 @@ const ui_render = @import("ui/render.zig");
 const shell_runtime = @import("ui/shell_runtime.zig");
 const ui_terminal = @import("ui/terminal/terminal.zig");
 const cursor_probe = @import("ui/terminal/cursor_probe.zig");
-const ui_subagents = @import("ui/subagent/controller.zig");
 const transcript_runtime = @import("ui/transcript/runtime.zig");
 const resume_projection = @import("ui/transcript/resume_projection.zig");
 const assistant_pacer = @import("ui/assistant/pacer.zig");
@@ -256,10 +251,10 @@ const ToolPermissionDecision = types.ToolPermissionDecision;
 const PermissionGrant = types.PermissionGrant;
 const PermissionEngine = permissions.PermissionEngine;
 const QueuedPrompt = worker_runtime.QueuedPrompt;
+const WorkItem = worker_runtime.WorkItem;
 const WorkerRuntime = worker_runtime.WorkerRuntime;
 const SessionRuntime = session_runtime.SessionRuntime;
 const PromptHistoryRuntime = prompt_history_runtime.PromptHistoryRuntime;
-const BackgroundRuntime = background_runtime.BackgroundRuntime;
 const ToolExecutionResult = agent_runtime.ToolExecutionResult;
 const ApprovalPrompt = approval_prompt.ApprovalPrompt;
 const ApprovalScreenState = footer_runtime.ApprovalScreenState;
@@ -271,10 +266,9 @@ const TranscriptRuntime = transcript_runtime.TranscriptRuntime;
 const ResumeProjection = resume_projection.ResumeProjection;
 const RawEnviron = io_mod.RawEnviron;
 
-const RuntimeContextSnapshot = background_runtime.RuntimeContextSnapshot;
-
 const footer_rows: u16 = 4;
 const active_poll_timeout_ms: i32 = 8;
+const focused_ui_worker_poll_timeout_ms: i32 = 1;
 const idle_wasm_poll_timeout_ms: i32 = 16;
 const resize_debounce_ms: i64 = 100;
 const max_transcript_bytes: usize = 256 * 1024;
@@ -287,6 +281,21 @@ const max_read_file_lines: usize = 400;
 const max_read_file_line_len: usize = 2000;
 const max_command_output_bytes: usize = 64 * 1024;
 const input_escape_timeout_ms: i64 = 30;
+
+fn nativeLoopPollTimeoutMs(
+    default_timeout_ms: i32,
+    auth_refresh_active: bool,
+    skills_refresh_active: bool,
+    transcript_page_work_active: bool,
+) i32 {
+    return if (auth_refresh_active or
+        skills_refresh_active or
+        transcript_page_work_active)
+        @min(default_timeout_ms, focused_ui_worker_poll_timeout_ms)
+    else
+        default_timeout_ms;
+}
+
 const max_prompt_history: usize = 100;
 
 const ignored_list_entries = [_][]const u8{
@@ -548,6 +557,7 @@ const App = struct {
     const HostConfigAppRuntime = app_host_config_runtime.Runtime(Self);
     const BootstrapAppRuntime = app_bootstrap_runtime.Runtime(Self);
     const InputAppRuntime = app_input_runtime.Runtime(Self);
+    const InputFullTranscriptRuntime = input_full_transcript_runtime.Runtime(Self);
     const InputSubmitRuntime = input_submit_runtime.SubmitRuntime(Self);
     const NotificationAppRuntime = app_notification_runtime.Runtime(
         Self,
@@ -647,7 +657,6 @@ const App = struct {
         }
         try WorkerAppRuntime.tick(
             self,
-            app_callbacks.Bindings(App).onTaskCompletion,
             app_callbacks.Bindings(App).workerEventHandlers(self),
         );
         try self.flushRequestedFrame();
@@ -729,12 +738,10 @@ const App = struct {
 
     worker_thread: ?std.Thread = null,
     worker: WorkerRuntime = .{},
-    background: BackgroundRuntime = .{},
     terminal_client: terminal_client_runtime.Runtime = .{},
-    terminal_direct: terminal_direct_runtime.Runtime = .{},
-    terminal_takeover: app_terminal_takeover_runtime.Controller = .{},
+    managed_executions: managed_execution.Runtime = managed_execution.Runtime.init(std.heap.c_allocator),
+    legacy_process_provider: process_provider.Provider = process_provider.unavailable_provider,
     upgrader: auto_upgrade.AutoUpgrade = .{},
-    subagents: ui_subagents.Controller = .{},
     change_tracker: change_tracker_mod.ChangeTracker = .{},
     mcp: app_mcp_runtime.State = .{},
     skills: skill_runtime.Runtime = .{},
@@ -774,16 +781,15 @@ const App = struct {
             .usage_dashboard = undefined,
             .session_persistence = undefined,
             .shell = TranscriptRuntime.init(),
-            .subagents = ui_subagents.Controller.init(),
             .lifecycle_runtime = hooks.Runtime.init(alloc),
-            .background = BackgroundRuntime.init(if (comptime host_target.is_wasm)
-                background_process_provider.unavailable_provider
-            else
-                background_process.provider),
             .terminal_client = terminal_client_runtime.Runtime.init(if (comptime host_target.is_wasm)
-                background_process_provider.unavailable_provider
+                process_provider.unavailable_provider
             else
-                background_process.provider),
+                shell_process_provider.provider),
+            .legacy_process_provider = if (comptime host_target.is_wasm)
+                process_provider.unavailable_provider
+            else
+                shell_process_provider.provider,
         };
         auth_runtime.Runtime.initInto(
             &app.auth,
@@ -821,7 +827,6 @@ const App = struct {
             builtin_gateway.default_model,
             default_max_agent_steps,
             handle_sigwinch,
-            launch.record_requested,
             .{
                 .load_mcp_runtime = if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
                 .skill_root_policy = if (comptime host_target.is_wasm) wasm_skill_root_policy else builtin_skills.root_policy,
@@ -841,10 +846,13 @@ const App = struct {
         app.context_limits.applyCommandLine(launch.modifiers.context_limit_overrides);
         if (comptime host_profile.durable_sessions or host_profile.js_host_sessions) {
             if (app.requested_resume != null) {
-                if (launch.upgrade_relaunch) {
+                if (launch.upgrade_relaunch != null) {
                     try SessionAppRuntime.resumeRequestedSessionAfterUpgrade(
                         &app,
                         app_version,
+                        build_update_channel,
+                        launch.upgrade_relaunch.?.previous_revision orelse "",
+                        build_revision,
                     );
                 } else {
                     try SessionAppRuntime.resumeRequestedSession(&app);
@@ -1011,32 +1019,23 @@ const App = struct {
         self.stopStream();
 
         self.worker.requestShutdown();
-        self.background.requestStop();
+        self.managed_executions.shutdown();
         self.upgrader.stop();
         self.file_index.requestStop();
 
-        self.terminal_takeover.shutdown(App, self);
         self.releaseTerminal();
         if (self.worker_thread) |thread| thread.join();
-        self.terminal_takeover.deinit(self.alloc);
-        const direct_deinit_disposition = if (capture_resume_handoff)
-            self.terminal_direct.deinitSettled(self.alloc)
-        else blk: {
-            self.terminal_direct.deinitAbnormal(self.alloc, "runtime_failure");
-            break :blk terminal_direct_runtime.DeinitDisposition.abnormal;
-        };
         self.terminal_client.deinit();
+        self.managed_executions.deinit();
         self.model_cache.deinit();
         self.usage_dashboard.deinit();
         InputSubmitRuntime.clearPendingSubmission(self, "shutdown");
-        const resume_handoff = if (capture_resume_handoff and
-            direct_deinit_disposition == .settled)
+        const resume_handoff = if (capture_resume_handoff)
             SessionAppRuntime.finalizePersistenceWithResumeHandoff(self)
         else blk: {
             SessionAppRuntime.finalizePersistence(self);
             break :blk null;
         };
-        self.background.deinit(std.heap.c_allocator);
         self.worker.deinit(std.heap.c_allocator);
         self.web_fetch_runtime.deinit(self.alloc);
         self.parallel_web_fetch_runtime.deinit();
@@ -1044,7 +1043,6 @@ const App = struct {
         self.parallel_web_search_runtime.deinit();
         if (self.parallel_connection) |*connection| connection.deinit(self.alloc);
         self.parallel_connection = null;
-        self.subagents.deinit(self.alloc);
         self.queued_prompt_review.deinit(self.alloc);
         self.prompt_history.deinit(self.alloc);
         self.clearPendingImages();
@@ -1177,10 +1175,7 @@ const App = struct {
             );
             switch (exit_cause) {
                 .requested_exit => {},
-                .input_closed => {
-                    self.terminal_direct.deinitAbnormal(self.alloc, "input_closed");
-                    return error.TerminalInputClosed;
-                },
+                .input_closed => return error.TerminalInputClosed,
             }
             switch (app_terminal_runtime.Runtime(App).prepareGracefulExit(self)) {
                 .ready => return,
@@ -1197,16 +1192,26 @@ const App = struct {
     }
 
     pub fn loopPollTimeoutMs(ctx: *anyopaque, default_timeout_ms: i32) i32 {
-        const self: *const App = @ptrCast(@alignCast(ctx));
-        if (comptime !host_target.is_wasm) return default_timeout_ms;
+        const self: *App = @ptrCast(@alignCast(ctx));
+        if (comptime !host_target.is_wasm) {
+            return nativeLoopPollTimeoutMs(
+                default_timeout_ms,
+                self.auth.sourceInventoryRefreshActive(),
+                self.skills.refreshActive(),
+                self.fullTranscriptFocusedWorkActive(),
+            );
+        }
         return if (self.pacer.hasPending()) default_timeout_ms else idle_wasm_poll_timeout_ms;
+    }
+
+    fn fullTranscriptFocusedWorkActive(self: *App) bool {
+        return self.shell.fullTranscriptFocusedWorkActive();
     }
 
     fn processNextCooperativePrompt(self: *App) !void {
         if (comptime !host_target.is_wasm) return;
         try app_process_runtime.Runtime(App).processNextCooperativePrompt(
             self,
-            app_callbacks.Bindings(App).onTaskCompletion,
             app_callbacks.Bindings(App).workerEventHandlers(self),
             flushRequestedFrame,
         );
@@ -1415,66 +1420,34 @@ const App = struct {
     pub fn nativeSubagentWorkActive(self: *App) !bool {
         if (comptime !build_options.orchestration_enabled) return false;
         const host_runtime = SessionAppRuntime.subagentHost(self) orelse return false;
-        _ = try host_runtime.reconcileAfterRestart(io_mod.milliTimestamp());
-        switch (host_runtime.recoveryState()) {
-            .pending, .scheduled, .running, .deferred => return error.NativeSubagentRecoveryUnsettled,
-            .complete => {},
+        host_runtime.requestBackgroundRecovery(io_mod.milliTimestamp()) catch {
+            return error.NativeSubagentRecoveryUnsettled;
+        };
+        if (host_runtime.recoveryState() != .complete) {
+            return error.NativeSubagentRecoveryUnsettled;
         }
 
-        var cursor: ?[]u8 = null;
-        defer if (cursor) |owned| self.alloc.free(owned);
-        while (true) {
-            var result = try host_runtime.manager.snapshot(self.alloc, .{
-                .root_id = host_runtime.root_id,
-                .cursor = cursor,
-                .limit = subagent_domain.max_page_limit,
-            });
-            defer result.deinit(self.alloc);
-
-            var next_cursor: ?[]u8 = null;
-            switch (result) {
-                .failure => return error.NativeSubagentSnapshotUnavailable,
-                .snapshot => |snapshot| {
-                    for (snapshot.nodes) |node| {
-                        if (host_runtime.owner.externalBusy(node.child_id)) return true;
-                        switch (node.state) {
-                            .queued, .running, .awaiting_approval => return true,
-                            .idle,
-                            .interrupted,
-                            .completed,
-                            .failed,
-                            .cancelled,
-                            .archived,
-                            => {},
-                        }
-                    }
-                    if (snapshot.next_cursor) |next| {
-                        next_cursor = try self.alloc.dupe(u8, next);
-                    }
-                },
+        var lock = try host_runtime.managed.state_store.acquireLock(self.alloc);
+        defer lock.release();
+        var registry = try host_runtime.managed.state_store.load(self.alloc);
+        defer registry.deinit(self.alloc);
+        for (registry.children) |child| {
+            switch (child.phase) {
+                .running, .awaiting_approval => return true,
+                .idle, .interrupted, .finished => {},
             }
-
-            if (cursor) |owned| self.alloc.free(owned);
-            cursor = next_cursor;
-            if (cursor == null) return false;
         }
+        return false;
     }
 
     pub fn orchestrationModeEntered(self: *App) void {
+        _ = self;
         if (comptime !build_options.orchestration_enabled) return;
-        // The command is only admitted from the root composer, so the native
-        // manager cannot be the active alternate-screen owner here. Clear only
-        // its disposable projection; durable child records remain untouched.
-        self.subagents.clearProjection(self.alloc);
     }
 
     pub fn orchestrationModeLeft(self: *App) void {
+        _ = self;
         if (comptime !build_options.orchestration_enabled) return;
-        self.refreshSubagentManagerProjectionNow() catch |err| debug_trace.logf(
-            "orchestration",
-            "native subagent projection restore deferred error={s}",
-            .{@errorName(err)},
-        );
     }
 
     pub fn startOrchestrationAgentRun(
@@ -1962,7 +1935,15 @@ const App = struct {
         const source_turn_id = self.orchestration.active_source_turn_id orelse return;
         const active_turn_id = self.worker.activeTurnId();
         if (active_turn_id == 0) return;
-        const messages = try self.worker.takeSteering(std.heap.c_allocator, active_turn_id);
+        const boundary = try self.worker.takeSteeringBoundary(
+            std.heap.c_allocator,
+            active_turn_id,
+            .model,
+        );
+        const messages = switch (boundary) {
+            .continue_turn => |msgs| msgs,
+            .none, .handoff, .interrupt => return,
+        };
         defer {
             for (messages) |message| std.heap.c_allocator.free(message);
             if (messages.len > 0) std.heap.c_allocator.free(messages);
@@ -2101,12 +2082,7 @@ const App = struct {
             prompt,
             skill_tokens,
             null,
-            .queue,
         );
-    }
-
-    pub fn steerPrompt(self: *App, prompt: []const u8) !bool {
-        return self.enqueuePromptWithOptionalReview(prompt, &.{}, null, .steer);
     }
 
     pub fn enqueuePromptWithReviewDraft(
@@ -2135,18 +2111,14 @@ const App = struct {
                 .image_tokens = @constCast(review_image_tokens),
                 .skill_display_spans = review_skill_spans,
             },
-            .queue,
         );
     }
-
-    const PromptSubmitIntent = enum { queue, steer };
 
     fn enqueuePromptWithOptionalReview(
         self: *App,
         prompt: []const u8,
         skill_tokens: []const registered_entities.SkillTokenSpan,
         review_draft: ?worker_runtime.QueueReviewDraft,
-        intent: PromptSubmitIntent,
     ) !bool {
         const context_targets = if (self.context_enabled)
             try context_contract.applicableTargetsForImages(self.alloc, self.pending_images.items)
@@ -2167,12 +2139,11 @@ const App = struct {
                 debug_trace.preview(prompt, 120),
             },
         );
-        if (try self.snapshotAndQueuePromptWithSkillBindings(
+        if (!try self.snapshotAndAdmitInteractivePromptWithSkillBindings(
             prompt,
             skill_tokens,
             review_draft,
-            intent,
-        ) != .enqueued) return false;
+        )) return false;
         WorkerAppRuntime.syncState(
             self,
             app_callbacks.Bindings(App).worker_tool_lifecycle_presenter(self),
@@ -2216,7 +2187,6 @@ const App = struct {
             draft.images,
             draft.turn_id,
             true,
-            .queue,
         );
         WorkerAppRuntime.syncState(
             self,
@@ -2365,14 +2335,13 @@ const App = struct {
         try RenderAppRuntime.flushRequestedFrame(@as(*Self, self));
     }
 
-    pub fn snapshotAndQueuePromptWithSkillBindings(
+    fn snapshotAndAdmitInteractivePromptWithSkillBindings(
         self: *App,
         prompt: []const u8,
         skill_tokens: []const registered_entities.SkillTokenSpan,
         review_draft: ?worker_runtime.QueueReviewDraft,
-        intent: PromptSubmitIntent,
-    ) !PromptQueueOutcome {
-        return self.snapshotAndQueuePrompt(
+    ) !bool {
+        const queued = try self.snapshotPrompt(
             prompt,
             skill_tokens,
             review_draft,
@@ -2380,8 +2349,11 @@ const App = struct {
             null,
             0,
             false,
-            intent,
         );
+        errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
+        try self.worker.admitInteractivePrompt(std.heap.c_allocator, queued);
+        HerdrAppRuntime.reportWorking(self);
+        return true;
     }
 
     pub fn continuePausedRecovery(self: *App) !bool {
@@ -2400,7 +2372,6 @@ const App = struct {
             null,
             checkpoint.turn_id,
             false,
-            .queue,
         ) != .enqueued) return false;
         WorkerAppRuntime.syncState(
             self,
@@ -2420,10 +2391,33 @@ const App = struct {
         prompt_images: ?[]const types.ImageAttachment,
         turn_id: u64,
         user_prompt_already_presented: bool,
-        intent: PromptSubmitIntent,
     ) !PromptQueueOutcome {
-        try self.reloadSkills();
+        const queued = try self.snapshotPrompt(
+            prompt,
+            skill_tokens,
+            review_draft,
+            recovery_checkpoint,
+            prompt_images,
+            turn_id,
+            user_prompt_already_presented,
+        );
+        errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
+        try self.worker.enqueuePrompt(std.heap.c_allocator, queued);
+        HerdrAppRuntime.reportWorking(self);
+        return .enqueued;
+    }
 
+    // Caller owns the returned prompt until worker admission succeeds.
+    fn snapshotPrompt(
+        self: *App,
+        prompt: []const u8,
+        skill_tokens: []const registered_entities.SkillTokenSpan,
+        review_draft: ?worker_runtime.QueueReviewDraft,
+        recovery_checkpoint: ?*const session_codec.RecoveryCheckpoint,
+        prompt_images: ?[]const types.ImageAttachment,
+        turn_id: u64,
+        user_prompt_already_presented: bool,
+    ) !worker_runtime.QueuedPrompt {
         const source_images = if (recovery_checkpoint) |checkpoint|
             checkpoint.user.images
         else if (prompt_images) |images|
@@ -2477,15 +2471,12 @@ const App = struct {
         );
         errdefer types.freeImageAttachmentSlice(std.heap.c_allocator, authorized_image_catalog);
 
-        const history_copy = if (orchestration_turn)
-            try self.session.snapshotHistory(std.heap.c_allocator)
-        else
-            try self.session.snapshotContextHistory(std.heap.c_allocator);
+        const history_copy = try self.session.snapshotHistory(std.heap.c_allocator);
         errdefer types.freeHistoryTurnSlice(std.heap.c_allocator, history_copy);
         const root_user_intent_context = try auto_classifier_context.buildCanonicalRootUserContext(
             std.heap.c_allocator,
             prompt_copy,
-            self.session.history.items,
+            self.session.agent.history.items,
         );
         errdefer std.heap.c_allocator.free(root_user_intent_context);
 
@@ -2530,7 +2521,7 @@ const App = struct {
                 review,
             );
 
-        const owned_prompt = worker_runtime.QueuedPrompt{
+        return .{
             .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else turn_id,
             .executor = if (orchestration_turn) .extension else .native_agent,
             .prompt = prompt_copy,
@@ -2547,6 +2538,8 @@ const App = struct {
             .account_id = account_id_copy,
             .permission_mode = self.permission_engine.mode,
             .history = history_copy,
+            .context_history_start = self.session.contextHistoryStart(),
+            .unversioned_history_count = self.session.unversionedHistoryEnd(),
             .root_user_intent_context = root_user_intent_context,
             .grants = grants_copy,
             .skill_bindings = skill_bindings,
@@ -2557,13 +2550,45 @@ const App = struct {
             .recovery_source_already_presented = recovery_checkpoint != null,
             .user_prompt_already_presented = user_prompt_already_presented,
         };
-        try self.worker.admitPrompt(
-            std.heap.c_allocator,
-            owned_prompt,
-            recovery_checkpoint == null and intent == .steer,
-        );
+    }
+
+    pub fn enqueueContextCompaction(self: *App) !bool {
+        if (self.worker.isProcessing() or self.worker.queuedPromptCount() > 0) return false;
+        const selection = self.provider_selection.selection();
+        const model = try std.heap.c_allocator.dupe(u8, selection.model);
+        errdefer std.heap.c_allocator.free(model);
+        const credential = self.auth.gatewayCredential() orelse return error.MissingApiKey;
+        const api_key = try std.heap.c_allocator.dupe(u8, credential.api_key);
+        errdefer secret.zeroAndFree(std.heap.c_allocator, api_key);
+        const gateway_team = if (credential.gateway_team) |team|
+            try std.heap.c_allocator.dupe(u8, team)
+        else
+            null;
+        errdefer if (gateway_team) |team| std.heap.c_allocator.free(team);
+        const account_id = if (self.auth.accountId()) |id|
+            try std.heap.c_allocator.dupe(u8, id)
+        else
+            null;
+        errdefer if (account_id) |id| std.heap.c_allocator.free(id);
+        const history = try self.session.snapshotHistory(std.heap.c_allocator);
+        errdefer types.freeHistoryTurnSlice(std.heap.c_allocator, history);
+
+        try self.worker.enqueueContextCompaction(.{
+            .model = model,
+            .provider = selection.provider,
+            .api_key = api_key,
+            .gateway_team = gateway_team,
+            .credential_source = credential.source,
+            .account_id = account_id,
+            .history = history,
+            .unversioned_history_count = self.session.unversionedHistoryEnd(),
+        });
         HerdrAppRuntime.reportWorking(self);
-        return .enqueued;
+        return true;
+    }
+
+    pub fn hasContextToCompact(self: *const App) bool {
+        return self.session.hasContextToCompact();
     }
 
     pub fn installInitialMcpRuntime(self: *App, runtime: ?*mcp_runtime_mod.McpRuntime) void {
@@ -2982,10 +3007,47 @@ const App = struct {
         return AgentAppRuntime.runSubagentChild(raw, turn, message, admission, cancel);
     }
 
-    pub fn reloadSkills(self: *App) !void {
-        const loaded = try app_runtime_setup.loadSkills(std.heap.c_allocator, self.workspace_root, builtin_skills.root_policy);
-        skill_runtime.traceDiagnostics("interactive_reload", loaded.diagnostics);
-        self.skills.replaceLoaded(std.heap.c_allocator, loaded.dir, loaded.skills, loaded.diagnostics);
+    pub fn requestSkillsRefresh(self: *App) !u64 {
+        const home = try app_runtime_setup.resolveSkillsHome(std.heap.c_allocator);
+        defer if (home) |value| std.heap.c_allocator.free(value);
+        return self.skills.requestRefresh(
+            std.heap.c_allocator,
+            self.workspace_root,
+            home,
+            builtin_skills.root_policy,
+        );
+    }
+
+    pub fn collectPendingSkillRefresh(
+        self: *App,
+        pending: *input_submit_runtime.PendingSubmission,
+    ) !input_submit_runtime.PendingSkillRefresh {
+        if (comptime host_target.is_wasm) return .current;
+        const generation = pending.skill_refresh_generation orelse blk: {
+            const requested = try self.requestSkillsRefresh();
+            pending.skill_refresh_generation = requested;
+            break :blk requested;
+        };
+        return switch (self.skills.generationStatus(generation)) {
+            .pending => .pending,
+            .current => .current,
+            .failed => error.SkillCatalogRefreshFailed,
+        };
+    }
+
+    fn pollSkillsRefresh(self: *App) !skill_runtime.RefreshCompletion {
+        const completion = try self.skills.pollRefresh(
+            std.heap.c_allocator,
+            self.workspace_root,
+            builtin_skills.root_policy,
+        );
+        if (completion == .adopted) {
+            skill_runtime.traceDiagnostics(
+                "interactive_refresh",
+                self.skills.diagnostics,
+            );
+        }
+        return completion;
     }
 
     pub fn allowToolForSession(self: *App, tool_name: []const u8, target_path: []const u8) !void {
@@ -3103,44 +3165,6 @@ const App = struct {
             arena,
             call,
         );
-    }
-
-    pub fn writeSubagentSnapshot(self: *App) !void {
-        if (!self.nativeSubagentsAvailable()) {
-            try self.writeDomainNotice(.{
-                .topic = "ALT",
-                .tone = .warning,
-                .body = "Native fx subagents are unavailable while ALT mode is active. Use /alt off to return to native fx.",
-            }, true);
-            return;
-        }
-        try RenderAppRuntime.toggleSubagentView(self);
-    }
-
-    pub fn refreshSubagentManagerProjection(self: *App) !void {
-        if (comptime !host_profile.subagents) return;
-        if (!self.nativeSubagentsAvailable()) {
-            self.subagents.clearProjection(self.alloc);
-            return;
-        }
-        try RenderAppRuntime.refreshSubagentManager(self, false);
-    }
-
-    pub fn refreshSubagentManagerProjectionNow(self: *App) !void {
-        if (comptime !host_profile.subagents) return;
-        if (!self.nativeSubagentsAvailable()) {
-            self.subagents.clearProjection(self.alloc);
-            return;
-        }
-        try RenderAppRuntime.refreshSubagentManagerAfterSessionInstall(self);
-    }
-
-    pub fn acknowledgeSubagentManagerSelection(self: *App) !void {
-        try RenderAppRuntime.acknowledgeSubagentManagerSelection(self);
-    }
-
-    pub fn acknowledgeVisibleSubagentChildBeforeClose(self: *App) void {
-        RenderAppRuntime.acknowledgeVisibleSubagentChildBeforeClose(self);
     }
 
     pub fn fetchModelIds(self: *App) !std.ArrayList([]u8) {
@@ -3279,12 +3303,27 @@ const App = struct {
             .text = @constCast(text),
         } });
         if (comptime host_profile.cooperative_agent) {
-            try WorkerAppRuntime.tick(self, app_callbacks.Bindings(App).onTaskCompletion, app_callbacks.Bindings(App).workerEventHandlers(self));
+            try WorkerAppRuntime.tick(self, app_callbacks.Bindings(App).workerEventHandlers(self));
             try self.flushRequestedFrame();
         }
     }
 
-    pub fn processQueuedPrompt(self: *App, job: QueuedPrompt) !void {
+    pub fn processQueuedWork(self: *App, work: WorkItem) !void {
+        const result = switch (work) {
+            .prompt => |job| self.processQueuedPrompt(job),
+            .compact_context => |task| AgentAppRuntime.processContextCompaction(
+                self,
+                task,
+                builtin_gateway.retry_count,
+            ),
+        };
+        result catch |err| {
+            if (err == error.TurnFinalizationDeliveryFailed) return;
+            return err;
+        };
+    }
+
+    fn processQueuedPrompt(self: *App, job: QueuedPrompt) !void {
         if (comptime build_options.orchestration_enabled) {
             if (job.executor == .extension) {
                 var snapshot_ownership = worker_runtime.ActivePromptSnapshotOwnership.init(job.images);
@@ -3374,10 +3413,6 @@ const App = struct {
                 .content = browser_capabilities.model_context,
             });
         }
-    }
-
-    fn runtimeContextSnapshot(self: *App, alloc: Allocator) !RuntimeContextSnapshot {
-        return self.background.snapshot(alloc);
     }
 
     pub fn writeTranscript(self: *App, text: []const u8, record: bool) !void {
@@ -3540,13 +3575,6 @@ const App = struct {
         try app_terminal_runtime.Runtime(App).submitDirect(self, command);
     }
 
-    pub fn requestTerminalOpen(
-        self: *App,
-        session_id: []const u8,
-    ) app_terminal_runtime.OpenRequestResult {
-        return app_terminal_runtime.Runtime(App).requestOpen(self, session_id);
-    }
-
     pub fn appendDomainNotice(self: *App, notice: types.SemanticNotice) !u32 {
         return self.shell.appendSemanticNotice(self.alloc, notice);
     }
@@ -3699,6 +3727,10 @@ const App = struct {
         return SessionAppRuntime.commitRuntimePreferences(self, patch);
     }
 
+    pub fn fastModeModelBound(self: *const App) bool {
+        return SessionAppRuntime.fastModeModelBound(self);
+    }
+
     pub fn appendFinishedPrompt(self: *App, finished: types.FinishedPrompt) !void {
         try SessionAppRuntime.appendFinishedPrompt(self, finished);
         if (finished.summary) |summary| {
@@ -3732,7 +3764,6 @@ const App = struct {
             self.approval_prompt.isActive() or
             @constCast(&self.mcp).projectPromptActive() or
             self.auth.apiKeyEntryActive() or
-            self.subagents.isViewActive() or
             !self.shell.has_committed_frame or
             !self.shell.footer_viewport.has_frame or
             self.shell.footer_viewport.cursor.row == 0 or
@@ -3961,13 +3992,20 @@ const App = struct {
     pub fn loopCollectFacts(ctx: *anyopaque) !void {
         const self: *App = @ptrCast(@alignCast(ctx));
         if (!try WorkerAppRuntime.authorizeInteractiveAdmission(self)) return;
+
+        if (comptime !host_target.is_wasm) {
+            if (self.file_index.joinThreadIfDone(std.heap.c_allocator)) {
+                self.shell.render_requests.request(.footer);
+            }
+            switch (try self.pollSkillsRefresh()) {
+                .none, .unchanged => {},
+                .adopted, .failed => self.shell.render_requests.request(.footer),
+            }
+            try app_commands.Handlers(App).collectSkillsRefreshFacts(self);
+        }
         InputSubmitRuntime.collectPendingSubmissionFacts(self);
 
-        if (!self.terminal_takeover.blocksFxSurface(&self.terminal)) {
-            try self.collectThemeFacts();
-        } else {
-            self.terminal_input_runtime.terminal_theme_monitor.poll(io_mod.milliTimestamp());
-        }
+        try self.collectThemeFacts();
 
         if (comptime !host_target.is_wasm) {
             UpgradeAppRuntime.collectUpgradeFacts(self);
@@ -3977,11 +4015,6 @@ const App = struct {
             app_permission_runtime.monotonicMillis(),
         );
 
-        if (comptime !host_target.is_wasm) {
-            if (self.file_index.joinThreadIfDone(std.heap.c_allocator)) {
-                self.shell.render_requests.request(.footer);
-            }
-        }
         if (try self.model_cache.pollLoadTransition()) {
             try AuthAppRuntime.reconcileLoadedProviderModel(self);
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
@@ -4002,6 +4035,7 @@ const App = struct {
         try app_commands.Handlers(App).collectMcpAuthenticationFacts(self);
         try app_commands.Handlers(App).collectMcpReloadFacts(self);
         if (comptime host_profile.native_auth or host_profile.js_host_auth) {
+            try AuthAppRuntime.collectSourceInventoryFacts(self);
             try AuthAppRuntime.collectSignInFacts(self);
         }
         if (comptime host_profile.native_auth) {
@@ -4011,10 +4045,7 @@ const App = struct {
         try self.processNextCooperativePrompt();
 
         const cols_before_resize = self.shell.layout.cols;
-        if (self.terminal_takeover.blocksFxSurface(&self.terminal)) {
-            self.shell.layout = self.terminal.queryLayout(footer_rows) catch
-                self.shell.layout;
-        } else if (self.terminal_input_runtime.native_clear_probe.active() or
+        if (self.terminal_input_runtime.native_clear_probe.active() or
             self.terminal_input_runtime.native_clear_probe.awaitingLateResponse())
         {
             try self.collectNativeClearProbeFacts();
@@ -4034,8 +4065,6 @@ const App = struct {
                 }
             };
         }
-        try self.terminal_takeover.collect(App, self);
-
         // Terminal width changed with the modal open, so the footer
         // panel needs to re-wrap labels and descriptions.
         if (self.question_prompt.isActive() and cols_before_resize != self.shell.layout.cols) {
@@ -4048,25 +4077,55 @@ const App = struct {
         if (comptime !host_target.is_wasm) {
             try SessionAppRuntime.pollSessionPicker(self);
         }
+        try self.shell.prewarmFullTranscriptPage(
+            self.fullTranscriptSidecarCapability(),
+            self.fullTranscriptDiffResolver(),
+        );
         if (try self.shell.pollFullTranscriptPageLoad()) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .modal);
         }
-        if (self.subagents.childConversationRuntime()) |child| {
-            if (try child.pollFullTranscriptPageLoad()) {
-                RenderAppRuntime.requestActiveSurfaceFrame(self, .modal);
-            }
-        }
-        if (!self.terminal_takeover.blocksFxSurface(&self.terminal)) {
-            const input_now_ms = io_mod.milliTimestamp();
-            InputAppRuntime.expireTerminalInputGestures(self, input_now_ms);
-            const terminal_input = self.terminal_input_runtime.flushTerminalAction(
-                input_now_ms,
-                input_escape_timeout_ms,
-                InputAppRuntime.terminalPasteActive(self),
+        if (!self.shell.fullTranscriptActive() and
+            self.shell.takeReadyFullTranscriptOpen() and
+            self.terminal.alternate_screen_owner == .none and
+            !self.approval_prompt.isActive())
+        {
+            try app_lifecycle.openFullTranscript(
+                self.alloc,
+                &self.terminal,
+                &self.shell,
+                &self.metrics,
             );
-            try self.routeTerminalInputIngress(terminal_input);
+            debug_trace.logf(
+                "full_transcript",
+                "depth_transition from=inline to=full route=root trigger=ctrl_o",
+                .{},
+            );
+            RenderAppRuntime.requestActiveSurfaceFrame(self, .modal);
         }
-        try WorkerAppRuntime.tick(self, app_callbacks.Bindings(App).onTaskCompletion, app_callbacks.Bindings(App).workerEventHandlers(self));
+        if (self.shell.takeFullTranscriptPreparationFailure()) {
+            if (self.shell.fullTranscriptActive()) {
+                try app_lifecycle.closeFullTranscript(
+                    self.alloc,
+                    &self.terminal,
+                    &self.shell,
+                    &self.metrics,
+                );
+            }
+            try self.writeDomainNotice(.{
+                .topic = "transcript",
+                .tone = .@"error",
+                .body = "Full transcript preparation failed. The reader was closed instead of showing stale content.",
+            }, true);
+        }
+        const input_now_ms = io_mod.milliTimestamp();
+        InputAppRuntime.expireTerminalInputGestures(self, input_now_ms);
+        const terminal_input = self.terminal_input_runtime.flushTerminalAction(
+            input_now_ms,
+            input_escape_timeout_ms,
+            InputAppRuntime.terminalPasteActive(self),
+        );
+        try self.routeTerminalInputIngress(terminal_input);
+        try WorkerAppRuntime.tick(self, app_callbacks.Bindings(App).workerEventHandlers(self));
         const now_ns = io_mod.nanoTimestamp();
         if (!self.approval_prompt.isActive() and !self.question_prompt.isActive() and !self.auth.apiKeyEntryActive()) {
             try self.pacer.tick(self.alloc, now_ns, self.pacerCallbacks());
@@ -4078,7 +4137,6 @@ const App = struct {
     pub fn loopCommitFrame(ctx: *anyopaque) !void {
         const self: *App = @ptrCast(@alignCast(ctx));
         if (!try WorkerAppRuntime.authorizeInteractiveAdmission(self)) return;
-        if (try self.terminal_takeover.commit(App, self)) return;
         if (self.terminal_input_runtime.native_clear_probe.active()) return;
         _ = self.admitPendingResizeSignal("post_input");
         try self.flushRequestedFrame();
@@ -4132,7 +4190,6 @@ const App = struct {
 
     fn handleAfterThemeMonitorByte(self: *App, byte: u8) !void {
         if (try self.routeActivePasteTransportByte(byte)) return;
-        if (try self.terminal_takeover.handleByte(App, self, byte)) return;
         if (!self.terminal_input_runtime.terminal_cursor_probe.interceptsInput()) {
             if (try self.beginNativeClearProbe(byte)) return;
             try self.handleTerminalInputByte(byte);
@@ -4191,9 +4248,7 @@ const App = struct {
             switch (source) {
                 .cursor_probe => {
                     if (try self.routeActivePasteTransportByte(byte)) return;
-                    if (!try self.terminal_takeover.handleByte(App, self, byte)) {
-                        try self.handleCursorDeferredInputByte(byte);
-                    }
+                    try self.handleCursorDeferredInputByte(byte);
                 },
                 .theme_monitor => try self.handleAfterThemeMonitorByte(byte),
             }
@@ -4203,7 +4258,6 @@ const App = struct {
         switch (ui_input.terminalInputOwner(
             &self.terminal_input_runtime.terminal_theme_monitor,
             InputAppRuntime.terminalPasteActive(self),
-            true,
         )) {
             .theme_monitor => {
                 try self.handleThemeMonitorByte(byte);
@@ -4214,10 +4268,9 @@ const App = struct {
                 std.debug.assert(routed);
                 return;
             },
-            .takeover, .fx_input => {},
+            .fx_input => {},
         }
 
-        if (try self.terminal_takeover.handleByte(App, self, byte)) return;
         if (self.terminal_input_runtime.terminal_theme_monitor.enabled) {
             try self.handleThemeMonitorByte(byte);
             return;
@@ -4236,9 +4289,6 @@ const App = struct {
 
     pub fn loopNextCollectedByte(ctx: *anyopaque) ?u8 {
         const self: *App = @ptrCast(@alignCast(ctx));
-        if (self.terminal_takeover.blocksFxSurface(&self.terminal)) {
-            return self.terminal_input_runtime.takeDeferredThemeMonitorByte();
-        }
         return self.terminal_input_runtime.takeDeferredTerminalInputByte();
     }
 };
@@ -4317,7 +4367,7 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
             io_mod.setIo(threaded.io());
             try terminal_tmux_session.runLauncher(
                 processAllocator(),
-                background_process.provider,
+                shell_process_provider.provider,
                 raw_args,
             );
             return;
@@ -4360,7 +4410,7 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
             try terminal_host.run(
                 processAllocator(),
                 try terminal_host.Config.fromEnvironment(
-                    background_process.provider,
+                    shell_process_provider.provider,
                 ),
             );
             return;
@@ -4388,10 +4438,6 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
         try command_runner.runForegroundSessionBootstrap(cli_args);
         return;
     }
-    _ = cli_surface.recordRequested(cli_args) catch {
-        try writeStderrFast(cli_surface.record_modifier_usage);
-        exitFast(1);
-    };
     if (cli_args.len > 0 and isTopLevelHelp(cli_args)) {
         try writeTopLevelHelpFast(raw_env);
         exitFast(0);
@@ -4724,6 +4770,14 @@ test "lightweight local commands do not request early threaded io" {
     }
 }
 
+test "focused UI workers retain a bounded native poll timeout" {
+    try std.testing.expectEqual(@as(i32, 8), nativeLoopPollTimeoutMs(8, false, false, false));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, false, false));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, true, false));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, true));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, true, true));
+}
+
 test "footer runtime compatibility facade exports composeFooterFrame" {
     _ = footer_runtime.composeFooterFrame;
 }
@@ -4772,7 +4826,7 @@ fn fullEntryConfig() app_entry_runtime.Config {
         .gateway_chat_url = builtin_gateway.default_chat_url,
         .gateway_provider = native_gateway_provider,
         .provider_set = builtin_providers.native,
-        .background_process_provider = background_process.provider,
+        .process_provider = shell_process_provider.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
         .prompt_policy = builtin_context.prompt_policy,
@@ -4810,7 +4864,7 @@ fn localEntryConfig() app_entry_runtime.Config {
         .gateway_chat_url = builtin_gateway.default_chat_url,
         .gateway_provider = native_gateway_provider,
         .provider_set = builtin_providers.native,
-        .background_process_provider = background_process.provider,
+        .process_provider = shell_process_provider.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
         .prompt_policy = .{ .system_prompt = "" },
@@ -4848,7 +4902,7 @@ fn emptyEntryConfig() app_entry_runtime.Config {
         .gateway_chat_url = "",
         .gateway_provider = native_gateway_provider,
         .provider_set = builtin_providers.native,
-        .background_process_provider = background_process.provider,
+        .process_provider = shell_process_provider.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
         .prompt_policy = .{ .system_prompt = "" },
@@ -5161,80 +5215,6 @@ test "compiled orchestration contributes to the native slash-command surface" {
     }
 }
 
-test "background process registry ignores stale watcher urls" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const tmp_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
-    defer std.testing.allocator.free(tmp_root);
-    const old_log = try std.fs.path.join(std.testing.allocator, &.{ tmp_root, "old.log" });
-    defer std.testing.allocator.free(old_log);
-    const new_log = try std.fs.path.join(std.testing.allocator, &.{ tmp_root, "new.log" });
-    defer std.testing.allocator.free(new_log);
-    {
-        var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), old_log, .{ .truncate = true });
-        file.close(io_mod.getIo());
-    }
-    {
-        var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), new_log, .{ .truncate = true });
-        file.close(io_mod.getIo());
-    }
-    const Stub = struct {
-        fn match(
-            pid_text: []const u8,
-            _: process_supervisor.ProcessInstanceToken,
-        ) process_supervisor.TokenMatch {
-            return if (std.mem.eql(u8, pid_text, "12345"))
-                .matched
-            else
-                .missing;
-        }
-    };
-    process_supervisor.process_token_match_for_test = Stub.match;
-    defer process_supervisor.process_token_match_for_test = null;
-    const token = try process_supervisor.ProcessInstanceToken.parse(
-        "linux:00112233445566778899aabbccddeeff:12345",
-    );
-
-    var app = App{ .alloc = std.testing.allocator };
-    app.background.process_provider =
-        background_process_provider.process_supervisor_test_provider;
-    defer {
-        app.worker.deinit(std.heap.c_allocator);
-        app.background.deinit(std.heap.c_allocator);
-    }
-
-    const old_id = try app.background.registerBackground(std.heap.c_allocator, .{
-        .pid = "12345",
-        .process_token = token,
-        .command = "npm run dev",
-        .cwd = "/tmp/a",
-        .log_path = old_log,
-        .expect_url = true,
-    });
-    const new_id = try app.background.registerBackground(std.heap.c_allocator, .{
-        .pid = "12345",
-        .process_token = token,
-        .command = "npm run dev",
-        .cwd = "/tmp/b",
-        .log_path = new_log,
-        .expect_url = true,
-    });
-
-    _ = app.background.publishServerUrl(std.heap.c_allocator, old_id, try std.heap.c_allocator.dupe(u8, "http://localhost:3000"));
-
-    var snapshot = try app.runtimeContextSnapshot(std.testing.allocator);
-    defer snapshot.deinit(std.testing.allocator);
-    try std.testing.expectEqual(new_id, snapshot.process_id.?);
-    try std.testing.expect(snapshot.server_url == null);
-
-    const resolved = app.background.publishServerUrl(std.heap.c_allocator, new_id, try std.heap.c_allocator.dupe(u8, "http://localhost:4000")) orelse return error.TestExpectedEqual;
-    std.heap.c_allocator.free(resolved);
-
-    snapshot.deinit(std.testing.allocator);
-    snapshot = try app.runtimeContextSnapshot(std.testing.allocator);
-    try std.testing.expectEqualStrings("http://localhost:4000", snapshot.server_url.?);
-}
-
 test "normalize assistant text removes markdown emphasis and leading blank lines" {
     const normalized = try agent_runtime.normalizeAssistantTextForDisplay(std.testing.allocator, "\n\n**Hola** `mundo`");
     defer std.testing.allocator.free(normalized);
@@ -5333,7 +5313,6 @@ test {
     _ = @import("core/app/usage_dashboard_runtime.zig");
     _ = @import("core/app/app_process_runtime.zig");
     _ = @import("core/app/app_render_runtime.zig");
-    _ = @import("core/app/app_terminal_takeover_runtime.zig");
     _ = @import("core/app/app_runtime_setup.zig");
     _ = @import("core/app/app_session_runtime.zig");
     _ = @import("core/app/app_upgrade_runtime.zig");
@@ -5343,14 +5322,8 @@ test {
     _ = @import("ui/render_engine/assistant_wrap.zig");
     _ = @import("ui/render_engine/transcript_blocks.zig");
     _ = @import("ui/render_engine/viewport_selection.zig");
-    _ = @import("ui/subagent/controller.zig");
-    _ = @import("ui/subagent/runtime.zig");
     _ = @import("core/agent/assistant_presentation.zig");
     _ = @import("core/upgrade/auto_upgrade.zig");
-    _ = @import("core/background/background.zig");
-    _ = @import("core/background/background_commands.zig");
-    _ = @import("core/background/background_runtime.zig");
-    _ = @import("core/background/background_store.zig");
     _ = @import("core/cli/cli_ask.zig");
     _ = @import("core/cli/cli_replay.zig");
     _ = @import("core/cli/cli_surface.zig");
@@ -5426,7 +5399,10 @@ test {
     _ = @import("core/workspace/current_branch.zig");
     _ = @import("core/permissions/permission_gate.zig");
     _ = @import("core/permissions/permissions.zig");
-    _ = @import("core/background/process_supervisor.zig");
+    _ = @import("core/execution/process_identity.zig");
+    _ = @import("core/execution/process_provider.zig");
+    _ = @import("core/execution/managed_execution_contract.zig");
+    _ = @import("core/execution/managed_execution.zig");
     _ = @import("core/execution/process_tree.zig");
     _ = @import("core/config/prompt_policy.zig");
     _ = @import("core/workspace/record_tape.zig");
@@ -5434,6 +5410,7 @@ test {
     _ = @import("core/session/session_commands.zig");
     _ = @import("core/session/session_json.zig");
     _ = @import("core/session/session_store.zig");
+    _ = @import("core/session/legacy_background_migration.zig");
     _ = @import("core/orchestration/revision_store.zig");
     _ = @import("core/orchestration/session_binding.zig");
     _ = @import("core/session/prompt_history_store.zig");
@@ -5441,25 +5418,14 @@ test {
     _ = @import("core/session/web_fetch_artifacts.zig");
     _ = @import("core/skills/skill_runtime.zig");
     _ = @import("core/subagent/domain.zig");
-    _ = @import("core/subagent/tool_result.zig");
-    _ = @import("core/subagent/create_store.zig");
-    _ = @import("core/subagent/control_store.zig");
+    _ = @import("core/subagent/child_state.zig");
+    _ = @import("core/subagent/managed_owner.zig");
     _ = @import("core/subagent/resume_admission.zig");
-    _ = @import("core/subagent/relationship_index.zig");
-    _ = @import("core/subagent/manager.zig");
     _ = @import("core/subagent/execution.zig");
     _ = @import("core/subagent/tool_host.zig");
-    _ = @import("core/subagent/communication.zig");
-    _ = @import("core/subagent/communication_store.zig");
-    _ = @import("core/subagent/communication_manager.zig");
-    _ = @import("core/subagent/parent_delivery_projector.zig");
-    _ = @import("core/subagent/ui_projection.zig");
     _ = @import("core/subagent/authority.zig");
     _ = @import("core/subagent/approval_registry.zig");
-    _ = @import("core/subagent/approval_persistence.zig");
-    _ = @import("core/subagent/work_events.zig");
     _ = @import("core/terminal/contracts.zig");
-    _ = @import("core/terminal/monitor.zig");
     _ = @import("core/terminal/operation.zig");
     _ = @import("core/terminal/protocol.zig");
     _ = @import("core/terminal/host_policy.zig");
@@ -5470,12 +5436,12 @@ test {
     _ = @import("core/terminal/host.zig");
     _ = @import("core/terminal/tmux_session.zig");
     _ = @import("core/terminal/client.zig");
-    _ = @import("core/terminal/direct_runtime.zig");
+    _ = @import("core/terminal/managed_observer.zig");
     _ = @import("core/app/app_terminal_runtime.zig");
-    _ = @import("tools/terminal/terminal.zig");
+    _ = @import("tools/shell/shell.zig");
+    _ = @import("tools/shell/process_provider.zig");
     _ = @import("core/app/input_approval_runtime.zig");
     _ = @import("acp/sessions.zig");
-    _ = @import("core/tasks/task_helpers.zig");
     _ = @import("core/shared/text_utils.zig");
     _ = @import("core/tooling/tool_projection.zig");
     _ = @import("core/tooling/tool_dispatch.zig");

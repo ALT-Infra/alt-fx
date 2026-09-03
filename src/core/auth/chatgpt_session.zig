@@ -1,9 +1,12 @@
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host_target = @import("../hosts/target.zig");
+const host = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
+const types = @import("../shared/types.zig");
 const secret = @import("secret.zig");
+const session_presence = @import("session_presence.zig");
 
 const Allocator = std.mem.Allocator;
 const schema_version: i64 = 1;
@@ -14,6 +17,10 @@ const mutation_lock_deadline_ms: u64 = 2000;
 
 pub const issuer = "https://auth.openai.com";
 pub const auth_file_name = profile_paths.chatgpt_auth_file_name;
+
+pub fn presence() host.SecretStorePresence {
+    return session_presence.profileFile(auth_file_name, max_auth_file_bytes);
+}
 
 pub fn refreshDeadlineMs(expires_at_ms: i64) i64 {
     return @max(expires_at_ms - expiry_skew_ms, 0);
@@ -208,6 +215,7 @@ pub fn parse(alloc: Allocator, bytes: []const u8) !Session {
     errdefer secret.zeroAndFree(alloc, refresh_token);
     const account_id = try dupeRequiredString(alloc, object, "account_id");
     errdefer alloc.free(account_id);
+    if (!types.validCredentialAccountId(account_id)) return error.InvalidChatGptAuthSession;
     const expires_at_ms = try requiredInteger(object, "expires_at_ms");
     return .{
         .access_token = access_token,
@@ -266,4 +274,16 @@ test "ChatGPT auth session round trips without exposing token fields to structur
 test "ChatGPT session refresh deadline keeps a one minute safety margin" {
     try std.testing.expectEqual(@as(i64, 40_000), refreshDeadlineMs(100_000));
     try std.testing.expectEqual(@as(i64, 0), refreshDeadlineMs(10_000));
+}
+
+test "ChatGPT auth session rejects account identifiers unsafe for HTTP headers" {
+    var session = parse(
+        std.testing.allocator,
+        "{\"version\":1,\"access_token\":\"access\",\"refresh_token\":\"refresh\",\"expires_at_ms\":1000,\"account_id\":\"acct\\r\\ninjected\"}",
+    ) catch |err| {
+        try std.testing.expectEqual(error.InvalidChatGptAuthSession, err);
+        return;
+    };
+    defer session.deinit(std.testing.allocator);
+    return error.TestExpectedInvalidChatGptAuthSession;
 }

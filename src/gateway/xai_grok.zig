@@ -27,6 +27,7 @@ const connect_timeout_ms: i64 = 30_000;
 
 pub const agent_stream_provider = stream_provider.Provider{
     .stream_fn = streamCompletion,
+    .build_request_fn = buildRequestForProvider,
 };
 
 fn validateModel(model: []const u8) !void {
@@ -68,10 +69,13 @@ pub fn buildRequest(
     try writeResponsesInput(writer, alloc, request.messages, request.verified_images);
     try writer.writeByte(']');
 
-    _ = try responses_protocol.writeTools(writer, alloc, request.tools);
-    try writer.writeAll(",\"tool_choice\":");
-    try std.json.Stringify.value(request.tool_choice.label(), .{}, writer);
-    try writer.writeAll(",\"parallel_tool_calls\":true,\"include\":[\"reasoning.encrypted_content\"]");
+    const tool_count = try responses_protocol.writeTools(writer, alloc, request.tools);
+    if (tool_count > 0) {
+        try writer.writeAll(",\"tool_choice\":");
+        try std.json.Stringify.value(request.tool_choice.label(), .{}, writer);
+        try writer.writeAll(",\"parallel_tool_calls\":true");
+    }
+    try writer.writeAll(",\"include\":[\"reasoning.encrypted_content\"]");
     try writer.writeAll(",\"text\":{\"verbosity\":\"low\"");
     if (request.response_format) |format| {
         if (format.schema != .object) return error.InvalidStructuredResponseSchema;
@@ -93,6 +97,14 @@ pub fn buildRequest(
     if (request.max_output_tokens) |limit| try writer.print(",\"max_output_tokens\":{d}", .{limit});
     try writer.writeByte('}');
     return out.toOwnedSlice();
+}
+
+fn buildRequestForProvider(
+    _: ?*anyopaque,
+    alloc: Allocator,
+    request: stream_provider.RequestData,
+) anyerror![]u8 {
+    return buildRequest(alloc, request);
 }
 
 fn writeResponsesInput(
@@ -130,8 +142,9 @@ fn streamCompletion(
         return stream_provider.failResult(error.InvalidGrokSubscriptionAccount);
     }
     try validateModel(request.model);
-    const payload = try buildRequest(alloc, request.data());
-    defer alloc.free(payload);
+    const payload = request.prepared_request_body orelse
+        try buildRequest(alloc, request.data());
+    defer if (request.prepared_request_body == null) alloc.free(payload);
     var result = streamPrepared(alloc, request, payload) catch |err| {
         if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
         if (requestDeadlineExpired(request)) return stream_provider.failResult(error.Timeout);
@@ -567,6 +580,8 @@ test "xAI Grok standard requests omit the priority service tier" {
     defer std.testing.allocator.free(body);
 
     try std.testing.expect(std.mem.find(u8, body, "\"service_tier\"") == null);
+    try std.testing.expect(std.mem.find(u8, body, "\"tool_choice\"") == null);
+    try std.testing.expect(std.mem.find(u8, body, "\"parallel_tool_calls\"") == null);
 }
 
 test "xAI Grok serializes each verified image directly once" {

@@ -9,6 +9,7 @@ const display_width = @import("../../core/shared/display_width.zig");
 const list_window = @import("../../core/shared/list_window.zig");
 const skill_runtime = @import("../../core/skills/skill_runtime.zig");
 const types = @import("../../core/shared/types.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 const paste_blocks = @import("../../core/input/pasted_blocks.zig");
 const core_input_runtime = @import("../../core/input/runtime.zig");
 const visual_layout = @import("../input/visual_layout.zig");
@@ -54,12 +55,10 @@ pub const ComposedInputRows = struct {
     }
 };
 
-// Collapsed queue banner: the prompts stay hidden until the review is opened,
-// so this row only reports how many are waiting and how to reach them.
+// Ordinary queued work stays collapsed until review opens.
 pub fn composeQueuedSummaryRow(
     alloc: Allocator,
     queued_count: usize,
-    steering_count: usize,
     queued_paused: bool,
     width: u16,
 ) !std.ArrayList(u8) {
@@ -69,15 +68,8 @@ pub fn composeQueuedSummaryRow(
     // The paused hint row already owns the controls, so it drops the affordance.
     const affordance = if (queued_paused) "" else " · ↑ to edit";
     var row_buf: [max_top_row_len]u8 = undefined;
-    const ordinary_count = queued_count -| steering_count;
     const label = if (queued_count == 0)
         "queued"
-    else if (ordinary_count == 0 and steering_count == 1)
-        std.fmt.bufPrint(&row_buf, "1 steering message{s}", .{affordance}) catch "1 steering message"
-    else if (ordinary_count == 0)
-        std.fmt.bufPrint(&row_buf, "{d} steering messages{s}", .{ steering_count, affordance }) catch "steering messages"
-    else if (steering_count > 0)
-        std.fmt.bufPrint(&row_buf, "{d} pending messages · {d} steering{s}", .{ queued_count, steering_count, affordance }) catch "pending messages"
     else if (queued_count == 1)
         std.fmt.bufPrint(&row_buf, "1 queued message{s}", .{affordance}) catch "1 queued message"
     else
@@ -88,18 +80,48 @@ pub fn composeQueuedSummaryRow(
     return row;
 }
 
+pub fn composeSteeringMessageRow(
+    alloc: Allocator,
+    message: []const u8,
+    show_escape_hint: bool,
+    width: u16,
+) !std.ArrayList(u8) {
+    var row: std.ArrayList(u8) = .empty;
+    try row.appendSlice(alloc, ui_render.hint_style);
+    var safe_message = try text_utils.encodeTerminalSafe(
+        alloc,
+        message,
+        std.math.maxInt(usize),
+    );
+    defer safe_message.deinit(alloc);
+
+    const escape_hint = " · Esc to steer now";
+    const width_usize: usize = width;
+    const escape_width = display_width.visibleWidth(escape_hint);
+    if (show_escape_hint and width_usize > escape_width) {
+        try row_text.appendSingleLineMiddleEllipsized(
+            alloc,
+            &row,
+            safe_message.bytes,
+            width_usize - escape_width,
+        );
+        try row.appendSlice(alloc, escape_hint);
+    } else {
+        try row_text.appendSingleLineMiddleEllipsized(alloc, &row, safe_message.bytes, width_usize);
+    }
+    try row.appendSlice(alloc, ui_render.reset_style);
+    return row;
+}
+
 pub fn composeQueueReviewHintRow(
     alloc: Allocator,
     width: u16,
     empty_draft: bool,
     cancel_all_available: bool,
-    steering: bool,
 ) !std.ArrayList(u8) {
     var row: std.ArrayList(u8) = .empty;
     try row.appendSlice(alloc, ui_render.dim_style);
-    const hint = if (steering)
-        "steering paused · enter to apply"
-    else if (cancel_all_available)
+    const hint = if (cancel_all_available)
         "paused · enter to send · press esc to cancel all queued"
     else if (empty_draft)
         "paused · delete again to remove queued prompt · enter to send unchanged"
@@ -111,24 +133,46 @@ pub fn composeQueueReviewHintRow(
 }
 
 test "collapsed queue banner counts the waiting prompts and offers the review" {
-    var single = try composeQueuedSummaryRow(std.testing.allocator, 1, 0, false, 80);
+    var single = try composeQueuedSummaryRow(std.testing.allocator, 1, false, 80);
     defer single.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, single.items, "1 queued message · ↑ to edit") != null);
 
-    var many = try composeQueuedSummaryRow(std.testing.allocator, 3, 0, false, 80);
+    var many = try composeQueuedSummaryRow(std.testing.allocator, 3, false, 80);
     defer many.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, many.items, "3 queued messages · ↑ to edit") != null);
 }
 
-test "collapsed queue banner identifies pending steering" {
-    var row = try composeQueuedSummaryRow(std.testing.allocator, 1, 1, false, 80);
+test "steering rows show actual messages and only the final escape hint" {
+    var first = try composeSteeringMessageRow(std.testing.allocator, "First steer", false, 80);
+    defer first.deinit(std.testing.allocator);
+    var final = try composeSteeringMessageRow(std.testing.allocator, "Second steer", true, 80);
+    defer final.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.find(u8, first.items, "First steer") != null);
+    try std.testing.expect(std.mem.find(u8, first.items, "Esc to steer now") == null);
+    try std.testing.expect(std.mem.find(u8, final.items, "Second steer · Esc to steer now") != null);
+}
+
+test "narrow steering row preserves distinguishing message ends and the escape hint" {
+    const message = "BEGIN change the implementation direction and retain this unique END";
+    var row = try composeSteeringMessageRow(std.testing.allocator, message, true, 48);
     defer row.deinit(std.testing.allocator);
 
-    try std.testing.expect(std.mem.find(u8, row.items, "1 steering message · ↑ to edit") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "BEGIN") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "END") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "Esc to steer now") != null);
+    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 48);
+}
+
+test "steering rows visibly escape terminal control bytes" {
+    var unsafe = try composeSteeringMessageRow(std.testing.allocator, "before\x1b[2Jafter", true, 80);
+    defer unsafe.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, unsafe.items, "before\\x1b[2Jafter · Esc to steer now") != null);
+    try std.testing.expect(std.mem.find(u8, unsafe.items, "\x1b[2J") == null);
 }
 
 test "collapsed queue banner drops the affordance while the review is paused" {
-    var row = try composeQueuedSummaryRow(std.testing.allocator, 2, 0, true, 80);
+    var row = try composeQueuedSummaryRow(std.testing.allocator, 2, true, 80);
     defer row.deinit(std.testing.allocator);
 
     try std.testing.expect(std.mem.find(u8, row.items, "2 queued messages") != null);
@@ -136,7 +180,7 @@ test "collapsed queue banner drops the affordance while the review is paused" {
 }
 
 test "queue review hint explains empty draft deletion" {
-    var row = try composeQueueReviewHintRow(std.testing.allocator, 100, true, false, false);
+    var row = try composeQueueReviewHintRow(std.testing.allocator, 100, true, false);
     defer row.deinit(std.testing.allocator);
 
     try std.testing.expect(std.mem.find(u8, row.items, "delete again to remove queued prompt") != null);
@@ -144,17 +188,10 @@ test "queue review hint explains empty draft deletion" {
 }
 
 test "post-cancel queue review hint offers cancelling every queued prompt" {
-    var row = try composeQueueReviewHintRow(std.testing.allocator, 100, false, true, false);
+    var row = try composeQueueReviewHintRow(std.testing.allocator, 100, false, true);
     defer row.deinit(std.testing.allocator);
 
     try std.testing.expect(std.mem.find(u8, row.items, "press esc to cancel all queued") != null);
-}
-
-test "steering review hint says enter applies steering" {
-    var row = try composeQueueReviewHintRow(std.testing.allocator, 100, false, false, true);
-    defer row.deinit(std.testing.allocator);
-
-    try std.testing.expect(std.mem.find(u8, row.items, "steering paused · enter to apply") != null);
 }
 
 // Ordered widest-first; every fallback keeps the enter/esc controls so narrow
@@ -244,7 +281,7 @@ pub fn cappedInputRows(total_rows: usize, content_bottom: u16, input_visible: bo
 }
 
 pub fn slashCompletionPickerPrefix(ctx: RenderContext, modal_active: bool, show_model_query: bool, show_file_query: bool) ?[]const u8 {
-    if (ctx.input.picker.isInlinePickerDismissed(.slash) or modal_active or show_model_query or show_file_query) return null;
+    if (ctx.input.picker.isInlinePickerSuppressed(.slash) or modal_active or show_model_query or show_file_query) return null;
     if (ctx.input.picker.inlinePickerTriggerKind(&ctx.input.edit_state) != .slash) return null;
     // Mid-turn model-shaped input owns the footer slot even while the model list is hidden.
     if (ctx.stream.active and ctx.input.picker.isModelShapedInput(&ctx.input.edit_state)) return null;
@@ -326,12 +363,13 @@ pub fn measureRawInputGeometryPrepared(
     }, raw_anchor);
     const capped = cappedInputRows(summary.total_rows, content_bottom, input_visible);
     const window = visual_layout.visibleWindow(summary.cursor.row_index, summary.total_rows, capped.row_limit);
-    const show_slash_query = slashCompletionPickerActive(ctx, modal_active, show_model_query, show_file_query);
-    const slash_completion_count = if (show_slash_query)
+    const slash_query_active = slashCompletionPickerActive(ctx, modal_active, show_model_query, show_file_query);
+    const slash_completion_count = if (slash_query_active)
         prepared_slash_completion_count orelse
             slashCompletionPickerCount(ctx, modal_active, show_model_query, show_file_query)
     else
         0;
+    const show_slash_query = slash_query_active and slash_completion_count > 0;
     // Model picker rows (model, effort, and fast stages) render flush left
     // like the rest of the footer instead of following the query token,
     // which indents the options oddly once a long model id is present.
@@ -434,17 +472,15 @@ pub fn composeHintRow(
     else
         null;
     var hint_buf: [max_status_line_len]u8 = undefined;
-    var hint_with_subagents_buf: [max_status_line_len + 128]u8 = undefined;
     const base_hint_line = ui_render.buildHintLineWithIdentity(
         ctx.stream.active,
         approval_active,
         ctx.has_api_key or (ctx.auth_picker.active and ctx.auth_picker.include_skip),
         ctx.model,
         ctx.permission_mode,
-        ctx.queued_count,
+        ctx.queued_count -| ctx.steering_messages.len,
         active_label,
-        ctx.fast_mode,
-        ctx.model_supports_fast,
+        ctx.fast_indicator_active,
         ctx.effort,
         ctx.model_supports_effort,
         ctx.statusline,
@@ -458,24 +494,6 @@ pub fn composeHintRow(
         "press ctrl+c again to exit"
     else if (auth_hint) |hint|
         hint
-    else if (ctx.selected_subagent_label) |label|
-        if (ctx.selected_subagent_status) |status|
-            std.fmt.bufPrint(
-                &hint_with_subagents_buf,
-                "{s} · {s} · {s}",
-                .{
-                    label,
-                    switch (status) {
-                        .awaiting_approval => "approval",
-                        else => @tagName(status),
-                    },
-                    base_hint_line,
-                },
-            ) catch base_hint_line
-        else
-            base_hint_line
-    else if (ctx.subagent_view_active)
-        std.fmt.bufPrint(&hint_with_subagents_buf, "Subagent manager · tracked {d} · ctrl+x exit", .{ctx.subagent_count}) catch base_hint_line
     else
         base_hint_line;
 
@@ -1037,31 +1055,6 @@ fn appendLayoutUnitContent(
             }
             try row.appendSlice(alloc, ui_render.tag_style);
             try row_text.appendClipped(alloc, row, token.name, @intCast(@min(emit_cells, std.math.maxInt(u16))));
-            if (visual_layout.skillTokenSourceLabel(token)) |source_label| {
-                const emitted_name_cells = @min(display_width.visibleWidth(token.name), emit_cells);
-                const label_cells = emit_cells - emitted_name_cells;
-                if (label_cells > 0) {
-                    try row_text.appendClipped(
-                        alloc,
-                        row,
-                        visual_layout.skill_source_separator,
-                        @intCast(@min(label_cells, std.math.maxInt(u16))),
-                    );
-                    const emitted_separator_cells = @min(
-                        display_width.visibleWidth(visual_layout.skill_source_separator),
-                        label_cells,
-                    );
-                    const source_cells = label_cells - emitted_separator_cells;
-                    if (source_cells > 0) {
-                        try row_text.appendClipped(
-                            alloc,
-                            row,
-                            source_label,
-                            @intCast(@min(source_cells, std.math.maxInt(u16))),
-                        );
-                    }
-                }
-            }
             try row.appendSlice(alloc, ui_render.reset_style);
             remaining_cells.* -= emit_cells;
             omitted_positive_unit.* = unit.cell_width > emit_cells;
@@ -1099,11 +1092,6 @@ fn testRenderContext(input: *const InputRuntime) RenderContext {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .input = input,
     };
 }
@@ -1132,6 +1120,31 @@ test "composer badge labels a later-turn image with its own id" {
     try std.testing.expectEqual(@as(usize, 1), composed.rows.items.len);
     try std.testing.expect(std.mem.find(u8, composed.rows.items[0].items, "[Image 2]") != null);
     try std.testing.expect(std.mem.find(u8, composed.rows.items[0].items, "[Image 1]") == null);
+}
+
+test "composer skill token shows only its name" {
+    const alloc = std.testing.allocator;
+    const skill_tokens = [_]visual_layout.SkillTokenSpan{.{
+        .raw_start = 0,
+        .raw_end = "$review".len,
+        .name = "review",
+        .path = "/tmp/review",
+        .display_source = .workspace_codex,
+    }};
+    const source = visual_layout.Source{
+        .input = "$review",
+        .cursor = "$review".len,
+        .terminal_cols = 40,
+        .skill_tokens = &skill_tokens,
+    };
+    const summary = visual_layout.summarize(source, null);
+    const window = visual_layout.visibleWindow(summary.cursor.row_index, summary.total_rows, 1);
+    var composed = try composeVisibleInputRows(alloc, source, window);
+    defer composed.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), composed.rows.items.len);
+    try std.testing.expect(std.mem.find(u8, composed.rows.items[0].items, "review") != null);
+    try std.testing.expect(std.mem.find(u8, composed.rows.items[0].items, "workspace .codex") == null);
 }
 
 test "composeVisibleInputRows avoids clear-to-eol after full-width input" {
@@ -1488,15 +1501,31 @@ test "footer slash completion remains active across capped input rows" {
     try std.testing.expect(tiny_geometry.slash_completion_count > 0);
 }
 
-test "footer slash completion separates query activity from candidate count" {
+test "footer slash completion follows candidate visibility transitions" {
     const alloc = std.testing.allocator;
     var input = InputRuntime{};
     defer input.deinit(alloc);
 
-    try input.textReplacementState().replace(alloc, "/hezzzzz");
+    try input.textReplacementState().replace(alloc, "/mo");
+    const matching = measureRawInputGeometry(testRenderContext(&input), 80, 20, true, false, false, false);
+    try std.testing.expect(matching.show_slash_query);
+    try std.testing.expect(matching.slash_completion_count > 0);
+
+    try input.textReplacementState().replace(alloc, "/mozzzzz");
     const no_match = measureRawInputGeometry(testRenderContext(&input), 80, 20, true, false, false, false);
-    try std.testing.expect(no_match.show_slash_query);
+    try std.testing.expect(!no_match.show_slash_query);
     try std.testing.expectEqual(@as(usize, 0), no_match.slash_completion_count);
+
+    try input.textReplacementState().replace(alloc, "/mo");
+    const restored = measureRawInputGeometry(testRenderContext(&input), 80, 20, true, false, false, false);
+    try std.testing.expect(restored.show_slash_query);
+    try std.testing.expect(restored.slash_completion_count > 0);
+}
+
+test "footer slash completion preserves command argument ownership" {
+    const alloc = std.testing.allocator;
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
 
     try input.textReplacementState().replace(alloc, "/resume ");
     const no_args = measureRawInputGeometry(testRenderContext(&input), 80, 20, true, false, false, false);
@@ -1596,13 +1625,7 @@ test "compose hint row keeps model in left hint text" {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
-        .fast_mode = true,
-        .model_supports_fast = true,
+        .fast_indicator_active = true,
         .input = &input,
     };
 
@@ -1687,7 +1710,7 @@ test "compose hint row replaces model status with subscription sign-in controls"
     }
 }
 
-test "compose hint row uses dots in subagent view" {
+test "compose hint row keeps configured fast mode visible" {
     var input = InputRuntime{};
     defer input.deinit(std.testing.allocator);
 
@@ -1696,51 +1719,7 @@ test "compose hint row uses dots in subagent view" {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 2,
-        .subagent_view_active = true,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
-        .input = &input,
-    };
-
-    var row = try composeHintRow(std.testing.allocator, false, null, ctx, 96);
-    defer row.deinit(std.testing.allocator);
-
-    try std.testing.expect(std.mem.find(u8, row.items, "Subagent manager · tracked 2 · ctrl+x exit") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, " | ") == null);
-}
-
-test "compose hint row keeps active child identity ahead of model status" {
-    var input = InputRuntime{};
-    defer input.deinit(std.testing.allocator);
-    var ctx = testRenderContext(&input);
-    ctx.selected_subagent_label = "header-child";
-    ctx.selected_subagent_status = .awaiting_approval;
-
-    var row = try composeHintRow(std.testing.allocator, false, null, ctx, 64);
-    defer row.deinit(std.testing.allocator);
-
-    try std.testing.expect(std.mem.find(u8, row.items, "header-child · approval") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "gpt-5.1") != null);
-}
-
-test "compose hint row omits the inactive subagent manager marker" {
-    var input = InputRuntime{};
-    defer input.deinit(std.testing.allocator);
-
-    const ctx: RenderContext = .{
-        .stream = .{},
-        .has_api_key = true,
-        .model = "gpt-5.1",
-        .queued_count = 0,
-        .subagent_count = 2,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
-        .fast_mode = true,
-        .model_supports_fast = true,
+        .fast_indicator_active = true,
         .input = &input,
     };
 
@@ -1748,11 +1727,9 @@ test "compose hint row omits the inactive subagent manager marker" {
     defer row.deinit(std.testing.allocator);
 
     try std.testing.expect(std.mem.find(u8, row.items, "gpt-5.1 · ⚡︎") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "subagents 2") == null);
-    try std.testing.expect(std.mem.find(u8, row.items, "ctrl+x manager") == null);
 }
 
-test "compose hint row does not advertise background terminals or the manager shortcut" {
+test "compose hint row does not advertise background terminals" {
     var input = InputRuntime{};
     defer input.deinit(std.testing.allocator);
     var ctx = testRenderContext(&input);
@@ -1763,7 +1740,6 @@ test "compose hint row does not advertise background terminals or the manager sh
 
     try std.testing.expect(std.mem.find(u8, row.items, "gpt-5.1") != null);
     try std.testing.expect(std.mem.find(u8, row.items, "background (") == null);
-    try std.testing.expect(std.mem.find(u8, row.items, "ctrl+x manager") == null);
 }
 
 test "compose hint row right-aligns upgrade status" {
@@ -1775,11 +1751,6 @@ test "compose hint row right-aligns upgrade status" {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .upgrade_status = "update ready: ctrl+g to reload",
         .statusline = .{
             .workspace_label = "/a/long/workspace/path/that/uses/the/statusline-tail",
@@ -1805,11 +1776,6 @@ test "compose hint row right-aligns upgrade status after styled auto mode" {
         .model = "openai/gpt-4o",
         .permission_mode = .auto,
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .upgrade_status = "update ready: ctrl+g to reload",
         .input = &input,
     };

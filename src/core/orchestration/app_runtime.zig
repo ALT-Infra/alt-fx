@@ -296,12 +296,6 @@ fn hostConversationHistory(
                 .task = entry.user.text,
                 .answer = entry.assistant,
             },
-            .background_command => |entry| .{
-                .ordinal = index + 1,
-                .status = .background,
-                .task = entry.user.text,
-                .answer = entry.assistant orelse "",
-            },
             .interrupted => |entry| .{
                 .ordinal = index + 1,
                 .status = switch (entry.terminal_reason) {

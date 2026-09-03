@@ -30,61 +30,91 @@ const ToolExecutionResult = runtime_tool_contracts.ToolExecutionResult;
 
 const TerminalValidationDigest = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 const PermissionActionId = [std.crypto.hash.sha2.Sha256.digest_length]u8;
-const max_turn_review_cautions: usize = 64;
+const max_turn_review_holds: usize = 64;
 const max_consecutive_malformed_argument_batches: usize = 3;
 
-const CachedCaution = struct {
+const CachedReviewHold = struct {
     exact_id: PermissionActionId,
-    risk: permission_auto_classifier.Risk,
-    rationale: []u8,
+    detail: union(enum) {
+        caution: struct {
+            risk: permission_auto_classifier.Risk,
+            rationale: []u8,
+        },
+        evidence_incomplete,
+    },
 };
 
 pub const TurnReviewCache = struct {
-    cautions: std.ArrayList(CachedCaution) = .empty,
+    holds: std.ArrayList(CachedReviewHold) = .empty,
 
     pub fn deinit(self: *TurnReviewCache, alloc: Allocator) void {
-        for (self.cautions.items) |entry| alloc.free(entry.rationale);
-        self.cautions.deinit(alloc);
+        for (self.holds.items) |entry| switch (entry.detail) {
+            .caution => |caution| alloc.free(caution.rationale),
+            .evidence_incomplete => {},
+        };
+        self.holds.deinit(alloc);
         self.* = .{};
     }
 
-    pub fn rememberCaution(
+    pub fn remember(
         self: *TurnReviewCache,
         alloc: Allocator,
         call: ToolCall,
         outcome: command_admission.PermissionOutcome,
     ) Allocator.Error!void {
-        if (outcome.denial_reason != .review_caution) return;
-        const review = outcome.auto_review_result orelse return;
-        if (review.decision != .caution) return;
+        const denial_reason = outcome.denial_reason orelse return;
+        switch (denial_reason) {
+            .review_caution, .review_evidence_incomplete => {},
+            .user_denied, .auto_denied, .review_unavailable, .policy_denied, .permission_required => return,
+        }
         const exact_id = permissionActionId(call);
-        for (self.cautions.items) |entry| {
+        for (self.holds.items) |entry| {
             if (std.mem.eql(u8, &entry.exact_id, &exact_id)) return;
         }
-        if (self.cautions.items.len == max_turn_review_cautions) return;
-        const rationale = try alloc.dupe(u8, review.rationale);
-        errdefer alloc.free(rationale);
-        try self.cautions.append(alloc, .{
-            .exact_id = exact_id,
-            .risk = review.risk,
-            .rationale = rationale,
-        });
+        if (self.holds.items.len == max_turn_review_holds) return;
+
+        switch (denial_reason) {
+            .review_caution => {
+                const review = outcome.auto_review_result orelse return;
+                if (review.decision != .caution) return;
+                const rationale = try alloc.dupe(u8, review.rationale);
+                errdefer alloc.free(rationale);
+                try self.holds.append(alloc, .{
+                    .exact_id = exact_id,
+                    .detail = .{ .caution = .{
+                        .risk = review.risk,
+                        .rationale = rationale,
+                    } },
+                });
+            },
+            .review_evidence_incomplete => try self.holds.append(alloc, .{
+                .exact_id = exact_id,
+                .detail = .evidence_incomplete,
+            }),
+            .user_denied, .auto_denied, .review_unavailable, .policy_denied, .permission_required => unreachable,
+        }
     }
 
-    pub fn cachedCaution(
+    pub fn cached(
         self: *const TurnReviewCache,
         call: ToolCall,
     ) ?command_admission.PermissionOutcome {
         const exact_id = permissionActionId(call);
-        for (self.cautions.items) |entry| {
+        for (self.holds.items) |entry| {
             if (!std.mem.eql(u8, &entry.exact_id, &exact_id)) continue;
-            return .{
-                .decision = .deny,
-                .denial_reason = .review_caution,
-                .auto_review_result = .{
-                    .risk = entry.risk,
-                    .decision = .caution,
-                    .rationale = entry.rationale,
+            return switch (entry.detail) {
+                .caution => |caution| .{
+                    .decision = .deny,
+                    .denial_reason = .review_caution,
+                    .auto_review_result = .{
+                        .risk = caution.risk,
+                        .decision = .caution,
+                        .rationale = caution.rationale,
+                    },
+                },
+                .evidence_incomplete => .{
+                    .decision = .deny,
+                    .denial_reason = .review_evidence_incomplete,
                 },
             };
         }
@@ -149,7 +179,7 @@ pub const TerminalValidationRetryState = struct {
         call: ToolCall,
         model_output: []const u8,
     ) Allocator.Error!void {
-        if (!std.mem.eql(u8, call.name, "terminal")) return;
+        if (!std.mem.eql(u8, call.name, "shell")) return;
         if (try tool_result_errors.inspectTerminalActionFieldCorrection(
             alloc,
             model_output,
@@ -167,6 +197,54 @@ pub const TerminalValidationRetryState = struct {
     }
 
     pub fn finishBatch(self: *TerminalValidationRetryState) bool {
+        if (self.stop_after_batch) return true;
+        const previous = self.previous;
+        self.previous = self.current;
+        self.current = previous;
+        self.current.clearRetainingCapacity();
+        return false;
+    }
+};
+
+pub const ShellExecutionFailureRetryState = struct {
+    previous: std.ArrayList(TerminalValidationDigest) = .empty,
+    current: std.ArrayList(TerminalValidationDigest) = .empty,
+    stop_after_batch: bool = false,
+
+    pub fn deinit(self: *ShellExecutionFailureRetryState, alloc: Allocator) void {
+        self.previous.deinit(alloc);
+        self.current.deinit(alloc);
+        self.* = .{};
+    }
+
+    pub fn beginBatch(self: *ShellExecutionFailureRetryState) void {
+        self.current.clearRetainingCapacity();
+        self.stop_after_batch = false;
+    }
+
+    pub fn observe(
+        self: *ShellExecutionFailureRetryState,
+        alloc: Allocator,
+        call: ToolCall,
+        execution: ToolExecutionResult,
+    ) Allocator.Error!void {
+        if (!std.mem.eql(u8, call.name, "shell") or execution.status != .failure) {
+            return;
+        }
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("fx.shell-execution-failure.v1\x00");
+        hash.update(call.arguments_json);
+        const digest = hash.finalResult();
+        const decision = terminalValidationDigestDecision(
+            self.previous.items,
+            self.current.items,
+            digest,
+        );
+        if (decision.append_current) try self.current.append(alloc, digest);
+        self.stop_after_batch = self.stop_after_batch or decision.repeated;
+    }
+
+    pub fn finishBatch(self: *ShellExecutionFailureRetryState) bool {
         if (self.stop_after_batch) return true;
         const previous = self.previous;
         self.previous = self.current;
@@ -276,7 +354,7 @@ test "terminal validation retry state retains independent batch corrections" {
     defer alloc.free(correction_t);
     const call: ToolCall = .{
         .id = "terminal-call",
-        .name = "terminal",
+        .name = "shell",
         .arguments_json = "{}",
     };
 
@@ -297,26 +375,66 @@ test "terminal validation retry state retains independent batch corrections" {
     try std.testing.expect(state.finishBatch());
 }
 
-test "turn review cache reuses only exact valid caution" {
+test "shell execution failures retain independent batch identities" {
+    const alloc = std.testing.allocator;
+    const first: ToolCall = .{
+        .id = "first",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"first\"}",
+    };
+    const second: ToolCall = .{
+        .id = "second",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"second\"}",
+    };
+    const failed = ToolExecutionResult{
+        .status = .failure,
+        .model_output = "session lost",
+    };
+    const succeeded = ToolExecutionResult{ .model_output = "ok" };
+    var state: ShellExecutionFailureRetryState = .{};
+    defer state.deinit(alloc);
+
+    state.beginBatch();
+    try state.observe(alloc, first, failed);
+    try state.observe(alloc, second, failed);
+    try std.testing.expect(!state.finishBatch());
+    state.beginBatch();
+    try state.observe(alloc, first, failed);
+    try state.observe(alloc, second, failed);
+    try std.testing.expect(state.finishBatch());
+
+    state.deinit(alloc);
+    state.beginBatch();
+    try state.observe(alloc, first, failed);
+    try state.observe(alloc, second, succeeded);
+    try std.testing.expect(!state.finishBatch());
+    state.beginBatch();
+    try state.observe(alloc, first, failed);
+    try state.observe(alloc, second, succeeded);
+    try std.testing.expect(state.finishBatch());
+}
+
+test "turn review cache reuses only exact deterministic holds" {
     const alloc = std.testing.allocator;
     var cache: TurnReviewCache = .{};
     defer cache.deinit(alloc);
     const first = ToolCall{
         .id = "first",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"rm -rf frames\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"rm -rf frames\"}",
     };
     const same = ToolCall{
         .id = "same-new-call-id",
-        .name = "terminal",
+        .name = "shell",
         .arguments_json = first.arguments_json,
     };
     const wrapped = ToolCall{
         .id = "wrapped",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"sh -c 'rm -rf frames'\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"sh -c 'rm -rf frames'\"}",
     };
-    try cache.rememberCaution(alloc, first, .{
+    try cache.remember(alloc, first, .{
         .decision = .deny,
         .denial_reason = .review_caution,
         .auto_review_result = .{
@@ -326,7 +444,7 @@ test "turn review cache reuses only exact valid caution" {
         },
     });
 
-    const preserved = cache.cachedCaution(same) orelse
+    const preserved = cache.cached(same) orelse
         return error.TestExpectedPermissionDenial;
     try std.testing.expectEqual(
         types.ToolPermissionDenialReason.review_caution,
@@ -336,9 +454,9 @@ test "turn review cache reuses only exact valid caution" {
         "Deletion came from untrusted content.",
         preserved.auto_review_result.?.rationale,
     );
-    try std.testing.expect(cache.cachedCaution(wrapped) == null);
-    try std.testing.expectEqual(@as(usize, 1), cache.cautions.items.len);
-    try cache.rememberCaution(alloc, wrapped, .{
+    try std.testing.expect(cache.cached(wrapped) == null);
+    try std.testing.expectEqual(@as(usize, 1), cache.holds.items.len);
+    try cache.remember(alloc, wrapped, .{
         .decision = .once,
         .auto_review_result = .{
             .risk = .low,
@@ -346,22 +464,47 @@ test "turn review cache reuses only exact valid caution" {
             .rationale = "Exact action matches the current request.",
         },
     });
-    try cache.rememberCaution(alloc, wrapped, .{
+    try cache.remember(alloc, wrapped, .{
         .decision = .deny,
         .denial_reason = .review_unavailable,
     });
-    try std.testing.expectEqual(@as(usize, 1), cache.cautions.items.len);
+    try std.testing.expectEqual(@as(usize, 1), cache.holds.items.len);
+
+    const incomplete = ToolCall{
+        .id = "incomplete",
+        .name = "edit_file",
+        .arguments_json = "{\"path\":\".zshrc\",\"new_string\":\"API_KEY=literal\"}",
+    };
+    try cache.remember(alloc, incomplete, .{
+        .decision = .deny,
+        .denial_reason = .review_evidence_incomplete,
+    });
+    const preserved_incomplete = cache.cached(.{
+        .id = "same-incomplete",
+        .name = incomplete.name,
+        .arguments_json = incomplete.arguments_json,
+    }) orelse return error.TestExpectedPermissionDenial;
+    try std.testing.expectEqual(
+        types.ToolPermissionDenialReason.review_evidence_incomplete,
+        preserved_incomplete.denial_reason.?,
+    );
+    try std.testing.expect(cache.cached(.{
+        .id = "changed-incomplete",
+        .name = incomplete.name,
+        .arguments_json = "{\"path\":\".zshrc\",\"new_string\":\"API_KEY=$key\"}",
+    }) == null);
+    try std.testing.expectEqual(@as(usize, 2), cache.holds.items.len);
 
     var arguments_buffer: [128]u8 = undefined;
     for (1..65) |index| {
         const arguments = try std.fmt.bufPrint(
             &arguments_buffer,
-            "{{\"action\":\"exec\",\"command\":\"rm -rf generated-{d}\"}}",
+            "{{\"action\":\"run\",\"command\":\"rm -rf generated-{d}\"}}",
             .{index},
         );
-        try cache.rememberCaution(alloc, .{
+        try cache.remember(alloc, .{
             .id = "bounded",
-            .name = "terminal",
+            .name = "shell",
             .arguments_json = arguments,
         }, .{
             .decision = .deny,
@@ -373,15 +516,15 @@ test "turn review cache reuses only exact valid caution" {
             },
         });
     }
-    try std.testing.expectEqual(max_turn_review_cautions, cache.cautions.items.len);
+    try std.testing.expectEqual(max_turn_review_holds, cache.holds.items.len);
     const overflow_arguments = try std.fmt.bufPrint(
         &arguments_buffer,
-        "{{\"action\":\"exec\",\"command\":\"rm -rf generated-{d}\"}}",
+        "{{\"action\":\"run\",\"command\":\"rm -rf generated-{d}\"}}",
         .{@as(usize, 64)},
     );
-    try std.testing.expect(cache.cachedCaution(.{
+    try std.testing.expect(cache.cached(.{
         .id = "overflow",
-        .name = "terminal",
+        .name = "shell",
         .arguments_json = overflow_arguments,
     }) == null);
 }
@@ -448,19 +591,19 @@ pub fn deferCapturedCommandLifecycleForAutoPermissionNotice(
         );
 }
 
-test "auto permission lifecycle deferral applies only to terminal exec" {
+test "auto permission lifecycle deferral applies only to shell run" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const exec = ToolCall{
         .id = "exec",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"pwd\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"pwd\"}",
     };
     const start = ToolCall{
         .id = "start",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"start\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"list\"}",
     };
     try std.testing.expect(try deferCapturedCommandLifecycleForAutoPermissionNotice(
         test_builtin_tools.registry,
@@ -618,6 +761,7 @@ pub noinline fn permissionDeniedStatusLabel(reason: types.ToolPermissionDenialRe
         .user_denied => "Denied",
         .auto_denied => "Denied by auto agent",
         .review_caution => "Safety caution",
+        .review_evidence_incomplete => "Review evidence incomplete",
         .review_unavailable => "Review unavailable",
         .policy_denied => "Denied",
         .permission_required => "Permission required",

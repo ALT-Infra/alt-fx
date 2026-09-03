@@ -18,6 +18,7 @@ pub const Error = error{
 };
 
 pub const Request = struct {
+    agent: *agent_runtime.Agent,
     deps: *const runtime_deps.AgentRuntimeDeps,
     semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink = null,
     lifecycle: runtime_lifecycle.LifecycleContext,
@@ -26,7 +27,8 @@ pub const Request = struct {
 };
 
 pub fn run(request: Request) Error!void {
-    agent_runtime.processQueuedPrompt(
+    agent_runtime.processAgentPrompt(
+        request.agent,
         request.deps,
         request.semantic_presentation,
         request.lifecycle,

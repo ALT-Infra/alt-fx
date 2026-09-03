@@ -59,15 +59,44 @@ const StreamState = types.StreamState;
 const ActivityProjection = activity_runtime.ActivityProjection;
 const InputRuntime = core_input_runtime.Runtime;
 const TranscriptRuntime = transcript_runtime.TranscriptRuntime;
-const SubagentStatus = @import("../../core/subagent/domain.zig").State;
 
 pub const SkillsMenuProjection = struct {
     active: bool = false,
     items: []const skill_runtime.Skill = &.{},
+    actual_indices: []const u32 = &.{},
+    index_ready: bool = false,
     source_filter: skill_runtime.SkillMenuSourceFilter = .all,
     selected_index: usize = 0,
     window_start: usize = 0,
     query: []const u8 = "",
+
+    pub fn itemCount(self: SkillsMenuProjection) usize {
+        if (self.index_ready) return self.actual_indices.len;
+        return skill_runtime.skillMenuFilterQueryCount(
+            self.items,
+            self.source_filter,
+            self.query,
+        );
+    }
+
+    pub fn itemAt(
+        self: SkillsMenuProjection,
+        display_index: usize,
+    ) ?*const skill_runtime.Skill {
+        if (!self.index_ready) {
+            const actual_index = skill_runtime.skillMenuActualIndexAtQuery(
+                self.items,
+                self.source_filter,
+                self.query,
+                display_index,
+            ) orelse return null;
+            return &self.items[actual_index];
+        }
+        if (display_index >= self.actual_indices.len) return null;
+        const actual_index: usize = self.actual_indices[display_index];
+        if (actual_index >= self.items.len) return null;
+        return &self.items[actual_index];
+    }
 };
 
 pub const ModelMenuProjection = struct {
@@ -388,8 +417,10 @@ pub fn helpMenuProjection(
 
 pub fn skillsMenuProjection(skills: *const skill_runtime.Runtime) SkillsMenuProjection {
     return .{
-        .active = skills.menu.active,
+        .active = skills.menuVisible(),
         .items = skills.items,
+        .actual_indices = skills.menu_index.actual_indices.items,
+        .index_ready = skills.menu_index_ready,
         .source_filter = skills.menu.source_filter,
         .selected_index = skills.menu.selected_index,
         .window_start = skills.menu.window_start,
@@ -430,21 +461,14 @@ pub const RenderContext = struct {
     composer_visible: bool = true,
     permission_mode: types.PermissionMode = .ask,
     queued_count: usize,
-    steering_count: usize = 0,
+    steering_messages: []const []const u8 = &.{},
+    steering_waits_for_tool: bool = false,
     queued_paused: bool = false,
     queued_cancel_all_available: bool = false,
     queued_prompt_cards: []const QueuedPromptCard = &.{},
     queued_prompt_card_rows: u16 = 0,
     queued_editor_active: bool = false,
-    subagent_count: usize,
-    subagent_view_active: bool,
-    selected_subagent_id: ?u64,
-    selected_subagent_label: ?[]const u8,
-    selected_subagent_status: ?SubagentStatus,
-    selected_subagent_tool_calls: usize = 0,
-    selected_subagent_activity: ?[]const u8 = null,
-    fast_mode: bool = false,
-    model_supports_fast: bool = false,
+    fast_indicator_active: bool = false,
     effort: types.ReasoningEffort = .auto,
     model_supports_effort: bool = false,
     ctrl_c_pending: bool = false,
@@ -526,11 +550,15 @@ pub const QueuedBannerFacts = struct {
     paused: bool = false,
     card_count: usize = 0,
     card_rows: u16 = 0,
+    steering_rows: u16 = 0,
 };
 
 pub fn queuedBannerRowsForFacts(facts: QueuedBannerFacts) u16 {
     if (facts.queued_count == 0) return 0;
     const paused_hint_rows: u16 = @intFromBool(facts.paused);
+    if (facts.steering_rows > 0) {
+        return facts.steering_rows +| paused_hint_rows +| collapsed_queue_banner_gap_rows;
+    }
     if (facts.card_rows > 0) {
         const between_cards: u16 = @intCast(@min(
             facts.card_count -| 1,
@@ -548,6 +576,10 @@ pub fn queuedBannerRows(ctx: RenderContext) u16 {
         .paused = ctx.queued_paused,
         .card_count = ctx.queued_prompt_cards.len,
         .card_rows = ctx.queued_prompt_card_rows,
+        .steering_rows = @intCast(@min(
+            ctx.steering_messages.len,
+            @as(usize, std.math.maxInt(u16)),
+        )),
     });
 }
 
@@ -558,6 +590,10 @@ test "queued banner row policy consumes aggregate card facts" {
     try std.testing.expectEqual(@as(u16, 3), queuedBannerRowsForFacts(.{
         .queued_count = 2,
         .paused = true,
+    }));
+    try std.testing.expectEqual(@as(u16, 3), queuedBannerRowsForFacts(.{
+        .queued_count = 2,
+        .steering_rows = 2,
     }));
     try std.testing.expectEqual(@as(u16, 7), queuedBannerRowsForFacts(.{
         .queued_count = 2,
@@ -771,6 +807,22 @@ test "skillsMenuProjection mirrors runtime menu state" {
     try std.testing.expectEqualStrings("work", projection.query);
 }
 
+test "skillsMenuProjection hides zero-result mentions and preserves command menus" {
+    var skills = [_]skill_runtime.Skill{
+        .{ .name = "managed", .description = "managed desc", .path = "/tmp/managed/SKILL.md", .source = .global_fx },
+    };
+    var runtime: skill_runtime.Runtime = .{ .items = &skills };
+
+    runtime.openMenuWithQuery(.dollar, .{ .start = 0, .end = "$missing".len }, "missing");
+    try std.testing.expect(!skillsMenuProjection(&runtime).active);
+
+    runtime.menu.setQuery("man");
+    try std.testing.expect(skillsMenuProjection(&runtime).active);
+
+    runtime.openMenuWithQuery(.command, null, "missing");
+    try std.testing.expect(skillsMenuProjection(&runtime).active);
+}
+
 test "modelMenuProjection mirrors cache-owned catalog state" {
     var cache = model_cache_runtime.Runtime.init(std.testing.allocator, "/v1/models");
     defer cache.deinit();
@@ -845,11 +897,6 @@ test "frame-owned thinking activity projects the thinking label" {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .shimmer_pos = 0,
         .input = &input,
     };
@@ -873,11 +920,6 @@ test "frame-owned activity renders the thinking elapsed counter from the frame c
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .input = &input,
     };
 
@@ -901,11 +943,6 @@ test "frame-owned activity keeps active tools out of the turn status row" {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .activity = .{ .tool_slot = .{
             .entry_id = 123,
             .fallback_label = "reading src/main.zig",
@@ -948,11 +985,6 @@ test "current frame-owned activity leaves the focused tool in the transcript" {
         .has_api_key = true,
         .model = "test-model",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .activity = .{ .tool_slot = .{
             .entry_id = 123,
             .fallback_label = "● Running\x1b[0m \x1b[38;5;245mzig build test\x1b[0m\n",
@@ -1017,11 +1049,6 @@ test "frame-owned activity preserves route recovery status tone" {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .activity = .{ .turn_thinking = .{
             .label = "⚠ API error · attempt 1/3 failed · retrying",
             .tone = .warning,
@@ -1068,11 +1095,6 @@ test "frame-owned activity shows live streaming token progress" {
         .has_api_key = true,
         .model = "test-model",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .activity = .none,
         .now_ms = 13_000,
         .input = &input,
@@ -1173,11 +1195,6 @@ test "frame-owned activity uses clipped command activity label" {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .activity = .{ .tool_slot = .{
             .entry_id = 123,
             .fallback_label = "running read-only tools",

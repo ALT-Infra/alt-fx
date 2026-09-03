@@ -41,6 +41,7 @@ pub const SessionStarted = struct {
     conversation_language: session.ConversationLanguage,
     preferences: session_codec.DurableSessionPreferences,
     usage: ?session_usage.Snapshot = null,
+    subagent_child: bool = false,
 
     fn deinit(self: *SessionStarted, alloc: Allocator) void {
         alloc.free(self.id);
@@ -919,6 +920,7 @@ fn applyDelta(
                 .history = &.{},
                 .total_input_tokens = 0,
                 .total_output_tokens = 0,
+                .subagent_child = payload.subagent_child,
             };
             errdefer alloc.free(next.id);
             next.origin_workspace_root = try alloc.dupe(u8, payload.origin_workspace_root);
@@ -995,6 +997,9 @@ fn applyDelta(
                 current.history = try alloc.realloc(current.history, current.history.len + 1);
             }
             current.history[current.history.len - 1] = turn;
+            if (payload.turn == .compacted_summary) {
+                current.context_history_start = current.history.len - 1;
+            }
             current.conversation_language = payload.conversation_language;
             current.total_input_tokens = payload.total_input_tokens;
             current.total_output_tokens = payload.total_output_tokens;
@@ -1051,6 +1056,7 @@ fn validateEnvelope(envelope: Envelope) !void {
                 .total_input_tokens = 0,
                 .total_output_tokens = 0,
                 .usage = payload.usage,
+                .subagent_child = payload.subagent_child,
             };
             try session_codec.validateState(state);
         },
@@ -1147,6 +1153,9 @@ fn writePayload(writer: *std.Io.Writer, event: Event) !void {
                 try writer.writeAll(",\"usage\":");
                 try session_usage.writeSnapshot(writer, usage);
             }
+            if (payload.subagent_child) {
+                try writer.writeAll(",\"subagent_child\":true");
+            }
             try writer.writeByte('}');
         },
         .preferences_changed => |payload| {
@@ -1242,25 +1251,20 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
     return switch (kind) {
         .session_started => blk: {
             const source = try requireObject(value);
-            const object = if (source.count() == 6)
-                try exactObject(value, &.{
-                    "id",
-                    "created_at_ms",
-                    "origin_workspace_root",
-                    "workspace_root",
-                    "conversation_language",
-                    "preferences",
-                })
-            else
-                try exactObject(value, &.{
-                    "id",
-                    "created_at_ms",
-                    "origin_workspace_root",
-                    "workspace_root",
-                    "conversation_language",
-                    "preferences",
-                    "usage",
-                });
+            if (source.count() < 6 or source.count() > 8) {
+                return error.InvalidEventFrame;
+            }
+            try rejectUnknownKeys(source, &.{
+                "id",
+                "created_at_ms",
+                "origin_workspace_root",
+                "workspace_root",
+                "conversation_language",
+                "preferences",
+                "usage",
+                "subagent_child",
+            });
+            const object = source;
             const id = try dupeString(alloc, object, "id");
             errdefer alloc.free(id);
             const origin = try dupeString(alloc, object, "origin_workspace_root");
@@ -1283,6 +1287,13 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
             else
                 null;
             errdefer if (usage) |*snapshot| snapshot.deinit(alloc);
+            const subagent_child = if (object.get("subagent_child")) |raw|
+                if (raw == .bool and raw.bool)
+                    true
+                else
+                    return error.InvalidEventFrame
+            else
+                false;
             break :blk .{ .session_started = .{
                 .id = id,
                 .created_at_ms = try requireI64(object, "created_at_ms"),
@@ -1293,6 +1304,7 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
                 ) catch return error.InvalidEventFrame,
                 .preferences = preferences,
                 .usage = usage,
+                .subagent_child = subagent_child,
             } };
         },
         .preferences_changed => blk: {
@@ -1644,6 +1656,7 @@ test "event frame codec is deterministic and validates contiguous sequence and g
                 .effort = types.ReasoningEffort.literal("medium"),
                 .fast_mode = false,
             },
+            .subagent_child = true,
         } },
     };
 
@@ -1657,6 +1670,7 @@ test "event frame codec is deterministic and validates contiguous sequence and g
     var decoded = try decodeFrame(alloc, first);
     defer decoded.deinit(alloc);
     try std.testing.expectEqual(Kind.session_started, decoded.kind());
+    try std.testing.expect(decoded.event.session_started.subagent_child);
     try std.testing.expectEqualSlices(u8, &generation, &decoded.log_generation);
     try std.testing.expectEqual(@as(u64, 1), decoded.seq);
 
@@ -2119,6 +2133,51 @@ test "single event application updates caller-owned state without replaying its 
     try std.testing.expectEqual(@as(u64, 100), state.total_input_tokens);
     try std.testing.expectEqual(@as(u64, 50), state.total_output_tokens);
     try std.testing.expectEqual(@as(i64, 30), state.updated_at_ms);
+}
+
+test "compacted summary event advances the durable replacement boundary" {
+    const alloc = std.testing.allocator;
+    var state: ?session_codec.DurableSessionState = try singleEventTestState(
+        "session-compaction-checkpoint",
+    ).dupe(alloc);
+    defer if (state) |*current| current.deinit(alloc);
+
+    const generation = identifier(0xb0);
+    try applyDelta(alloc, &state, .{
+        .log_generation = generation,
+        .seq = 1,
+        .event_id = identifier(0xb1),
+        .timestamp_ms = 30,
+        .event = .{ .history_turn_committed = .{
+            .conversation_language = session.ConversationLanguage.literal("en"),
+            .total_input_tokens = 10,
+            .total_output_tokens = 5,
+            .turn = .{ .assistant = .{
+                .user = .{ .text = @constCast("exact prompt") },
+                .assistant = @constCast("exact reply"),
+            } },
+        } },
+    });
+    try applyDelta(alloc, &state, .{
+        .log_generation = generation,
+        .seq = 2,
+        .event_id = identifier(0xb2),
+        .timestamp_ms = 40,
+        .event = .{ .history_turn_committed = .{
+            .conversation_language = session.ConversationLanguage.literal("en"),
+            .total_input_tokens = 20,
+            .total_output_tokens = 10,
+            .turn = .{ .compacted_summary = .{
+                .summary = @constCast("<context_handoff>\nsummary\n</context_handoff>"),
+                .removed_turn_count = 1,
+                .compaction_count = 1,
+            } },
+        } },
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), state.?.history.len);
+    try std.testing.expectEqual(@as(usize, 1), state.?.context_history_start);
+    try std.testing.expectEqualStrings("exact prompt", state.?.history[0].assistant.user.text);
 }
 
 test "single event application preserves caller-owned state on allocation failure" {

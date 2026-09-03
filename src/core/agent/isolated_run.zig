@@ -86,8 +86,6 @@ const Context = struct {
         result.interactive = true;
         result.output_chunk_ctx = self;
         result.on_output_chunk = discardOutputChunk;
-        result.background_url_ctx = self;
-        result.on_background_url_ready = discardBackgroundUrl;
         result.lifecycle_view = self.config.lifecycle_view;
         result.lifecycle_scope = .{
             .kind = .interactive,
@@ -127,6 +125,7 @@ pub fn run(
     defer context.deinit();
     const deps = runtimeDeps(&context);
     agent_run_service.run(.{
+        .agent = &config.session.agent,
         .deps = &deps,
         .lifecycle = .{
             .view = config.lifecycle_view,
@@ -235,8 +234,6 @@ fn appendRuntimeContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayL
         .interactive = true,
         .permission_mode = context.prompt.permission_mode,
         .tracker = tool_ctx.tracker,
-        .background = tool_ctx.background,
-        .session = context.config.session,
     }, arena, messages);
 }
 
@@ -382,7 +379,15 @@ fn publishCommittedFileHandoff(_: *anyopaque, _: file_mutation.CommittedFileHand
 fn refreshGatewayCredential(raw: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: auth_runtime.CredentialRefreshMode, expected_account_id: ?[]const u8) !?[]u8 {
     const context: *Context = @ptrCast(@alignCast(raw));
     const tool_ctx = context.toolContext();
-    return auth_runtime.refreshCredentialTokenForAccount(tool_ctx.oauth_transport, alloc, source, mode, expected_account_id);
+    var refreshed = (try auth_runtime.refreshCredentialForAccount(
+        tool_ctx.oauth_transport,
+        alloc,
+        source,
+        mode,
+        expected_account_id,
+    )) orelse return null;
+    defer refreshed.deinit(alloc);
+    return try alloc.dupe(u8, refreshed.token);
 }
 
 test "isolated HTTP failure retains sanitized provider billing detail" {

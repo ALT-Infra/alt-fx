@@ -1399,16 +1399,33 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendLiteralText("/he");
       await session.waitForText("/help", 5_000);
       await session.sendLiteralText("zzzzz");
-      let pane = await session.waitForText("no matching slash commands", 5_000);
-      expect(composerContains(pane, "/hezzzzz")).toBe(true);
-      expect(pane).not.toContain("Enter Use");
-      await session.sendKeys("Escape");
       await session.waitForPane(
-        (current) =>
-          composerContains(current, "/hezzzzz") &&
-          !current.includes("no matching slash commands"),
+        (current) => composerContains(current, "/hezzzzz"),
         5_000,
       );
+      await Bun.sleep(100);
+      let pane = await session.capturePane();
+      expect(composerContains(pane, "/hezzzzz")).toBe(true);
+      expect(pane).not.toContain("Enter Use");
+      expect(pane).not.toContain("no matching slash commands");
+
+      for (let index = 0; index < 5; index++) await session.sendKeys("BSpace");
+      await session.waitForPane(
+        (current) => composerContains(current, "/he") && current.includes("Enter Use"),
+        5_000,
+      );
+
+      await session.sendKeys("C-u");
+      const absolutePath = "/opt/project/src/main.zig";
+      await session.sendLiteralText(absolutePath);
+      await session.waitForPane(
+        (current) => composerContains(current, absolutePath),
+        5_000,
+      );
+      await Bun.sleep(100);
+      pane = await session.capturePane();
+      expect(pane).not.toContain("no matching slash commands");
+      expect(pane).not.toContain("Enter Use");
 
       await session.sendKeys("C-u");
       await session.sendLiteralText("/name");
@@ -1453,8 +1470,14 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       for (const retired of ["/appearance", "/input", "/maxxing"]) {
         await session.sendKeys("C-u");
         await session.sendLiteralText(retired);
-        pane = await session.waitForText("no matching slash commands", 5_000);
+        await session.waitForPane(
+          (current) => composerContains(current, retired),
+          5_000,
+        );
+        await Bun.sleep(100);
+        pane = await session.capturePane();
         expect(composerContains(pane, retired)).toBe(true);
+        expect(pane).not.toContain("no matching slash commands");
         expect(pane).not.toContain("minimal");
         expect(pane).not.toContain("legacy");
         expect(pane).not.toContain("resume-helper");
@@ -2424,16 +2447,19 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("C-u");
 
       await session.sendLiteralText(" $");
+      grid = await waitForSkillsMenu(session, 4);
+      expect(composerContains(grid.join("\n"), " $")).toBe(true);
+      await session.sendKeys("C-[");
       await session.waitForPane(
-        (current) =>
-          composerContains(current, " $") &&
-          current.includes("𝒇x") &&
-          !current.includes("Skills 4"),
+        (current) => composerContains(current, " $") && !current.includes("Skills 4"),
         5_000,
       );
       await session.sendKeys("C-u");
 
       await session.sendLiteralText("hello $");
+      grid = await waitForSkillsMenu(session, 4);
+      expect(composerContains(grid.join("\n"), "hello $")).toBe(true);
+      await session.sendKeys("C-[");
       await session.waitForPane(
         (current) =>
           composerContains(current, "hello $") &&
@@ -2443,52 +2469,62 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       );
       await session.sendKeys("C-u");
 
-      await session.sendLiteralText("explain $man");
+      await session.sendLiteralText("price$");
+      grid = await waitForSkillsMenu(session, 4);
+      expect(composerContains(grid.join("\n"), "price$")).toBe(true);
+      await session.sendKeys("C-[");
       await session.waitForPane(
         (current) =>
-          composerContains(current, "explain $managed-menu") &&
+          composerContains(current, "price$") &&
           !current.includes("Skills 4"),
         5_000,
       );
-      let inlineEscapes = await session.capturePaneEscapes();
-      expect(inlineEscapes).toContain(`${DIM_SGR}aged-menu`);
+      await session.sendKeys("C-u");
+
+      await session.sendLiteralText("explain $man");
+      grid = await waitForSkillsMenu(session, 1);
+      expect(composerContains(grid.join("\n"), "explain $man")).toBe(true);
+      expect(await session.capturePaneEscapes()).not.toContain(`${DIM_SGR}aged-menu`);
+
+      await session.sendLiteralText("zzzzzz");
+      await session.waitForPane(
+        (current) =>
+          composerContains(current, "explain $manzzzzzz") &&
+          !current.includes("Skills ") &&
+          !current.includes("No skills found.") &&
+          !current.includes("Enter Use"),
+        5_000,
+      );
+
+      await session.sendKeys("BSpace BSpace BSpace BSpace BSpace BSpace");
+      grid = await waitForSkillsMenu(session, 1);
+      expect(composerContains(grid.join("\n"), "explain $man")).toBe(true);
 
       await session.sendKeys("C-[");
       await session.waitForPane(
         (current) =>
           composerContains(current, "explain $man") &&
+          !current.includes("Skills "),
+        5_000,
+      );
+      await session.sendLiteralText("x");
+      await session.waitForPane(
+        (current) =>
+          composerContains(current, "explain $manx") &&
+          !current.includes("Skills ") &&
           !current.includes("aged-menu"),
         5_000,
       );
       await session.sendKeys("C-u");
 
-      await session.sendLiteralText("explain $man");
-      await session.waitForPane(
-        (current) => composerContains(current, "explain $managed-menu"),
-        5_000,
-      );
-      await session.sendKeys("Tab");
+      await session.sendLiteralText("prefix$man");
+      grid = await waitForSkillsMenu(session, 1);
+      expect(composerContains(grid.join("\n"), "prefix$man")).toBe(true);
+      await session.sendKeys("Enter");
       await session.waitForPane(
         (current) =>
-          composerContains(current, "explain managed-menu") &&
-          !current.includes("Skills 4"),
-        5_000,
-      );
-      inlineEscapes = await session.capturePaneEscapes();
-      expect(inlineEscapes).toContain(`${SELECTED_COMPLETION_SGR}managed-menu`);
-      expect(inlineEscapes).not.toContain(`${DIM_SGR}aged-menu`);
-      await session.sendKeys("C-u");
-
-      await session.sendLiteralText("explain $man");
-      await session.waitForPane(
-        (current) => composerContains(current, "explain $managed-menu"),
-        5_000,
-      );
-      await session.sendKeys("Right");
-      await session.waitForPane(
-        (current) =>
-          composerContains(current, "explain managed-menu") &&
-          !current.includes("Skills 4"),
+          composerContains(current, "prefixmanaged-menu") &&
+          !current.includes("Skills "),
         5_000,
       );
       await session.sendKeys("C-u");
@@ -2501,7 +2537,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
           !current.includes("Skills 4"),
         5_000,
       );
-      inlineEscapes = await session.capturePaneEscapes();
+      let inlineEscapes = await session.capturePaneEscapes();
       expect(inlineEscapes).toContain(`${DIM_SGR}ills`);
 
       await session.sendKeys("C-[");
@@ -2995,7 +3031,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   );
 
   test(
-    "skills catalog retains input ownership for global view shortcuts",
+    "skills catalog keeps direct Ctrl-X and escaped Ctrl-X returns to the composer",
     async () => {
       const fixture = createSkillsMenuFixture();
       session = await TmuxSession.create({
@@ -3025,9 +3061,8 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendText("/skills");
       await waitForSkillsMenu(session, 4);
       await session.sendHexBytes(["1b", "18"]);
-      await session.waitForText("Agents & processes", 5_000);
-      await session.sendKeys("C-x");
       await session.waitForComposer(5_000);
+      expect((await session.capturePane())).not.toContain("Agents & processes");
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
       session = null;
@@ -3504,7 +3539,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
 
       await session.sendKeys("-l '/clear'");
-      await session.waitForText("start a fresh session and keep background processes", 5_000);
+      await session.waitForText("start a fresh conversation", 5_000);
       await session.sendKeys("Enter");
       await session.waitForComposer(5_000);
 

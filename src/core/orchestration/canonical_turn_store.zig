@@ -98,7 +98,7 @@ pub const Store = struct {
         prompt.skill_display_spans = &.{};
         prompt.context_snapshot.deinit(alloc);
         prompt.context_snapshot = context_contract.GatheredContextSnapshot{};
-        prompt.steer_target_turn_id = null;
+        prompt.delivery = .ordinary;
         prompt.executor = .native_agent;
         return self.captureOwned(alloc, prompt);
     }
