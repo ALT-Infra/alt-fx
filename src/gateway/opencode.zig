@@ -1,5 +1,7 @@
 const std = @import("std");
 const chat_completions = @import("openai_chat_completions.zig");
+const opencode_responses = @import("opencode_responses.zig");
+const stream_provider = @import("../core/agent/stream_provider.zig");
 
 const endpoint_zen = "https://opencode.ai/zen/v1/chat/completions";
 const endpoint_go = "https://opencode.ai/zen/go/v1/chat/completions";
@@ -25,7 +27,24 @@ const spec = chat_completions.Spec{
     .non_retryable_limit_markers = &.{ "GoUsageLimitError", "FreeUsageLimitError" },
 };
 
-pub const agent_stream_provider = chat_completions.provider(&spec);
+pub const agent_stream_provider = stream_provider.Provider{
+    .stream_fn = streamDispatch,
+};
+
+fn streamDispatch(
+    _: ?*anyopaque,
+    alloc: std.mem.Allocator,
+    request: stream_provider.ModelRequest,
+) !stream_provider.Result {
+    // Models verified to need the Responses API bypass chat completions.
+    // Everything else keeps its exact current route.
+    if (opencode_responses.isRouted(request.model)) {
+        return opencode_responses.agent_stream_provider.stream(alloc, request);
+    }
+    return chat_provider.stream(alloc, request);
+}
+
+const chat_provider = chat_completions.provider(&spec);
 
 test "OpenCode routes Zen and Go without changing model identity in fx" {
     const zen = route("kimi-k3");

@@ -6,6 +6,7 @@ const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
 const models_dev = @import("models_dev.zig");
+const opencode_responses = @import("opencode_responses.zig");
 
 const max_models_per_surface: usize = 4096;
 const max_model_id_bytes: usize = 256;
@@ -260,18 +261,33 @@ fn appendSurface(
         if (value != .object) continue;
         const raw_id = stringField(value.object, "id") orelse continue;
         if (raw_id.len == 0 or raw_id.len > max_model_id_bytes) continue;
-        if (!supportsChatCompletions(protocol_provider, raw_id)) continue;
-        if (free_only and !availableWithoutKey(protocol_provider, raw_id)) continue;
-        if (findDuplicate(catalog.items, id_prefix, raw_id)) continue;
-        if (catalog.items.len >= max_models_per_surface * 2) return error.OpenCodeModelCatalogTooLarge;
+        const id = try std.fmt.allocPrint(alloc, "{s}{s}", .{ id_prefix, raw_id });
+        errdefer alloc.free(id);
+        // Models routed to the Responses API bypass the chat-completions
+        // protocol gate; the router owns their transport decision.
+        if (!supportsChatCompletions(protocol_provider, raw_id) and
+            !opencode_responses.isRouted(id))
+        {
+            alloc.free(id);
+            continue;
+        }
+        if (free_only and !availableWithoutKey(protocol_provider, raw_id)) {
+            alloc.free(id);
+            continue;
+        }
+        if (findDuplicate(catalog.items, id_prefix, raw_id)) {
+            alloc.free(id);
+            continue;
+        }
+        if (catalog.items.len >= max_models_per_surface * 2) {
+            return error.OpenCodeModelCatalogTooLarge;
+        }
         const protocol_model = protocol_provider.models.map.get(raw_id);
         var reasoning = if (protocol_model) |model|
             try models_dev.parseReasoningFields(alloc, model.reasoning, model.reasoning_options)
         else
             models_dev.ReasoningMetadata{};
         defer reasoning.deinit(alloc);
-        const id = try std.fmt.allocPrint(alloc, "{s}{s}", .{ id_prefix, raw_id });
-        errdefer alloc.free(id);
         const model_type = try alloc.dupe(u8, "language");
         errdefer alloc.free(model_type);
         try catalog.append(alloc, .{
@@ -297,8 +313,10 @@ fn availableWithoutKey(provider: ProtocolProvider, model_id: []const u8) bool {
 /// models.dev per-model SDK tags describe direct provider access, but OpenCode
 /// re-serves everything on its OpenAI-compatible endpoints, so a tag other
 /// than openai-compatible does not always mean fx cannot drive the model.
-/// Entries here are verified live through fx and stay until models.dev
-/// corrects the tag. Do not extend without a live chat-completion check.
+/// Entries here are verified live over chat completions and stay until
+/// models.dev corrects the tag. Models that need a different transport live
+/// in opencode_responses' routed list instead. Do not extend either without
+/// a live chat completion through fx.
 const chat_completions_overrides: []const []const u8 = &.{
     // Tagged @ai-sdk/anthropic; served on the Go endpoint like its siblings.
     "qwen3.8-flash",
