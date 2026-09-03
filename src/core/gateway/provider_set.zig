@@ -222,6 +222,8 @@ test "provider compaction route preserves provider and credential authority" {
         .gateway = .{ .compaction_model = "openai/gpt-5.6-luna" },
         .codex = .{ .compaction_model = "gpt-5.6-luna" },
         .grok = .{ .compaction_model = "grok-4.5" },
+        .opencode = .{},
+        .cline = .{},
     };
     const cases = [_]struct {
         provider: model_provider.ProviderId,
