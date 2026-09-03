@@ -1315,6 +1315,14 @@ pub fn Runtime(comptime App: type) type {
                     measurement.activity_projection
                 else
                     .{ .turn_thinking = .{ .label = footer_frame.label() } };
+                const prompt_turn_reservation = promptTurnReservation(
+                    app,
+                    presentation_shell,
+                    canonical_transcript_preview,
+                    pending_card,
+                    if (footer_measurement) |*measurement| measurement else null,
+                    frame_activity,
+                );
                 var fixed_point_ctx = FixedPointTranscriptContext(App){
                     .app = app,
                     .presentation_shell = presentation_shell,
@@ -1347,6 +1355,7 @@ pub fn Runtime(comptime App: type) type {
                         .footer = neutral_footer,
                         .transcript = transcript_preview,
                         .activity = frame_activity,
+                        .prompt_turn = prompt_turn_reservation,
                         .body_mode = .transcript,
                         .prior = active_committed_layout,
                     },
@@ -1358,7 +1367,7 @@ pub fn Runtime(comptime App: type) type {
                 scroll_plan = fixed_point.scroll_plan;
                 debug_trace.logf(
                     "frame_layout",
-                    "layout_id={x} solved_frame_height={d} footer_height={d} footer_top={d} owned_top={d} owned_bottom={d} scroll_rows={d}",
+                    "layout_id={x} solved_frame_height={d} footer_height={d} footer_top={d} owned_top={d} owned_bottom={d} prompt_turn_transcript_rows={d} prompt_turn_active={s} scroll_rows={d}",
                     .{
                         solved.layout_id,
                         solved.solved_frame_height,
@@ -1366,6 +1375,8 @@ pub fn Runtime(comptime App: type) type {
                         solved.footer_area.top,
                         solved.owned_top,
                         solved.owned_band.bottom,
+                        prompt_turn_reservation.transcript_rows,
+                        if (prompt_turn_reservation.active()) "true" else "false",
                         scroll_plan.terminal_scroll_rows,
                     },
                 );
@@ -2314,6 +2325,44 @@ fn validatePreparedTranscriptFitsPlan(
         );
         return error.InvalidPaintPlan;
     }
+}
+
+fn promptTurnReservation(
+    app: anytype,
+    shell: *const transcript_runtime.TranscriptRuntime,
+    canonical_preview: render_engine.frame_layout.TranscriptFlowPreview,
+    pending_card: ?PendingCardProjection,
+    footer_measurement: ?*const surface_frame.SurfaceFooterMeasurement,
+    frame_activity: render_engine.frame_layout.ActivityState,
+) render_engine.frame_layout.PromptTurnReservation {
+    if (frame_activity != .none) return .{};
+    const measurement = footer_measurement orelse return .{};
+    if (!measurement.input_visible or
+        measurement.show_picker or
+        measurement.picker_rows > 0 or
+        measurement.banner_active or
+        measurement.footer_gap_active or
+        app.stream.active or
+        shell.fullTranscriptActive()) return .{};
+    if (comptime @hasField(@TypeOf(app.*), "skills")) {
+        if (comptime @hasDecl(@TypeOf(app.skills), "menuVisible")) {
+            if (app.skills.menuVisible()) return .{};
+        }
+    }
+
+    const future_activity = render_engine.frame_layout.ActivityState.thinkingAfterUserTurn();
+    const pending_submission_active = if (comptime @hasField(@TypeOf(app.*), "submission"))
+        app.submission.pending != null
+    else
+        false;
+    if (pending_card != null or pending_submission_active) {
+        const canonical_rows = if (pending_card) |card|
+            canonical_preview.natural_visual_rows +| (card.row_count -| 1)
+        else
+            canonical_preview.natural_visual_rows;
+        return .{ .transcript_rows = canonical_rows, .activity = future_activity };
+    }
+    return .{};
 }
 
 fn footerMeasurementFromRows(rows: render_engine.footer_layout.FooterRows) render_engine.frame_layout.FooterMeasurement {

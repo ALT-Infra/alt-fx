@@ -91,6 +91,10 @@ pub fn Runtime(comptime App: type) type {
                 error.ConnectionSetupTimedOut => return alloc.dupe(u8, "Connection setup timed out after 30 seconds."),
                 error.TlsInitializationFailed => return alloc.dupe(u8, "Connection setup failed: TLS could not be initialized."),
                 error.ModelImageCapabilityUnavailable => return alloc.dupe(u8, image_attachments.model_image_capability_unavailable_notice),
+                error.CompactionResultStorageUnavailable => return alloc.dupe(
+                    u8,
+                    "Context could not be compacted because older tool results could not be preserved. Save the session or restore writable session storage, then try again.",
+                ),
                 else => {},
             }
             if (detailedErrorSummary(err)) |detail| {
@@ -210,6 +214,22 @@ test "formatErrorBody describes terminal connection setup failures plainly" {
     const unrelated_timeout = try Rt.formatErrorBody(alloc, "request failed", error.ConnectionTimedOut);
     defer alloc.free(unrelated_timeout);
     try std.testing.expectEqualStrings("request failed: ConnectionTimedOut", unrelated_timeout);
+}
+
+test "formatErrorBody explains compaction result storage failure" {
+    const alloc = std.testing.allocator;
+    const Rt = Runtime(DummyApp);
+    const body = try Rt.formatErrorBody(
+        alloc,
+        "request failed",
+        error.CompactionResultStorageUnavailable,
+    );
+    defer alloc.free(body);
+
+    try std.testing.expectEqualStrings(
+        "Context could not be compacted because older tool results could not be preserved. Save the session or restore writable session storage, then try again.",
+        body,
+    );
 }
 
 test "formatToolExecutionError includes detail for MissingField" {

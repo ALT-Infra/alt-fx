@@ -1102,16 +1102,25 @@ pub fn Runtime(comptime App: type) type {
                     .{ .managed = capability }
                 else
                     .unavailable;
-            try runtime_context_compaction.validateUnversionedHistoryResults(
-                job.history,
-                job.unversioned_history_count,
-            );
             var messages: std.ArrayList(ChatMessage) = .empty;
             defer messages.deinit(arena);
+            const uncertain_history_count = @min(
+                @max(
+                    job.unversioned_history_count,
+                    job.context_history_start,
+                ),
+                job.history.len,
+            );
             try session_runtime.appendCompactionHistoryChatMessages(
                 arena,
                 &messages,
-                job.history,
+                job.history[0..uncertain_history_count],
+            );
+            const uncertain_message_count = messages.items.len;
+            try session_runtime.appendCompactionHistoryChatMessages(
+                arena,
+                &messages,
+                job.history[uncertain_history_count..],
             );
             const source_tokens = runtime_prompt_context.estimateCompactionSourceTokens(
                 messages.items,
@@ -1150,6 +1159,10 @@ pub fn Runtime(comptime App: type) type {
                 .source_tokens = source_tokens,
                 .protected_tokens = retained_tokens,
                 .source_messages = messages.items[0 .. messages.items.len - retained_message_count],
+                .uncertain_source_message_count = @min(
+                    uncertain_message_count,
+                    messages.items.len - retained_message_count,
+                ),
                 .result_storage = result_storage,
                 .api_key = job.api_key,
                 .credential_source = job.credential_source,

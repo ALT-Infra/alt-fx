@@ -51,36 +51,28 @@ pub const ResultStorage = union(enum) {
     managed: *session_child_store.SessionChildCapability,
 };
 
-pub fn validateUnversionedHistoryResults(
-    history: []const types.HistoryTurn,
-    unversioned_history_count: usize,
-) !void {
-    for (history[0..@min(unversioned_history_count, history.len)]) |turn| {
-        const execution = switch (turn) {
-            .assistant => |entry| entry.execution,
-            .interrupted => |entry| entry.execution,
-            .compacted_summary => continue,
-        };
-        for (execution.tool_steps) |step| {
-            for (step.tool_results) |result| {
-                if (result.output_handle == null) return error.AmbiguousCompactionResult;
-            }
-        }
-    }
-}
+pub const resultHandleForContinuation = compaction_state.resultHandleForContinuation;
 
 pub fn promoteMessageResults(
     alloc: Allocator,
     messages: []types.ChatMessage,
     storage: ResultStorage,
+    uncertain_prefix_message_count: usize,
 ) !void {
-    for (messages) |*message| {
+    for (messages, 0..) |*message, message_index| {
         if (message.role != .tool) continue;
         const content = message.content orelse continue;
-        var memory = message.tool_result_memory orelse
+        const uncertain = message_index < uncertain_prefix_message_count;
+        var memory = message.tool_result_memory orelse if (uncertain)
+            types.ToolResultMemory{
+                .output_bytes = content.len,
+                .stored_output_bytes = content.len,
+                .truncated = true,
+            }
+        else
             return error.IncompleteCompactionResult;
-        if (memory.output_handle != null) continue;
-        if (memory.truncated) return error.IncompleteCompactionResult;
+        if (resultHandleForContinuation(memory) != null) continue;
+        if (memory.truncated and !uncertain) return error.IncompleteCompactionResult;
         const call_id = message.tool_call_id orelse return error.IncompleteCompactionResult;
         const tool_name = message.tool_name orelse return error.IncompleteCompactionResult;
         const handle = switch (storage) {
@@ -102,6 +94,7 @@ pub fn promoteMessageResults(
         };
         memory.output_handle = handle;
         memory.stored_output_bytes = content.len;
+        memory.truncated = memory.truncated or uncertain;
         message.tool_result_memory = memory;
         message.content = try std.fmt.allocPrint(
             alloc,
@@ -631,48 +624,141 @@ fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
     return count;
 }
 
-test "compaction result retention promotes only corrected history" {
+test "compaction result retention snapshots uncertain history without changing canonical results" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(result_dir);
 
-    var results = [_]types.PersistedToolResult{.{
-        .tool_call_id = @constCast("call-promote"),
-        .tool_name = @constCast("read_file"),
-        .status = .success,
-        .output = @constCast("complete redacted output"),
-        .output_bytes = 24,
-        .stored_output_bytes = 24,
-    }};
-    var steps = [_]types.ToolExecutionStep{.{ .tool_results = &results }};
-    var history = [_]types.HistoryTurn{.{ .assistant = .{
-        .user = .{ .text = @constCast("read it") },
-        .assistant = @constCast("read"),
-        .execution = .{ .tool_steps = &steps },
-    } }};
-
-    try validateUnversionedHistoryResults(&history, 0);
-    var messages = [_]types.ChatMessage{.{
-        .role = .tool,
-        .content = results[0].output,
-        .tool_call_id = results[0].tool_call_id,
-        .tool_name = results[0].tool_name,
-        .tool_result_memory = .{ .truncated = false },
-    }};
-    try promoteMessageResults(alloc, &messages, .{ .legacy_dir = result_dir });
-    const handle = messages[0].tool_result_memory.?.output_handle orelse
-        return error.TestExpectedEqual;
-    defer alloc.free(handle);
-    try std.testing.expectEqualStrings("complete redacted output", results[0].output);
-    defer alloc.free(@constCast(messages[0].content.?));
-    const stored = try result_store.readByRange(alloc, result_dir, handle, 1, 100);
-    defer alloc.free(stored);
-    try std.testing.expect(std.mem.find(u8, stored, "complete redacted output") != null);
-
-    try std.testing.expectError(
-        error.AmbiguousCompactionResult,
-        validateUnversionedHistoryResults(&history, 1),
+    const results = [_]types.PersistedToolResult{
+        .{
+            .tool_call_id = @constCast("call-promote"),
+            .tool_name = @constCast("read_file"),
+            .status = .success,
+            .output = @constCast("complete redacted output"),
+            .output_bytes = 24,
+            .stored_output_bytes = 24,
+        },
+        .{
+            .tool_call_id = @constCast("call-uncertain-truncated"),
+            .tool_name = @constCast("grep_files"),
+            .status = .success,
+            .output = @constCast("available legacy bytes"),
+            .output_bytes = 128,
+            .stored_output_bytes = 22,
+            .truncated = true,
+        },
+        .{
+            .tool_call_id = @constCast("call-current-complete"),
+            .tool_name = @constCast("read_file"),
+            .status = .success,
+            .output = @constCast("current complete output"),
+            .output_bytes = 23,
+            .stored_output_bytes = 23,
+        },
+    };
+    var messages = [_]types.ChatMessage{
+        .{
+            .role = .tool,
+            .content = results[0].output,
+            .tool_call_id = results[0].tool_call_id,
+            .tool_name = results[0].tool_name,
+            .tool_result_memory = .{ .truncated = false },
+        },
+        .{
+            .role = .tool,
+            .content = results[1].output,
+            .tool_call_id = results[1].tool_call_id,
+            .tool_name = results[1].tool_name,
+            .tool_result_memory = .{
+                .output_bytes = results[1].output_bytes,
+                .stored_output_bytes = results[1].stored_output_bytes,
+                .truncated = true,
+            },
+        },
+        .{
+            .role = .tool,
+            .content = "interrupted legacy bytes",
+            .tool_call_id = "call-uncertain-missing-memory",
+            .tool_name = "subagent",
+        },
+        .{
+            .role = .tool,
+            .content = results[2].output,
+            .tool_call_id = results[2].tool_call_id,
+            .tool_name = results[2].tool_name,
+            .tool_result_memory = .{
+                .output_bytes = results[2].output_bytes,
+                .stored_output_bytes = results[2].stored_output_bytes,
+                .truncated = false,
+            },
+        },
+    };
+    try promoteMessageResults(
+        alloc,
+        &messages,
+        .{ .legacy_dir = result_dir },
+        3,
     );
+    defer for (&messages) |*message| {
+        if (message.tool_result_memory.?.output_handle) |handle| alloc.free(handle);
+        alloc.free(@constCast(message.content.?));
+    };
+    try std.testing.expectEqualStrings("complete redacted output", results[0].output);
+    try std.testing.expect(results[0].output_handle == null);
+    try std.testing.expect(!results[0].truncated);
+    try std.testing.expect(messages[0].tool_result_memory.?.truncated);
+    try std.testing.expect(messages[1].tool_result_memory.?.truncated);
+    try std.testing.expect(messages[2].tool_result_memory.?.truncated);
+    try std.testing.expectEqual(
+        @as(usize, "interrupted legacy bytes".len),
+        messages[2].tool_result_memory.?.stored_output_bytes,
+    );
+    try std.testing.expect(!messages[3].tool_result_memory.?.truncated);
+    const stored = try result_store.readByRange(
+        alloc,
+        result_dir,
+        messages[1].tool_result_memory.?.output_handle.?,
+        1,
+        100,
+    );
+    defer alloc.free(stored);
+    try std.testing.expect(std.mem.find(u8, stored, "available legacy bytes") != null);
+
+    var current_incomplete = [_]types.ChatMessage{.{
+        .role = .tool,
+        .content = "current truncated bytes",
+        .tool_call_id = "call-current-truncated",
+        .tool_name = "read_file",
+        .tool_result_memory = .{ .truncated = true },
+    }};
+    try std.testing.expectError(
+        error.IncompleteCompactionResult,
+        promoteMessageResults(
+            alloc,
+            &current_incomplete,
+            .{ .legacy_dir = result_dir },
+            0,
+        ),
+    );
+
+    var replay_backed = [_]types.ChatMessage{.{
+        .role = .tool,
+        .content = "bounded shell projection",
+        .tool_call_id = "call-command-replay",
+        .tool_name = "shell",
+        .tool_result_memory = .{
+            .truncated = true,
+            .command_output_replay = .{ .available = .{
+                .handle = "fx-command-replay-complete.bin",
+                .framed_bytes = 128,
+            } },
+        },
+    }};
+    const original_content = replay_backed[0].content.?;
+    try promoteMessageResults(alloc, &replay_backed, .unavailable, 0);
+    try std.testing.expectEqual(original_content.ptr, replay_backed[0].content.?.ptr);
+    try std.testing.expect(replay_backed[0].tool_result_memory.?.output_handle == null);
+    try std.testing.expect(replay_backed[0].tool_result_memory.?.truncated);
 }
