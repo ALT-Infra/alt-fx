@@ -4393,13 +4393,22 @@ fn buildCanonicalCompactionWindow(
     alloc: Allocator,
     history: []const HistoryTurn,
     within_turn_suffix: []const ChatMessage,
+    uncertain_history_count: usize,
+    uncertain_message_count: *usize,
 ) !std.ArrayList(ChatMessage) {
     var messages: std.ArrayList(ChatMessage) = .empty;
     errdefer messages.deinit(alloc);
+    const boundary = @min(uncertain_history_count, history.len);
     try session_runtime.appendCompactionHistoryChatMessages(
         alloc,
         &messages,
-        history,
+        history[0..boundary],
+    );
+    uncertain_message_count.* = messages.items.len;
+    try session_runtime.appendCompactionHistoryChatMessages(
+        alloc,
+        &messages,
+        history[boundary..],
     );
     try messages.appendSlice(alloc, within_turn_suffix);
     return messages;
@@ -4423,14 +4432,18 @@ test "repeated compaction source keeps canonical history and the complete active
         .{ .role = .assistant, .content = "new assistant" },
         .{ .role = .tool, .content = "new result" },
     };
+    var uncertain_message_count: usize = 0;
     var messages = try buildCanonicalCompactionWindow(
         std.testing.allocator,
         &history,
         &suffix,
+        0,
+        &uncertain_message_count,
     );
     defer messages.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 6), messages.items.len);
+    try std.testing.expectEqual(@as(usize, 0), uncertain_message_count);
     try std.testing.expectEqualStrings("canonical user", messages.items[0].content.?);
     try std.testing.expectEqualStrings("canonical assistant", messages.items[1].content.?);
     try std.testing.expectEqualStrings("old assistant", messages.items[2].content.?);
@@ -4492,6 +4505,7 @@ pub const ContextCompactionTransactionRequest = struct {
     source_tokens: usize,
     protected_tokens: usize,
     source_messages: []ChatMessage,
+    uncertain_source_message_count: usize = 0,
     result_storage: runtime_context_compaction.ResultStorage,
     api_key: []const u8,
     credential_source: ?types.CredentialSource = null,
@@ -4553,6 +4567,7 @@ pub fn compactContextTransaction(
         alloc,
         request.source_messages,
         request.result_storage,
+        request.uncertain_source_message_count,
     );
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
     if (deps.push_interactive_notice) |push_notice| {
@@ -5266,20 +5281,26 @@ fn processQueuedPromptLoop(
                         }
                     },
                     .compact => {
-                        try runtime_context_compaction.validateUnversionedHistoryResults(
-                            job.history,
-                            job.unversioned_history_count,
-                        );
                         try promoteRequestLocalResultsForCompaction(
                             arena,
                             config,
                             within_turn_suffix.items,
                             @constCast(request_messages),
                         );
+                        const uncertain_history_count = @min(
+                            @max(
+                                job.unversioned_history_count,
+                                job.context_history_start,
+                            ),
+                            job.history.len,
+                        );
+                        var uncertain_message_count: usize = 0;
                         var compaction_messages = try buildCanonicalCompactionWindow(
                             arena,
                             job.history,
                             within_turn_suffix.items,
+                            uncertain_history_count,
+                            &uncertain_message_count,
                         );
                         defer compaction_messages.deinit(arena);
                         const result_storage: runtime_context_compaction.ResultStorage =
@@ -5289,11 +5310,6 @@ fn processQueuedPromptLoop(
                                 .{ .legacy_dir = dir }
                             else
                                 .unavailable;
-                        try runtime_context_compaction.promoteMessageResults(
-                            arena,
-                            @constCast(request_messages),
-                            result_storage,
-                        );
                         const retained_tail_limit = retainedHistoryTailLimit(
                             job.history,
                             within_turn_suffix.items.len > 0,
@@ -5307,6 +5323,8 @@ fn processQueuedPromptLoop(
                                 retained_tail_limit,
                             );
                         const retained_message_count = retained_history_tail.message_count;
+                        const compaction_source_message_count =
+                            compaction_messages.items.len - retained_message_count;
                         const retained_tokens = runtime_prompt_context.estimateCompactionSourceTokens(
                             compaction_messages.items[compaction_messages.items.len - retained_message_count ..],
                         );
@@ -5355,7 +5373,11 @@ fn processQueuedPromptLoop(
                             .request_tokens = request_cost.estimated_input_tokens,
                             .source_tokens = request_cost.estimated_input_tokens,
                             .protected_tokens = prompt_tokens +| retained_tokens,
-                            .source_messages = compaction_messages.items[0 .. compaction_messages.items.len - retained_message_count],
+                            .source_messages = compaction_messages.items[0..compaction_source_message_count],
+                            .uncertain_source_message_count = @min(
+                                uncertain_message_count,
+                                compaction_source_message_count,
+                            ),
                             .result_storage = result_storage,
                             .api_key = active_api_key,
                             .credential_source = job.credential_source,
@@ -9776,7 +9798,7 @@ fn promoteRequestLocalResultsForCompaction(
         const content = message.content orelse continue;
         var memory = message.tool_result_memory orelse
             return error.ContextCapacityExceeded;
-        if (memory.output_handle != null) continue;
+        if (runtime_context_compaction.resultHandleForContinuation(memory) != null) continue;
         if (memory.truncated) return error.ContextCapacityExceeded;
         const call_id = message.tool_call_id orelse return error.ContextCapacityExceeded;
         const tool_name = message.tool_name orelse return error.ContextCapacityExceeded;

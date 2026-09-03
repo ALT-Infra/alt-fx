@@ -4461,8 +4461,6 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
             hasEmptyComposer(pane),
           15_000,
         );
-        await tui.sendText("/compact");
-        await tui.waitForText("Context compacted.", 15_000);
         await tui.sendText("/quit");
         await tui.waitForSessionEnd(15_000);
         tui = null;
@@ -4473,6 +4471,21 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         });
         expect(latest.code).toBe(0);
         const sessionId = JSON.parse(latest.stdout).id as string;
+
+        const compactionStderrPath = join(root.root, "compaction-stderr.log");
+        tui = await TmuxSession.create({
+          cmd: `${FX_BIN} --resume ${sessionId}`,
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          stderrPath: compactionStderrPath,
+        });
+        await tui.waitForComposer(15_000);
+        await tui.sendText("/compact");
+        await tui.waitForText("Context compacted.", 15_000);
+        await tui.sendText("/quit");
+        await tui.waitForSessionEnd(15_000);
+        tui = null;
+        expect(readFileSync(compactionStderrPath, "utf8")).toBe("");
 
         const beforeResume = await runFx(
           ["session", "--id", sessionId, "--json"],
@@ -4503,6 +4516,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(canonical.history.at(-1)?.summary).toContain(
           "Continue the compacted session.",
         );
+        const inlineSummary = canonical.history.at(-1)?.summary
+          ?.split("\n")
+          .find((line) => line.includes(`call_id="${inlineCallId}"`));
+        expect(inlineSummary).toContain("result_handle=");
+        expect(inlineSummary).toContain("truncated=true");
 
         expect(gateway.requests).toHaveLength(5);
         const compactRequest = JSON.parse(gateway.requests[4].body) as {
@@ -4607,6 +4625,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         const secondSummary = secondCanonical.history.at(-1)?.summary ?? "";
         expect(secondSummary).toContain(callId);
         expect(secondSummary).toContain(inlineCallId);
+        const secondInlineSummary = secondSummary
+          .split("\n")
+          .find((line) => line.includes(`call_id="${inlineCallId}"`));
+        expect(secondInlineSummary).toContain("result_handle=");
+        expect(secondInlineSummary).toContain("truncated=true");
       } finally {
         if (tui) await tui.kill();
         gateway.stop();

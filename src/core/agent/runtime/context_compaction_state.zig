@@ -233,7 +233,7 @@ fn statusFromResult(status: ?types.PersistedToolStatus) OperationStatus {
     };
 }
 
-fn resultHandleForContinuation(memory: types.ToolResultMemory) ?[]const u8 {
+pub fn resultHandleForContinuation(memory: types.ToolResultMemory) ?[]const u8 {
     const replay = memory.command_output_replay orelse return memory.output_handle;
     return switch (replay) {
         .available => |descriptor| descriptor.handle,

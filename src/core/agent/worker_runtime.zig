@@ -144,6 +144,7 @@ pub const ContextCompactionTask = struct {
     credential_source: ?types.CredentialSource = null,
     account_id: ?[]u8 = null,
     history: []types.HistoryTurn,
+    context_history_start: usize = 0,
     unversioned_history_count: usize = std.math.maxInt(usize),
 };
 

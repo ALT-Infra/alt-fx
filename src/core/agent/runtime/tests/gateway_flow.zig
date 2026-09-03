@@ -3006,9 +3006,10 @@ test "processQueuedPrompt semantically compacts history at eighty percent and co
         .tool_call_id = @constCast("auto_restored_1"),
         .tool_name = @constCast("read_file"),
         .status = .success,
-        .output = @constCast("AUTO_RESTORED_RESULT_SENTINEL"),
-        .output_bytes = 29,
+        .output = @constCast("AUTO_RESTORED_AVAILABLE_BYTES"),
+        .output_bytes = 100,
         .stored_output_bytes = 29,
+        .truncated = true,
     }};
     var restored_steps = [_]types.ToolExecutionStep{.{
         .tool_calls = &restored_calls,
@@ -3033,6 +3034,16 @@ test "processQueuedPrompt semantically compacts history at eighty percent and co
     try std.testing.expectEqual(@as(usize, 2), hooks.history_turns.items.len);
     try std.testing.expect(hooks.history_turns.items[0] == .compacted_summary);
     try std.testing.expect(hooks.history_turns.items[1] == .assistant);
+    try std.testing.expect(std.mem.find(
+        u8,
+        hooks.history_turns.items[0].compacted_summary.summary,
+        "result_handle=",
+    ) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        hooks.history_turns.items[0].compacted_summary.summary,
+        "truncated=true",
+    ) != null);
     try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
     try expectBodyContains(&gateway, 0, "AUTO_HISTORY_ASSISTANT_SENTINEL");
     try expectBodyContains(&gateway, 0, "\"toolChoice\":{\"type\":\"none\"}");
@@ -3156,6 +3167,13 @@ test "processQueuedPrompt compacts mid-turn after tool output crosses eighty per
     hooks.permission_decisions = &.{.once};
     hooks.exec_plans = &.{.{ .result = .{
         .model_output = "MIDTURN_RESULT_SENTINEL\n" ++ ("m" ** (10 * 1024)),
+        .tool_result_memory = .{
+            .truncated = true,
+            .command_output_replay = .{ .available = .{
+                .handle = "fx-command-replay-midturn-complete.bin",
+                .framed_bytes = 12 * 1024,
+            } },
+        },
     } }};
     var fixture = PromptFixture{};
     var config = fixture.config();
@@ -3176,7 +3194,16 @@ test "processQueuedPrompt compacts mid-turn after tool output crosses eighty per
     try std.testing.expect(hooks.history_turns.items[0] == .compacted_summary);
     try std.testing.expect(hooks.history_turns.items[1] == .assistant);
     const persisted_result = hooks.history_turns.items[1].assistant.execution.tool_steps[0].tool_results[0];
-    try std.testing.expect(persisted_result.output_handle != null);
+    try std.testing.expect(persisted_result.output_handle == null);
+    const replay = persisted_result.command_output_replay orelse
+        return error.TestExpectedEqual;
+    switch (replay) {
+        .available => |descriptor| try std.testing.expectEqualStrings(
+            "fx-command-replay-midturn-complete.bin",
+            descriptor.handle,
+        ),
+        .unavailable => return error.TestExpectedEqual,
+    }
     try std.testing.expect(std.mem.find(u8, persisted_result.output, "MIDTURN_RESULT_SENTINEL") != null);
     try std.testing.expect(persisted_result.output.len > 10 * 1024);
     try std.testing.expectEqualStrings("Mid-turn compaction complete.", hooks.finish_assistant_text.?);
