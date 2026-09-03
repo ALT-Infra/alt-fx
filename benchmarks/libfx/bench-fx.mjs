@@ -72,11 +72,9 @@ async function runChild() {
     fetch: tracedFetch,
     home: repoRoot,
     workspaceRoot: repoRoot,
-    env: {
-      AI_GATEWAY_API_KEY: "libfx-benchmark-key",
-      FX_GATEWAY_CHAT_URL: gatewayUrl,
-      FX_MODEL: "benchmark/model",
-    },
+    apiKey: "libfx-benchmark-key",
+    gatewayChatUrl: gatewayUrl,
+    model: "benchmark/model",
   });
   const agentReadyAt = performance.now();
   const promptAt = performance.now();

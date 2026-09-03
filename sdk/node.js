@@ -67,9 +67,8 @@ function validateNativeBackend(backend) {
     const actualVersion = backend.libfxApiVersion ?? "missing";
     throw new Error(`native addon API version ${actualVersion} is incompatible with libfx API version ${libfxApiVersion}`);
   }
-  if (typeof backend.createFxAgent !== "function" && typeof backend.createCore !== "function" &&
-    typeof backend.createFxTerminal !== "function") {
-    throw new Error("native addon must export createFxAgent(), createCore(), or createFxTerminal()");
+  if (typeof backend.createCore !== "function" && typeof backend.createFxTerminal !== "function") {
+    throw new Error("native addon must export createCore() or createFxTerminal()");
   }
   return backend;
 }
@@ -120,26 +119,8 @@ function wasmBytes(input) {
   return pending;
 }
 
-function validateGatewayChatUrl(value) {
-  if (value === undefined) return;
-  if (typeof value !== "string") throw new TypeError("FX_GATEWAY_CHAT_URL must be a string");
-  let url;
-  try { url = new URL(value); } catch { throw new TypeError("FX_GATEWAY_CHAT_URL must be a valid URL"); }
-  if (url.username || url.password || url.hash) {
-    throw new TypeError("FX_GATEWAY_CHAT_URL must not contain credentials or a fragment");
-  }
-  if (url.href === "https://ai-gateway.vercel.sh/v3/ai/language-model") return;
-  const loopback = url.hostname === "127.0.0.1" || url.hostname === "[::1]" || url.hostname === "localhost";
-  if (url.protocol !== "http:" || !loopback || !url.port) {
-    throw new TypeError("FX_GATEWAY_CHAT_URL must use the canonical Gateway or explicit loopback HTTP");
-  }
-}
-
 function createNativeCoreRuntime(addon, options) {
-  const apiKey = options.env?.AI_GATEWAY_API_KEY;
-  const model = options.env?.FX_MODEL;
-  const gatewayChatUrl = options.env?.FX_GATEWAY_CHAT_URL;
-  validateGatewayChatUrl(gatewayChatUrl);
+  const { apiKey, model, gatewayChatUrl } = options;
   const core = addon.createCore({
     apiKey,
     home: options.home ?? homedir(),
@@ -258,7 +239,6 @@ function createNativeAgent(addon, options) {
 
 async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWasm, options) {
   const { nativeAddon, backend = "auto", ...runtimeOptions } = options ?? {};
-  validateGatewayChatUrl(runtimeOptions.env?.FX_GATEWAY_CHAT_URL);
   if (!new Set(["auto", "native", "wasm"]).has(backend)) {
     throw new TypeError('backend must be "auto", "native", or "wasm"');
   }
@@ -268,14 +248,11 @@ async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWas
   if (backend !== "wasm") {
     const native = await resolveNativeBackend(nativeAddon);
     nativeError = native.error;
-    if (typeof native.backend?.[nativeMethod] === "function" ||
-      (surface === "agent" && typeof native.backend?.createCore === "function")) {
+    if (typeof native.backend?.[nativeMethod] === "function") {
       nativeAttempted = true;
       try {
-        if (typeof native.backend?.[nativeMethod] === "function") {
-          return await native.backend[nativeMethod](runtimeOptions);
-        }
-        return await createNativeAgent(native.backend, runtimeOptions);
+        if (surface === "agent") return await createNativeAgent(native.backend, runtimeOptions);
+        return await native.backend[nativeMethod](runtimeOptions);
       } catch (error) {
         nativeError = error;
         if (backend === "native") throw error;
@@ -298,8 +275,17 @@ async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWas
   });
 }
 
-export function createFxAgent(options = {}) {
-  return createWithFallback("agent", "createFxAgent", createWasmAgent, defaultCoreWasm, options);
+export async function createFxAgent(options = {}) {
+  if (options != null && Object.hasOwn(Object(options), "env")) {
+    throw new TypeError("createFxAgent() does not accept env; pass apiKey and model directly");
+  }
+  return createWithFallback(
+    "agent",
+    "createCore",
+    createWasmAgent,
+    defaultCoreWasm,
+    options,
+  );
 }
 
 export function createFxTerminal(options = {}) {

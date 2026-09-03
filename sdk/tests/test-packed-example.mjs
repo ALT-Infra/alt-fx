@@ -13,6 +13,8 @@ const { createSkillsAdapter } = await import(pathToFileURL(resolve(packageRoot, 
 assert.equal(typeof createMcpAdapter, "function");
 assert.equal(typeof createSkillsAdapter, "function");
 
+let requestedAuthorization;
+let requestedModel;
 const server = createServer((request, response) => {
   request.resume();
   request.on("end", () => {
@@ -21,6 +23,8 @@ const server = createServer((request, response) => {
       response.end('{"object":"list","data":[]}');
       return;
     }
+    requestedAuthorization = request.headers.authorization;
+    requestedModel = request.headers["ai-language-model-id"];
     response.writeHead(200, { "content-type": "text/event-stream" });
     response.end('data: {"type":"text-delta","delta":"packed"}\n\ndata: {"type":"finish","finishReason":{"unified":"stop","raw":"stop"},"usage":{"inputTokens":{"total":1},"outputTokens":{"total":1}}}\n\ndata: [DONE]\n\n');
   });
@@ -32,7 +36,9 @@ const agent = await createFxAgent({
   nativeAddon: resolve(packageRoot, `libfx.${platform}.node`),
   wasm: resolve(packageRoot, "fx-core.wasm"),
   fetch,
-  env: { AI_GATEWAY_API_KEY: "packed-key", FX_GATEWAY_CHAT_URL: `http://127.0.0.1:${server.address().port}/chat`, FX_MODEL: "packed/model" },
+  apiKey: "packed-key",
+  gatewayChatUrl: `http://127.0.0.1:${server.address().port}/chat`,
+  model: "packed/model",
 });
 try {
   assert.deepEqual(Object.keys(agent).sort(), ["checkpoint", "close", "prompt"]);
@@ -41,6 +47,8 @@ try {
   for await (const event of turn) if (event.type === "text_delta") text += event.delta;
   assert.equal(text, "packed");
   assert.deepEqual(await turn.result, { stopReason: "end_turn", usage: { inputTokens: 1, outputTokens: 1 } });
+  assert.equal(requestedAuthorization, "Bearer packed-key");
+  assert.equal(requestedModel, "packed/model");
   assert.ok((await agent.checkpoint()).length > 48);
   await agent.close();
   console.log(`${backend} packed libfx example passed`);

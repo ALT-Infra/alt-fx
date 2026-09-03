@@ -5,7 +5,58 @@ const workspaceInfoLimit = 4 * 1024;
 const workspaceCommandLimit = 64 * 1024;
 const workspaceOutputLimit = 64 * 1024;
 const maxInstructionsBytes = 64 * 1024;
+const maxApiKeyBytes = 64 * 1024;
+const maxModelBytes = 1024;
+const maxUrlBytes = 16 * 1024;
 const streamReadsPerTaskYield = 32;
+
+function boundedString(value, name, maxBytes, required) {
+  if (value === undefined && !required) return undefined;
+  if (typeof value !== "string" || value.length === 0) {
+    throw new TypeError(`${name} ${required ? "is required and " : ""}must be a non-empty string`);
+  }
+  if (encoder.encode(value).length > maxBytes) {
+    throw new RangeError(`${name} exceeds the ${maxBytes} byte libfx limit`);
+  }
+  return value;
+}
+
+function validateGatewayChatUrl(value) {
+  if (value === undefined) return;
+  boundedString(value, "gatewayChatUrl", maxUrlBytes, false);
+  let url;
+  try { url = new URL(value); } catch { throw new TypeError("gatewayChatUrl must be a valid URL"); }
+  if (url.username || url.password || url.hash) {
+    throw new TypeError("gatewayChatUrl must not contain credentials or a fragment");
+  }
+  if (url.href === "https://ai-gateway.vercel.sh/v3/ai/language-model") return;
+  const loopback = url.hostname === "127.0.0.1" || url.hostname === "[::1]" || url.hostname === "localhost";
+  if (url.protocol !== "http:" || !loopback || !url.port) {
+    throw new TypeError("gatewayChatUrl must use the canonical Gateway or explicit loopback HTTP");
+  }
+}
+
+function normalizeAgentOptions(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError("createFxAgent() options must be an object");
+  }
+  const options = { ...value };
+  if (Object.hasOwn(options, "env")) {
+    throw new TypeError("createFxAgent() does not accept env; pass apiKey and model directly");
+  }
+  options.apiKey = boundedString(options.apiKey, "apiKey", maxApiKeyBytes, true);
+  options.model = boundedString(options.model, "model", maxModelBytes, false);
+  validateGatewayChatUrl(options.gatewayChatUrl);
+  return options;
+}
+
+function agentEnvironment(options) {
+  return {
+    AI_GATEWAY_API_KEY: options.apiKey,
+    ...(options.model === undefined ? {} : { FX_MODEL: options.model }),
+    ...(options.gatewayChatUrl === undefined ? {} : { FX_GATEWAY_CHAT_URL: options.gatewayChatUrl }),
+  };
+}
 
 function validWorkspacePath(path) {
   if (typeof path !== "string" || !path.startsWith("/") || path.includes("\0")) return false;
@@ -1014,7 +1065,7 @@ function base64ToBytes(value) {
 }
 
 export async function createFxAgent(options = {}) {
-  options = { ...options };
+  options = normalizeAgentOptions(options);
   const hostTools = normalizeHostTools(options.tools);
   const instructions = normalizeInstructions(options.instructions);
   const initialCheckpoint = checkpointBytes(options.checkpoint);
@@ -1047,7 +1098,12 @@ export async function createFxAgent(options = {}) {
     return { content, isError, cancelled: controller.signal.aborted };
   };
   emit("runtime.start");
-  const runtimeOptions = { ...options, args: ["acp"], hostToolExecutor: executeHostTool };
+  const runtimeOptions = {
+    ...options,
+    args: ["acp"],
+    env: agentEnvironment(options),
+    hostToolExecutor: executeHostTool,
+  };
   const runtime = options.runtimeFactory
     ? await options.runtimeFactory(runtimeOptions)
     : await instantiate(runtimeOptions);
