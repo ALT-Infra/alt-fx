@@ -1028,6 +1028,9 @@ fn ansi_span_fixture_enabled() bool {
 }
 
 fn assert_frozen_ansi_span_fixture() !void {
+    // The fixture hardcodes link IDs fx-1/fx-2, so reset the global counter
+    // to restore the old fresh-process behavior when running in-process.
+    assistant_presentation.resetLinkIdCounterForTests();
     const alloc = std.testing.allocator;
     var capture = StreamCapture{};
     defer capture.deinit(alloc);

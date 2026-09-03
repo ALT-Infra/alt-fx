@@ -12,6 +12,14 @@ const block_render = @import("presentation/block_render.zig");
 /// Prevents OSC 8 hyperlinks from coalescing across wrapped terminal rows.
 var link_id_counter: u32 = 1;
 
+/// Resets the OSC 8 link counter for deterministic tests. Production code
+/// must never call this; it exists because the frozen ANSI fixture used to
+/// run in a fresh nested process (counter starting at 1) and now runs
+/// in-process where earlier tests may have already incremented it.
+pub fn resetLinkIdCounterForTests() void {
+    link_id_counter = 1;
+}
+
 pub const setInlineCodeTheme = ansi.setInlineCodeTheme;
 pub const writeHorizontalRule = ansi.writeHorizontalRule;
 

@@ -261,6 +261,9 @@ describe("cli: help", () => {
       expect(outputs[1]).toBe(outputs[0]);
       expect(outputs[2]).toBe(outputs[0]);
       const stdout = outputs[0]!;
+      // Descriptions wrap at narrow widths, so match wrap-sensitive phrases
+      // against a whitespace-flattened copy.
+      const flatStdout = stdout.replace(/\s+/g, " ");
       expect(stdout).not.toContain("\x1b[");
       expect(stdout).not.toContain("\x1b]2;");
       expect(stdout).toStartWith(
@@ -269,7 +272,7 @@ describe("cli: help", () => {
       expect(stdout.match(/𝒇x/g) ?? []).toHaveLength(1);
       expect(stdout).toContain("fx starts an interactive session by default.");
       expect(stdout).toContain("Commands:\n");
-      expect(stdout).toContain("Run one noninteractive request");
+      expect(flatStdout).toContain("Run one noninteractive request");
       expect(stdout).toContain("Sign in to a model provider");
       expect(stdout).toContain("Sign out of a model provider");
       expect(stdout).toContain("Choose the active model provider");
