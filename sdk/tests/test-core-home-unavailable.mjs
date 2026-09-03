@@ -54,10 +54,7 @@ const agent = await Promise.race([
     backend: "wasm",
     wasm: await readFile(wasmPath),
     fetch: mockFetch,
-    env: {
-      AI_GATEWAY_API_KEY: "sdk-test-key",
-      HOME: "/repo",
-    },
+    apiKey: "sdk-test-key",
     workspace: {
       info: {
         version: 1,

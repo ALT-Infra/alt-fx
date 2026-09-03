@@ -19,7 +19,8 @@ filesystem read when imported.
 import { createFxAgent } from "libfx";
 
 const agent = await createFxAgent({
-  env: { AI_GATEWAY_API_KEY: process.env.AI_GATEWAY_API_KEY },
+  apiKey: process.env.AI_GATEWAY_API_KEY,
+  model: "google/gemini-2.5-flash-lite",
 });
 
 const turn = agent.prompt("Explain this project.");
@@ -32,6 +33,10 @@ console.log(await turn.result); // { stopReason, usage }
 const checkpoint = await agent.checkpoint();
 await agent.close();
 ```
+
+`apiKey` is required. `model` is optional and defaults to fx's built-in model.
+Agent configuration uses named options; `env` is reserved for
+`createFxTerminal()`.
 
 `prompt(input, { signal? })` accepts a string or text/resource blocks. It
 returns an async iterable of normalized events:
@@ -46,7 +51,7 @@ opaque, bounded, versioned bytes. Restore them only when creating a fresh
 agent:
 
 ```js
-const restored = await createFxAgent({ checkpoint, env });
+const restored = await createFxAgent({ apiKey, model, checkpoint });
 ```
 
 The checkpoint contains conversation history and usage only. The host owns
@@ -57,6 +62,8 @@ MCP clients, and skill records.
 
 ```js
 const agent = await createFxAgent({
+  apiKey,
+  model,
   instructions: "Keep answers concise.",
   tools: [{
     name: "lookup",
@@ -70,7 +77,6 @@ const agent = await createFxAgent({
       return database.get(input.key, { signal });
     },
   }],
-  env,
 });
 ```
 
@@ -94,9 +100,10 @@ const mcp = await createMcpAdapter(client, {
 });
 
 const agent = await createFxAgent({
+  apiKey,
+  model,
   tools: mcp.tools,
   instructions: mcp.instructions,
-  env,
 });
 
 // ...
@@ -115,15 +122,15 @@ import { createSkillsAdapter } from "libfx/skills";
 
 const record = await loadSkillFile("./skills/review/SKILL.md");
 const skills = createSkillsAdapter([record]);
-const agent = await createFxAgent({ ...skills, env });
+const agent = await createFxAgent({ apiKey, model, ...skills });
 ```
 
 ## Backends
 
 ```js
-await createFxAgent({ backend: "auto" });   // native, then Wasm fallback
-await createFxAgent({ backend: "native" }); // require N-API
-await createFxAgent({ backend: "wasm" });   // require Wasm + JSPI
+await createFxAgent({ apiKey, backend: "auto" });   // native, then Wasm fallback
+await createFxAgent({ apiKey, backend: "native" }); // require N-API
+await createFxAgent({ apiKey, backend: "wasm" });   // require Wasm + JSPI
 ```
 
 Within one JavaScript realm, libfx compiles each stable Wasm source once and
@@ -156,7 +163,7 @@ stores remain terminal-only host integrations.
 
 ## Security
 
-Treat `nativeAddon` and `env.FX_GATEWAY_CHAT_URL` as trusted host
+Treat `nativeAddon` and `gatewayChatUrl` as trusted host
 configuration. Do not embed long-lived credentials in public browser code.
 Host tool functions, MCP clients, and skill loaders retain their own authority;
 libfx validates and sequences them but does not grant operating-system access.

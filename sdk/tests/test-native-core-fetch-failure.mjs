@@ -15,10 +15,8 @@ const agent = await createFxAgent({
     error.name = "AbortError";
     throw error;
   },
-  env: {
-    AI_GATEWAY_API_KEY: "native-core-fetch-failure-key",
-    FX_MODEL: "native/test-model",
-  },
+  apiKey: "native-core-fetch-failure-key",
+  model: "native/test-model",
 });
 
 let closed = false;
