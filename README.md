@@ -1,4 +1,4 @@
-# alt-fx
+# fixer
 
 ```
  ⠀⠀⠀⠀⠀⠀⣠⣾⣿⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀
@@ -13,13 +13,13 @@
  ⣿⣿⣿⠟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
 ```
 
-alt-fx is a fork of [vercel-labs/fx](https://github.com/vercel-labs/fx) with ALT's recursive multi-model Team orchestration bundled as a first-class, replaceable extension.
+fixer is a fork of [vercel-labs/fx](https://github.com/vercel-labs/fx) with ALT's recursive multi-model Team orchestration bundled as a first-class, replaceable extension.
 
 fx remains the harness. Its terminal UI, model clients, credentials, permission engine, tools, filesystem access, process execution, and persistence infrastructure remain native. ALT owns only Team definitions, leadership, consultations, specialist projections, bounded orchestration context, and the rules by which results return.
 
 **Development status:** ALT is experimental but usable through a native guided Team library. It creates, selects, revises, starts, and deletes immutable Teams without exposing their stored JSON documents. Every ALT session is pinned to the exact Team revision that created it and remains resumable after later revisions or deletion.
 
-ALT is compiled into normal alt-fx builds, but **ALT mode is not active when the application starts**. alt-fx opens in native fx. `/alt` resumes the latest ALT session when one exists and opens the Team library on a fresh installation, `/resume` identifies ALT sessions by their pinned Team revision, and `/alt off` returns to a native fx session.
+ALT is compiled into normal fixer builds, but **ALT mode is not active when the application starts**. fixer opens in native fx. `/alt` resumes the latest ALT session when one exists and opens the Team library on a fresh installation, `/resume` identifies ALT sessions by their pinned Team revision, and `/alt off` returns to a native fx session.
 
 The underlying harness remains optimized for research and embeddability as part of larger systems.
 
@@ -31,16 +31,16 @@ It's open source (Apache-2.0), model-agnostic, and suitable for both local and c
 
 ## Build and run
 
-Building alt-fx requires [Zig 0.16.0+](https://ziglang.org/download/):
+Building fixer requires [Zig 0.16.0+](https://ziglang.org/download/):
 
 ```bash
-git clone https://github.com/ALT-Infra/alt-fx.git
-cd alt-fx
+git clone https://github.com/ALT-Infra/fixer.git
+cd fixer
 zig build -Doptimize=ReleaseSafe
 ./zig-out/bin/fx
 ```
 
-ALT-Infra intentionally publishes no alt-fx release tags or prebuilt releases. Clone the repository and build the current source.
+ALT-Infra intentionally publishes no fixer release tags or prebuilt releases. Clone the repository and build the current source.
 
 ## Run fx
 
@@ -149,7 +149,7 @@ Open Team management directly, or begin a new Team in the guided builder:
 
 The builder configures the Team name, unified provider, primary, peers, specialists, per-role model and instructions, and callable specialist authority. Team and role IDs are opaque, generated automatically, and never presented as authoring fields. Role models are chosen through fx's native live model catalog instead of typed from memory. Write each role's instructions only as that role's identity and expertise: ALT separately supplies every primary and peer with the complete peer roster and exact peer definitions. Every primary and peer can consult every other peer; specialist access is supplied separately and may be exclusive to one of them.
 
-The Team library can start the latest revision in a new conversation, edit it as the next immutable revision in another new conversation, or remove it from the active library. Editing preserves the hidden Team identity. Removed Teams remain available through sessions that already pin one of their revisions. A Team must contain a primary and at least one peer or callable specialist; alt-fx does not offer a single-agent ALT preset.
+The Team library can start the latest revision in a new conversation, edit it as the next immutable revision in another new conversation, or remove it from the active library. Editing preserves the hidden Team identity. Removed Teams remain available through sessions that already pin one of their revisions. A Team must contain a primary and at least one peer or callable specialist; fixer does not offer a single-agent ALT preset.
 
 Return to native fx without leaving the application:
 
